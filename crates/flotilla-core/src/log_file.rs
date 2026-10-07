@@ -314,11 +314,11 @@ mod tests {
         )
         .expect("current");
 
-        let lines = read_daemon_logs(state.path(), 4, &DaemonLogQuery {
-            since_seconds: Some(2 * 60 * 60),
-            level: Some("warn".into()),
-            target: Some("flotilla_daemon::peer".into()),
-        })
+        let lines = read_daemon_logs(
+            state.path(),
+            4,
+            &DaemonLogQuery { since_seconds: Some(2 * 60 * 60), level: Some("warn".into()), target: Some("flotilla_daemon::peer".into()) },
+        )
         .expect("read logs");
 
         assert_eq!(lines.len(), 1);

@@ -272,29 +272,33 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
 
     let workspace = workspaces.get("convoy-stage4a-implement").await.expect("workspace get should succeed");
     workspaces
-        .update_status("convoy-stage4a-implement", &workspace.metadata.resource_version, &VesselStatus {
-            configured_limits: None,
-            runtime_observation: None,
-            placement_decision: None,
-            phase: VesselPhase::Ready,
-            message: None,
-            observed_policy_ref: Some("laptop-docker".to_string()),
-            observed_policy_version: Some("17".to_string()),
-            environment_ref: Some("env-implement".to_string()),
-            image_ref: Some("registry.example/crew:latest".to_string()),
-            local_image_id: Some("sha256:test-image".to_string()),
-            registry_digest: None,
-            checkout_refs: Default::default(),
-            terminal_session_refs: vec!["terminal-implement-coder".to_string()],
-            interrupted_roles: Default::default(),
-            started_at: Some(timestamp(18)),
-            ready_at: Some(timestamp(19)),
-            requested_stance: None,
-            effective_stance: None,
-            held_credentials: Default::default(),
-            credential_delivery_retry: None,
-            credential_refresh_retry: None,
-        })
+        .update_status(
+            "convoy-stage4a-implement",
+            &workspace.metadata.resource_version,
+            &VesselStatus {
+                configured_limits: None,
+                runtime_observation: None,
+                placement_decision: None,
+                phase: VesselPhase::Ready,
+                message: None,
+                observed_policy_ref: Some("laptop-docker".to_string()),
+                observed_policy_version: Some("17".to_string()),
+                environment_ref: Some("env-implement".to_string()),
+                image_ref: Some("registry.example/crew:latest".to_string()),
+                local_image_id: Some("sha256:test-image".to_string()),
+                registry_digest: None,
+                checkout_refs: Default::default(),
+                terminal_session_refs: vec!["terminal-implement-coder".to_string()],
+                interrupted_roles: Default::default(),
+                started_at: Some(timestamp(18)),
+                ready_at: Some(timestamp(19)),
+                requested_stance: None,
+                effective_stance: None,
+                held_credentials: Default::default(),
+                credential_delivery_retry: None,
+                credential_refresh_retry: None,
+            },
+        )
         .await
         .expect("workspace status update should succeed");
 

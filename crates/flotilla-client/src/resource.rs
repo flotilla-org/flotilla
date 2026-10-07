@@ -581,26 +581,29 @@ mod tests {
     #[test]
     fn dedup_plan_refuses_disagreeing_homes_before_returning_deletions() {
         let records = BTreeMap::from([
-            (("hosts".to_string(), "host-a".to_string()), vec![
-                AuthoredRecord {
-                    root: SweepRoot { host_id: "host-a".to_string(), node_id: NodeId::new("node-a") },
-                    namespace: "flotilla".to_string(),
-                    kind: "hosts".to_string(),
-                    name: "host-a".to_string(),
-                    natural_home: Some("host-a".to_string()),
-                },
-                AuthoredRecord {
-                    root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-b") },
-                    namespace: "flotilla".to_string(),
-                    kind: "hosts".to_string(),
-                    name: "host-a".to_string(),
-                    natural_home: Some("host-a".to_string()),
-                },
-            ]),
-            (("placementpolicies".to_string(), "shared".to_string()), vec![
-                authored_policy("host-a", "shared", "host-a"),
-                authored_policy("host-b", "shared", "host-b"),
-            ]),
+            (
+                ("hosts".to_string(), "host-a".to_string()),
+                vec![
+                    AuthoredRecord {
+                        root: SweepRoot { host_id: "host-a".to_string(), node_id: NodeId::new("node-a") },
+                        namespace: "flotilla".to_string(),
+                        kind: "hosts".to_string(),
+                        name: "host-a".to_string(),
+                        natural_home: Some("host-a".to_string()),
+                    },
+                    AuthoredRecord {
+                        root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-b") },
+                        namespace: "flotilla".to_string(),
+                        kind: "hosts".to_string(),
+                        name: "host-a".to_string(),
+                        natural_home: Some("host-a".to_string()),
+                    },
+                ],
+            ),
+            (
+                ("placementpolicies".to_string(), "shared".to_string()),
+                vec![authored_policy("host-a", "shared", "host-a"), authored_policy("host-b", "shared", "host-b")],
+            ),
         ]);
 
         let error = plan_dedup_deletions(records).expect_err("disagreement must abort the complete plan");
@@ -609,10 +612,10 @@ mod tests {
 
     #[test]
     fn dedup_plan_refuses_when_the_natural_home_has_no_authored_copy() {
-        let records = BTreeMap::from([(("placementpolicies".to_string(), "shared".to_string()), vec![
-            authored_policy("host-a", "shared", "host-c"),
-            authored_policy("host-b", "shared", "host-c"),
-        ])]);
+        let records = BTreeMap::from([(
+            ("placementpolicies".to_string(), "shared".to_string()),
+            vec![authored_policy("host-a", "shared", "host-c"), authored_policy("host-b", "shared", "host-c")],
+        )]);
 
         let error = plan_dedup_deletions(records).expect_err("missing home copy must abort the plan");
         assert!(error.contains("natural home host-c has no authored copy"));
@@ -620,16 +623,19 @@ mod tests {
 
     #[test]
     fn dedup_plan_refuses_an_unscoped_policy_before_returning_deletions() {
-        let records = BTreeMap::from([(("placementpolicies".to_string(), "shared".to_string()), vec![
-            authored_policy("host-a", "shared", "host-a"),
-            AuthoredRecord {
-                root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-host-b") },
-                namespace: "flotilla".to_string(),
-                kind: "placementpolicies".to_string(),
-                name: "shared".to_string(),
-                natural_home: None,
-            },
-        ])]);
+        let records = BTreeMap::from([(
+            ("placementpolicies".to_string(), "shared".to_string()),
+            vec![
+                authored_policy("host-a", "shared", "host-a"),
+                AuthoredRecord {
+                    root: SweepRoot { host_id: "host-b".to_string(), node_id: NodeId::new("node-host-b") },
+                    namespace: "flotilla".to_string(),
+                    kind: "placementpolicies".to_string(),
+                    name: "shared".to_string(),
+                    natural_home: None,
+                },
+            ],
+        )]);
 
         let error = plan_dedup_deletions(records).expect_err("unscoped policy must abort the complete plan");
         assert!(error.contains("has no host-scoped natural home"));
@@ -659,10 +665,13 @@ mod tests {
             };
             assert!(matches!(command.action, CommandAction::QueryResourceList { ref kind, .. } if kind == "convoys"));
             server_session
-                .write(Message::ok_response(id, Response::QueryResult {
-                    command_id: 1,
-                    value: CommandValue::ResourceRead(Box::new(envelope(ResourceRecordType::Current, "1"))),
-                }))
+                .write(Message::ok_response(
+                    id,
+                    Response::QueryResult {
+                        command_id: 1,
+                        value: CommandValue::ResourceRead(Box::new(envelope(ResourceRecordType::Current, "1"))),
+                    },
+                ))
                 .await
                 .expect("write list response");
 
@@ -739,10 +748,13 @@ mod tests {
                 };
                 assert!(matches!(command.action, CommandAction::QueryHostList {}));
                 server_session
-                    .write(Message::ok_response(id, Response::QueryResult {
-                        command_id: next_command_id,
-                        value: CommandValue::HostList(Box::new(HostListResponse { hosts: three_root_hosts() })),
-                    }))
+                    .write(Message::ok_response(
+                        id,
+                        Response::QueryResult {
+                            command_id: next_command_id,
+                            value: CommandValue::HostList(Box::new(HostListResponse { hosts: three_root_hosts() })),
+                        },
+                    ))
                     .await
                     .expect("write host inventory");
                 next_command_id += 1;
@@ -761,10 +773,13 @@ mod tests {
                     let node_id = command.node_id.expect("convoy inventory target");
                     let objects = fixture.get(&(node_id.to_string(), "convoys".to_string())).cloned().expect("convoy fixture root");
                     server_session
-                        .write(Message::ok_response(id, Response::QueryResult {
-                            command_id: next_command_id,
-                            value: CommandValue::ResourceRead(Box::new(list_envelope("convoys", &node_id, objects))),
-                        }))
+                        .write(Message::ok_response(
+                            id,
+                            Response::QueryResult {
+                                command_id: next_command_id,
+                                value: CommandValue::ResourceRead(Box::new(list_envelope("convoys", &node_id, objects))),
+                            },
+                        ))
                         .await
                         .expect("write convoy inventory");
                     next_command_id += 1;
@@ -785,10 +800,13 @@ mod tests {
                         let node_id = command.node_id.expect("inventory target");
                         let objects = fixture.get(&(node_id.to_string(), (*kind).to_string())).cloned().expect("fixture root and kind");
                         server_session
-                            .write(Message::ok_response(id, Response::QueryResult {
-                                command_id: next_command_id,
-                                value: CommandValue::ResourceRead(Box::new(list_envelope(kind, &node_id, objects))),
-                            }))
+                            .write(Message::ok_response(
+                                id,
+                                Response::QueryResult {
+                                    command_id: next_command_id,
+                                    value: CommandValue::ResourceRead(Box::new(list_envelope(kind, &node_id, objects))),
+                                },
+                            ))
                             .await
                             .expect("write resource inventory");
                         next_command_id += 1;

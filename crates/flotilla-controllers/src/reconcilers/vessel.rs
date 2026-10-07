@@ -845,10 +845,13 @@ impl Reconciler for VesselReconciler {
                             if let CheckoutSpec::Worktree(spec) = &existing.spec {
                                 contained_branches.insert(spec.r#ref.strip_prefix("refs/heads/").unwrap_or(&spec.r#ref).to_string());
                             }
-                            contained_worktree_checkouts.push((checkout_name.clone(), match &existing.spec {
-                                CheckoutSpec::Worktree(spec) => Some(spec.clone_ref.clone()),
-                                CheckoutSpec::FreshClone(_) | CheckoutSpec::Observed(_) => None,
-                            }));
+                            contained_worktree_checkouts.push((
+                                checkout_name.clone(),
+                                match &existing.spec {
+                                    CheckoutSpec::Worktree(spec) => Some(spec.clone_ref.clone()),
+                                    CheckoutSpec::FreshClone(_) | CheckoutSpec::Observed(_) => None,
+                                },
+                            ));
                         }
                         checkout_refs.insert(repository_key.clone(), checkout_name);
                         checkout_paths.insert(repository_key, path);
@@ -1742,12 +1745,15 @@ mod tests {
         backend
             .clone()
             .using::<Clone>(namespace)
-            .create(&InputMeta::builder().name("clone".to_string()).build(), &CloneSpec {
-                repo_ref: repo_ref.clone(),
-                url: "https://example.com/repo".into(),
-                env_ref: "host".into(),
-                path: "/clone".into(),
-            })
+            .create(
+                &InputMeta::builder().name("clone".to_string()).build(),
+                &CloneSpec {
+                    repo_ref: repo_ref.clone(),
+                    url: "https://example.com/repo".into(),
+                    env_ref: "host".into(),
+                    path: "/clone".into(),
+                },
+            )
             .await
             .expect("clone");
         backend
@@ -1879,12 +1885,15 @@ mod tests {
             }
             let vessel = driver
                 .using::<Vessel>("flotilla")
-                .create(&meta, &VesselSpec {
-                    convoy_ref: "convoy".to_string(),
-                    vessel_name: "work".to_string(),
-                    placement_policy_ref: snapshot_name.to_string(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                })
+                .create(
+                    &meta,
+                    &VesselSpec {
+                        convoy_ref: "convoy".to_string(),
+                        vessel_name: "work".to_string(),
+                        placement_policy_ref: snapshot_name.to_string(),
+                        adopted_checkout_refs: BTreeMap::new(),
+                    },
+                )
                 .await
                 .expect("vessel");
             assert_eq!(

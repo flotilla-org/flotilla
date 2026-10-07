@@ -536,13 +536,10 @@ mod tests {
     #[test]
     fn compiled_bindings_resolve_composed_mode_later_wins() {
         // Build a small table where two modes bind the same key differently.
-        let table = &[Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: None, hint_key: None }, Binding {
-            mode: BindingModeId::Help,
-            key: "q",
-            action: Action::Dismiss,
-            hint: None,
-            hint_key: None,
-        }];
+        let table = &[
+            Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: None, hint_key: None },
+            Binding { mode: BindingModeId::Help, key: "q", action: Action::Dismiss, hint: None, hint_key: None },
+        ];
         let compiled = CompiledBindings::from_table(table);
         // Composed: [Normal, Help] — Help is later, so it wins.
         let mode = KeyBindingMode::Composed(vec![BindingModeId::Normal, BindingModeId::Help]);
@@ -562,14 +559,10 @@ mod tests {
     #[test]
     fn hints_for_single_mode_includes_shared() {
         // Create a table with a shared hint and a mode hint.
-        let table =
-            &[Binding { mode: BindingModeId::Shared, key: "esc", action: Action::Dismiss, hint: Some("Back"), hint_key: None }, Binding {
-                mode: BindingModeId::Normal,
-                key: "q",
-                action: Action::Quit,
-                hint: Some("Quit"),
-                hint_key: None,
-            }];
+        let table = &[
+            Binding { mode: BindingModeId::Shared, key: "esc", action: Action::Dismiss, hint: Some("Back"), hint_key: None },
+            Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: Some("Quit"), hint_key: None },
+        ];
         let compiled = CompiledBindings::from_table(table);
         let mode = KeyBindingMode::Single(BindingModeId::Normal);
         let hints = compiled.hints_for(&mode);
@@ -581,14 +574,10 @@ mod tests {
     #[test]
     fn hints_for_composed_mode_overrides_by_key() {
         // Two modes both hint 'q' with different labels — later wins.
-        let table =
-            &[Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: Some("Quit"), hint_key: None }, Binding {
-                mode: BindingModeId::Help,
-                key: "q",
-                action: Action::Dismiss,
-                hint: Some("Close"),
-                hint_key: None,
-            }];
+        let table = &[
+            Binding { mode: BindingModeId::Normal, key: "q", action: Action::Quit, hint: Some("Quit"), hint_key: None },
+            Binding { mode: BindingModeId::Help, key: "q", action: Action::Dismiss, hint: Some("Close"), hint_key: None },
+        ];
         let compiled = CompiledBindings::from_table(table);
         let mode = KeyBindingMode::Composed(vec![BindingModeId::Normal, BindingModeId::Help]);
         let hints = compiled.hints_for(&mode);
@@ -661,14 +650,10 @@ mod tests {
 
     #[test]
     fn hints_for_no_shared_fallback_excludes_shared_hints() {
-        let table =
-            &[Binding { mode: BindingModeId::Shared, key: "esc", action: Action::Dismiss, hint: Some("Back"), hint_key: None }, Binding {
-                mode: BindingModeId::CommandPalette,
-                key: "esc",
-                action: Action::Dismiss,
-                hint: Some("Close"),
-                hint_key: None,
-            }];
+        let table = &[
+            Binding { mode: BindingModeId::Shared, key: "esc", action: Action::Dismiss, hint: Some("Back"), hint_key: None },
+            Binding { mode: BindingModeId::CommandPalette, key: "esc", action: Action::Dismiss, hint: Some("Close"), hint_key: None },
+        ];
         let compiled = CompiledBindings::from_table_with_no_shared_fallback(table, &[BindingModeId::CommandPalette]);
         let hints = compiled.hints_for(&KeyBindingMode::Single(BindingModeId::CommandPalette));
         let keys: Vec<&str> = hints.iter().map(|h| h.key.as_str()).collect();

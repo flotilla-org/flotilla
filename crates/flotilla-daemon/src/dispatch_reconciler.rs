@@ -428,12 +428,10 @@ impl DispatchReconciler {
                 }
             }
             mission.occupancy_rebuilds += 1;
-            mission.occupancy.insert(project.metadata.name.clone(), Occupancy {
-                board: board.clone(),
-                policy: policy.clone(),
-                project_active,
-                missions,
-            });
+            mission.occupancy.insert(
+                project.metadata.name.clone(),
+                Occupancy { board: board.clone(), policy: policy.clone(), project_active, missions },
+            );
         }
         let occupancy = &mission.occupancy[&project.metadata.name];
         let mut ready = input.readiness.clone()?;
@@ -922,11 +920,14 @@ mod tests {
             creatable: true,
         };
 
-        assert_eq!(ready_issue_query(&binding), IssueQuery {
-            search: None,
-            label: Some(READY_ISSUE_LABEL.to_string()),
-            match_fields: BTreeMap::from([("component".to_string(), vec!["terminal".to_string()])]),
-        });
+        assert_eq!(
+            ready_issue_query(&binding),
+            IssueQuery {
+                search: None,
+                label: Some(READY_ISSUE_LABEL.to_string()),
+                match_fields: BTreeMap::from([("component".to_string(), vec!["terminal".to_string()])]),
+            }
+        );
     }
 
     async fn harness(
@@ -938,31 +939,34 @@ mod tests {
         backend
             .clone()
             .using::<Project>(NAMESPACE)
-            .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
-                charter: None,
-                role_definitions: BTreeMap::new(),
-                charter_prose: BTreeMap::new(),
-                parent: None,
-                platform_matrix: Vec::new(),
-                role_needs: Default::default(),
-                skills: BTreeMap::new(),
-                display_name: "Widgets".to_string(),
-                default_workflow_ref: "implement".to_string(),
-                supervision: None,
-                issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
-                    .source(source())
-                    .alias("widgets".to_string())
-                    .build()],
-                repositories: vec![flotilla_resources::ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: RepositoryKey("acme/widgets".to_string()),
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: None,
-                }],
-                dispatch_policy: Some(policy),
-            })
+            .create(
+                &InputMeta::builder().name("widgets".to_string()).build(),
+                &ProjectSpec {
+                    charter: None,
+                    role_definitions: BTreeMap::new(),
+                    charter_prose: BTreeMap::new(),
+                    parent: None,
+                    platform_matrix: Vec::new(),
+                    role_needs: Default::default(),
+                    skills: BTreeMap::new(),
+                    display_name: "Widgets".to_string(),
+                    default_workflow_ref: "implement".to_string(),
+                    supervision: None,
+                    issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                        .source(source())
+                        .alias("widgets".to_string())
+                        .build()],
+                    repositories: vec![flotilla_resources::ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: RepositoryKey("acme/widgets".to_string()),
+                        alias: None,
+                        roles: Default::default(),
+                        subpath: None,
+                        default_branch: None,
+                    }],
+                    dispatch_policy: Some(policy),
+                },
+            )
             .await
             .expect("project");
         let issues = Arc::new(FakeIssues {
@@ -1070,10 +1074,11 @@ mod tests {
         assert_eq!(moved_project.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
         let current = convoys.get("watched").await.expect("convoy");
         convoys
-            .update_status("watched", &current.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landed,
-                ..Default::default()
-            })
+            .update_status(
+                "watched",
+                &current.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+            )
             .await
             .expect("convoy update");
         reconciler.reconcile_once().await.expect("update pass");
@@ -1319,33 +1324,36 @@ mod tests {
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
-            .create(&InputMeta::builder().name("human-dispatch".to_string()).build(), &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: "review-and-fix".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::<String, InputValue>::new(),
-                placement_policy: Some("docker-local".to_string()),
-                repositories: Vec::new(),
-                r#ref: Some("fix-2".to_string()),
-                project_ref: Some("widgets".to_string()),
-                adopted_checkout_refs: Default::default(),
-                issues: vec![ConvoyIssue {
-                    reference: ready.reference.clone(),
-                    repository_ref: None,
-                    snapshot: IssueSnapshot {
-                        title: ready.title,
-                        body: ready.body,
-                        state: ready.state,
-                        labels: ready.labels,
-                        as_of: ready.as_of,
-                    },
-                }],
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &InputMeta::builder().name("human-dispatch".to_string()).build(),
+                &ConvoySpec {
+                    continuation: None,
+                    subjects: Vec::new(),
+                    role: String::new(),
+                    generation: 1,
+                    workflow_ref: "review-and-fix".to_string(),
+                    dispatching_principal_ref: Default::default(),
+                    inputs: BTreeMap::<String, InputValue>::new(),
+                    placement_policy: Some("docker-local".to_string()),
+                    repositories: Vec::new(),
+                    r#ref: Some("fix-2".to_string()),
+                    project_ref: Some("widgets".to_string()),
+                    adopted_checkout_refs: Default::default(),
+                    issues: vec![ConvoyIssue {
+                        reference: ready.reference.clone(),
+                        repository_ref: None,
+                        snapshot: IssueSnapshot {
+                            title: ready.title,
+                            body: ready.body,
+                            state: ready.state,
+                            labels: ready.labels,
+                            as_of: ready.as_of,
+                        },
+                    }],
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("manual convoy");
         clock.advance(Duration::seconds(90));
@@ -1405,33 +1413,36 @@ mod tests {
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
-            .create(&InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(), &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: "deleted-workflow".to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::<String, InputValue>::new(),
-                placement_policy: None,
-                repositories: Vec::new(),
-                r#ref: Some("fix-2".to_string()),
-                project_ref: Some("widgets".to_string()),
-                adopted_checkout_refs: Default::default(),
-                issues: vec![ConvoyIssue {
-                    reference: dispatched.reference,
-                    repository_ref: None,
-                    snapshot: IssueSnapshot {
-                        title: dispatched.title,
-                        body: dispatched.body,
-                        state: dispatched.state,
-                        labels: dispatched.labels,
-                        as_of: dispatched.as_of,
-                    },
-                }],
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(),
+                &ConvoySpec {
+                    continuation: None,
+                    subjects: Vec::new(),
+                    role: String::new(),
+                    generation: 1,
+                    workflow_ref: "deleted-workflow".to_string(),
+                    dispatching_principal_ref: Default::default(),
+                    inputs: BTreeMap::<String, InputValue>::new(),
+                    placement_policy: None,
+                    repositories: Vec::new(),
+                    r#ref: Some("fix-2".to_string()),
+                    project_ref: Some("widgets".to_string()),
+                    adopted_checkout_refs: Default::default(),
+                    issues: vec![ConvoyIssue {
+                        reference: dispatched.reference,
+                        repository_ref: None,
+                        snapshot: IssueSnapshot {
+                            title: dispatched.title,
+                            body: dispatched.body,
+                            state: dispatched.state,
+                            labels: dispatched.labels,
+                            as_of: dispatched.as_of,
+                        },
+                    }],
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("manual convoy");
         clock.advance(Duration::seconds(60));
@@ -1623,15 +1634,15 @@ mod tests {
             harness(candidates, vec![issue("12", &[], None, IssueState::Open), issue("15", &[], None, IssueState::Closed)], policy(60))
                 .await;
         for (id, kind) in [("7", "Grill"), ("8", "Map"), ("9", "Brainstorm")] {
-            issues.facts.lock().expect("facts").insert(IssueRef { source: source(), id: id.into() }, DispatchIssueFacts {
-                issue_type: Some(kind.into()),
-                ..Default::default()
-            });
+            issues.facts.lock().expect("facts").insert(
+                IssueRef { source: source(), id: id.into() },
+                DispatchIssueFacts { issue_type: Some(kind.into()), ..Default::default() },
+            );
         }
-        issues.facts.lock().expect("facts").insert(IssueRef { source: source(), id: "10".into() }, DispatchIssueFacts {
-            has_open_pull_request: true,
-            ..Default::default()
-        });
+        issues.facts.lock().expect("facts").insert(
+            IssueRef { source: source(), id: "10".into() },
+            DispatchIssueFacts { has_open_pull_request: true, ..Default::default() },
+        );
         native_edge(&issues, "11", "12");
         native_edge(&issues, "14", "15");
         reconciler.reconcile_once().await.expect("pass");
@@ -1664,12 +1675,15 @@ mod tests {
             let reference = candidate.reference.clone();
             let (backend, issues, _, reconciler) =
                 harness(vec![candidate], vec![issue("9", &[], None, IssueState::Open)], policy(300)).await;
-            issues.facts.lock().expect("facts").insert(reference, DispatchIssueFacts {
-                issue_type: if ideation >= 4 { kinds[ideation].map(str::to_string) } else { None },
-                blockers: if native_blocked { vec![IssueRef { source: source(), id: "9".into() }] } else { vec![] },
-                has_open_pull_request: serving_pr,
-                landed: false,
-            });
+            issues.facts.lock().expect("facts").insert(
+                reference,
+                DispatchIssueFacts {
+                    issue_type: if ideation >= 4 { kinds[ideation].map(str::to_string) } else { None },
+                    blockers: if native_blocked { vec![IssueRef { source: source(), id: "9".into() }] } else { vec![] },
+                    has_open_pull_request: serving_pr,
+                    landed: false,
+                },
+            );
             assert_eq!(
                 reconciler.reconcile_once().await.expect("pass").queued,
                 usize::from(open && ready_label && !native_blocked && !serving_pr && ideation == 0)

@@ -449,16 +449,20 @@ mod tests {
             .await
             .expect("create session");
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-                crew: Some(
-                    flotilla_resources::CrewSessionStatus::builder()
-                        .id("crew-1".to_string())
-                        .adapter("codex".to_string())
-                        .stance("trusted".to_string())
-                        .build(),
-                ),
-                ..TerminalSessionStatus::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &TerminalSessionStatus {
+                    crew: Some(
+                        flotilla_resources::CrewSessionStatus::builder()
+                            .id("crew-1".to_string())
+                            .adapter("codex".to_string())
+                            .stance("trusted".to_string())
+                            .build(),
+                    ),
+                    ..TerminalSessionStatus::default()
+                },
+            )
             .await
             .expect("mark crew");
         let blobs = MemoryBlobStore::default();

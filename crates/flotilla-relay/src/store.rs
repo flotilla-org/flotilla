@@ -135,11 +135,8 @@ impl<S: Sql> Store<S> {
     }
 
     pub(crate) fn add_token(&self, id: &str, digest: &str, now_ms: u64) -> StoreResult<()> {
-        self.sql.exec("INSERT INTO consumer_tokens (id, digest, created_ms) VALUES (?, ?, ?)", &[
-            id.into(),
-            digest.into(),
-            int(now_ms)?,
-        ])?;
+        self.sql
+            .exec("INSERT INTO consumer_tokens (id, digest, created_ms) VALUES (?, ?, ?)", &[id.into(), digest.into(), int(now_ms)?])?;
         Ok(())
     }
 
@@ -155,12 +152,10 @@ impl<S: Sql> Store<S> {
     }
 
     pub(crate) fn add_secret(&self, source: &str, id: &str, secret: &str, now_ms: u64) -> StoreResult<()> {
-        self.sql.exec("INSERT INTO source_secrets (source, id, secret, created_ms) VALUES (?, ?, ?, ?)", &[
-            source.into(),
-            id.into(),
-            secret.into(),
-            int(now_ms)?,
-        ])?;
+        self.sql.exec(
+            "INSERT INTO source_secrets (source, id, secret, created_ms) VALUES (?, ?, ?, ?)",
+            &[source.into(), id.into(), secret.into(), int(now_ms)?],
+        )?;
         Ok(())
     }
 
@@ -272,10 +267,10 @@ impl<S: Sql> Store<S> {
     }
 
     fn set_cursor(&self, name: &str, value: u64) -> StoreResult<()> {
-        self.sql.exec("INSERT INTO cursors (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value", &[
-            name.into(),
-            int(value)?,
-        ])?;
+        self.sql.exec(
+            "INSERT INTO cursors (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            &[name.into(), int(value)?],
+        )?;
         Ok(())
     }
 }

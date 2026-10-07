@@ -88,21 +88,24 @@ fn issue(id: &str, ready: bool) -> TableIssueStart {
 fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
     let host_name = HostName::new(name);
     let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
-    model.hosts.insert(environment_id.clone(), TuiHostState {
-        environment_id: environment_id.clone(),
-        host_name: host_name.clone(),
-        is_local: false,
-        status: PeerStatus::Connected,
-        summary: flotilla_protocol::HostSummary {
-            environment_id,
-            host_name: Some(host_name),
-            node: NodeInfo::new(NodeId::new(name), name),
-            system: flotilla_protocol::SystemInfo::default(),
-            inventory: flotilla_protocol::ToolInventory::default(),
-            providers: vec![],
-            environments: vec![],
+    model.hosts.insert(
+        environment_id.clone(),
+        TuiHostState {
+            environment_id: environment_id.clone(),
+            host_name: host_name.clone(),
+            is_local: false,
+            status: PeerStatus::Connected,
+            summary: flotilla_protocol::HostSummary {
+                environment_id,
+                host_name: Some(host_name),
+                node: NodeInfo::new(NodeId::new(name), name),
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+                environments: vec![],
+            },
         },
-    });
+    );
 }
 
 #[tokio::test]
@@ -194,11 +197,10 @@ fn convoy_delete_confirms_then_routes_to_origin_host() {
 
     let (command, pending) = app.proto_commands.take_next().expect("confirmed delete command");
     assert_eq!(command.node_id, Some(NodeId::new("remote-host")));
-    assert_eq!(command.action, CommandAction::ConvoyDelete {
-        namespace: Some("other-team".into()),
-        name: "failed-convoy".into(),
-        force: false,
-    });
+    assert_eq!(
+        command.action,
+        CommandAction::ConvoyDelete { namespace: Some("other-team".into()), name: "failed-convoy".into(), force: false }
+    );
     assert_eq!(pending.expect("pending context").table_row_context().map(|context| &context.row_id), Some(&row_id));
 }
 

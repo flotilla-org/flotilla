@@ -969,11 +969,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                             let consecutive_failures =
                                 finalizer_failures.get(&name).map_or(1, |failure| failure.consecutive_failures.saturating_add(1));
                             let delay = FinalizerFailure::delay(consecutive_failures);
-                            finalizer_failures.insert(name.clone(), FinalizerFailure {
-                                creation_timestamp: object.metadata.creation_timestamp,
-                                consecutive_failures,
-                                retry_at: Instant::now() + delay,
-                            });
+                            finalizer_failures.insert(
+                                name.clone(),
+                                FinalizerFailure {
+                                    creation_timestamp: object.metadata.creation_timestamp,
+                                    consecutive_failures,
+                                    retry_at: Instant::now() + delay,
+                                },
+                            );
                             delay
                         });
                         if attempted_reconcile {
@@ -1012,12 +1015,15 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 if !terminal {
                                     retry_after = Some(delay);
                                 }
-                                object_failures.insert(name.clone(), ObjectFailure {
-                                    failure,
-                                    creation_timestamp: object.metadata.creation_timestamp,
-                                    retry_at: Instant::now() + delay,
-                                    terminal,
-                                });
+                                object_failures.insert(
+                                    name.clone(),
+                                    ObjectFailure {
+                                        failure,
+                                        creation_timestamp: object.metadata.creation_timestamp,
+                                        retry_at: Instant::now() + delay,
+                                        terminal,
+                                    },
+                                );
                             }
                         }
                         warn!(

@@ -637,9 +637,10 @@ impl<'a> AttachResolver<'a> {
                 DockerEnvironmentHopResolver::new(HashMap::from([(environment_id.clone(), container_name.to_string())]));
             let hop_resolver =
                 HopResolver::new(Arc::new(NoopRemoteHopResolver), Arc::new(environment_resolver), Arc::new(NoopTerminalHopResolver));
-            let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() }, Hop::RunCommand {
-                command: attach_args,
-            }]);
+            let plan = HopPlan(vec![
+                Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() },
+                Hop::RunCommand { command: attach_args },
+            ]);
             let mut context = ResolutionContext {
                 current_host: self.host_name.clone(),
                 current_environment: None,
@@ -1187,11 +1188,10 @@ mod tests {
         let local_host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&local_host), &HostSpec {
-                display_name: "standing-test".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &test_meta(&local_host),
+                &HostSpec { display_name: "standing-test".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
@@ -1253,11 +1253,10 @@ mod tests {
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&host), &HostSpec {
-                display_name: "standing-test".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &test_meta(&host),
+                &HostSpec { display_name: "standing-test".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "coder-env", &host).await;
@@ -1265,10 +1264,11 @@ mod tests {
         let convoys = backend.using::<ResourceConvoy>("flotilla");
         let convoy = convoys.get("convoy-failed").await.expect("convoy");
         convoys
-            .update_status("convoy-failed", &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                ..Default::default()
-            })
+            .update_status(
+                "convoy-failed",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+            )
             .await
             .expect("failed convoy status");
         let sessions = backend.using::<ResourceTerminalSession>("flotilla");
@@ -1305,11 +1305,10 @@ mod tests {
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&host), &HostSpec {
-                display_name: "standing-test".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &test_meta(&host),
+                &HostSpec { display_name: "standing-test".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "coder-env", &host).await;
@@ -1352,11 +1351,10 @@ mod tests {
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&host), &HostSpec {
-                display_name: "standing-test".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &test_meta(&host),
+                &HostSpec { display_name: "standing-test".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "coder-env", &host).await;

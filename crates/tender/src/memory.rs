@@ -119,13 +119,16 @@ impl MemoryTender {
                         if record.publication.availability == Availability::Available {
                             record.publication.availability = Availability::Unavailable;
                         }
-                        (record.publication.id, Record {
-                            publication: record.publication,
-                            requested_audience: record.requested_audience,
-                            expires_at: record.expires_at,
-                            sender: None,
-                            streams: Vec::new(),
-                        })
+                        (
+                            record.publication.id,
+                            Record {
+                                publication: record.publication,
+                                requested_audience: record.requested_audience,
+                                expires_at: record.expires_at,
+                                sender: None,
+                                streams: Vec::new(),
+                            },
+                        )
                     })
                     .collect();
             }
@@ -490,13 +493,16 @@ impl Tender for MemoryTender {
                 generation: 1,
                 availability: Availability::Available,
             };
-            state.records.insert(id, Record {
-                publication,
-                requested_audience: request.audience,
-                expires_at: grant.expires_at,
-                sender: Some(sender),
-                streams: Vec::new(),
-            });
+            state.records.insert(
+                id,
+                Record {
+                    publication,
+                    requested_audience: request.audience,
+                    expires_at: grant.expires_at,
+                    sender: Some(sender),
+                    streams: Vec::new(),
+                },
+            );
             Lease { id, generation: 1, publisher: session.caller.clone() }
         };
         state.notify()?;

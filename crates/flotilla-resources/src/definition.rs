@@ -151,12 +151,10 @@ impl<T: Resource> DefinitionResolver<T> {
             if value_changed || resolves_conflict || current.is_none() {
                 changed = true;
                 spec_changed = true;
-                merge.fields.insert(path, FieldMergeMetadata {
-                    dot: dot.clone(),
-                    seen: context.clone(),
-                    written_at: now,
-                    writer: Some(writer.clone()),
-                });
+                merge.fields.insert(
+                    path,
+                    FieldMergeMetadata { dot: dot.clone(), seen: context.clone(), written_at: now, writer: Some(writer.clone()) },
+                );
             }
         }
         if spec_changed {
@@ -179,12 +177,10 @@ impl<T: Resource> DefinitionResolver<T> {
             return current.ok_or_else(|| ResourceError::not_found(&meta.name));
         }
 
-        merge.fields.insert(DELETION_FIELD.to_string(), FieldMergeMetadata {
-            dot: dot.clone(),
-            seen: context.clone(),
-            written_at: now,
-            writer: Some(writer.clone()),
-        });
+        merge.fields.insert(
+            DELETION_FIELD.to_string(),
+            FieldMergeMetadata { dot: dot.clone(), seen: context.clone(), written_at: now, writer: Some(writer.clone()) },
+        );
         merge.seen = context;
         merge.seen.insert(local_root, next_counter);
         merge.conflicts.clear();
@@ -240,12 +236,15 @@ impl<T: Resource> DefinitionResolver<T> {
             seen: BTreeMap::new(),
             conflicts: BTreeMap::new(),
         });
-        merge.fields.insert(DELETION_FIELD.to_string(), FieldMergeMetadata {
-            dot,
-            seen: context.clone(),
-            written_at: Utc::now(),
-            writer: Some(WriterIdentity::operator().with_source("definition-delete")),
-        });
+        merge.fields.insert(
+            DELETION_FIELD.to_string(),
+            FieldMergeMetadata {
+                dot,
+                seen: context.clone(),
+                written_at: Utc::now(),
+                writer: Some(WriterIdentity::operator().with_source("definition-delete")),
+            },
+        );
         merge.seen = context;
         merge.seen.insert(local_root, next_counter);
         merge.conflicts.clear();

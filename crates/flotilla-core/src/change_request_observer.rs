@@ -494,11 +494,8 @@ impl ChangeRequestRefresher {
         let this = self.clone();
         let task_subject = subject.clone();
         let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
-        active.insert(subject, ActiveRefresh {
-            demands: HashMap::from([(subscription_id, freshness)]),
-            wake: Arc::new(Notify::new()),
-            task,
-        });
+        active
+            .insert(subject, ActiveRefresh { demands: HashMap::from([(subscription_id, freshness)]), wake: Arc::new(Notify::new()), task });
         Ok(())
     }
 

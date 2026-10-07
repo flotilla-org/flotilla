@@ -282,12 +282,15 @@ mod tests {
             name: "fleet".into(),
             workflow: Some("work".into()),
             skills: BTreeMap::new(),
-            roles: BTreeMap::from([("governor".into(), RoleDefinition {
-                agent: Some("claude".into()),
-                model: Some("fleet".into()),
-                workflow: Some("govern".into()),
-                brief_template: Some("fleet template".into()),
-            })]),
+            roles: BTreeMap::from([(
+                "governor".into(),
+                RoleDefinition {
+                    agent: Some("claude".into()),
+                    model: Some("fleet".into()),
+                    workflow: Some("govern".into()),
+                    brief_template: Some("fleet template".into()),
+                },
+            )]),
         }];
         let mut winner = "fleet";
         for name in ["parent", "project", "convoy", "dispatch"] {
@@ -320,12 +323,15 @@ mod tests {
         let projects = backend.definitions::<Project>("test");
         let fleet = ProjectSpec::builder()
             .display_name("Fleet".into())
-            .role_definitions(BTreeMap::from([("governor".into(), RoleDefinition {
-                agent: Some("claude".into()),
-                model: Some("fleet".into()),
-                workflow: Some("govern".into()),
-                brief_template: Some("fleet template".into()),
-            })]))
+            .role_definitions(BTreeMap::from([(
+                "governor".into(),
+                RoleDefinition {
+                    agent: Some("claude".into()),
+                    model: Some("fleet".into()),
+                    workflow: Some("govern".into()),
+                    brief_template: Some("fleet template".into()),
+                },
+            )]))
             .charter_prose(BTreeMap::from([("*".into(), "Fleet-only prose".into())]))
             .build();
         projects.apply(&InputMeta::builder().name("fleet".into()).build(), &fleet).await.expect("fleet");

@@ -302,15 +302,18 @@ impl SlowCloudAgent {
 #[async_trait]
 impl CloudAgentService for SlowCloudAgent {
     async fn list_sessions(&self, _: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        Ok(vec![("sess-1".into(), CloudAgentSession {
-            title: "Slow Session".into(),
-            status: SessionStatus::Running,
-            model: None,
-            updated_at: None,
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-            item_noun: String::new(),
-        })])
+        Ok(vec![(
+            "sess-1".into(),
+            CloudAgentSession {
+                title: "Slow Session".into(),
+                status: SessionStatus::Running,
+                model: None,
+                updated_at: None,
+                provider_name: String::new(),
+                provider_display_name: String::new(),
+                item_noun: String::new(),
+            },
+        )])
     }
 
     async fn archive_session(&self, _: &str) -> Result<(), String> {
@@ -943,28 +946,31 @@ async fn resource_list_and_get_queries_return_wire_json() {
     daemon
         .resource_backend()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Missing repository".into(),
-            default_workflow_ref: "wf".into(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: RepositoryKey("missing".into()),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: None,
-            }],
-            dispatch_policy: None,
-        })
+        .create(
+            &InputMeta::builder().name("missing-repository".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Missing repository".into(),
+                default_workflow_ref: "wf".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: RepositoryKey("missing".into()),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: None,
+                }],
+                dispatch_policy: None,
+            },
+        )
         .await
         .expect("create project with unresolved repository");
     let project = daemon
@@ -1011,16 +1017,19 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         observed_workflow_ref: Some("implement-review@1".to_string()),
         ..Default::default()
     };
-    status.work.insert("work".to_string(), WorkState {
-        phase: WorkPhase::Complete,
-        placement: Some(flotilla_resources::PlacementStatus {
-            fields: BTreeMap::from([(
-                "checkout_refs".to_string(),
-                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "checkout-dead".to_string())])),
-            )]),
-        }),
-        ..WorkState::builder().phase(WorkPhase::Complete).build()
-    });
+    status.work.insert(
+        "work".to_string(),
+        WorkState {
+            phase: WorkPhase::Complete,
+            placement: Some(flotilla_resources::PlacementStatus {
+                fields: BTreeMap::from([(
+                    "checkout_refs".to_string(),
+                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "checkout-dead".to_string())])),
+                )]),
+            }),
+            ..WorkState::builder().phase(WorkPhase::Complete).build()
+        },
+    );
     let convoy = convoys
         .create(
             &InputMeta::builder().name("terminal-checkout".to_string()).build(),
@@ -1076,19 +1085,23 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         .await
         .expect("create change request");
     change_requests
-        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-            title: Default::default(),
-            author: Default::default(),
-            review_decision: Default::default(),
-            review_requested_from_owner: Default::default(),
-            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
-            head_sha: flotilla_resources::Observation::known("abc123".to_string(), observed_at),
-            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
-            review: flotilla_resources::ChangeRequestReviewObservation {
-                actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+        .update_status(
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+                head_sha: flotilla_resources::Observation::known("abc123".to_string(), observed_at),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
             },
-            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
-        })
+        )
         .await
         .expect("publish merged change request");
 
@@ -1896,14 +1909,17 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
     let mut status = host.status.unwrap_or_default();
     status.ready = true;
     status.heartbeat_at = Some(chrono::Utc::now());
-    status.fulfilment_facts.insert("docker-test".into(), FulfilmentFacts {
-        harnesses: agent_adapters
-            .iter()
-            .filter(|adapter| adapter.as_str() == "codex")
-            .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
-            .collect(),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "docker-test".into(),
+        FulfilmentFacts {
+            harnesses: agent_adapters
+                .iter()
+                .filter(|adapter| adapter.as_str() == "codex")
+                .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
+                .collect(),
+            ..Default::default()
+        },
+    );
     status.capabilities.insert("docker".to_string(), serde_json::json!(true));
     status.capabilities.insert("os".to_string(), serde_json::json!("linux"));
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
@@ -1957,28 +1973,31 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: issue_source_bindings.into_iter().map(Into::into).collect(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: issue_source_bindings.into_iter().map(Into::into).collect(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project create");
 }
@@ -2011,12 +2030,15 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
-            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &InputMeta::builder().name("claude-max".to_string()).build(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("Claude credential create");
     backend
@@ -2041,31 +2063,34 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Zellij".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
-                .source(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() })
-                .alias("zellij".to_string())
-                .build()],
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("zellij".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Zellij".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                    .source(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() })
+                    .alias("zellij".to_string())
+                    .build()],
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project create");
 
@@ -2096,9 +2121,12 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
             .build()
     };
     let rejected_id = daemon.execute(start("reviewless", "single-agent")).await.expect("dispatch command");
-    assert_eq!(recv_command_finished(&mut events, rejected_id).await, CommandValue::Error {
-        message: "workflow single-agent not permitted for fork-stance repository — use implement-review".to_string()
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, rejected_id).await,
+        CommandValue::Error {
+            message: "workflow single-agent not permitted for fork-stance repository — use implement-review".to_string()
+        }
+    );
 
     let repositories = backend.clone().using::<Repository>("flotilla");
     let stored = repositories.get(&repository.key().to_string()).await.expect("fork repository");
@@ -2111,18 +2139,16 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .await
         .expect("explicit reviewless override");
     let overridden_id = daemon.execute(start("overridden", "single-agent")).await.expect("override dispatch command");
-    assert_eq!(recv_command_finished(&mut events, overridden_id).await, CommandValue::ConvoyStarted {
-        name: "overridden@zellij".into(),
-        attach_plan: None,
-        binding: None
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, overridden_id).await,
+        CommandValue::ConvoyStarted { name: "overridden@zellij".into(), attach_plan: None, binding: None }
+    );
 
     let admitted_id = daemon.execute(start("reviewed", "implement-review")).await.expect("dispatch command");
-    assert_eq!(recv_command_finished(&mut events, admitted_id).await, CommandValue::ConvoyStarted {
-        name: "reviewed@zellij".into(),
-        attach_plan: None,
-        binding: None
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, admitted_id).await,
+        CommandValue::ConvoyStarted { name: "reviewed@zellij".into(), attach_plan: None, binding: None }
+    );
     let convoy = admitted_convoy(&backend, "reviewed").await;
     assert_eq!(convoy.spec.workflow_ref, "implement-review");
     let workflow = backend.using::<WorkflowTemplate>("flotilla").get("implement-review").await.expect("implement-review workflow");
@@ -2204,28 +2230,31 @@ async fn exercise_existing_pr_admission(continuing: bool) {
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".to_string(),
-            default_workflow_ref: "single-agent".to_string(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository_key.clone(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("trunk".to_string()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".to_string(),
+                default_workflow_ref: "single-agent".to_string(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository_key.clone(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("trunk".to_string()),
+                }],
+            },
+        )
         .await
         .expect("project create");
 
@@ -2252,10 +2281,11 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         .expect("old holder");
     if continuing {
         convoys
-            .update_status("old-holder", &old.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Failed,
-                ..Default::default()
-            })
+            .update_status(
+                "old-holder",
+                &old.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Failed, ..Default::default() },
+            )
             .await
             .expect("old failed");
     }
@@ -2289,11 +2319,14 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         .await
         .expect("PR adoption command accepted");
 
-    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "convoy-adoption-of-an-existing-pr-1071@flotilla".to_string(),
-        attach_plan: None,
-        binding: None,
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, command_id).await,
+        CommandValue::ConvoyStarted {
+            name: "convoy-adoption-of-an-existing-pr-1071@flotilla".to_string(),
+            attach_plan: None,
+            binding: None,
+        }
+    );
     let convoy = admitted_convoy(&backend, "convoy-adoption-of-an-existing-pr-1071").await;
     assert_eq!(convoy.spec.workflow_ref, "single-agent-shepherd");
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("feat/existing-pr"));
@@ -2335,11 +2368,10 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         // The same PR supplies both merged and closed terminal alternatives.
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves[1].address, leaves[0].address);
-        assert_eq!(leaves[0].address, flotilla_protocol::LeafAddress::ChangeRequest {
-            service: "github.com".into(),
-            scope: "owner/repo".into(),
-            number: 1071
-        });
+        assert_eq!(
+            leaves[0].address,
+            flotilla_protocol::LeafAddress::ChangeRequest { service: "github.com".into(), scope: "owner/repo".into(), number: 1071 }
+        );
         let settlement = flotilla_resources::evaluate_landing_settlement(
             &replacement,
             &BTreeMap::new(),
@@ -2369,17 +2401,23 @@ async fn exercise_existing_pr_admission(continuing: bool) {
         .expect("observed change request");
     let at = chrono::Utc::now();
     records
-        .update_status(&name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-            title: Default::default(),
-            author: Default::default(),
-            review_decision: Default::default(),
-            review_requested_from_owner: Default::default(),
-            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, at),
-            head_sha: flotilla_resources::Observation::unknown(at),
-            checks: flotilla_resources::Observation::unknown(at),
-            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: flotilla_resources::Observation::unknown(at) },
-            mergeable: flotilla_resources::Observation::unknown(at),
-        })
+        .update_status(
+            &name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, at),
+                head_sha: flotilla_resources::Observation::unknown(at),
+                checks: flotilla_resources::Observation::unknown(at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::unknown(at),
+                },
+                mergeable: flotilla_resources::Observation::unknown(at),
+            },
+        )
         .await
         .expect("observed status");
     assert_eq!(
@@ -2399,14 +2437,17 @@ async fn exercise_existing_pr_admission(continuing: bool) {
 async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
     let provider = Arc::new(FakeChangeRequest::new());
     provider
-        .add_change_requests(vec![("42".to_string(), ChangeRequest {
-            title: "Keep landing human-owned".to_string(),
-            branch: "stack/fork-fix".to_string(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            body: None,
-            provider_name: "fake-cr".to_string(),
-            provider_display_name: "Fake PRs".to_string(),
-        })])
+        .add_change_requests(vec![(
+            "42".to_string(),
+            ChangeRequest {
+                title: "Keep landing human-owned".to_string(),
+                branch: "stack/fork-fix".to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "fake-cr".to_string(),
+                provider_display_name: "Fake PRs".to_string(),
+            },
+        )])
         .await;
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_change_request(provider.clone() as Arc<dyn ChangeRequestTracker>),
@@ -2435,9 +2476,12 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
         .await
         .expect("dispatch merge command");
 
-    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Error {
-        message: "merging change request 42 is forbidden for fork-stance repository; landing is human-only".to_string(),
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, command_id).await,
+        CommandValue::Error {
+            message: "merging change request 42 is forbidden for fork-stance repository; landing is human-only".to_string(),
+        }
+    );
     let (_, request) = provider.get_change_request("42").await.expect("change request should remain available");
     assert_eq!(request.status, flotilla_protocol::ChangeRequestStatus::Open);
 }
@@ -2452,23 +2496,30 @@ async fn create_test_host_direct_policy(
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts.create(&InputMeta::builder().name(host_ref.to_string()).build(), &HostSpec::default()).await.expect("host create");
     hosts
-        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            fulfilment_facts: BTreeMap::from([(policy_name.to_string(), FulfilmentFacts {
-                harnesses: agent_adapters
-                    .iter()
-                    .filter(|adapter| adapter.as_str() == "codex")
-                    .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
-                    .collect(),
-                ..Default::default()
-            })]),
-            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
-            heartbeat_at: Some(chrono::Utc::now()),
-            ready: true,
-            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-            resource_store: None,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                fulfilment_facts: BTreeMap::from([(
+                    policy_name.to_string(),
+                    FulfilmentFacts {
+                        harnesses: agent_adapters
+                            .iter()
+                            .filter(|adapter| adapter.as_str() == "codex")
+                            .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
+                            .collect(),
+                        ..Default::default()
+                    },
+                )]),
+                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
+                heartbeat_at: Some(chrono::Utc::now()),
+                ready: true,
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+                resource_store: None,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("host status update");
     let policy = PlacementPolicySpec::builder()
@@ -2879,12 +2930,15 @@ async fn implement_review_admission_shares_a_vessel_with_different_resolved_skil
     create_test_convoy_project(&backend, None).await;
     backend
         .definitions::<CrewDefaults>("flotilla")
-        .apply(&InputMeta::builder().name("fleet".into()).build(), &CrewDefaultsSpec {
-            project_ref: None,
-            default_workflow_ref: None,
-            roles: BTreeMap::new(),
-            skills: BTreeMap::from([("coder".into(), vec!["implement".into()]), ("reviewer".into(), vec!["review".into()])]),
-        })
+        .apply(
+            &InputMeta::builder().name("fleet".into()).build(),
+            &CrewDefaultsSpec {
+                project_ref: None,
+                default_workflow_ref: None,
+                roles: BTreeMap::new(),
+                skills: BTreeMap::from([("coder".into(), vec!["implement".into()]), ("reviewer".into(), vec!["review".into()])]),
+            },
+        )
         .await
         .expect("defaults");
     let crew = |role: &str| {
@@ -2935,12 +2989,15 @@ async fn implement_review_admission_shares_a_vessel_with_different_resolved_skil
     // Different grants remain an isolation criterion even with crew-local skills.
     backend
         .definitions::<CredentialSpec>("flotilla")
-        .create(&InputMeta::builder().name("coder-gh".into()).build(), &CredentialSpecSpec {
-            consumer: CredentialConsumer::Gh,
-            source: CredentialSource::Env { name: "TEST_CODER_TOKEN".into() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &InputMeta::builder().name("coder-gh".into()).build(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "TEST_CODER_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("credential");
     backend
@@ -3153,10 +3210,13 @@ async fn codex_admission_refuses_old_host_and_explains_version_gap() {
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("old-host").await.expect("host");
     let mut status = host.status.expect("status");
-    status.fulfilment_facts.insert("old-codex".into(), FulfilmentFacts {
-        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.154.0".into(), models: BTreeMap::new() })]),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "old-codex".into(),
+        FulfilmentFacts {
+            harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.154.0".into(), models: BTreeMap::new() })]),
+            ..Default::default()
+        },
+    );
     hosts.update_status("old-host", &host.metadata.resource_version, &status).await.expect("probe facts");
     let result = start_capability_convoy(&daemon, "codex-version", |_| {}).await;
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
@@ -3184,12 +3244,15 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
-            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &InputMeta::builder().name("claude-max".to_string()).build(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("Claude credential");
     backend
@@ -3207,28 +3270,40 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts.get("direct-model").await.expect("model host");
     let mut status = host.status.expect("host status");
-    status.fulfilment_facts.insert("host-direct-model".to_string(), FulfilmentFacts {
-        harnesses: BTreeMap::from([("claude-code".to_string(), HarnessFacts {
-            version: "2.1.300".to_string(),
-            models: BTreeMap::from([
-                ("preview".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe }),
-                ("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
-                ("mixed".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
-            ]),
-        })]),
-        observed_at: chrono::Utc::now(),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "host-direct-model".to_string(),
+        FulfilmentFacts {
+            harnesses: BTreeMap::from([(
+                "claude-code".to_string(),
+                HarnessFacts {
+                    version: "2.1.300".to_string(),
+                    models: BTreeMap::from([
+                        ("preview".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe }),
+                        ("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
+                        ("mixed".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
+                    ]),
+                },
+            )]),
+            observed_at: chrono::Utc::now(),
+            ..Default::default()
+        },
+    );
     // A second observed harness that rejects `unavailable` but has no verdict
     // on `mixed`, so `mixed` is rejected by only some observed harnesses.
-    status.fulfilment_facts.insert("unprobed-model-kind".to_string(), FulfilmentFacts {
-        harnesses: BTreeMap::from([("claude-code".to_string(), HarnessFacts {
-            version: "2.1.300".to_string(),
-            models: BTreeMap::from([("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe })]),
-        })]),
-        observed_at: chrono::Utc::now(),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "unprobed-model-kind".to_string(),
+        FulfilmentFacts {
+            harnesses: BTreeMap::from([(
+                "claude-code".to_string(),
+                HarnessFacts {
+                    version: "2.1.300".to_string(),
+                    models: BTreeMap::from([("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe })]),
+                },
+            )]),
+            observed_at: chrono::Utc::now(),
+            ..Default::default()
+        },
+    );
     status.capabilities.insert(HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"]));
     hosts.update_status("direct-model", &host.metadata.resource_version, &status).await.expect("publish model facts");
 
@@ -3350,28 +3425,31 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project create");
     create_test_host_direct_policy(&backend, "host-direct-a-empty", "empty-host", 200, BTreeSet::new()).await;
@@ -3488,28 +3566,31 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project create");
 
@@ -3593,10 +3674,13 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     .await
     .expect("legacy create command should finish");
 
-    assert_eq!(legacy_result, CommandValue::Error {
-        message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
-            .to_string()
-    });
+    assert_eq!(
+        legacy_result,
+        CommandValue::Error {
+            message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
+                .to_string()
+        }
+    );
     assert!(matches!(
         backend.using::<ResourceConvoy>("flotilla").get("missing-adapter-legacy").await,
         Err(flotilla_resources::ResourceError::NotFound { .. })
@@ -3626,28 +3710,31 @@ async fn convoy_start_accepts_project_list_identifier() {
     backend
         .clone()
         .definitions::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project create");
 
@@ -3693,11 +3780,10 @@ async fn convoy_start_accepts_project_list_identifier() {
             .await
             .expect("convoy start command accepted");
 
-        assert_eq!(recv_command_finished(&mut events, start_id).await, CommandValue::ConvoyStarted {
-            name: format!("{name}@flotilla"),
-            attach_plan: None,
-            binding: None
-        });
+        assert_eq!(
+            recv_command_finished(&mut events, start_id).await,
+            CommandValue::ConvoyStarted { name: format!("{name}@flotilla"), attach_plan: None, binding: None }
+        );
         let convoy = admitted_convoy(&backend, &name).await;
         assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
     }
@@ -3739,9 +3825,12 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
         .await
         .expect("convoy start command accepted");
 
-    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Error {
-        message: "project flotilla/missing is not ready: resource not found: missing (tried flotilla/missing)".into()
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, command_id).await,
+        CommandValue::Error {
+            message: "project flotilla/missing is not ready: resource not found: missing (tried flotilla/missing)".into()
+        }
+    );
 }
 
 #[tokio::test]
@@ -3789,41 +3878,44 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
-                .source(reference.source.clone())
-                .alias("planning".to_string())
-                .build()],
-            dispatch_policy: None,
-            repositories: vec![
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: repository.key(),
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: Some("main".into()),
-                },
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: secondary_repository.key(),
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: Some("main".into()),
-                },
-            ],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                    .source(reference.source.clone())
+                    .alias("planning".to_string())
+                    .build()],
+                dispatch_policy: None,
+                repositories: vec![
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: repository.key(),
+                        alias: None,
+                        roles: Default::default(),
+                        subpath: None,
+                        default_branch: Some("main".into()),
+                    },
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: secondary_repository.key(),
+                        alias: None,
+                        roles: Default::default(),
+                        subpath: None,
+                        default_branch: Some("main".into()),
+                    },
+                ],
+            },
+        )
         .await
         .expect("project create");
 
@@ -3982,9 +4074,10 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         )
         .await
         .expect("bare issue command accepted");
-    assert_eq!(recv_command_finished(&mut events, bare_id).await, CommandValue::Error {
-        message: "issue 732 requires an alias because project flotilla has 2 issue sources".into()
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, bare_id).await,
+        CommandValue::Error { message: "issue 732 requires an alias because project flotilla has 2 issue sources".into() }
+    );
 
     let default_id = daemon
         .execute(
@@ -4014,11 +4107,10 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         )
         .await
         .expect("default start command accepted");
-    assert_eq!(recv_command_finished(&mut events, default_id).await, CommandValue::ConvoyStarted {
-        name: "default-regard@flotilla".into(),
-        attach_plan: None,
-        binding: None
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, default_id).await,
+        CommandValue::ConvoyStarted { name: "default-regard@flotilla".into(), attach_plan: None, binding: None }
+    );
     let default_convoy = admitted_convoy(&backend, "default-regard").await;
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
     let regard = regards
@@ -4123,11 +4215,10 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("offline fallback should finish");
-    assert_eq!(fallback_result, CommandValue::ConvoyStarted {
-        name: "start-convoy-from-an-issue-732@flotilla".into(),
-        attach_plan: None,
-        binding: None,
-    });
+    assert_eq!(
+        fallback_result,
+        CommandValue::ConvoyStarted { name: "start-convoy-from-an-issue-732@flotilla".into(), attach_plan: None, binding: None }
+    );
     let fallback = admitted_convoy(&backend, "start-convoy-from-an-issue-732").await;
     assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
@@ -4135,28 +4226,31 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Explicit workflow".into(),
-            default_workflow_ref: "missing-default".into(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("explicit-workflow".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Explicit workflow".into(),
+                default_workflow_ref: "missing-default".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project with unresolved default should persist");
     let empty_bindings_project = daemon
@@ -4216,11 +4310,10 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("explicit workflow should not consult the missing default");
-    assert_eq!(explicit_result, CommandValue::ConvoyStarted {
-        name: "explicit-workflow@explicit-workflow".into(),
-        attach_plan: None,
-        binding: None,
-    });
+    assert_eq!(
+        explicit_result,
+        CommandValue::ConvoyStarted { name: "explicit-workflow@explicit-workflow".into(), attach_plan: None, binding: None }
+    );
 
     let wrong_namespace_id = daemon
         .execute(
@@ -4339,28 +4432,31 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     backend
         .clone()
         .using::<Project>("flotilla")
-        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent".into(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                charter_store: None,
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
-        })
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
         .await
         .expect("project create");
 
@@ -4432,11 +4528,10 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first admission");
-    assert_eq!(recv_command_finished(&mut events, first_id).await, CommandValue::ConvoyStarted {
-        name: "governor@flotilla".to_string(),
-        attach_plan: None,
-        binding: None,
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, first_id).await,
+        CommandValue::ConvoyStarted { name: "governor@flotilla".to_string(), attach_plan: None, binding: None }
+    );
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let first = convoys.list().await.expect("list first generation").items.pop().expect("first generation");
     assert!(first.metadata.name.starts_with("convoy-"));
@@ -4446,15 +4541,17 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     assert_eq!(first.metadata.labels.get(flotilla_resources::GENERATION_LABEL).map(String::as_str), Some("1"));
 
     let duplicate_id = daemon.execute(command.clone()).await.expect("duplicate admission result");
-    assert_eq!(recv_command_finished(&mut events, duplicate_id).await, CommandValue::Error {
-        message: "live convoy governor@flotilla generation 1 already exists".to_string(),
-    });
+    assert_eq!(
+        recv_command_finished(&mut events, duplicate_id).await,
+        CommandValue::Error { message: "live convoy governor@flotilla generation 1 already exists".to_string() }
+    );
 
     convoys
-        .update_status(&first.metadata.name, &first.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            &first.metadata.name,
+            &first.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("settle first generation");
     let second_id = daemon.execute(command).await.expect("second generation admission");
@@ -4502,10 +4599,11 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessi
         .await
         .expect("create pre-identity convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Landed,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+        )
         .await
         .expect("mark pre-identity convoy landed");
 
@@ -4559,16 +4657,19 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         .await
         .expect("create convoy");
     let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
-    status.work.insert("work".to_string(), WorkState {
-        phase: WorkPhase::Complete,
-        placement: Some(flotilla_resources::PlacementStatus {
-            fields: BTreeMap::from([(
-                "checkout_refs".to_string(),
-                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "merged-checkout".to_string())])),
-            )]),
-        }),
-        ..WorkState::builder().phase(WorkPhase::Complete).build()
-    });
+    status.work.insert(
+        "work".to_string(),
+        WorkState {
+            phase: WorkPhase::Complete,
+            placement: Some(flotilla_resources::PlacementStatus {
+                fields: BTreeMap::from([(
+                    "checkout_refs".to_string(),
+                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "merged-checkout".to_string())])),
+                )]),
+            }),
+            ..WorkState::builder().phase(WorkPhase::Complete).build()
+        },
+    );
     let convoy = convoys.update_status("merged-deleted-branch", &convoy.metadata.resource_version, &status).await.expect("mark landed");
     let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
     let checkout = checkouts
@@ -4607,10 +4708,11 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         ..Default::default()
     };
     let checkout = checkouts
-        .update_status("merged-checkout", &checkout.metadata.resource_version, &flotilla_resources::CheckoutStatus {
-            integration,
-            ..Default::default()
-        })
+        .update_status(
+            "merged-checkout",
+            &checkout.metadata.resource_version,
+            &flotilla_resources::CheckoutStatus { integration, ..Default::default() },
+        )
         .await
         .expect("publish integration observation");
 
@@ -4684,16 +4786,19 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
         flotilla_resources::SubjectDiscoverySource::Claim,
         chrono::Utc::now(),
     );
-    status.work.insert("work".to_string(), WorkState {
-        phase: WorkPhase::Complete,
-        placement: Some(flotilla_resources::PlacementStatus {
-            fields: BTreeMap::from([(
-                "checkout_refs".to_string(),
-                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "missing-status".to_string())])),
-            )]),
-        }),
-        ..WorkState::builder().phase(WorkPhase::Complete).build()
-    });
+    status.work.insert(
+        "work".to_string(),
+        WorkState {
+            phase: WorkPhase::Complete,
+            placement: Some(flotilla_resources::PlacementStatus {
+                fields: BTreeMap::from([(
+                    "checkout_refs".to_string(),
+                    serde_json::json!(BTreeMap::from([(repo_ref.clone(), "missing-status".to_string())])),
+                )]),
+            }),
+            ..WorkState::builder().phase(WorkPhase::Complete).build()
+        },
+    );
     let convoy = convoys.update_status("landed-missing-status", &convoy.metadata.resource_version, &status).await.expect("mark landed");
     let checkout = backend
         .clone()
@@ -4731,19 +4836,23 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
     assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&checkout), false).await.is_err());
     let now = chrono::Utc::now();
     changes
-        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-            title: Default::default(),
-            author: Default::default(),
-            review_decision: Default::default(),
-            review_requested_from_owner: Default::default(),
-            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, now),
-            head_sha: flotilla_resources::Observation::known("abc".to_string(), now),
-            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, now),
-            review: flotilla_resources::ChangeRequestReviewObservation {
-                actionable_at_head: flotilla_resources::Observation::known(false, now),
+        .update_status(
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, now),
+                head_sha: flotilla_resources::Observation::known("abc".to_string(), now),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, now),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, now),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
             },
-            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
-        })
+        )
         .await
         .expect("mark change request merged");
 
@@ -5066,16 +5175,19 @@ async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &s
 
 fn checkout_state_for_repo(repo: &Path, branch: &str) -> Arc<std::sync::RwLock<FakeVcsState>> {
     FakeVcsState::builder(repo.to_path_buf())
-        .checkout_raw(repo.join(branch), Checkout {
-            branch: branch.into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            host_name: None,
-            environment_id: None,
-        })
+        .checkout_raw(
+            repo.join(branch),
+            Checkout {
+                branch: branch.into(),
+                is_main: false,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                host_name: None,
+                environment_id: None,
+            },
+        )
         .build()
 }
 
@@ -6072,11 +6184,15 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
         )
         .await
         .expect("create standing convoy");
-    apply_status_patch(&convoys, "standing-convoy", &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
-        phase: ConvoyPhase::Active,
-        started_at: Some(chrono::Utc::now()),
-        finished_at: None,
-    })
+    apply_status_patch(
+        &convoys,
+        "standing-convoy",
+        &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
+            phase: ConvoyPhase::Active,
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+        },
+    )
     .await
     .expect("mark convoy active");
 
@@ -6094,15 +6210,19 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
         )
         .await
         .expect("create terminal session");
-    apply_status_patch(&terminals, "standing-cleat-session", &TerminalSessionStatusPatch::MarkRunning {
-        configured_limits: None,
-        session_id: "cleat-standing".to_string(),
-        pid: None,
-        started_at: chrono::Utc::now(),
-        crew: None,
-        launch_command: "cleat attach standing".to_string(),
-        delivered_message_id: None,
-    })
+    apply_status_patch(
+        &terminals,
+        "standing-cleat-session",
+        &TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
+            session_id: "cleat-standing".to_string(),
+            pid: None,
+            started_at: chrono::Utc::now(),
+            crew: None,
+            launch_command: "cleat attach standing".to_string(),
+            delivered_message_id: None,
+        },
+    )
     .await
     .expect("mark terminal running");
 
@@ -6279,38 +6399,41 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     let other = RepositorySpec::remote("https://github.com/owner/other").expect("other repository spec");
     let projects = daemon.resource_backend().using::<Project>("flotilla");
     projects
-        .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "repo suite".to_string(),
-            default_workflow_ref: "single-agent".to_string(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: tracked.key(),
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: None,
-                },
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: other.key(),
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: None,
-                },
-            ],
-        })
+        .create(
+            &InputMeta::builder().name("repo".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "repo suite".to_string(),
+                default_workflow_ref: "single-agent".to_string(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: tracked.key(),
+                        alias: None,
+                        roles: Default::default(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: other.key(),
+                        alias: None,
+                        roles: Default::default(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                ],
+            },
+        )
         .await
         .expect("generated-name occupant should be creatable");
 
@@ -6536,46 +6659,49 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     }
     let projects = daemon.resource_backend().definitions::<Project>("flotilla");
     projects
-        .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "ghostty".to_string(),
-            default_workflow_ref: "single-agent".to_string(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: front.key(),
-                    alias: None,
-                    roles: [ProjectRepositoryRole::Code].into(),
-                    subpath: None,
-                    default_branch: Some("main".to_string()),
-                },
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: ssh.key(),
-                    alias: None,
-                    roles: [ProjectRepositoryRole::Ops].into(),
-                    subpath: None,
-                    default_branch: Some("main".to_string()),
-                },
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: alias.key(),
-                    alias: None,
-                    roles: [ProjectRepositoryRole::Ops].into(),
-                    subpath: None,
-                    default_branch: Some("main".to_string()),
-                },
-            ],
-        })
+        .create(
+            &InputMeta::builder().name("ghostty".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "ghostty".to_string(),
+                default_workflow_ref: "single-agent".to_string(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: front.key(),
+                        alias: None,
+                        roles: [ProjectRepositoryRole::Code].into(),
+                        subpath: None,
+                        default_branch: Some("main".to_string()),
+                    },
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: ssh.key(),
+                        alias: None,
+                        roles: [ProjectRepositoryRole::Ops].into(),
+                        subpath: None,
+                        default_branch: Some("main".to_string()),
+                    },
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: alias.key(),
+                        alias: None,
+                        roles: [ProjectRepositoryRole::Ops].into(),
+                        subpath: None,
+                        default_branch: Some("main".to_string()),
+                    },
+                ],
+            },
+        )
         .await
         .expect("legacy project");
 
@@ -6641,10 +6767,10 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
             &CredentialGrantSpec::builder()
                 .selector(CredentialGrantSelector::builder().repositories(BTreeSet::from([front.key(), ssh.key()])).build())
                 .credentials(BTreeSet::new())
-                .landing_credentials(BTreeMap::from([("landing".to_string(), LandingCredentialScope::Branch {
-                    repository: front.key(),
-                    branch: "main".to_string(),
-                })]))
+                .landing_credentials(BTreeMap::from([(
+                    "landing".to_string(),
+                    LandingCredentialScope::Branch { repository: front.key(), branch: "main".to_string() },
+                )]))
                 .build(),
         )
         .await
@@ -6656,14 +6782,20 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get(&host_ref).await.expect("governor host");
     let mut status = host.status.expect("governor host status");
-    status.fulfilment_facts.insert("governor-host".to_string(), FulfilmentFacts {
-        harnesses: BTreeMap::from([("codex".to_string(), HarnessFacts {
-            version: "1.0.0".to_string(),
-            models: BTreeMap::from([("fable".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
-        })]),
-        observed_at: chrono::Utc::now(),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "governor-host".to_string(),
+        FulfilmentFacts {
+            harnesses: BTreeMap::from([(
+                "codex".to_string(),
+                HarnessFacts {
+                    version: "1.0.0".to_string(),
+                    models: BTreeMap::from([("fable".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
+                },
+            )]),
+            observed_at: chrono::Utc::now(),
+            ..Default::default()
+        },
+    );
     hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("publish governor model facts");
     daemon
         .install_convoy_ensure_reconciler(Arc::new(
@@ -6678,10 +6810,11 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     assert!(first.spec.repositories.iter().any(|repository| repository.repo_ref == alias.key()));
     let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
     convoys
-        .update_status(&first.metadata.name, &first.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            &first.metadata.name,
+            &first.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("first generation fails");
     daemon
@@ -6732,10 +6865,10 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     assert_eq!(scoped.spec.vessels[0].credential_scopes["landing"], BTreeSet::from([inspected.key()]));
     let grant = grants.get("legacy-grant").await.expect("migrated grant");
     assert_eq!(grant.spec.selector.repositories, BTreeSet::from([inspected.key()]));
-    assert_eq!(grant.spec.landing_credentials["landing"], LandingCredentialScope::Branch {
-        repository: inspected.key(),
-        branch: "main".to_string()
-    });
+    assert_eq!(
+        grant.spec.landing_credentials["landing"],
+        LandingCredentialScope::Branch { repository: inspected.key(), branch: "main".to_string() }
+    );
     assert_eq!(successor.spec.repositories[0].repo_ref, inspected.key());
 
     // #2159: refuse the overlapping declaration before it can poison namespace
@@ -6784,38 +6917,41 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
     daemon
         .resource_backend()
         .definitions::<Project>("flotilla")
-        .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
-            charter: None,
-            role_definitions: BTreeMap::new(),
-            charter_prose: BTreeMap::new(),
-            parent: None,
-            platform_matrix: Vec::new(),
-            role_needs: Default::default(),
-            skills: BTreeMap::new(),
-            display_name: "ghostty".to_string(),
-            default_workflow_ref: "single-agent".to_string(),
-            supervision: None,
-            issue_source_bindings: Vec::new(),
-            dispatch_policy: None,
-            repositories: vec![
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: front.key(),
-                    alias: Some("front".to_string()),
-                    roles: [ProjectRepositoryRole::Code].into(),
-                    subpath: None,
-                    default_branch: None,
-                },
-                ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: ssh.key(),
-                    alias: Some("ssh".to_string()),
-                    roles: [ProjectRepositoryRole::Ops].into(),
-                    subpath: None,
-                    default_branch: None,
-                },
-            ],
-        })
+        .create(
+            &InputMeta::builder().name("ghostty".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "ghostty".to_string(),
+                default_workflow_ref: "single-agent".to_string(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: front.key(),
+                        alias: Some("front".to_string()),
+                        roles: [ProjectRepositoryRole::Code].into(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                    ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: ssh.key(),
+                        alias: Some("ssh".to_string()),
+                        roles: [ProjectRepositoryRole::Ops].into(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                ],
+            },
+        )
         .await
         .expect("legacy project");
 
@@ -7962,9 +8098,11 @@ hostname = "buildbox.example"
     );
 
     let terminal_pool: Arc<dyn TerminalPool> = Arc::new(FakeTerminalPool::new());
-    let mut discovery = static_ssh_test_discovery_with_env_and_detectors(ssh_runner, Arc::new(TestEnvVars::default()), vec![Box::new(
-        RunnerEchoHostDetector { probe: "ENABLE_REMOTE_TERMINALS", assertion_key: "ENABLE_REMOTE_TERMINALS" },
-    )]);
+    let mut discovery = static_ssh_test_discovery_with_env_and_detectors(
+        ssh_runner,
+        Arc::new(TestEnvVars::default()),
+        vec![Box::new(RunnerEchoHostDetector { probe: "ENABLE_REMOTE_TERMINALS", assertion_key: "ENABLE_REMOTE_TERMINALS" })],
+    );
     discovery
         .factories
         .terminal_pools
@@ -8062,12 +8200,15 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     authority
         .resource_backend()
         .using::<flotilla_resources::Vessel>("flotilla")
-        .create(&InputMeta::builder().name("work-vessel".to_string()).build(), &flotilla_resources::VesselSpec {
-            convoy_ref: "handoff-convoy".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "host-direct".to_string(),
-            adopted_checkout_refs: Default::default(),
-        })
+        .create(
+            &InputMeta::builder().name("work-vessel".to_string()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "handoff-convoy".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "host-direct".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
         .await
         .expect("create vessel");
     let session_name = |role: &str, index| {
@@ -8202,17 +8343,21 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .await
         .expect("create convoy");
     convoys
-        .update_status("split-convoy", &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([(
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Stalled).build(),
+        .update_status(
+            "split-convoy",
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Stalled).build(),
+                    )]),
                 )]),
-            )]),
-            ..Default::default()
-        })
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark stalled crew work");
     let sessions = terminal_host.resource_backend().using::<TerminalSession>("flotilla");
@@ -8294,17 +8439,21 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
         .await
         .expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([(
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
                 )]),
-            )]),
-            ..Default::default()
-        })
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark crew working");
 
@@ -8339,11 +8488,15 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     assert_eq!(withdrawn.as_deref(), Some("Use the newer instruction"));
     assert!(convoys.get("busy-convoy").await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
 
-    apply_status_patch(&convoys, "busy-convoy", &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
-        phase: ConvoyPhase::Landed,
-        started_at: None,
-        finished_at: Some(chrono::Utc::now()),
-    })
+    apply_status_patch(
+        &convoys,
+        "busy-convoy",
+        &flotilla_resources::ConvoyStatusPatch::RollUpPhase {
+            phase: ConvoyPhase::Landed,
+            started_at: None,
+            finished_at: Some(chrono::Utc::now()),
+        },
+    )
     .await
     .expect("mark convoy terminal");
     let error = daemon
@@ -8365,23 +8518,25 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     backend
         .clone()
         .using::<ResourceHost>("flotilla")
-        .create(&InputMeta::builder().name(local_host_ref.clone()).build(), &HostSpec {
-            display_name: daemon.host_name().to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &InputMeta::builder().name(local_host_ref.clone()).build(),
+            &HostSpec { display_name: daemon.host_name().to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("create local host resource");
     backend
         .clone()
         .using::<flotilla_resources::Environment>("flotilla")
-        .create(&InputMeta::builder().name("idle-environment".to_string()).build(), &flotilla_resources::EnvironmentSpec {
-            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
-                host_ref: local_host_ref,
-                repo_default_dir: "/workspace".to_string(),
-            }),
-            docker: None,
-        })
+        .create(
+            &InputMeta::builder().name("idle-environment".to_string()).build(),
+            &flotilla_resources::EnvironmentSpec {
+                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                    host_ref: local_host_ref,
+                    repo_default_dir: "/workspace".to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("create idle crew environment");
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -8393,26 +8548,30 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .await
         .expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            crew_work: BTreeMap::from([
-                (
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
-                    )]),
-                ),
-                (
-                    "review".to_string(),
-                    BTreeMap::from([(
-                        "qa".to_string(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
-                    )]),
-                ),
-            ]),
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                crew_work: BTreeMap::from([
+                    (
+                        "work".to_string(),
+                        BTreeMap::from([(
+                            "coder".to_string(),
+                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                        )]),
+                    ),
+                    (
+                        "review".to_string(),
+                        BTreeMap::from([(
+                            "qa".to_string(),
+                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
+                        )]),
+                    ),
+                ]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark crew working");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -8451,16 +8610,20 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .await
         .expect("create idle crew session");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("idle-coder".to_string()),
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                as_of: chrono::Utc::now() - chrono::Duration::minutes(2),
-                source: TerminalAttentionSource::Screen,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("idle-coder".to_string()),
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    as_of: chrono::Utc::now() - chrono::Duration::minutes(2),
+                    source: TerminalAttentionSource::Screen,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("observe working crew session");
     let review_session = sessions
@@ -8498,11 +8661,15 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .await
         .expect("create review crew session");
     sessions
-        .update_status(&review_session.metadata.name, &review_session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("idle-review".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &review_session.metadata.name,
+            &review_session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("idle-review".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark review crew session running");
 
@@ -8520,13 +8687,17 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
     let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
     assert_eq!(first.spec.body, "Finish the current turn");
-    apply_status_patch(&sessions, "idle-coder-session", &TerminalSessionStatusPatch::ObserveAttention {
-        attention: TerminalAttention {
-            state: TerminalAttentionState::Idle,
-            as_of: chrono::Utc::now() - chrono::Duration::minutes(1),
-            source: TerminalAttentionSource::Screen,
+    apply_status_patch(
+        &sessions,
+        "idle-coder-session",
+        &TerminalSessionStatusPatch::ObserveAttention {
+            attention: TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: chrono::Utc::now() - chrono::Duration::minutes(1),
+                source: TerminalAttentionSource::Screen,
+            },
         },
-    })
+    )
     .await
     .expect("observe idle crew session");
 
@@ -8590,29 +8761,36 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
         .await
         .expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([(
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
                 )]),
-            )]),
-            ..Default::default()
-        })
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark crew working");
     backend
         .clone()
         .using::<flotilla_resources::Vessel>("flotilla")
-        .create(&InputMeta::builder().name("work-vessel".to_string()).build(), &flotilla_resources::VesselSpec {
-            convoy_ref: "turn-boundary".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "test".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &InputMeta::builder().name("work-vessel".to_string()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "turn-boundary".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("create vessel");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -8758,18 +8936,22 @@ async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
         .await
         .expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([(
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
                 )]),
-            )]),
-            ..Default::default()
-        })
+                ..Default::default()
+            },
+        )
         .await
         .expect("record unclaimed work");
     let result = daemon
@@ -8800,37 +8982,44 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         .await
         .expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([(
-                    "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &flotilla_resources::ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
                 )]),
-            )]),
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: flotilla_resources::interactive_single_workflow_spec().vessels,
-            }),
-            ..Default::default()
-        })
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: flotilla_resources::interactive_single_workflow_spec().vessels,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark crew working");
     backend
         .clone()
         .using::<flotilla_resources::Vessel>("flotilla")
-        .create(&InputMeta::builder().name("missing-ledger-vessel".to_string()).build(), &flotilla_resources::VesselSpec {
-            convoy_ref: "missing-ledger".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "test".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &InputMeta::builder().name("missing-ledger-vessel".to_string()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "missing-ledger".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("create vessel");
 
@@ -8941,14 +9130,17 @@ fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
         let temp = tempfile::tempdir().expect("test config");
         let provider = Arc::new(FakeChangeRequest::new());
         provider
-            .add_change_requests(vec![("55".into(), ChangeRequest {
-                title: "Identity".into(),
-                branch: "feature".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: Some("Existing body".into()),
-                provider_name: "fake".into(),
-                provider_display_name: "Fake".into(),
-            })])
+            .add_change_requests(vec![(
+                "55".into(),
+                ChangeRequest {
+                    title: "Identity".into(),
+                    branch: "feature".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    body: Some("Existing body".into()),
+                    provider_name: "fake".into(),
+                    provider_display_name: "Fake".into(),
+                },
+            )])
             .await;
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider.clone()));
         let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;

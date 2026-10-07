@@ -48,10 +48,10 @@ fn landing_credentials_are_absent_before_approval_and_both_scopings_stage_after(
         claim(),
     );
     let credentials = BTreeMap::from([
-        ("branch-push".to_string(), LandingCredentialScope::Branch {
-            repository: RepositoryKey("github.com-org-repo".to_string()),
-            branch: "topic".to_string(),
-        }),
+        (
+            "branch-push".to_string(),
+            LandingCredentialScope::Branch { repository: RepositoryKey("github.com-org-repo".to_string()), branch: "topic".to_string() },
+        ),
         ("temporal-push".to_string(), LandingCredentialScope::TemporalOnly),
     ]);
     let mut vessel = VesselStatus::default();
@@ -86,9 +86,10 @@ fn stale_approval_never_stages_and_refusal_preserves_the_reason() {
                 .build(),
         )
         .build();
-    assert_eq!(evaluate_landing_gate(&spec, Some(&refused), "sha256:reviewed-head", &BTreeMap::new()), LandingGateDecision::Refused {
-        reason: "review evidence is incomplete".to_string()
-    });
+    assert_eq!(
+        evaluate_landing_gate(&spec, Some(&refused), "sha256:reviewed-head", &BTreeMap::new()),
+        LandingGateDecision::Refused { reason: "review evidence is incomplete".to_string() }
+    );
 }
 
 #[test]
@@ -99,7 +100,8 @@ fn acknowledged_gate_is_terminal_and_does_not_wait_forever() {
         claim(),
     );
     let acknowledged = DemandStatus::builder().state(DemandState::Acknowledged).build();
-    assert_eq!(evaluate_landing_gate(&spec, Some(&acknowledged), "sha256:reviewed-head", &BTreeMap::new()), LandingGateDecision::Refused {
-        reason: "landing approval was dismissed".to_string()
-    });
+    assert_eq!(
+        evaluate_landing_gate(&spec, Some(&acknowledged), "sha256:reviewed-head", &BTreeMap::new()),
+        LandingGateDecision::Refused { reason: "landing approval was dismissed".to_string() }
+    );
 }

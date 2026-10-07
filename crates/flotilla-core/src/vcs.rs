@@ -603,16 +603,19 @@ pub struct EnumeratedCheckout {
 impl EnumeratedCheckout {
     /// Adapt identity facts for consumers of provider data without inventing enrichment.
     pub fn into_provider_checkout(self) -> (ExecutionEnvironmentPath, Checkout) {
-        (self.path, Checkout {
-            branch: self.git_ref,
-            is_main: self.is_main,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            host_name: None,
-            environment_id: None,
-        })
+        (
+            self.path,
+            Checkout {
+                branch: self.git_ref,
+                is_main: self.is_main,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                host_name: None,
+                environment_id: None,
+            },
+        )
     }
 }
 
@@ -2310,16 +2313,10 @@ mod tests {
 
             let backend = GitCliBackend::checkout_root(&target, &*runner);
             assert_eq!(backend.head_upstream().await.expect("upstream").stdout.trim(), "origin/continued");
-            git(&target, &[
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@example.com",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "replacement crew",
-            ]);
+            git(
+                &target,
+                &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "replacement crew"],
+            );
             git(&target, &["push"]);
             let pushed = backend.head_commit_text().await.expect("pushed tip");
             let remote_tip = backend.remote_heads("origin", "refs/heads/continued").await.expect("remote tip");
@@ -2448,14 +2445,10 @@ mod tests {
             git(&source, &["commit", "-am", "advance remote main"]);
             git(&source, &["push", "origin", "main"]);
             git(&host_clone, &["fetch", "origin", "main"]);
-            git(&host_clone, &[
-                "worktree",
-                "add",
-                "-b",
-                "untouched",
-                root.join("checkout").to_str().expect("checkout path"),
-                "origin/main",
-            ]);
+            git(
+                &host_clone,
+                &["worktree", "add", "-b", "untouched", root.join("checkout").to_str().expect("checkout path"), "origin/main"],
+            );
 
             let checkout = root.join("checkout");
             let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
@@ -2993,9 +2986,10 @@ mod tests {
             vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Release)
                 .await
                 .expect("release through path alias");
-            vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Protect {
-                reason: "flotilla-managed: convoy/work",
-            })
+            vcs.checkout_registration(
+                aliased_target.to_str().expect("aliased path"),
+                CheckoutRegistration::Protect { reason: "flotilla-managed: convoy/work" },
+            )
             .await
             .expect("protect through path alias");
             assert!(admin.join("locked").exists(), "path aliases preserve protection");

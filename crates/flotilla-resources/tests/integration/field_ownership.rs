@@ -40,20 +40,23 @@ fn placement_policy_declares_every_spec_leaf_and_no_status_fields() {
         .iter()
         .map(|ownership| (ownership.field, ownership.owner))
         .collect::<Vec<_>>();
-    assert_eq!(declared, vec![
-        ("spec.pool", WriterRole::ReconcileLoop),
-        ("spec.priority", WriterRole::Operator),
-        ("spec.host_direct", WriterRole::ReconcileLoop),
-        ("spec.docker_per_vessel", WriterRole::ReconcileLoop),
-        ("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
-        ("spec.docker_per_vessel.image", WriterRole::Operator),
-        ("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
-        ("spec.docker_per_vessel.memory_policy", WriterRole::Operator),
-        ("spec.docker_per_vessel.agent_adapters", WriterRole::Operator),
-        ("spec.docker_per_vessel.default_cwd", WriterRole::Operator),
-        ("spec.docker_per_vessel.env", WriterRole::Operator),
-        ("spec.docker_per_vessel.checkout", WriterRole::ReconcileLoop),
-    ]);
+    assert_eq!(
+        declared,
+        vec![
+            ("spec.pool", WriterRole::ReconcileLoop),
+            ("spec.priority", WriterRole::Operator),
+            ("spec.host_direct", WriterRole::ReconcileLoop),
+            ("spec.docker_per_vessel", WriterRole::ReconcileLoop),
+            ("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
+            ("spec.docker_per_vessel.image", WriterRole::Operator),
+            ("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
+            ("spec.docker_per_vessel.memory_policy", WriterRole::Operator),
+            ("spec.docker_per_vessel.agent_adapters", WriterRole::Operator),
+            ("spec.docker_per_vessel.default_cwd", WriterRole::Operator),
+            ("spec.docker_per_vessel.env", WriterRole::Operator),
+            ("spec.docker_per_vessel.checkout", WriterRole::ReconcileLoop),
+        ]
+    );
     assert!(declared.iter().all(|(field, _)| !field.starts_with("status.")), "PlacementPolicy has no status fields");
 }
 

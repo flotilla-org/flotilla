@@ -328,14 +328,17 @@ impl SshTransport {
             .await
             .map_err(|e| format!("failed to connect to forwarded socket {}: {e}", self.local_socket_path.display()))?;
 
-        flotilla_protocol::framing::write_message_line(&mut stream, &Message::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            node_id: self.local_node_id.clone(),
-            display_name: self.local_display_name.clone(),
-            session_id: self.local_session_id,
-            connection_role: None,
-            surface: None,
-        })
+        flotilla_protocol::framing::write_message_line(
+            &mut stream,
+            &Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                node_id: self.local_node_id.clone(),
+                display_name: self.local_display_name.clone(),
+                session_id: self.local_session_id,
+                connection_role: None,
+                surface: None,
+            },
+        )
         .await?;
 
         let (read_half, write_half) = stream.into_split();
@@ -1010,25 +1013,28 @@ mod tests {
         assert_eq!(commands[1].args[4], format!("sh -c {}", shell_quote(&transport.remote_cleanup_command())));
         let tunnel = runner.spawns().pop().expect("tunnel invocation");
         let (forward, reverse) = transport.resource_forward_specs();
-        assert_eq!(tunnel, RecordedCommand {
-            binary: "ssh".into(),
-            args: vec![
-                "-N".into(),
-                "-L".into(),
-                forward,
-                "-R".into(),
-                reverse,
-                "-o".into(),
-                "ExitOnForwardFailure=yes".into(),
-                "-o".into(),
-                "StreamLocalBindUnlink=yes".into(),
-                "-o".into(),
-                "ServerAliveInterval=15".into(),
-                "-o".into(),
-                "ServerAliveCountMax=3".into(),
-                "peer-a.example.invalid".into(),
-            ],
-        });
+        assert_eq!(
+            tunnel,
+            RecordedCommand {
+                binary: "ssh".into(),
+                args: vec![
+                    "-N".into(),
+                    "-L".into(),
+                    forward,
+                    "-R".into(),
+                    reverse,
+                    "-o".into(),
+                    "ExitOnForwardFailure=yes".into(),
+                    "-o".into(),
+                    "StreamLocalBindUnlink=yes".into(),
+                    "-o".into(),
+                    "ServerAliveInterval=15".into(),
+                    "-o".into(),
+                    "ServerAliveCountMax=3".into(),
+                    "peer-a.example.invalid".into(),
+                ],
+            }
+        );
     }
 
     #[tokio::test]

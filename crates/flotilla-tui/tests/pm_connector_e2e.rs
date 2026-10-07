@@ -141,10 +141,11 @@ async fn seed(backend: &ResourceBackend, namespace: &str) -> ResourceObject<Chan
     let ensure = backend.using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.expect("local ensure version");
     backend
         .using::<ConvoyEnsure>(namespace)
-        .update_status("governor", &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some("attempt-1".into()),
-            ..Default::default()
-        })
+        .update_status(
+            "governor",
+            &ensure.metadata.resource_version,
+            &ConvoyEnsureStatus { convoy_ref: Some("attempt-1".into()), ..Default::default() },
+        )
         .await
         .expect("current attempt");
     let cr = backend
@@ -196,12 +197,17 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     let daemon =
         InProcessDaemon::new_with_resource_backend(vec![], config.clone(), fake_discovery(false), HostName::new("local"), backend.clone())
             .await;
-    let runtime = DaemonRuntime::start_with_options(daemon.clone(), config, None, RuntimeOptions {
-        start_controllers: false,
-        heartbeat_interval: Duration::from_secs(300),
-        controller_resync_interval: Duration::from_secs(300),
-        ..Default::default()
-    })
+    let runtime = DaemonRuntime::start_with_options(
+        daemon.clone(),
+        config,
+        None,
+        RuntimeOptions {
+            start_controllers: false,
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            ..Default::default()
+        },
+    )
     .await
     .expect("runtime");
     let query_state = daemon.aggregator_projection_state().await;
@@ -251,10 +257,11 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     let ensure = backend.using::<ConvoyEnsure>("flotilla").get("governor").await.expect("standing role version");
     backend
         .using::<ConvoyEnsure>("flotilla")
-        .update_status("governor", &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some("attempt-2".into()),
-            ..Default::default()
-        })
+        .update_status(
+            "governor",
+            &ensure.metadata.resource_version,
+            &ConvoyEnsureStatus { convoy_ref: Some("attempt-2".into()), ..Default::default() },
+        )
         .await
         .expect("new current attempt");
     wait("new current attempt", || {

@@ -489,15 +489,17 @@ mod tests {
         );
         assert_eq!(subjects.len(), 1);
         assert_eq!(subjects[0].internal().expect("internal reference"), "cr/lab/robert/project-map/12");
-        let subjects = change_request_subjects_from_claim("https://forge.example/team/other/repository/pulls/13", &repositories, &[
-            flotilla_resources::ForgeSpec::builder()
+        let subjects = change_request_subjects_from_claim(
+            "https://forge.example/team/other/repository/pulls/13",
+            &repositories,
+            &[flotilla_resources::ForgeSpec::builder()
                 .forge_id("lab".into())
                 .kind(flotilla_resources::ForgeKind::Forgejo)
                 .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
                 .https_url("https://forge.example/team".into())
                 .git_ssh_host("forge.example".into())
-                .build(),
-        ]);
+                .build()],
+        );
         assert!(subjects.is_empty(), "a claim cannot produce a PR in an unadmitted repository");
     }
 
@@ -655,12 +657,13 @@ mod tests {
         let pushed = inspect_pushed(&vcs, Some(&change_request), "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
-        assert_eq!(runner.calls(), vec![("git".to_string(), vec![
-            "merge-base".to_string(),
-            "--is-ancestor".to_string(),
-            "HEAD".to_string(),
-            "merged-head".to_string(),
-        ])]);
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "git".to_string(),
+                vec!["merge-base".to_string(), "--is-ancestor".to_string(), "HEAD".to_string(), "merged-head".to_string(),]
+            )]
+        );
     }
 
     #[tokio::test]
@@ -887,13 +890,16 @@ mod tests {
         assert_eq!(change_request.expect("bound change request should be observed").state, ChangeRequestState::Merged);
         assert_eq!(
             runner.calls()[1],
-            ("gh".to_string(), vec![
-                "pr".to_string(),
-                "view".to_string(),
-                "1071".to_string(),
-                "--json".to_string(),
-                "number,state,mergedAt,baseRefName,mergeable,headRefOid".to_string(),
-            ],)
+            (
+                "gh".to_string(),
+                vec![
+                    "pr".to_string(),
+                    "view".to_string(),
+                    "1071".to_string(),
+                    "--json".to_string(),
+                    "number,state,mergedAt,baseRefName,mergeable,headRefOid".to_string(),
+                ],
+            )
         );
     }
 

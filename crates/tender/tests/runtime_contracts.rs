@@ -275,12 +275,15 @@ async fn stored_v1_remains_decodable() {
         })
         .unwrap();
     let published = authority
-        .publish(&publisher, PublishRequest {
-            namespace: Namespace("n".into()),
-            name: "assigned".into(),
-            audience: BTreeSet::from([consumer.caller.clone()]),
-            reclaim: Some(PublicationId(1)),
-        })
+        .publish(
+            &publisher,
+            PublishRequest {
+                namespace: Namespace("n".into()),
+                name: "assigned".into(),
+                audience: BTreeSet::from([consumer.caller.clone()]),
+                reclaim: Some(PublicationId(1)),
+            },
+        )
         .await
         .unwrap();
     assert_eq!(published.lease.generation, 8);

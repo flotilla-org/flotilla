@@ -660,10 +660,10 @@ impl SqliteBackend {
         let observed_at = violation.observed_at.to_rfc3339();
         self.call("record field ownership violation", move |connection| {
             connection
-                .execute("INSERT INTO field_ownership_violations (body_json, observed_at) VALUES (?1, ?2)", rusqlite::params![
-                    body,
-                    observed_at
-                ])
+                .execute(
+                    "INSERT INTO field_ownership_violations (body_json, observed_at) VALUES (?1, ?2)",
+                    rusqlite::params![body, observed_at],
+                )
                 .map_err(|error| Self::map_sqlite(error, "record field ownership violation"))?;
             connection
                 .execute(
@@ -965,10 +965,13 @@ impl SqliteBackend {
                                 .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
                         });
                     match decoded {
-                        Ok((object, last_synced_at)) => items.push((origin_root.clone(), ReadResourceObject {
-                            object,
-                            provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
-                        })),
+                        Ok((object, last_synced_at)) => items.push((
+                            origin_root.clone(),
+                            ReadResourceObject {
+                                object,
+                                provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
+                            },
+                        )),
                         Err(error) => invalid_partitions.entry(origin_root).or_default().push((name, body, error)),
                     }
                 }
@@ -1290,12 +1293,11 @@ impl SqliteBackend {
             })
             .await?;
         for (kind, object) in events {
-            Self::notify_replica_watchers(&self.replica_watchers, &operation_key, StoredReplicaEvent {
-                origin_root: origin_root.clone(),
-                synced_at,
-                kind,
-                object,
-            });
+            Self::notify_replica_watchers(
+                &self.replica_watchers,
+                &operation_key,
+                StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind, object },
+            );
         }
         Ok(())
     }
@@ -1446,12 +1448,11 @@ impl SqliteBackend {
         if !changed {
             return Ok(());
         }
-        Self::notify_replica_watchers(&self.replica_watchers, &operation_key, StoredReplicaEvent {
-            origin_root: origin_root.clone(),
-            synced_at,
-            kind,
-            object: value,
-        });
+        Self::notify_replica_watchers(
+            &self.replica_watchers,
+            &operation_key,
+            StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind, object: value },
+        );
         Ok(())
     }
 
@@ -2419,10 +2420,10 @@ mod latency_tests {
 
         let repair = rusqlite::Connection::open(&path).expect("open independent writer");
         repair
-            .execute("UPDATE resource_objects SET body_json = ?1 WHERE kind = ?2 AND name = 'repaired'", rusqlite::params![
-                original_body,
-                Host::API_PATHS.kind
-            ])
+            .execute(
+                "UPDATE resource_objects SET body_json = ?1 WHERE kind = ?2 AND name = 'repaired'",
+                rusqlite::params![original_body, Host::API_PATHS.kind],
+            )
             .expect("repair row before queued cleanup");
         release_tx.send(()).expect("release writer");
         blocked_writer.await.expect("writer task");
@@ -2449,10 +2450,11 @@ mod latency_tests {
             let mut current = created;
             for iteration in 0..100 {
                 current = writers
-                    .update_status("feta", &current.metadata.resource_version, &HostStatus {
-                        ready: iteration % 2 == 0,
-                        ..Default::default()
-                    })
+                    .update_status(
+                        "feta",
+                        &current.metadata.resource_version,
+                        &HostStatus { ready: iteration % 2 == 0, ..Default::default() },
+                    )
                     .await
                     .expect("update status");
             }
@@ -2511,10 +2513,11 @@ mod tests {
         let path = dir.path().join("resources.sqlite");
         let backend = SqliteBackend::open(&path).expect("sqlite backend should open");
         backend
-            .create_typed::<Environment>("flotilla", &InputMeta::builder().name("contended".to_string()).build(), &EnvironmentSpec {
-                host_direct: None,
-                docker: None,
-            })
+            .create_typed::<Environment>(
+                "flotilla",
+                &InputMeta::builder().name("contended".to_string()).build(),
+                &EnvironmentSpec { host_direct: None, docker: None },
+            )
             .await
             .expect("create live resource");
 

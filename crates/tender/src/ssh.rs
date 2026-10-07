@@ -451,10 +451,13 @@ pub fn forwarding_arguments(
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
-        format!("StreamLocalBindUnlink={}", match existing_socket {
-            ExistingSocket::Unlink => "yes",
-            ExistingSocket::Refuse => "no",
-        }),
+        format!(
+            "StreamLocalBindUnlink={}",
+            match existing_socket {
+                ExistingSocket::Unlink => "yes",
+                ExistingSocket::Refuse => "no",
+            }
+        ),
         "-o".into(),
         "ServerAliveInterval=15".into(),
         "-o".into(),
@@ -913,12 +916,15 @@ mod tests {
             .expect("host policy");
         let session = Session { caller: caller.clone(), pinned_host: host.fingerprint(), via: None };
         let published = policy
-            .publish(&session, PublishRequest {
-                namespace: crate::Namespace("n".into()),
-                name: "service".into(),
-                audience: std::collections::BTreeSet::from([caller]),
-                reclaim: None,
-            })
+            .publish(
+                &session,
+                PublishRequest {
+                    namespace: crate::Namespace("n".into()),
+                    name: "service".into(),
+                    audience: std::collections::BTreeSet::from([caller]),
+                    reclaim: None,
+                },
+            )
             .await
             .expect("publish");
         let lease = published.lease;

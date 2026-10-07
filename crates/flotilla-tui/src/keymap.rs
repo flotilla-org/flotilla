@@ -223,11 +223,10 @@ impl Keymap {
     /// Build the default keymap from the flat binding table.
     pub fn defaults() -> Self {
         Self {
-            compiled: CompiledBindings::from_table_with_no_shared_fallback(BINDINGS, &[
-                BindingModeId::CommandPalette,
-                BindingModeId::FilePicker,
-                BindingModeId::Notifications,
-            ]),
+            compiled: CompiledBindings::from_table_with_no_shared_fallback(
+                BINDINGS,
+                &[BindingModeId::CommandPalette, BindingModeId::FilePicker, BindingModeId::Notifications],
+            ),
         }
     }
 
@@ -333,17 +332,20 @@ impl Keymap {
         // Define sections and their actions in display order.
         let section_defs: &[(&str, &[Action])] = &[
             ("Navigation", &[Action::SelectNext, Action::SelectPrev, Action::NextPanel, Action::PrevPanel]),
-            ("Actions", &[
-                Action::Confirm,
-                Action::OpenCommandPalette,
-                Action::OpenContextualPalette,
-                Action::OpenActionMenu,
-                Action::OpenFind,
-                Action::OpenFilePicker,
-                Action::Refresh,
-                Action::ToggleStatusBarKeys,
-                Action::ToggleNotifications,
-            ]),
+            (
+                "Actions",
+                &[
+                    Action::Confirm,
+                    Action::OpenCommandPalette,
+                    Action::OpenContextualPalette,
+                    Action::OpenActionMenu,
+                    Action::OpenFind,
+                    Action::OpenFilePicker,
+                    Action::Refresh,
+                    Action::ToggleStatusBarKeys,
+                    Action::ToggleNotifications,
+                ],
+            ),
             ("Multi-select (issues)", &[Action::ToggleMultiSelect]),
             ("Repos", &[Action::PrevTab, Action::NextTab, Action::MoveTabLeft, Action::MoveTabRight]),
             ("General", &[Action::ToggleDebug, Action::CycleTheme, Action::ToggleHelp, Action::Dismiss, Action::Quit]),

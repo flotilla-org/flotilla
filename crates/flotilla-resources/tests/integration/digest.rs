@@ -168,10 +168,11 @@ async fn quarantine_cannot_prove_authoritative_absence() {
     })
     .await
     .expect("cleanup completed");
-    for query in [DigestQuery::Root, DigestQuery::Children { expected_root: root.root.clone() }, DigestQuery::Snapshot {
-        expected_root: root.root.clone(),
-        bucket: 0,
-    }] {
+    for query in [
+        DigestQuery::Root,
+        DigestQuery::Children { expected_root: root.root.clone() },
+        DigestQuery::Snapshot { expected_root: root.root.clone(), bucket: 0 },
+    ] {
         let error = local.digest(&query).await.expect_err("quarantine refuses proof");
         assert!(error.to_string().contains("quarantined"));
     }

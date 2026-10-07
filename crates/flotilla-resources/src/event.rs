@@ -239,23 +239,26 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let convoy = backend
             .using::<Convoy>("flotilla")
-            .create(&InputMeta::builder().name("held-work".to_string()).build(), &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                workflow_ref: "work".to_string(),
-                role: "held-work".to_string(),
-                generation: 1,
-                dispatching_principal_ref: Default::default(),
-                inputs: Default::default(),
-                placement_policy: None,
-                repositories: Vec::new(),
-                r#ref: None,
-                project_ref: None,
-                adopted_checkout_refs: Default::default(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &InputMeta::builder().name("held-work".to_string()).build(),
+                &ConvoySpec {
+                    continuation: None,
+                    subjects: Vec::new(),
+                    workflow_ref: "work".to_string(),
+                    role: "held-work".to_string(),
+                    generation: 1,
+                    dispatching_principal_ref: Default::default(),
+                    inputs: Default::default(),
+                    placement_policy: None,
+                    repositories: Vec::new(),
+                    r#ref: None,
+                    project_ref: None,
+                    adopted_checkout_refs: Default::default(),
+                    issues: Vec::new(),
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("create convoy");
         let recorder = EventRecorder::with_ttl(backend.clone(), Duration::seconds(10));

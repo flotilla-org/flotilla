@@ -190,34 +190,34 @@ mod tests {
 
     #[test]
     fn host_status() {
-        assert_eq!(parse_and_resolve(&["host", "alpha", "status"]), Resolved::HostQuery {
-            subject: HostName::new("alpha"),
-            kind: HostQueryKind::Status
-        });
+        assert_eq!(
+            parse_and_resolve(&["host", "alpha", "status"]),
+            Resolved::HostQuery { subject: HostName::new("alpha"), kind: HostQueryKind::Status }
+        );
     }
 
     #[test]
     fn marked_subject_disambiguates_host_named_status() {
-        assert_eq!(parse_and_resolve(&["host", "@status", "status"]), Resolved::HostQuery {
-            subject: HostName::new("status"),
-            kind: HostQueryKind::Status,
-        });
+        assert_eq!(
+            parse_and_resolve(&["host", "@status", "status"]),
+            Resolved::HostQuery { subject: HostName::new("status"), kind: HostQueryKind::Status }
+        );
     }
 
     #[test]
     fn explicit_subject_preserves_host_beginning_with_marker() {
-        assert_eq!(parse_and_resolve(&["host", "--subject", "@status", "status"]), Resolved::HostQuery {
-            subject: HostName::new("@status"),
-            kind: HostQueryKind::Status,
-        });
+        assert_eq!(
+            parse_and_resolve(&["host", "--subject", "@status", "status"]),
+            Resolved::HostQuery { subject: HostName::new("@status"), kind: HostQueryKind::Status }
+        );
     }
 
     #[test]
     fn host_providers() {
-        assert_eq!(parse_and_resolve(&["host", "alpha", "providers"]), Resolved::HostQuery {
-            subject: HostName::new("alpha"),
-            kind: HostQueryKind::Providers
-        });
+        assert_eq!(
+            parse_and_resolve(&["host", "alpha", "providers"]),
+            Resolved::HostQuery { subject: HostName::new("alpha"), kind: HostQueryKind::Providers }
+        );
     }
 
     #[test]

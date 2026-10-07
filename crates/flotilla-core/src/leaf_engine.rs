@@ -829,11 +829,10 @@ impl LeafSubscriptionTable {
 
     async fn fire(&self, subscription_id: uuid::Uuid, mut fire: LeafFire) {
         fire.subscription_id = subscription_id;
-        self.inner.last_firings.lock().await.insert((subscription_id, fire.leaf.clone()), LeafFiringRecord {
-            leaf: fire.leaf.clone(),
-            value: fire.value.clone(),
-            fired_at: Utc::now(),
-        });
+        self.inner.last_firings.lock().await.insert(
+            (subscription_id, fire.leaf.clone()),
+            LeafFiringRecord { leaf: fire.leaf.clone(), value: fire.value.clone(), fired_at: Utc::now() },
+        );
         let watcher = self.inner.rows.lock().await.get(&subscription_id).map(|row| row.watcher.clone());
         match watcher {
             Some(LeafWatcher::WaitCaller { connection_id }) => {
@@ -871,16 +870,20 @@ impl LeafSubscriptionTable {
         let attempts = prior.map_or(1, |prior| prior.attempts.saturating_add(1));
         let delay = 5_i64.saturating_mul(1_i64 << attempts.saturating_sub(1).min(6)).min(300);
         let now = Utc::now();
-        flotilla_resources::apply_status_patch(&convoys, convoy, &flotilla_resources::ConvoyStatusPatch::FailTurnDelivery {
-            source: source.to_string(),
-            failure: flotilla_resources::TurnDeliveryFailure::builder()
-                .reason(error.reason.clone())
-                .failed_at(now)
-                .kind(error.kind)
-                .attempts(attempts)
-                .retry_at(now + chrono::Duration::seconds(delay))
-                .build(),
-        })
+        flotilla_resources::apply_status_patch(
+            &convoys,
+            convoy,
+            &flotilla_resources::ConvoyStatusPatch::FailTurnDelivery {
+                source: source.to_string(),
+                failure: flotilla_resources::TurnDeliveryFailure::builder()
+                    .reason(error.reason.clone())
+                    .failed_at(now)
+                    .kind(error.kind)
+                    .attempts(attempts)
+                    .retry_at(now + chrono::Duration::seconds(delay))
+                    .build(),
+            },
+        )
         .await
         .map_err(|error| error.to_string())?;
         if changed {
@@ -1080,10 +1083,13 @@ impl LeafSubscriptionTable {
                 )
             }
             LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
-                if matches!(&rule.on.subject, flotilla_resources::SubjectVariable::Artifact {
-                    about: flotilla_resources::ArtifactSubjectBinding::ChangeRequestHead,
-                    ..
-                }) {
+                if matches!(
+                    &rule.on.subject,
+                    flotilla_resources::SubjectVariable::Artifact {
+                        about: flotilla_resources::ArtifactSubjectBinding::ChangeRequestHead,
+                        ..
+                    }
+                ) {
                     let checkout_sources =
                         self.inner.backend.including_replicas::<Checkout>(&namespace).list().await.map_err(|error| error.to_string())?;
                     let checkouts = select_convoy_children(&convoy, &checkout_sources.items);
@@ -2039,11 +2045,10 @@ impl ReconcilerWake {
                 .and_then(|workflow| workflow.supervision.clone())
                 .or(project_policy)
                 .unwrap_or_else(|| {
-                    vec![SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() }, SupervisionTarget::ProjectCrew {
-                        convoy_role: "governor".into(),
-                        vessel: String::new(),
-                        role: "governor".into(),
-                    }]
+                    vec![
+                        SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
+                        SupervisionTarget::ProjectCrew { convoy_role: "governor".into(), vessel: String::new(), role: "governor".into() },
+                    ]
                 });
             // An exhausted cursor on a crew target is a legacy failed lookup,
             // not a consumed operator policy. Retry that target after one roll.
@@ -3287,23 +3292,26 @@ mod tests {
                 // The original firing need not remain eligible: health still follows receipts.
                 status.phase = ConvoyPhase::Interrupted;
                 status.stalled = None;
-                status.turn_deliveries.insert("review".into(), flotilla_resources::TurnDeliveryStatus {
-                    episodes: vec![TurnDeliveryEpisode {
-                        subject_revision: "head".into(),
-                        evidence_at: start,
-                        judged_claim_at: start,
-                        outcome: TurnDeliveryOutcome::Queued {
-                            rung,
-                            queued_at: start,
-                            vessel: "work".into(),
-                            role: "coder".into(),
-                            message_id: "turn".into(),
-                            blocking_reason: "initial".into(),
-                        },
-                        sender: Default::default(),
-                    }],
-                    ..Default::default()
-                });
+                status.turn_deliveries.insert(
+                    "review".into(),
+                    flotilla_resources::TurnDeliveryStatus {
+                        episodes: vec![TurnDeliveryEpisode {
+                            subject_revision: "head".into(),
+                            evidence_at: start,
+                            judged_claim_at: start,
+                            outcome: TurnDeliveryOutcome::Queued {
+                                rung,
+                                queued_at: start,
+                                vessel: "work".into(),
+                                role: "coder".into(),
+                                message_id: "turn".into(),
+                                blocking_reason: "initial".into(),
+                            },
+                            sender: Default::default(),
+                        }],
+                        ..Default::default()
+                    },
+                );
                 // Stored episodes, including their original age, survive daemon restoration.
                 let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
                 convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
@@ -3325,20 +3333,24 @@ mod tests {
                 let session =
                     sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
                 sessions
-                    .update_status("resumed-coder", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                        phase: TerminalSessionPhase::Running,
-                        attention: Some(TerminalAttention {
-                            state: [
-                                TerminalAttentionState::Unobservable,
-                                TerminalAttentionState::Working,
-                                TerminalAttentionState::Idle,
-                                TerminalAttentionState::NeedsInput,
-                            ][state],
-                            source: TerminalAttentionSource::Screen,
-                            as_of: now,
-                        }),
-                        ..Default::default()
-                    })
+                    .update_status(
+                        "resumed-coder",
+                        &session.metadata.resource_version,
+                        &flotilla_resources::TerminalSessionStatus {
+                            phase: TerminalSessionPhase::Running,
+                            attention: Some(TerminalAttention {
+                                state: [
+                                    TerminalAttentionState::Unobservable,
+                                    TerminalAttentionState::Working,
+                                    TerminalAttentionState::Idle,
+                                    TerminalAttentionState::NeedsInput,
+                                ][state],
+                                source: TerminalAttentionSource::Screen,
+                                as_of: now,
+                            }),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .unwrap();
                 for repeat in 0..2 {
@@ -3421,23 +3433,26 @@ mod tests {
         status.stalled = None;
         status.attention = None;
         for source in ["review", "checks"] {
-            status.turn_deliveries.insert(source.into(), flotilla_resources::TurnDeliveryStatus {
-                episodes: vec![TurnDeliveryEpisode {
-                    subject_revision: "head".into(),
-                    evidence_at: now,
-                    judged_claim_at: now,
-                    outcome: TurnDeliveryOutcome::Queued {
-                        rung: TurnDeliveryRung::WarmSession,
-                        queued_at: now - chrono::Duration::seconds(301),
-                        vessel: "work".into(),
-                        role: "coder".into(),
-                        message_id: source.into(),
-                        blocking_reason: "initial".into(),
-                    },
-                    sender: Default::default(),
-                }],
-                ..Default::default()
-            });
+            status.turn_deliveries.insert(
+                source.into(),
+                flotilla_resources::TurnDeliveryStatus {
+                    episodes: vec![TurnDeliveryEpisode {
+                        subject_revision: "head".into(),
+                        evidence_at: now,
+                        judged_claim_at: now,
+                        outcome: TurnDeliveryOutcome::Queued {
+                            rung: TurnDeliveryRung::WarmSession,
+                            queued_at: now - chrono::Duration::seconds(301),
+                            vessel: "work".into(),
+                            role: "coder".into(),
+                            message_id: source.into(),
+                            blocking_reason: "initial".into(),
+                        },
+                        sender: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+            );
         }
         let convoy = convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
         let mut watch = convoys.watch(WatchStart::Now).await.unwrap();
@@ -3511,18 +3526,22 @@ mod tests {
                 let sessions = backend.using::<TerminalSession>("flotilla");
                 let session = sessions.get("resumed-coder").await.expect("session");
                 sessions
-                    .update_status("resumed-coder", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                        phase: TerminalSessionPhase::Running,
-                        started_at: Some(start),
-                        crew: Some(
-                            flotilla_resources::CrewSessionStatus::builder()
-                                .id("crew".into())
-                                .adapter(if claude { "claude-code" } else { "codex" }.into())
-                                .stance("trusted-implicit".into())
-                                .build(),
-                        ),
-                        ..Default::default()
-                    })
+                    .update_status(
+                        "resumed-coder",
+                        &session.metadata.resource_version,
+                        &flotilla_resources::TerminalSessionStatus {
+                            phase: TerminalSessionPhase::Running,
+                            started_at: Some(start),
+                            crew: Some(
+                                flotilla_resources::CrewSessionStatus::builder()
+                                    .id("crew".into())
+                                    .adapter(if claude { "claude-code" } else { "codex" }.into())
+                                    .stance("trusted-implicit".into())
+                                    .build(),
+                            ),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .expect("running session");
                 let convoys = backend.using::<Convoy>("flotilla");
@@ -3596,15 +3615,19 @@ mod tests {
             .await
             .expect("governor session");
         sessions
-            .update_status("governor-session", &governor.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state: TerminalAttentionState::Working,
-                    source: TerminalAttentionSource::Screen,
-                    as_of: start + chrono::Duration::seconds(900),
-                }),
-                ..Default::default()
-            })
+            .update_status(
+                "governor-session",
+                &governor.metadata.resource_version,
+                &flotilla_resources::TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    attention: Some(TerminalAttention {
+                        state: TerminalAttentionState::Working,
+                        source: TerminalAttentionSource::Screen,
+                        as_of: start + chrono::Duration::seconds(900),
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("working supervisor");
         observe_actor(&backend, &wake, TerminalAttentionState::Working, start).await;
@@ -3908,11 +3931,10 @@ mod tests {
         create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
         let row = overload_row(uuid::Uuid::new_v4());
         let id = row.id;
-        table.inner.last_firings.lock().await.insert((id, row.leaves[0].clone()), LeafFiringRecord {
-            leaf: row.leaves[0].clone(),
-            value: "Active".into(),
-            fired_at: Utc::now(),
-        });
+        table.inner.last_firings.lock().await.insert(
+            (id, row.leaves[0].clone()),
+            LeafFiringRecord { leaf: row.leaves[0].clone(), value: "Active".into(), fired_at: Utc::now() },
+        );
         table.inner.unable_since.lock().await.insert(id, (UnableEvidenceKey::Absent, Utc::now()));
         table.inner.stale_attention_reported.lock().await.insert(id);
         overload_demand(&table, id).await;
@@ -4059,37 +4081,41 @@ mod tests {
             .await
             .expect("create work convoy");
         convoys
-            .update_status("stalled-work", &source.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![flotilla_resources::VesselRequirement::builder()
-                        .name("work".into())
-                        .crew(vec![flotilla_resources::CrewSpec::builder()
-                            .role("coder".into())
-                            .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
-                            .completion_conditions(vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
-                                "coder",
-                                "decision-ledger",
-                                flotilla_resources::ArtifactSubjectBinding::Convoy,
-                            )])
-                            .build()])
-                        .build()],
-                }),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("needs decision".into()).build(),
+            .update_status(
+                "stalled-work",
+                &source.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![flotilla_resources::VesselRequirement::builder()
+                            .name("work".into())
+                            .crew(vec![flotilla_resources::CrewSpec::builder()
+                                .role("coder".into())
+                                .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+                                .completion_conditions(vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
+                                    "coder",
+                                    "decision-ledger",
+                                    flotilla_resources::ArtifactSubjectBinding::Convoy,
+                                )])
+                                .build()])
+                            .build()],
+                    }),
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([(
+                            "coder".into(),
+                            CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("needs decision".into()).build(),
+                        )]),
                     )]),
-                )]),
-                ..Default::default()
-            })
+                    ..Default::default()
+                },
+            )
             .await
             .expect("stall work convoy");
         for (name, generation, phase) in governors {
@@ -4106,14 +4132,18 @@ mod tests {
                 .await
                 .expect("create governor convoy");
             convoys
-                .update_status(name, &created.metadata.resource_version, &ConvoyStatus {
-                    phase: *phase,
-                    crew_work: BTreeMap::from([(
-                        "govern".into(),
-                        BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                    )]),
-                    ..Default::default()
-                })
+                .update_status(
+                    name,
+                    &created.metadata.resource_version,
+                    &ConvoyStatus {
+                        phase: *phase,
+                        crew_work: BTreeMap::from([(
+                            "govern".into(),
+                            BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                        )]),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .expect("set governor phase");
         }
@@ -4124,16 +4154,19 @@ mod tests {
             literal: "Done".into(),
         };
         let id = uuid::Uuid::new_v4();
-        wake.subscriptions.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+        wake.subscriptions.inner.rows.lock().await.insert(
             id,
-            namespace: "flotilla".into(),
-            leaves: vec![leaf],
-            watcher: LeafWatcher::ReconcilerWake { convoy: "stalled-work".into() },
-            maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
-            freshness_demand: None,
-            created_at: Utc::now(),
-            episode_key: EpisodeKeyFields::default(),
-        });
+            LeafSubscriptionRow {
+                id,
+                namespace: "flotilla".into(),
+                leaves: vec![leaf],
+                watcher: LeafWatcher::ReconcilerWake { convoy: "stalled-work".into() },
+                maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
+                freshness_demand: None,
+                created_at: Utc::now(),
+                episode_key: EpisodeKeyFields::default(),
+            },
+        );
         (backend, wake, delivery)
     }
 
@@ -4501,10 +4534,14 @@ mod tests {
             .await
             .expect("vessel");
         vessels
-            .update_status("actor-vessel", &vessel.metadata.resource_version, &flotilla_resources::VesselStatus {
-                checkout_refs: BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "actor-checkout".into())]),
-                ..Default::default()
-            })
+            .update_status(
+                "actor-vessel",
+                &vessel.metadata.resource_version,
+                &flotilla_resources::VesselStatus {
+                    checkout_refs: BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "actor-checkout".into())]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("checkout association");
         let start = Utc::now();
@@ -4595,11 +4632,15 @@ mod tests {
             source: flotilla_resources::TerminalAttentionSource::Hook,
         };
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                attention: Some(idle_before_delivery),
-                ..Default::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &flotilla_resources::TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    attention: Some(idle_before_delivery),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("idle before brief delivery");
         let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
@@ -4699,10 +4740,11 @@ mod tests {
             .expect("create ensure");
         let created = ensures.get(&created.metadata.name).await.expect("read ensure");
         ensures
-            .update_status("wheelhouse-governor", &created.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
-                convoy_ref: Some(convoy_ref.into()),
-                ..Default::default()
-            })
+            .update_status(
+                "wheelhouse-governor",
+                &created.metadata.resource_version,
+                &flotilla_resources::ConvoyEnsureStatus { convoy_ref: Some(convoy_ref.into()), ..Default::default() },
+            )
             .await
             .expect("set owned attempt");
     }
@@ -5240,13 +5282,17 @@ mod tests {
                             .expect("tracing scenario");
                         let now = Utc::now();
                         records
-                            .update_status(&name, &record.metadata.resource_version, &flotilla_resources::IssueStatus {
-                                state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
-                                updated_at: flotilla_resources::Observation::known(now, now),
-                                title: Default::default(),
-                                assignees: Default::default(),
-                                labels: Default::default(),
-                            })
+                            .update_status(
+                                &name,
+                                &record.metadata.resource_version,
+                                &flotilla_resources::IssueStatus {
+                                    state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
+                                    updated_at: flotilla_resources::Observation::known(now, now),
+                                    title: Default::default(),
+                                    assignees: Default::default(),
+                                    labels: Default::default(),
+                                },
+                            )
                             .await
                             .expect("tracing scenario");
                         leaf.address = LeafAddress::Issue { service: "github.com".into(), scope: "team/repo".into(), number: 1 };
@@ -5258,27 +5304,28 @@ mod tests {
                             wake = supervision_wake_with_limit(&backend, limit);
                         }
                         let id = uuid::Uuid::new_v4();
-                        wake.subscriptions.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+                        wake.subscriptions.inner.rows.lock().await.insert(
                             id,
-                            namespace: "flotilla".into(),
-                            leaves: vec![leaf.clone()],
-                            watcher: LeafWatcher::TurnDelivery {
-                                convoy: "stalled-work".into(),
-                                source: "checks".into(),
-                                rule: Box::new(rule.clone()),
+                            LeafSubscriptionRow {
+                                id,
+                                namespace: "flotilla".into(),
+                                leaves: vec![leaf.clone()],
+                                watcher: LeafWatcher::TurnDelivery {
+                                    convoy: "stalled-work".into(),
+                                    source: "checks".into(),
+                                    rule: Box::new(rule.clone()),
+                                },
+                                maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+                                freshness_demand: None,
+                                created_at: Utc::now(),
+                                episode_key: Default::default(),
                             },
-                            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
-                            freshness_demand: None,
-                            created_at: Utc::now(),
-                            episode_key: Default::default(),
-                        });
+                        );
                         wake.subscriptions
-                            .fire(id, LeafFire {
-                                subscription_id: id,
-                                watcher_id: uuid::Uuid::nil(),
-                                leaf: leaf.clone(),
-                                value: "fail".into(),
-                            })
+                            .fire(
+                                id,
+                                LeafFire { subscription_id: id, watcher_id: uuid::Uuid::nil(), leaf: leaf.clone(), value: "fail".into() },
+                            )
                             .await;
                         let status = convoys.get("stalled-work").await.expect("tracing scenario").status.expect("tracing scenario");
                         let failure = status.turn_deliveries["checks"].failure.as_ref().expect("tracing scenario");
@@ -5330,12 +5377,10 @@ mod tests {
                         .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "checks"))
                         .expect("tracing scenario");
                     wake.subscriptions
-                        .fire(row.id, LeafFire {
-                            subscription_id: row.id,
-                            watcher_id: uuid::Uuid::nil(),
-                            leaf: leaf.clone(),
-                            value: "fail".into(),
-                        })
+                        .fire(
+                            row.id,
+                            LeafFire { subscription_id: row.id, watcher_id: uuid::Uuid::nil(), leaf: leaf.clone(), value: "fail".into() },
+                        )
                         .await;
                     let status = convoys.get("stalled-work").await.expect("tracing scenario").status.expect("tracing scenario");
                     let failure = status.turn_deliveries["checks"].failure.as_ref().expect("tracing scenario");
@@ -5506,14 +5551,18 @@ mod tests {
             subscriptions: LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher),
             _marker: PhantomData,
         };
-        create_convoy(&backend, "delivery", ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        create_convoy(
+            &backend,
+            "delivery",
+            ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await;
         let terminal = backend.using::<TerminalSession>("flotilla");
         let created = terminal
@@ -5554,16 +5603,19 @@ mod tests {
             literal: "Done".into(),
         };
         let id = uuid::Uuid::new_v4();
-        wake.subscriptions.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+        wake.subscriptions.inner.rows.lock().await.insert(
             id,
-            namespace: "flotilla".into(),
-            leaves: vec![leaf],
-            watcher: LeafWatcher::ReconcilerWake { convoy: "delivery".into() },
-            maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
-            freshness_demand: None,
-            created_at: Utc::now(),
-            episode_key: EpisodeKeyFields::default(),
-        });
+            LeafSubscriptionRow {
+                id,
+                namespace: "flotilla".into(),
+                leaves: vec![leaf],
+                watcher: LeafWatcher::ReconcilerWake { convoy: "delivery".into() },
+                maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
+                freshness_demand: None,
+                created_at: Utc::now(),
+                episode_key: EpisodeKeyFields::default(),
+            },
+        );
         let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
         let objects = HashMap::from([("delivery".into(), convoy)]);
         wake.judge_stalls("flotilla", &objects).await.expect("judge stale screen");
@@ -5615,10 +5667,11 @@ mod tests {
             .await
             .expect("vessel");
         vessels
-            .update_status("delivery-work", &vessel.metadata.resource_version, &flotilla_resources::VesselStatus {
-                environment_ref: Some("delivery-env".into()),
-                ..Default::default()
-            })
+            .update_status(
+                "delivery-work",
+                &vessel.metadata.resource_version,
+                &flotilla_resources::VesselStatus { environment_ref: Some("delivery-env".into()), ..Default::default() },
+            )
             .await
             .expect("place vessel");
         let now = Utc::now();
@@ -5637,9 +5690,11 @@ mod tests {
         ];
         let mut standing_row_id = None;
         for (retry, expected) in scenarios {
-            flotilla_resources::apply_status_patch(&vessels, "delivery-work", &flotilla_resources::VesselStatusPatch::CredentialDelivery {
-                retry: Some(retry),
-            })
+            flotilla_resources::apply_status_patch(
+                &vessels,
+                "delivery-work",
+                &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: Some(retry) },
+            )
             .await
             .expect("record delivery retry");
             let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
@@ -5660,9 +5715,11 @@ mod tests {
             let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
             assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);
         }
-        flotilla_resources::apply_status_patch(&vessels, "delivery-work", &flotilla_resources::VesselStatusPatch::CredentialDelivery {
-            retry: None,
-        })
+        flotilla_resources::apply_status_patch(
+            &vessels,
+            "delivery-work",
+            &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: None },
+        )
         .await
         .expect("clear credential retry");
         let checkouts = backend.using::<Checkout>("flotilla");
@@ -5906,11 +5963,10 @@ mod tests {
             leaf(LeafAddress::Usage { provider: provider.to_string(), account: account.to_string() }, ".windows.weekly.used-percent", "90");
         usage_leaf.operator = LeafOperator::GreaterThan;
         let subscription_id = table
-            .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
-                namespace: "flotilla".to_string(),
-                leaves: vec![usage_leaf],
-                freshness_demand: None,
-            })
+            .subscribe_wait(
+                uuid::Uuid::new_v4(),
+                WaitSubscriptionRequest { namespace: "flotilla".to_string(), leaves: vec![usage_leaf], freshness_demand: None },
+            )
             .await
             .expect("subscribe usage leaf");
 
@@ -6060,23 +6116,27 @@ mod tests {
             .await
             .expect("convoy");
         convoys
-            .update_status("cooldown", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                ..Default::default()
-            })
+            .update_status(
+                "cooldown",
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() },
+            )
             .await
             .expect("landing");
         let id = uuid::Uuid::new_v4();
-        table.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+        table.inner.rows.lock().await.insert(
             id,
-            namespace: "flotilla".into(),
-            leaves: vec!["cr/github.com/team/one/1 .state == merged".parse().expect("exit leaf")],
-            watcher: LeafWatcher::ReconcilerWake { convoy: "cooldown".into() },
-            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
-            freshness_demand: Some(now),
-            created_at: now,
-            episode_key: EpisodeKeyFields::default(),
-        });
+            LeafSubscriptionRow {
+                id,
+                namespace: "flotilla".into(),
+                leaves: vec!["cr/github.com/team/one/1 .state == merged".parse().expect("exit leaf")],
+                watcher: LeafWatcher::ReconcilerWake { convoy: "cooldown".into() },
+                maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+                freshness_demand: Some(now),
+                created_at: now,
+                episode_key: EpisodeKeyFields::default(),
+            },
+        );
         let wake = ReconcilerWake { subscriptions: table, _marker: PhantomData };
         for at in [now, retry_at - chrono::Duration::nanoseconds(1), retry_at] {
             let convoy = convoys.get("cooldown").await.expect("convoy");
@@ -6101,24 +6161,25 @@ mod tests {
         let table = LeafSubscriptionTable::new(backend, broadcast_test_sink(event_tx), refresher);
         let id = uuid::Uuid::new_v4();
         let fired_leaf = leaf(LeafAddress::Convoy { name: "held".to_string() }, ".status.phase", "Landed");
-        table.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+        table.inner.rows.lock().await.insert(
             id,
-            namespace: "flotilla".to_string(),
-            leaves: vec![fired_leaf.clone()],
-            watcher: LeafWatcher::ReconcilerWake { convoy: "held".to_string() },
-            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
-            freshness_demand: None,
-            created_at: Utc::now(),
-            episode_key: EpisodeKeyFields::default(),
-        });
+            LeafSubscriptionRow {
+                id,
+                namespace: "flotilla".to_string(),
+                leaves: vec![fired_leaf.clone()],
+                watcher: LeafWatcher::ReconcilerWake { convoy: "held".to_string() },
+                maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+                freshness_demand: None,
+                created_at: Utc::now(),
+                episode_key: EpisodeKeyFields::default(),
+            },
+        );
 
         table
-            .fire(id, LeafFire {
-                subscription_id: uuid::Uuid::nil(),
-                watcher_id: uuid::Uuid::nil(),
-                leaf: fired_leaf,
-                value: "Landed".into(),
-            })
+            .fire(
+                id,
+                LeafFire { subscription_id: uuid::Uuid::nil(), watcher_id: uuid::Uuid::nil(), leaf: fired_leaf, value: "Landed".into() },
+            )
             .await;
 
         let diagnostics = table.diagnostics().await;
@@ -6246,10 +6307,11 @@ mod tests {
                 issues: &HashMap::new(),
                 artifacts: &HashMap::new(),
             };
-            let fire = evaluate_row(row, &subjects, LeafObservationStaleness {
-                change_request: Duration::from_secs(60),
-                issue: Duration::from_secs(60),
-            })
+            let fire = evaluate_row(
+                row,
+                &subjects,
+                LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
+            )
             .expect("evaluate merged")
             .expect("merged fires");
             table.fire(row.id, fire).await;
@@ -6257,10 +6319,11 @@ mod tests {
             for competing in
                 rows.iter().filter(|candidate| candidate.id != row.id && matches!(candidate.watcher, LeafWatcher::TurnDelivery { .. }))
             {
-                if let Some(fire) = evaluate_row(competing, &subjects, LeafObservationStaleness {
-                    change_request: Duration::from_secs(60),
-                    issue: Duration::from_secs(60),
-                })
+                if let Some(fire) = evaluate_row(
+                    competing,
+                    &subjects,
+                    LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
+                )
                 .expect("competing evaluation")
                 {
                     table.fire(competing.id, fire).await;
@@ -6699,30 +6762,34 @@ mod tests {
         let created = convoys.create(&InputMeta::builder().name("wake-turn".to_string()).build(), &convoy_spec).await.expect("convoy");
         let base = Utc::now();
         convoys
-            .update_status("wake-turn", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(ExitDeclaration::standard_table()),
-                    turn_delivery: indexmap::IndexMap::from([(source.to_string(), rule.clone())]),
-                    vessels: Vec::new(),
-                }),
-                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([(
-                        "coder".to_string(),
-                        CrewWorkState::builder()
-                            .phase(CrewWorkPhase::Done)
-                            .finished_at(base)
-                            .decision_ledger_ref("https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1".to_string())
-                            .build(),
+            .update_status(
+                "wake-turn",
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Landing,
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: Some(ExitDeclaration::standard_table()),
+                        turn_delivery: indexmap::IndexMap::from([(source.to_string(), rule.clone())]),
+                        vessels: Vec::new(),
+                    }),
+                    work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                    crew_work: BTreeMap::from([(
+                        "work".to_string(),
+                        BTreeMap::from([(
+                            "coder".to_string(),
+                            CrewWorkState::builder()
+                                .phase(CrewWorkPhase::Done)
+                                .finished_at(base)
+                                .decision_ledger_ref("https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1".to_string())
+                                .build(),
+                        )]),
                     )]),
-                )]),
-                ..Default::default()
-            })
+                    ..Default::default()
+                },
+            )
             .await
             .expect("landing status");
         let cr_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1392);
@@ -6750,20 +6817,23 @@ mod tests {
             literal: literal.to_string(),
         };
         let subscription_id = uuid::Uuid::new_v4();
-        table.inner.rows.lock().await.insert(subscription_id, LeafSubscriptionRow {
-            id: subscription_id,
-            namespace: "flotilla".to_string(),
-            leaves: vec![leaf.clone()],
-            watcher: LeafWatcher::TurnDelivery {
-                convoy: "wake-turn".to_string(),
-                source: source.to_string(),
-                rule: Box::new(rule.clone()),
+        table.inner.rows.lock().await.insert(
+            subscription_id,
+            LeafSubscriptionRow {
+                id: subscription_id,
+                namespace: "flotilla".to_string(),
+                leaves: vec![leaf.clone()],
+                watcher: LeafWatcher::TurnDelivery {
+                    convoy: "wake-turn".to_string(),
+                    source: source.to_string(),
+                    rule: Box::new(rule.clone()),
+                },
+                maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+                freshness_demand: Some(base),
+                created_at: base,
+                episode_key: EpisodeKeyFields::default(),
             },
-            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
-            freshness_demand: Some(base),
-            created_at: base,
-            episode_key: EpisodeKeyFields::default(),
-        });
+        );
 
         let mut record_version = record.metadata.resource_version;
         let stale_status = flotilla_resources::ChangeRequestStatus {
@@ -6986,20 +7056,24 @@ mod tests {
             .await
             .expect("create zero-subject convoy");
         convoys
-            .update_status("no-cr", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(ExitDeclaration::standard_table()),
-                    turn_delivery: Default::default(),
-                    vessels: Vec::new(),
-                }),
-                observed_workflow_ref: Some("workflow".to_string()),
-                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
-                ..Default::default()
-            })
+            .update_status(
+                "no-cr",
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Landing,
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: Some(ExitDeclaration::standard_table()),
+                        turn_delivery: Default::default(),
+                        vessels: Vec::new(),
+                    }),
+                    observed_workflow_ref: Some("workflow".to_string()),
+                    work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("mark zero-subject convoy Landing");
         let controller = tokio::spawn(
@@ -7058,20 +7132,24 @@ mod tests {
         let convoys = backend.clone().using::<Convoy>("flotilla");
         let created = convoys.create(&meta, &spec).await.expect("create unbound convoy");
         let landing = convoys
-            .update_status("adopt-late", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(ExitDeclaration::standard_table()),
-                    turn_delivery: Default::default(),
-                    vessels: Vec::new(),
-                }),
-                observed_workflow_ref: Some("workflow".to_string()),
-                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
-                ..Default::default()
-            })
+            .update_status(
+                "adopt-late",
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Landing,
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: Some(ExitDeclaration::standard_table()),
+                        turn_delivery: Default::default(),
+                        vessels: Vec::new(),
+                    }),
+                    observed_workflow_ref: Some("workflow".to_string()),
+                    work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("claims enter Landing before binding");
         spec.change_request =
@@ -7147,20 +7225,24 @@ mod tests {
             })
             .build();
         convoys
-            .update_status("cross-host", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(ExitDeclaration::standard_table()),
-                    turn_delivery: Default::default(),
-                    vessels: Vec::new(),
-                }),
-                observed_workflow_ref: Some("workflow".to_string()),
-                work: BTreeMap::from([("work".to_string(), work)]),
-                ..Default::default()
-            })
+            .update_status(
+                "cross-host",
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Landing,
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: Some(ExitDeclaration::standard_table()),
+                        turn_delivery: Default::default(),
+                        vessels: Vec::new(),
+                    }),
+                    observed_workflow_ref: Some("workflow".to_string()),
+                    work: BTreeMap::from([("work".to_string(), work)]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("mark authority convoy Landing");
 
@@ -7182,22 +7264,26 @@ mod tests {
             .await
             .expect("create remote checkout");
         remote_checkouts
-            .update_status("remote-checkout", &checkout.metadata.resource_version, &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                integration: CheckoutIntegrationStatus {
-                    landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
-                    change_request: Some(
-                        ChangeRequestObservation::builder()
-                            .id("1364".to_string())
-                            .state(ChangeRequestState::Open)
-                            .mergeability(flotilla_resources::ChangeRequestMergeability::Mergeable)
-                            .observed_at(Utc::now().to_rfc3339())
-                            .build(),
-                    ),
+            .update_status(
+                "remote-checkout",
+                &checkout.metadata.resource_version,
+                &CheckoutStatus {
+                    phase: CheckoutPhase::Ready,
+                    integration: CheckoutIntegrationStatus {
+                        landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
+                        change_request: Some(
+                            ChangeRequestObservation::builder()
+                                .id("1364".to_string())
+                                .state(ChangeRequestState::Open)
+                                .mergeability(flotilla_resources::ChangeRequestMergeability::Mergeable)
+                                .observed_at(Utc::now().to_rfc3339())
+                                .build(),
+                        ),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            })
+            )
             .await
             .expect("record remote checkout CR evidence");
         authority
@@ -7222,19 +7308,23 @@ mod tests {
             .expect("create remote CR record");
         let observed_at = Utc::now();
         remote_records
-            .update_status(&record.metadata.name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-                title: Default::default(),
-                author: Default::default(),
-                review_decision: Default::default(),
-                review_requested_from_owner: Default::default(),
-                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
-                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
-                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
-                review: flotilla_resources::ChangeRequestReviewObservation {
-                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            .update_status(
+                &record.metadata.name,
+                &record.metadata.resource_version,
+                &flotilla_resources::ChangeRequestStatus {
+                    title: Default::default(),
+                    author: Default::default(),
+                    review_decision: Default::default(),
+                    review_requested_from_owner: Default::default(),
+                    state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+                    head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                    checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                    review: flotilla_resources::ChangeRequestReviewObservation {
+                        actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                    },
+                    mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
                 },
-                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
-            })
+            )
             .await
             .expect("publish remote merge");
         authority
@@ -7386,19 +7476,23 @@ mod tests {
             .expect("create authority CR");
         let observed_at = Utc::now();
         records
-            .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-                title: Default::default(),
-                author: Default::default(),
-                review_decision: Default::default(),
-                review_requested_from_owner: Default::default(),
-                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
-                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
-                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
-                review: flotilla_resources::ChangeRequestReviewObservation {
-                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &flotilla_resources::ChangeRequestStatus {
+                    title: Default::default(),
+                    author: Default::default(),
+                    review_decision: Default::default(),
+                    review_requested_from_owner: Default::default(),
+                    state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+                    head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                    checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                    review: flotilla_resources::ChangeRequestReviewObservation {
+                        actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                    },
+                    mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
                 },
-                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
-            })
+            )
             .await
             .expect("publish authority CR");
 
@@ -7421,11 +7515,14 @@ mod tests {
         let table = LeafSubscriptionTable::new(reader, broadcast_test_sink(event_tx.clone()), refresher);
         let mut events = event_tx.subscribe();
         let subscription_id = table
-            .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
-                namespace: "flotilla".to_string(),
-                leaves: vec![leaf(subject, ".state", "merged")],
-                freshness_demand: None,
-            })
+            .subscribe_wait(
+                uuid::Uuid::new_v4(),
+                WaitSubscriptionRequest {
+                    namespace: "flotilla".to_string(),
+                    leaves: vec![leaf(subject, ".state", "merged")],
+                    freshness_demand: None,
+                },
+            )
             .await
             .expect("subscribe replica CR");
         assert_eq!(receive_fire(&mut events, subscription_id).await.value, "merged");
@@ -7640,37 +7737,43 @@ mod tests {
         let table = LeafSubscriptionTable::new(former_owner.clone(), broadcast_test_sink(event_tx.clone()), refresher.clone());
         let mut events = event_tx.subscribe();
         let subscription_id = table
-            .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
-                namespace: "flotilla".to_string(),
-                leaves: vec![leaf(
-                    LeafAddress::ChangeRequest {
-                        service: "github.com".to_string(),
-                        scope: "flotilla-org/flotilla".to_string(),
-                        number: 2052,
-                    },
-                    ".state",
-                    "merged",
-                )],
-                freshness_demand: None,
-            })
+            .subscribe_wait(
+                uuid::Uuid::new_v4(),
+                WaitSubscriptionRequest {
+                    namespace: "flotilla".to_string(),
+                    leaves: vec![leaf(
+                        LeafAddress::ChangeRequest {
+                            service: "github.com".to_string(),
+                            scope: "flotilla-org/flotilla".to_string(),
+                            number: 2052,
+                        },
+                        ".state",
+                        "merged",
+                    )],
+                    freshness_demand: None,
+                },
+            )
             .await
             .expect("wait on takeover observation");
         assert_eq!(receive_fire(&mut events, subscription_id).await.value, "merged");
 
         let fallback_id = table
-            .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
-                namespace: "flotilla".to_string(),
-                leaves: vec![leaf(
-                    LeafAddress::ChangeRequest {
-                        service: "github.com".to_string(),
-                        scope: "flotilla-org/flotilla".to_string(),
-                        number: 2052,
-                    },
-                    ".state",
-                    "open",
-                )],
-                freshness_demand: None,
-            })
+            .subscribe_wait(
+                uuid::Uuid::new_v4(),
+                WaitSubscriptionRequest {
+                    namespace: "flotilla".to_string(),
+                    leaves: vec![leaf(
+                        LeafAddress::ChangeRequest {
+                            service: "github.com".to_string(),
+                            scope: "flotilla-org/flotilla".to_string(),
+                            number: 2052,
+                        },
+                        ".state",
+                        "open",
+                    )],
+                    freshness_demand: None,
+                },
+            )
             .await
             .expect("wait for local fallback");
         assert!(tokio::time::timeout(Duration::from_millis(100), events.recv()).await.is_err(), "stale local state must not fire");
@@ -7899,11 +8002,10 @@ mod tests {
         let connection = uuid::Uuid::new_v4();
         let leaf: Leaf = "issue/github.com/flotilla-org/flotilla/2052 .state == closed".parse().expect("issue leaf");
         table
-            .subscribe_wait(connection, WaitSubscriptionRequest {
-                namespace: "flotilla".into(),
-                leaves: vec![leaf.clone()],
-                freshness_demand: None,
-            })
+            .subscribe_wait(
+                connection,
+                WaitSubscriptionRequest { namespace: "flotilla".into(), leaves: vec![leaf.clone()], freshness_demand: None },
+            )
             .await
             .expect("subscribe issue");
         let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
@@ -7964,19 +8066,27 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let issues = IssueRefresher::new(backend.clone(), "issue-owner".into(), Arc::new(UnavailableIssues), IssueRefreshCadence {
-            state: Duration::from_secs(90),
-            freshness_demanded: Duration::from_secs(10),
-            stale_after: Duration::from_secs(1),
-        });
+        let issues = IssueRefresher::new(
+            backend.clone(),
+            "issue-owner".into(),
+            Arc::new(UnavailableIssues),
+            IssueRefreshCadence {
+                state: Duration::from_secs(90),
+                freshness_demanded: Duration::from_secs(10),
+                stale_after: Duration::from_secs(1),
+            },
+        );
         let table = LeafSubscriptionTable::with_issues(backend.clone(), broadcast_test_sink(event_tx), change_requests, issues);
         let connection = uuid::Uuid::new_v4();
         table
-            .subscribe_wait(connection, WaitSubscriptionRequest {
-                namespace: "flotilla".into(),
-                leaves: vec!["issue/github.com/flotilla-org/flotilla/2052 .state == closed".parse().expect("leaf")],
-                freshness_demand: None,
-            })
+            .subscribe_wait(
+                connection,
+                WaitSubscriptionRequest {
+                    namespace: "flotilla".into(),
+                    leaves: vec!["issue/github.com/flotilla-org/flotilla/2052 .state == closed".parse().expect("leaf")],
+                    freshness_demand: None,
+                },
+            )
             .await
             .expect("subscribe");
         assert!(
@@ -7985,13 +8095,17 @@ mod tests {
         );
         let now = Utc::now();
         records
-            .update_status(&name, &created.metadata.resource_version, &flotilla_resources::IssueStatus {
-                title: Default::default(),
-                assignees: Default::default(),
-                state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
-                labels: flotilla_resources::Observation::known(vec![], now),
-                updated_at: flotilla_resources::Observation::known(now, now),
-            })
+            .update_status(
+                &name,
+                &created.metadata.resource_version,
+                &flotilla_resources::IssueStatus {
+                    title: Default::default(),
+                    assignees: Default::default(),
+                    state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
+                    labels: flotilla_resources::Observation::known(vec![], now),
+                    updated_at: flotilla_resources::Observation::known(now, now),
+                },
+            )
             .await
             .expect("fresh issue");
         assert!(matches!(
@@ -8051,37 +8165,44 @@ mod tests {
         let created = convoys.create(&InputMeta::builder().name("issue-turn".into()).build(), &spec).await.expect("convoy");
         let claim_at = Utc::now() - chrono::Duration::seconds(2);
         convoys
-            .update_status("issue-turn", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        CrewWorkState::builder()
-                            .phase(CrewWorkPhase::Done)
-                            .finished_at(claim_at)
-                            .decision_ledger_ref("https://example.com/ledger".into())
-                            .build(),
+            .update_status(
+                "issue-turn",
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Landing,
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([(
+                            "coder".into(),
+                            CrewWorkState::builder()
+                                .phase(CrewWorkPhase::Done)
+                                .finished_at(claim_at)
+                                .decision_ledger_ref("https://example.com/ledger".into())
+                                .build(),
+                        )]),
                     )]),
-                )]),
-                ..Default::default()
-            })
+                    ..Default::default()
+                },
+            )
             .await
             .expect("claim");
         let leaf = flotilla_resources::issue_address(&reference)
             .map(|address| Leaf { address, field_path: ".state".into(), operator: LeafOperator::Equal, literal: "closed".into() })
             .expect("issue address");
         let subscription_id = uuid::Uuid::new_v4();
-        table.inner.rows.lock().await.insert(subscription_id, LeafSubscriptionRow {
-            id: subscription_id,
-            namespace: "flotilla".into(),
-            leaves: vec![leaf.clone()],
-            watcher: LeafWatcher::TurnDelivery { convoy: "issue-turn".into(), source: "issue".into(), rule: Box::new(rule.clone()) },
-            maker: LeafMaker::Observed { refresher: "issue".into(), external_party: "forge".into() },
-            freshness_demand: Some(claim_at),
-            created_at: claim_at,
-            episode_key: EpisodeKeyFields::default(),
-        });
+        table.inner.rows.lock().await.insert(
+            subscription_id,
+            LeafSubscriptionRow {
+                id: subscription_id,
+                namespace: "flotilla".into(),
+                leaves: vec![leaf.clone()],
+                watcher: LeafWatcher::TurnDelivery { convoy: "issue-turn".into(), source: "issue".into(), rule: Box::new(rule.clone()) },
+                maker: LeafMaker::Observed { refresher: "issue".into(), external_party: "forge".into() },
+                freshness_demand: Some(claim_at),
+                created_at: claim_at,
+                episode_key: EpisodeKeyFields::default(),
+            },
+        );
         let records = backend.using::<Issue>("flotilla");
         let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
         let issue = records
@@ -8101,13 +8222,17 @@ mod tests {
         let watch = tokio::spawn(async move { watching_table.watch_row(watched_row).await });
         let changed_at = Utc::now();
         records
-            .update_status(&name, &issue.metadata.resource_version, &flotilla_resources::IssueStatus {
-                title: Default::default(),
-                assignees: Default::default(),
-                state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, changed_at),
-                labels: flotilla_resources::Observation::known(vec!["done".into()], changed_at),
-                updated_at: flotilla_resources::Observation::known(changed_at, changed_at),
-            })
+            .update_status(
+                &name,
+                &issue.metadata.resource_version,
+                &flotilla_resources::IssueStatus {
+                    title: Default::default(),
+                    assignees: Default::default(),
+                    state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, changed_at),
+                    labels: flotilla_resources::Observation::known(vec!["done".into()], changed_at),
+                    updated_at: flotilla_resources::Observation::known(changed_at, changed_at),
+                },
+            )
             .await
             .expect("observation");
         tokio::time::timeout(Duration::from_secs(2), async {

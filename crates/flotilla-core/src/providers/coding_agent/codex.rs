@@ -170,15 +170,18 @@ fn map_task_to_session(task: &TaskItem, provider_name: &str) -> (String, CloudAg
 
     let updated_at = task.updated_at.and_then(epoch_to_rfc3339);
 
-    (task.id.clone(), CloudAgentSession {
-        title,
-        status,
-        model: None,
-        updated_at,
-        provider_name: provider_name.to_string(),
-        provider_display_name: "Codex".into(),
-        item_noun: "Task".into(),
-    })
+    (
+        task.id.clone(),
+        CloudAgentSession {
+            title,
+            status,
+            model: None,
+            updated_at,
+            provider_name: provider_name.to_string(),
+            provider_display_name: "Codex".into(),
+            item_noun: "Task".into(),
+        },
+    )
 }
 
 // --- CodexCodingAgent struct and HTTP helpers ---
@@ -374,10 +377,10 @@ impl CodexCodingAgent {
         // Cache the discovered env IDs for this repo
         {
             let mut cache = self.env_cache.lock().expect("env_cache lock poisoned");
-            cache.entries.insert(repo_slug.to_string(), EnvCacheEntry {
-                environment_ids: matching_ids.iter().map(|s| s.to_string()).collect(),
-                loaded_at: Instant::now(),
-            });
+            cache.entries.insert(
+                repo_slug.to_string(),
+                EnvCacheEntry { environment_ids: matching_ids.iter().map(|s| s.to_string()).collect(), loaded_at: Instant::now() },
+            );
         }
 
         let mut all_sessions = Vec::new();
@@ -490,10 +493,10 @@ impl super::CloudAgentService for CodexCodingAgent {
                         match self.fetch_environment_ids(repo_slug, &fresh_auth).await {
                             Ok(ids) => {
                                 let mut cache = self.env_cache.lock().expect("env_cache lock poisoned");
-                                cache.entries.insert(repo_slug.to_string(), EnvCacheEntry {
-                                    environment_ids: ids.clone(),
-                                    loaded_at: Instant::now(),
-                                });
+                                cache.entries.insert(
+                                    repo_slug.to_string(),
+                                    EnvCacheEntry { environment_ids: ids.clone(), loaded_at: Instant::now() },
+                                );
                                 auth = fresh_auth;
                                 ids
                             }

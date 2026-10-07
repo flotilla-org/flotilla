@@ -288,13 +288,10 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
     );
     daemon.repos.write().await.insert(
         identity.clone(),
-        RepoState::new(identity, RepoRootState {
-            path: path.into(),
-            model: RepoModel::new(stale, None),
-            slug: None,
-            unmet: Vec::new(),
-            is_local: true,
-        }),
+        RepoState::new(
+            identity,
+            RepoRootState { path: path.into(), model: RepoModel::new(stale, None), slug: None, unmet: Vec::new(), is_local: true },
+        ),
     );
     let first = daemon.issue_provider_for_source(&source).await.expect("source provider");
     let initial = first.list_changed_since(&source, "2026-07-01T00:00:00Z", 50).await.expect("initial poll");

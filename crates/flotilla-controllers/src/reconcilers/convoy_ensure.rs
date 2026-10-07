@@ -437,10 +437,11 @@ impl EnsurePass<'_> {
         }
         let replacement = self.commit_ensured_convoy(namespace, &ensure, admission).await?;
         if ensure.spec.driver_ref.is_none() {
-            self.patch_convoy_ensure(namespace, name, ConvoyEnsureStatusPatch::Running {
-                convoy_ref: replacement.clone(),
-                observed_at: self.clock.now(),
-            })
+            self.patch_convoy_ensure(
+                namespace,
+                name,
+                ConvoyEnsureStatusPatch::Running { convoy_ref: replacement.clone(), observed_at: self.clock.now() },
+            )
             .await?;
         }
         Ok(format!("ConvoyEnsure/{name} rolled to {replacement}"))
@@ -634,11 +635,15 @@ impl EnsurePass<'_> {
                 })
                 .unwrap_or(latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1));
             if !force_now && retry_at > self.clock.now() {
-                self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
-                    strikes: consecutive_failures,
-                    retry_at,
-                    failure: "ensured convoy entered a terminal failure phase".to_string(),
-                })
+                self.patch_driver_ensure_status_if_local(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::BackoffState {
+                        strikes: consecutive_failures,
+                        retry_at,
+                        failure: "ensured convoy entered a terminal failure phase".to_string(),
+                    },
+                )
                 .await?;
                 return Ok(None);
             }
@@ -663,11 +668,11 @@ impl EnsurePass<'_> {
                         ensure.status.as_ref().and_then(|status| status.retry.as_ref()),
                     )
                 };
-                self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
-                    strikes: consecutive_failures,
-                    retry_at,
-                    failure: error.clone(),
-                })
+                self.patch_driver_ensure_status_if_local(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::BackoffState { strikes: consecutive_failures, retry_at, failure: error.clone() },
+                )
                 .await?;
                 Err(format!("driver admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
             }
@@ -689,15 +694,19 @@ impl EnsurePass<'_> {
         if unchanged {
             return Ok(());
         }
-        self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::DriverAdmission {
-            condition: Some(ConvoyEnsureCondition {
-                condition_type: DRIVER_ADMISSION_CONDITION_TYPE.to_string(),
-                value: ConditionValue::False,
-                reason: reason.to_string(),
-                message,
-                observed_at: self.clock.now(),
-            }),
-        })
+        self.patch_convoy_ensure(
+            namespace,
+            &ensure.metadata.name,
+            ConvoyEnsureStatusPatch::DriverAdmission {
+                condition: Some(ConvoyEnsureCondition {
+                    condition_type: DRIVER_ADMISSION_CONDITION_TYPE.to_string(),
+                    value: ConditionValue::False,
+                    reason: reason.to_string(),
+                    message,
+                    observed_at: self.clock.now(),
+                }),
+            },
+        )
         .await
     }
 
@@ -726,10 +735,11 @@ impl EnsurePass<'_> {
         let config_hash = ensure_config_hash(&ensure.spec)?;
         if status.observed_config_hash.as_deref() != Some(&config_hash) {
             let changed = status.observed_config_hash.is_some();
-            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ObserveConfig {
-                config_hash: config_hash.clone(),
-                changed,
-            })
+            self.patch_convoy_ensure(
+                namespace,
+                &ensure.metadata.name,
+                ConvoyEnsureStatusPatch::ObserveConfig { config_hash: config_hash.clone(), changed },
+            )
             .await?;
             status.observed_config_hash = Some(config_hash.clone());
             if changed {
@@ -765,10 +775,11 @@ impl EnsurePass<'_> {
             self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
             let convoy_ref = convoy.metadata.name.clone();
             if status.convoy_ref.as_deref() != Some(&convoy_ref) || status.retry_at.is_some() || status.last_failure.is_some() {
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
-                    convoy_ref,
-                    observed_at: now,
-                })
+                self.patch_convoy_ensure(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now },
+                )
                 .await?;
                 return Ok(Some(format!("ConvoyEnsure/{} observed running", ensure.metadata.name)));
             }
@@ -836,10 +847,11 @@ impl EnsurePass<'_> {
                     .map_err(|error| format!("record backing-evidence event: {error}"))?;
                 self.raise_ensure_attention(ensure, &convoy, &failure, None).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
-                    self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Holding {
-                        convoy_ref: convoy.metadata.name.clone(),
-                        failure,
-                    })
+                    self.patch_convoy_ensure(
+                        namespace,
+                        &ensure.metadata.name,
+                        ConvoyEnsureStatusPatch::Holding { convoy_ref: convoy.metadata.name.clone(), failure },
+                    )
                     .await?;
                     return Ok(Some(format!("ConvoyEnsure/{} held for operator attention", ensure.metadata.name)));
                 }
@@ -853,18 +865,20 @@ impl EnsurePass<'_> {
             if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
                 let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
                 self.raise_ensure_attention(ensure, &convoy, &failure, Some(now + ENSURE_ESCALATION_AFTER)).await?;
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::RestartLimitReached {
-                    convoy_ref: convoy.metadata.name.clone(),
-                    failure,
-                })
+                self.patch_convoy_ensure(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::RestartLimitReached { convoy_ref: convoy.metadata.name.clone(), failure },
+                )
                 .await?;
                 return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
             }
             let retry_at = now + ensure_retry_delay(status.restart_count);
-            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackingOff {
-                retry_at,
-                failure: failure.to_string(),
-            })
+            self.patch_convoy_ensure(
+                namespace,
+                &ensure.metadata.name,
+                ConvoyEnsureStatusPatch::BackingOff { retry_at, failure: failure.to_string() },
+            )
             .await?;
             return Ok(Some(format!("ConvoyEnsure/{} backing off until {retry_at}", ensure.metadata.name)));
         }
@@ -884,10 +898,11 @@ impl EnsurePass<'_> {
         match restart {
             Ok(convoy_ref) => {
                 self.ensure_admission_retries.lock().await.remove(&retry_key);
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
-                    convoy_ref: convoy_ref.clone(),
-                    observed_at: now,
-                })
+                self.patch_convoy_ensure(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::Running { convoy_ref: convoy_ref.clone(), observed_at: now },
+                )
                 .await?;
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
@@ -900,10 +915,11 @@ impl EnsurePass<'_> {
                     let mut retries = self.ensure_admission_retries.lock().await;
                     record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
                 };
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
-                    retry_at,
-                    failure: error.clone(),
-                })
+                self.patch_convoy_ensure(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::Retrying { retry_at, failure: error.clone() },
+                )
                 .await?;
                 Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
             }
@@ -921,10 +937,11 @@ impl EnsurePass<'_> {
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(convoy_ref) => {
                 self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), ensure.metadata.name.clone()));
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
-                    convoy_ref,
-                    observed_at: now,
-                })
+                self.patch_convoy_ensure(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::Running { convoy_ref, observed_at: now },
+                )
                 .await?;
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
@@ -940,10 +957,11 @@ impl EnsurePass<'_> {
                     let mut retries = self.ensure_admission_retries.lock().await;
                     record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
                 };
-                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
-                    retry_at,
-                    failure: error.clone(),
-                })
+                self.patch_convoy_ensure(
+                    namespace,
+                    &ensure.metadata.name,
+                    ConvoyEnsureStatusPatch::Retrying { retry_at, failure: error.clone() },
+                )
                 .await?;
                 Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
             }
@@ -1241,10 +1259,11 @@ mod tests {
                 .await
                 .map_err(|e| e.to_string())?;
             convoys
-                .update_status(&name, &convoy.metadata.resource_version, &ConvoyStatus {
-                    ensure_admission: Some(ensure.spec.clone()),
-                    ..Default::default()
-                })
+                .update_status(
+                    &name,
+                    &convoy.metadata.resource_version,
+                    &ConvoyStatus { ensure_admission: Some(ensure.spec.clone()), ..Default::default() },
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(name)

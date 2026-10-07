@@ -249,10 +249,13 @@ mod tests {
     async fn create_environment(backend: &ResourceBackend) {
         backend
             .using::<Environment>("another-namespace")
-            .create(&InputMeta::builder().name("env".into()).build(), &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/".into() }),
-                docker: None,
-            })
+            .create(
+                &InputMeta::builder().name("env".into()).build(),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "home".into(), repo_default_dir: "/".into() }),
+                    docker: None,
+                },
+            )
             .await
             .expect("authoritative environment");
     }

@@ -553,11 +553,11 @@ mod tests {
             let hosts = backend.using::<Host>("flotilla");
             let host = hosts.create(&meta("host"), &HostSpec::default()).await.unwrap();
             hosts
-                .update_status("host", &host.metadata.resource_version, &HostStatus {
-                    ready: true,
-                    heartbeat_at: Some(Utc::now()),
-                    ..Default::default()
-                })
+                .update_status(
+                    "host",
+                    &host.metadata.resource_version,
+                    &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
+                )
                 .await
                 .unwrap();
         }
@@ -568,11 +568,11 @@ mod tests {
                 let hosts = first.using::<Host>("flotilla");
                 let host = hosts.get("host").await.unwrap();
                 hosts
-                    .update_status("host", &host.metadata.resource_version, &HostStatus {
-                        ready: false,
-                        heartbeat_at: Some(Utc::now()),
-                        ..Default::default()
-                    })
+                    .update_status(
+                        "host",
+                        &host.metadata.resource_version,
+                        &HostStatus { ready: false, heartbeat_at: Some(Utc::now()), ..Default::default() },
+                    )
                     .await
                     .unwrap();
                 Ok(1_u64)
@@ -629,11 +629,11 @@ mod tests {
         let hosts = ready.using::<Host>("flotilla");
         let host = hosts.create(&meta("host"), &HostSpec::default()).await.unwrap();
         hosts
-            .update_status("host", &host.metadata.resource_version, &HostStatus {
-                ready: true,
-                heartbeat_at: Some(Utc::now()),
-                ..Default::default()
-            })
+            .update_status(
+                "host",
+                &host.metadata.resource_version,
+                &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
+            )
             .await
             .unwrap();
         assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(missing.local_root().unwrap()));

@@ -122,15 +122,19 @@ impl WorldBuilder for CheckoutWorldBuilder {
         let fail_inspection = scenario == LivenessScenario::Contradictory;
         let current = if fail_inspection {
             resolver
-                .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
-                    clone_retry: None,
-                    phase: CheckoutPhase::Ready,
-                    path: None,
-                    commit: Some("abc123".to_string()),
-                    branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
-                    integration: CheckoutIntegrationStatus::default(),
-                    message: None,
-                })
+                .update_status(
+                    "checkout-a",
+                    &created.metadata.resource_version,
+                    &CheckoutStatus {
+                        clone_retry: None,
+                        phase: CheckoutPhase::Ready,
+                        path: None,
+                        commit: Some("abc123".to_string()),
+                        branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                        integration: CheckoutIntegrationStatus::default(),
+                        message: None,
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?
         } else {
@@ -338,30 +342,34 @@ impl WorldBuilder for ConvoyWorldBuilder {
             .map_err(|error| error.to_string())?;
         let observed_at = self.clock.now().to_rfc3339();
         checkouts
-            .update_status("checkout-a", &checkout.metadata.resource_version, &CheckoutStatus {
-                clone_retry: None,
-                phase: CheckoutPhase::Ready,
-                path: Some("/work/checkout-a".to_string()),
-                commit: Some("abc123".to_string()),
-                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
-                integration: CheckoutIntegrationStatus {
-                    head_revision: None,
-                    clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                    pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at.clone()).build(),
-                    landed_evidence: None,
-                    change_request: Some(
-                        ChangeRequestObservation::builder()
-                            .id(CHANGE_REQUEST_NUMBER.to_string())
-                            .state(ChangeRequestState::Open)
-                            .mergeability(ChangeRequestMergeability::Unknown)
-                            .observed_at(observed_at)
-                            .build(),
-                    ),
-                    remote_refs: Default::default(),
+            .update_status(
+                "checkout-a",
+                &checkout.metadata.resource_version,
+                &CheckoutStatus {
+                    clone_retry: None,
+                    phase: CheckoutPhase::Ready,
+                    path: Some("/work/checkout-a".to_string()),
+                    commit: Some("abc123".to_string()),
+                    branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                    integration: CheckoutIntegrationStatus {
+                        head_revision: None,
+                        clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                        pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                        landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at.clone()).build(),
+                        landed_evidence: None,
+                        change_request: Some(
+                            ChangeRequestObservation::builder()
+                                .id(CHANGE_REQUEST_NUMBER.to_string())
+                                .state(ChangeRequestState::Open)
+                                .mergeability(ChangeRequestMergeability::Unknown)
+                                .observed_at(observed_at)
+                                .build(),
+                        ),
+                        remote_refs: Default::default(),
+                    },
+                    message: None,
                 },
-                message: None,
-            })
+            )
             .await
             .map_err(|error| error.to_string())?;
 

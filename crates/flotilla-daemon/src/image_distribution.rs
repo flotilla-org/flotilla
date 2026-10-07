@@ -283,9 +283,13 @@ impl ImageDistributionIo for DockerImageIo {
     async fn pull(&self, cache: &ImageCacheBinding, reference: &str) -> Result<(), String> {
         validate_registry_reference(cache, reference)?;
         self.credentials
-            .image_registry_operation(&self.host, HostImageAction::ImagePull, &cache.pull_credential, &cache.repository, &[
-                "pull", reference,
-            ])
+            .image_registry_operation(
+                &self.host,
+                HostImageAction::ImagePull,
+                &cache.pull_credential,
+                &cache.repository,
+                &["pull", reference],
+            )
             .await?;
         Ok(())
     }
@@ -387,10 +391,10 @@ mod tests {
                 .expect("fleet Project");
             backend
                 .definitions::<FleetDesignation>("test")
-                .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec {
-                    project: "fleet".into(),
-                    image_cache: Some(cache()),
-                })
+                .apply(
+                    &InputMeta::builder().name("fleet".into()).build(),
+                    &FleetDesignationSpec { project: "fleet".into(), image_cache: Some(cache()) },
+                )
                 .await
                 .expect("cache");
         }

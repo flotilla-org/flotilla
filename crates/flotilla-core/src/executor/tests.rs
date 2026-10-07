@@ -69,16 +69,19 @@ impl MockCheckoutManager {
     fn succeeding(branch: &str, path: &str) -> Self {
         Self {
             validate_result: tokio::sync::Mutex::new(Some(Ok(()))),
-            create_result: tokio::sync::Mutex::new(Some(Ok((PathBuf::from(path), Checkout {
-                branch: branch.to_string(),
-                is_main: false,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                host_name: None,
-                environment_id: None,
-            })))),
+            create_result: tokio::sync::Mutex::new(Some(Ok((
+                PathBuf::from(path),
+                Checkout {
+                    branch: branch.to_string(),
+                    is_main: false,
+                    trunk_ahead_behind: None,
+                    remote_ahead_behind: None,
+                    working_tree: None,
+                    last_commit: None,
+                    host_name: None,
+                    environment_id: None,
+                },
+            )))),
             remove_result: tokio::sync::Mutex::new(Some(Ok(()))),
         }
     }
@@ -950,10 +953,10 @@ async fn create_workspace_for_checkout_selects_existing_workspace() {
 async fn checkout_action_creates_workspace_after_checkout() {
     // Fresh checkout has no binding in the store, so a new workspace is
     // always created (binding-based lookup returns None).
-    let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:99".to_string(), Workspace {
-        name: "feat-x".to_string(),
-        attachable_set_id: None,
-    })]));
+    let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![(
+        "workspace:99".to_string(),
+        Workspace { name: "feat-x".to_string(), attachable_set_id: None },
+    )]));
 
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
@@ -2783,10 +2786,13 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         _ => panic!("expected steps"),
     };
 
-    assert_eq!(result, CommandValue::CheckoutCreated {
-        branch: "feat-x".into(),
-        path: QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat-x"),
-    });
+    assert_eq!(
+        result,
+        CommandValue::CheckoutCreated {
+            branch: "feat-x".into(),
+            path: QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat-x"),
+        }
+    );
 }
 
 #[tokio::test]
@@ -3348,10 +3354,10 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
     let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
-        role: "main".into(),
-        command: "bash".into(),
-    }];
+    let requested = vec![
+        PreparedTerminalCommand { role: "main".into(), command: "claude".into() },
+        PreparedTerminalCommand { role: "main".into(), command: "bash".into() },
+    ];
 
     let result = service
         .prepare_terminal_commands(&set_id, "feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))

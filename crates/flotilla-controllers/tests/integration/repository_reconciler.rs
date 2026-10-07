@@ -37,10 +37,13 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
     durable
         .clone()
         .using::<Environment>(NAMESPACE)
-        .create(&meta("env-host-a"), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".to_string(), repo_default_dir: "/repos".to_string() }),
-            docker: None,
-        })
+        .create(
+            &meta("env-host-a"),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".to_string(), repo_default_dir: "/repos".to_string() }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment create");
     durable
@@ -92,23 +95,30 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .expect("observed checkout create");
     let clones = durable.clone().using::<Clone>(NAMESPACE);
     let clone = clones
-        .create(&meta("clone-a"), &CloneSpec {
-            repo_ref: repository_key.clone(),
-            url: "https://github.com/org/repo.git".to_string(),
-            env_ref: "env-host-a".to_string(),
-            path: "/repos/repo".to_string(),
-        })
+        .create(
+            &meta("clone-a"),
+            &CloneSpec {
+                repo_ref: repository_key.clone(),
+                url: "https://github.com/org/repo.git".to_string(),
+                env_ref: "env-host-a".to_string(),
+                path: "/repos/repo".to_string(),
+            },
+        )
         .await
         .expect("clone create");
     clones
-        .update_status("clone-a", &clone.metadata.resource_version, &CloneStatus {
-            phase: ClonePhase::Ready,
-            default_branch: Some("main".to_string()),
-            message: None,
-            failed_at: None,
-            failure_policy: None,
-            retry: None,
-        })
+        .update_status(
+            "clone-a",
+            &clone.metadata.resource_version,
+            &CloneStatus {
+                phase: ClonePhase::Ready,
+                default_branch: Some("main".to_string()),
+                message: None,
+                failed_at: None,
+                failure_policy: None,
+                retry: None,
+            },
+        )
         .await
         .expect("clone status");
 

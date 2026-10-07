@@ -393,13 +393,16 @@ mod tests {
             let Arg::NestedCommand(shell) = argv.last().expect("remote command") else { panic!("login shell") };
             assert_eq!(&shell[..3], [Arg::Literal("${SHELL:-/bin/sh}".into()), Arg::Literal("-l".into()), Arg::Literal("-c".into())]);
             let Arg::NestedCommand(command) = shell.last().expect("attach command") else { panic!("attach argv") };
-            assert_eq!(&command[..5], [
-                Arg::Literal("flotilla".into()),
-                Arg::Literal("attach".into()),
-                Arg::Literal("--transient".into()),
-                Arg::Literal("--host".into()),
-                Arg::Quoted("kiwi".into())
-            ]);
+            assert_eq!(
+                &command[..5],
+                [
+                    Arg::Literal("flotilla".into()),
+                    Arg::Literal("attach".into()),
+                    Arg::Literal("--transient".into()),
+                    Arg::Literal("--host".into()),
+                    Arg::Quoted("kiwi".into())
+                ]
+            );
             assert_eq!(&command[command.len() - 2..], [Arg::Literal("--".into()), Arg::Quoted("crew session".into())]);
             let seat_args = &command[5..command.len() - 2];
             assert_eq!(seat_args, &flag.map(|flag| vec![Arg::Literal(flag.into())]).unwrap_or_default());
@@ -420,10 +423,10 @@ mod tests {
     #[test]
     fn env_assignment_rejects_invalid_argv_keys() {
         for key in ["", "A=B", "FOO-BAR", "9KEY", "A;cmd"] {
-            let plan = ResolvedAttachPlan::command(vec![Arg::Literal("env".into()), Arg::EnvAssignment {
-                key: key.into(),
-                value: "value".into(),
-            }]);
+            let plan = ResolvedAttachPlan::command(vec![
+                Arg::Literal("env".into()),
+                Arg::EnvAssignment { key: key.into(), value: "value".into() },
+            ]);
             assert!(attach_argv(&plan).is_err());
         }
     }

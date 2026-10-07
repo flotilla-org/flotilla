@@ -980,10 +980,10 @@ async fn discover_providers_inner(
     );
     if let Some(impl_name) = flotilla_config.ai_utility.claude.as_ref().and_then(|c| c.implementation.as_deref()) {
         if !registry.ai_utilities.prefer_by_implementation(impl_name) {
-            unmet.push((ProviderCategory::AiUtility.slug().into(), UnmetRequirement::UnknownProviderPreference {
-                category: ProviderCategory::AiUtility,
-                key: impl_name.into(),
-            }));
+            unmet.push((
+                ProviderCategory::AiUtility.slug().into(),
+                UnmetRequirement::UnknownProviderPreference { category: ProviderCategory::AiUtility, key: impl_name.into() },
+            ));
         }
     }
     apply_backend_pref(

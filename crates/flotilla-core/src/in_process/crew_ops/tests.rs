@@ -100,30 +100,37 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
         .await
         .expect("convoy");
     convoys
-        .update_status("crew", &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Landing,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                vessels: vec![flotilla_resources::VesselRequirement::builder()
-                    .name("work".into())
-                    .crew(vec![flotilla_resources::CrewSpec::builder()
-                        .role("coder".into())
-                        .source(CrewSource::Agent {
-                            selector: Selector { capability: "code".into(), adapter: None, model: None },
-                            prompt: None,
-                            brief_template: None,
-                        })
-                        .build()])
-                    .build()],
-                exit: None,
-                turn_delivery: Default::default(),
-                stall_nudges: Default::default(),
-                supervision: None,
-            }),
-            work: BTreeMap::from([("work".into(), WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build())]),
-            crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]))]),
-            ..Default::default()
-        })
+        .update_status(
+            "crew",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    vessels: vec![flotilla_resources::VesselRequirement::builder()
+                        .name("work".into())
+                        .crew(vec![flotilla_resources::CrewSpec::builder()
+                            .role("coder".into())
+                            .source(CrewSource::Agent {
+                                selector: Selector { capability: "code".into(), adapter: None, model: None },
+                                prompt: None,
+                                brief_template: None,
+                            })
+                            .build()])
+                        .build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("status");
     backend
@@ -168,9 +175,10 @@ async fn resume_restores_work_until_credentials_are_staged() {
     assert_eq!(error, "staging unavailable");
     let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
     assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
-    assert_eq!(crew.resume("flotilla", "crew", "continue", None, None).await.expect("retry"), ConvoyResumeOutcome::Queued {
-        displaced: None
-    });
+    assert_eq!(
+        crew.resume("flotilla", "crew", "continue", None, None).await.expect("retry"),
+        ConvoyResumeOutcome::Queued { displaced: None }
+    );
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
     assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
     let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
@@ -194,9 +202,10 @@ fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
             match operation {
                 0 | 1 => {
                     let prompt = if operation == 0 { "first" } else { "second" };
-                    assert_eq!(crew.resume("flotilla", "crew", prompt, None, None).await.expect("queue"), ConvoyResumeOutcome::Queued {
-                        displaced: expected.clone()
-                    });
+                    assert_eq!(
+                        crew.resume("flotilla", "crew", prompt, None, None).await.expect("queue"),
+                        ConvoyResumeOutcome::Queued { displaced: expected.clone() }
+                    );
                     expected = Some(prompt.to_string());
                 }
                 2 => {
@@ -329,12 +338,15 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
         backend
             .using::<Vessel>("flotilla")
-            .create(&InputMeta::builder().name("vessel".into()).build(), &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &InputMeta::builder().name("vessel".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "crew".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "test".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("vessel");
         let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -347,15 +359,19 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         let sessions = backend.using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("session").await.expect("session");
         sessions
-            .update_status("session", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                crew: Some(flotilla_resources::CrewSessionStatus {
-                    id: "governor-id".into(),
-                    adapter: "codex".into(),
-                    model: None,
-                    stance: "trusted-implicit".into(),
-                }),
-                ..Default::default()
-            })
+            .update_status(
+                "session",
+                &session.metadata.resource_version,
+                &flotilla_resources::TerminalSessionStatus {
+                    crew: Some(flotilla_resources::CrewSessionStatus {
+                        id: "governor-id".into(),
+                        adapter: "codex".into(),
+                        model: None,
+                        stance: "trusted-implicit".into(),
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("crew identity");
         let repository_spec = flotilla_resources::RepositorySpec::remote("https://github.com/example/live").expect("repository spec");
@@ -509,15 +525,19 @@ async fn turn_admission_returns_the_canonical_suppressed_message() {
         .expectation(MessageExpectation::Reply)
         .build();
     let first = crew.deliver_turn(&request).await.expect("first admission");
-    flotilla_resources::apply_status_patch(&backend.using::<Message>("flotilla"), &first.message.name, &MessageStatusPatch::Delivered {
-        receiver: ResolvedMessageReceiver::builder()
-            .crew_id("crew-id".into())
-            .session("session".into())
-            .delivered_at(Utc::now())
-            .evidence("transport acceptance".into())
-            .build(),
-        at: Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &backend.using::<Message>("flotilla"),
+        &first.message.name,
+        &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew-id".into())
+                .session("session".into())
+                .delivered_at(Utc::now())
+                .evidence("transport acceptance".into())
+                .build(),
+            at: Utc::now(),
+        },
+    )
     .await
     .expect("open receipt");
     let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status;
@@ -549,15 +569,19 @@ async fn follow_up_reference_releases_from_message_evidence() {
     let pending = convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].pending_follow_up.clone().unwrap();
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
     assert_eq!(convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].pending_follow_up.as_ref(), Some(&pending));
-    flotilla_resources::apply_status_patch(&backend.using::<Message>("flotilla"), &pending.name, &MessageStatusPatch::Delivered {
-        receiver: ResolvedMessageReceiver::builder()
-            .crew_id("crew-id".into())
-            .session("session".into())
-            .delivered_at(Utc::now())
-            .evidence("transport acceptance".into())
-            .build(),
-        at: Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &backend.using::<Message>("flotilla"),
+        &pending.name,
+        &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew-id".into())
+                .session("session".into())
+                .delivered_at(Utc::now())
+                .evidence("transport acceptance".into())
+                .build(),
+            at: Utc::now(),
+        },
+    )
     .await
     .unwrap();
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
@@ -595,15 +619,19 @@ async fn follow_up_reference_uses_target_namespace() {
     intent.body = "target continuation".into();
     let messages = backend.using::<Message>("target");
     messages.create(&InputMeta::builder().name(name.clone()).build(), &intent).await.expect("target message");
-    flotilla_resources::apply_status_patch(&messages, &name, &MessageStatusPatch::Delivered {
-        receiver: ResolvedMessageReceiver::builder()
-            .crew_id("crew-id".into())
-            .session("session".into())
-            .delivered_at(Utc::now())
-            .evidence("transport acceptance".into())
-            .build(),
-        at: Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &messages,
+        &name,
+        &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew-id".into())
+                .session("session".into())
+                .delivered_at(Utc::now())
+                .evidence("transport acceptance".into())
+                .build(),
+            at: Utc::now(),
+        },
+    )
     .await
     .expect("target delivery evidence");
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue from target");
@@ -659,15 +687,19 @@ async fn remote_suppression_restores_workflow_before_replication() {
         .expectation(MessageExpectation::Reply)
         .build();
     inbox.accept(&InputMeta::builder().name("canonical".into()).build(), &existing, Utc::now()).await.unwrap();
-    flotilla_resources::apply_status_patch(&remote.using::<Message>("flotilla"), "canonical", &MessageStatusPatch::Delivered {
-        receiver: ResolvedMessageReceiver::builder()
-            .crew_id("crew-id".into())
-            .session("session".into())
-            .delivered_at(Utc::now())
-            .evidence("accepted at receiver".into())
-            .build(),
-        at: Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &remote.using::<Message>("flotilla"),
+        "canonical",
+        &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew-id".into())
+                .session("session".into())
+                .delivered_at(Utc::now())
+                .evidence("accepted at receiver".into())
+                .build(),
+            at: Utc::now(),
+        },
+    )
     .await
     .unwrap();
     let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(ReceiverPublisher(inbox));
@@ -739,15 +771,19 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
             .expectation(MessageExpectation::Reply)
             .build();
         inbox.accept(&InputMeta::builder().name("canonical".into()).build(), &intent, Utc::now()).await.unwrap();
-        flotilla_resources::apply_status_patch(&receiver.using::<Message>("flotilla"), "canonical", &MessageStatusPatch::Delivered {
-            receiver: ResolvedMessageReceiver::builder()
-                .crew_id("crew-id".into())
-                .session("session".into())
-                .delivered_at(Utc::now())
-                .evidence("receiver receipt".into())
-                .build(),
-            at: Utc::now(),
-        })
+        flotilla_resources::apply_status_patch(
+            &receiver.using::<Message>("flotilla"),
+            "canonical",
+            &MessageStatusPatch::Delivered {
+                receiver: ResolvedMessageReceiver::builder()
+                    .crew_id("crew-id".into())
+                    .session("session".into())
+                    .delivered_at(Utc::now())
+                    .evidence("receiver receipt".into())
+                    .build(),
+                at: Utc::now(),
+            },
+        )
         .await
         .unwrap();
         let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(ReceiverPublisher(inbox));
@@ -899,11 +935,15 @@ async fn resume_and_withdraw_wait_for_follow_up_replication() {
     for withdraw in [false, true] {
         let (crew, backend, _, _config) = fixture(CrewWorkPhase::Done).await;
         let convoys = backend.using::<ResourceConvoy>("flotilla");
-        apply_resource_status_patch(&convoys, "crew", &ConvoyStatusPatch::QueueMessageFollowUp {
-            vessel: "work".into(),
-            role: "coder".into(),
-            message: Some(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "not-replicated")),
-        })
+        apply_resource_status_patch(
+            &convoys,
+            "crew",
+            &ConvoyStatusPatch::QueueMessageFollowUp {
+                vessel: "work".into(),
+                role: "coder".into(),
+                message: Some(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "not-replicated")),
+            },
+        )
         .await
         .expect("pending continuation");
         let before = convoys.get("crew").await.expect("before command").status;
@@ -1099,20 +1139,26 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<Vessel>("flotilla")
-        .create(&InputMeta::builder().name("vessel".into()).build(), &VesselSpec {
-            convoy_ref: "crew".into(),
-            vessel_name: "work".into(),
-            placement_policy_ref: "policy".into(),
-            adopted_checkout_refs: Default::default(),
-        })
+        .create(
+            &InputMeta::builder().name("vessel".into()).build(),
+            &VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
         .await
         .expect("vessel");
     backend
         .using::<Environment>("flotilla")
-        .create(&InputMeta::builder().name("resume-env".into()).build(), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
-            docker: None,
-        })
+        .create(
+            &InputMeta::builder().name("resume-env".into()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment");
     let source = Arc::new(Delivery(
@@ -1236,18 +1282,22 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     }
     let session = sessions.get("session").await.expect("session");
     sessions
-        .update_status("session", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            session_id: Some("terminal".into()),
-            crew: Some(
-                flotilla_resources::CrewSessionStatus::builder()
-                    .id("crew-id".into())
-                    .adapter("codex".into())
-                    .stance("trusted".into())
-                    .build(),
-            ),
-            ..Default::default()
-        })
+        .update_status(
+            "session",
+            &session.metadata.resource_version,
+            &flotilla_resources::TerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                session_id: Some("terminal".into()),
+                crew: Some(
+                    flotilla_resources::CrewSessionStatus::builder()
+                        .id("crew-id".into())
+                        .adapter("codex".into())
+                        .stance("trusted".into())
+                        .build(),
+                ),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running holder");
     let transport = Transport { working: AtomicBool::new(true), submitted: Mutex::new(Vec::new()) };
@@ -1310,12 +1360,15 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
         probe.fail.store(false, Ordering::SeqCst);
         backend
             .using::<Vessel>("flotilla")
-            .create(&InputMeta::builder().name("vessel".into()).build(), &VesselSpec {
-                convoy_ref: "crew".into(),
-                vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &InputMeta::builder().name("vessel".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "crew".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "test".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("caller vessel");
         let convoys = backend.using::<ResourceConvoy>("flotilla");
@@ -1497,15 +1550,19 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
             .await
             .expect("governor session");
         sessions
-            .update_status("governor-session", &governor_session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                crew: Some(flotilla_resources::CrewSessionStatus {
-                    id: "governor-id".into(),
-                    adapter: "codex".into(),
-                    model: None,
-                    stance: "trusted-implicit".into(),
-                }),
-                ..Default::default()
-            })
+            .update_status(
+                "governor-session",
+                &governor_session.metadata.resource_version,
+                &flotilla_resources::TerminalSessionStatus {
+                    crew: Some(flotilla_resources::CrewSessionStatus {
+                        id: "governor-id".into(),
+                        adapter: "codex".into(),
+                        model: None,
+                        stance: "trusted-implicit".into(),
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("supervisor identity");
         let escalation = MessageSpec::builder()

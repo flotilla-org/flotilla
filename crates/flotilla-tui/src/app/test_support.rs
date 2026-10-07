@@ -59,21 +59,24 @@ fn local_node_id() -> NodeId {
 fn insert_stub_local_host(model: &mut TuiModel) {
     let host_name = HostName::local();
     let environment_id = EnvironmentId::host(HostId::new("local-test-host"));
-    model.hosts.insert(environment_id.clone(), TuiHostState {
-        environment_id: environment_id.clone(),
-        host_name: host_name.clone(),
-        is_local: true,
-        status: super::PeerStatus::Connected,
-        summary: HostSummary {
-            environment_id,
-            host_name: Some(host_name.clone()),
-            node: NodeInfo::new(local_node_id(), host_name.as_str()),
-            system: flotilla_protocol::SystemInfo::default(),
-            inventory: flotilla_protocol::ToolInventory::default(),
-            providers: vec![],
-            environments: vec![],
+    model.hosts.insert(
+        environment_id.clone(),
+        TuiHostState {
+            environment_id: environment_id.clone(),
+            host_name: host_name.clone(),
+            is_local: true,
+            status: super::PeerStatus::Connected,
+            summary: HostSummary {
+                environment_id,
+                host_name: Some(host_name.clone()),
+                node: NodeInfo::new(local_node_id(), host_name.as_str()),
+                system: flotilla_protocol::SystemInfo::default(),
+                inventory: flotilla_protocol::ToolInventory::default(),
+                providers: vec![],
+                environments: vec![],
+            },
         },
-    });
+    );
 }
 
 impl StubDaemon {

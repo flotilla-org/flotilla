@@ -285,14 +285,17 @@ impl GitHubChangeRequest {
             Self::parse_state(&pr.state)
         };
 
-        (id, ChangeRequest {
-            title: pr.title.clone(),
-            branch: pr.head_ref_name.clone(),
-            status,
-            body: pr.body.clone(),
-            provider_name: self.provider_name.clone(),
-            provider_display_name: "GitHub".into(),
-        })
+        (
+            id,
+            ChangeRequest {
+                title: pr.title.clone(),
+                branch: pr.head_ref_name.clone(),
+                status,
+                body: pr.body.clone(),
+                provider_name: self.provider_name.clone(),
+                provider_display_name: "GitHub".into(),
+            },
+        )
     }
 
     fn next_history_page(request: &serde_json::Value) -> Option<HistoryPage> {

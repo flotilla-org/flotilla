@@ -1163,10 +1163,10 @@ dependency = { path = "../dependency" }
         if docker && fail {
             assert!(result.unwrap_err().contains("unavailable"));
         } else {
-            assert_eq!(result.unwrap().iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec![
-                "fourth";
-                if docker { count } else { 0 }
-            ]);
+            assert_eq!(
+                result.unwrap().iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+                vec!["fourth"; if docker { count } else { 0 }]
+            );
         }
         assert_eq!(
             preparations.load(Ordering::Relaxed),

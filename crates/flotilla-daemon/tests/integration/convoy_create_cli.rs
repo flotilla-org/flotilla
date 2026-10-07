@@ -241,9 +241,10 @@ async fn convoy_create_command_creates_convoy_resource() {
         )
         .await
         .expect("execute invalid role");
-    assert_eq!(await_command_result(&mut rx, invalid_id).await, CommandValue::Error {
-        message: "convoy name `bad@role` must be a lowercase DNS label of at most 63 characters".into()
-    });
+    assert_eq!(
+        await_command_result(&mut rx, invalid_id).await,
+        CommandValue::Error { message: "convoy name `bad@role` must be a lowercase DNS label of at most 63 characters".into() }
+    );
 }
 
 #[tokio::test]

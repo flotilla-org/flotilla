@@ -12,21 +12,19 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.using::<Host>("flotilla");
     let host = hosts
-        .create(&InputMeta::builder().name("host-id".to_string()).build(), &HostSpec {
-            display_name: "feta".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &InputMeta::builder().name("host-id".to_string()).build(),
+            &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("host");
     let full = HostStatus {
         ready: true,
         heartbeat_at: Some(Utc::now()),
-        fulfilment_facts: BTreeMap::from([("linux-docker".to_string(), FulfilmentFacts {
-            free_vessel_slots: Some(0),
-            observed_at: Utc::now(),
-            ..Default::default()
-        })]),
+        fulfilment_facts: BTreeMap::from([(
+            "linux-docker".to_string(),
+            FulfilmentFacts { free_vessel_slots: Some(0), observed_at: Utc::now(), ..Default::default() },
+        )]),
         ..Default::default()
     };
     let host = hosts.update_status("host-id", &host.metadata.resource_version, &full).await.expect("full host");
@@ -62,10 +60,11 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         }),
     };
     let convoy = convoys
-        .update_status("waiting", &convoy.metadata.resource_version, &ConvoyStatus {
-            placement_decision: Some(decision),
-            ..Default::default()
-        })
+        .update_status(
+            "waiting",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus { placement_decision: Some(decision), ..Default::default() },
+        )
         .await
         .expect("decision");
     let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
@@ -94,11 +93,10 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
     assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::SetStalled { condition: None })));
 
     hosts
-        .create(&InputMeta::builder().name("another-host-id".to_string()).build(), &HostSpec {
-            display_name: "feta".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &InputMeta::builder().name("another-host-id".to_string()).build(),
+            &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("second host with same display name");
     let prepared = reconciler.prepare(&convoy).await.expect("ambiguous host waits instead of failing prepare");

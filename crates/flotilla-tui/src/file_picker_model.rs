@@ -298,11 +298,10 @@ mod tests {
         let scan_count = Arc::clone(&scans);
         let mut listing = DirectoryListing::with_scanner(Arc::new(move |_: &Path| {
             scan_count.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![Directory { name: "alpha".into(), path: "/repos/alpha".into(), is_git_repo: true }, Directory {
-                name: "beta".into(),
-                path: "/repos/beta".into(),
-                is_git_repo: false,
-            }])
+            Ok(vec![
+                Directory { name: "alpha".into(), path: "/repos/alpha".into(), is_git_repo: true },
+                Directory { name: "beta".into(), path: "/repos/beta".into(), is_git_repo: false },
+            ])
         }));
         listing.update("/repos/");
         tokio::time::timeout(Duration::from_secs(1), async {

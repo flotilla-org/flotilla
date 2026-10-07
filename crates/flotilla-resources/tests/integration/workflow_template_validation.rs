@@ -120,11 +120,10 @@ vessels:
     assert_eq!(spec.stall_nudges["work/coder"].max_per_episode, 0);
     assert!(serde_yml::to_string(&spec).expect("serialize").contains("max_per_episode: 0"));
     let mut invalid = spec;
-    invalid.stall_nudges.insert("work/reviewer".to_string(), flotilla_resources::StallNudgePolicy {
-        max_per_episode: 1,
-        max_refusals: None,
-        idle_grace_seconds: None,
-    });
+    invalid.stall_nudges.insert(
+        "work/reviewer".to_string(),
+        flotilla_resources::StallNudgePolicy { max_per_episode: 1, max_refusals: None, idle_grace_seconds: None },
+    );
     assert!(validate(&invalid)
         .expect_err("unknown role")
         .iter()
@@ -356,12 +355,10 @@ fn stock_landing_workflows_validate_with_checks_review_conflicting_and_merged_tu
         ("implement-review", implement_review_workflow_spec(), "coder"),
     ] {
         validate(&spec).unwrap_or_else(|errors| panic!("stock workflow {name} must validate: {errors:?}"));
-        assert_eq!(spec.turn_delivery.keys().filter(|source| !source.starts_with("reviewer-")).map(String::as_str).collect::<Vec<_>>(), [
-            "checks-settled",
-            "merged-unclaimed",
-            "actionable-review",
-            "conflicting"
-        ]);
+        assert_eq!(
+            spec.turn_delivery.keys().filter(|source| !source.starts_with("reviewer-")).map(String::as_str).collect::<Vec<_>>(),
+            ["checks-settled", "merged-unclaimed", "actionable-review", "conflicting"]
+        );
         for (source, rule) in &spec.turn_delivery {
             assert_eq!(rule.to.vessel, "work", "wrong vessel in {name}");
             assert_eq!(rule.to.role, if source.starts_with("reviewer-") { "reviewer" } else { role }, "wrong role in {name}");
@@ -612,9 +609,10 @@ fn validate_rejects_cycles() {
     spec.vessels[0].depends_on = vec!["review".to_string()];
 
     let errors = validate(&spec).expect_err("validation should fail");
-    assert_has_error(&errors, &ValidationError::DependencyCycle {
-        cycle: vec!["implement".to_string(), "review".to_string(), "implement".to_string()],
-    });
+    assert_has_error(
+        &errors,
+        &ValidationError::DependencyCycle { cycle: vec!["implement".to_string(), "review".to_string(), "implement".to_string()] },
+    );
 }
 
 #[test]
@@ -628,10 +626,17 @@ fn validate_rejects_unknown_input_references() {
     }
 
     let errors = validate(&spec).expect_err("validation should fail");
-    assert_has_error(&errors, &ValidationError::UnknownInputReference {
-        location: InterpolationLocation { vessel: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
-        name: "missing".to_string(),
-    });
+    assert_has_error(
+        &errors,
+        &ValidationError::UnknownInputReference {
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt,
+            },
+            name: "missing".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -645,10 +650,17 @@ fn validate_rejects_unknown_workflow_fields() {
     }
 
     let errors = validate(&spec).expect_err("validation should fail");
-    assert_has_error(&errors, &ValidationError::UnknownWorkflowField {
-        location: InterpolationLocation { vessel: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
-        name: "uid".to_string(),
-    });
+    assert_has_error(
+        &errors,
+        &ValidationError::UnknownWorkflowField {
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt,
+            },
+            name: "uid".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -662,14 +674,28 @@ fn validate_rejects_malformed_owned_interpolations() {
     }
 
     let errors = validate(&spec).expect_err("validation should fail");
-    assert_has_error(&errors, &ValidationError::MalformedInterpolation {
-        location: InterpolationLocation { vessel: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
-        text: "inputs.branch ".to_string(),
-    });
-    assert_has_error(&errors, &ValidationError::MalformedInterpolation {
-        location: InterpolationLocation { vessel: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
-        text: "workflow.name.extra".to_string(),
-    });
+    assert_has_error(
+        &errors,
+        &ValidationError::MalformedInterpolation {
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt,
+            },
+            text: "inputs.branch ".to_string(),
+        },
+    );
+    assert_has_error(
+        &errors,
+        &ValidationError::MalformedInterpolation {
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt,
+            },
+            text: "workflow.name.extra".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -694,11 +720,14 @@ fn validate_rejects_reserved_process_label_keys() {
     spec.vessels[0].crew[0].labels.insert("flotilla.work/convoy".to_string(), "manual".to_string());
 
     let errors = validate(&spec).expect_err("reserved labels should fail validation");
-    assert_has_error(&errors, &ValidationError::ReservedLabelKey {
-        vessel: "implement".to_string(),
-        role: "coder".to_string(),
-        key: "flotilla.work/convoy".to_string(),
-    });
+    assert_has_error(
+        &errors,
+        &ValidationError::ReservedLabelKey {
+            vessel: "implement".to_string(),
+            role: "coder".to_string(),
+            key: "flotilla.work/convoy".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -789,8 +818,8 @@ vessels:
 
     let errors = validate(&spec).expect_err("invalid repository scopes should fail validation");
     assert_has_error(&errors, &ValidationError::EmptyRepositoryScope { vessel: "empty".to_string() });
-    assert_has_error(&errors, &ValidationError::DuplicateRepositoryRef {
-        vessel: "duplicate".to_string(),
-        repo_ref: RepositoryKey("repo-a".to_string()),
-    });
+    assert_has_error(
+        &errors,
+        &ValidationError::DuplicateRepositoryRef { vessel: "duplicate".to_string(), repo_ref: RepositoryKey("repo-a".to_string()) },
+    );
 }

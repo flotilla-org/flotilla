@@ -123,10 +123,10 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     let initial_sequences = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let events = daemon
-                .subscribe_queries(subscriber, &[QueryCursor { query: fleet_query.clone(), since: None }, QueryCursor {
-                    query: project_query.clone(),
-                    since: None,
-                }])
+                .subscribe_queries(
+                    subscriber,
+                    &[QueryCursor { query: fleet_query.clone(), since: None }, QueryCursor { query: project_query.clone(), since: None }],
+                )
                 .await
                 .expect("subscribe checkout queries");
             let result_sets = events
@@ -229,10 +229,13 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     }
 
     let stale_replay = daemon
-        .subscribe_queries(subscriber, &[
-            QueryCursor { query: fleet_query.clone(), since: initial_sequences.get(&fleet_query).copied() },
-            QueryCursor { query: project_query.clone(), since: initial_sequences.get(&project_query).copied() },
-        ])
+        .subscribe_queries(
+            subscriber,
+            &[
+                QueryCursor { query: fleet_query.clone(), since: initial_sequences.get(&fleet_query).copied() },
+                QueryCursor { query: project_query.clone(), since: initial_sequences.get(&project_query).copied() },
+            ],
+        )
         .await
         .expect("replay stale checkout cursors");
     assert_eq!(stale_replay.iter().filter(|event| matches!(event, DaemonEvent::ResultSet(_))).count(), 2);
@@ -245,10 +248,13 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         .all(|rows| rows.len() == 1 && rows[0].branch == "feature/revised"));
 
     let current_replay = daemon
-        .subscribe_queries(subscriber, &[
-            QueryCursor { query: fleet_query.clone(), since: modifications.get(&fleet_query).map(|delta| delta.seq) },
-            QueryCursor { query: project_query.clone(), since: modifications.get(&project_query).map(|delta| delta.seq) },
-        ])
+        .subscribe_queries(
+            subscriber,
+            &[
+                QueryCursor { query: fleet_query.clone(), since: modifications.get(&fleet_query).map(|delta| delta.seq) },
+                QueryCursor { query: project_query.clone(), since: modifications.get(&project_query).map(|delta| delta.seq) },
+            ],
+        )
         .await
         .expect("subscribe with current checkout cursors");
     assert!(current_replay.is_empty());
@@ -594,48 +600,63 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .await
         .expect("create convoy terminal session");
     sessions
-        .update_status(&convoy_session.metadata.name, &convoy_session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("cleat-convoy-coder".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy_session.metadata.name,
+            &convoy_session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("cleat-convoy-coder".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark convoy terminal session running");
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.create(&convoy_meta("convoy-a"), &convoy_spec("scratch")).await.expect("create convoy for bound terminal session");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement::builder().name("coder".to_string()).crew(Vec::new()).build()],
-            }),
-            work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder().name("coder".to_string()).crew(Vec::new()).build()],
+                }),
+                work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark convoy vessel running");
     let unresolvable = sessions
-        .create(&InputMeta::builder().name("terminal-unresolvable".to_string()).build(), &TerminalSessionSpec {
-            env_ref: "missing-environment".to_string(),
-            role: "observer".to_string(),
-            source: TerminalSessionSource::Tool { command: "bash".to_string() },
-            cwd: "/repo".to_string(),
-            env: Default::default(),
-            pool: "fake".to_string(),
-        })
+        .create(
+            &InputMeta::builder().name("terminal-unresolvable".to_string()).build(),
+            &TerminalSessionSpec {
+                env_ref: "missing-environment".to_string(),
+                role: "observer".to_string(),
+                source: TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/repo".to_string(),
+                env: Default::default(),
+                pool: "fake".to_string(),
+            },
+        )
         .await
         .expect("create unresolvable terminal session");
     sessions
-        .update_status(&unresolvable.metadata.name, &unresolvable.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("cleat-unresolvable".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &unresolvable.metadata.name,
+            &unresolvable.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("cleat-unresolvable".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark unresolvable terminal session running");
     let options = RuntimeOptions {
@@ -668,11 +689,15 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .await
         .expect("create terminal session");
     sessions
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("cleat-yeoman".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("cleat-yeoman".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark terminal session running");
 
@@ -787,10 +812,10 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
 
     let scope = QueryScope::new("flotilla", "flotilla");
     let scoped = daemon
-        .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor {
-            query: QueryId::Independents { scope: Some(scope.clone()) },
-            since: None,
-        }])
+        .subscribe_queries(
+            uuid::Uuid::new_v4(),
+            &[QueryCursor { query: QueryId::Independents { scope: Some(scope.clone()) }, since: None }],
+        )
         .await
         .expect("subscribe to project independents query");
     let scoped_rows = scoped

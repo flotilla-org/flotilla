@@ -66,12 +66,15 @@ async fn mismatched_clone_name_fails() {
         .expect("repository create should succeed");
     let resolver = backend.using::<flotilla_resources::Clone>("flotilla");
     let clone = resolver
-        .create(&meta("clone-wrong"), &CloneSpec {
-            repo_ref: repository_key,
-            url: "git@github.com:flotilla-org/flotilla.git".to_string(),
-            env_ref: "host-direct-01HXYZ".to_string(),
-            path: "/Users/alice/dev/flotilla".to_string(),
-        })
+        .create(
+            &meta("clone-wrong"),
+            &CloneSpec {
+                repo_ref: repository_key,
+                url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+                env_ref: "host-direct-01HXYZ".to_string(),
+                path: "/Users/alice/dev/flotilla".to_string(),
+            },
+        )
         .await
         .expect("create should succeed");
     let reconciler = CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.using("flotilla"));
@@ -94,12 +97,15 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
     let clone = backend
         .clone()
         .using::<flotilla_resources::Clone>("flotilla")
-        .create(&meta(&clone_name), &CloneSpec {
-            repo_ref: repository_key,
-            url: "git@github.work:flotilla-org/flotilla.git".to_string(),
-            env_ref: env_ref.to_string(),
-            path: "/Users/alice/dev/flotilla".to_string(),
-        })
+        .create(
+            &meta(&clone_name),
+            &CloneSpec {
+                repo_ref: repository_key,
+                url: "git@github.work:flotilla-org/flotilla.git".to_string(),
+                env_ref: env_ref.to_string(),
+                path: "/Users/alice/dev/flotilla".to_string(),
+            },
+        )
         .await
         .expect("clone should create");
     let reconciler = CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.using("flotilla"));
@@ -123,12 +129,15 @@ async fn clone_failures_remain_retryable() {
     let clone = backend
         .clone()
         .using::<flotilla_resources::Clone>("flotilla")
-        .create(&meta(&clone_name), &CloneSpec {
-            repo_ref: repository_key,
-            url: "git@github.com:flotilla-org/private.git".to_string(),
-            env_ref: env_ref.to_string(),
-            path: "/Users/alice/dev/private".to_string(),
-        })
+        .create(
+            &meta(&clone_name),
+            &CloneSpec {
+                repo_ref: repository_key,
+                url: "git@github.com:flotilla-org/private.git".to_string(),
+                env_ref: env_ref.to_string(),
+                path: "/Users/alice/dev/private".to_string(),
+            },
+        )
         .await
         .expect("clone should create");
     let reconciler = CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla"));
@@ -169,12 +178,15 @@ async fn transient_clone_failure_remains_retryable_and_converges() {
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", env_ref));
     let clones = backend.clone().using::<flotilla_resources::Clone>("flotilla");
     let clone = clones
-        .create(&meta(&clone_name), &CloneSpec {
-            repo_ref: repository_key,
-            url: "git@github.com:flotilla-org/flotilla.git".to_string(),
-            env_ref: env_ref.to_string(),
-            path: "/Users/alice/dev/flotilla".to_string(),
-        })
+        .create(
+            &meta(&clone_name),
+            &CloneSpec {
+                repo_ref: repository_key,
+                url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+                env_ref: env_ref.to_string(),
+                path: "/Users/alice/dev/flotilla".to_string(),
+            },
+        )
         .await
         .expect("clone should create");
     let reconciler =

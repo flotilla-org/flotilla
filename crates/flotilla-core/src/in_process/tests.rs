@@ -126,11 +126,14 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let provider: Arc<dyn ChangeRequestTracker> = Arc::new(FakeChangeRequest::new());
     for repository in [&first, &second] {
-        daemon.convoy_admission.repository_change_requests.write().await.insert(repository.key(), RepositoryChangeRequestProvider {
-            service_url: "https://github.com".to_string(),
-            repository: repository.key().to_string(),
-            provider: Arc::clone(&provider),
-        });
+        daemon.convoy_admission.repository_change_requests.write().await.insert(
+            repository.key(),
+            RepositoryChangeRequestProvider {
+                service_url: "https://github.com".to_string(),
+                repository: repository.key().to_string(),
+                provider: Arc::clone(&provider),
+            },
+        );
     }
     repositories.delete(&first.key().to_string()).await.expect("delete first repository");
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -150,11 +153,10 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
 
     let third = RepositorySpec::remote("https://github.com/example/third").expect("third repository");
     repositories.create(&test_meta(&third.key().to_string()), &third).await.expect("create third repository");
-    daemon.convoy_admission.repository_change_requests.write().await.insert(third.key(), RepositoryChangeRequestProvider {
-        service_url: "https://github.com".to_string(),
-        repository: third.key().to_string(),
-        provider,
-    });
+    daemon.convoy_admission.repository_change_requests.write().await.insert(
+        third.key(),
+        RepositoryChangeRequestProvider { service_url: "https://github.com".to_string(), repository: third.key().to_string(), provider },
+    );
     backend
         .clone()
         .using::<Repository>("alternate")
@@ -226,19 +228,23 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
             .expect("change request");
         let observed_at = Utc::now();
         change_requests
-            .update_status(name, &created.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-                title: flotilla_resources::Observation::known(format!("PR {number}"), observed_at),
-                author: Default::default(),
-                review_decision: Default::default(),
-                review_requested_from_owner: Default::default(),
-                state: flotilla_resources::Observation::known(state, observed_at),
-                head_sha: flotilla_resources::Observation::unknown(observed_at),
-                checks: flotilla_resources::Observation::unknown(observed_at),
-                review: flotilla_resources::ChangeRequestReviewObservation {
-                    actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+            .update_status(
+                name,
+                &created.metadata.resource_version,
+                &flotilla_resources::ChangeRequestStatus {
+                    title: flotilla_resources::Observation::known(format!("PR {number}"), observed_at),
+                    author: Default::default(),
+                    review_decision: Default::default(),
+                    review_requested_from_owner: Default::default(),
+                    state: flotilla_resources::Observation::known(state, observed_at),
+                    head_sha: flotilla_resources::Observation::unknown(observed_at),
+                    checks: flotilla_resources::Observation::unknown(observed_at),
+                    review: flotilla_resources::ChangeRequestReviewObservation {
+                        actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+                    },
+                    mergeable: flotilla_resources::Observation::unknown(observed_at),
                 },
-                mergeable: flotilla_resources::Observation::unknown(observed_at),
-            })
+            )
             .await
             .expect("change request status");
     }
@@ -349,13 +355,16 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
     let identity = RepoIdentity { authority: "github.com".into(), path: "team/repo".into() };
     daemon.repos.write().await.insert(
         identity.clone(),
-        RepoState::new(identity, RepoRootState {
-            path: temp.path().join("repo"),
-            model: RepoModel::new(registry, None),
-            slug: Some("team/repo".into()),
-            unmet: vec![],
-            is_local: true,
-        }),
+        RepoState::new(
+            identity,
+            RepoRootState {
+                path: temp.path().join("repo"),
+                model: RepoModel::new(registry, None),
+                slug: Some("team/repo".into()),
+                unmet: vec![],
+                is_local: true,
+            },
+        ),
     );
 
     let list = |kind| Command::builder().action(CommandAction::QueryCliList { kind }).build();
@@ -584,10 +593,11 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                 .await
                 .expect("queued terminal");
             sessions
-                .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-                    phase: ResourceTerminalSessionPhase::Running,
-                    ..Default::default()
-                })
+                .update_status(
+                    &session.metadata.name,
+                    &session.metadata.resource_version,
+                    &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
+                )
                 .await
                 .expect("running terminal");
             let intent = flotilla_resources::MessageSpec::builder()
@@ -689,19 +699,23 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         raised_at: Utc::now(),
     };
     convoys
-        .update_status(&governor.metadata.name, &governor.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            work: BTreeMap::from([(
-                "govern".to_string(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "govern".to_string(),
-                BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            attention: Some(existing_attention.clone()),
-            ..Default::default()
-        })
+        .update_status(
+            &governor.metadata.name,
+            &governor.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                work: BTreeMap::from([(
+                    "govern".to_string(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "govern".to_string(),
+                    BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                attention: Some(existing_attention.clone()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running governor");
     let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
@@ -741,10 +755,11 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         .await
         .expect("governor terminal on placement host");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
+        )
         .await
         .expect("running terminal");
     let request = crate::leaf_engine::CrewTurnIntent::builder()
@@ -983,26 +998,30 @@ async fn resume_staging_fixture_with_clock(
         .await
         .expect("convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Landing,
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![claim_crew("coder")]).build()],
-            }),
-            work: BTreeMap::from([(
-                "work".to_string(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Landing,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![claim_crew("coder")]).build()],
+                }),
+                work: BTreeMap::from([(
+                    "work".to_string(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status");
     backend
@@ -1208,13 +1227,17 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .await
         .expect("governor convoy");
     convoys
-        .update_status("governor", &governor.metadata.resource_version, &ConvoyStatus {
-            crew_work: BTreeMap::from([(
-                "watch".to_string(),
-                BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "governor",
+            &governor.metadata.resource_version,
+            &ConvoyStatus {
+                crew_work: BTreeMap::from([(
+                    "watch".to_string(),
+                    BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("governor status");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
@@ -1248,21 +1271,25 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .await
         .expect("governor session");
     sessions
-        .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            crew: Some(flotilla_resources::CrewSessionStatus {
-                id: "governor-crew".to_string(),
-                adapter: "codex".to_string(),
-                model: None,
-                stance: "governor".to_string(),
-            }),
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                as_of: chrono::Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "governor-session",
+            &governor_session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                crew: Some(flotilla_resources::CrewSessionStatus {
+                    id: "governor-crew".to_string(),
+                    adapter: "codex".to_string(),
+                    model: None,
+                    stance: "governor".to_string(),
+                }),
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    as_of: chrono::Utc::now(),
+                    source: TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("governor working");
     let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
@@ -1393,15 +1420,19 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     assert_eq!(guidance.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions
-        .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: chrono::Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "governor-session",
+            &governor_session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Idle,
+                    as_of: chrono::Utc::now(),
+                    source: TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("governor idle");
     let patch = convoy_external_patches::mark_crew_stalled(
@@ -1444,28 +1475,36 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .expect("reset crew to working");
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions
-        .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                as_of: chrono::Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "governor-session",
+            &governor_session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    as_of: chrono::Utc::now(),
+                    source: TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("governor working");
     let source_session = sessions.get("resume-staging-session").await.expect("source session");
     sessions
-        .update_status("resume-staging-session", &source_session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::NeedsInput,
-                as_of: chrono::Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "resume-staging-session",
+            &source_session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::NeedsInput,
+                    as_of: chrono::Utc::now(),
+                    source: TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("source needs input");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1485,15 +1524,19 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .expect("NeedsInput routes to governor");
     let source_session = sessions.get("resume-staging-session").await.expect("source session");
     sessions
-        .update_status("resume-staging-session", &source_session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Working,
-                as_of: chrono::Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "resume-staging-session",
+            &source_session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    as_of: chrono::Utc::now(),
+                    source: TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("source resumes work");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1552,10 +1595,11 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
         .await
         .expect("digest-backed session");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Stopped,
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Stopped, ..Default::default() },
+        )
         .await
         .expect("stopped session");
     let request = crate::leaf_engine::CrewTurnIntent::builder()
@@ -1599,24 +1643,29 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
     daemon.deliver_standing_turn(&request).await.expect("first intent");
     let messages = backend.using::<flotilla_resources::Message>("flotilla");
     let message = messages.list().await.expect("messages").items.remove(0);
-    flotilla_resources::apply_status_patch(&messages, &message.metadata.name, &flotilla_resources::MessageStatusPatch::Delivered {
-        receiver: flotilla_resources::ResolvedMessageReceiver::builder()
-            .crew_id("crew".into())
-            .session("old-session".into())
-            .delivered_at(Utc::now())
-            .evidence("holder accepted input".into())
-            .build(),
-        at: Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &messages,
+        &message.metadata.name,
+        &flotilla_resources::MessageStatusPatch::Delivered {
+            receiver: flotilla_resources::ResolvedMessageReceiver::builder()
+                .crew_id("crew".into())
+                .session("old-session".into())
+                .delivered_at(Utc::now())
+                .evidence("holder accepted input".into())
+                .build(),
+            at: Utc::now(),
+        },
+    )
     .await
     .expect("receipt");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("resume-staging-session").await.expect("session");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Lost,
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Lost, ..Default::default() },
+        )
         .await
         .expect("lost after delivery");
     assert_eq!(daemon.deliver_standing_turn(&request).await.expect("duplicate already accepted"), TurnDeliveryRung::FreshAgent);
@@ -1654,30 +1703,34 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .await
             .expect("convoy");
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Landing,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([(
-                    "work".to_string(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".to_string(),
-                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
-                )]),
-                ..Default::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: flotilla_resources::ConvoyPhase::Landing,
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![VesselRequirement::builder()
+                            .name("work".to_string())
+                            .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
+                            .crew(Vec::new())
+                            .build()],
+                    }),
+                    work: BTreeMap::from([(
+                        "work".to_string(),
+                        flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
+                    )]),
+                    crew_work: BTreeMap::from([(
+                        "work".to_string(),
+                        BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
+                    )]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("admitted claim");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
@@ -1717,10 +1770,11 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .await
             .expect("session");
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-                phase,
-                ..Default::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &ResourceTerminalSessionStatus { phase, ..Default::default() },
+            )
             .await
             .expect("session phase");
         let request = crate::leaf_engine::CrewTurnIntent::builder()
@@ -1944,14 +1998,17 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .expect("credential");
     let provider = Arc::new(FakeChangeRequest::new());
     provider
-        .add_change_requests(vec![("17".to_string(), ChangeRequest {
-            title: "Fix ghostty".to_string(),
-            branch: "governor".to_string(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            body: None,
-            provider_name: "forgejo".to_string(),
-            provider_display_name: "Forgejo".to_string(),
-        })])
+        .add_change_requests(vec![(
+            "17".to_string(),
+            ChangeRequest {
+                title: "Fix ghostty".to_string(),
+                branch: "governor".to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "forgejo".to_string(),
+                provider_display_name: "Forgejo".to_string(),
+            },
+        )])
         .await;
     let mut discovery = fake_discovery(false);
     discovery.factories.change_requests = vec![Box::new(ForgeAwareTestChangeRequestFactory(provider))];
@@ -2035,11 +2092,15 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         &[forge],
     );
     assert_eq!(claim.len(), 1);
-    flotilla_resources::apply_status_patch(&convoys, "multi-repo", &ConvoyStatusPatch::DiscoverSubjects {
-        subjects: vec![(claim[0].clone(), flotilla_protocol::Relationship::Produces)],
-        source: flotilla_resources::SubjectDiscoverySource::Claim,
-        at: Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &convoys,
+        "multi-repo",
+        &ConvoyStatusPatch::DiscoverSubjects {
+            subjects: vec![(claim[0].clone(), flotilla_protocol::Relationship::Produces)],
+            source: flotilla_resources::SubjectDiscoverySource::Claim,
+            at: Utc::now(),
+        },
+    )
     .await
     .expect("claim discovery");
     let with_followup = convoys.get("multi-repo").await.expect("convoy with follow-up");
@@ -2371,12 +2432,15 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
 
     let outcomes = daemon.crew_ops.archive_convoy_checkouts_best_effort("flotilla", "archive-convoy").await.expect("best-effort archive");
 
-    assert_eq!(outcomes.iter().map(|outcome| (outcome.checkout.as_str(), outcome.status)).collect::<Vec<_>>(), vec![
-        ("already-pushed", CheckoutArchiveStatus::NothingToArchive),
-        ("needs-push", CheckoutArchiveStatus::Archived),
-        ("push-fails", CheckoutArchiveStatus::Failed),
-        ("stale-pushed", CheckoutArchiveStatus::Archived),
-    ]);
+    assert_eq!(
+        outcomes.iter().map(|outcome| (outcome.checkout.as_str(), outcome.status)).collect::<Vec<_>>(),
+        vec![
+            ("already-pushed", CheckoutArchiveStatus::NothingToArchive),
+            ("needs-push", CheckoutArchiveStatus::Archived),
+            ("push-fails", CheckoutArchiveStatus::Failed),
+            ("stale-pushed", CheckoutArchiveStatus::Archived),
+        ]
+    );
     assert_eq!(outcomes[2].detail.as_deref(), Some("remote rejected"));
     assert_eq!(
         runner.calls().iter().filter(|(command, args)| command == "git" && args.first().is_some_and(|arg| arg == "push")).count(),
@@ -2425,19 +2489,23 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
         .expect("change request observation");
     let observed_at = Utc::now();
     change_requests
-        .update_status(&observation.metadata.name, &observation.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-            title: Default::default(),
-            author: Default::default(),
-            review_decision: Default::default(),
-            review_requested_from_owner: Default::default(),
-            state: flotilla_resources::Observation::known(ObservedChangeRequestState::Open, observed_at),
-            head_sha: flotilla_resources::Observation::unknown(observed_at),
-            checks: flotilla_resources::Observation::unknown(observed_at),
-            review: flotilla_resources::ChangeRequestReviewObservation {
-                actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+        .update_status(
+            &observation.metadata.name,
+            &observation.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(ObservedChangeRequestState::Open, observed_at),
+                head_sha: flotilla_resources::Observation::unknown(observed_at),
+                checks: flotilla_resources::Observation::unknown(observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+                },
+                mergeable: flotilla_resources::Observation::unknown(observed_at),
             },
-            mergeable: flotilla_resources::Observation::unknown(observed_at),
-        })
+        )
         .await
         .expect("change request status");
 
@@ -2814,16 +2882,19 @@ async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lookup: RestA
         let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
         let key = repository.key();
         backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository");
-        daemon.convoy_admission.repository_change_requests.write().await.insert(key.clone(), RepositoryChangeRequestProvider {
-            service_url: repository.forge().expect("forge").service_url.clone(),
-            repository: scope.clone(),
-            provider: Arc::new(GitHubChangeRequest::new(
-                "github".into(),
-                scope,
-                Arc::new(GhApiClient::new(runner.clone())),
-                runner.clone(),
-            )),
-        });
+        daemon.convoy_admission.repository_change_requests.write().await.insert(
+            key.clone(),
+            RepositoryChangeRequestProvider {
+                service_url: repository.forge().expect("forge").service_url.clone(),
+                repository: scope.clone(),
+                provider: Arc::new(GitHubChangeRequest::new(
+                    "github".into(),
+                    scope,
+                    Arc::new(GhApiClient::new(runner.clone())),
+                    runner.clone(),
+                )),
+            },
+        );
         keys.push(key);
     }
     RestAdmissionFixture { calls, daemon, keys, _config: config }
@@ -3226,57 +3297,66 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         .build();
     let bosun = CrewSpec::builder().role("bosun".to_string()).source(CrewSource::Tool { command: "test".to_string() }).build();
     convoys
-        .update_status("refused-claim", &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: indexmap::IndexMap::from([("work/coder".to_string(), flotilla_resources::StallNudgePolicy {
-                    max_per_episode: 2,
-                    max_refusals: None,
-                    idle_grace_seconds: Some(0),
-                })]),
-                supervision: Some(vec![flotilla_resources::SupervisionTarget::ConvoyCrew {
-                    vessel: "work".to_string(),
-                    role: "bosun".to_string(),
-                }]),
-                exit: None,
-                turn_delivery: indexmap::IndexMap::from([(
-                    "conflicting".to_string(),
-                    flotilla_resources::TurnDeliveryRule::builder()
-                        .on("$cr.mergeable == conflicting".parse().expect("conflict leaf"))
-                        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
-                        .brief(
-                            "Rebase onto the current base branch and file a fresh settlement claim; the previous claim is superseded."
-                                .to_string(),
-                        )
-                        .hold(flotilla_resources::HoldAct::ChangeRequestComment { body: "paused".to_string() })
-                        .build(),
+        .update_status(
+            "refused-claim",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: indexmap::IndexMap::from([(
+                        "work/coder".to_string(),
+                        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(0) },
+                    )]),
+                    supervision: Some(vec![flotilla_resources::SupervisionTarget::ConvoyCrew {
+                        vessel: "work".to_string(),
+                        role: "bosun".to_string(),
+                    }]),
+                    exit: None,
+                    turn_delivery: indexmap::IndexMap::from([(
+                        "conflicting".to_string(),
+                        flotilla_resources::TurnDeliveryRule::builder()
+                            .on("$cr.mergeable == conflicting".parse().expect("conflict leaf"))
+                            .to(flotilla_resources::TurnDeliveryTarget::builder()
+                                .vessel("work".to_string())
+                                .role("coder".to_string())
+                                .build())
+                            .brief(
+                                "Rebase onto the current base branch and file a fresh settlement claim; the previous claim is superseded."
+                                    .to_string(),
+                            )
+                            .hold(flotilla_resources::HoldAct::ChangeRequestComment { body: "paused".to_string() })
+                            .build(),
+                    )]),
+                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder, bosun]).build()],
+                }),
+                work: BTreeMap::from([(
+                    "work".to_string(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
                 )]),
-                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder, bosun]).build()],
-            }),
-            work: BTreeMap::from([(
-                "work".to_string(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([
-                    ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                    ("bosun".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                ]),
-            )]),
-            ..Default::default()
-        })
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([
+                        ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                        ("bosun".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                    ]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("active status");
     backend
         .using::<Vessel>("flotilla")
-        .create(&test_meta("refused-claim-vessel"), &VesselSpec {
-            convoy_ref: "refused-claim".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "test".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &test_meta("refused-claim-vessel"),
+            &VesselSpec {
+                convoy_ref: "refused-claim".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel");
     let session = backend
@@ -3318,15 +3398,19 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         .expect("session");
     backend
         .using::<ResourceTerminalSession>("flotilla")
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: Utc::now(),
-                source: TerminalAttentionSource::Hook,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Idle,
+                    as_of: Utc::now(),
+                    source: TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("idle session");
     let context = CrewCommandContext {
@@ -3351,11 +3435,15 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             &[],
         );
         assert_eq!(subjects.len(), 1);
-        flotilla_resources::apply_status_patch(&convoys, "refused-claim", &ConvoyStatusPatch::DiscoverSubjects {
-            subjects: vec![(subjects[0].clone(), flotilla_protocol::Relationship::Produces)],
-            source: flotilla_resources::SubjectDiscoverySource::Claim,
-            at: Utc::now(),
-        })
+        flotilla_resources::apply_status_patch(
+            &convoys,
+            "refused-claim",
+            &ConvoyStatusPatch::DiscoverSubjects {
+                subjects: vec![(subjects[0].clone(), flotilla_protocol::Relationship::Produces)],
+                source: flotilla_resources::SubjectDiscoverySource::Claim,
+                at: Utc::now(),
+            },
+        )
         .await
         .expect("second PR discovery");
         runner.mixed_history_errors.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3440,13 +3528,14 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         "the rejected completion still discovered a PR in the convoy's repository"
     );
     // #2211: claim admission persists the cause and exact PR identity before nudging.
-    assert_eq!(refused_status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes, vec![
-        CrewCompletionRefusalCause::ConflictingChangeRequest {
+    assert_eq!(
+        refused_status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes,
+        vec![CrewCompletionRefusalCause::ConflictingChangeRequest {
             service: "github.com".into(),
             scope: "flotilla-org/flotilla".into(),
             number: 2200,
-        }
-    ]);
+        }]
+    );
     assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     let observed = backend
         .using::<ResourceChangeRequest>("flotilla")
@@ -3567,36 +3656,43 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .await
         .expect("convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![requirement.clone()],
-            }),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([
-                    ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                    ("reviewer".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
-                ]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![requirement.clone()],
+                }),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([
+                        ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                        ("reviewer".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
+                    ]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("active convoy");
     backend
         .clone()
         .using::<Vessel>("flotilla")
-        .create(&test_meta("convoy-two-crew-work"), &flotilla_resources::VesselSpec {
-            convoy_ref: "convoy-two-crew".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "contained".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &test_meta("convoy-two-crew-work"),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-two-crew".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "contained".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel");
 
@@ -3626,28 +3722,31 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let coder = backend
         .clone()
         .using::<ResourceTerminalSession>("flotilla")
-        .create(&coder_meta, &ResourceTerminalSessionSpec {
-            env_ref: "contained-env".to_string(),
-            role: "coder".to_string(),
-            source: TerminalSessionSource::Agent {
-                selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
-                brief: flotilla_resources::TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/coder.md".to_string(),
-                    content: "Implement the issue.".to_string(),
-                    copies: Vec::new(),
+        .create(
+            &coder_meta,
+            &ResourceTerminalSessionSpec {
+                env_ref: "contained-env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Implement the issue.".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "convoy-two-crew".to_string(),
+                        vessel_ref: "convoy-two-crew-work".to_string(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".to_string(),
-                    convoy: "convoy-two-crew".to_string(),
-                    vessel_ref: "convoy-two-crew-work".to_string(),
-                }),
-                message: None,
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "contained".to_string(),
             },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "contained".to_string(),
-        })
+        )
         .await
         .expect("eager coder terminal");
 
@@ -3665,10 +3764,11 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .await
         .expect("failed reviewer target");
     let failed_reviewer = sessions
-        .update_status(&failed_reviewer.metadata.name, &failed_reviewer.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            &failed_reviewer.metadata.name,
+            &failed_reviewer.metadata.resource_version,
+            &ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("failed phase");
     let error = daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect_err("failed target");
@@ -3899,10 +3999,11 @@ async fn convoy_resolution_falls_back_to_a_unique_terminal_generation() {
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.get("convoy-one").await.expect("terminal convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Landed,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+        )
         .await
         .expect("mark convoy terminal");
 
@@ -3918,10 +4019,11 @@ async fn convoy_resolution_refuses_multiple_terminal_generations() {
     for name in ["convoy-one", "convoy-two"] {
         let created = convoys.get(name).await.expect("terminal convoy");
         convoys
-            .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                ..Default::default()
-            })
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+            )
             .await
             .expect("mark convoy terminal");
     }
@@ -3952,10 +4054,11 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
         .await
         .expect("convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("failed convoy");
     backend
@@ -4023,10 +4126,11 @@ async fn concurrent_convoy_phase_change_prevents_operator_abandonment() {
         .await
         .expect("convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() },
+        )
         .await
         .expect("active convoy");
 
@@ -4064,10 +4168,11 @@ async fn gone_worktree_satisfies_teardown_gate_without_integration_observation()
         .await
         .expect("convoy");
     let convoy = convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("failed convoy");
     let checkouts = backend.using::<ResourceCheckout>("flotilla");
@@ -4086,11 +4191,15 @@ async fn gone_worktree_satisfies_teardown_gate_without_integration_observation()
         .await
         .expect("checkout");
     let gone = checkouts
-        .update_status("checkout-gone", &created_checkout.metadata.resource_version, &ResourceCheckoutStatus {
-            phase: flotilla_resources::CheckoutPhase::Gone,
-            path: Some("/missing/worktree".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            "checkout-gone",
+            &created_checkout.metadata.resource_version,
+            &ResourceCheckoutStatus {
+                phase: flotilla_resources::CheckoutPhase::Gone,
+                path: Some("/missing/worktree".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("gone checkout");
 
@@ -4161,11 +4270,15 @@ async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_seco
         .await
         .expect("governor vessel");
     vessels
-        .update_status(&vessel_name, &vessel.metadata.resource_version, &flotilla_resources::VesselStatus {
-            phase: flotilla_resources::VesselPhase::Failed,
-            message: Some("Docker container stopped after host reboot".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &vessel_name,
+            &vessel.metadata.resource_version,
+            &flotilla_resources::VesselStatus {
+                phase: flotilla_resources::VesselPhase::Failed,
+                message: Some("Docker container stopped after host reboot".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("lost container");
     assert!(backend.using::<ResourceCheckout>("flotilla").list().await.expect("ephemeral checkout observations").items.is_empty());
@@ -4284,10 +4397,11 @@ async fn convoy_resolution_prefers_an_exact_unlabelled_record_name() {
         .await
         .expect("pre-identity convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Landed,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+        )
         .await
         .expect("mark convoy terminal");
 
@@ -4306,10 +4420,11 @@ async fn convoy_explain_addresses_an_exact_terminal_pre_identity_record() {
         .await
         .expect("pre-identity convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("mark convoy terminal");
 
@@ -4328,27 +4443,34 @@ async fn convoy_explain_surfaces_queued_turn_age_and_blocker() {
     let convoy = convoys.create(&test_meta("queued"), &ConvoySpec::builder().workflow_ref("review".into()).build()).await.unwrap();
     let queued_at = daemon.clock.now() - chrono::Duration::seconds(601);
     convoys
-        .update_status("queued", &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            turn_deliveries: BTreeMap::from([("review".into(), flotilla_resources::TurnDeliveryStatus {
-                episodes: vec![flotilla_resources::TurnDeliveryEpisode {
-                    subject_revision: "head".into(),
-                    evidence_at: queued_at,
-                    judged_claim_at: queued_at,
-                    outcome: flotilla_resources::TurnDeliveryOutcome::Queued {
-                        rung: flotilla_resources::TurnDeliveryRung::WarmSession,
-                        queued_at,
-                        vessel: "work".into(),
-                        role: "coder".into(),
-                        message_id: "turn".into(),
-                        blocking_reason: "old readiness".into(),
+        .update_status(
+            "queued",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                turn_deliveries: BTreeMap::from([(
+                    "review".into(),
+                    flotilla_resources::TurnDeliveryStatus {
+                        episodes: vec![flotilla_resources::TurnDeliveryEpisode {
+                            subject_revision: "head".into(),
+                            evidence_at: queued_at,
+                            judged_claim_at: queued_at,
+                            outcome: flotilla_resources::TurnDeliveryOutcome::Queued {
+                                rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                                queued_at,
+                                vessel: "work".into(),
+                                role: "coder".into(),
+                                message_id: "turn".into(),
+                                blocking_reason: "old readiness".into(),
+                            },
+                            sender: Default::default(),
+                        }],
+                        ..Default::default()
                     },
-                    sender: Default::default(),
-                }],
+                )]),
                 ..Default::default()
-            })]),
-            ..Default::default()
-        })
+            },
+        )
         .await
         .unwrap();
     let explanation = daemon.explain_convoy_internal(Some(namespace), "queued").await.unwrap();
@@ -4372,10 +4494,11 @@ async fn convoy_explain_refuses_multiple_terminal_generations() {
     for name in ["convoy-one", "convoy-two"] {
         let created = convoys.get(name).await.expect("terminal convoy");
         convoys
-            .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landed,
-                ..Default::default()
-            })
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+            )
             .await
             .expect("mark convoy terminal");
     }
@@ -4514,14 +4637,18 @@ async fn standing_ensure_fixture_for(
 async fn declaration_refusal_staleness_uses_the_daemon_clock_at_the_24_hour_boundary() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     let projects = backend.using::<Project>("flotilla");
-    apply_resource_status_patch(&projects, "standing-project", &flotilla_resources::ProjectStatusPatch::DeclarationRefused {
-        condition: Some(flotilla_resources::DeclarationRefusedCondition {
-            entry_path: "broken.md".into(),
-            message: "invalid declaration".into(),
-            since: clock.now(),
-            observed_at: clock.now(),
-        }),
-    })
+    apply_resource_status_patch(
+        &projects,
+        "standing-project",
+        &flotilla_resources::ProjectStatusPatch::DeclarationRefused {
+            condition: Some(flotilla_resources::DeclarationRefusedCondition {
+                entry_path: "broken.md".into(),
+                message: "invalid declaration".into(),
+                since: clock.now(),
+                observed_at: clock.now(),
+            }),
+        },
+    )
     .await
     .expect("record refusal");
     backend
@@ -4758,13 +4885,17 @@ async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys.get(&convoy_ref).await.expect("generation");
     convoys
-        .update_status(&convoy_ref, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            message: Some("placement failed".to_string()),
-            started_at: Some(clock.now()),
-            finished_at: Some(clock.now()),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy_ref,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                message: Some("placement failed".to_string()),
+                started_at: Some(clock.now()),
+                finished_at: Some(clock.now()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("fail generation");
     convoy_ref
@@ -4782,13 +4913,17 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
         .expect("latest generation");
     clock.set(convoy.metadata.creation_timestamp);
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            message: Some("placement failed".to_string()),
-            started_at: Some(clock.now()),
-            finished_at: Some(clock.now()),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                message: Some("placement failed".to_string()),
+                started_at: Some(clock.now()),
+                finished_at: Some(clock.now()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("fail generation");
     convoy.metadata.name
@@ -4805,10 +4940,13 @@ async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: V
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("standing-agent-host").await.expect("standing agent host");
     let mut status = host.status.expect("standing agent host status");
-    status.fulfilment_facts.insert("standing-agent".into(), flotilla_resources::FulfilmentFacts {
-        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "standing-agent".into(),
+        flotilla_resources::FulfilmentFacts {
+            harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+            ..Default::default()
+        },
+    );
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
     status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
     hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("standing agent host capacity");
@@ -4855,11 +4993,14 @@ async fn admitted_standing_workflow(daemon: &InProcessDaemon, backend: &Resource
 #[tokio::test]
 async fn standing_ensure_applies_agent_overrides_to_the_admitted_workflow_snapshot() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
-    configure_standing_ensure_agent(&backend, vec![flotilla_protocol::AgentOverride {
-        capability: "governor".to_string(),
-        adapter: "codex".to_string(),
-        model: Some("fable".to_string()),
-    }])
+    configure_standing_ensure_agent(
+        &backend,
+        vec![flotilla_protocol::AgentOverride {
+            capability: "governor".to_string(),
+            adapter: "codex".to_string(),
+            model: Some("fable".to_string()),
+        }],
+    )
     .await;
 
     let workflow = admitted_standing_workflow(&daemon, &backend).await;
@@ -4983,10 +5124,11 @@ async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_a
         .is_empty());
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 3);
 
-    apply_resource_status_patch(&demands, "ensure-attention-quartermaster", &DemandStatusPatch::Acknowledge {
-        as_of: clock.now(),
-        authority: "operator".to_string(),
-    })
+    apply_resource_status_patch(
+        &demands,
+        "ensure-attention-quartermaster",
+        &DemandStatusPatch::Acknowledge { as_of: clock.now(), authority: "operator".to_string() },
+    )
     .await
     .expect("operator acknowledges escalation");
     daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("clear hold");
@@ -5035,13 +5177,17 @@ async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ensure(
         .expect("live generation");
     let failed = convoys.get(&failed_ref).await.expect("generation");
     convoys
-        .update_status(&failed_ref, &failed.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
-            message: Some("clone failed before the work environment was provisioned".to_string()),
-            finished_at: Some(clock.now()),
-            ..Default::default()
-        })
+        .update_status(
+            &failed_ref,
+            &failed.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
+                message: Some("clone failed before the work environment was provisioned".to_string()),
+                finished_at: Some(clock.now()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("record clone-failed generation");
 
@@ -5317,11 +5463,10 @@ async fn declared_driver_derives_bounded_backoff_from_its_homed_generations() {
     let host_origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
     let hosts = host_origin.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(&driver_id), &HostSpec {
-            display_name: "udder".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&driver_id),
+            &HostSpec { display_name: "udder".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("driver host");
     hosts
@@ -5439,11 +5584,10 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     hosts
-        .create(&test_meta("missing-driver"), &HostSpec {
-            display_name: "missing-driver".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta("missing-driver"),
+            &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("known but unreachable driver");
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unreachable driver skip").is_empty());
@@ -5464,11 +5608,10 @@ async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_o
     let driver_id = daemon.local_host_id().expect("driver host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(&driver_id), &HostSpec {
-            display_name: "local".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&driver_id),
+            &HostSpec { display_name: "local".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("driver host");
     hosts
@@ -5483,11 +5626,15 @@ async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_o
     ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &spec).await.expect("make admission fail");
     let ensure = ensures.get("quartermaster").await.expect("updated ensure");
     ensures
-        .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some("stale-convoy".to_string()),
-            running_since: Some(clock.now() - ChronoDuration::days(1)),
-            ..Default::default()
-        })
+        .update_status(
+            &ensure.metadata.name,
+            &ensure.metadata.resource_version,
+            &ConvoyEnsureStatus {
+                convoy_ref: Some("stale-convoy".to_string()),
+                running_since: Some(clock.now() - ChronoDuration::days(1)),
+                ..Default::default()
+            },
+        )
         .await
         .expect("seed stale pre-driver status");
 
@@ -5567,9 +5714,10 @@ async fn resolved_default_branch_dependency_change_retries_admission_before_dead
         .await
         .expect("replicate resolved default branch");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("dependency change bypasses deadline"), vec![
-        "started quartermaster@standing-project"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("dependency change bypasses deadline"),
+        vec!["started quartermaster@standing-project"]
+    );
 }
 
 #[tokio::test]
@@ -5601,16 +5749,21 @@ async fn statusless_ensured_generation_is_live_even_when_address_labels_are_miss
         .await
         .expect("simulate generation whose address labels have not materialized");
     ensures
-        .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            observed_config_hash: ensure.status.and_then(|status| status.observed_config_hash),
-            ..Default::default()
-        })
+        .update_status(
+            &ensure.metadata.name,
+            &ensure.metadata.resource_version,
+            &ConvoyEnsureStatus {
+                observed_config_hash: ensure.status.and_then(|status| status.observed_config_hash),
+                ..Default::default()
+            },
+        )
         .await
         .expect("simulate lost ensure status update");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("rediscover admitted generation"), vec![
-        "ConvoyEnsure/quartermaster observed running"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("rediscover admitted generation"),
+        vec!["ConvoyEnsure/quartermaster observed running"]
+    );
     assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref), Some(convoy_ref));
 }
@@ -5691,11 +5844,10 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
     let driver_ref = daemon.canonical_local_host_id().expect("root B host identity").to_string();
     target
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&driver_ref), &HostSpec {
-            display_name: "root-b".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&driver_ref),
+            &HostSpec { display_name: "root-b".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("root B host resource");
     let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
@@ -5708,10 +5860,11 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
         .expect("source repository");
     source
         .using::<Repository>("flotilla")
-        .update_status(&source_repository.metadata.name, &source_repository.metadata.resource_version, &RepositoryStatus {
-            default_branch: Some("main".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &source_repository.metadata.name,
+            &source_repository.metadata.resource_version,
+            &RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
+        )
         .await
         .expect("source default branch observation");
     target
@@ -5796,9 +5949,10 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
         .await
         .expect("replicate ensures");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("cross-root ensure admission"), vec![
-        "started quartermaster@cross-root-project"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("cross-root ensure admission"),
+        vec!["started quartermaster@cross-root-project"]
+    );
     let convoy = target
         .using::<ResourceConvoy>("flotilla")
         .list()
@@ -5818,10 +5972,11 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
         .expect("conflicting source repository");
     conflicting_source
         .using::<Repository>("flotilla")
-        .update_status(&conflicting_repository.metadata.name, &conflicting_repository.metadata.resource_version, &RepositoryStatus {
-            default_branch: Some("trunk".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &conflicting_repository.metadata.name,
+            &conflicting_repository.metadata.resource_version,
+            &RepositoryStatus { default_branch: Some("trunk".to_string()), ..Default::default() },
+        )
         .await
         .expect("conflicting default branch observation");
     target
@@ -5853,12 +6008,16 @@ async fn standing_backing_inspection_holds_empty_evidence_after_provisioning_sta
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys.get(&convoy_ref).await.expect("standing convoy");
     let convoy = convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
-            finished_at: Some(clock.now()),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
+                finished_at: Some(clock.now()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("record post-provisioning failure");
 
@@ -5869,9 +6028,10 @@ async fn standing_backing_inspection_holds_empty_evidence_after_provisioning_sta
 
     assert_eq!(refusal, "no backing environment evidence is available");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold without backing evidence"), vec![
-        "ConvoyEnsure/quartermaster held for operator attention"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold without backing evidence"),
+        vec!["ConvoyEnsure/quartermaster held for operator attention"]
+    );
     let events = backend.using::<Event>("flotilla").list().await.expect("list object events").items;
     assert!(events.iter().any(|event| {
         event.spec.regarding.name == convoy_ref
@@ -5913,13 +6073,17 @@ async fn standing_ensure_retries_convoy_that_failed_before_provisioning() {
         .expect("convoy ref");
     let convoy = convoys.get(&convoy_ref).await.expect("standing convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            provisioning: Some(ConvoyProvisioningState::NotStarted),
-            message: Some("workflow validation failed".to_string()),
-            finished_at: Some(clock.now()),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                provisioning: Some(ConvoyProvisioningState::NotStarted),
+                message: Some("workflow validation failed".to_string()),
+                finished_at: Some(clock.now()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("record pre-provisioning failure");
 
@@ -5948,14 +6112,18 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     let first = convoys.get(&first_ref).await.expect("standing convoy");
     let now = clock.now();
     convoys
-        .update_status(&first.metadata.name, &first.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Failed,
-            message: Some("provider registry unavailable".to_string()),
-            started_at: Some(now),
-            finished_at: Some(now),
-            observed_workflow_ref: Some("quartermaster".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &first.metadata.name,
+            &first.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                message: Some("provider registry unavailable".to_string()),
+                started_at: Some(now),
+                finished_at: Some(now),
+                observed_workflow_ref: Some("quartermaster".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("fail convoy after resolution loss");
     let environments = backend.using::<ResourceEnvironment>("flotilla");
@@ -5984,18 +6152,23 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
         .await
         .expect("backing environment");
     environments
-        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &ResourceEnvironmentStatus {
-            phase: EnvironmentPhase::Ready,
-            ready: true,
-            docker_container_id: Some("live-container".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &environment.metadata.name,
+            &environment.metadata.resource_version,
+            &ResourceEnvironmentStatus {
+                phase: EnvironmentPhase::Ready,
+                ready: true,
+                docker_container_id: Some("live-container".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("mark backing live");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold live backing"), vec![
-        "ConvoyEnsure/quartermaster held for operator attention"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold live backing"),
+        vec!["ConvoyEnsure/quartermaster held for operator attention"]
+    );
     clock.advance(ChronoDuration::hours(1));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("continue holding").is_empty());
     assert!(convoys.get(&first_ref).await.is_ok(), "failed convoy and its live container must survive");
@@ -6010,19 +6183,24 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
 
     let environment = environments.get("quartermaster-work").await.expect("backing environment");
     environments
-        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &ResourceEnvironmentStatus {
-            phase: EnvironmentPhase::Failed,
-            ready: false,
-            message: Some("Docker container live-container is not running".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &environment.metadata.name,
+            &environment.metadata.resource_version,
+            &ResourceEnvironmentStatus {
+                phase: EnvironmentPhase::Failed,
+                ready: false,
+                message: Some("Docker container live-container is not running".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("verify backing dead");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("record crash backoff");
     clock.advance(ChronoDuration::seconds(30));
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"), vec![
-        "started quartermaster@standing-project"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("restart dead backing"),
+        vec!["started quartermaster@standing-project"]
+    );
     let generations = convoys.list().await.expect("standing generations").items;
     assert_eq!(generations.len(), 2);
     assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == 1));
@@ -6137,9 +6315,10 @@ async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_sup
 
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe abandoned generation");
     clock.advance(ChronoDuration::seconds(30));
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("supersede abandoned generation"), vec![
-        "started quartermaster@standing-project"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("supersede abandoned generation"),
+        vec!["started quartermaster@standing-project"]
+    );
 
     let generations = convoys.list().await.expect("standing generations").items;
     assert_eq!(generations.len(), 2);
@@ -6179,9 +6358,10 @@ async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but_acc
         .await
         .expect("global builtin workflow");
     clock.advance(ChronoDuration::minutes(1));
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("global workflow admits"), vec![
-        "started quartermaster@standing-project"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("global workflow admits"),
+        vec!["started quartermaster@standing-project"]
+    );
 }
 
 #[tokio::test]
@@ -6233,29 +6413,34 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     let ensure = ensures.get("quartermaster").await.expect("ensure");
     let first_ref = ensure.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("first convoy ref");
     ensures
-        .update_status(&ensure.metadata.name, &ensure.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some(first_ref.clone()),
-            restart_count: 7,
-            running_since: Some(clock.now()),
-            retry_at: None,
-            last_failure: None,
-            hold_reason: None,
-            observed_config_hash: None,
-            declaration_refused: None,
-            admitted_config_hash: None,
-            config_drift: None,
-            conditions: Vec::new(),
-            retry: None,
-            stalled: None,
-        })
+        .update_status(
+            &ensure.metadata.name,
+            &ensure.metadata.resource_version,
+            &ConvoyEnsureStatus {
+                convoy_ref: Some(first_ref.clone()),
+                restart_count: 7,
+                running_since: Some(clock.now()),
+                retry_at: None,
+                last_failure: None,
+                hold_reason: None,
+                observed_config_hash: None,
+                declaration_refused: None,
+                admitted_config_hash: None,
+                config_drift: None,
+                conditions: Vec::new(),
+                retry: None,
+                stalled: None,
+            },
+        )
         .await
         .expect("seed crash budget");
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     convoys.delete(&first_ref).await.expect("operator reap");
 
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"), vec![
-        "started quartermaster@standing-project"
-    ]);
+    assert_eq!(
+        daemon.reconcile_convoy_ensures_once("flotilla").await.expect("prompt resurrection"),
+        vec!["started quartermaster@standing-project"]
+    );
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 
     let materialized_name = crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
@@ -6297,9 +6482,10 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     .await;
     assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
     clock.set(retry_at);
-    assert_eq!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"), vec![
-        "started quartermaster@standing-project"
-    ]);
+    assert_eq!(
+        restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("past-due retry"),
+        vec!["started quartermaster@standing-project"]
+    );
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 }
 
@@ -6323,16 +6509,19 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
         .await
         .expect("host");
     hosts
-        .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            fulfilment_facts: BTreeMap::from([("udder-kind".into(), FulfilmentFacts {
-                gui_session_logged_in: true,
-                observed_at: Utc::now(),
+        .update_status(
+            &host_id,
+            &host.metadata.resource_version,
+            &HostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                fulfilment_facts: BTreeMap::from([(
+                    "udder-kind".into(),
+                    FulfilmentFacts { gui_session_logged_in: true, observed_at: Utc::now(), ..Default::default() },
+                )]),
                 ..Default::default()
-            })]),
-            ..Default::default()
-        })
+            },
+        )
         .await
         .expect("host facts");
     for name in ["collision-a", "collision-b"] {
@@ -6423,27 +6612,33 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(&host_id), &HostSpec {
-            display_name: "local-host".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&host_id),
+            &HostSpec { display_name: "local-host".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("create host");
     hosts
-        .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            fulfilment_facts: BTreeMap::from([("local-kind".to_string(), FulfilmentFacts {
-                harnesses: BTreeMap::from([("claude-code".to_string(), HarnessFacts {
-                    version: "2.1.282".to_string(),
-                    ..Default::default()
-                })]),
-                gui_session_logged_in: true,
+        .update_status(
+            &host_id,
+            &host.metadata.resource_version,
+            &HostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                fulfilment_facts: BTreeMap::from([(
+                    "local-kind".to_string(),
+                    FulfilmentFacts {
+                        harnesses: BTreeMap::from([(
+                            "claude-code".to_string(),
+                            HarnessFacts { version: "2.1.282".to_string(), ..Default::default() },
+                        )]),
+                        gui_session_logged_in: true,
+                        ..Default::default()
+                    },
+                )]),
                 ..Default::default()
-            })]),
-            ..Default::default()
-        })
+            },
+        )
         .await
         .expect("publish facts");
     let listed = daemon.fulfilment_list_internal().await.expect("list facts");
@@ -6474,11 +6669,10 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
     let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
     stale_source
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&host_id), &HostSpec {
-            display_name: "local-host".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&host_id),
+            &HostSpec { display_name: "local-host".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("stale self-origin host");
     backend
@@ -6489,19 +6683,22 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
-        .create(&test_meta(&host_id), &HostSpec {
-            display_name: "local-host".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&host_id),
+            &HostSpec { display_name: "local-host".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("authoritative local host");
     hosts
-        .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
-            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host_id,
+            &local.metadata.resource_version,
+            &HostStatus {
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish live local capacity");
     backend
@@ -6576,19 +6773,22 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
-        .create(&test_meta(&host_id), &HostSpec {
-            display_name: "local-host".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(&host_id),
+            &HostSpec { display_name: "local-host".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("authoritative local host");
     hosts
-        .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
-            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host_id,
+            &local.metadata.resource_version,
+            &HostStatus {
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish live local capacity");
     let policy = backend
@@ -6649,12 +6849,15 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         .expect("project");
     backend
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("claude-max"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "governor@example.com".to_string() },
-            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &test_meta("claude-max"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "governor@example.com".to_string() },
+                source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("credential declaration");
     backend
@@ -6690,27 +6893,30 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         .expect("workflow");
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta("udder-id"), &HostSpec {
-            display_name: "udder".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta("udder-id"),
+            &HostSpec { display_name: "udder".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("remote host");
     hosts
-        .update_status("udder-id", &host.metadata.resource_version, &HostStatus {
-            capabilities: [
-                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
-                (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
-                ("docker".to_string(), serde_json::json!(true)),
-                ("os".to_string(), serde_json::json!("linux")),
-            ]
-            .into_iter()
-            .collect(),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            ..HostStatus::default()
-        })
+        .update_status(
+            "udder-id",
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: [
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
+                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
+                    ("docker".to_string(), serde_json::json!(true)),
+                    ("os".to_string(), serde_json::json!("linux")),
+                ]
+                .into_iter()
+                .collect(),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("remote host capabilities");
     let placement_source = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -6785,10 +6991,10 @@ async fn placement_candidates_and_refusals_agree_across_roots() {
     let left = default_convoy_placement_policy(&kiwi, "flotilla", None, &[], &workflow, None).await.expect("kiwi candidates");
     let right = default_convoy_placement_policy(&feta, "flotilla", None, &[], &workflow, None).await.expect("feta candidates");
     assert_eq!(left.refused_candidates, right.refused_candidates);
-    assert_eq!(left.refused_candidates.iter().map(|candidate| candidate.policy_name.as_str()).collect::<Vec<_>>(), vec![
-        "feta-policy",
-        "kiwi-policy"
-    ]);
+    assert_eq!(
+        left.refused_candidates.iter().map(|candidate| candidate.policy_name.as_str()).collect::<Vec<_>>(),
+        vec!["feta-policy", "kiwi-policy"]
+    );
     for backend in [&kiwi, &feta] {
         assert_eq!(backend.using::<PlacementPolicy>("flotilla").list().await.expect("controller view").items.len(), 1);
     }
@@ -6891,11 +7097,10 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host_id in ["host-id-a", "host-id-b"] {
         hosts
-            .create(&test_meta(host_id), &HostSpec {
-                display_name: "shared-name".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &test_meta(host_id),
+                &HostSpec { display_name: "shared-name".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("host");
     }
@@ -6907,20 +7112,23 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(host_ref), &HostSpec {
-            display_name: host_ref.to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(host_ref),
+            &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("host create");
     hosts
-        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("host status update");
     placement_policy(backend, policy_name, host_ref).await;
@@ -6931,29 +7139,36 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta("ssh-host"), &HostSpec {
-            display_name: "beaufort".to_string(),
-            connection: flotilla_resources::HostConnection::AgentlessSsh {
-                owning_daemon: "owner-host".to_string(),
-                destination: "crew@beaufort.example".to_string(),
+        .create(
+            &test_meta("ssh-host"),
+            &HostSpec {
+                display_name: "beaufort".to_string(),
+                connection: flotilla_resources::HostConnection::AgentlessSsh {
+                    owning_daemon: "owner-host".to_string(),
+                    destination: "crew@beaufort.example".to_string(),
+                },
+                ..HostSpec::default()
             },
-            ..HostSpec::default()
-        })
+        )
         .await
         .expect("SSH Host");
     hosts
-        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            capabilities: BTreeMap::from([
-                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
-                ("agentless".to_string(), serde_json::json!(true)),
-                ("transport".to_string(), serde_json::json!("ssh")),
-                ("placement".to_string(), serde_json::json!("host_direct_only")),
-                ("owning_daemon".to_string(), serde_json::json!("owner-host")),
-            ]),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: BTreeMap::from([
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
+                    ("agentless".to_string(), serde_json::json!(true)),
+                    ("transport".to_string(), serde_json::json!("ssh")),
+                    ("placement".to_string(), serde_json::json!("host_direct_only")),
+                    ("owning_daemon".to_string(), serde_json::json!("owner-host")),
+                ]),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("SSH observation");
     let policy = placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
@@ -7020,20 +7235,23 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
     create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
-        .create(&test_meta("local-host-id"), &HostSpec {
-            display_name: "local-host".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta("local-host-id"),
+            &HostSpec { display_name: "local-host".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("local host");
     hosts
-        .update_status(&local.metadata.name, &local.metadata.resource_version, &HostStatus {
-            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &local.metadata.name,
+            &local.metadata.resource_version,
+            &HostStatus {
+                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("local host status");
     placement_policy(&backend, "host-direct-z-local", "local-host").await;
@@ -7077,20 +7295,24 @@ async fn default_placement_error_lists_each_refusal_and_failed_host_condition_re
         let hosts = backend.using::<ResourceHost>("flotilla");
         let host = hosts.get(host_name).await.expect("host");
         hosts
-            .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-                capabilities: host.status.expect("host status").capabilities,
-                daemon_generation: Some(format!("{host_name}-generation")),
-                heartbeat_at: Some(Utc::now()),
-                ready: false,
-                conditions: vec![HostCondition::builder()
-                    .condition_type("test")
-                    .value(ConditionValue::False)
-                    .reason(condition_reason)
-                    .message(condition_message)
-                    .observed_at(Utc::now())
-                    .build()],
-                ..HostStatus::default()
-            })
+            .update_status(
+                &host.metadata.name,
+                &host.metadata.resource_version,
+                &HostStatus {
+                    capabilities: host.status.expect("host status").capabilities,
+                    daemon_generation: Some(format!("{host_name}-generation")),
+                    heartbeat_at: Some(Utc::now()),
+                    ready: false,
+                    conditions: vec![HostCondition::builder()
+                        .condition_type("test")
+                        .value(ConditionValue::False)
+                        .reason(condition_reason)
+                        .message(condition_message)
+                        .observed_at(Utc::now())
+                        .build()],
+                    ..HostStatus::default()
+                },
+            )
             .await
             .expect("degraded host status");
     }
@@ -7116,20 +7338,24 @@ async fn default_placement_accepts_a_host_with_an_authorship_collision() {
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("feta").await.expect("host");
     hosts
-        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            capabilities: host.status.expect("host status").capabilities,
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            conditions: vec![HostCondition::builder()
-                .condition_type("ResourceReplication/AuthorshipCollision")
-                .value(ConditionValue::False)
-                .reason("HomeBoundRecordAuthoredAtMultipleRoots")
-                .message("Convoy/flotilla/standing-collision is authored at multiple roots")
-                .observed_at(Utc::now())
-                .blocks_readiness(false)
-                .build()],
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: host.status.expect("host status").capabilities,
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                conditions: vec![HostCondition::builder()
+                    .condition_type("ResourceReplication/AuthorshipCollision")
+                    .value(ConditionValue::False)
+                    .reason("HomeBoundRecordAuthoredAtMultipleRoots")
+                    .message("Convoy/flotilla/standing-collision is authored at multiple roots")
+                    .observed_at(Utc::now())
+                    .blocks_readiness(false)
+                    .build()],
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("host status with advisory collision");
 
@@ -7144,10 +7370,13 @@ pub(super) async fn create_test_environment(daemon: &InProcessDaemon, name: &str
     daemon
         .resource_backend()
         .using::<ResourceEnvironment>("flotilla")
-        .create(&test_meta(name), &ResourceEnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: "/tmp".to_string() }),
-            docker: None,
-        })
+        .create(
+            &test_meta(name),
+            &ResourceEnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: "/tmp".to_string() }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment");
     name.to_string()
@@ -7178,11 +7407,15 @@ pub(super) async fn create_running_session(daemon: &InProcessDaemon, env_ref: &s
         .await
         .expect("terminal session");
     terminals
-        .update_status(name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            session_id: Some(format!("session-{name}")),
-            ..Default::default()
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                session_id: Some(format!("session-{name}")),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running session");
 }
@@ -7205,11 +7438,10 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
     for host_id in ["shared-host-id-a", "shared-host-id-b"] {
         hosts
-            .create(&test_meta(host_id), &HostSpec {
-                display_name: "shared-host".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &test_meta(host_id),
+                &HostSpec { display_name: "shared-host".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("ambiguous host");
     }
@@ -7273,17 +7505,21 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
                 .await
                 .expect("agent session");
             terminals
-                .update_status(name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
-                    phase: ResourceTerminalSessionPhase::Running,
-                    session_id: Some("session-one".to_string()),
-                    crew: Some(flotilla_resources::CrewSessionStatus {
-                        id: "crew-one".to_string(),
-                        adapter: "codex".to_string(),
-                        model: None,
-                        stance: "coder".to_string(),
-                    }),
-                    ..Default::default()
-                })
+                .update_status(
+                    name,
+                    &created.metadata.resource_version,
+                    &ResourceTerminalSessionStatus {
+                        phase: ResourceTerminalSessionPhase::Running,
+                        session_id: Some("session-one".to_string()),
+                        crew: Some(flotilla_resources::CrewSessionStatus {
+                            id: "crew-one".to_string(),
+                            adapter: "codex".to_string(),
+                            model: None,
+                            stance: "coder".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .expect("agent status");
         } else {
@@ -7310,27 +7546,30 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
 async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(host_ref), &HostSpec {
-            display_name: host_ref.to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta(host_ref),
+            &HostSpec { display_name: host_ref.to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("host create");
     hosts
-        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            capabilities: [
-                (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
-                ("docker".to_string(), serde_json::json!(true)),
-                ("os".to_string(), serde_json::json!("linux")),
-            ]
-            .into_iter()
-            .collect(),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            resource_store: None,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: [
+                    (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
+                    ("docker".to_string(), serde_json::json!(true)),
+                    ("os".to_string(), serde_json::json!("linux")),
+                ]
+                .into_iter()
+                .collect(),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                resource_store: None,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("host status update");
     backend
@@ -7410,20 +7649,23 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
     }
     backend
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("github-app"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::GithubApp {
-                actor_login: None,
-                installation_id: Some(1),
-                installation_repository: None,
-                permissions: Some(BTreeMap::from([
-                    ("contents".to_string(), "write".to_string()),
-                    ("actions".to_string(), "read".to_string()),
-                ])),
+        .create(
+            &test_meta("github-app"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(1),
+                    installation_repository: None,
+                    permissions: Some(BTreeMap::from([
+                        ("contents".to_string(), "write".to_string()),
+                        ("actions".to_string(), "read".to_string()),
+                    ])),
+                },
+                source: CredentialSource::GithubApp { app_id_path: "app-id".to_string(), private_key_path: "key".to_string() },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
             },
-            source: CredentialSource::GithubApp { app_id_path: "app-id".to_string(), private_key_path: "key".to_string() },
-            lifecycle: CredentialLifecycle::Refreshable,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        )
         .await
         .expect("declaration");
     for (name, roles, trust, permissions) in [
@@ -7515,20 +7757,23 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<CredentialSpec>("flotilla")
-            .create(&test_meta("app"), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(1),
-                    installation_repository: None,
-                    permissions: match mode {
-                        Mode::UnlistedNoCap => None,
-                        _ => Some(BTreeMap::from([("contents".into(), "write".into()), ("actions".into(), "read".into())])),
+            .create(
+                &test_meta("app"),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(1),
+                        installation_repository: None,
+                        permissions: match mode {
+                            Mode::UnlistedNoCap => None,
+                            _ => Some(BTreeMap::from([("contents".into(), "write".into()), ("actions".into(), "read".into())])),
+                        },
                     },
+                    source: CredentialSource::GithubApp { app_id_path: "app-id".into(), private_key_path: "key".into() },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp { app_id_path: "app-id".into(), private_key_path: "key".into() },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("spec");
         for name in ["base", "elevation"] {
@@ -7589,12 +7834,15 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("claude-max"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
-            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &test_meta("claude-max"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+                source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("create Claude credential declaration");
     let workflow = WorkflowTemplateSpec::builder()
@@ -7651,12 +7899,15 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("github-crew-pr"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::Gh,
-            source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &test_meta("github-crew-pr"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("create GitHub credential declaration");
     backend
@@ -7693,12 +7944,15 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("github-crew-pr"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::Gh,
-            source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &test_meta("github-crew-pr"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("create GitHub credential declaration");
     let workflow = WorkflowTemplateSpec::builder()
@@ -7735,27 +7989,30 @@ async fn remote_placement_uses_replicated_host_capabilities() {
     let feta = ResourceBackend::InMemory(InMemoryBackend::default());
     let feta_hosts = feta.using::<ResourceHost>("flotilla");
     let fresh = feta_hosts
-        .create(&test_meta("feta-host"), &HostSpec {
-            display_name: "feta".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &test_meta("feta-host"),
+            &HostSpec { display_name: "feta".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("create fresh feta self-report");
     feta_hosts
-        .update_status(&fresh.metadata.name, &fresh.metadata.resource_version, &HostStatus {
-            capabilities: [(
-                flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(),
-                serde_json::json!(BTreeSet::from(["claude-max".to_string()])),
-            )]
-            .into_iter()
-            .collect(),
-            heartbeat_at: Some(now - chrono::Duration::seconds(1)),
-            ready: true,
-            daemon_generation: Some("fresh-feta-generation".to_string()),
-            daemon_started_at: Some(now - chrono::Duration::minutes(1)),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &fresh.metadata.name,
+            &fresh.metadata.resource_version,
+            &HostStatus {
+                capabilities: [(
+                    flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(),
+                    serde_json::json!(BTreeSet::from(["claude-max".to_string()])),
+                )]
+                .into_iter()
+                .collect(),
+                heartbeat_at: Some(now - chrono::Duration::seconds(1)),
+                ready: true,
+                daemon_generation: Some("fresh-feta-generation".to_string()),
+                daemon_started_at: Some(now - chrono::Duration::minutes(1)),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("write fresh feta capabilities");
     backend
@@ -7812,12 +8069,15 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("claude-max"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
-            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &test_meta("claude-max"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+                source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("create Claude credential declaration");
     let workflow = WorkflowTemplateSpec::builder()
@@ -7922,12 +8182,15 @@ async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_a
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
-        .create(&test_meta("claude-max"), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
-            source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &test_meta("claude-max"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+                source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("create Claude credential declaration");
     let mut workflow = WorkflowTemplateSpec::builder()
@@ -8104,24 +8367,31 @@ async fn crew_fail_requires_operator_force() {
     let convoy =
         convoys.create(&test_meta("operator-failure"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("crew status");
     backend
         .clone()
         .using::<Vessel>("flotilla")
-        .create(&test_meta("operator-failure-vessel"), &VesselSpec {
-            convoy_ref: "operator-failure".into(),
-            vessel_name: "work".into(),
-            placement_policy_ref: "test".into(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &test_meta("operator-failure-vessel"),
+            &VesselSpec {
+                convoy_ref: "operator-failure".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel");
     daemon
@@ -8205,11 +8475,15 @@ async fn stall_test_session(backend: &ResourceBackend, convoy: &str, name: &str,
         .await
         .expect("session");
     sessions
-        .update_status(name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(attention),
-            ..Default::default()
-        })
+        .update_status(
+            name,
+            &session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(attention),
+                ..Default::default()
+            },
+        )
         .await
         .expect("attention");
 }
@@ -8221,27 +8495,30 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let created =
         convoys.create(&test_meta("idle-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
-        .update_status("idle-crew", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some({
-                let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
-                snapshot.stall_nudges.insert("work/coder".into(), flotilla_resources::StallNudgePolicy {
-                    max_per_episode: 2,
-                    max_refusals: None,
-                    idle_grace_seconds: Some(3),
-                });
-                snapshot
-            }),
-            work: BTreeMap::from([(
-                "work".into(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "idle-crew",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some({
+                    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+                    snapshot.stall_nudges.insert(
+                        "work/coder".into(),
+                        flotilla_resources::StallNudgePolicy { max_per_episode: 2, max_refusals: None, idle_grace_seconds: Some(3) },
+                    );
+                    snapshot
+                }),
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("active status");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
@@ -8267,15 +8544,19 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         .await
         .expect("session");
     let mut idle = sessions
-        .update_status("idle-session", &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention {
-                state: TerminalAttentionState::Idle,
-                as_of: Utc::now() - chrono::Duration::seconds(3),
-                source: TerminalAttentionSource::Screen,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "idle-session",
+            &session.metadata.resource_version,
+            &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Idle,
+                    as_of: Utc::now() - chrono::Duration::seconds(3),
+                    source: TerminalAttentionSource::Screen,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("idle attention");
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -8293,11 +8574,14 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let mut events = daemon.subscribe();
     let subscription = daemon
         .crew_ops
-        .subscribe_wait(uuid::Uuid::new_v4(), flotilla_protocol::WaitSubscriptionRequest {
-            namespace: "flotilla".into(),
-            leaves: vec!["convoy/idle-crew .status.stalled == true".parse().expect("stall leaf")],
-            freshness_demand: None,
-        })
+        .subscribe_wait(
+            uuid::Uuid::new_v4(),
+            flotilla_protocol::WaitSubscriptionRequest {
+                namespace: "flotilla".into(),
+                leaves: vec!["convoy/idle-crew .status.stalled == true".parse().expect("stall leaf")],
+                freshness_demand: None,
+            },
+        )
         .await
         .expect("subscribe to stalled condition");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -8326,26 +8610,36 @@ async fn stale_working_attention_does_not_stall_crew() {
     let created =
         convoys.create(&test_meta("stale-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
-        .update_status("stale-crew", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(stall_workflow_snapshot(vec![claim_crew("coder")])),
-            work: BTreeMap::from([(
-                "work".into(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "stale-crew",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some(stall_workflow_snapshot(vec![claim_crew("coder")])),
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("active status");
-    stall_test_session(&backend, "stale-crew", "stale-session", "coder", TerminalAttention {
-        state: TerminalAttentionState::Working,
-        as_of: Utc::now() - chrono::Duration::minutes(3),
-        source: TerminalAttentionSource::Hook,
-    })
+    stall_test_session(
+        &backend,
+        "stale-crew",
+        "stale-session",
+        "coder",
+        TerminalAttention {
+            state: TerminalAttentionState::Working,
+            as_of: Utc::now() - chrono::Duration::minutes(3),
+            source: TerminalAttentionSource::Hook,
+        },
+    )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
     assert!(convoys.get("stale-crew").await.expect("convoy").status.expect("status").stalled.is_none());
@@ -8378,19 +8672,23 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
         "$cr.state == merged".parse().expect("leaf template"),
     )])));
     convoys
-        .update_status("landed-claim", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Landing,
-            workflow_snapshot: Some(snapshot),
-            work: BTreeMap::from([(
-                "work".into(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "landed-claim",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Landing,
+                workflow_snapshot: Some(snapshot),
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("landing status");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -8414,26 +8712,32 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     let record = records.get(&record_name).await.expect("demanded observation record");
     let fresh = Utc::now();
     records
-        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-            title: Default::default(),
-            author: Default::default(),
-            review_decision: Default::default(),
-            review_requested_from_owner: Default::default(),
-            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, fresh),
-            head_sha: flotilla_resources::Observation::known("head".into(), fresh),
-            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, fresh),
-            review: flotilla_resources::ChangeRequestReviewObservation {
-                actionable_at_head: flotilla_resources::Observation::known(false, fresh),
+        .update_status(
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, fresh),
+                head_sha: flotilla_resources::Observation::known("head".into(), fresh),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, fresh),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, fresh),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, fresh),
             },
-            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, fresh),
-        })
+        )
         .await
         .expect("fresh observation");
-    stall_test_session(&backend, "landed-claim", "idle-landing-session", "coder", TerminalAttention {
-        state: TerminalAttentionState::Idle,
-        as_of: Utc::now(),
-        source: TerminalAttentionSource::Hook,
-    })
+    stall_test_session(
+        &backend,
+        "landed-claim",
+        "idle-landing-session",
+        "coder",
+        TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Hook },
+    )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
     assert!(convoys.get("landed-claim").await.expect("convoy").status.expect("status").stalled.is_none());
@@ -8447,18 +8751,22 @@ async fn landing_without_armed_exit_rows_stalls() {
     let created =
         convoys.create(&test_meta("unarmed-landing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
-        .update_status("unarmed-landing", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Landing,
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: Vec::new(),
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "unarmed-landing",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Landing,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("landing status");
     let stalled = wait_for_stall(&backend, "unarmed-landing", true).await.stalled.expect("stalled");
@@ -8488,21 +8796,25 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.create(&test_meta("stale-observation"), &spec).await.expect("convoy");
     convoys
-        .update_status("stale-observation", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Landing,
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
-                    "shipped".into(),
-                    "$cr.state == merged".parse().expect("leaf template"),
-                )]))),
-                turn_delivery: Default::default(),
-                vessels: Vec::new(),
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "stale-observation",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Landing,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
+                        "shipped".into(),
+                        "$cr.state == merged".parse().expect("leaf template"),
+                    )]))),
+                    turn_delivery: Default::default(),
+                    vessels: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("landing status");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
@@ -8521,19 +8833,23 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .expect("observation record");
     let old = Utc::now() - chrono::Duration::hours(1);
     records
-        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-            title: Default::default(),
-            author: Default::default(),
-            review_decision: Default::default(),
-            review_requested_from_owner: Default::default(),
-            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, old),
-            head_sha: flotilla_resources::Observation::known("old".into(), old),
-            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, old),
-            review: flotilla_resources::ChangeRequestReviewObservation {
-                actionable_at_head: flotilla_resources::Observation::known(false, old),
+        .update_status(
+            &record_name,
+            &record.metadata.resource_version,
+            &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, old),
+                head_sha: flotilla_resources::Observation::known("old".into(), old),
+                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, old),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::known(false, old),
+                },
+                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, old),
             },
-            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, old),
-        })
+        )
         .await
         .expect("stale observation");
     let stalled = wait_for_stall(&backend, "stale-observation", true).await.stalled.expect("stalled");
@@ -8549,22 +8865,26 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.create(&test_meta("standing"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
-        .update_status("standing", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
-                .role("governor".into())
-                .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
-                .build()])),
-            work: BTreeMap::from([(
-                "work".into(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "standing",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
+                    .role("governor".into())
+                    .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+                    .build()])),
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("active status");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
@@ -8591,15 +8911,19 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
             .await
             .expect("session");
         sessions
-            .update_status(name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Running,
-                attention: Some(TerminalAttention {
-                    state,
-                    as_of: Utc::now() - chrono::Duration::seconds(10),
-                    source: TerminalAttentionSource::Screen,
-                }),
-                ..Default::default()
-            })
+            .update_status(
+                name,
+                &session.metadata.resource_version,
+                &ResourceTerminalSessionStatus {
+                    phase: ResourceTerminalSessionPhase::Running,
+                    attention: Some(TerminalAttention {
+                        state,
+                        as_of: Utc::now() - chrono::Duration::seconds(10),
+                        source: TerminalAttentionSource::Screen,
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("attention");
     }
@@ -8615,10 +8939,11 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
     let created =
         convoys.create(&test_meta("replicated"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
     convoys
-        .update_status("replicated", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Landing,
-            ..Default::default()
-        })
+        .update_status(
+            "replicated",
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Landing, ..Default::default() },
+        )
         .await
         .expect("landing status");
     let replica = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("replica"));
@@ -8677,11 +9002,15 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         let session = sessions.get("resume-staging-session").await.expect("session");
         let original_cwd = session.spec.cwd.clone();
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-                phase: ResourceTerminalSessionPhase::Stopped,
-                inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-                ..Default::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &ResourceTerminalSessionStatus {
+                    phase: ResourceTerminalSessionPhase::Stopped,
+                    inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("agent exited");
         daemon
@@ -8839,11 +9168,11 @@ fn resource_host_descriptions_survive_transport_changes(tc: hegel::TestCase) {
         let local_name = daemon.local_host_id().expect("local host").to_string();
         let local = local_hosts.create(&test_meta(&local_name), &HostSpec::default()).await.expect("local Host");
         local_hosts
-            .update_status(&local_name, &local.metadata.resource_version, &HostStatus {
-                description: Some(local_summary.clone()),
-                heartbeat_at: Some(Utc::now()),
-                ..Default::default()
-            })
+            .update_status(
+                &local_name,
+                &local.metadata.resource_version,
+                &HostStatus { description: Some(local_summary.clone()), heartbeat_at: Some(Utc::now()), ..Default::default() },
+            )
             .await
             .expect("publish local description");
         let local = daemon.get_host_status_internal(&local_environment).await.expect("local resource description");
@@ -9312,25 +9641,32 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
     let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
     snapshot.exit = Some(flotilla_resources::ExitDeclaration::Claim(flotilla_resources::ClaimExit));
     convoys
-        .update_status("ledger-claim", &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(snapshot),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "ledger-claim",
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                workflow_snapshot: Some(snapshot),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("working crew");
     backend
         .using::<Vessel>("flotilla")
-        .create(&test_meta("ledger-claim-vessel"), &VesselSpec {
-            convoy_ref: "ledger-claim".into(),
-            vessel_name: "work".into(),
-            placement_policy_ref: "test".into(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &test_meta("ledger-claim-vessel"),
+            &VesselSpec {
+                convoy_ref: "ledger-claim".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel");
     let context = CrewCommandContext {
@@ -9426,14 +9762,17 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
         let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
         let provider = Arc::new(FakeChangeRequest::new());
         provider
-            .add_change_requests(vec![("7".into(), ChangeRequest {
-                title: "Old work".into(),
-                branch: "reused".into(),
-                status: state,
-                body: None,
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            })])
+            .add_change_requests(vec![(
+                "7".into(),
+                ChangeRequest {
+                    title: "Old work".into(),
+                    branch: "reused".into(),
+                    status: state,
+                    body: None,
+                    provider_name: "github".into(),
+                    provider_display_name: "GitHub".into(),
+                },
+            )])
             .await;
         fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             provider;
@@ -9479,22 +9818,28 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
     let provider = Arc::new(FakeChangeRequest::new());
     provider
         .add_change_requests(vec![
-            ("7".into(), ChangeRequest {
-                title: "Old work".into(),
-                branch: "requested".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Merged,
-                body: None,
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            }),
-            ("8".into(), ChangeRequest {
-                title: "Real work".into(),
-                branch: "actual".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            }),
+            (
+                "7".into(),
+                ChangeRequest {
+                    title: "Old work".into(),
+                    branch: "requested".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Merged,
+                    body: None,
+                    provider_name: "github".into(),
+                    provider_display_name: "GitHub".into(),
+                },
+            ),
+            (
+                "8".into(),
+                ChangeRequest {
+                    title: "Real work".into(),
+                    branch: "actual".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    body: None,
+                    provider_name: "github".into(),
+                    provider_display_name: "GitHub".into(),
+                },
+            ),
         ])
         .await;
     fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
@@ -9634,14 +9979,17 @@ async fn checkout_creation_does_not_reuse_cached_branch_absence() {
         .expect("absence")
         .is_none());
     provider
-        .add_change_requests(vec![("7".into(), ChangeRequest {
-            title: "Old work".into(),
-            branch: "reused".into(),
-            status: flotilla_protocol::ChangeRequestStatus::Closed,
-            body: None,
-            provider_name: "github".into(),
-            provider_display_name: "GitHub".into(),
-        })])
+        .add_change_requests(vec![(
+            "7".into(),
+            ChangeRequest {
+                title: "Old work".into(),
+                branch: "reused".into(),
+                status: flotilla_protocol::ChangeRequestStatus::Closed,
+                body: None,
+                provider_name: "github".into(),
+                provider_display_name: "GitHub".into(),
+            },
+        )])
         .await;
     // Ordinary observation may reuse the earlier absence; creation must still
     // inspect the forge anew through the same production observation adapter.
@@ -9712,10 +10060,10 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
     layers.apply(&test_meta("display"), &display).await.expect("display layer");
     let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
     baselines
-        .apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec {
-            image: "crew:v1".into(),
-            layers: Some(ImageLayerSelection::builder().base("base".into()).build()),
-        })
+        .apply(
+            &test_meta("fleet-crew"),
+            &CrewImageBaselineSpec { image: "crew:v1".into(), layers: Some(ImageLayerSelection::builder().base("base".into()).build()) },
+        )
         .await
         .expect("baseline alongside layers");
     let crew = CrewSpec::builder()
@@ -9824,11 +10172,14 @@ async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
         .display_name("Fleet".into())
         .role_definitions(BTreeMap::from([
             ("quartermaster".into(), RoleDefinition { workflow: Some("quartermaster".into()), ..Default::default() }),
-            ("governor".into(), RoleDefinition {
-                agent: Some("codex".into()),
-                brief_template: Some("{% block operating_instructions %}Fleet governor template{% endblock %}".into()),
-                ..Default::default()
-            }),
+            (
+                "governor".into(),
+                RoleDefinition {
+                    agent: Some("codex".into()),
+                    brief_template: Some("{% block operating_instructions %}Fleet governor template{% endblock %}".into()),
+                    ..Default::default()
+                },
+            ),
         ]))
         .build();
     projects.apply(&test_meta("fleet"), &fleet).await.expect("fleet");
@@ -9983,15 +10334,19 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
     daemon.apply_intent_document("flotilla", document.clone()).await.unwrap();
     let messages = backend.using::<Message>("flotilla");
     assert_eq!(messages.get("first").await.unwrap().spec.receiver, "flotilla/convoy/work/coder");
-    flotilla_resources::apply_status_patch(&messages, "first", &MessageStatusPatch::Delivered {
-        receiver: ResolvedMessageReceiver::builder()
-            .crew_id("crew".into())
-            .session("session".into())
-            .delivered_at(chrono::Utc::now())
-            .evidence("receipt".into())
-            .build(),
-        at: chrono::Utc::now(),
-    })
+    flotilla_resources::apply_status_patch(
+        &messages,
+        "first",
+        &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew".into())
+                .session("session".into())
+                .delivered_at(chrono::Utc::now())
+                .evidence("receipt".into())
+                .build(),
+            at: chrono::Utc::now(),
+        },
+    )
     .await
     .unwrap();
     document["metadata"]["name"] = "next".into();
@@ -10231,20 +10586,24 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
             .expect("project");
         let project = projects.get(name).await.expect("current project");
         projects
-            .update_status(name, &project.metadata.resource_version, &ProjectStatus {
-                dispatch_queue: (0..400)
-                    .map(|id| DispatchQueueEntry {
-                        score: None,
-                        issue: flotilla_protocol::IssueRef { source: source.clone(), id: id.to_string() },
-                        title: format!("Issue {id}"),
-                        issue_as_of: now,
-                        ready_observed_at: now,
-                        observed_at: now,
-                        provenance: "test".into(),
-                    })
-                    .collect(),
-                ..Default::default()
-            })
+            .update_status(
+                name,
+                &project.metadata.resource_version,
+                &ProjectStatus {
+                    dispatch_queue: (0..400)
+                        .map(|id| DispatchQueueEntry {
+                            score: None,
+                            issue: flotilla_protocol::IssueRef { source: source.clone(), id: id.to_string() },
+                            title: format!("Issue {id}"),
+                            issue_as_of: now,
+                            ready_observed_at: now,
+                            observed_at: now,
+                            provenance: "test".into(),
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("readiness projection");
     }
@@ -10351,14 +10710,17 @@ impl ChangeRequestTracker for CountingForgeRequests {
     }
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok((id.into(), ChangeRequest {
-            title: "Shared PR".into(),
-            branch: "work".into(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            body: None,
-            provider_name: "fake".into(),
-            provider_display_name: "Fake".into(),
-        }))
+        Ok((
+            id.into(),
+            ChangeRequest {
+                title: "Shared PR".into(),
+                branch: "work".into(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "fake".into(),
+                provider_display_name: "Fake".into(),
+            },
+        ))
     }
     async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
         unreachable!()
@@ -10462,11 +10824,11 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
             continue;
         }
         hosts
-            .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-                ready: true,
-                heartbeat_at: Some(Utc::now()),
-                ..Default::default()
-            })
+            .update_status(
+                &host.metadata.name,
+                &host.metadata.resource_version,
+                &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
+            )
             .await
             .unwrap();
     }
@@ -10482,11 +10844,11 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get("host-0").await.unwrap();
     hosts
-        .update_status("host-0", &host.metadata.resource_version, &HostStatus {
-            ready: true,
-            heartbeat_at: Some(Utc::now()),
-            ..Default::default()
-        })
+        .update_status(
+            "host-0",
+            &host.metadata.resource_version,
+            &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
+        )
         .await
         .unwrap();
     replicate::<ResourceHost>(&daemons).await;
@@ -10547,11 +10909,11 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get("host-0").await.unwrap();
     hosts
-        .update_status("host-0", &host.metadata.resource_version, &HostStatus {
-            ready: false,
-            heartbeat_at: Some(Utc::now()),
-            ..Default::default()
-        })
+        .update_status(
+            "host-0",
+            &host.metadata.resource_version,
+            &HostStatus { ready: false, heartbeat_at: Some(Utc::now()), ..Default::default() },
+        )
         .await
         .unwrap();
     replicate::<ResourceHost>(&daemons).await;
@@ -10595,11 +10957,11 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     // Recovery restores the preferred observer; the fallback stops polling.
     let host = hosts.get("host-0").await.unwrap();
     hosts
-        .update_status("host-0", &host.metadata.resource_version, &HostStatus {
-            ready: true,
-            heartbeat_at: Some(Utc::now()),
-            ..Default::default()
-        })
+        .update_status(
+            "host-0",
+            &host.metadata.resource_version,
+            &HostStatus { ready: true, heartbeat_at: Some(Utc::now()), ..Default::default() },
+        )
         .await
         .unwrap();
     replicate::<ResourceHost>(&daemons).await;
@@ -10657,14 +11019,17 @@ async fn continuation_resolves_branch_without_pr_and_refuses_terminal_pr() {
     for status in [ChangeRequestStatus::Merged, ChangeRequestStatus::Closed] {
         let provider = Arc::new(FakeChangeRequest::new());
         provider
-            .add_change_requests(vec![("7".into(), ChangeRequest {
-                title: "Old PR".into(),
-                branch: "wip".into(),
-                status,
-                body: None,
-                provider_name: "fake".into(),
-                provider_display_name: "Fake".into(),
-            })])
+            .add_change_requests(vec![(
+                "7".into(),
+                ChangeRequest {
+                    title: "Old PR".into(),
+                    branch: "wip".into(),
+                    status,
+                    body: None,
+                    provider_name: "fake".into(),
+                    provider_display_name: "Fake".into(),
+                },
+            )])
             .await;
         fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
             provider;

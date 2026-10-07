@@ -331,9 +331,10 @@ async fn http_replication_resnapshots_after_quarantined_history() {
         .expect("historical spec should be an object")
         .remove("workflow_ref");
     connection
-        .execute("UPDATE resource_events SET body_json = ?1 WHERE event_version = 1", [
-            serde_json::to_string(&body).expect("encode old-schema event")
-        ])
+        .execute(
+            "UPDATE resource_events SET body_json = ?1 WHERE event_version = 1",
+            [serde_json::to_string(&body).expect("encode old-schema event")],
+        )
         .expect("remove a now-required field from the historical event");
     drop(connection);
     let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("reopen origin after schema upgrade"));
@@ -966,9 +967,11 @@ async fn dispatch_add_list_remove_repo_round_trip() {
     let canonical_repo_path = repo_path.canonicalize().expect("canonical requested repo path");
     assert_eq!(listed[0].path.as_deref(), Some(canonical_repo_path.as_path()));
 
-    let remove = dispatch_request_test(&daemon, 12, Request::RemoveRepo {
-        path: listed[0].path.clone().expect("tracked repo should have local path"),
-    })
+    let remove = dispatch_request_test(
+        &daemon,
+        12,
+        Request::RemoveRepo { path: listed[0].path.clone().expect("tracked repo should have local path") },
+    )
     .await;
     assert!(matches!(ok_response(remove, 12), Response::RemoveRepo));
 }
@@ -988,23 +991,26 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
 
     backend
         .using::<Convoy>("flotilla")
-        .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "scratch".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: Default::default(),
-            placement_policy: None,
-            repositories: Vec::new(),
-            r#ref: None,
-            project_ref: None,
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &InputMeta::builder().name("persisted".to_string()).build(),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "scratch".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: Default::default(),
+                placement_policy: None,
+                repositories: Vec::new(),
+                r#ref: None,
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy create should succeed");
     drop(server);
@@ -1127,25 +1133,33 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
 
     {
         let mut store = agent_state_store.lock().expect("lock agent state store");
-        store.upsert(existing_id.clone(), AgentEntry {
-            harness: AgentHarness::ClaudeCode,
-            status: AgentStatus::Idle,
-            model: Some("old-model".into()),
-            session_title: Some("Existing".into()),
-            session_id: Some(session_id.clone()),
-            last_event_epoch_secs: 1,
-        });
+        store.upsert(
+            existing_id.clone(),
+            AgentEntry {
+                harness: AgentHarness::ClaudeCode,
+                status: AgentStatus::Idle,
+                model: Some("old-model".into()),
+                session_title: Some("Existing".into()),
+                session_id: Some(session_id.clone()),
+                last_event_epoch_secs: 1,
+            },
+        );
     }
 
-    let response = dispatch_request_with_state(&daemon, &agent_state_store, 5, Request::AgentHook {
-        event: AgentHookEvent::builder()
-            .attachable_id(incoming_id.clone())
-            .harness(AgentHarness::ClaudeCode)
-            .event_type(AgentEventType::Active)
-            .session_id(session_id.clone())
-            .model("new-model".to_string())
-            .build(),
-    })
+    let response = dispatch_request_with_state(
+        &daemon,
+        &agent_state_store,
+        5,
+        Request::AgentHook {
+            event: AgentHookEvent::builder()
+                .attachable_id(incoming_id.clone())
+                .harness(AgentHarness::ClaudeCode)
+                .event_type(AgentEventType::Active)
+                .session_id(session_id.clone())
+                .model("new-model".to_string())
+                .build(),
+        },
+    )
     .await;
 
     assert!(matches!(ok_response(response, 5), Response::AgentHook));
@@ -1162,14 +1176,17 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
     let (_tmp, daemon) = empty_daemon().await;
     let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&InputMeta::builder().name("terminal-demo-coder".to_string()).build(), &TerminalSessionSpec {
-            env_ref: "host-direct".into(),
-            role: "coder".into(),
-            source: TerminalSessionSource::Tool { command: "claude".into() },
-            cwd: "/repo".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        .create(
+            &InputMeta::builder().name("terminal-demo-coder".to_string()).build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: "claude".into() },
+                cwd: "/repo".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
         .await
         .expect("terminal create");
     let mut status = TerminalSessionStatus::default();
@@ -1186,16 +1203,24 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
     sessions.update_status("terminal-demo-coder", &created.metadata.resource_version, &status).await.expect("running status");
     let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
 
-    let response = dispatch_request_with_state(&daemon, &agent_state_store, 8, Request::AgentHook {
-        event: AgentHookEvent::builder()
-            .attachable_id(AttachableId::new("att-managed"))
-            .harness(AgentHarness::ClaudeCode)
-            .event_type(AgentEventType::WaitingForPermission)
-            .session_id("claude-native-session".to_string())
-            .cwd("/repo".to_string())
-            .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "terminal-demo-coder".into() })
-            .build(),
-    })
+    let response = dispatch_request_with_state(
+        &daemon,
+        &agent_state_store,
+        8,
+        Request::AgentHook {
+            event: AgentHookEvent::builder()
+                .attachable_id(AttachableId::new("att-managed"))
+                .harness(AgentHarness::ClaudeCode)
+                .event_type(AgentEventType::WaitingForPermission)
+                .session_id("claude-native-session".to_string())
+                .cwd("/repo".to_string())
+                .terminal(flotilla_protocol::AgentHookTerminalRef {
+                    namespace: "flotilla".into(),
+                    session_name: "terminal-demo-coder".into(),
+                })
+                .build(),
+        },
+    )
     .await;
 
     assert!(matches!(ok_response(response, 8), Response::AgentHook));
@@ -1241,29 +1266,33 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             .expect("convoy");
         let workflow = flotilla_resources::single_agent_workflow_spec();
         convoys
-            .update_status(&convoy_name, &created_convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Active,
-                work: BTreeMap::from([(
-                    "work".into(),
-                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-                )]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([(
-                        "coder".into(),
-                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+            .update_status(
+                &convoy_name,
+                &created_convoy.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus {
+                    phase: flotilla_resources::ConvoyPhase::Active,
+                    work: BTreeMap::from([(
+                        "work".into(),
+                        flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
                     )]),
-                )]),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    vessels: workflow.vessels,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                ..Default::default()
-            })
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([(
+                            "coder".into(),
+                            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                        )]),
+                    )]),
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        vessels: workflow.vessels,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("convoy status");
         let name = format!("terminal-{harness_name}");
@@ -1319,15 +1348,20 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 sessions.update_status(&name, &current.metadata.resource_version, &status).await.expect("screen working status");
             } else {
                 let parsed = parser.parse_event(event_type, payload.as_bytes()).expect("parse hook");
-                let response = dispatch_request_with_state(&daemon, &store, 8, Request::AgentHook {
-                    event: AgentHookEvent::builder()
-                        .attachable_id(AttachableId::new(name.clone()))
-                        .harness(harness.clone())
-                        .event_type(parsed.event_type)
-                        .maybe_session_id(parsed.session_id)
-                        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() })
-                        .build(),
-                })
+                let response = dispatch_request_with_state(
+                    &daemon,
+                    &store,
+                    8,
+                    Request::AgentHook {
+                        event: AgentHookEvent::builder()
+                            .attachable_id(AttachableId::new(name.clone()))
+                            .harness(harness.clone())
+                            .event_type(parsed.event_type)
+                            .maybe_session_id(parsed.session_id)
+                            .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() })
+                            .build(),
+                    },
+                )
                 .await;
                 assert!(matches!(ok_response(response, 8), Response::AgentHook));
             }
@@ -1361,24 +1395,32 @@ async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
 
     {
         let mut store = agent_state_store.lock().expect("lock agent state store");
-        store.upsert(existing_id.clone(), AgentEntry {
-            harness: AgentHarness::ClaudeCode,
-            status: AgentStatus::Active,
-            model: Some("opus".into()),
-            session_title: Some("Existing".into()),
-            session_id: Some(session_id.clone()),
-            last_event_epoch_secs: 1,
-        });
+        store.upsert(
+            existing_id.clone(),
+            AgentEntry {
+                harness: AgentHarness::ClaudeCode,
+                status: AgentStatus::Active,
+                model: Some("opus".into()),
+                session_title: Some("Existing".into()),
+                session_id: Some(session_id.clone()),
+                last_event_epoch_secs: 1,
+            },
+        );
     }
 
-    let response = dispatch_request_with_state(&daemon, &agent_state_store, 6, Request::AgentHook {
-        event: AgentHookEvent::builder()
-            .attachable_id(AttachableId::new("att-ended"))
-            .harness(AgentHarness::ClaudeCode)
-            .event_type(AgentEventType::Ended)
-            .session_id(session_id.clone())
-            .build(),
-    })
+    let response = dispatch_request_with_state(
+        &daemon,
+        &agent_state_store,
+        6,
+        Request::AgentHook {
+            event: AgentHookEvent::builder()
+                .attachable_id(AttachableId::new("att-ended"))
+                .harness(AgentHarness::ClaudeCode)
+                .event_type(AgentEventType::Ended)
+                .session_id(session_id.clone())
+                .build(),
+        },
+    )
     .await;
 
     assert!(matches!(ok_response(response, 6), Response::AgentHook));
@@ -1393,14 +1435,19 @@ async fn dispatch_agent_hook_no_change_event_is_ok_without_creating_entry() {
     let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
     let attachable_id = AttachableId::new("att-no-change");
 
-    let response = dispatch_request_with_state(&daemon, &agent_state_store, 7, Request::AgentHook {
-        event: AgentHookEvent::builder()
-            .attachable_id(attachable_id.clone())
-            .harness(AgentHarness::ClaudeCode)
-            .event_type(AgentEventType::NoChange)
-            .session_id("sess-no-change".to_string())
-            .build(),
-    })
+    let response = dispatch_request_with_state(
+        &daemon,
+        &agent_state_store,
+        7,
+        Request::AgentHook {
+            event: AgentHookEvent::builder()
+                .attachable_id(attachable_id.clone())
+                .harness(AgentHarness::ClaudeCode)
+                .event_type(AgentEventType::NoChange)
+                .session_id("sess-no-change".to_string())
+                .build(),
+        },
+    )
     .await;
 
     assert!(matches!(ok_response(response, 7), Response::AgentHook));
@@ -1683,28 +1730,31 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
 
     let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&InputMeta::builder().name("terminal-stranded-work-coder".to_string()).build(), &TerminalSessionSpec {
-            env_ref: "local".into(),
-            role: "coder".into(),
-            source: TerminalSessionSource::Agent {
-                selector: Selector::for_capability("code"),
-                brief: TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/coder.md".into(),
-                    content: String::new(),
-                    copies: vec![],
+        .create(
+            &InputMeta::builder().name("terminal-stranded-work-coder".to_string()).build(),
+            &TerminalSessionSpec {
+                env_ref: "local".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("code"),
+                    brief: TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: String::new(),
+                        copies: vec![],
+                    },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "stranded".into(),
+                        vessel_ref: "stranded-work".into(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "stranded".into(),
-                    vessel_ref: "stranded-work".into(),
-                }),
-                message: None,
+                cwd: "/repo".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
             },
-            cwd: "/repo".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        )
         .await
         .expect("terminal create");
     let mut status = TerminalSessionStatus::default();
@@ -1874,19 +1924,26 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         .await
         .expect("create remote host resource");
     remote_hosts
-        .update_status(&remote_host_id, &remote_host.metadata.resource_version, &HostStatus {
-            capabilities: BTreeMap::from([(flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))]),
-            fulfilment_facts: BTreeMap::from([(format!("host-direct-{remote_host_id}"), FulfilmentFacts {
-                harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
-                ..Default::default()
-            })]),
-            heartbeat_at: Some(chrono::Utc::now()),
-            daemon_generation: Some("feta-test".to_string()),
-            ready: true,
-            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &remote_host_id,
+            &remote_host.metadata.resource_version,
+            &HostStatus {
+                capabilities: BTreeMap::from([(flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))]),
+                fulfilment_facts: BTreeMap::from([(
+                    format!("host-direct-{remote_host_id}"),
+                    FulfilmentFacts {
+                        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+                        ..Default::default()
+                    },
+                )]),
+                heartbeat_at: Some(chrono::Utc::now()),
+                daemon_generation: Some("feta-test".to_string()),
+                ready: true,
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish remote host capacity");
     daemon
@@ -2055,30 +2112,37 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let environments = placed.using::<flotilla_resources::Environment>("flotilla");
     let environment_name = format!("host-direct-{remote_host_id}");
     let environment = environments
-        .create(&InputMeta::builder().name(environment_name.clone()).build(), &flotilla_resources::EnvironmentSpec {
-            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
-                host_ref: remote_host_id.clone(),
-                repo_default_dir: "/workspace".to_string(),
-            }),
-            docker: None,
-        })
+        .create(
+            &InputMeta::builder().name(environment_name.clone()).build(),
+            &flotilla_resources::EnvironmentSpec {
+                host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                    host_ref: remote_host_id.clone(),
+                    repo_default_dir: "/workspace".to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("placement host environment");
     environments
-        .update_status(&environment_name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
-            image_build_refs: Vec::new(),
-            configured_limits: None,
-            runtime_observation: None,
-            phase: flotilla_resources::EnvironmentPhase::Ready,
-            ready: true,
-            docker_container_id: None,
-            image_ref: None,
-            local_image_id: None,
-            registry_digest: None,
-            message: None,
-            credential_delivery_retry: None,
-            credential_refresh_retry: None,
-        })
+        .update_status(
+            &environment_name,
+            &environment.metadata.resource_version,
+            &flotilla_resources::EnvironmentStatus {
+                image_build_refs: Vec::new(),
+                configured_limits: None,
+                runtime_observation: None,
+                phase: flotilla_resources::EnvironmentPhase::Ready,
+                ready: true,
+                docker_container_id: None,
+                image_ref: None,
+                local_image_id: None,
+                registry_digest: None,
+                message: None,
+                credential_delivery_retry: None,
+                credential_refresh_retry: None,
+            },
+        )
         .await
         .expect("placement host environment ready");
     let vessel_task = tokio::spawn(
@@ -2241,12 +2305,16 @@ async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement()
         .await
         .expect("create remote host");
     hosts
-        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            daemon_generation: Some("stopped-generation".to_string()),
-            heartbeat_at: Some(chrono::Utc::now()),
-            ready: false,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host.metadata.name,
+            &host.metadata.resource_version,
+            &HostStatus {
+                daemon_generation: Some("stopped-generation".to_string()),
+                heartbeat_at: Some(chrono::Utc::now()),
+                ready: false,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("mark remote host not ready");
     daemon
@@ -2428,21 +2496,25 @@ expected_host_name = "feta"
     let mut events = daemon.subscribe();
 
     router
-        .emit_remote_command_event(7, node("feta"), CommandPeerEvent::Finished {
-            repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
-            repo: None,
-            result: CommandValue::ConvoyStarted {
-                name: "remote-work".to_string(),
-                attach_plan: Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach remote-session")),
-                binding: Some(
-                    AttachBinding::builder()
-                        .host(HostName::new("feta"))
-                        .namespace("flotilla".to_string())
-                        .session("remote-session".to_string())
-                        .build(),
-                ),
+        .emit_remote_command_event(
+            7,
+            node("feta"),
+            CommandPeerEvent::Finished {
+                repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
+                repo: None,
+                result: CommandValue::ConvoyStarted {
+                    name: "remote-work".to_string(),
+                    attach_plan: Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach remote-session")),
+                    binding: Some(
+                        AttachBinding::builder()
+                            .host(HostName::new("feta"))
+                            .namespace("flotilla".to_string())
+                            .session("remote-session".to_string())
+                            .build(),
+                    ),
+                },
             },
-        })
+        )
         .await;
 
     let result = match events.recv().await.expect("command event") {
@@ -2539,18 +2611,21 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
                 QuerySubscriptions::default(),
             );
             request_dispatcher
-                .dispatch(402, Request::Execute {
-                    command: Command::builder()
-                        .action(CommandAction::QueryDaemonLogs {
-                            query: DaemonLogQuery {
-                                since_seconds: Some(7200),
-                                level: Some("warn".into()),
-                                target: Some("flotilla_daemon::peer".into()),
-                            },
-                        })
-                        .node_id(node("feta"))
-                        .build(),
-                })
+                .dispatch(
+                    402,
+                    Request::Execute {
+                        command: Command::builder()
+                            .action(CommandAction::QueryDaemonLogs {
+                                query: DaemonLogQuery {
+                                    since_seconds: Some(7200),
+                                    level: Some("warn".into()),
+                                    target: Some("flotilla_daemon::peer".into()),
+                                },
+                            })
+                            .node_id(node("feta"))
+                            .build(),
+                    },
+                )
                 .await
         }
     });
@@ -2573,9 +2648,11 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
 
     // Simulate the remote response arriving via complete_remote_command.
     remote_command_router
-        .complete_remote_command(request_id, node("feta"), CommandValue::DaemonLogs {
-            lines: vec![r#"{"level":"WARN","target":"flotilla_daemon::peer"}"#.into()],
-        })
+        .complete_remote_command(
+            request_id,
+            node("feta"),
+            CommandValue::DaemonLogs { lines: vec![r#"{"level":"WARN","target":"flotilla_daemon::peer"}"#.into()] },
+        )
         .await;
 
     let response = tokio::time::timeout(StdDuration::from_secs(5), dispatch_handle)
@@ -2642,16 +2719,19 @@ async fn remote_command_mutations_route_remote_step_requests() {
         RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil(), QuerySubscriptions::default());
 
     let response = request_dispatcher
-        .dispatch(402, Request::Execute {
-            command: Command::builder()
-                .action(CommandAction::Checkout {
-                    repo: RepoSelector::Identity(repo_identity.clone()),
-                    target: CheckoutTarget::FreshBranch("feat-remote-step".into()),
-                    issue_ids: vec![("github".into(), "123".into())],
-                })
-                .node_id(NodeId::new("feta"))
-                .build(),
-        })
+        .dispatch(
+            402,
+            Request::Execute {
+                command: Command::builder()
+                    .action(CommandAction::Checkout {
+                        repo: RepoSelector::Identity(repo_identity.clone()),
+                        target: CheckoutTarget::FreshBranch("feat-remote-step".into()),
+                        issue_ids: vec![("github".into(), "123".into())],
+                    })
+                    .node_id(NodeId::new("feta"))
+                    .build(),
+            },
+        )
         .await;
 
     let command_id = match ok_response(response, 402) {
@@ -2789,12 +2869,15 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
     .await
     .expect("timeout waiting for remapped step updates");
 
-    assert_eq!(observed, vec![
-        (0, 4, "Create checkout for branch feat-remap".into(), StepStatus::Started),
-        (0, 4, "Create checkout for branch feat-remap".into(), StepStatus::Succeeded),
-        (1, 4, "Link issues to branch".into(), StepStatus::Started),
-        (1, 4, "Link issues to branch".into(), StepStatus::Succeeded),
-    ]);
+    assert_eq!(
+        observed,
+        vec![
+            (0, 4, "Create checkout for branch feat-remap".into(), StepStatus::Started),
+            (0, 4, "Create checkout for branch feat-remap".into(), StepStatus::Succeeded),
+            (1, 4, "Link issues to branch".into(), StepStatus::Started),
+            (1, 4, "Link issues to branch".into(), StepStatus::Succeeded),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -2904,24 +2987,28 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
         )
         .await;
     remote_command_router
-        .complete_remote_step(request_id, NodeId::new("feta"), vec![
-            StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
-                branch: "feat-workspace-local".into(),
-                path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
-            }),
-            StepOutcome::Produced(CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
-                label: "feat-workspace-local@feta".into(),
-                target_node_id: NodeId::new("feta"),
-                display_host: Some(HostName::new("feta")),
-                checkout_path: PathBuf::from("/srv/feta/repo/wt-feat-workspace-local"),
-                checkout_key: Some(QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local")),
-                attachable_set_id: None,
-                environment_id: None,
-                container_name: None,
-                template_yaml: None,
-                prepared_commands: vec![],
-            }))),
-        ])
+        .complete_remote_step(
+            request_id,
+            NodeId::new("feta"),
+            vec![
+                StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
+                    branch: "feat-workspace-local".into(),
+                    path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
+                }),
+                StepOutcome::Produced(CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
+                    label: "feat-workspace-local@feta".into(),
+                    target_node_id: NodeId::new("feta"),
+                    display_host: Some(HostName::new("feta")),
+                    checkout_path: PathBuf::from("/srv/feta/repo/wt-feat-workspace-local"),
+                    checkout_key: Some(QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local")),
+                    attachable_set_id: None,
+                    environment_id: None,
+                    container_name: None,
+                    template_yaml: None,
+                    prepared_commands: vec![],
+                }))),
+            ],
+        )
         .await;
 
     let (saw_remote_checkout_step, saw_remote_prepare_step, saw_local_attach_step, finished) =
@@ -2957,10 +3044,13 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
     assert!(saw_remote_prepare_step, "expected remote workspace preparation before local attach");
     assert!(saw_local_attach_step, "expected a local attach workspace step");
 
-    assert_eq!(finished, CommandValue::CheckoutCreated {
-        branch: "feat-workspace-local".into(),
-        path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
-    });
+    assert_eq!(
+        finished,
+        CommandValue::CheckoutCreated {
+            branch: "feat-workspace-local".into(),
+            path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
+        }
+    );
 
     let created_workspaces = workspace_manager.workspaces.lock().await.clone();
     assert_eq!(created_workspaces.len(), 1, "expected local workspace creation");
@@ -3630,11 +3720,14 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                         }
                         CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
                             assert!(event_repo.is_none(), "refresh-all has no single checkout context");
-                            assert_eq!(result, &CommandValue::Refreshed {
-                                repository_count: 1,
-                                repos: vec![physical_repo.clone()],
-                                identity_changes: Vec::new()
-                            });
+                            assert_eq!(
+                                result,
+                                &CommandValue::Refreshed {
+                                    repository_count: 1,
+                                    repos: vec![physical_repo.clone()],
+                                    identity_changes: Vec::new()
+                                }
+                            );
                             saw_finished = true;
                         }
                         CommandPeerEvent::StepUpdate { .. } => {}
@@ -3650,11 +3743,10 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(*request_id, 7);
                     assert_eq!(requester_node_id, &NodeId::new("desktop"));
                     assert_eq!(responder_node_id, daemon.node_id());
-                    assert_eq!(result.as_ref(), &CommandValue::Refreshed {
-                        repository_count: 1,
-                        repos: vec![physical_repo.clone()],
-                        identity_changes: Vec::new()
-                    });
+                    assert_eq!(
+                        result.as_ref(),
+                        &CommandValue::Refreshed { repository_count: 1, repos: vec![physical_repo.clone()], identity_changes: Vec::new() }
+                    );
                     saw_response = true;
                 }
                 other => panic!("unexpected proxied message: {other:?}"),
@@ -4010,10 +4102,10 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
 
     flotilla_protocol::framing::write_message_line(&mut writer, &current_client_hello()).await.expect("write client hello");
     let hello_line = reader.next_line().await.expect("read hello response").expect("hello response line");
-    assert!(matches!(serde_json::from_str::<Message>(&hello_line).expect("parse hello response"), Message::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        ..
-    }));
+    assert!(matches!(
+        serde_json::from_str::<Message>(&hello_line).expect("parse hello response"),
+        Message::Hello { protocol_version: PROTOCOL_VERSION, .. }
+    ));
 
     let request = Message::Request { id: 1, request: Request::ListRepos };
     flotilla_protocol::framing::write_message_line(&mut writer, &request).await.expect("write request");
@@ -5167,10 +5259,14 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
             .await
             .expect("stored convoy");
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Landed,
-                ..flotilla_resources::ConvoyStatus::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus {
+                    phase: flotilla_resources::ConvoyPhase::Landed,
+                    ..flotilla_resources::ConvoyStatus::default()
+                },
+            )
             .await
             .expect("settled stored convoy");
     }
@@ -5178,12 +5274,15 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     let env_ref = format!("host-direct-{}", daemon.local_host_id().expect("local host"));
     backend
         .definitions::<CredentialSpec>("flotilla")
-        .create(&InputMeta::builder().name("work-token".into()).build(), &CredentialSpecSpec {
-            consumer: CredentialConsumer::Claude,
-            source: CredentialSource::Env { name: "TEST_WORK_TOKEN".into() },
-            lifecycle: CredentialLifecycle::Issued,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &InputMeta::builder().name("work-token".into()).build(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::Claude,
+                source: CredentialSource::Env { name: "TEST_WORK_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("credential declaration");
     let convoys = backend.using::<Convoy>("flotilla");
@@ -5195,73 +5294,84 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         .await
         .expect("live convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement::builder()
-                    .name("work".into())
-                    .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
-                    .crew(Vec::new())
-                    .build()],
-            }),
-            ..ConvoyStatus::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".into())
+                        .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                ..ConvoyStatus::default()
+            },
+        )
         .await
         .expect("live credential requirement");
     let vessels = backend.using::<Vessel>("flotilla");
     let vessel = vessels
-        .create(&InputMeta::builder().name("live-work-vessel".into()).build(), &VesselSpec {
-            convoy_ref: "live-credential-work".into(),
-            vessel_name: "work".into(),
-            placement_policy_ref: "test".into(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &InputMeta::builder().name("live-work-vessel".into()).build(),
+            &VesselSpec {
+                convoy_ref: "live-credential-work".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("live vessel");
     vessels
-        .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
-            phase: VesselPhase::Ready,
-            environment_ref: Some(env_ref.clone()),
-            ..VesselStatus::default()
-        })
+        .update_status(
+            &vessel.metadata.name,
+            &vessel.metadata.resource_version,
+            &VesselStatus { phase: VesselPhase::Ready, environment_ref: Some(env_ref.clone()), ..VesselStatus::default() },
+        )
         .await
         .expect("placed vessel");
     let sessions = backend.using::<TerminalSession>("flotilla");
     let session = sessions
-        .create(&InputMeta::builder().name("live-crew".into()).build(), &TerminalSessionSpec {
-            env_ref,
-            role: "coder".into(),
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "passthrough".into(),
-            source: TerminalSessionSource::Agent {
-                selector: Selector { capability: "code".into(), adapter: None, model: None },
-                brief: TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/coder.md".into(),
-                    content: "test".into(),
-                    copies: Vec::new(),
+        .create(
+            &InputMeta::builder().name("live-crew".into()).build(),
+            &TerminalSessionSpec {
+                env_ref,
+                role: "coder".into(),
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "passthrough".into(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "code".into(), adapter: None, model: None },
+                    brief: TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: "test".into(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "live-credential-work".into(),
+                        vessel_ref: "live-work-vessel".into(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "live-credential-work".into(),
-                    vessel_ref: "live-work-vessel".into(),
-                }),
-                message: None,
             },
-        })
+        )
         .await
         .expect("live crew");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            ..TerminalSessionStatus::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..TerminalSessionStatus::default() },
+        )
         .await
         .expect("running crew");
     let runtime = tokio::time::timeout(

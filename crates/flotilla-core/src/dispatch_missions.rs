@@ -662,10 +662,10 @@ mod tests {
                 DispatchMission::builder().name("stability".into()).build(),
                 DispatchMission::builder().name("other".into()).build(),
             ])
-            .lanes(vec![DispatchLane { mission: "stability".into(), labels: BTreeSet::from(["bug".into()]) }, DispatchLane {
-                mission: "other".into(),
-                labels: BTreeSet::new(),
-            }])
+            .lanes(vec![
+                DispatchLane { mission: "stability".into(), labels: BTreeSet::from(["bug".into()]) },
+                DispatchLane { mission: "other".into(), labels: BTreeSet::new() },
+            ])
             .build();
         let score = board.score(&issue("1"), &policy).expect("map member");
         assert_eq!(score.mission_issue, Some(reference("map")));

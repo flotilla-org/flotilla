@@ -178,14 +178,17 @@ mod tests {
     async fn default_bound_observation_preserves_healthy_requests_after_a_missing_one() {
         let provider = FakeChangeRequest::new();
         provider
-            .add_change_requests(vec![("2".to_string(), ChangeRequest {
-                title: "Healthy PR".to_string(),
-                branch: "healthy".to_string(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                provider_name: "fake".to_string(),
-                provider_display_name: "Fake".to_string(),
-            })])
+            .add_change_requests(vec![(
+                "2".to_string(),
+                ChangeRequest {
+                    title: "Healthy PR".to_string(),
+                    branch: "healthy".to_string(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    body: None,
+                    provider_name: "fake".to_string(),
+                    provider_display_name: "Fake".to_string(),
+                },
+            )])
             .await;
         let observed = provider.observe_bound(&[1, 2], &Default::default()).await.expect("independent reads");
         assert!(observed.get(&1).expect("missing PR result").as_ref().is_err());

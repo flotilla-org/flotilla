@@ -610,13 +610,17 @@ impl CrewService {
             .filter_map(|session| {
                 let pending = session.status.as_ref()?.completion_pending.clone()?;
                 let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return None };
-                Some((session.metadata.name, pending, CrewCommandContext {
-                    crew_id: None,
-                    namespace: Some(context.namespace.clone()),
-                    convoy: Some(context.convoy.clone()),
-                    vessel_ref: Some(context.vessel_ref.clone()),
-                    role: Some(session.spec.role),
-                }))
+                Some((
+                    session.metadata.name,
+                    pending,
+                    CrewCommandContext {
+                        crew_id: None,
+                        namespace: Some(context.namespace.clone()),
+                        convoy: Some(context.convoy.clone()),
+                        vessel_ref: Some(context.vessel_ref.clone()),
+                        role: Some(session.spec.role),
+                    },
+                ))
             })
             .collect())
     }
@@ -838,11 +842,15 @@ impl CrewService {
         // passes validation. Record it first so a newly named PR can satisfy
         // readiness; the parser admits only this convoy's repositories.
         if !claim_subjects.is_empty() {
-            convoy = apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
-                subjects: claim_subjects.iter().cloned().map(|subject| (subject, flotilla_protocol::Relationship::Produces)).collect(),
-                source: flotilla_resources::SubjectDiscoverySource::Claim,
-                at: self.clock.now(),
-            })
+            convoy = apply_resource_status_patch(
+                &convoys,
+                convoy_name,
+                &ConvoyStatusPatch::DiscoverSubjects {
+                    subjects: claim_subjects.iter().cloned().map(|subject| (subject, flotilla_protocol::Relationship::Produces)).collect(),
+                    source: flotilla_resources::SubjectDiscoverySource::Claim,
+                    at: self.clock.now(),
+                },
+            )
             .await
             .map_err(|error| error.to_string())?;
         }
@@ -993,13 +1001,17 @@ impl CrewService {
                     .collect::<Vec<_>>();
                 reasons.extend(observation_errors);
                 let expectation = reasons.join("; ");
-                apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RefuseCrewCompletion {
-                    vessel: context.vessel.clone(),
-                    role: context.caller_role.clone(),
-                    expectation: expectation.clone(),
-                    causes: refusal_causes,
-                    message: message.clone(),
-                })
+                apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &ConvoyStatusPatch::RefuseCrewCompletion {
+                        vessel: context.vessel.clone(),
+                        role: context.caller_role.clone(),
+                        expectation: expectation.clone(),
+                        causes: refusal_causes,
+                        message: message.clone(),
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
                 return Err(format!("crew completion expectations unmet: {expectation}"));
@@ -1034,13 +1046,17 @@ impl CrewService {
                     decision_ledger_digest,
                     completed_while_crew_active,
                 };
-                apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::BeginMessageFollowUp {
-                    vessel: context.vessel,
-                    role: context.caller_role,
-                    message: reference.clone(),
-                    content: follow_up.object.spec.body,
-                    claim,
-                })
+                apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &ConvoyStatusPatch::BeginMessageFollowUp {
+                        vessel: context.vessel,
+                        role: context.caller_role,
+                        message: reference.clone(),
+                        content: follow_up.object.spec.body,
+                        claim,
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
                 if let Some(session) = routing.session_name.as_deref() {
@@ -1268,10 +1284,14 @@ impl CrewService {
         }
         match action {
             flotilla_protocol::CrewSupervisionAction::Resume => {
-                self.convoy_resume_with_sender_internal(namespace, convoy_name, message, Some(vessel), Some(role), MessageAttribution {
-                    sender,
-                    in_reply_to,
-                })
+                self.convoy_resume_with_sender_internal(
+                    namespace,
+                    convoy_name,
+                    message,
+                    Some(vessel),
+                    Some(role),
+                    MessageAttribution { sender, in_reply_to },
+                )
                 .await?;
             }
             flotilla_protocol::CrewSupervisionAction::Fail => {
@@ -1293,9 +1313,11 @@ impl CrewService {
                 condition.supervisor = None;
                 condition.maker = Some(flotilla_resources::LeafMaker::Actor { vessel: vessel.to_string(), role: role.to_string() });
                 condition.rung = flotilla_resources::StallRung::Operator;
-                apply_resource_status_patch(&convoys, convoy_name, &flotilla_resources::ConvoyStatusPatch::SetStalled {
-                    condition: Some(condition),
-                })
+                apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             }
@@ -1623,9 +1645,17 @@ impl CrewService {
     ) -> Result<(), String> {
         let Some(caller) = caller else { return Ok(()) };
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::RecordLifecycleMutation {
-            mutation: flotilla_resources::LifecycleMutation { action: action.to_string(), caller: caller.clone(), at: self.clock.now() },
-        })
+        apply_resource_status_patch(
+            &convoys,
+            name,
+            &ConvoyStatusPatch::RecordLifecycleMutation {
+                mutation: flotilla_resources::LifecycleMutation {
+                    action: action.to_string(),
+                    caller: caller.clone(),
+                    at: self.clock.now(),
+                },
+            },
+        )
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -1679,11 +1709,14 @@ impl CrewService {
             return Err("crew handoff requires a non-empty message".into());
         }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
-        let receiver = flotilla_resources::qualify_message_address(target, &flotilla_resources::MessageAddressContext {
-            project: project.into(),
-            convoy: context.convoy.clone(),
-            vessel: context.vessel.clone(),
-        })
+        let receiver = flotilla_resources::qualify_message_address(
+            target,
+            &flotilla_resources::MessageAddressContext {
+                project: project.into(),
+                convoy: context.convoy.clone(),
+                vessel: context.vessel.clone(),
+            },
+        )
         .map_err(|error| error.to_string())?;
         let parts = receiver.split('/').collect::<Vec<_>>();
         let [target_project, target_convoy, target_vessel, target_role] = parts.as_slice() else {
@@ -1945,23 +1978,26 @@ impl CrewService {
                     }
                     let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
                     let _created = sessions
-                        .create(&terminal_meta, &flotilla_resources::TerminalSessionSpec {
-                            env_ref: anchor.spec.env_ref,
-                            role: target.to_string(),
-                            source: TerminalSessionSource::Agent {
-                                selector: selector.clone(),
-                                brief,
-                                context: Box::new(TerminalCrewContext {
-                                    namespace: context.namespace.clone(),
-                                    convoy: context.convoy.clone(),
-                                    vessel_ref: context.vessel_ref.clone(),
-                                }),
-                                message: None,
+                        .create(
+                            &terminal_meta,
+                            &flotilla_resources::TerminalSessionSpec {
+                                env_ref: anchor.spec.env_ref,
+                                role: target.to_string(),
+                                source: TerminalSessionSource::Agent {
+                                    selector: selector.clone(),
+                                    brief,
+                                    context: Box::new(TerminalCrewContext {
+                                        namespace: context.namespace.clone(),
+                                        convoy: context.convoy.clone(),
+                                        vessel_ref: context.vessel_ref.clone(),
+                                    }),
+                                    message: None,
+                                },
+                                cwd: anchor.spec.cwd,
+                                env: anchor.spec.env,
+                                pool: anchor.spec.pool,
                             },
-                            cwd: anchor.spec.cwd,
-                            env: anchor.spec.env,
-                            pool: anchor.spec.pool,
-                        })
+                        )
                         .await
                         .map_err(|err| err.to_string())?;
                     self.publish_message_intent(&context.namespace, &message_name, &intent).await.map(|_| ())
@@ -2152,11 +2188,11 @@ impl CrewService {
             // returns canonical admission, as it does for subject-based producers.
             let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
             if admitted.name == message_name {
-                apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueMessageFollowUp {
-                    vessel: vessel.clone(),
-                    role: role.clone(),
-                    message: Some(admitted),
-                })
+                apply_resource_status_patch(
+                    &convoys,
+                    name,
+                    &ConvoyStatusPatch::QueueMessageFollowUp { vessel: vessel.clone(), role: role.clone(), message: Some(admitted) },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             }
@@ -2340,11 +2376,11 @@ impl CrewService {
                             .is_some_and(|status| status.phase.is_terminal())
                     };
                     if terminal {
-                        apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueMessageFollowUp {
-                            vessel: vessel.clone(),
-                            role: role.clone(),
-                            message: None,
-                        })
+                        apply_resource_status_patch(
+                            &convoys,
+                            name,
+                            &ConvoyStatusPatch::QueueMessageFollowUp { vessel: vessel.clone(), role: role.clone(), message: None },
+                        )
                         .await
                         .map_err(|error| error.to_string())?;
                     }

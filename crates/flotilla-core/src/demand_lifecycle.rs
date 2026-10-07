@@ -27,10 +27,11 @@ impl DemandLifecycle {
             }
             match expiry.disposition {
                 DemandExpiryDisposition::Escalate => {
-                    apply_status_patch(&resolver, &demand.metadata.name, &DemandStatusPatch::Escalate {
-                        as_of: now,
-                        authority: EXPIRY_AUTHORITY.to_string(),
-                    })
+                    apply_status_patch(
+                        &resolver,
+                        &demand.metadata.name,
+                        &DemandStatusPatch::Escalate { as_of: now, authority: EXPIRY_AUTHORITY.to_string() },
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 }

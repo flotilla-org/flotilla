@@ -233,11 +233,14 @@ pub async fn build_plan(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            Ok(build_create_checkout_plan(branch, create_branch, intent, issue_ids, checkout_host, CheckoutDisplayContext {
-                local_node_id,
-                local_host,
-                target_display_host,
-            }))
+            Ok(build_create_checkout_plan(
+                branch,
+                create_branch,
+                intent,
+                issue_ids,
+                checkout_host,
+                CheckoutDisplayContext { local_node_id, local_host, target_display_host },
+            ))
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {

@@ -234,10 +234,10 @@ impl PresentationManager for FakePresentationManager {
 
     async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         self.created.lock().expect("created lock").push(config.clone());
-        Ok((format!("workspace:{}", self.created.lock().expect("created lock").len()), Workspace {
-            name: config.name.clone(),
-            attachable_set_id: None,
-        }))
+        Ok((
+            format!("workspace:{}", self.created.lock().expect("created lock").len()),
+            Workspace { name: config.name.clone(), attachable_set_id: None },
+        ))
     }
 
     async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
@@ -364,65 +364,72 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
 
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
-        .create(&controller_meta().name("convoy-multi").call(), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: vec![
-                ConvoyRepositorySpec::builder()
-                    .url("https://github.com/flotilla-org/flotilla".to_string())
-                    .repo_ref(known.key())
-                    .source_ref("main".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("flotilla".to_string())
-                    .subpaths(Vec::new())
-                    .build(),
-                ConvoyRepositorySpec::builder()
-                    .url("https://github.com/flotilla-org/cleat".to_string())
-                    .repo_ref(missing.key())
-                    .source_ref("main".to_string())
-                    .target_ref("main".to_string())
-                    .workspace_slug("cleat".to_string())
-                    .subpaths(Vec::new())
-                    .build(),
-            ],
-            r#ref: Some("fix/multi".to_string()),
-            project_ref: Some("flotilla-suite".to_string()),
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &controller_meta().name("convoy-multi").call(),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![
+                    ConvoyRepositorySpec::builder()
+                        .url("https://github.com/flotilla-org/flotilla".to_string())
+                        .repo_ref(known.key())
+                        .source_ref("main".to_string())
+                        .target_ref("main".to_string())
+                        .workspace_slug("flotilla".to_string())
+                        .subpaths(Vec::new())
+                        .build(),
+                    ConvoyRepositorySpec::builder()
+                        .url("https://github.com/flotilla-org/cleat".to_string())
+                        .repo_ref(missing.key())
+                        .source_ref("main".to_string())
+                        .target_ref("main".to_string())
+                        .workspace_slug("cleat".to_string())
+                        .subpaths(Vec::new())
+                        .build(),
+                ],
+                r#ref: Some("fix/multi".to_string()),
+                project_ref: Some("flotilla-suite".to_string()),
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy should create");
     convoys
-        .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: "implement".to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Tool { command: "cargo test".to_string() })
-                        .build()],
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-multi",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: "implement".to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Tool { command: "cargo test".to_string() })
+                            .build()],
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status should update");
     create_workspace(
@@ -476,12 +483,15 @@ async fn clone_controller_marks_clone_ready() {
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
     clones
-        .create(&controller_meta().name(&clone_name).call(), &CloneSpec {
-            repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
-            url: "git@github.com:flotilla-org/flotilla.git".to_string(),
-            env_ref: "host-direct-01HXYZ".to_string(),
-            path: "/Users/alice/dev/flotilla".to_string(),
-        })
+        .create(
+            &controller_meta().name(&clone_name).call(),
+            &CloneSpec {
+                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
+                url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+                env_ref: "host-direct-01HXYZ".to_string(),
+                path: "/Users/alice/dev/flotilla".to_string(),
+            },
+        )
         .await
         .expect("clone create should succeed");
 
@@ -517,23 +527,30 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     let failed_clone = clones
-        .create(&controller_meta().name(&clone_name).call(), &CloneSpec {
-            repo_ref: repository_spec.key(),
-            url: "git@github.com:flotilla-org/flotilla.git".to_string(),
-            env_ref: "host-direct-01HXYZ".to_string(),
-            path: "/Users/alice/dev/flotilla".to_string(),
-        })
+        .create(
+            &controller_meta().name(&clone_name).call(),
+            &CloneSpec {
+                repo_ref: repository_spec.key(),
+                url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+                env_ref: "host-direct-01HXYZ".to_string(),
+                path: "/Users/alice/dev/flotilla".to_string(),
+            },
+        )
         .await
         .expect("clone create should succeed");
     clones
-        .update_status(&clone_name, &failed_clone.metadata.resource_version, &CloneStatus {
-            phase: ClonePhase::Failed,
-            default_branch: None,
-            message: Some("authentication failed: repository access denied".to_string()),
-            failed_at: Some(Utc::now() - chrono::Duration::hours(15)),
-            failure_policy: None,
-            retry: None,
-        })
+        .update_status(
+            &clone_name,
+            &failed_clone.metadata.resource_version,
+            &CloneStatus {
+                phase: ClonePhase::Failed,
+                default_branch: None,
+                message: Some("authentication failed: repository access denied".to_string()),
+                failed_at: Some(Utc::now() - chrono::Duration::hours(15)),
+                failure_policy: None,
+                retry: None,
+            },
+        )
         .await
         .expect("legacy clone failure should apply");
 
@@ -600,25 +617,28 @@ async fn environment_controller_marks_docker_environment_ready() {
     let backend = ResourceBackend::InMemory(Default::default());
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     environments
-        .create(&controller_meta().name("docker-env").call(), &EnvironmentSpec {
-            host_direct: None,
-            docker: Some(DockerEnvironmentSpec {
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                host_ref: "01HXYZ".to_string(),
-                image: "ghcr.io/flotilla/dev:latest".to_string(),
-                declared_agent_adapters: Default::default(),
-                required_agent_adapters: Default::default(),
-                pull_policy: Default::default(),
-                mounts: vec![EnvironmentMount {
-                    source_path: "/tmp/src".to_string(),
-                    target_path: "/workspace".to_string(),
-                    mode: EnvironmentMountMode::Rw,
-                }],
-                env: Default::default(),
-            }),
-        })
+        .create(
+            &controller_meta().name("docker-env").call(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "01HXYZ".to_string(),
+                    image: "ghcr.io/flotilla/dev:latest".to_string(),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    mounts: vec![EnvironmentMount {
+                        source_path: "/tmp/src".to_string(),
+                        target_path: "/workspace".to_string(),
+                        mode: EnvironmentMountMode::Rw,
+                    }],
+                    env: Default::default(),
+                }),
+            },
+        )
         .await
         .expect("environment create should succeed");
 
@@ -764,14 +784,17 @@ async fn terminal_session_controller_marks_session_running() {
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     sessions
-        .create(&controller_meta().name("term-a").call(), &flotilla_resources::TerminalSessionSpec {
-            env_ref: "host-direct-01HXYZ".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &controller_meta().name("term-a").call(),
+            &flotilla_resources::TerminalSessionSpec {
+                env_ref: "host-direct-01HXYZ".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("session create should succeed");
 
@@ -855,12 +878,15 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
 
     let presentations = backend.clone().using::<Presentation>(NAMESPACE);
     presentations
-        .create(&controller_meta().name("presentation-a").call(), &PresentationSpec {
-            convoy_ref: "convoy-a".to_string(),
-            presentation_policy_ref: "default".to_string(),
-            name: "convoy-a".to_string(),
-            process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-        })
+        .create(
+            &controller_meta().name("presentation-a").call(),
+            &PresentationSpec {
+                convoy_ref: "convoy-a".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "convoy-a".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
+            },
+        )
         .await
         .expect("presentation create should succeed");
 
@@ -1156,13 +1182,17 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     let created = hosts.create(&controller_meta().name(name).call(), &HostSpec::default()).await.expect("host create should succeed");
     hosts
-        .update_status(name, &created.metadata.resource_version, &HostStatus {
-            capabilities: Default::default(),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            resource_store: None,
-            ..HostStatus::default()
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &HostStatus {
+                capabilities: Default::default(),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                resource_store: None,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("host status update should succeed");
 }

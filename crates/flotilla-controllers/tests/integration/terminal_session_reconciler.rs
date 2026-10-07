@@ -33,10 +33,13 @@ use crate::common;
 async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let environment = environments
-        .create(&meta(name), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/workspace".to_string() }),
-            docker: None,
-        })
+        .create(
+            &meta(name),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/workspace".to_string() }),
+                docker: None,
+            },
+        )
         .await
         .expect("create environment");
     let mut status = EnvironmentStatus::default();
@@ -105,35 +108,38 @@ async fn dead_generation_is_lost_then_recreated() {
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
-                brief: flotilla_resources::TerminalBrief {
-                    path: ".flotilla/briefs/coder.md".into(),
-                    content: "Original brief".into(),
-                    artifact_digest: None,
-                    copies: Vec::new(),
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: "Original brief".into(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-work".into(),
+                    }),
+                    message: Some(flotilla_resources::TerminalCrewMessage {
+                        id: "conflicting-1".into(),
+                        text: "PR #2185 is conflicting; rebase and rerun the gates".into(),
+                        sender: Default::default(),
+                        delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                        acknowledged: Default::default(),
+                        following: Vec::new(),
+                    }),
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-work".into(),
-                }),
-                message: Some(flotilla_resources::TerminalCrewMessage {
-                    id: "conflicting-1".into(),
-                    text: "PR #2185 is conflicting; rebase and rerun the gates".into(),
-                    sender: Default::default(),
-                    delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                }),
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
             },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        )
         .await
         .expect("create session");
     let mut running = TerminalSessionStatus::default();
@@ -216,14 +222,17 @@ async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".into() },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
         .await
         .expect("create session");
     let mut status = TerminalSessionStatus::default();
@@ -260,13 +269,16 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let env = environments
-        .create(&meta("env-a"), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec {
-                host_ref: "01HXYZ".to_string(),
-                repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
-            }),
-            docker: None,
-        })
+        .create(
+            &meta("env-a"),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: "01HXYZ".to_string(),
+                    repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("env create should succeed");
     environments
@@ -286,14 +298,17 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
         .expect("env ready update should succeed");
 
     let session = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("session create should succeed");
     let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla");
@@ -332,14 +347,17 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
     let session = backend
         .clone()
         .using::<TerminalSession>("flotilla")
-        .create(&meta("terminal-orphan").with_lifecycle_authority(LifecycleAuthority::Managed), &TerminalSessionSpec {
-            env_ref: "deleted-environment".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &meta("terminal-orphan").with_lifecycle_authority(LifecycleAuthority::Managed),
+            &TerminalSessionSpec {
+                env_ref: "deleted-environment".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("create orphaned terminal session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
@@ -622,14 +640,17 @@ async fn failed_environment_terminal_stops_without_probing_its_runtime() {
 
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let session = sessions
-        .create(&meta("terminal-failed-environment"), &TerminalSessionSpec {
-            env_ref: "env-failed".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &meta("terminal-failed-environment"),
+            &TerminalSessionSpec {
+                env_ref: "env-failed".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("create terminal");
     let runtime = Arc::new(UnavailableRunningRuntime::default());
@@ -882,10 +903,16 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
         let backend = ResourceBackend::InMemory(Default::default());
         let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
         let env = environments
-            .create(&meta("host-direct-feta"), &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "feta".to_string(), repo_default_dir: "/worktrees".to_string() }),
-                docker: None,
-            })
+            .create(
+                &meta("host-direct-feta"),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec {
+                        host_ref: "feta".to_string(),
+                        repo_default_dir: "/worktrees".to_string(),
+                    }),
+                    docker: None,
+                },
+            )
             .await
             .map_err(|error| error.to_string())?;
         let mut env_status = EnvironmentStatus::default();
@@ -1159,10 +1186,13 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let env = environments
-        .create(&meta("env-a"), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/repos".into() }),
-            docker: None,
-        })
+        .create(
+            &meta("env-a"),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host-a".into(), repo_default_dir: "/repos".into() }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment");
     let mut env_status = EnvironmentStatus::default();
@@ -1184,14 +1214,17 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
         )]))
         .build();
     let session = sessions
-        .create(&input, &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "watcher".into(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "tail -f log".into() },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        .create(
+            &input,
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "watcher".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "tail -f log".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
         .await
         .expect("terminal");
     let runtime = Arc::new(TagRecordingRuntime::default());
@@ -1199,14 +1232,17 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
 
     reconciler.prepare(&session).await.expect("provisioning dependencies");
 
-    assert_eq!(runtime.tags.lock().expect("tags mutex").as_slice(), &[
-        flotilla_resources::TerminalSessionTag::new("convoy", "demo"),
-        flotilla_resources::TerminalSessionTag::new("vessel", "demo-work"),
-        flotilla_resources::TerminalSessionTag::new(
-            CREDENTIAL_SCOPES_SESSION_TAG,
-            r#"{"github-app":["github.com-flotilla-org-flotilla"]}"#,
-        ),
-    ]);
+    assert_eq!(
+        runtime.tags.lock().expect("tags mutex").as_slice(),
+        &[
+            flotilla_resources::TerminalSessionTag::new("convoy", "demo"),
+            flotilla_resources::TerminalSessionTag::new("vessel", "demo-work"),
+            flotilla_resources::TerminalSessionTag::new(
+                CREDENTIAL_SCOPES_SESSION_TAG,
+                r#"{"github-app":["github.com-flotilla-org-flotilla"]}"#,
+            ),
+        ]
+    );
 }
 
 #[derive(Default)]
@@ -1334,28 +1370,31 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
     create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
-                brief: flotilla_resources::TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/coder.md".into(),
-                    content: "brief".into(),
-                    copies: Vec::new(),
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: "brief".into(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-implement".into(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-implement".into(),
-                }),
-                message: None,
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
             },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        )
         .await
         .expect("session");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
@@ -1394,35 +1433,38 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let text = "[flotilla · turn: conflicting]\n\nRebase the PR";
     let session = sessions
-        .create(&meta("fresh-turn"), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("code"),
-                brief: flotilla_resources::TerminalBrief {
-                    path: "brief.md".into(),
-                    content: text.into(),
-                    artifact_digest: None,
-                    copies: Vec::new(),
+        .create(
+            &meta("fresh-turn"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("code"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".into(),
+                        content: text.into(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-work".into(),
+                    }),
+                    message: Some(flotilla_resources::TerminalCrewMessage {
+                        id: "fresh-turn-message".into(),
+                        text: text.into(),
+                        sender: flotilla_resources::CrewMessageSender::FlotillaTurn { source: "conflicting".into() },
+                        delivery: flotilla_resources::CrewMessageDelivery::LaunchBrief,
+                        acknowledged: Default::default(),
+                        following: Vec::new(),
+                    }),
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-work".into(),
-                }),
-                message: Some(flotilla_resources::TerminalCrewMessage {
-                    id: "fresh-turn-message".into(),
-                    text: text.into(),
-                    sender: flotilla_resources::CrewMessageSender::FlotillaTurn { source: "conflicting".into() },
-                    delivery: flotilla_resources::CrewMessageDelivery::LaunchBrief,
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                }),
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
             },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        )
         .await
         .expect("create fresh turn session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
@@ -1482,42 +1524,45 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "reviewer".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("review"),
-                brief: flotilla_resources::TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/reviewer.md".into(),
-                    content: "brief".into(),
-                    copies: Vec::new(),
-                },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-review".into(),
-                }),
-                message: Some(flotilla_resources::TerminalCrewMessage {
-                    id: "message-new".into(),
-                    text: "Review the amended commit".into(),
-                    sender: Default::default(),
-                    delivery: Default::default(),
-                    acknowledged: Default::default(),
-                    following: vec![flotilla_resources::TerminalCrewMessage {
-                        id: "nudge-after-brief".into(),
-                        text: "Check the result".into(),
-                        sender: flotilla_resources::CrewMessageSender::FlotillaNudge,
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "reviewer".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("review"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/reviewer.md".into(),
+                        content: "brief".into(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-review".into(),
+                    }),
+                    message: Some(flotilla_resources::TerminalCrewMessage {
+                        id: "message-new".into(),
+                        text: "Review the amended commit".into(),
+                        sender: Default::default(),
                         delivery: Default::default(),
                         acknowledged: Default::default(),
-                        following: Vec::new(),
-                    }],
-                }),
+                        following: vec![flotilla_resources::TerminalCrewMessage {
+                            id: "nudge-after-brief".into(),
+                            text: "Check the result".into(),
+                            sender: flotilla_resources::CrewMessageSender::FlotillaNudge,
+                            delivery: Default::default(),
+                            acknowledged: Default::default(),
+                            following: Vec::new(),
+                        }],
+                    }),
+                },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
             },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        )
         .await
         .expect("session");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
@@ -1569,11 +1614,10 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     runtime.pending.store(false, Ordering::SeqCst);
 
     let deps = reconciler.prepare(&session).await.expect("observe pending message");
-    assert_eq!(runtime.delivered.lock().expect("delivered mutex").as_slice(), &[(
-        "cleat-session".to_string(),
-        "Review the amended commit".to_string(),
-        TerminalDeliveryReadiness::TurnBoundary,
-    )]);
+    assert_eq!(
+        runtime.delivered.lock().expect("delivered mutex").as_slice(),
+        &[("cleat-session".to_string(), "Review the amended commit".to_string(), TerminalDeliveryReadiness::TurnBoundary,)]
+    );
     let outcome = reconciler.reconcile(&session, &deps, Utc::now());
     assert!(matches!(
         &outcome.patch,
@@ -1624,35 +1668,38 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "reviewer".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("review"),
-                brief: flotilla_resources::TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/reviewer.md".into(),
-                    content: "brief".into(),
-                    copies: Vec::new(),
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "reviewer".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("review"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/reviewer.md".into(),
+                        content: "brief".into(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-review".into(),
+                    }),
+                    message: Some(flotilla_resources::TerminalCrewMessage {
+                        id: "message-new".into(),
+                        text: "Review the amended commit".into(),
+                        sender: Default::default(),
+                        delivery: Default::default(),
+                        acknowledged: Default::default(),
+                        following: Vec::new(),
+                    }),
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-review".into(),
-                }),
-                message: Some(flotilla_resources::TerminalCrewMessage {
-                    id: "message-new".into(),
-                    text: "Review the amended commit".into(),
-                    sender: Default::default(),
-                    delivery: Default::default(),
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                }),
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
             },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        )
         .await
         .expect("session");
     let mut status = TerminalSessionStatus::default();
@@ -1968,14 +2015,17 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("output-crew"), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        .create(
+            &meta("output-crew"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
         .await
         .expect("session");
     let start = Utc::now();
@@ -2006,14 +2056,17 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("session");
     let mut status = TerminalSessionStatus::default();
@@ -2061,28 +2114,31 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
-                brief: flotilla_resources::TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/coder.md".into(),
-                    content: "brief".into(),
-                    copies: vec!["/workspace/repo-a".into()],
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: "brief".into(),
+                        copies: vec!["/workspace/repo-a".into()],
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-implement".into(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-implement".into(),
-                }),
-                message: None,
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
             },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        )
         .await
         .expect("session");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
@@ -2239,14 +2295,17 @@ async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() 
         create_ready_environment(&backend, "env-a").await;
         let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
         let created = sessions
-            .create(&meta("term-a"), &TerminalSessionSpec {
-                env_ref: "env-a".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "hookless".to_string(),
-            })
+            .create(
+                &meta("term-a"),
+                &TerminalSessionSpec {
+                    env_ref: "env-a".to_string(),
+                    role: "coder".to_string(),
+                    source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    env: Default::default(),
+                    pool: "hookless".to_string(),
+                },
+            )
             .await
             .expect("session");
         let mut status = flotilla_resources::TerminalSessionStatus::default();
@@ -2326,14 +2385,17 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "codex".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &meta("term-a"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "codex".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("session");
     let mut status = TerminalSessionStatus::default();
@@ -2381,37 +2443,44 @@ async fn controller_loop_prunes_acknowledged_message_payloads() {
         head.append(new_message(id));
     }
     let created = sessions
-        .create(&InputMeta::builder().name("history-session".into()).build(), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
-                brief: flotilla_resources::TerminalBrief {
-                    path: "brief.md".into(),
-                    content: "original brief".into(),
-                    artifact_digest: None,
-                    copies: Vec::new(),
+        .create(
+            &InputMeta::builder().name("history-session".into()).build(),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".into(),
+                        content: "original brief".into(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-work".into(),
+                    }),
+                    message: Some(head),
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-work".into(),
-                }),
-                message: Some(head),
             },
-        })
+        )
         .await
         .expect("session");
     sessions
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("history-session".into()),
-            delivered_message_id: Some("turn-0".into()),
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("history-session".into()),
+                delivered_message_id: Some("turn-0".into()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running");
     let runtime = Arc::new(DeliveringTerminalRuntime::default());
@@ -2532,43 +2601,50 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
         create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
         let created = sessions
-            .create(&meta("exited-agent"), &TerminalSessionSpec {
-                env_ref: "env-a".into(),
-                role: "coder".into(),
-                cwd: "/workspace".into(),
-                env: Default::default(),
-                pool: "cleat".into(),
-                source: flotilla_resources::TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("coding"),
-                    brief: flotilla_resources::TerminalBrief {
-                        path: "brief.md".into(),
-                        content: "original brief".into(),
-                        artifact_digest: None,
-                        copies: Vec::new(),
+            .create(
+                &meta("exited-agent"),
+                &TerminalSessionSpec {
+                    env_ref: "env-a".into(),
+                    role: "coder".into(),
+                    cwd: "/workspace".into(),
+                    env: Default::default(),
+                    pool: "cleat".into(),
+                    source: flotilla_resources::TerminalSessionSource::Agent {
+                        selector: flotilla_resources::Selector::for_capability("coding"),
+                        brief: flotilla_resources::TerminalBrief {
+                            path: "brief.md".into(),
+                            content: "original brief".into(),
+                            artifact_digest: None,
+                            copies: Vec::new(),
+                        },
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
+                            namespace: "flotilla".into(),
+                            convoy: "demo".into(),
+                            vessel_ref: "demo-work".into(),
+                        }),
+                        message: None,
                     },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "demo".into(),
-                        vessel_ref: "demo-work".into(),
-                    }),
-                    message: None,
                 },
-            })
+            )
             .await
             .expect("session");
         let running = sessions
-            .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
-                phase,
-                session_id: Some("live-shell".into()),
-                crew: Some(
-                    flotilla_resources::CrewSessionStatus::builder()
-                        .id("launch-id".into())
-                        .adapter("codex".into())
-                        .stance("trusted".into())
-                        .build(),
-                ),
-                ..Default::default()
-            })
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase,
+                    session_id: Some("live-shell".into()),
+                    crew: Some(
+                        flotilla_resources::CrewSessionStatus::builder()
+                            .id("launch-id".into())
+                            .adapter("codex".into())
+                            .stance("trusted".into())
+                            .build(),
+                    ),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("running shell");
         let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code, screen)), backend, "flotilla");
@@ -2608,12 +2684,16 @@ async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
     };
     let created = sessions.create(&meta("lost-unavailable"), &spec).await.expect("terminal");
     let lost = sessions
-        .update_status("lost-unavailable", &created.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Lost,
-            session_id: Some("existing-session".into()),
-            stopped_at: Some(Utc::now() - chrono::Duration::days(100)),
-            ..Default::default()
-        })
+        .update_status(
+            "lost-unavailable",
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Lost,
+                session_id: Some("existing-session".into()),
+                stopped_at: Some(Utc::now() - chrono::Duration::days(100)),
+                ..Default::default()
+            },
+        )
         .await
         .expect("lost terminal");
     let runtime = Arc::new(UnavailableRunningRuntime::default());
@@ -2726,28 +2806,31 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("receipt-session"), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            cwd: cwd.path().display().to_string(),
-            env: Default::default(),
-            pool: "cleat".into(),
-            source: flotilla_resources::TerminalSessionSource::Agent {
-                selector: flotilla_resources::Selector::for_capability("coding"),
-                brief: flotilla_resources::TerminalBrief {
-                    path: ".flotilla/briefs/coder.md".into(),
-                    content: "work".into(),
-                    artifact_digest: None,
-                    copies: Vec::new(),
+        .create(
+            &meta("receipt-session"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                cwd: cwd.path().display().to_string(),
+                env: Default::default(),
+                pool: "cleat".into(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: "work".into(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-work".into(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".into(),
-                    convoy: "demo".into(),
-                    vessel_ref: "demo-work".into(),
-                }),
-                message: None,
             },
-        })
+        )
         .await
         .expect("session");
     let mut status = TerminalSessionStatus {
@@ -2894,11 +2977,11 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
         .await
         .expect("session");
     sessions
-        .update_status("old-orphan", &created.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("old-process".into()),
-            ..Default::default()
-        })
+        .update_status(
+            "old-orphan",
+            &created.metadata.resource_version,
+            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, session_id: Some("old-process".into()), ..Default::default() },
+        )
         .await
         .expect("running");
     let runtime = Arc::new(CleanupRecordingTerminalRuntime::default());
@@ -3050,14 +3133,17 @@ async fn independent_owner_absence_log_does_not_claim_gate_approval() {
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.using::<TerminalSession>("flotilla");
     let session = sessions
-        .create(&meta("independent"), &TerminalSessionSpec {
-            env_ref: "missing-env".to_string(),
-            role: "shell".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &meta("independent"),
+            &TerminalSessionSpec {
+                env_ref: "missing-env".to_string(),
+                role: "shell".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(CleanupRecordingTerminalRuntime::default()), backend, "flotilla");
@@ -3082,23 +3168,34 @@ async fn unchanged_attention_decisions_log_once() {
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
-        .create(&meta("decision-crew"), &TerminalSessionSpec {
-            env_ref: "env-a".into(),
-            role: "coder".into(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        .create(
+            &meta("decision-crew"),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
         .await
         .expect("attention tracing scenario");
     let now = Utc::now();
     let session = sessions
-        .update_status("decision-crew", &created.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: now }),
-            ..Default::default()
-        })
+        .update_status(
+            "decision-crew",
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Idle,
+                    source: TerminalAttentionSource::Hook,
+                    as_of: now,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("attention tracing scenario");
     let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
@@ -3144,28 +3241,31 @@ async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
         create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
         let created = sessions
-            .create(&meta("term-a"), &TerminalSessionSpec {
-                env_ref: "env-a".to_string(),
-                role: "reviewer".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Agent {
-                    selector: flotilla_resources::Selector::for_capability("review"),
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/reviewer.md".into(),
-                        content: "brief".into(),
-                        copies: Vec::new(),
+            .create(
+                &meta("term-a"),
+                &TerminalSessionSpec {
+                    env_ref: "env-a".to_string(),
+                    role: "reviewer".to_string(),
+                    source: flotilla_resources::TerminalSessionSource::Agent {
+                        selector: flotilla_resources::Selector::for_capability("review"),
+                        brief: flotilla_resources::TerminalBrief {
+                            artifact_digest: None,
+                            path: ".flotilla/briefs/reviewer.md".into(),
+                            content: "brief".into(),
+                            copies: Vec::new(),
+                        },
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
+                            namespace: "flotilla".into(),
+                            convoy: "demo".into(),
+                            vessel_ref: "demo-review".into(),
+                        }),
+                        message: None,
                     },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: "flotilla".into(),
-                        convoy: "demo".into(),
-                        vessel_ref: "demo-review".into(),
-                    }),
-                    message: None,
+                    cwd: "/workspace".to_string(),
+                    env: Default::default(),
+                    pool: "cleat".to_string(),
                 },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            })
+            )
             .await
             .expect("session");
         let mut status = TerminalSessionStatus::default();

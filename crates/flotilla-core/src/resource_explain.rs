@@ -86,11 +86,17 @@ pub(crate) async fn run_resource_watch_command(context: ResourceWatchCommandCont
         context.command_id,
         &context.node_id,
         &context.repo_identity,
-        resource_read_envelope(resource_kind.clone(), plural.clone(), namespace.clone(), initial_cursor, vec![ResourceReadRecord {
-            record_type: ResourceRecordType::Bookmark,
-            provenance: ResourceRecordProvenance::Local { node_id: context.node_id.clone() },
-            object: None,
-        }]),
+        resource_read_envelope(
+            resource_kind.clone(),
+            plural.clone(),
+            namespace.clone(),
+            initial_cursor,
+            vec![ResourceReadRecord {
+                record_type: ResourceRecordType::Bookmark,
+                provenance: ResourceRecordProvenance::Local { node_id: context.node_id.clone() },
+                object: None,
+            }],
+        ),
     );
 
     let mut stream = watch.stream;

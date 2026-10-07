@@ -234,11 +234,10 @@ mod tests {
     #[test]
     fn parses_subject_keyed_change_request_address() {
         let leaf: Leaf = "cr/github.com/flotilla-org/flotilla/1363 .state == merged".parse().expect("parse CR leaf");
-        assert_eq!(leaf.address, LeafAddress::ChangeRequest {
-            service: "github.com".to_string(),
-            scope: "flotilla-org/flotilla".to_string(),
-            number: 1363,
-        });
+        assert_eq!(
+            leaf.address,
+            LeafAddress::ChangeRequest { service: "github.com".to_string(), scope: "flotilla-org/flotilla".to_string(), number: 1363 }
+        );
         assert_eq!(leaf.to_string(), "cr/github.com/flotilla-org/flotilla/1363 .state == merged");
     }
 

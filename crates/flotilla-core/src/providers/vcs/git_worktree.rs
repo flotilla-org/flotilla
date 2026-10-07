@@ -49,11 +49,14 @@ impl GitWorktreeStrategy {
 
         let rendered = self
             .env
-            .render_str(&self.checkout_path, minijinja::context! {
-                repo_path => root.to_string_lossy(),
-                repo => repo_name,
-                branch => branch,
-            })
+            .render_str(
+                &self.checkout_path,
+                minijinja::context! {
+                    repo_path => root.to_string_lossy(),
+                    repo => repo_name,
+                    branch => branch,
+                },
+            )
             .map_err(|e| format!("failed to render worktree path: {e}"))?;
 
         let path = PathBuf::from(rendered.trim());
@@ -155,16 +158,19 @@ impl GitWorktreeStrategy {
             },
         );
 
-        (path.clone(), Checkout {
-            branch: branch.to_string(),
-            is_main,
-            trunk_ahead_behind: trunk_ab,
-            remote_ahead_behind: remote_ab,
-            working_tree: wt_status,
-            last_commit: commit,
-            host_name: None,
-            environment_id: None,
-        })
+        (
+            path.clone(),
+            Checkout {
+                branch: branch.to_string(),
+                is_main,
+                trunk_ahead_behind: trunk_ab,
+                remote_ahead_behind: remote_ab,
+                working_tree: wt_status,
+                last_commit: commit,
+                host_name: None,
+                environment_id: None,
+            },
+        )
     }
 }
 

@@ -613,10 +613,10 @@ struct TopologyGraph {
 impl From<&TopologyResponse> for TopologyGraph {
     fn from(response: &TopologyResponse) -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert(response.local_node.node_id.clone(), TopologyGraphNode {
-            label: response.local_node.display_name.clone(),
-            local: true,
-        });
+        nodes.insert(
+            response.local_node.node_id.clone(),
+            TopologyGraphNode { label: response.local_node.display_name.clone(), local: true },
+        );
 
         let mut edges = BTreeSet::new();
         for route in &response.routes {

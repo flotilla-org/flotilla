@@ -427,14 +427,18 @@ fn group_rank(group: &Group) -> (bool, std::cmp::Reverse<u8>, std::cmp::Reverse<
 }
 
 fn entry_rank(entry: &AwarenessEntry) -> (bool, std::cmp::Reverse<u8>, u8) {
-    (entry_is_terminal(entry), std::cmp::Reverse(state_rank(entry.state)), match entry.kind {
-        AwarenessKind::Issue => 0,
-        AwarenessKind::Convoy => 1,
-        AwarenessKind::Vessel => 2,
-        AwarenessKind::Independent => 3,
-        AwarenessKind::Checkout => 4,
-        AwarenessKind::Fleet | AwarenessKind::Project => 5,
-    })
+    (
+        entry_is_terminal(entry),
+        std::cmp::Reverse(state_rank(entry.state)),
+        match entry.kind {
+            AwarenessKind::Issue => 0,
+            AwarenessKind::Convoy => 1,
+            AwarenessKind::Vessel => 2,
+            AwarenessKind::Independent => 3,
+            AwarenessKind::Checkout => 4,
+            AwarenessKind::Fleet | AwarenessKind::Project => 5,
+        },
+    )
 }
 
 fn entry_is_terminal(entry: &AwarenessEntry) -> bool {

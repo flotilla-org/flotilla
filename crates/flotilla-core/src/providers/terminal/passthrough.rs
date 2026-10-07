@@ -123,11 +123,10 @@ mod tests {
         let env = vec![("FOO".to_string(), "bar".to_string())];
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &env).expect("attach_args");
 
-        assert_eq!(args, vec![
-            Arg::Literal("env".into()),
-            Arg::EnvAssignment { key: "FOO".into(), value: "bar".into() },
-            Arg::Literal("bash".into()),
-        ]);
+        assert_eq!(
+            args,
+            vec![Arg::Literal("env".into()), Arg::EnvAssignment { key: "FOO".into(), value: "bar".into() }, Arg::Literal("bash".into()),]
+        );
     }
 
     #[test]

@@ -212,14 +212,17 @@ impl ForgejoChangeRequestProvider {
         } else {
             ChangeRequestStatus::Open
         };
-        Some((number.to_string(), ChangeRequest {
-            title,
-            branch,
-            status,
-            body: value["body"].as_str().map(str::to_string),
-            provider_name: "forgejo".into(),
-            provider_display_name: "Forgejo".into(),
-        }))
+        Some((
+            number.to_string(),
+            ChangeRequest {
+                title,
+                branch,
+                status,
+                body: value["body"].as_str().map(str::to_string),
+                provider_name: "forgejo".into(),
+                provider_display_name: "Forgejo".into(),
+            },
+        ))
     }
 
     async fn list(&self, state: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
@@ -427,10 +430,11 @@ mod tests {
         ForgejoChangeRequestProvider::new(
             http,
             Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new("https://forgejo.example".into(), None, ForgejoAuth {
-                token: "test".into(),
-                token_path: PathBuf::from("test"),
-            }),
+            ForgejoIssueProviderConfig::new(
+                "https://forgejo.example".into(),
+                None,
+                ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
+            ),
             "team/repo".into(),
         )
     }

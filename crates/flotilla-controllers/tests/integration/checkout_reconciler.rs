@@ -310,11 +310,11 @@ async fn missing_worktree_observed_on_its_host_becomes_gone() {
         .await
         .expect("checkout");
     let checkout = checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            path: Some("/checkouts/a".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/checkouts/a".to_string()), ..Default::default() },
+        )
         .await
         .expect("ready checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime { path_exists: Some(false), ..Default::default() });
@@ -342,11 +342,15 @@ async fn deleting_checkout_retries_finalizer_without_a_status_change() {
     create_deleting_checkout(&backend, "retry-cleanup", "/checkouts/retry").await;
     let current = checkouts.get("retry-cleanup").await.expect("checkout exists");
     checkouts
-        .update_status("retry-cleanup", &current.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Failed,
-            message: Some("checkout teardown failed: temporary removal failure".to_string()),
-            ..current.status.expect("ready status")
-        })
+        .update_status(
+            "retry-cleanup",
+            &current.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Failed,
+                message: Some("checkout teardown failed: temporary removal failure".to_string()),
+                ..current.status.expect("ready status")
+            },
+        )
         .await
         .expect("seed previously recorded finalizer error");
     let runtime = Arc::new(RecordingCheckoutRuntime { transient_removal_failures: AtomicUsize::new(1), ..Default::default() });
@@ -462,12 +466,15 @@ async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_
     let backend = ResourceBackend::InMemory(Default::default());
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     let clone = clones
-        .create(&meta("clone-a"), &CloneSpec {
-            repo_ref: RepositoryKey(repo_key(REPO_URL)),
-            url: REPO_URL.to_string(),
-            env_ref: "host-direct-a".to_string(),
-            path: "/clones/repo".to_string(),
-        })
+        .create(
+            &meta("clone-a"),
+            &CloneSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                url: REPO_URL.to_string(),
+                env_ref: "host-direct-a".to_string(),
+                path: "/clones/repo".to_string(),
+            },
+        )
         .await
         .expect("clone should create");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -487,14 +494,18 @@ async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_
         .expect("checkout should create");
     let failed_at = checkout.metadata.creation_timestamp + chrono::Duration::seconds(1);
     clones
-        .update_status("clone-a", &clone.metadata.resource_version, &CloneStatus {
-            phase: ClonePhase::Failed,
-            default_branch: None,
-            message: Some("authentication failed".to_string()),
-            failed_at: Some(failed_at),
-            failure_policy: None,
-            retry: None,
-        })
+        .update_status(
+            "clone-a",
+            &clone.metadata.resource_version,
+            &CloneStatus {
+                phase: ClonePhase::Failed,
+                default_branch: None,
+                message: Some("authentication failed".to_string()),
+                failed_at: Some(failed_at),
+                failure_policy: None,
+                retry: None,
+            },
+        )
         .await
         .expect("legacy clone failure should apply");
     let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
@@ -516,18 +527,22 @@ async fn structural_clone_failure_is_terminal_for_its_checkout() {
     let backend = ResourceBackend::InMemory(Default::default());
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     clones
-        .create(&meta("clone-a"), &CloneSpec {
-            repo_ref: RepositoryKey(repo_key(REPO_URL)),
-            url: REPO_URL.to_string(),
-            env_ref: "host-direct-a".to_string(),
-            path: "/clones/repo".to_string(),
-        })
+        .create(
+            &meta("clone-a"),
+            &CloneSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                url: REPO_URL.to_string(),
+                env_ref: "host-direct-a".to_string(),
+                path: "/clones/repo".to_string(),
+            },
+        )
         .await
         .expect("clone should create");
-    apply_status_patch(&clones, "clone-a", &CloneStatusPatch::MarkFailed {
-        message: "clone name mismatch".to_string(),
-        failed_at: chrono::Utc::now(),
-    })
+    apply_status_patch(
+        &clones,
+        "clone-a",
+        &CloneStatusPatch::MarkFailed { message: "clone name mismatch".to_string(), failed_at: chrono::Utc::now() },
+    )
     .await
     .expect("structural clone failure should apply");
     let checkout = backend
@@ -580,15 +595,19 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
         .await
         .expect("deleting checkout create should succeed");
     checkouts
-        .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some(target_path.to_string()),
-            commit: Some("base-commit".to_string()),
-            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some(target_path.to_string()),
+                commit: Some("base-commit".to_string()),
+                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("deleting checkout status update should succeed");
 }
@@ -656,15 +675,19 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
         .await
         .expect("checkout create should succeed");
     checkouts
-        .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
-            commit: Some("base-commit".to_string()),
-            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            "checkout-a",
+            &created.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
+                commit: Some("base-commit".to_string()),
+                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
@@ -673,11 +696,14 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
 
     reconciler.run_finalizer(&checkout).await.expect("finalizer should succeed");
 
-    assert_eq!(runtime.removals.lock().expect("removals lock").as_slice(), &[CheckoutRemoval::Worktree {
-        clone_path: "/checkouts/repo".to_string(),
-        branch: "feature/cleanup".to_string(),
-        target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
-    }]);
+    assert_eq!(
+        runtime.removals.lock().expect("removals lock").as_slice(),
+        &[CheckoutRemoval::Worktree {
+            clone_path: "/checkouts/repo".to_string(),
+            branch: "feature/cleanup".to_string(),
+            target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -835,9 +861,10 @@ async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone
 
     reconciler.run_finalizer(&created).await.expect("missing clone must not wedge checkout deletion");
 
-    assert_eq!(runtime.removals.lock().expect("removals lock").as_slice(), &[CheckoutRemoval::OrphanedWorktree {
-        target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
-    }]);
+    assert_eq!(
+        runtime.removals.lock().expect("removals lock").as_slice(),
+        &[CheckoutRemoval::OrphanedWorktree { target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string() }]
+    );
 }
 
 #[tokio::test]
@@ -860,15 +887,19 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
         .await
         .expect("checkout create should succeed");
     checkouts
-        .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
-            commit: Some("base-commit".to_string()),
-            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            "checkout-a",
+            &created.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
+                commit: Some("base-commit".to_string()),
+                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
@@ -909,23 +940,27 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
         .expect("checkout create should succeed");
     let observed_at = chrono::Utc::now().to_rfc3339();
     checkouts
-        .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
-            commit: Some("base-commit".to_string()),
-            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
-            integration: flotilla_resources::CheckoutIntegrationStatus {
-                head_revision: None,
-                clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
-                landed_evidence: None,
-                change_request: None,
-                remote_refs: Default::default(),
+        .update_status(
+            "checkout-a",
+            &created.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
+                commit: Some("base-commit".to_string()),
+                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                integration: flotilla_resources::CheckoutIntegrationStatus {
+                    head_revision: None,
+                    clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                    pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
+                    landed_evidence: None,
+                    change_request: None,
+                    remote_refs: Default::default(),
+                },
+                message: None,
             },
-            message: None,
-        })
+        )
         .await
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
@@ -940,12 +975,15 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0);
     // Issue #2675: even a fresh Ready checkout is re-protected on every
     // reconcile, using its owning environment rather than a vessel mount path.
-    assert_eq!(*runtime.protections.lock().expect("protections"), vec![(
-        "host-direct-a".into(),
-        "/checkouts/repo".into(),
-        "/checkouts/convoy-a/repo.feature-cleanup".into(),
-        "flotilla-managed: standalone/checkout-a".into()
-    )]);
+    assert_eq!(
+        *runtime.protections.lock().expect("protections"),
+        vec![(
+            "host-direct-a".into(),
+            "/checkouts/repo".into(),
+            "/checkouts/convoy-a/repo.feature-cleanup".into(),
+            "flotilla-managed: standalone/checkout-a".into()
+        )]
+    );
     // Maintenance errors are retryable and leave the persisted Ready phase intact.
     let failing = Arc::new(RecordingCheckoutRuntime { protection_error: Some("environment unavailable".into()), ..Default::default() });
     let retrying = CheckoutReconciler::new(failing, backend, NAMESPACE);
@@ -1013,17 +1051,21 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
             .expect("create checkout on its authority host");
         let observed_at = (now - chrono::Duration::seconds(31)).to_rfc3339();
         checkouts
-            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                path: Some("/checkouts/cross-host".to_string()),
-                integration: flotilla_resources::CheckoutIntegrationStatus {
-                    clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                    pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
-                    landed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at).build(),
+            .update_status(
+                &checkout.metadata.name,
+                &checkout.metadata.resource_version,
+                &CheckoutStatus {
+                    phase: CheckoutPhase::Ready,
+                    path: Some("/checkouts/cross-host".to_string()),
+                    integration: flotilla_resources::CheckoutIntegrationStatus {
+                        clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                        pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                        landed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at).build(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            })
+            )
             .await
             .expect("record pre-Landing evidence");
 
@@ -1061,10 +1103,11 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
         .await
         .expect("create authority convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Landed,
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+        )
         .await
         .expect("mark convoy Landed");
     checkout_host
@@ -1254,10 +1297,11 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
         .await
         .expect("create convoy");
     convoys
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Landing,
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() },
+        )
         .await
         .expect("mark convoy Landing");
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -1287,17 +1331,21 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
         .observed_at(now.to_rfc3339())
         .build();
     checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            path: Some("/checkouts/a".to_string()),
-            integration: flotilla_resources::CheckoutIntegrationStatus {
-                clean: failed_lookup.clone(),
-                pushed: failed_lookup.clone(),
-                landed: failed_lookup,
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                path: Some("/checkouts/a".to_string()),
+                integration: flotilla_resources::CheckoutIntegrationStatus {
+                    clean: failed_lookup.clone(),
+                    pushed: failed_lookup.clone(),
+                    landed: failed_lookup,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        })
+        )
         .await
         .expect("record failed lookup");
 
@@ -1440,10 +1488,11 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
             .await
             .expect("old checkout");
         checkouts
-            .update_status("old-checkout", &old.metadata.resource_version, &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                ..Default::default()
-            })
+            .update_status(
+                "old-checkout",
+                &old.metadata.resource_version,
+                &CheckoutStatus { phase: CheckoutPhase::Ready, ..Default::default() },
+            )
             .await
             .expect("ready old");
         let new = checkouts

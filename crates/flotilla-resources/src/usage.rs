@@ -154,10 +154,10 @@ mod tests {
     async fn assert_observation_history_is_thin(backend: ResourceBackend) {
         let records = backend.using::<Usage>("flotilla");
         let created = records
-            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec {
-                provider: "codex".to_string(),
-                account: "user@example.com".to_string(),
-            })
+            .create(
+                &InputMeta::builder().name("usage-account".to_string()).build(),
+                &UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
+            )
             .await
             .expect("create usage observation");
         let first = records
@@ -176,10 +176,10 @@ mod tests {
     async fn assert_observations_are_monotonically_ordered(backend: ResourceBackend) {
         let records = backend.using::<Usage>("flotilla");
         let created = records
-            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec {
-                provider: "codex".to_string(),
-                account: "user@example.com".to_string(),
-            })
+            .create(
+                &InputMeta::builder().name("usage-account".to_string()).build(),
+                &UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
+            )
             .await
             .expect("create usage observation");
         let older = status(8.0, "2026-08-06T10:00:00Z".parse().expect("time"));
@@ -199,10 +199,10 @@ mod tests {
     async fn assert_equal_observation_times_are_idempotent_only(backend: ResourceBackend) {
         let records = backend.using::<Usage>("flotilla");
         let created = records
-            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &UsageSpec {
-                provider: "codex".to_string(),
-                account: "user@example.com".to_string(),
-            })
+            .create(
+                &InputMeta::builder().name("usage-account".to_string()).build(),
+                &UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
+            )
             .await
             .expect("create usage observation");
         let observed_at = "2026-08-06T10:00:00Z".parse().expect("time");

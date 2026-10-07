@@ -410,21 +410,27 @@ mod tests {
         let resolver = backend.definitions::<CrewDefaults>("flotilla");
         let meta = crate::InputMeta::builder().name("fleet".to_string()).build();
         assert!(resolver
-            .apply(&meta, &CrewDefaultsSpec {
-                project_ref: None,
-                default_workflow_ref: None,
-                roles: BTreeMap::new(),
-                skills: BTreeMap::from([("*".into(), vec!["a/b@testing".into()])])
-            })
+            .apply(
+                &meta,
+                &CrewDefaultsSpec {
+                    project_ref: None,
+                    default_workflow_ref: None,
+                    roles: BTreeMap::new(),
+                    skills: BTreeMap::from([("*".into(), vec!["a/b@testing".into()])])
+                }
+            )
             .await
             .is_ok());
         assert!(resolver
-            .apply(&meta, &CrewDefaultsSpec {
-                project_ref: None,
-                default_workflow_ref: None,
-                roles: BTreeMap::new(),
-                skills: BTreeMap::from([("*".into(), vec!["../bad".into()])])
-            })
+            .apply(
+                &meta,
+                &CrewDefaultsSpec {
+                    project_ref: None,
+                    default_workflow_ref: None,
+                    roles: BTreeMap::new(),
+                    skills: BTreeMap::from([("*".into(), vec!["../bad".into()])])
+                }
+            )
             .await
             .is_err());
         let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"CrewDefaults", "metadata":{"name":"fleet"}, "spec":{"skills":{"*": ["a/b@testing"]}}});

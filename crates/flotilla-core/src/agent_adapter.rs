@@ -228,20 +228,23 @@ fn build_crew_brief_with_options(
         CrewAssignment::Unassigned =>
             "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise run `flotilla crew stall --reason decision --message 'No assignment was provided'` rather than inventing work.",
     };
-    let mut content = render_crew_brief_template(options, &CrewBriefTemplateContext {
-        role,
-        convoy: &context.convoy,
-        vessel,
-        vessel_ref: &context.vessel_ref,
-        assignment_text,
-        charter_prose: &options.charter_prose,
-        charter_commit: options.charter_commit.as_deref(),
-        members,
-        handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
-        has_credential_scope: options.has_credential_scope,
-        has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
-        is_standing: options.is_standing,
-    })?;
+    let mut content = render_crew_brief_template(
+        options,
+        &CrewBriefTemplateContext {
+            role,
+            convoy: &context.convoy,
+            vessel,
+            vessel_ref: &context.vessel_ref,
+            assignment_text,
+            charter_prose: &options.charter_prose,
+            charter_commit: options.charter_commit.as_deref(),
+            members,
+            handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+            has_credential_scope: options.has_credential_scope,
+            has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
+            is_standing: options.is_standing,
+        },
+    )?;
     if !options.charter_prose.is_empty() || options.charter_commit.is_some() {
         content.push_str("\n\n## Project charter\n\n");
         if let Some(commit) = &options.charter_commit {
@@ -477,11 +480,14 @@ impl CapabilityTable {
 
     #[cfg(test)]
     pub(crate) fn with_ambient_only_test_requirement(mut self, capability: &str) -> Self {
-        self.requirements.insert(capability.to_string(), AgentRequirement {
-            adapter: "ambient-only-test".to_string(),
-            model: None,
-            credential_policy: AgentCredentialPolicy::AmbientOnly { scope: flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE },
-        });
+        self.requirements.insert(
+            capability.to_string(),
+            AgentRequirement {
+                adapter: "ambient-only-test".to_string(),
+                model: None,
+                credential_policy: AgentCredentialPolicy::AmbientOnly { scope: flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE },
+            },
+        );
         self
     }
 
@@ -1433,11 +1439,10 @@ mod tests {
             "work",
             "coder",
             CrewAssignment::Prompt("Fix the flux capacitor."),
-            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }, CrewBriefMember {
-                role: "reviewer".to_string(),
-                state: "latent".to_string(),
-                is_agent: true,
-            }],
+            &[
+                CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true },
+                CrewBriefMember { role: "reviewer".to_string(), state: "latent".to_string(), is_agent: true },
+            ],
         );
         assert!(reviewed.content.contains("apply the `in-vessel-review` label in the PR-create command itself"));
     }
@@ -1544,11 +1549,10 @@ mod tests {
             "work",
             "reviewer",
             CrewAssignment::CarriedIssue,
-            &[CrewBriefMember { role: "coder".to_string(), state: "handed-off".to_string(), is_agent: true }, CrewBriefMember {
-                role: "reviewer".to_string(),
-                state: "active".to_string(),
-                is_agent: true,
-            }],
+            &[
+                CrewBriefMember { role: "coder".to_string(), state: "handed-off".to_string(), is_agent: true },
+                CrewBriefMember { role: "reviewer".to_string(), state: "active".to_string(), is_agent: true },
+            ],
             &CrewBriefRenderOptions {
                 template: "diff-review".to_string(),
                 overrides: Vec::new(),
@@ -2360,10 +2364,11 @@ mod tests {
         for role in ["coder", "reviewer"] {
             let home = base.join("crews").join(role);
             adapter
-                .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &vec![(
-                    "CODEX_HOME".into(),
-                    home.display().to_string(),
-                )])
+                .prepare_with_environment(
+                    &ExecutionEnvironmentPath::new(&workspace),
+                    &brief,
+                    &vec![("CODEX_HOME".into(), home.display().to_string())],
+                )
                 .await
                 .expect("prepare crew");
             let config = std::fs::read_to_string(home.join("config.toml")).expect("private config").parse::<DocumentMut>().expect("config");
@@ -2448,12 +2453,10 @@ mod tests {
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
         assert!(parsed.get("commit_attribution").is_none());
         let notify = parsed["notify"].as_array().expect("notify command array");
-        assert_eq!(notify.iter().map(|entry| entry.as_str()).collect::<Vec<_>>(), vec![
-            Some("flotilla"),
-            Some("hook"),
-            Some("codex"),
-            Some("notify")
-        ]);
+        assert_eq!(
+            notify.iter().map(|entry| entry.as_str()).collect::<Vec<_>>(),
+            vec![Some("flotilla"), Some("hook"), Some("codex"), Some("notify")]
+        );
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
     }
 

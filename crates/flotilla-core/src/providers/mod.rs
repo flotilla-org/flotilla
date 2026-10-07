@@ -1051,13 +1051,16 @@ pub(crate) mod testing {
         assert_eq!(runner.run("ok", &[], Path::new("/"), &label).await, Ok("success".into()));
         assert_eq!(runner.run("empty", &[], Path::new("/"), &label).await, Err(String::new()));
         assert_eq!(runner.remaining(), 0);
-        assert_eq!(runner.calls(), vec![
-            ("gh".into(), vec!["api".into()]),
-            ("missing".into(), vec![]),
-            ("raw-ok".into(), vec![]),
-            ("ok".into(), vec![]),
-            ("empty".into(), vec![])
-        ]);
+        assert_eq!(
+            runner.calls(),
+            vec![
+                ("gh".into(), vec!["api".into()]),
+                ("missing".into(), vec![]),
+                ("raw-ok".into(), vec![]),
+                ("ok".into(), vec![]),
+                ("empty".into(), vec![])
+            ]
+        );
         let legacy = MockRunner::new(vec![Ok("legacy success".into()), Err("legacy failure".into())]);
         assert_eq!(legacy.run("ok", &[], Path::new("/"), &label).await, Ok("legacy success".into()));
         let output = legacy.run_output("fail", &[], Path::new("/"), &label).await.expect("legacy output");

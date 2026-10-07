@@ -131,12 +131,15 @@ mod tests {
         let adapters = crate::agent_adapter::AgentAdapterRegistry::discover(&bag, Arc::new(runner));
         let codex = adapters.get("codex").expect("codex agent adapter should register when the binary is present");
         codex
-            .prepare(&crate::path_context::ExecutionEnvironmentPath::new("/workspace"), &flotilla_resources::TerminalBrief {
-                artifact_digest: None,
-                path: ".flotilla/briefs/coder.md".into(),
-                content: "Implement the issue.".into(),
-                copies: Vec::new(),
-            })
+            .prepare(
+                &crate::path_context::ExecutionEnvironmentPath::new("/workspace"),
+                &flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "Implement the issue.".into(),
+                    copies: Vec::new(),
+                },
+            )
             .await
             .expect("production-shaped discovery should supply Codex config location");
     }

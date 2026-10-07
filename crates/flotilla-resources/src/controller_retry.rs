@@ -119,9 +119,10 @@ mod tests {
         let mut retry = ControllerRetry::retryable(None, now, backoff);
         for (attempt, delay) in [(1, 30), (2, 60), (3, 120), (4, 120)] {
             assert_eq!(retry.attempts, attempt);
-            assert_eq!(retry.disposition, ControllerRetryDisposition::Retryable {
-                next_attempt_at: now + chrono::Duration::seconds(delay)
-            });
+            assert_eq!(
+                retry.disposition,
+                ControllerRetryDisposition::Retryable { next_attempt_at: now + chrono::Duration::seconds(delay) }
+            );
             assert_eq!(retry.stall_reason(now, RetryCeiling::default()), None);
             retry = ControllerRetry::retryable(Some(&retry), now, backoff);
         }

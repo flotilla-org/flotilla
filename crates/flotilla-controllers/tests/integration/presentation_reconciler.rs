@@ -134,10 +134,10 @@ impl PresentationManager for RecordingPresentationManager {
             return Err(message);
         }
         self.created.lock().expect("created lock").push(config.clone());
-        Ok((format!("workspace:{}", self.created.lock().expect("created lock").len()), Workspace {
-            name: config.name.clone(),
-            attachable_set_id: None,
-        }))
+        Ok((
+            format!("workspace:{}", self.created.lock().expect("created lock").len()),
+            Workspace { name: config.name.clone(), attachable_set_id: None },
+        ))
     }
 
     async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
@@ -242,14 +242,18 @@ async fn active_managed_presentation_without_its_convoy_is_torn_down_once() {
         .await
         .expect("presentation create should succeed");
     let presentation = presentations
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &PresentationStatus {
-            phase: flotilla_resources::PresentationPhase::Active,
-            observed_workspace_ref: Some("workspace-a".to_string()),
-            observed_presentation_manager: Some("fake-manager".to_string()),
-            observed_spec_hash: Some("hash-a".to_string()),
-            message: None,
-            ready_at: Some(Utc::now()),
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &PresentationStatus {
+                phase: flotilla_resources::PresentationPhase::Active,
+                observed_workspace_ref: Some("workspace-a".to_string()),
+                observed_presentation_manager: Some("fake-manager".to_string()),
+                observed_spec_hash: Some("hash-a".to_string()),
+                message: None,
+                ready_at: Some(Utc::now()),
+            },
+        )
         .await
         .expect("presentation status update should succeed");
     let runtime = Arc::new(FakePresentationRuntime::default());
@@ -263,10 +267,10 @@ async fn active_managed_presentation_without_its_convoy_is_torn_down_once() {
         Some(PresentationStatusPatch::MarkTornDown { ref message })
             if message.as_deref() == Some("convoy 'missing-convoy' no longer exists")
     ));
-    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
-        "fake-manager".to_string(),
-        "workspace-a".to_string()
-    )]);
+    assert_eq!(
+        runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(),
+        &[("fake-manager".to_string(), "workspace-a".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -292,14 +296,18 @@ async fn active_managed_orphan_does_not_retry_failed_teardown_on_resync() {
         .await
         .expect("presentation create should succeed");
     let presentation = presentations
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &PresentationStatus {
-            phase: flotilla_resources::PresentationPhase::Active,
-            observed_workspace_ref: Some("workspace-a".to_string()),
-            observed_presentation_manager: Some("zellij".to_string()),
-            observed_spec_hash: Some("hash-a".to_string()),
-            message: None,
-            ready_at: Some(Utc::now()),
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &PresentationStatus {
+                phase: flotilla_resources::PresentationPhase::Active,
+                observed_workspace_ref: Some("workspace-a".to_string()),
+                observed_presentation_manager: Some("zellij".to_string()),
+                observed_spec_hash: Some("hash-a".to_string()),
+                message: None,
+                ready_at: Some(Utc::now()),
+            },
+        )
         .await
         .expect("presentation status update should succeed");
     let runtime = Arc::new(FakePresentationRuntime::with_tear_down_results(vec![Err(
@@ -522,22 +530,27 @@ async fn sorted_session_determinism_uses_task_and_process_ordinals() {
     reconciler.prepare(&presentation).await.expect("deps should load");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
-    assert_eq!(apply_calls[0].crew.iter().map(|process| process.attach_command.as_str()).collect::<Vec<_>>(), vec![
-        "attach term-a",
-        "attach term-b"
-    ]);
+    assert_eq!(
+        apply_calls[0].crew.iter().map(|process| process.attach_command.as_str()).collect::<Vec<_>>(),
+        vec!["attach term-a", "attach term-b"]
+    );
 }
 
 #[tokio::test]
 async fn empty_sessions_trigger_teardown() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host(&backend, HOST_REF).await;
-    let presentation = create_presentation_with_status(&backend, "presentation-a", "default", PresentationStatus {
-        observed_presentation_manager: Some("fake-manager".to_string()),
-        observed_workspace_ref: Some("workspace-a".to_string()),
-        observed_spec_hash: Some("hash".to_string()),
-        ..Default::default()
-    })
+    let presentation = create_presentation_with_status(
+        &backend,
+        "presentation-a",
+        "default",
+        PresentationStatus {
+            observed_presentation_manager: Some("fake-manager".to_string()),
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            observed_spec_hash: Some("hash".to_string()),
+            ..Default::default()
+        },
+    )
     .await;
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
@@ -546,10 +559,10 @@ async fn empty_sessions_trigger_teardown() {
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::TornDown { message: None }));
-    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
-        "fake-manager".to_string(),
-        "workspace-a".to_string()
-    )]);
+    assert_eq!(
+        runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(),
+        &[("fake-manager".to_string(), "workspace-a".to_string())]
+    );
     assert!(matches!(outcome.patch, Some(PresentationStatusPatch::MarkTornDown { .. })));
 }
 
@@ -578,12 +591,17 @@ async fn retry_from_clean_slate_clears_previous_workspace_before_retry() {
         }),
     ]));
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
-    let created = create_presentation_with_status(&backend, "presentation-a", "default", PresentationStatus {
-        observed_presentation_manager: Some("old-manager".to_string()),
-        observed_workspace_ref: Some("workspace-old".to_string()),
-        observed_spec_hash: Some("old-hash".to_string()),
-        ..Default::default()
-    })
+    let created = create_presentation_with_status(
+        &backend,
+        "presentation-a",
+        "default",
+        PresentationStatus {
+            observed_presentation_manager: Some("old-manager".to_string()),
+            observed_workspace_ref: Some("workspace-old".to_string()),
+            observed_spec_hash: Some("old-hash".to_string()),
+            ..Default::default()
+        },
+    )
     .await;
 
     let first_deps = reconciler.prepare(&created).await.expect("deps should load");
@@ -649,34 +667,44 @@ async fn unknown_policy_fails_without_runtime_invocation() {
 async fn finalizer_tears_down_recorded_workspace() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host(&backend, HOST_REF).await;
-    let presentation = create_presentation_with_status(&backend, "presentation-a", "default", PresentationStatus {
-        observed_presentation_manager: Some("fake-manager".to_string()),
-        observed_workspace_ref: Some("workspace-a".to_string()),
-        ..Default::default()
-    })
+    let presentation = create_presentation_with_status(
+        &backend,
+        "presentation-a",
+        "default",
+        PresentationStatus {
+            observed_presentation_manager: Some("fake-manager".to_string()),
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            ..Default::default()
+        },
+    )
     .await;
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
     reconciler.run_finalizer(&presentation).await.expect("finalizer should succeed");
 
-    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
-        "fake-manager".to_string(),
-        "workspace-a".to_string()
-    )]);
+    assert_eq!(
+        runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(),
+        &[("fake-manager".to_string(), "workspace-a".to_string())]
+    );
 }
 
 #[tokio::test]
 async fn finalizer_allows_deletion_when_the_recorded_manager_is_unavailable() {
     let backend = ResourceBackend::InMemory(Default::default());
-    let presentation = create_presentation_with_status(&backend, "presentation-a", "default", PresentationStatus {
-        phase: flotilla_resources::PresentationPhase::Active,
-        observed_workspace_ref: Some("workspace-a".to_string()),
-        observed_presentation_manager: Some("zellij".to_string()),
-        observed_spec_hash: Some("hash-a".to_string()),
-        message: None,
-        ready_at: Some(Utc::now()),
-    })
+    let presentation = create_presentation_with_status(
+        &backend,
+        "presentation-a",
+        "default",
+        PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Active,
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            observed_presentation_manager: Some("zellij".to_string()),
+            observed_spec_hash: Some("hash-a".to_string()),
+            message: None,
+            ready_at: Some(Utc::now()),
+        },
+    )
     .await;
     let runtime = Arc::new(FakePresentationRuntime::with_tear_down_results(vec![Err(
         "presentation manager 'zellij' no longer available".to_string()
@@ -685,10 +713,10 @@ async fn finalizer_allows_deletion_when_the_recorded_manager_is_unavailable() {
 
     reconciler.run_finalizer(&presentation).await.expect("manager loss must not block presentation deletion");
 
-    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
-        "zellij".to_string(),
-        "workspace-a".to_string()
-    )]);
+    assert_eq!(
+        runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(),
+        &[("zellij".to_string(), "workspace-a".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -894,13 +922,16 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
 async fn create_ready_host_direct_env(backend: &ResourceBackend, name: &str) {
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     let created = environments
-        .create(&meta(name), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec {
-                host_ref: HOST_REF.to_string(),
-                repo_default_dir: "/Users/alice/dev/flotilla".to_string(),
-            }),
-            docker: None,
-        })
+        .create(
+            &meta(name),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: HOST_REF.to_string(),
+                    repo_default_dir: "/Users/alice/dev/flotilla".to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("env create should succeed");
     let mut status = EnvironmentStatus::default();
@@ -918,21 +949,24 @@ async fn create_ready_host_direct_env(backend: &ResourceBackend, name: &str) {
 async fn create_ready_docker_env(backend: &ResourceBackend, name: &str) {
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     let created = environments
-        .create(&meta(name), &EnvironmentSpec {
-            host_direct: None,
-            docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                host_ref: HOST_REF.to_string(),
-                image: "ubuntu:24.04".to_string(),
-                declared_agent_adapters: Default::default(),
-                required_agent_adapters: Default::default(),
-                pull_policy: Default::default(),
-                mounts: Vec::new(),
-                env: BTreeMap::new(),
-            }),
-        })
+        .create(
+            &meta(name),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: HOST_REF.to_string(),
+                    image: "ubuntu:24.04".to_string(),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: BTreeMap::new(),
+                }),
+            },
+        )
         .await
         .expect("env create should succeed");
     let mut status = EnvironmentStatus::default();
@@ -950,14 +984,17 @@ async fn create_ready_docker_env(backend: &ResourceBackend, name: &str) {
 async fn create_running_terminal(backend: &ResourceBackend, name: &str, env_ref: &str, labels: BTreeMap<String, String>) {
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let created = sessions
-        .create(&common::controller_meta().name(name).labels(labels).call(), &TerminalSessionSpec {
-            env_ref: env_ref.to_string(),
-            role: "main".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
-            cwd: "/workspace/repo".to_string(),
-            env: Default::default(),
-            pool: "fake".to_string(),
-        })
+        .create(
+            &common::controller_meta().name(name).labels(labels).call(),
+            &TerminalSessionSpec {
+                env_ref: env_ref.to_string(),
+                role: "main".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/workspace/repo".to_string(),
+                env: Default::default(),
+                pool: "fake".to_string(),
+            },
+        )
         .await
         .expect("session create should succeed");
     let mut status = TerminalSessionStatus::default();
@@ -995,12 +1032,15 @@ async fn create_presentation_with_status(
 ) -> flotilla_resources::ResourceObject<Presentation> {
     let presentations = backend.clone().using::<Presentation>(NAMESPACE);
     let created = presentations
-        .create(&meta(name), &PresentationSpec {
-            convoy_ref: "convoy-a".to_string(),
-            presentation_policy_ref: policy_ref.to_string(),
-            name: "convoy-a".to_string(),
-            process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-        })
+        .create(
+            &meta(name),
+            &PresentationSpec {
+                convoy_ref: "convoy-a".to_string(),
+                presentation_policy_ref: policy_ref.to_string(),
+                name: "convoy-a".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
+            },
+        )
         .await
         .expect("presentation create should succeed");
     if status != PresentationStatus::default() {

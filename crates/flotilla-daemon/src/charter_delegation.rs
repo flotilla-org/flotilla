@@ -704,11 +704,10 @@ mod tests {
         )
         .await
         .expect("delegated");
-        assert_eq!(reader.reads.lock().expect("reads").as_slice(), &[CharterSource::Repository {
-            repo: "https://example.test/app-ops".into(),
-            branch: "reviewed".into(),
-            path: "charter".into()
-        }]);
+        assert_eq!(
+            reader.reads.lock().expect("reads").as_slice(),
+            &[CharterSource::Repository { repo: "https://example.test/app-ops".into(), branch: "reviewed".into(), path: "charter".into() }]
+        );
         let records = |files: &[LoadedManifestFile]| {
             files
                 .iter()

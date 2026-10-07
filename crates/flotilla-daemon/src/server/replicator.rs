@@ -257,11 +257,10 @@ impl PeerReplicatorSupervisors {
 
         let cancellation = CancellationToken::new();
         let socket_path_source = SocketPathSource::new(resource_socket_path);
-        self.generations.insert(peer.clone(), ActiveGeneration {
-            generation,
-            cancellation: cancellation.clone(),
-            socket_path_source: socket_path_source.clone(),
-        });
+        self.generations.insert(
+            peer.clone(),
+            ActiveGeneration { generation, cancellation: cancellation.clone(), socket_path_source: socket_path_source.clone() },
+        );
         Some((cancellation, socket_path_source))
     }
 }
@@ -1225,10 +1224,10 @@ mod tests {
         source.update(PathBuf::from("/tmp/second.sock"));
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        assert_eq!(*attempted_paths.lock().expect("attempted paths lock"), vec![
-            PathBuf::from("/tmp/first.sock"),
-            PathBuf::from("/tmp/second.sock")
-        ]);
+        assert_eq!(
+            *attempted_paths.lock().expect("attempted paths lock"),
+            vec![PathBuf::from("/tmp/first.sock"), PathBuf::from("/tmp/second.sock")]
+        );
 
         cancellation.cancel();
         task.await.expect("replicator supervisor task");
