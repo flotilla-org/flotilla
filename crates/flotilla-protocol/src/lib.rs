@@ -143,7 +143,11 @@ pub enum CrewMessageSender {
 /// roll deploying #2710, together with CrewMessageSender (ADR 0047).
 pub fn serialize_legacy_crew_sender<S: serde::Serializer>(sender: &CrewMessageSender, serializer: S) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
-    let mut record = serializer.serialize_map(None)?;
+    let fields = match sender {
+        CrewMessageSender::Unknown | CrewMessageSender::FlotillaNudge => 1,
+        _ => 2,
+    };
+    let mut record = serializer.serialize_map(Some(fields))?;
     let kind = match sender {
         CrewMessageSender::Unknown => "unknown",
         CrewMessageSender::FlotillaNudge => "flotilla-nudge",

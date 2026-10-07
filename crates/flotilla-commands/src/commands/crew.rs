@@ -63,7 +63,7 @@ pub enum CrewVerb {
         #[arg(long = "carry", value_parser = parse_carry)]
         carries: Vec<flotilla_protocol::MessageReference>,
     },
-    /// Resume stalled crew work with guidance
+    /// Resume stalled crew work, or send mid-turn guidance to working crew as an operator
     Resume {
         #[arg(long)]
         message: String,

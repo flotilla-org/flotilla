@@ -22,6 +22,8 @@ The local daemon uses the existing trusted operator principal model; this change
 
 Fail and Escalate rulings are durable notifications to the original crew, with no reply expectation or workflow activation. Publication precedes the authority patch so a failed patch cannot erase the decision. The command reports a patch error; a supervisor can retry the workflow mutation while the Message preserves the decision. A delivered notification does not itself perform that mutation.
 
+Each supervision command has its own Message identity. Explicitly retrying a failed Fail/Escalate command can therefore create another notification, including amended guidance; receiving either notification does not apply the workflow action. This is per-command admission, not idempotency across separate supervisor invocations.
+
 ## Operator live acceptance
 
 Run after deploying matching binaries to the fleet. Use a disposable active convoy with a coder in one vessel and a reviewer in another, placed on different hosts. Run the handoff from the coder's session so `FLOTILLA_CREW_ID` identifies its source. Substitute actual project, convoy, vessel, role, artifact resource names, and revisions below.
@@ -41,7 +43,7 @@ flotilla crew supervise --convoy CONVOY --vessel work --role coder resume --mess
 flotilla resource list Message
 ```
 
-Verify `sender=principal:<authenticated-name>`, relation `supervisor`, and the exact role receiver. Working crews retain queued continuation intent until their turn boundary.
+Verify `sender=principal:<authenticated-name>`, relation `supervisor`, and the exact role receiver. For an operator, `resume` on working crew sends mid-turn guidance instead of returning `crew is not stalled`. Working crews retain queued continuation intent until their turn boundary.
 
 From the coder, declare a stall that the convoy policy assigns to its governor:
 

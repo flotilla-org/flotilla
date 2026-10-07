@@ -250,6 +250,35 @@ fn crew_message_header_escapes_sender_supplied_delimiters() {
     assert_eq!(crew_message_header(&CrewMessageSender::Unknown), "unknown sender · message");
 }
 
+// One-generation envelopes must preserve every previous sender shape during unrelated writes.
+// Generate payloads containing delimiters and vary nullable operator attribution; cover every tag.
+#[hegel::test]
+fn legacy_sender_envelopes_preserve_stored_shapes(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let payload = format!("actor/{}]\n{{}}", tc.draw(gs::integers::<usize>().min_value(0).max_value(100)));
+    let principal =
+        if tc.draw(gs::booleans()) { serde_json::json!({"namespace": "flotilla", "name": payload}) } else { serde_json::Value::Null };
+    let shapes = [
+        serde_json::json!({"kind": "unknown"}),
+        serde_json::json!({"kind": "flotilla-nudge"}),
+        serde_json::json!({"kind": "flotilla-turn", "source": payload}),
+        serde_json::json!({"kind": "flotilla-escalation", "from": payload}),
+        serde_json::json!({"kind": "operator-resume", "principal": principal}),
+        serde_json::json!({"kind": "operator-follow-up", "principal": principal}),
+        serde_json::json!({"kind": "governor", "name": payload}),
+        serde_json::json!({"kind": "bosun", "name": payload}),
+        serde_json::json!({"kind": "handoff", "from": payload}),
+    ];
+    for shape in shapes {
+        let sender: CrewMessageSender = serde_json::from_value(shape.clone()).expect("previous-generation sender");
+        let envelope = pending_crew_message(sender.clone(), "legacy input");
+        let encoded = serde_json::to_value(&envelope).expect("preserve envelope");
+        assert_eq!(encoded["sender"], shape);
+        let decoded: TerminalCrewMessage = serde_json::from_value(encoded).expect("decode preserved envelope");
+        assert_eq!(decoded.sender, sender);
+    }
+}
+
 // The delivery port must refuse both operations after its owning service stops;
 // retaining the actuator cannot keep the service alive (#2221).
 #[tokio::test]
@@ -1235,7 +1264,8 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
 }
 
 // Handoffs route to the addressed vessel, preserve typed carries, and admit once per command.
-// Generated scenarios cover local and remote receiver homes, duplicate text, and invalid targets.
+// Generated scenarios cover local and remote receiver homes, latent and completed work,
+// duplicate text, and invalid targets. The receiver has no terminal in either initial phase.
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
     use flotilla_resources::{Message, MessageInbox, MessageReference, MessageRelation, MessageSpec, VesselSpec};
@@ -1244,6 +1274,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
     use crate::leaf_engine::ResourceIntentPublisher;
     let remote = tc.draw(gs::booleans());
     let publication_fails = tc.draw(gs::booleans());
+    let receiver_phase = if tc.draw(gs::booleans()) { CrewWorkPhase::Done } else { CrewWorkPhase::Pending };
     let repeats = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     // Stand-in for the cross-host resource mutation endpoint; admission uses the real inbox.
     struct ReceiverHome {
@@ -1296,7 +1327,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
         status.workflow_snapshot.as_mut().expect("snapshot").vessels.push(receiver_vessel);
         status
             .crew_work
-            .insert("review".into(), BTreeMap::from([("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build())]));
+            .insert("review".into(), BTreeMap::from([("reviewer".into(), CrewWorkState::builder().phase(receiver_phase).build())]));
         convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("second vessel");
         let home = if remote { ResourceBackend::InMemory(Default::default()) } else { backend.clone() };
         let publisher: Arc<dyn ResourceIntentPublisher> =

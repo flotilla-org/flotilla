@@ -1127,8 +1127,17 @@ impl Reconciler for VesselReconciler {
             .collect::<Vec<_>>();
 
         let mut terminal_refs = Vec::new();
+        let starts_active = |index: usize, process: &flotilla_resources::CrewSpec| {
+            requirement.starts_eagerly(index)
+                || convoy
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.crew_work.get(&obj.spec.vessel_name))
+                    .and_then(|crew| crew.get(&process.role))
+                    .is_some_and(|work| matches!(work.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted))
+        };
         for (crew_index, process) in requirement.crew.iter().enumerate() {
-            let should_start = requirement.starts_eagerly(crew_index);
+            let should_start = starts_active(crew_index, process);
             let identity = TerminalSessionIdentity::builder()
                 .vessel_ref(obj.metadata.name.clone())
                 .convoy(obj.spec.convoy_ref.clone())
@@ -1209,7 +1218,7 @@ impl Reconciler for VesselReconciler {
                                 .enumerate()
                                 .map(|(index, member)| CrewBriefMember {
                                     role: member.role.clone(),
-                                    state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.to_string(),
+                                    state: if starts_active(index, member) { "active" } else { "latent" }.to_string(),
                                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
                                 })
                                 .collect::<Vec<_>>();
