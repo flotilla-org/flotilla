@@ -137,15 +137,15 @@ fn prior_generation_crew_delivery_records_decode_without_sender() {
 }
 
 #[test]
-fn prior_generation_label_spellings_remain_selectable() {
-    // #588: the stored metadata fixture remains selectable via canonical keys.
+fn prior_generation_label_metadata_decodes_without_aliasing() {
+    // #2629: historical metadata still decodes, but no longer aliases canonical keys.
     // The deployed corpus contains only specs/statuses, without metadata labels.
     let content = include_str!("../fixtures/terminal_session_pending_finalization.json");
     let document: Value = serde_json::from_str(content).expect("stored session");
     let labels: BTreeMap<String, String> = serde_json::from_value(document["metadata"]["labels"].clone()).expect("labels");
     for key in [flotilla_resources::VESSEL_REF_LABEL, flotilla_resources::VESSEL_ORDINAL_LABEL, flotilla_resources::CREW_ORDINAL_LABEL] {
         let value = labels.get(&key.replace('-', "_")).expect("fixture must exercise each previous-generation key");
-        assert!(flotilla_resources::labels_match(&labels, &BTreeMap::from([(key.to_string(), value.clone())])));
+        assert!(!flotilla_resources::labels_match(&labels, &BTreeMap::from([(key.to_string(), value.clone())])));
     }
 }
 

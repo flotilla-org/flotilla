@@ -578,28 +578,16 @@ async fn probe_config_errors_use_cached_defaults() {
     }
 }
 
-// Issue #2829: previous-generation pool preferences load without selecting shpool.
-// Glue: parsing the retired preference through the real config decoder is the contract.
+// #2834: ordinary provider preferences preserve backend strings, including
+// unknown or historical names; discovery decides whether a provider exists.
 #[test]
-fn retired_shpool_preference_is_ignored() {
-    let config: FlotillaConfig = toml::from_str("[terminal_pool]\nbackend = 'shpool'\n").expect("legacy config loads");
-    assert_eq!(config.terminal_pool.preference.backend, None);
-    assert!(!toml::to_string(&config).expect("config serializes").contains("shpool"));
-    for backend in ["cleat", "passthrough", "unknown"] {
-        let config: FlotillaConfig = toml::from_str(&format!("[terminal_pool]\nbackend = '{backend}'\n")).expect("config loads");
-        assert_eq!(config.terminal_pool.preference.backend.as_deref(), Some(backend));
-    }
-}
-
-// Issue #2830: old presentation preferences load without selecting tmux.
-// Glue: the real config decoder drops only the retired backend.
-#[test]
-fn retired_tmux_preference_is_ignored() {
-    let config: FlotillaConfig = toml::from_str("[presentation_manager]\nbackend = 'tmux'\n").expect("legacy config loads");
-    assert_eq!(config.presentation_manager.preference.backend, None);
-    assert!(!toml::to_string(&config).expect("config serializes").contains("tmux"));
-    for backend in ["cmux", "zellij", "unknown"] {
-        let config: FlotillaConfig = toml::from_str(&format!("[presentation_manager]\nbackend = '{backend}'\n")).expect("config loads");
-        assert_eq!(config.presentation_manager.preference.backend.as_deref(), Some(backend));
+fn provider_preferences_preserve_backend_strings() {
+    for backend in ["", "cleat", "passthrough", "cmux", "zellij", "unknown", "shpool", "tmux"] {
+        for section in ["terminal_pool", "presentation_manager"] {
+            let config: FlotillaConfig = toml::from_str(&format!("[{section}]\nbackend = '{backend}'\n")).expect("config loads");
+            let preference =
+                if section == "terminal_pool" { &config.terminal_pool.preference } else { &config.presentation_manager.preference };
+            assert_eq!(preference.backend.as_deref(), Some(backend));
+        }
     }
 }
