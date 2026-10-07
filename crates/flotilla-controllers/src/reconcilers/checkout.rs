@@ -405,6 +405,7 @@ where
                         CheckoutPhase::Failed | CheckoutPhase::Gone => false,
                     }
                     && other.spec.repo_ref() == obj.spec.repo_ref()
+                    // Recovery can move environments; a live owner still reserves the same repository branch.
                     && (continuing || other.spec.env_ref() == obj.spec.env_ref())
                     && other.spec.branch() == obj.spec.branch()
             });

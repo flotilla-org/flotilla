@@ -2234,6 +2234,29 @@ mod tests {
     // pushes onto that branch, and preserves the branch on retry and teardown.
     #[tokio::test]
     async fn explicit_continuation_tracks_remote_tip_and_pushes() {
+        // Process boundary fake: fail upstream setup after real Git creates the locked worktree.
+        struct RefuseUpstream;
+        #[async_trait]
+        impl CommandRunner for RefuseUpstream {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                if args.contains(&"--set-upstream-to") {
+                    return Err("temporary upstream failure".into());
+                }
+                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &crate::providers::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let remote = dir.path().join("remote");
         std::fs::create_dir(&remote).expect("remote dir");
@@ -2258,6 +2281,20 @@ mod tests {
             let expected = advertised.split_whitespace().next().expect("remote SHA");
             let target = dir.path().join(if fresh { "fresh" } else { "worktree" });
             let target_str = target.to_str().expect("target");
+            if !fresh {
+                let failing = test_fl(&root, Arc::new(RefuseUpstream), true);
+                assert!(
+                    matches!(
+                        failing.continue_checkout("continued", target_str, "managed continuation").await,
+                        Err(CheckoutMaterialisationError::Protection(_))
+                    ),
+                    "post-add failures must remain retryable"
+                );
+                let admin = root.join(".git/worktrees/worktree");
+                assert!(admin.join("locked").exists(), "partial creation must remain protected");
+                // Preserve crew work across retry while repairing the upstream and registration.
+                std::fs::write(target.join("user-work"), "keep me").expect("user work");
+            }
             let materialised = if fresh {
                 vcs.continue_fresh_clone(remote.to_str().expect("remote"), "continued", target_str).await.expect("continue clone")
             } else {
@@ -2265,6 +2302,12 @@ mod tests {
             };
             assert_eq!(materialised.commit.as_deref().map(str::trim), Some(expected.trim()));
             assert_eq!(materialised.provenance, CheckoutBranchProvenance::PreExisting);
+            if !fresh {
+                assert_eq!(std::fs::read_to_string(target.join("user-work")).expect("preserved work"), "keep me");
+                assert!(root.join(".git/worktrees/worktree/locked").exists(), "retry must restore registration protection");
+                std::fs::remove_file(target.join("user-work")).expect("remove test work before teardown");
+            }
+
             let backend = GitCliBackend::checkout_root(&target, &*runner);
             assert_eq!(backend.head_upstream().await.expect("upstream").stdout.trim(), "origin/continued");
             git(&target, &[

@@ -188,7 +188,7 @@ impl ConvoyAdmission {
         repositories: &[ConvoyRepositorySpec],
         continuation: &flotilla_protocol::ConvoyContinuation,
     ) -> Result<(RepositoryKey, String, Option<ResolvedConvoyChangeRequestAdmission>), String> {
-        use flotilla_protocol::{ChangeRequestStatus, ConvoyContinuation};
+        use flotilla_protocol::ConvoyContinuation;
         let keys = repositories.iter().map(|repo| repo.repo_ref.clone()).collect::<Vec<_>>();
         let (key, branch, id) = match continuation {
             ConvoyContinuation::ChangeRequest(id) => {
@@ -211,13 +211,9 @@ impl ConvoyAdmission {
                     if let Some((found, request)) =
                         provider.find_change_request_by_branch(branch).await.map_err(|error| error.to_string())?
                     {
-                        if !matches!(request.status, ChangeRequestStatus::Open | ChangeRequestStatus::Draft) {
-                            return Err(format!(
-                                "cannot continue {:?} change request #{found}; reopen it explicitly first",
-                                request.status
-                            ));
-                        }
+                        require_open_continuation(&request.status, &found)?;
                         id = Some(found);
+                        break;
                     }
                 }
                 (repository.repo_ref.clone(), branch.clone(), id)
@@ -238,18 +234,18 @@ impl ConvoyAdmission {
 
     async fn refuse_live_continuation_holder(&self, namespace: &str, spec: &ConvoySpec) -> Result<(), String> {
         let Some(repository) = &spec.continuation else { return Ok(()) };
+        let requested_subjects = spec
+            .declared_subjects()?
+            .into_iter()
+            .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Produces)
+            .map(|entry| entry.subject)
+            .collect::<BTreeSet<_>>();
         for source in self.backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?.items {
             let other = source.object;
             if other.metadata.deletion_timestamp.is_some() || other.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
             }
             let same_branch = other.spec.r#ref == spec.r#ref && other.spec.repositories.iter().any(|repo| &repo.repo_ref == repository);
-            let requested_subjects = spec
-                .declared_subjects()?
-                .into_iter()
-                .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Produces)
-                .map(|entry| entry.subject)
-                .collect::<BTreeSet<_>>();
             let same_pr =
                 flotilla_resources::active_change_request_subjects(&other)?.iter().any(|subject| requested_subjects.contains(subject));
             if same_branch || same_pr {
@@ -285,20 +281,14 @@ impl ConvoyAdmission {
         for (repository, scope, provider) in candidates {
             match provider.get_change_request_for_admission(requested_id).await {
                 Ok(admission) => {
-                    if require_open
-                        && !matches!(
-                            admission.change_request.status,
-                            flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
-                        )
-                    {
-                        failures.push(AdmissionLookupFailure {
-                            context: Some(format!("repository {scope}")),
-                            error: ObservationError::Forge(format!(
-                                "cannot continue {:?} change request #{}; reopen it explicitly first",
-                                admission.change_request.status, admission.id
-                            )),
-                        });
-                        continue;
+                    if require_open {
+                        if let Err(error) = require_open_continuation(&admission.change_request.status, &admission.id) {
+                            failures.push(AdmissionLookupFailure {
+                                context: Some(format!("repository {scope}")),
+                                error: ObservationError::Forge(error),
+                            });
+                            continue;
+                        }
                     }
                     let Some(base_ref) = admission.base_ref else {
                         failures.push(AdmissionLookupFailure {
@@ -3940,6 +3930,14 @@ async fn image_placement_cost(
         })
     });
     Ok(if registry { flotilla_resources::ImageAcquisitionCost::RegistryPull } else { flotilla_resources::ImageAcquisitionCost::Build })
+}
+
+fn require_open_continuation(status: &flotilla_protocol::ChangeRequestStatus, id: &str) -> Result<(), String> {
+    if matches!(status, flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft) {
+        Ok(())
+    } else {
+        Err(format!("cannot continue {status:?} change request #{id}; reopen it explicitly first"))
+    }
 }
 
 #[cfg(test)]
