@@ -1194,7 +1194,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 delivery.role,
                 delivery.last_delivery_rung.as_deref().unwrap_or("not recorded"),
                 delivery.delivered_message_id.as_deref().unwrap_or("-"),
-                delivery.sender.as_ref().map(|sender| sender.short_label()).unwrap_or_else(|| "-".to_string())
+                delivery.sender.as_deref().unwrap_or("-")
             );
             if let Some(condition) = &delivery.terminal_condition {
                 let _ = writeln!(output, "    {condition}");

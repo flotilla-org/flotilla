@@ -1126,7 +1126,9 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     assert!(message.is_none());
     let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].spec.body, "[operator (unattributed) · via convoy resume]\n\ncontinue");
+    // Native Message attribution is separate from its unframed body.
+    assert_eq!(records[0].spec.body, "continue");
+    assert_eq!(records[0].spec.sender, "principal:implicit");
 }
 
 #[tokio::test]
@@ -1320,7 +1322,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         let requests = supervision.requests.lock().expect("supervision requests");
         let escalation = requests.iter().find(|request| request.vessel == "watch").expect("governor escalation");
         // #2592: the supervisor must identify the convoy and act on the exact stalled crew.
-        assert_eq!(escalation.sender, "system:stall-judge");
+        assert_eq!(escalation.sender, "project/resume-staging/work/coder");
         assert_eq!(escalation.relation, flotilla_resources::MessageRelation::Supervisor);
         let framed = &escalation.brief;
         assert!(framed.starts_with("Escalated from coder@work in graphql-budget@project:"));
@@ -1411,7 +1413,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .into_iter()
         .find(|message| message.spec.body.contains("continue with access"))
         .expect("guidance Message");
-    assert_eq!(guidance.spec.sender, "project/governor");
+    assert_eq!(guidance.spec.sender, "project/governor/watch/governor");
     assert_eq!(guidance.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions

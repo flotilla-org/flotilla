@@ -2417,8 +2417,19 @@ impl ReconcilerWake {
                                     .role(target_role.clone())
                                     .brief(brief)
                                     .subject_revision(condition.began_at.timestamp_micros().to_string())
-                                    .sender("system:stall-judge".into())
+                                    .sender(
+                                        stalled_source_actor(&condition)
+                                            .map(|(vessel, role)| {
+                                                format!(
+                                                    "{}/{}/{vessel}/{role}",
+                                                    convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                                                    convoy.metadata.name
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "system:stall-judge".into()),
+                                    )
                                     .relation(flotilla_resources::MessageRelation::Supervisor)
+                                    .expectation(flotilla_resources::MessageExpectation::Reply)
                                     .references(vec![flotilla_resources::MessageReference::ControlRecord {
                                         resource: flotilla_protocol::ResourceRef::new(
                                             "flotilla.work/v1",
@@ -4653,6 +4664,9 @@ mod tests {
         let requests = delivery.requests.lock().expect("supervisor requests");
         assert!(!requests.is_empty(), "missing session should be supervised: {:?}", status.stalled);
         assert_eq!(requests[0].convoy, "governor");
+        // Escalations retain the fully-qualified source crew, including its convoy.
+        assert_eq!(requests[0].sender, "wheelhouse/stalled-work/work/coder");
+        assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
     }
 
     async fn create_governor_ensure(backend: &ResourceBackend, convoy_ref: &str) {
@@ -5089,6 +5103,9 @@ mod tests {
         let requests = delivery.requests.lock().expect("deliveries");
         assert_eq!(requests.len(), 1, "remote governor must receive its escalation");
         assert_eq!(requests[0].convoy, "governor");
+        // Escalations retain the fully-qualified source crew, including its convoy.
+        assert_eq!(requests[0].sender, "wheelhouse/stalled-work/work/coder");
+        assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
     }
 
     // ProjectCrew requires project scope; a missing ref must be diagnostic,

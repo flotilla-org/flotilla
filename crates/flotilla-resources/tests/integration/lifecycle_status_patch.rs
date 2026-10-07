@@ -5,7 +5,7 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, LandingCredentialScope, PendingBrief,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, LandingCredentialScope,
     PlacementStatus, PresentationPhase, PresentationStatus, PresentationStatusPatch, RepositoryKey, Stance, StatusPatch,
     TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
     VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
@@ -103,9 +103,6 @@ define_patch_kinds! {
     ConvoyResumeCrewWork => CONTINUATION,
     ConvoyQueueMessageFollowUp => DUPLICATE,
     ConvoyBeginMessageFollowUp => CONTINUATION,
-    ConvoySetPendingBrief => DUPLICATE,
-    ConvoyClearPendingBrief => DUPLICATE,
-    ConvoyDeliverPendingBrief => CONTINUATION,
     ConvoyRecordTurnDelivery => CONTINUATION,
     ConvoyRefuseTurnDelivery => NONE,
     ConvoyFailTurnDelivery => NONE,
@@ -184,9 +181,6 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
         ConvoyStatusPatch::QueueMessageFollowUp { .. } => PatchKind::ConvoyQueueMessageFollowUp,
         ConvoyStatusPatch::BeginMessageFollowUp { .. } => PatchKind::ConvoyBeginMessageFollowUp,
-        ConvoyStatusPatch::SetPendingBrief { .. } => PatchKind::ConvoySetPendingBrief,
-        ConvoyStatusPatch::ClearPendingBrief => PatchKind::ConvoyClearPendingBrief,
-        ConvoyStatusPatch::DeliverPendingBrief { .. } => PatchKind::ConvoyDeliverPendingBrief,
         ConvoyStatusPatch::RecordTurnDelivery { .. } => PatchKind::ConvoyRecordTurnDelivery,
         ConvoyStatusPatch::RefuseTurnDelivery { .. } => PatchKind::ConvoyRefuseTurnDelivery,
         ConvoyStatusPatch::FailTurnDelivery { .. } => PatchKind::ConvoyFailTurnDelivery,
@@ -306,15 +300,6 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
         claim_evidence: None,
         completion_refusal: None,
     }
-}
-
-fn pending_brief() -> PendingBrief {
-    PendingBrief::builder()
-        .vessel("implement".to_string())
-        .role("coder".to_string())
-        .content("address review".to_string())
-        .queued_at(ts(25))
-        .build()
 }
 
 fn active_convoy_status() -> ConvoyStatus {
@@ -886,28 +871,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             },
         },
         LifecycleCase {
-            name: "pending brief queued",
-            kind: PatchKind::ConvoySetPendingBrief,
-            exercise: || {
-                let mut status = active_convoy_status();
-                let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() };
-                apply_and_replay(&mut status, &patch);
-                (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "pending brief cleared",
-            kind: PatchKind::ConvoyClearPendingBrief,
-            exercise: || {
-                let mut status = active_convoy_status();
-                ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
-                let before = convoy_timestamps(&status);
-                apply_and_replay(&mut status, &ConvoyStatusPatch::ClearPendingBrief);
-                (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
             name: "presentation active",
             kind: PatchKind::PresentationMarkActive,
             exercise: || {
@@ -1050,30 +1013,6 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 apply_and_replay(&mut status, &patch);
                 assert_eq!(status.crew_work["implement"]["coder"].superseded_claims.len(), 1);
                 assert!(status.crew_work["implement"]["coder"].pending_follow_up.is_none());
-                (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "pending brief delivery reopens convoy",
-            kind: PatchKind::ConvoyDeliverPendingBrief,
-            exercise: || {
-                let mut status = settled_convoy_status();
-                status.phase = ConvoyPhase::Landing;
-                ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
-                let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::DeliverPendingBrief {
-                    vessel: "implement".to_string(),
-                    role: "coder".to_string(),
-                    delivered_at: ts(30),
-                    content: "address review".to_string(),
-                    completion_message: Some("first turn complete".to_string()),
-                    disposition: Some("satisfied".to_string()),
-                    decision_ledger_ref: None,
-                    decision_ledger_digest: None,
-                    completed_while_crew_active: false,
-                    forced_by: None,
-                };
-                apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },
         },
@@ -1287,11 +1226,11 @@ fn turn_delivery_episodes_stored_before_2135_decode_their_head_sha_as_subject_re
 }
 
 // Review #2681: admitted artifact identity survives duplicate completion and force,
-// is archived at a pending-brief boundary, and cannot leak into a new working turn.
+// is archived at a Message follow-up boundary, and cannot leak into a new working turn.
 #[hegel::test]
 fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    // All continuation writers: resume, hand-off target, pending brief, and subject turn.
+    // All continuation writers: resume, hand-off target, Message follow-up, and subject turn.
     let continuation = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let mut status = active_convoy_status();
     let completion = ConvoyStatusPatch::MarkCrewCompleted {
@@ -1320,6 +1259,14 @@ fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hege
     duplicate.apply(&mut status);
     assert_eq!(status.crew_work["implement"]["coder"].decision_ledger_digest.as_deref(), Some("admitted"));
     assert!(status.crew_work["implement"]["coder"].completion_override.is_none());
+    if continuation == 2 {
+        ConvoyStatusPatch::QueueMessageFollowUp {
+            vessel: "implement".into(),
+            role: "coder".into(),
+            message: Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "follow-up")),
+        }
+        .apply(&mut status);
+    }
     let patch = match continuation {
         0 => ConvoyStatusPatch::ResumeCrewWork {
             vessel: "implement".into(),
@@ -1335,21 +1282,21 @@ fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hege
             handed_off_at: ts(40),
             message: "new turn".into(),
         },
-        2 => {
-            ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
-            ConvoyStatusPatch::DeliverPendingBrief {
-                vessel: "implement".into(),
-                role: "coder".into(),
-                delivered_at: ts(40),
-                content: "address review".into(),
-                completion_message: None,
+        2 => ConvoyStatusPatch::BeginMessageFollowUp {
+            vessel: "implement".into(),
+            role: "coder".into(),
+            message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "follow-up"),
+            content: "address review".into(),
+            claim: flotilla_resources::SupersededCrewClaim {
+                claimed_at: ts(40),
+                message: None,
                 disposition: None,
                 decision_ledger_ref: None,
                 decision_ledger_digest: Some("admitted".into()),
+                completion_override: None,
                 completed_while_crew_active: false,
-                forced_by: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
-            }
-        }
+            },
+        },
         _ => ConvoyStatusPatch::RecordTurnDelivery {
             source: "review".into(),
             episode: TurnDeliveryEpisode {

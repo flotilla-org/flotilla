@@ -91,15 +91,10 @@ fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
 }
 
 fn queue_pending_brief(status: &mut ConvoyStatus, role: &str) {
-    ConvoyStatusPatch::SetPendingBrief {
-        pending_brief: PendingBrief::builder()
-            .vessel("implement".to_string())
-            .role(role.to_string())
-            .content("address review".to_string())
-            .queued_at(ts(15))
-            .build(),
-    }
-    .apply(status);
+    // Seed a previous-generation record; current writers cannot queue PendingBrief.
+    status.turn_deliveries.entry("operator".into()).or_default().pending_brief = Some(
+        PendingBrief::builder().vessel("implement".into()).role(role.into()).content("address review".into()).queued_at(ts(15)).build(),
+    );
 }
 
 #[test]

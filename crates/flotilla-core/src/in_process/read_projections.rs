@@ -1114,7 +1114,7 @@ impl ReadProjections<'_> {
                 last_delivery_rung: None,
                 sender: match &source.object.spec.source {
                     TerminalSessionSource::Agent { message: Some(message), .. } if message.sender != CrewMessageSender::Unknown => {
-                        Some(message.sender.clone())
+                        Some(flotilla_resources::legacy_message_sender(&message.sender).0)
                     }
                     _ => None,
                 },

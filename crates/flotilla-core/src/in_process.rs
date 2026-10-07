@@ -63,6 +63,8 @@ use flotilla_protocol::{
     ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
+#[cfg(test)]
+use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
     active_change_request_subjects, api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, capped_github_app_permissions, change_request_address,
@@ -73,10 +75,10 @@ use flotilla_resources::{
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
     CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
     ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant,
-    CredentialSource, CredentialSpec, CrewCompletionPending, CrewMessageSender, CrewSource, CrewSpec, DocumentKey,
-    Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind,
-    Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
+    CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec, DocumentKey, Environment as ResourceEnvironment,
+    EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
     Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock,
@@ -6191,9 +6193,9 @@ impl InProcessDaemon {
     }
 
     async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match Box::pin(self.crew_handoff_internal(context, target, message)).await {
+            let result = match Box::pin(self.crew_ops.handoff_with_carries(context, target, message, carries.clone())).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
@@ -6223,7 +6225,13 @@ impl InProcessDaemon {
                         prompt,
                         vessel.as_deref(),
                         role.as_deref(),
-                        CrewMessageSender::OperatorResume { principal: dispatching_principal_ref.clone() },
+                        crew_ops::MessageAttribution {
+                            sender: dispatching_principal_ref.as_ref().map_or_else(
+                                || format!("principal:{}", PrincipalRef::IMPLICIT_NAME),
+                                |principal| format!("principal:{}", principal.name),
+                            ),
+                            in_reply_to: None,
+                        },
                     ))
                     .await
                     {

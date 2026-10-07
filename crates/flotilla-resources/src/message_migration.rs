@@ -69,8 +69,9 @@ pub fn legacy_message_spec(receiver: &str, message: &TerminalCrewMessage) -> Mes
 }
 
 impl TypedResolver<TerminalSession> {
-    /// Compatibility entry point for still-existing crew commands; it writes
-    /// only Message records. Remove the old sender argument after producer migration.
+    /// Test-only fixture entry point for previous-generation sender envelopes.
+    /// Production producers construct MessageSpec directly.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn accept_crew_message(
         &self,
         terminal: &ResourceObject<TerminalSession>,

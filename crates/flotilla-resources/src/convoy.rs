@@ -1063,6 +1063,8 @@ pub enum ConvoyProvisioningState {
     Started { started_at: DateTime<Utc> },
 }
 
+/// Previous-generation queue record, adopted into Message on read.
+/// Remove after the first fleet roll deploying #2710 (ADR 0047).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PendingBrief {
     pub vessel: String,
@@ -1070,7 +1072,11 @@ pub struct PendingBrief {
     pub content: String,
     pub queued_at: DateTime<Utc>,
     /// Decodes briefs queued before sender attribution; remove after the next fleet roll.
-    #[serde(default, skip_serializing_if = "crate::CrewMessageSender::is_unknown")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::CrewMessageSender::is_unknown",
+        serialize_with = "flotilla_protocol::serialize_legacy_crew_sender"
+    )]
     #[builder(default)]
     pub sender: crate::CrewMessageSender,
 }
@@ -1106,10 +1112,12 @@ pub struct TurnDeliveryStatus {
     pub failure: Option<TurnDeliveryFailure>,
     #[serde(default)]
     pub episodes: Vec<TurnDeliveryEpisode>,
-    /// The operator brief waiting for its target crew member's turn boundary.
+    /// Legacy operator queue, read only by Message adoption.
+    /// Remove after the first fleet roll deploying #2710 (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_brief: Option<PendingBrief>,
-    /// The placement host consumes this from the replicated convoy record.
+    /// Legacy remote turn queue, read only by Message adoption.
+    /// Remove after the first fleet roll deploying #2710 (ADR 0047).
     /// Decodes turn delivery statuses stored before remote supervision; remove
     /// the compatibility default one fleet roll after this field is deployed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1200,7 +1208,11 @@ pub struct TurnDeliveryEpisode {
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
     /// Decodes episodes stored before sender attribution; remove after the next fleet roll.
-    #[serde(default, skip_serializing_if = "crate::CrewMessageSender::is_unknown")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::CrewMessageSender::is_unknown",
+        serialize_with = "flotilla_protocol::serialize_legacy_crew_sender"
+    )]
     #[builder(default)]
     pub sender: crate::CrewMessageSender,
 }
@@ -1640,22 +1652,6 @@ pub enum ConvoyStatusPatch {
         message: flotilla_protocol::ResourceRef,
         content: String,
         claim: SupersededCrewClaim,
-    },
-    SetPendingBrief {
-        pending_brief: PendingBrief,
-    },
-    ClearPendingBrief,
-    DeliverPendingBrief {
-        vessel: String,
-        role: String,
-        delivered_at: DateTime<Utc>,
-        content: String,
-        completion_message: Option<String>,
-        disposition: Option<String>,
-        decision_ledger_ref: Option<String>,
-        decision_ledger_digest: Option<String>,
-        completed_while_crew_active: bool,
-        forced_by: Option<PrincipalRef>,
     },
     RecordTurnDelivery {
         source: String,
@@ -2221,64 +2217,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.completed_while_crew_active = false;
                 }
             }
-            Self::SetPendingBrief { pending_brief } => {
-                status.turn_deliveries.entry(PENDING_BRIEF_DELIVERY_SOURCE.to_string()).or_default().pending_brief =
-                    Some(pending_brief.clone());
-            }
-            Self::ClearPendingBrief => {
-                clear_operator_pending_brief(status);
-            }
-            Self::DeliverPendingBrief {
-                vessel,
-                role,
-                delivered_at,
-                content,
-                completion_message,
-                disposition,
-                decision_ledger_ref,
-                decision_ledger_digest,
-                completed_while_crew_active,
-                forced_by,
-            } => {
-                let matches_pending =
-                    status.pending_brief().is_some_and(|brief| brief.vessel == *vessel && brief.role == *role && brief.content == *content);
-                if !matches_pending {
-                    return;
-                }
-                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                    state.superseded_claims.push(SupersededCrewClaim {
-                        claimed_at: *delivered_at,
-                        message: completion_message.clone(),
-                        disposition: disposition.clone(),
-                        decision_ledger_ref: decision_ledger_ref.clone(),
-                        decision_ledger_digest: decision_ledger_digest.clone(),
-                        completion_override: forced_by
-                            .as_ref()
-                            .filter(|_| decision_ledger_ref.is_none() && decision_ledger_digest.is_none())
-                            .map(|principal| CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at }),
-                        completed_while_crew_active: *completed_while_crew_active,
-                    });
-                }
-                clear_operator_pending_brief(status);
-                status.phase = ConvoyPhase::Active;
-                status.finished_at = None;
-                if let Some(work) = status.work.get_mut(vessel) {
-                    work.phase = WorkPhase::Running;
-                    work.finished_at = None;
-                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
-                }
-                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                    state.phase = CrewWorkPhase::Working;
-                    state.started_at.get_or_insert(*delivered_at);
-                    state.finished_at = None;
-                    state.message = Some(content.clone());
-                    state.disposition = None;
-                    state.decision_ledger_ref = None;
-                    state.decision_ledger_digest = None;
-                    state.completion_override = None;
-                    state.completed_while_crew_active = false;
-                }
-            }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
                 delivery.failure = None;
@@ -2584,41 +2522,6 @@ pub mod external_patches {
         brief_id: Option<String>,
     ) -> ConvoyStatusPatch {
         ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id }
-    }
-
-    pub fn set_pending_brief(pending_brief: PendingBrief) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::SetPendingBrief { pending_brief }
-    }
-
-    pub fn clear_pending_brief() -> ConvoyStatusPatch {
-        ConvoyStatusPatch::ClearPendingBrief
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn deliver_pending_brief(
-        vessel: String,
-        role: String,
-        delivered_at: DateTime<Utc>,
-        content: String,
-        completion_message: Option<String>,
-        disposition: Option<String>,
-        decision_ledger_ref: Option<String>,
-        decision_ledger_digest: Option<String>,
-        completed_while_crew_active: bool,
-        forced_by: Option<PrincipalRef>,
-    ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::DeliverPendingBrief {
-            vessel,
-            role,
-            delivered_at,
-            content,
-            completion_message,
-            disposition,
-            decision_ledger_ref,
-            decision_ledger_digest,
-            completed_while_crew_active,
-            forced_by,
-        }
     }
 
     pub fn record_turn_delivery(

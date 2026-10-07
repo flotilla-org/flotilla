@@ -18095,6 +18095,7 @@ mod tests {
             .execute(
                 Command::builder()
                     .action(CommandAction::CrewHandoff {
+                        carries: Vec::new(),
                         context: crew_context.clone(),
                         target: "reviewer".to_string(),
                         message: "Review commit abc123".to_string(),
@@ -18146,6 +18147,7 @@ mod tests {
             .execute(
                 Command::builder()
                     .action(CommandAction::CrewHandoff {
+                        carries: Vec::new(),
                         context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
                         target: "coder".to_string(),
                         message: "Address the review findings".to_string(),
@@ -18344,6 +18346,7 @@ mod tests {
             .execute(
                 Command::builder()
                     .action(CommandAction::CrewHandoff {
+                        carries: Vec::new(),
                         context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
                         target: "reviewer".to_string(),
                         message: "Please verify the fixes".to_string(),
