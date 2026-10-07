@@ -15,9 +15,11 @@ use flotilla_core::{
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
-use flotilla_resources::{validate_message_migration_complete, validate_resource_document};
+use flotilla_resources::validate_resource_document;
 #[cfg(unix)]
-use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS};
+use flotilla_resources::{
+    validate_message_migration_complete, K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS,
+};
 use serde::Deserialize;
 use serde_json::Value;
 

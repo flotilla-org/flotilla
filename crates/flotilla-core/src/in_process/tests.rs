@@ -843,12 +843,16 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
         assert!(!PlacementTieBreak { needs: &named, now }.reserved(&candidate));
     }
 }
+#[cfg(unix)]
+use crate::providers::{
+    discovery::test_support::FakeTerminalPool,
+    terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
+};
 use crate::providers::{
     discovery::test_support::{
         fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeChangeRequest, FakeDiscoveryProviders,
-        FakeTerminalPool, FakeVcsFactory, FakeVcsState,
+        FakeVcsFactory, FakeVcsState,
     },
-    terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
     testing::MockRunner,
 };
 

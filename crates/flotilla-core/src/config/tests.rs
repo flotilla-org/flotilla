@@ -5,6 +5,7 @@ use std::{
 
 use flotilla_protocol::NodeId;
 use flotilla_resources::{RepositoryGitSpec, RepositoryProviderPreference, RepositorySpec, RepositoryVcsSpec};
+#[cfg(unix)]
 use hegel::generators as gs;
 use tempfile::tempdir;
 

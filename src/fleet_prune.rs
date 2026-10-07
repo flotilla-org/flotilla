@@ -142,18 +142,21 @@ fn candidates(mut generations: Vec<PathBuf>, protected: &HashSet<PathBuf>, keep:
     generations.into_iter().filter(|path| !protected.contains(path)).skip(keep).collect()
 }
 
+#[cfg(unix)]
 fn writable_tree(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            fs::set_permissions(path, fs::Permissions::from_mode(metadata.permissions().mode() | 0o200))?;
-            for entry in fs::read_dir(path)? {
-                writable_tree(&entry?.path())?;
-            }
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::set_permissions(path, fs::Permissions::from_mode(metadata.permissions().mode() | 0o200))?;
+        for entry in fs::read_dir(path)? {
+            writable_tree(&entry?.path())?;
         }
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn writable_tree(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

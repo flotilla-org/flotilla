@@ -40,3 +40,17 @@ Each old/new scenario is a separate test result. Successful real scenarios asser
 the private PID-file layout and verify that fixture cleanup stops the daemon.
 Builds use separate Cargo target directories and retain the effective prepared
 Ghostty toolchain file before restoring the source manifest.
+
+The operator-owned workflow should restore the entire binary output directory
+using the key printed by `ci/cleat-environment/cache-key.sh`, and skip clone/build
+only on an exact hit. The key includes both source revisions (which pin each
+revision's Rust, Zig and Ghostty), preparation scripts, and the Flotilla toolchain.
+Keep the provenance beside the binaries in the cache and upload it on hits too.
+
+Keep the provisioned contract in its separate Linux job: enabling its feature in
+the ordinary workspace test run would require both real binaries on every Test
+runner and would make missing provisioned tools fail unrelated tests. Restore a
+workspace-inclusive `cleat-environment` Rust cache to reuse its feature-specific
+core test binary and dependencies; save that Rust cache only from `main`. Sharing
+the ordinary Test job's dependency cache alone does not reuse the feature-specific
+core test executable. Measure the warm job separately from the cold source builds.
