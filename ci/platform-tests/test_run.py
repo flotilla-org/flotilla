@@ -75,12 +75,26 @@ class RunnerTests(unittest.TestCase):
         contexts = [json.loads(line) for line in runtime.read_text().splitlines()]
         self.assertEqual(len(contexts), 2)
         for context in contexts:
-            self.assertEqual(context, {"cwd":str(self.root / "flotilla-client"), "package":"flotilla-client",
-                                       "version":"1.2.3", "libraries":str(self.root / "native")})
+            self.assertEqual(Path(context.pop("cwd")).resolve(), (self.root / "flotilla-client").resolve())
+            self.assertEqual(context, {"package":"flotilla-client", "version":"1.2.3",
+                                       "libraries":str(self.root / "native")})
         cargo_calls = [c for c in commands if c[0] != "execute"]
         # All invocations use the same package/target/feature set.
         self.assertEqual(cargo_calls[0][:cargo_calls[0].index("--no-run")],
                          cargo_calls[1][:cargo_calls[0].index("--no-run")])
+
+    @unittest.skipIf(os.name == "nt", "directory aliases are covered by Unix script-contract jobs")
+    def test_cargo_context_through_directory_alias(self):
+        # Contract: Cargo's physical cwd and an aliased temp path identify the same package directory.
+        alias = self.root.parent / (self.root.name + "-alias")
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.addCleanup(alias.unlink)
+        self.root = alias
+        self.ci = alias / "ci/platform-tests"
+        self.log = alias / "commands.jsonl"
+        self.env["PATH"] = f"{alias}{os.pathsep}{self.env['PATH']}"
+        self.env["COMMAND_LOG"] = str(self.log)
+        self.test_cargo_runtime_context_and_multiple_artifacts()
 
     def test_library_crate_types(self):
         # Contract: cdylib/rlib metadata still denotes a --lib test target.
