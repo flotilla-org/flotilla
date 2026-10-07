@@ -55,6 +55,30 @@ Inventory failures appear every retry in the canonical structured log with
 A malformed inventory line stops the entire pass and resets the grace period;
 inspect those warnings when reclamation does not progress.
 
+## Rehydrating work after host loss
+
+A replacement convoy can continue a pushed branch and its open PR without
+superseding the review. First preserve any surviving uncommitted or unpushed
+work and push it to the existing remote branch. Retire the old convoy and its
+physical checkout; a failed or deleted convoy releases its logical binding,
+while a live convoy remains a holder.
+
+```bash
+flotilla convoy start --project flotilla --continue-pr 2866 --workflow single-agent \
+  --instruction "Continue the existing PR after host loss; update it in place."
+# WIP without a PR, in a single-repository Project:
+flotilla convoy start --project flotilla --continue-branch fix/wip --workflow single-agent
+```
+
+The replacement starts at the current remote head with the original upstream.
+Its durable produced subject names the original open PR and settlement tracks
+that PR. Closed/merged PRs are refused; reopen a closed request explicitly
+before continuing. `--branch` alone continues to request a fresh branch.
+
+This is the branch/PR rehydration primitive for #2872. Persisted agent homes,
+WIP checkpoint refs and a distinct environment-lost state remain that issue's
+work; this command does not restore a lost conversation or unpushed files.
+
 ## Cargo target cache policy
 
 A checkout's `target/` is managed cache state. The fleet uses two complementary controls: a daily, per-host mtime-based sweep for old Cargo artifact families and a per-checkout size-cap backstop for unusually large targets.

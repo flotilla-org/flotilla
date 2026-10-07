@@ -2074,6 +2074,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         Command::builder()
             .action(CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    continuation: None,
                     standing_role: None,
                     namespace: None,
                     project_ref: "zellij".into(),
@@ -2133,8 +2134,20 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     ));
 }
 
+// Admission and settlement run through the real daemon and in-memory resources.
 #[tokio::test]
 async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
+    exercise_existing_pr_admission(false).await;
+}
+
+// #2873: explicit continuation binds the same open PR as produced work after
+// failure/deletion, refuses a live holder, and keeps settlement waiting on it.
+#[tokio::test]
+async fn convoy_start_continues_open_pr_after_failed_or_deleted_holder() {
+    exercise_existing_pr_admission(true).await;
+}
+
+async fn exercise_existing_pr_admission(continuing: bool) {
     let response = concat!(
         "HTTP/2.0 200 OK\r\nEtag: \"pr-1071\"\r\nContent-Type: application/json\r\n\r\n",
         r#"{"number":1071,"title":"Convoy adoption of an existing PR","head":{"ref":"feat/existing-pr"},"base":{"ref":"main"},"state":"open","body":"Existing implementation work.","draft":false,"merged_at":null}"#,
@@ -2147,6 +2160,17 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
                 "gh",
                 &["api", "--include", "repos/owner/repo/pulls/1071", "-H", "If-None-Match: \"pr-1071\""],
                 Ok("HTTP/2.0 304 Not Modified\r\nEtag: \"pr-1071\"\r\n\r\n".to_string()),
+            )
+            // Separate admission attempts each revalidate the cached PR with the forge.
+            .on_run(
+                "gh",
+                &["api", "--include", "repos/owner/repo/pulls/1071", "-H", "If-None-Match: \"pr-1071\""],
+                Ok("HTTP/2.0 304 Not Modified\r\nEtag: \"pr-1071\"\r\n\r\n".into()),
+            )
+            .on_run(
+                "gh",
+                &["api", "--include", "repos/owner/repo/pulls/1071", "-H", "If-None-Match: \"pr-1071\""],
+                Ok("HTTP/2.0 304 Not Modified\r\nEtag: \"pr-1071\"\r\n\r\n".into()),
             )
             .build(),
     );
@@ -2205,16 +2229,47 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .await
         .expect("project create");
 
+    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    let old = convoys
+        .create(
+            &InputMeta::builder().name("old-holder".into()).build(),
+            &flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("single-agent-shepherd".into())
+                .role("old".into())
+                .project_ref("flotilla".into())
+                .r#ref("feat/existing-pr".into())
+                .repositories(vec![flotilla_resources::ConvoyRepositorySpec {
+                    repo_ref: repository_key.clone(),
+                    url: "https://github.com/owner/repo".into(),
+                    source_ref: "main".into(),
+                    target_ref: "main".into(),
+                    workspace_slug: "repo".into(),
+                    subpaths: vec![],
+                }])
+                .build(),
+        )
+        .await
+        .expect("old holder");
+    if continuing {
+        convoys
+            .update_status("old-holder", &old.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("old failed");
+    }
     let mut events = daemon.subscribe();
     let command_id = daemon
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: continuing.then(|| flotilla_protocol::ConvoyContinuation::ChangeRequest("1071".into())),
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".to_string(),
-                        change_request: Some("1071".to_string()),
+                        change_request: (!continuing).then(|| "1071".into()),
                         issues: Vec::new(),
                         name: None,
                         branch: None,
@@ -2250,6 +2305,52 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
             title: "Convoy adoption of an existing PR".to_string(),
         })
     );
+    if continuing {
+        assert_eq!(convoy.spec.continuation.as_ref(), Some(&repository_key));
+        let subjects = convoy.spec.declared_subjects().expect("subjects");
+        assert!(subjects.iter().any(|entry| entry.relationship == flotilla_protocol::Relationship::Produces && entry.subject.id == "1071"));
+        let start = || {
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".into())
+                            .name("replacement".into())
+                            .continuation(flotilla_protocol::ConvoyContinuation::ChangeRequest("1071".into()))
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build()
+        };
+        let id = daemon.execute(start()).await.expect("second attempt");
+        let refusal = recv_command_finished(&mut events, id).await;
+        assert!(matches!(refusal, CommandValue::Error { ref message } if message.contains("live convoy")), "{refusal:?}");
+        convoys.delete(&convoy.metadata.name).await.expect("delete previous holder");
+        let id = daemon.execute(start()).await.expect("replacement after deletion");
+        assert!(matches!(recv_command_finished(&mut events, id).await, CommandValue::ConvoyStarted { .. }));
+        let replacement = admitted_convoy(&backend, "replacement").await;
+        assert_eq!(replacement.spec.change_request.as_ref().map(|bound| bound.id.as_str()), Some("1071"));
+        let leaves = flotilla_resources::expected_change_request_leaves(&replacement, &BTreeMap::new()).expect("settlement leaves");
+        // The same PR supplies both merged and closed terminal alternatives.
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[1].address, leaves[0].address);
+        assert_eq!(leaves[0].address, flotilla_protocol::LeafAddress::ChangeRequest {
+            service: "github.com".into(),
+            scope: "owner/repo".into(),
+            number: 1071
+        });
+        let settlement = flotilla_resources::evaluate_landing_settlement(
+            &replacement,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            chrono::Utc::now(),
+        );
+        assert!(!settlement.satisfied, "the continued open PR must hold settlement even without a ready checkout");
+    }
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
@@ -3283,6 +3384,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3314,6 +3416,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3416,6 +3519,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3565,6 +3669,7 @@ async fn convoy_start_accepts_project_list_identifier() {
                 Command::builder()
                     .action(CommandAction::ConvoyStart {
                         intent: Box::new(ConvoyStartIntent {
+                            continuation: None,
                             standing_role: None,
                             namespace: None,
                             project_ref,
@@ -3610,6 +3715,7 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "missing".into(),
@@ -3727,6 +3833,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3813,6 +3920,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 Command::builder()
                     .action(CommandAction::ConvoyStart {
                         intent: Box::new(ConvoyStartIntent {
+                            continuation: None,
                             standing_role: None,
                             namespace: None,
                             project_ref: "flotilla".into(),
@@ -3851,6 +3959,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3882,6 +3991,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3925,6 +4035,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -3978,6 +4089,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -4070,6 +4182,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: Some("flotilla".into()),
                         project_ref: "explicit-workflow".into(),
@@ -4114,6 +4227,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: Some("other".into()),
                         project_ref: "flotilla".into(),
@@ -4158,6 +4272,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -4255,6 +4370,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
@@ -4650,6 +4766,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                     Command::builder()
                         .action(CommandAction::ConvoyStart {
                             intent: Box::new(ConvoyStartIntent {
+                                continuation: None,
                                 standing_role: None,
                                 namespace: None,
                                 project_ref: "flotilla".into(),
@@ -4718,6 +4835,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     let command = Command::builder()
         .action(CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
+                continuation: None,
                 standing_role: None,
                 namespace: None,
                 project_ref: "flotilla".into(),
@@ -4813,6 +4931,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        continuation: None,
                         standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),

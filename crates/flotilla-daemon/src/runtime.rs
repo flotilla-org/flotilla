@@ -50,7 +50,7 @@ use flotilla_protocol::{
 use flotilla_resources::{
     canonical_host_id, canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
     host_direct_environment_name, is_prepared_snapshot, watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest,
-    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry,
+    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry,
     ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, Demand,
     DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
     EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
@@ -5689,12 +5689,31 @@ fn removal_source_path(removal: &CheckoutRemoval) -> &str {
 impl CheckoutRuntime for RoutingCheckoutRuntime {
     async fn validate_new_branch(&self, checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
         let Some(target) = checkout.spec.target_path() else { return Ok(None) };
-        let env_ref = checkout.spec.env_ref().ok_or("checkout environment unavailable")?;
+        let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
         let environment = self.state.daemon.resolve_environment_ref(env_ref).ok_or("checkout environment unavailable")?;
         if environment.runner.path_exists(Path::new(target)).await? {
             return Ok(None);
         }
         self.state.daemon.validate_new_checkout_branch(checkout).await
+    }
+
+    async fn continue_checkout_in(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+        clone_path: Option<&str>,
+        reason: &str,
+    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
+        let env_ref = checkout.spec.env_ref().ok_or_else(|| "checkout environment unavailable".to_string())?;
+        let target = checkout.spec.target_path().ok_or_else(|| "checkout target unavailable".to_string())?;
+        let path = clone_path.unwrap_or(target);
+        let runtime = self.runtime_for(env_ref, path).await?;
+        let vcs = controller_vcs(&runtime.vcs, &runtime.runner, path)?;
+        let result = match &checkout.spec {
+            CheckoutSpec::Worktree(spec) => vcs.continue_checkout(&spec.r#ref, target, reason).await?,
+            CheckoutSpec::FreshClone(spec) => vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target).await?,
+            CheckoutSpec::Observed(_) => return Err("observed checkout cannot be continued".to_string().into()),
+        };
+        Ok(PreparedCheckout { commit: result.commit, branch_provenance: result.provenance })
     }
 
     async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
@@ -12384,6 +12403,7 @@ mod tests {
         let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
             .create(&empty_meta("remote-placement"), &ConvoySpec {
+                continuation: None,
                 subjects: Vec::new(),
                 role: String::new(),
                 generation: 1,
@@ -16235,6 +16255,7 @@ mod tests {
                     ]))
                     .build(),
                 &ConvoySpec {
+                    continuation: None,
                     subjects: Vec::new(),
                     role: "convoy-a".to_string(),
                     generation: 1,

@@ -212,6 +212,7 @@ pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> Objec
 
 pub fn valid_convoy_spec() -> RealConvoySpec {
     RealConvoySpec {
+        continuation: None,
         subjects: Vec::new(),
         role: String::new(),
         generation: 1,

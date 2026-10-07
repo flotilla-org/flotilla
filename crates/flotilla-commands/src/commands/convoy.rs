@@ -41,7 +41,7 @@ pub enum ConvoyVerb {
     /// Send a follow-up brief to convoy crew
     Resume(ConvoyResumeArgs),
     /// Start a convoy through Project-scoped admission completion
-    Start(ConvoyStartArgs),
+    Start(Box<ConvoyStartArgs>),
     /// Create a convoy from a workflow template
     Create(ConvoyCreateArgs),
 }
@@ -108,6 +108,12 @@ pub struct ConvoyStartArgs {
         value_parser = parse_pr_number
     )]
     pub change_request: Option<String>,
+    /// Continue an existing remote branch (requires a single-repository project)
+    #[arg(long, conflicts_with_all = ["branch", "change_request", "continue_pr"])]
+    pub continue_branch: Option<String>,
+    /// Continue an existing open PR and its current remote head
+    #[arg(long, conflicts_with_all = ["branch", "change_request", "continue_branch"], value_parser = parse_pr_number)]
+    pub continue_pr: Option<String>,
     /// Opaque external issue ID
     #[arg(long)]
     pub issue: Option<String>,
@@ -347,25 +353,28 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Start(ConvoyStartArgs {
-                project,
-                change_request,
-                issue,
-                issue_service,
-                issue_scope,
-                name,
-                branch,
-                workflow,
-                inputs,
-                instruction,
-                placement_policy,
-                needs,
-                escalation_reason,
-                agent_overrides,
-                skills,
-                no_attach,
-                attach,
-            }) => {
+            ConvoyVerb::Start(args) => {
+                let ConvoyStartArgs {
+                    project,
+                    change_request,
+                    continue_branch,
+                    continue_pr,
+                    issue,
+                    issue_service,
+                    issue_scope,
+                    name,
+                    branch,
+                    workflow,
+                    inputs,
+                    instruction,
+                    placement_policy,
+                    needs,
+                    escalation_reason,
+                    agent_overrides,
+                    skills,
+                    no_attach,
+                    attach,
+                } = *args;
                 if self.subject.is_some() {
                     return Err("convoy start does not take a positional convoy name; use --name".to_string());
                 }
@@ -398,6 +407,9 @@ impl ConvoyNoun {
                         context_repo: None,
                         action: CommandAction::ConvoyStart {
                             intent: Box::new(ConvoyStartIntent {
+                                continuation: continue_branch
+                                    .map(flotilla_protocol::ConvoyContinuation::Branch)
+                                    .or_else(|| continue_pr.map(flotilla_protocol::ConvoyContinuation::ChangeRequest)),
                                 standing_role: None,
                                 namespace: None,
                                 project_ref: project,
@@ -444,6 +456,7 @@ impl ConvoyNoun {
                             context_repo: None,
                             action: CommandAction::ConvoyStart {
                                 intent: Box::new(ConvoyStartIntent {
+                                    continuation: None,
                                     standing_role: None,
                                     namespace: None,
                                     project_ref: project_ref.clone(),
@@ -544,26 +557,35 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --role {}", quote_value(role))?;
                 }
             }
-            ConvoyVerb::Start(ConvoyStartArgs {
-                project,
-                change_request,
-                issue,
-                issue_service,
-                issue_scope,
-                name,
-                branch,
-                workflow,
-                inputs,
-                instruction,
-                placement_policy,
-                needs,
-                escalation_reason,
-                agent_overrides,
-                skills,
-                no_attach,
-                attach,
-            }) => {
+            ConvoyVerb::Start(args) => {
+                let ConvoyStartArgs {
+                    project,
+                    change_request,
+                    continue_branch,
+                    continue_pr,
+                    issue,
+                    issue_service,
+                    issue_scope,
+                    name,
+                    branch,
+                    workflow,
+                    inputs,
+                    instruction,
+                    placement_policy,
+                    needs,
+                    escalation_reason,
+                    agent_overrides,
+                    skills,
+                    no_attach,
+                    attach,
+                } = args.as_ref();
                 write!(f, " start --project {}", quote_value(project))?;
+                if let Some(branch) = continue_branch {
+                    write!(f, " --continue-branch {}", quote_value(branch))?;
+                }
+                if let Some(pr) = continue_pr {
+                    write!(f, " --continue-pr {}", quote_value(pr))?;
+                }
                 if let Some(change_request) = change_request {
                     write!(f, " --pr {}", quote_value(change_request))?;
                 }
@@ -664,6 +686,24 @@ mod tests {
 
     fn parse(args: &[&str]) -> ConvoyNoun {
         ConvoyNoun::try_parse_from(args).expect("should parse")
+    }
+
+    // Glue: the CLI must preserve explicit opt-in through resolution and display.
+    #[test]
+    fn convoy_continuation_flags_resolve_and_round_trip() {
+        for (flag, value, expected) in [
+            ("--continue-branch", "wip/old", flotilla_protocol::ConvoyContinuation::Branch("wip/old".into())),
+            ("--continue-pr", "7", flotilla_protocol::ConvoyContinuation::ChangeRequest("7".into())),
+        ] {
+            let args = ["convoy", "start", "--project", "flotilla", flag, value];
+            assert_round_trip::<ConvoyNoun>(&args);
+            let Resolved::NeedsContext { command, .. } = parse(&args).resolve().expect("resolve") else { panic!("context command") };
+            let CommandAction::ConvoyStart { intent } = command.action else { panic!("start") };
+            assert_eq!(intent.continuation, Some(expected));
+            for conflicting in ["--branch", "--pr", if flag == "--continue-pr" { "--continue-branch" } else { "--continue-pr" }] {
+                assert!(ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", flag, value, conflicting, "8"]).is_err());
+            }
+        }
     }
 
     #[test]
@@ -897,6 +937,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    continuation: None,
                     standing_role: None,
                     namespace: None,
                     project_ref: "widgets".into(),
@@ -933,6 +974,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    continuation: None,
                     standing_role: None,
                     namespace: None,
                     project_ref: "flotilla".into(),
@@ -964,6 +1006,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    continuation: None,
                     standing_role: None,
                     namespace: None,
                     project_ref: "flotilla".into(),
@@ -1004,6 +1047,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    continuation: None,
                     standing_role: None,
                     namespace: None,
                     project_ref: "flotilla".into(),
@@ -1119,6 +1163,7 @@ mod tests {
         let Resolved::NeedsContext { command, .. } = resolved else { panic!("expected daemon command") };
         assert_eq!(command.action, CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
+                continuation: None,
                 standing_role: None,
                 namespace: None,
                 project_ref: "widgets".into(),

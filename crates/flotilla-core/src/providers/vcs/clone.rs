@@ -35,7 +35,7 @@ impl ReferenceCloneStrategy {
     }
 
     /// Get the remote URL from the reference repo.
-    async fn remote_url(&self) -> Result<String, String> {
+    pub(crate) async fn remote_url(&self) -> Result<String, String> {
         let ref_dir = self.ref_dir_str()?;
         let url = self
             .runner

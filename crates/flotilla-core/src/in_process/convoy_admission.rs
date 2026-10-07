@@ -181,10 +181,93 @@ impl ConvoyAdmission {
         Ok(())
     }
 
+    /// Resolve explicit continuation with fresh forge facts. Absence is allowed
+    /// for branch-only work; terminal requests are never silently adopted.
+    pub(super) async fn resolve_continuation(
+        &self,
+        repositories: &[ConvoyRepositorySpec],
+        continuation: &flotilla_protocol::ConvoyContinuation,
+    ) -> Result<(RepositoryKey, String, Option<ResolvedConvoyChangeRequestAdmission>), String> {
+        use flotilla_protocol::ConvoyContinuation;
+        let keys = repositories.iter().map(|repo| repo.repo_ref.clone()).collect::<Vec<_>>();
+        let (key, branch, id) = match continuation {
+            ConvoyContinuation::ChangeRequest(id) => {
+                let resolved = self.resolve_change_request_admission(&keys, required_admission_value(id, "change request")?, true).await?;
+                return Ok((resolved.binding.repository_ref.clone(), resolved.branch.clone(), Some(resolved)));
+            }
+            ConvoyContinuation::Branch(branch) => {
+                let [repository] = repositories else {
+                    return Err(
+                        "--continue-branch requires a single-repository project; use --continue-pr for an unambiguous repository".into()
+                    );
+                };
+                validate_convoy_branch(branch)?;
+                let (candidates, failures) = self.repository_change_request_candidates(&keys).await;
+                if !failures.is_empty() {
+                    return Err(failures.join("; "));
+                }
+                let mut id = None;
+                for (_, _, provider) in candidates {
+                    if let Some((found, request)) =
+                        provider.find_change_request_by_branch(branch).await.map_err(|error| error.to_string())?
+                    {
+                        require_open_continuation(&request.status, &found)?;
+                        id = Some(found);
+                        break;
+                    }
+                }
+                (repository.repo_ref.clone(), branch.clone(), id)
+            }
+        };
+        let resolved = match id {
+            Some(id) => {
+                let resolved = self.resolve_change_request_admission(std::slice::from_ref(&key), &id, true).await?;
+                if resolved.branch != branch {
+                    return Err("change request head changed during continuation admission; retry".into());
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+        Ok((key, branch, resolved))
+    }
+
+    async fn refuse_live_continuation_holder(&self, namespace: &str, spec: &ConvoySpec) -> Result<(), String> {
+        let Some(repository) = &spec.continuation else { return Ok(()) };
+        let requested_subjects = spec
+            .declared_subjects()?
+            .into_iter()
+            .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Produces)
+            .map(|entry| entry.subject)
+            .collect::<BTreeSet<_>>();
+        for source in self.backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?.items {
+            let other = source.object;
+            if other.metadata.deletion_timestamp.is_some() || other.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                continue;
+            }
+            let same_branch = other.spec.r#ref == spec.r#ref && other.spec.repositories.iter().any(|repo| &repo.repo_ref == repository);
+            let same_pr =
+                flotilla_resources::active_change_request_subjects(&other)?.iter().any(|subject| requested_subjects.contains(subject));
+            if same_branch || same_pr {
+                return Err(format!("continuation is held by live convoy {}; release it before continuing", other.metadata.name));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn resolve_convoy_change_request_admission(
         &self,
         repository_keys: &[RepositoryKey],
         requested_id: &str,
+    ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
+        self.resolve_change_request_admission(repository_keys, requested_id, false).await
+    }
+
+    async fn resolve_change_request_admission(
+        &self,
+        repository_keys: &[RepositoryKey],
+        requested_id: &str,
+        require_open: bool,
     ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
         let (candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
         let mut failures = setup_failures
@@ -198,6 +281,15 @@ impl ConvoyAdmission {
         for (repository, scope, provider) in candidates {
             match provider.get_change_request_for_admission(requested_id).await {
                 Ok(admission) => {
+                    if require_open {
+                        if let Err(error) = require_open_continuation(&admission.change_request.status, &admission.id) {
+                            failures.push(AdmissionLookupFailure {
+                                context: Some(format!("repository {scope}")),
+                                error: ObservationError::Forge(error),
+                            });
+                            continue;
+                        }
+                    }
                     let Some(base_ref) = admission.base_ref else {
                         failures.push(AdmissionLookupFailure {
                             context: Some(format!("repository {scope}")),
@@ -1411,6 +1503,21 @@ impl ConvoyAdmission {
                 return Err("standing convoy must select at least one project repository".to_string());
             }
         }
+        let mut normalized_intent = intent.clone();
+        let mut continued_request = None;
+        let continuation = if let Some(continuation) = &intent.continuation {
+            if intent.branch.is_some() || intent.change_request.is_some() {
+                return Err("continuation cannot be combined with --branch or --pr".into());
+            }
+            let (repository, branch, request) = self.resolve_continuation(&repositories_snapshot, continuation).await?;
+            normalized_intent.branch = request.is_none().then_some(branch);
+            normalized_intent.change_request = request.as_ref().map(|request| request.binding.id.clone());
+            continued_request = request;
+            Some(repository)
+        } else {
+            None
+        };
+        let intent = &normalized_intent;
         if intent.change_request.is_some() && intent.branch.is_some() {
             return Err("change request adoption derives the branch from --pr; do not also provide a branch".to_string());
         }
@@ -1420,12 +1527,16 @@ impl ConvoyAdmission {
         let change_request = match intent.change_request.as_deref() {
             Some(id) => {
                 let id = required_admission_value(id, "change request")?;
-                let resolved = self
-                    .resolve_convoy_change_request_admission(
-                        &repositories_snapshot.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(),
-                        id,
-                    )
-                    .await?;
+                let resolved = match continued_request.take() {
+                    Some(resolved) => resolved,
+                    None => {
+                        self.resolve_convoy_change_request_admission(
+                            &repositories_snapshot.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(),
+                            id,
+                        )
+                        .await?
+                    }
+                };
                 let repository = repositories_snapshot
                     .iter_mut()
                     .find(|repository| repository.repo_ref == resolved.binding.repository_ref)
@@ -1534,6 +1645,7 @@ impl ConvoyAdmission {
             None => None,
         };
         let spec = ConvoySpec {
+            continuation,
             workflow_ref,
             role,
             generation: 0,
@@ -1574,6 +1686,7 @@ impl ConvoyAdmission {
             self.check_remote_placement_free_space_floor(namespace, Some(decision)).await?;
         }
         let _admission_guard = self.lock().await;
+        self.refuse_live_continuation_holder(namespace, &admission.spec).await?;
         admission.name = convoy_record_name();
         admission.spec.generation =
             allocate_convoy_generation(&self.backend, namespace, admission.spec.project_ref.as_deref(), &admission.spec.role).await?;
@@ -2145,6 +2258,7 @@ impl ConvoyAdmission {
             }
         };
         let spec = ConvoySpec {
+            continuation: None,
             workflow_ref: workflow_ref.to_string(),
             role: role.to_string(),
             generation,
@@ -2695,6 +2809,7 @@ pub(super) struct ConvoyStartKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ConvoyStartSubject {
+    Continuation(flotilla_protocol::ConvoyContinuation),
     ChangeRequest(String),
     Issues(Vec<flotilla_protocol::IssueSelector>),
     Name(String),
@@ -2709,7 +2824,9 @@ enum ConvoyStartSubject {
 
 impl ConvoyStartKey {
     pub(super) fn new(namespace: String, intent: &flotilla_protocol::ConvoyStartIntent) -> Self {
-        let subject = if let Some(change_request) = &intent.change_request {
+        let subject = if let Some(continuation) = &intent.continuation {
+            ConvoyStartSubject::Continuation(continuation.clone())
+        } else if let Some(change_request) = &intent.change_request {
             ConvoyStartSubject::ChangeRequest(change_request.clone())
         } else if intent.issues.is_empty() {
             match &intent.name {
@@ -3813,6 +3930,14 @@ async fn image_placement_cost(
         })
     });
     Ok(if registry { flotilla_resources::ImageAcquisitionCost::RegistryPull } else { flotilla_resources::ImageAcquisitionCost::Build })
+}
+
+fn require_open_continuation(status: &flotilla_protocol::ChangeRequestStatus, id: &str) -> Result<(), String> {
+    if matches!(status, flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft) {
+        Ok(())
+    } else {
+        Err(format!("cannot continue {status:?} change request #{id}; reopen it explicitly first"))
+    }
 }
 
 #[cfg(test)]

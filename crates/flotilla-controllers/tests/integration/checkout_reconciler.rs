@@ -68,6 +68,19 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         }
     }
     // Boundary fake: records the environment-scoped VCS registration request.
+    // VCS process boundary: a successful continued checkout is pre-existing work.
+    async fn continue_checkout_in(
+        &self,
+        _checkout: &ResourceObject<Checkout>,
+        _clone_path: Option<&str>,
+        _reason: &str,
+    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
+        self.creation_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.creation_protection_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
+            return Err(CheckoutMaterialisationError::Protection("temporary protection failure".into()));
+        }
+        Ok(PreparedCheckout { commit: Some("remote-tip".into()), branch_provenance: CheckoutBranchProvenance::PreExisting })
+    }
     async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
         self.protections.lock().expect("protections").push((env_ref.into(), clone_path.into(), target.into(), reason.into()));
         match &self.protection_error {
@@ -184,23 +197,48 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
 // without a terminal Failed phase or losing the creation's branch provenance.
 #[tokio::test(start_paused = true)]
 async fn pending_checkout_recovers_creation_protection_through_controller_loop() {
+    exercise_creation_protection_recovery(false).await;
+}
+
+// #2873: FreshClone continuation must keep protection failures retryable, even
+// beyond the retry budget, and recover without an operator resetting Failed.
+#[tokio::test(start_paused = true)]
+async fn continued_fresh_clone_recovers_protection_through_controller_loop() {
+    exercise_creation_protection_recovery(true).await;
+}
+
+async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_clone(&backend, NAMESPACE, "clone-recovery", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
-    let checkout = checkouts
-        .create(
-            &meta("checkout-recovery").with_lifecycle_authority(LifecycleAuthority::Managed),
-            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey(repo_key(REPO_URL)),
-                env_ref: "host-direct-a".into(),
-                r#ref: "recovery/work".into(),
-                base_ref: Some("main".into()),
-                target_path: "/checkouts/recovery".into(),
-                clone_ref: "clone-recovery".into(),
-            }),
-        )
-        .await
-        .expect("checkout");
+    let repo = RepositoryKey(repo_key(REPO_URL));
+    let mut metadata = meta("checkout-recovery").with_lifecycle_authority(LifecycleAuthority::Managed);
+    let spec = if continuing_fresh {
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&meta("continuing-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).continuation(repo.clone()).build())
+            .await
+            .expect("continuing convoy");
+        metadata.labels.insert(CONVOY_LABEL.into(), "continuing-owner".into());
+        CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+            repo_ref: repo,
+            env_ref: "host-direct-a".into(),
+            url: REPO_URL.into(),
+            r#ref: "recovery/work".into(),
+            base_ref: Some("main".into()),
+            target_path: "/checkouts/recovery".into(),
+        })
+    } else {
+        CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+            repo_ref: repo,
+            env_ref: "host-direct-a".into(),
+            r#ref: "recovery/work".into(),
+            base_ref: Some("main".into()),
+            target_path: "/checkouts/recovery".into(),
+            clone_ref: "clone-recovery".into(),
+        })
+    };
+    let checkout = checkouts.create(&metadata, &spec).await.expect("checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime {
         allow_creation: true,
         creation_protection_failures: AtomicUsize::new(7),
@@ -235,8 +273,11 @@ async fn pending_checkout_recovers_creation_protection_through_controller_loop()
                 saw_exhausted_retry = true;
             }
             if status.phase == CheckoutPhase::Ready {
-                assert_eq!(status.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
-                assert_eq!(status.commit.as_deref(), Some("base-commit"));
+                assert_eq!(
+                    status.branch_provenance,
+                    if continuing_fresh { CheckoutBranchProvenance::PreExisting } else { CheckoutBranchProvenance::CreatedForConvoy }
+                );
+                assert_eq!(status.commit.as_deref(), Some(if continuing_fresh { "remote-tip" } else { "base-commit" }));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1339,4 +1380,93 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
     let clear = retrying.reconcile(&old, &recovered, chrono::Utc::now()).patch.expect("clear validation diagnostic");
     apply_status_patch(&checkouts, "old", &clear).await.expect("clear error");
     assert!(checkouts.get("old").await.expect("recovered checkout").status.expect("status").message.is_none());
+}
+
+// #2873: logical reservations span environments, and cease holding a branch
+// after owner failure/deletion. Check the invariant after each lifecycle step.
+#[hegel::test]
+fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Generator covers every live/terminal convoy phase and repeated transitions.
+    let phases = [
+        ConvoyPhase::Pending,
+        ConvoyPhase::Active,
+        ConvoyPhase::Interrupted,
+        ConvoyPhase::Anchored,
+        ConvoyPhase::Landing,
+        ConvoyPhase::Landed,
+        ConvoyPhase::Failed,
+        ConvoyPhase::Cancelled,
+        ConvoyPhase::Abandoned,
+    ];
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let sequence =
+        (0..steps).map(|_| phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))]).collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repo = RepositoryKey(repo_key(REPO_URL));
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        convoys.create(&meta("old-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).build()).await.expect("old convoy");
+        convoys
+            .create(&meta("new-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).continuation(repo.clone()).build())
+            .await
+            .expect("continuing convoy");
+        create_ready_clone(&backend, NAMESPACE, "clone", REPO_URL, "host", "/clone").await;
+        let checkouts = backend.using::<Checkout>(NAMESPACE);
+        let new_spec = CheckoutSpec::Worktree(
+            CheckoutWorktreeSpec::builder()
+                .repo_ref(repo)
+                .env_ref("host".into())
+                .r#ref("continued".into())
+                .base_ref("main".into())
+                .clone_ref("clone".into())
+                .target_path("/checkout/new".into())
+                .build(),
+        );
+        let mut old_spec = new_spec.clone();
+        if let CheckoutSpec::Worktree(spec) = &mut old_spec {
+            spec.env_ref = "other-host".into();
+            spec.target_path = "/checkout/old".into();
+        }
+        let old = checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("old-checkout".into())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "old-owner".into())]))
+                    .build(),
+                &old_spec,
+            )
+            .await
+            .expect("old checkout");
+        checkouts
+            .update_status("old-checkout", &old.metadata.resource_version, &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                ..Default::default()
+            })
+            .await
+            .expect("ready old");
+        let new = checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("new-checkout".into())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "new-owner".into())]))
+                    .build(),
+                &new_spec,
+            )
+            .await
+            .expect("new checkout");
+        let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
+        for phase in sequence {
+            let old = convoys.get("old-owner").await.expect("old owner");
+            convoys
+                .update_status("old-owner", &old.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
+                .await
+                .expect("phase step");
+            let prepared = reconciler.prepare(&new).await.expect("prepare");
+            assert_eq!(matches!(prepared, CheckoutPrepared::Ready { .. }), phase.is_terminal(), "{phase:?}");
+        }
+        convoys.delete("old-owner").await.expect("delete owner");
+        assert!(matches!(reconciler.prepare(&new).await.expect("deleted binding"), CheckoutPrepared::Ready { .. }));
+    });
 }

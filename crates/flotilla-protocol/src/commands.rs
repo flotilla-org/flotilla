@@ -620,8 +620,18 @@ impl From<ConvoyAutoAttach> for ConvoyDispatchRegard {
     }
 }
 
+/// Explicit recovery input, distinct from naming a new branch or adopting a PR.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ConvoyContinuation {
+    Branch(String),
+    ChangeRequest(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyStartIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<ConvoyContinuation>,
     /// Local standing-role presence selects its inherited workflow shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standing_role: Option<String>,

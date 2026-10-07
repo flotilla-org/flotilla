@@ -3469,6 +3469,15 @@ impl InProcessDaemon {
         if !self.checkout_has_network_forge(checkout).await? {
             return Ok(None);
         }
+        let continuing = if let Some(owner) = checkout.metadata.labels.get(CONVOY_LABEL) {
+            match self.resource_backend.including_replicas::<ResourceConvoy>(&checkout.metadata.namespace).get(owner).await {
+                Ok(owner) => owner.object.spec.continuation.as_ref() == Some(checkout.spec.repo_ref()),
+                Err(ResourceError::NotFound { .. }) => false,
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            false
+        };
         let (candidates, failures) =
             self.convoy_admission.repository_change_request_candidates(std::slice::from_ref(checkout.spec.repo_ref())).await;
         if let Some(error) = failures.into_iter().next() {
@@ -3478,6 +3487,14 @@ impl InProcessDaemon {
             if let Some((id, request)) =
                 provider.find_change_request_by_branch_for_admission(checkout.spec.branch()).await.map_err(|error| error.to_string())?
             {
+                if continuing
+                    && matches!(
+                        request.status,
+                        flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
+                    )
+                {
+                    continue;
+                }
                 return Ok(Some(format!(
                     "checkout branch {} conflicts with {:?} change request #{}; choose a fresh branch name",
                     checkout.spec.branch(),

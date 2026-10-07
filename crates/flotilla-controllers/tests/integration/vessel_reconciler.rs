@@ -208,6 +208,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-scratch"), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,
@@ -550,6 +551,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-multi"), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,
@@ -769,6 +771,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-multi-docker"), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,
@@ -1062,6 +1065,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-multi-fresh"), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,
@@ -1201,6 +1205,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-scoped"), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,
@@ -2468,6 +2473,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .create(&meta("convoy-issue-brief"), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,
@@ -2897,6 +2903,7 @@ async fn create_convoy_with_labeled_processes(
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
         .create(&meta(name), &ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,

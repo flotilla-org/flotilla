@@ -61,6 +61,16 @@ pub trait CheckoutRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Continue a remote branch using the checkout's own environment and shape.
+    async fn continue_checkout_in(
+        &self,
+        _checkout: &ResourceObject<Checkout>,
+        _clone_path: Option<&str>,
+        _reason: &str,
+    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
+        Err("branch continuation is unavailable".to_string().into())
+    }
+
     /// Restore registration protection through the checkout's owning environment.
     async fn protect_worktree_in(&self, _env_ref: &str, _clone_path: &str, _target: &str, _reason: &str) -> Result<(), String> {
         Ok(())
@@ -366,8 +376,22 @@ where
             return Ok(CheckoutPrepared::None);
         }
 
+        let continuing = convoy.as_ref().is_some_and(|convoy| convoy.spec.continuation.as_ref() == Some(obj.spec.repo_ref()));
         if has_convoy_owner {
-            let conflict = self.checkouts.list().await?.items.into_iter().find(|other| {
+            let mut live_checkouts = Vec::new();
+            for other in self.checkouts.list().await?.items {
+                if continuing
+                    && other.metadata.labels.contains_key(CONVOY_LABEL)
+                    && self.owning_convoy(&other).await?.is_none_or(|owner| {
+                        owner.metadata.deletion_timestamp.is_some()
+                            || owner.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+                    })
+                {
+                    continue;
+                }
+                live_checkouts.push(other);
+            }
+            let conflict = live_checkouts.into_iter().find(|other| {
                 other.metadata.name != obj.metadata.name
                     && other.metadata.deletion_timestamp.is_none()
                     && match other.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) {
@@ -381,7 +405,8 @@ where
                         CheckoutPhase::Failed | CheckoutPhase::Gone => false,
                     }
                     && other.spec.repo_ref() == obj.spec.repo_ref()
-                    && other.spec.env_ref() == obj.spec.env_ref()
+                    // Recovery can move environments; a live owner still reserves the same repository branch.
+                    && (continuing || other.spec.env_ref() == obj.spec.env_ref())
                     && other.spec.branch() == obj.spec.branch()
             });
             if let Some(other) = conflict {
@@ -434,6 +459,19 @@ where
                 if clone.spec.env_ref != spec.env_ref {
                     return Ok(CheckoutPrepared::Failed("worktree clone env_ref mismatch".to_string()));
                 }
+                if continuing {
+                    return Ok(
+                        match self
+                            .runtime
+                            .continue_checkout_in(obj, Some(&clone.spec.path), &checkout_registration_reason(obj, convoy.as_ref()))
+                            .await
+                        {
+                            Ok(prepared) => CheckoutPrepared::Ready { prepared },
+                            Err(CheckoutMaterialisationError::Protection(error)) => return Err(ResourceError::other(error)),
+                            Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
+                        },
+                    );
+                }
                 Ok(
                     match self
                         .runtime
@@ -452,6 +490,13 @@ where
                         Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
                     },
                 )
+            }
+            CheckoutSpec::FreshClone(_) if continuing => {
+                Ok(match self.runtime.continue_checkout_in(obj, None, &checkout_registration_reason(obj, convoy.as_ref())).await {
+                    Ok(prepared) => CheckoutPrepared::Ready { prepared },
+                    Err(CheckoutMaterialisationError::Protection(error)) => return Err(ResourceError::other(error)),
+                    Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
+                })
             }
             CheckoutSpec::FreshClone(spec) => Ok(
                 match self
