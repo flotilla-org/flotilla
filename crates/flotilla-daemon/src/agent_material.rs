@@ -608,9 +608,7 @@ pub async fn validate_frozen_vessel_skills(
     authorize_frozen_sources(&sources, declared_credentials)?;
     for (crew, selected) in crews {
         if !selected.is_empty() {
-            validate_frozen_skills(source, selected, declared_credentials, credential_tokens, runner)
-                .await
-                .map_err(|error| format!("crew {crew}: {error}"))?;
+            stage_frozen_skills(&sources, selected, credential_tokens, runner).await.map_err(|error| format!("crew {crew}: {error}"))?;
         }
     }
     Ok(())
@@ -643,6 +641,7 @@ fn authorize_frozen_sources(
 /// revision staging as provisioning, without touching a crew's staged skills.
 /// Token files are explicit operator inputs, keyed by the declared credential;
 /// ambient Git credentials are disabled by the staging implementation.
+#[cfg(test)]
 async fn validate_frozen_skills(
     source: &Path,
     selected: &[flotilla_resources::SkillCatalogEntry],
@@ -652,6 +651,18 @@ async fn validate_frozen_skills(
 ) -> Result<(), String> {
     let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, selected)?;
     authorize_frozen_sources(&sources, declared_credentials)?;
+    stage_frozen_skills(&sources, selected, credential_tokens, runner).await
+}
+
+/// Stage one crew from the vessel's already resolved and authorized source set.
+/// Filter before staging to keep other crews' sources and names isolated.
+async fn stage_frozen_skills(
+    sources: &[SkillSource],
+    selected: &[flotilla_resources::SkillCatalogEntry],
+    credential_tokens: &BTreeMap<String, PathBuf>,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let sources = sources.iter().filter(|source| selected.iter().any(|entry| entry.source == source.name)).collect::<Vec<_>>();
     let scratch = tempfile::tempdir().map_err(|error| format!("create frozen-skill probe directory: {error}"))?;
     let mut args = vec![
         "flotilla-stage-skills".into(),
@@ -660,7 +671,7 @@ async fn validate_frozen_skills(
         "false".into(),
         scratch.path().join("cache").to_string_lossy().into_owned(),
     ];
-    for source in &sources {
+    for (index, source) in sources.iter().enumerate() {
         let token = if let Some(credential) = &source.credential {
             let path = credential_tokens.get(credential).ok_or_else(|| {
                 format!(
@@ -670,7 +681,7 @@ async fn validate_frozen_skills(
             })?;
             // Staging deletes tokens after failed probes; protect the operator's
             // original by supplying a private, disposable copy.
-            let copy = scratch.path().join(format!("token-{}", source.name));
+            let copy = scratch.path().join(format!("token-{index}"));
             std::fs::copy(path, &copy).map_err(|error| format!("copy probe token for {credential}: {error}"))?;
             copy.to_string_lossy().into_owned()
         } else {
@@ -2436,12 +2447,34 @@ esac
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path());
         let bundle = registry.skills.source.as_ref().expect("source");
-        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("new supply");
+        std::fs::write(
+            bundle.join(SKILL_BUNDLE_MANIFEST),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 5,
+                "sources": [{
+                    "name": "private-skills",
+                    "repository": "https://github.com/example/private-skills.git",
+                    "revision": "2".repeat(40),
+                    "credential": "private-skills",
+                }],
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("new supply");
         // Subprocess-boundary stand-in enforces the Git staging CLI, supplies
         // lazy blobs and records the exact revision fetched without networking.
         let runner = promisor_runner(temp.path());
         let selected = vec![crew_skill("private-source", "skills/private-folder")];
-        let spec = serde_json::from_value(serde_json::json!({"consumer":{"adapter":"github-app","installation_id":1},"source":{"kind":"github-app","app_id_path":"/test/app-id","private_key_path":"/test/key"},"lifecycle":"refreshable"})).expect("credential spec");
+        let spec = serde_json::from_value(serde_json::json!({
+            "consumer": {"adapter": "github-app", "installation_id": 1},
+            "source": {
+                "kind": "github-app",
+                "app_id_path": "/test/app-id",
+                "private_key_path": "/test/key",
+            },
+            "lifecycle": "refreshable",
+        }))
+        .expect("credential spec");
         let declared = BTreeMap::from([("private-skills".into(), spec)]);
         let missing = validate_frozen_skills(bundle, &selected, &BTreeMap::new(), &BTreeMap::new(), &runner)
             .await

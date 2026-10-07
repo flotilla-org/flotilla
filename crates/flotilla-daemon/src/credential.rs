@@ -1231,7 +1231,7 @@ impl CredentialStore {
             CredentialSource::GithubApp { app_id_path, private_key_path },
         ) = (&spec.consumer, &spec.source)
         else {
-            unreachable!("validated skill-source credential");
+            return Err(bounded_adapter_error(credential_name, "github-app", "skill source requires a GitHub App consumer and source"));
         };
         let installation_id = match (installation_id, installation_repository) {
             (Some(id), None) => *id,

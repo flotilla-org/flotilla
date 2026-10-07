@@ -101,6 +101,9 @@ impl Probes for CandidateProbes<'_> {
                 Err(error) => errors.push(format!("registry manifest {registry}: {error}")),
             }
         }
+        // Exact identities use the host observations checked above, then exact
+        // registry manifests. Local Docker inspection below is only a legacy
+        // tag fallback: it cannot prove availability on another fleet host.
         if !errors.is_empty() {
             return Err(errors.join("; "));
         }

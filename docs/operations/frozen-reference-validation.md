@@ -43,7 +43,10 @@ configured on the operator host. The checker never builds or substitutes images.
 
 This crew container has no Docker or live fleet. Run acceptance on **every fleet
 host**, against that host's live resource socket, before activation. Use the
-candidate release's own binary, supply and catalog:
+candidate release's own binary, supply and catalog. The operator host needs
+`python3` to export and verify the report. The evidence directory must be new
+and its parent must exist; each run deliberately refuses to overwrite prior
+evidence. Choose a fresh directory when repeating acceptance:
 
 ```bash
 scripts/accept-frozen-references.sh \

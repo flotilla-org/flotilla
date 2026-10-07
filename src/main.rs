@@ -2116,7 +2116,9 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 .await;
                 #[cfg(not(unix))]
                 let result = {
-                    let _ = (skill_sources, skill_probe_tokens);
+                    if skill_sources.is_some() || skill_probe_tokens.is_some() {
+                        return Err(color_eyre::eyre::eyre!("frozen-reference daemon validation requires Unix"));
+                    }
                     resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await
                 };
                 result.map(|_| ()).map_err(|error| {

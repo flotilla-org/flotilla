@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Operator-only live acceptance. Run on each host before fleet-install activation.
+# Requires python3 and a new evidence directory beneath an existing parent.
 # The script reads the daemon and writes evidence; it never rolls the fleet.
 set -euo pipefail
 if [[ $# -lt 3 || $# -gt 4 ]]; then
