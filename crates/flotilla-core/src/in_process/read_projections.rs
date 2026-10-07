@@ -1204,6 +1204,14 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
+        let messages = crew_message_views(self.backend, namespace)
+            .await?
+            .into_iter()
+            .filter(|message| {
+                message.receiver.split('/').nth(1) == Some(name)
+                    || message.current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(name))
+            })
+            .collect();
         Ok(ConvoyExplanation {
             cascade: convoy
                 .status
@@ -1212,6 +1220,8 @@ impl ReadProjections<'_> {
                 .and_then(|workflow| workflow.cascade.as_deref())
                 .or_else(|| pinned_workflow.as_ref().and_then(|workflow| workflow.object.spec.cascade.as_deref()))
                 .map(|cascade| serde_json::to_value(cascade).expect("serialize cascade")),
+
+            messages,
             environment_observations: convoy.status.as_ref().map(|status| status.environment_observations.clone()).unwrap_or_default(),
             skills: convoy
                 .status
@@ -1455,6 +1465,48 @@ fn explain_subject_observation(
             freshness: observed_freshness(readiness_at, now, change_request_stale_after),
         },
     }
+}
+
+/// Project durable inbox state without inferring delivery from terminal phases.
+pub(super) async fn crew_message_views(
+    backend: &flotilla_resources::ResourceBackend,
+    namespace: &str,
+) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
+    let mut records =
+        backend.including_replicas::<flotilla_resources::Message>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    records.sort_by_key(|record| {
+        (record.object.metadata.creation_timestamp, record.object.status.as_ref().and_then(|status| status.accepted_sequence))
+    });
+    let mut views = Vec::new();
+    for source in records {
+        let message = source.object;
+        let holder = flotilla_resources::resolve_message_receiver(backend, namespace, &message.spec.receiver)
+            .await
+            .map_err(|error| error.to_string())?;
+        let current_receiver = holder.and_then(|holder| {
+            let terminal = holder.object;
+            let convoy = terminal.metadata.labels.get(flotilla_resources::CONVOY_LABEL)?;
+            let vessel = terminal.metadata.labels.get(flotilla_resources::VESSEL_LABEL)?;
+            Some(format!("{}/{convoy}/{vessel}/{}", message.spec.receiver.split('/').next()?, terminal.spec.role))
+        });
+        let status = message.status.unwrap_or_default();
+        let receiver = status.resolved_receiver.as_ref();
+        views.push(flotilla_protocol::query::CrewMessageView {
+            current_receiver,
+            name: message.metadata.name,
+            sender: message.spec.sender,
+            receiver: message.spec.receiver,
+            relation: serde_json::to_value(message.spec.relation).expect("relation").as_str().expect("relation string").into(),
+            phase: serde_json::to_value(status.phase).expect("phase").as_str().expect("phase string").into(),
+            since: status.since.to_rfc3339(),
+            reason: status.reason,
+            subject: message.spec.subject.map(|subject| serde_json::to_value(subject).expect("subject")),
+            expectation: serde_json::to_value(message.spec.expectation).expect("expectation"),
+            crew_id: receiver.map(|receiver| receiver.crew_id.clone()),
+            session: receiver.map(|receiver| receiver.session.clone()),
+        });
+    }
+    Ok(views)
 }
 
 #[cfg(test)]
@@ -2639,6 +2691,41 @@ mod tests {
             .expect("filtered queue")
             .entries
             .is_empty());
+    }
+    // Both crew and convoy surfaces share the durable projection. Waiting
+    // reasons survive reads, and delivery identity comes only from evidence.
+    #[tokio::test]
+    async fn message_views_preserve_waiting_reasons_and_delivery_identity() {
+        use flotilla_resources::{Message, MessageInbox, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
+        let backend = ResourceBackend::InMemory(Default::default());
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        let intent = MessageSpec::builder()
+            .sender("flotilla/test".into())
+            .receiver("project/convoy/work/coder".into())
+            .relation(MessageRelation::System)
+            .body("brief".into())
+            .build();
+        inbox.accept(&InputMeta::builder().name("view".into()).build(), &intent, Utc::now()).await.expect("admit");
+        let pending = super::crew_message_views(&backend, "flotilla").await.expect("waiting view");
+        assert_eq!(pending[0].phase, "accepted");
+        assert!(pending[0].reason.as_deref().is_some_and(|reason| !reason.is_empty()));
+        assert!(pending[0].crew_id.is_none());
+        flotilla_resources::apply_status_patch(&backend.using::<Message>("flotilla"), "view", &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew".into())
+                .session("session".into())
+                .delivered_at(Utc::now())
+                .evidence("transport receipt".into())
+                .build(),
+            at: Utc::now(),
+        })
+        .await
+        .expect("receipt");
+        let delivered = super::crew_message_views(&backend, "flotilla").await.expect("delivered view");
+        assert_eq!(delivered[0].phase, "delivered");
+        assert_eq!(delivered[0].crew_id.as_deref(), Some("crew"));
+        assert_eq!(delivered[0].session.as_deref(), Some("session"));
+        assert!(delivered[0].reason.is_none());
     }
 }
 

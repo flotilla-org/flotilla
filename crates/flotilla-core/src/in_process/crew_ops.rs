@@ -21,12 +21,12 @@ use flotilla_resources::{
     CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
     CrewCompletionPending, CrewCompletionRefusalCause, CrewMessageDelivery, CrewMessageSender, CrewSource, CrewWorkPhase,
     Demand as ResourceDemand, Forge, HoldAct, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState,
-    PendingBrief, Presentation as ResourcePresentation, Project, ReplicaReadResolver, Repository, RepositoryKey, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    Presentation as ResourcePresentation, Project, Repository, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, TypedResolver, UnmetSettlementExpectation, Vessel,
-    WorkCompletionAuthority, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WorkCompletionAuthority,
+    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
 };
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
@@ -35,7 +35,6 @@ use super::{
     checkout_path,
     checkout_providers::CheckoutProviders,
     convoy_admission::convoy_address,
-    input_meta_from_resource,
     read_projections::{credential_refresh_alert_for_vessel, LeafSubscriptionRead},
     BriefArtifactWriter, WorkCredentialReconciler,
 };
@@ -68,10 +67,6 @@ pub(super) struct CrewService {
     convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     #[builder(default)]
     work_credential_reconciler: RwLock<Option<Arc<dyn WorkCredentialReconciler>>>,
-    // Networking can restart against the same module, replacing a dead router.
-    // This lock protects only Weak pointer copies/swaps, never async work.
-    #[builder(default)]
-    remote_turn_delivery: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::RemoteTurnDelivery>>>,
     clock: Arc<dyn Clock>,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     config: Arc<ConfigStore>,
@@ -108,35 +103,13 @@ pub(super) struct CrewTurnDeliveryActuator {
     pub(super) crew: Weak<CrewService>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnDeliverySessionPlan {
-    QueueWarm,
-    QueueFresh,
-    RestartFresh,
-}
-
-fn turn_delivery_session_plan(
-    phase: Option<ResourceTerminalSessionPhase>,
-    vessel: &str,
-    role: &str,
-) -> Result<TurnDeliverySessionPlan, String> {
-    match phase {
-        Some(ResourceTerminalSessionPhase::Running) => Ok(TurnDeliverySessionPlan::QueueWarm),
-        Some(ResourceTerminalSessionPhase::Starting) | None => Ok(TurnDeliverySessionPlan::QueueFresh),
-        Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => Ok(TurnDeliverySessionPlan::RestartFresh),
-        Some(ResourceTerminalSessionPhase::Failed) => {
-            Err(format!("turn-delivery target {vessel}/{role} failed provisioning and cannot be restarted"))
-        }
-    }
-}
-
 #[async_trait]
 impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
-    async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+    async fn deliver(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
         self.crew.upgrade().ok_or_else(|| "daemon stopped before turn delivery".to_string())?.deliver_turn(request).await
     }
 
-    async fn hold(&self, request: &crate::leaf_engine::TurnDeliveryRequest, act: &HoldAct, reason: &str) -> Result<(), String> {
+    async fn hold(&self, request: &crate::leaf_engine::CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String> {
         self.crew
             .upgrade()
             .ok_or_else(|| "daemon stopped before turn-delivery hold".to_string())?
@@ -308,20 +281,6 @@ pub(super) fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> Stri
     format!("[{}]\n\n{body}", crew_message_header(sender))
 }
 
-fn terminal_at_turn_boundary(session: &ResourceObject<ResourceTerminalSession>, now: chrono::DateTime<chrono::Utc>) -> bool {
-    session.status.as_ref().is_some_and(|status| {
-        status.phase == ResourceTerminalSessionPhase::Running
-            && status.completion_pending.is_none()
-            && !status.degraded.as_ref().is_some_and(|condition| condition.is_delivery())
-            && status
-                .attention
-                .as_ref()
-                .is_some_and(|attention| attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now))
-            && !matches!(&session.spec.source, TerminalSessionSource::Agent { message: Some(head), .. }
-                if head.next_after(status.delivered_message_id.as_deref()).is_some())
-    })
-}
-
 fn pending_crew_message(sender: CrewMessageSender, body: &str) -> TerminalCrewMessage {
     TerminalCrewMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -401,27 +360,7 @@ async fn queue_crew_message_object(
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
     next: TerminalCrewMessage,
 ) -> Result<(), String> {
-    let mut current = existing.clone();
-    for _ in 0..8 {
-        let mut spec = current.spec.clone();
-        let TerminalSessionSource::Agent { message: pending, .. } = &mut spec.source else {
-            return Err(format!("crew target `{}` is not an agent session", current.spec.role));
-        };
-        if let Some(head) = pending {
-            head.prune_acknowledged(current.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()));
-            head.append(next.clone());
-        } else {
-            *pending = Some(next.clone());
-        }
-        match sessions.update(&input_meta_from_resource(&current), &current.metadata.resource_version, &spec).await {
-            Ok(_) => return Ok(()),
-            Err(ResourceError::Conflict { .. }) => {
-                current = sessions.get(&current.metadata.name).await.map_err(|error| error.to_string())?;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err(format!("crew message contention persisted for session `{}`", existing.metadata.name))
+    sessions.accept_crew_message(existing, &next, Utc::now()).await.map_err(|error| error.to_string())
 }
 
 impl CrewService {
@@ -760,6 +699,11 @@ impl CrewService {
             .into_iter()
             .filter_map(|demand| credential_refresh_alert_for_vessel(&demand, &context.convoy, &context.vessel))
             .collect::<Vec<_>>();
+        let mut inbox_messages: HashMap<String, Vec<_>> = HashMap::new();
+        for message in super::read_projections::crew_message_views(&self.resource_backend, &context.namespace).await? {
+            inbox_messages.entry(message.current_receiver.as_ref().unwrap_or(&message.receiver).clone()).or_default().push(message);
+        }
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let members = task
             .crew
             .iter()
@@ -776,6 +720,12 @@ impl CrewService {
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
                 CrewListMember::builder()
+                    .messages(
+                        inbox_messages
+                            .get(&format!("{project}/{}/{}/{}", context.convoy, context.vessel, process.role))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
@@ -1005,6 +955,50 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
                 return Err(format!("crew completion expectations unmet: {expectation}"));
+            }
+        }
+        if let Some(reference) = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .and_then(|crew| crew.get(&context.caller_role))
+            .and_then(|state| state.pending_follow_up.as_ref())
+        {
+            let follow_up = self
+                .resource_backend
+                .including_replicas::<flotilla_resources::Message>(namespace)
+                .get(&reference.name)
+                .await
+                .map_err(|error| format!("follow-up Message awaits replication: {error}"))?;
+            if follow_up.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
+                let claim = flotilla_resources::SupersededCrewClaim {
+                    claimed_at: self.clock.now(),
+                    message,
+                    disposition,
+                    completion_override: forced_by
+                        .as_ref()
+                        .filter(|_| decision_ledger_ref.is_none() && decision_ledger_digest.is_none())
+                        .map(|principal| flotilla_resources::CrewCompletionOverride {
+                            principal: principal.clone(),
+                            forced_at: self.clock.now(),
+                        }),
+                    decision_ledger_ref,
+                    decision_ledger_digest,
+                    completed_while_crew_active,
+                };
+                apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::BeginMessageFollowUp {
+                    vessel: context.vessel,
+                    role: context.caller_role,
+                    message: reference.clone(),
+                    content: follow_up.object.spec.body,
+                    claim,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+                if let Some(session) = routing.session_name.as_deref() {
+                    self.clear_crew_completion_pending(namespace, session).await?;
+                }
+                return Ok(flotilla_protocol::CommandValue::CrewFollowUpDelivered);
             }
         }
         if let Some(pending) = convoy
@@ -1696,33 +1690,31 @@ impl CrewService {
             return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
         }
         if target_origin.is_some() {
-            let turn = flotilla_resources::PendingSupervisorTurn {
-                vessel: context.vessel.clone(),
-                role: target.to_string(),
-                queued_order: 0,
-                message: TerminalCrewMessage {
-                    id: format!("crew-handoff:{}", uuid::Uuid::new_v4().simple()),
-                    text: frame_crew_message(&sender, message),
-                    sender,
-                    delivery: CrewMessageDelivery::Queued,
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                },
-            };
-            if let Err(error) =
-                apply_resource_status_patch(&convoys, &context.convoy, &ConvoyStatusPatch::QueueSupervisorTurn { turn }).await
-            {
-                return Err(self
+            let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
+            let receiver = format!("{project}/{}/{}/{}", context.convoy, context.vessel, target);
+            let address = format!("{project}/{}/{}/{}", context.convoy, context.vessel, context.caller_role);
+            let relation = flotilla_resources::MessageRelation::Peer;
+            // Each crew command is a new action, even when its text repeats.
+            // Router retries replay this immutable document with the same ID.
+            let name = flotilla_resources::message_record_name(&receiver, &address, &format!("handoff:{}", uuid::Uuid::new_v4()));
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender(address)
+                .receiver(receiver)
+                .relation(relation)
+                .body(message.to_string())
+                .build();
+            return match self.publish_message_intent(&context.namespace, &name, &intent).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(self
                     .restore_crew_work_after_delivery_failure(
                         &convoys,
                         &context.convoy,
                         &reopened.metadata.resource_version,
                         &previous_status,
-                        error.to_string(),
+                        error,
                     )
-                    .await);
-            }
-            return Ok(());
+                    .await),
+            };
         }
         self.reconcile_or_restore_crew_work(
             &context.namespace,
@@ -1803,7 +1795,7 @@ impl CrewService {
                         brief.content.clear();
                     }
                     let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
-                    sessions
+                    let created = sessions
                         .create(&terminal_meta, &flotilla_resources::TerminalSessionSpec {
                             env_ref: anchor.spec.env_ref,
                             role: target.to_string(),
@@ -1815,15 +1807,15 @@ impl CrewService {
                                     convoy: context.convoy.clone(),
                                     vessel_ref: context.vessel_ref.clone(),
                                 }),
-                                message: Some(pending_crew_message(sender.clone(), message)),
+                                message: None,
                             },
                             cwd: anchor.spec.cwd,
                             env: anchor.spec.env,
                             pool: anchor.spec.pool,
                         })
                         .await
-                        .map(|_| ())
-                        .map_err(|err| err.to_string())
+                        .map_err(|err| err.to_string())?;
+                    queue_pending_crew_message(&sessions, &created, sender.clone(), message).await
                 }
                 Err(err) => Err(err.to_string()),
             }
@@ -1942,11 +1934,15 @@ impl CrewService {
             .await
             .map_err(|err| err.to_string())
             .map(|list| list.items.into_iter().next());
-        let at_turn_boundary = session
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .is_some_and(|session| terminal_at_turn_boundary(&session.object, self.clock.now()));
+        // Fresh idle evidence is a turn boundary, including crews already idle when queued.
+        let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
+            session.object.status.as_ref().is_some_and(|status| {
+                status.phase == ResourceTerminalSessionPhase::Running
+                    && status.attention.as_ref().is_some_and(|attention| {
+                        attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(self.clock.now())
+                    })
+            })
+        });
         let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
         });
@@ -1971,32 +1967,86 @@ impl CrewService {
             "crew turn delivery decision"
         );
         if queue_until_boundary {
-            let displaced = status.pending_brief().map(|brief| brief.content.clone());
-            apply_resource_status_patch(
-                &convoys,
-                name,
-                &convoy_external_patches::set_pending_brief(
-                    PendingBrief::builder()
-                        .vessel(vessel)
-                        .role(role)
-                        .content(prompt.to_string())
-                        .queued_at(self.clock.now())
-                        .sender(sender)
-                        .build(),
-                ),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
+            let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+            let receiver = format!("{project}/{name}/{vessel}/{role}");
+            let (address, relation) = flotilla_resources::legacy_message_sender(&sender);
+            let prior = self
+                .resource_backend
+                .including_replicas::<flotilla_resources::Message>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|message| {
+                    message.object.spec.receiver == receiver
+                        && message.object.spec.sender == address
+                        && message
+                            .object
+                            .status
+                            .as_ref()
+                            .is_none_or(|status| !status.phase.is_terminal() && !status.phase.has_delivery_evidence())
+                })
+                .max_by_key(|message| message.object.metadata.creation_timestamp);
+            let displaced = prior
+                .as_ref()
+                .map(|message| message.object.spec.body.clone())
+                .or_else(|| status.pending_brief().map(|brief| brief.content.clone()));
+            let message_name = flotilla_resources::message_record_name(&receiver, &address, &format!("resume:{}", uuid::Uuid::new_v4()));
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender(address)
+                .receiver(receiver)
+                .relation(relation)
+                .body(prompt.to_string())
+                .maybe_supersedes(prior.map(|message| message.object.metadata.name))
+                .build();
+            // This per-command ID survives router retries. The publisher still
+            // returns canonical admission, as it does for subject-based producers.
+            let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
+            if admitted.name == message_name {
+                apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueMessageFollowUp {
+                    vessel: vessel.clone(),
+                    role: role.clone(),
+                    message: Some(admitted),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            }
             return Ok(ConvoyResumeOutcome::Queued { displaced });
         }
 
-        let displaced =
-            status.pending_brief().filter(|brief| brief.vessel == vessel && brief.role == role).map(|brief| brief.content.clone());
+        let pending_ref = status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.pending_follow_up.as_ref());
+        let pending_message = if let Some(reference) = pending_ref {
+            self.resource_backend
+                .including_replicas::<flotilla_resources::Message>(namespace)
+                .get(&reference.name)
+                .await
+                .map_err(|error| format!("follow-up Message awaits replication: {error}"))?
+                .object
+                .into()
+        } else {
+            None
+        };
+        let displaced = pending_message.as_ref().map(|message| message.spec.body.clone()).or_else(|| {
+            status.pending_brief().filter(|brief| brief.vessel == vessel && brief.role == role).map(|brief| brief.content.clone())
+        });
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
         if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
         }
         let resume_message = pending_crew_message(sender.clone(), prompt);
+        let receiver = format!("{}/{name}/{vessel}/{role}", convoy.spec.project_ref.as_deref().unwrap_or(namespace));
+        let mut resume_intent = flotilla_resources::legacy_message_spec(&receiver, &resume_message);
+        resume_intent.supersedes = pending_message
+            .as_ref()
+            .filter(|message| {
+                message.status.as_ref().is_none_or(|status| {
+                    status.submission.is_none() && !status.phase.has_delivery_evidence() && !status.phase.is_terminal()
+                })
+            })
+            .map(|message| message.metadata.name.clone());
+        let address = resume_intent.sender.clone();
+        let message_name = flotilla_resources::message_record_name(&receiver, &address, &resume_message.id);
         let reopened = apply_resource_status_patch(
             &convoys,
             name,
@@ -2005,22 +2055,15 @@ impl CrewService {
                 role.clone(),
                 self.clock.now(),
                 prompt.to_string(),
-                Some(resume_message.id.clone()),
+                Some(message_name.clone()),
             ),
         )
         .await
         .map_err(|err| err.to_string())?;
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
-            let turn = flotilla_resources::PendingSupervisorTurn { vessel, role, message: resume_message, queued_order: 0 };
-            if let Err(error) = apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueSupervisorTurn { turn }).await {
+            if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
                 return Err(self
-                    .restore_crew_work_after_delivery_failure(
-                        &convoys,
-                        name,
-                        &reopened.metadata.resource_version,
-                        status,
-                        error.to_string(),
-                    )
+                    .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
                     .await);
             }
             return Ok(ConvoyResumeOutcome::Queued { displaced });
@@ -2028,18 +2071,12 @@ impl CrewService {
         let session = session.object;
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, &convoys, name, status.clone(), &reopened).await?;
         let delivery_result: Result<(), String> = async {
-            match session.status.as_ref().map(|status| status.phase) {
-                Some(ResourceTerminalSessionPhase::Running) => {
-                    queue_crew_message_object(&sessions, &session, resume_message.clone()).await?
-                }
-                Some(ResourceTerminalSessionPhase::Stopped) => {
-                    queue_crew_message_object(&sessions, &session, resume_message.clone()).await?;
-                    apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                }
-                _ => queue_crew_message_object(&sessions, &session, resume_message.clone()).await?,
+            if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped) {
+                apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
+            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
             Ok(())
         }
         .await;
@@ -2066,6 +2103,107 @@ impl CrewService {
                 .await
                 .map_err(|err| err.to_string())?;
         }
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+        let prefix = format!("{project}/{name}/");
+        let mut messages = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::Message>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|message| {
+                message.object.spec.receiver.starts_with(&prefix)
+                    && message.object.spec.relation == flotilla_resources::MessageRelation::Supervisor
+                    && !message.object.spec.sender.starts_with("system:")
+                    && message.object.status.as_ref().is_none_or(|status| {
+                        !status.phase.is_terminal() && !status.phase.has_delivery_evidence() && status.submission.is_none()
+                    })
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| message.object.metadata.creation_timestamp);
+        let withdrawn = messages.last().map(|message| message.object.spec.body.clone()).or(withdrawn);
+        let mut closed = BTreeSet::new();
+        for message in messages {
+            let patch = flotilla_resources::MessageStatusPatch::Finish {
+                phase: flotilla_resources::MessagePhase::Expired,
+                reason: "operator withdrew the queued brief".into(),
+                at: self.clock.now(),
+            };
+            let mut next = message.object.status.clone().unwrap_or_default();
+            flotilla_resources::StatusPatch::apply(&patch, &mut next);
+            let replacement = serde_json::to_value(next).expect("message status");
+            let result = if matches!(message.provenance, ResourceProvenance::Local) {
+                flotilla_resources::patch_resource_status_if_version(
+                    &self.resource_backend,
+                    namespace,
+                    "Message",
+                    &message.object.metadata.name,
+                    replacement,
+                    &message.object.metadata.resource_version,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            } else {
+                let publisher = self.resource_intent_publisher.read().expect("publisher lock").as_ref().and_then(Weak::upgrade);
+                match publisher {
+                    Some(publisher) => {
+                        publisher
+                            .patch_status(
+                                namespace,
+                                "Message",
+                                &message.object.metadata.name,
+                                replacement,
+                                &message.object.metadata.resource_version,
+                            )
+                            .await
+                    }
+                    None => Err("resource status mutation router unavailable".into()),
+                }
+            };
+            if let Err(error) = result {
+                return Err(format!(
+                    "withdrawal of {} failed: {error}; already withdrawn: {closed:?}; last queued brief: {withdrawn:?}",
+                    message.object.metadata.name
+                ));
+            }
+            closed.insert(message.object.metadata.name);
+        }
+        let latest = convoys.get(name).await.map_err(|error| error.to_string())?;
+        for (vessel, crew) in latest.status.as_ref().into_iter().flat_map(|status| status.crew_work.iter()) {
+            for (role, state) in crew {
+                if let Some(reference) = &state.pending_follow_up {
+                    let terminal = if closed.contains(&reference.name) {
+                        // Authority acknowledged this guarded close; replica lag
+                        // must not delay clearing its workflow continuation.
+                        true
+                    } else {
+                        self.resource_backend
+                            .including_replicas::<flotilla_resources::Message>(namespace)
+                            .get(&reference.name)
+                            .await
+                            .map_err(|error| {
+                                format!("follow-up Message awaits replication during withdrawal: {error}; last queued brief: {withdrawn:?}")
+                            })?
+                            .object
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.phase.is_terminal())
+                    };
+                    if terminal {
+                        apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueMessageFollowUp {
+                            vessel: vessel.clone(),
+                            role: role.clone(),
+                            message: None,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+        }
         Ok(withdrawn)
     }
 
@@ -2088,15 +2226,11 @@ impl CrewService {
         self.leaf_subscriptions.reconcile_stalls_once(namespace).await
     }
 
-    pub(super) fn set_remote_turn_delivery(&self, delivery: Weak<dyn crate::leaf_engine::RemoteTurnDelivery>) {
-        *self.remote_turn_delivery.write().expect("remote turn delivery lock") = Some(delivery);
-    }
-
     pub(super) async fn deliver_turn(
         &self,
-        request: &crate::leaf_engine::TurnDeliveryRequest,
+        request: &crate::leaf_engine::CrewTurnIntent,
     ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
-        use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, MessageSpec};
+        use flotilla_resources::MessageSpec;
         let target = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(&request.namespace)
@@ -2105,135 +2239,21 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         let convoy = &target.object;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
+        let receiver = format!("{project}/{}/{}/{}", request.convoy, request.vessel, request.role);
         let context = flotilla_resources::MessageAddressContext {
             project: project.to_string(),
             convoy: request.convoy.clone(),
             vessel: request.vessel.clone(),
         };
-        let receiver = flotilla_resources::qualify_message_address(&request.role, &context).map_err(|error| error.to_string())?;
-        let sender = match &request.sender {
-            CrewMessageSender::FlotillaTurn { .. } => "system:turn-rules".to_string(),
-            CrewMessageSender::FlotillaNudge => "system:nudge".to_string(),
-            CrewMessageSender::FlotillaEscalation { .. } => "system:stall-judge".to_string(),
-            CrewMessageSender::Unknown => "system:legacy".to_string(),
-            CrewMessageSender::OperatorResume { .. }
-            | CrewMessageSender::OperatorFollowUp { .. }
-            | CrewMessageSender::Governor { .. }
-            | CrewMessageSender::Bosun { .. }
-            | CrewMessageSender::Handoff { .. } => {
-                return Err("operator and crew senders require their declared message path".into());
-            }
-        };
-        let relation = if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. }) {
-            MessageRelation::Supervisor
-        } else {
-            MessageRelation::System
-        };
-        // Episode keys identify a workflow firing; Message revisions identify
-        // its observed subject. A merged episode is not a head SHA.
-        let subject = if let Some(subject) = &request.subject {
-            let number = subject.id.parse::<u64>().map_err(|_| "turn subject is not a numeric forge object".to_string())?;
-            Some(match subject.kind {
-                flotilla_protocol::SubjectKind::ChangeRequest => {
-                    if request.subject_revision.ends_with("@merged") {
-                        let name = change_request_record_name(&subject.source.service, &subject.source.scope, number);
-                        let record = self
-                            .resource_backend
-                            .including_replicas::<ResourceChangeRequest>(&request.namespace)
-                            .get(&name)
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .object;
-                        record
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.head_sha.value.clone())
-                            .map(|head| MessageReference::ChangeRequest {
-                                service: subject.source.service.clone(),
-                                scope: subject.source.scope.clone(),
-                                number,
-                                revision: head,
-                            })
-                            .unwrap_or_else(|| MessageReference::ControlRecord {
-                                resource: ResourceRef::new("flotilla.work/v1", "ChangeRequest", &request.namespace, &name),
-                                revision: record.metadata.resource_version,
-                            })
-                    } else {
-                        MessageReference::ChangeRequest {
-                            service: subject.source.service.clone(),
-                            scope: subject.source.scope.clone(),
-                            number,
-                            revision: request.subject_revision.clone(),
-                        }
-                    }
-                }
-                flotilla_protocol::SubjectKind::Issue => MessageReference::Issue {
-                    service: subject.source.service.clone(),
-                    scope: subject.source.scope.clone(),
-                    number,
-                    revision: request
-                        .subject_revision
-                        .rsplit_once('@')
-                        .map_or(request.subject_revision.as_str(), |(_, revision)| revision)
-                        .to_string(),
-                },
-            })
-        } else {
-            None
-        };
-        let subject = if subject.is_none() && matches!(request.sender, CrewMessageSender::FlotillaTurn { .. }) {
-            let artifact = if let Some((head, digest)) = request.subject_revision.split_once('@') {
-                self.resource_backend
-                    .including_replicas::<flotilla_resources::Artifact>(&request.namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .items
-                    .into_iter()
-                    .find(|artifact| artifact.object.spec.digest == digest && artifact.object.spec.subject == head)
-            } else {
-                None
-            };
-            artifact
-                .map(|artifact| MessageReference::Artifact {
-                    resource: flotilla_protocol::ResourceRef::new(
-                        "flotilla.work/v1",
-                        "Artifact",
-                        &request.namespace,
-                        &artifact.object.metadata.name,
-                    ),
-                    revision: artifact.object.spec.digest,
-                })
-                .or_else(|| {
-                    Some(MessageReference::ControlRecord {
-                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", &request.namespace, &request.convoy),
-                        revision: request.subject_revision.clone(),
-                    })
-                })
-        } else {
-            subject
-        };
-        let expectation = if matches!(request.sender, CrewMessageSender::FlotillaNudge) {
-            MessageExpectation::Outcome {
-                condition: format!("work/{}/{} .crew.{}.phase == Done", request.convoy, request.vessel, request.role)
-                    .parse()
-                    .map_err(|error: String| error)?,
-            }
-        } else {
-            MessageExpectation::None
-        };
-        let body = match &request.sender {
-            CrewMessageSender::FlotillaEscalation { from } => format!("Escalated from {from}:\n\n{}", request.brief),
-            _ => request.brief.clone(),
-        };
+        let sender = flotilla_resources::qualify_message_address(&request.sender, &context).map_err(|error| error.to_string())?;
         let intent = MessageSpec::builder()
             .sender(sender.clone())
             .receiver(receiver.clone())
-            .relation(relation)
-            .body(body)
-            .references(subject.clone().into_iter().collect())
-            .maybe_subject(subject)
-            .expectation(expectation)
+            .relation(request.relation)
+            .body(request.brief.clone())
+            .references(request.references.clone())
+            .maybe_subject(request.message_subject.clone())
+            .expectation(request.expectation.clone())
             .build();
         let name = flotilla_resources::message_record_name(
             &receiver,
@@ -2384,182 +2404,266 @@ impl CrewService {
         Ok(crate::leaf_engine::CrewTurnAdmission { new_turn, rung, message })
     }
 
-    async fn deliver_pending_supervisor_turn_for_session(
-        &self,
-        sessions: &TypedResolver<ResourceTerminalSession>,
-        convoys: &ReplicaReadResolver<ResourceConvoy>,
-        session: &ResourceObject<ResourceTerminalSession>,
-    ) -> Result<(), String> {
-        let Some(convoy_name) = session.metadata.labels.get(CONVOY_LABEL) else { return Ok(()) };
-        let Some(vessel) = session.metadata.labels.get(VESSEL_LABEL) else { return Ok(()) };
-        let Some(role) = session.metadata.labels.get(ROLE_LABEL) else { return Ok(()) };
-        let convoy = match convoys.get(convoy_name).await {
-            Ok(convoy) => convoy,
-            Err(ResourceError::NotFound { .. }) => return Ok(()),
-            Err(error) => return Err(error.to_string()),
-        };
-        let Some(status) = convoy.object.status else { return Ok(()) };
-        let delivered = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
-        let delivered_through = |id: &str| match &session.spec.source {
-            TerminalSessionSource::Agent { message: Some(head), .. } => head.delivered_through(delivered, id),
-            _ => false,
-        };
-        let Some(turn) = status
-            .turn_deliveries
-            .values()
-            .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref())
-            .filter(|turn| turn.vessel == *vessel && turn.role == *role && !delivered_through(&turn.message.id))
-            .min_by_key(|turn| turn.queued_order)
-        else {
-            return Ok(());
-        };
-        let mut spec = session.spec.clone();
-        let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else { return Ok(()) };
-        let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), vessel, role)?;
-        if message.as_ref().is_some_and(|current| current.contains_id(&turn.message.id)) && plan != TurnDeliverySessionPlan::RestartFresh {
-            return Ok(());
+    /// One-generation adoption runs independently of Message watches, including
+    /// at startup. Queue publication precedes clearing the authority's old intent.
+    pub(super) async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
+        let sessions = self.resource_backend.using::<ResourceTerminalSession>(namespace);
+        for session in sessions.list().await.map_err(|error| error.to_string())?.items {
+            if !session.metadata.labels.contains_key(CONVOY_LABEL) || !session.metadata.labels.contains_key(VESSEL_LABEL) {
+                continue;
+            }
+            sessions.adopt_legacy_messages(&session, self.clock.now()).await.map_err(|error| error.to_string())?;
         }
-        let queued = turn.message.clone();
-        if let Some(head) = message {
-            head.append(queued);
-        } else {
-            *message = Some(queued);
-        }
-        if plan == TurnDeliverySessionPlan::RestartFresh {
-            if let Some(head) = message {
-                brief.content = head.mark_next_for_launch(delivered).ok_or_else(|| "supervisor turn has no pending message".to_string())?;
-                brief.artifact_digest = None;
+        // Previous-generation authority queues may arrive before a local
+        // TerminalSession payload. Their receiver home adopts the same IDs.
+        for source in
+            self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?.items
+        {
+            if matches!(source.provenance, ResourceProvenance::Local) {
+                continue;
+            }
+            let convoy = source.object;
+            let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+            let mut turns = convoy
+                .status
+                .as_ref()
+                .into_iter()
+                .flat_map(|status| status.turn_deliveries.values())
+                .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref())
+                .collect::<Vec<_>>();
+            turns.sort_by_key(|turn| turn.queued_order);
+            for turn in turns {
+                let receiver = format!("{project}/{}/{}/{}", convoy.metadata.name, turn.vessel, turn.role);
+                let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
+                    continue;
+                }
+                let intent = flotilla_resources::legacy_message_spec(&receiver, &turn.message);
+                let name = flotilla_resources::message_record_name(&receiver, &intent.sender, &turn.message.id);
+                self.publish_message_intent(namespace, &name, &intent).await?;
+            }
+            for brief in convoy
+                .status
+                .as_ref()
+                .into_iter()
+                .flat_map(|status| status.turn_deliveries.values())
+                .filter_map(|delivery| delivery.pending_brief.as_ref())
+            {
+                let receiver = format!("{project}/{}/{}/{}", convoy.metadata.name, brief.vessel, brief.role);
+                let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
+                    continue;
+                }
+                let (sender, relation) = flotilla_resources::legacy_message_sender(&brief.sender);
+                let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("pending-brief:{}", brief.queued_at));
+                let intent = flotilla_resources::MessageSpec::builder()
+                    .sender(sender)
+                    .receiver(receiver)
+                    .relation(relation)
+                    .body(brief.content.clone())
+                    .build();
+                self.publish_message_intent(namespace, &name, &intent).await?;
             }
         }
-        sessions
-            .update(&input_meta_from_resource(session), &session.metadata.resource_version, &spec)
-            .await
-            .map_err(|error| error.to_string())?;
-        if plan == TurnDeliverySessionPlan::RestartFresh {
-            apply_resource_status_patch(sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+        let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
+        for candidate in convoys.list().await.map_err(|error| error.to_string())?.items {
+            let lock = self.convoy_message_lock(namespace, &candidate.metadata.name).await;
+            let _guard = lock.lock().await;
+            let convoy = convoys.get(&candidate.metadata.name).await.map_err(|error| error.to_string())?;
+            let Some(status) = &convoy.status else { continue };
+            let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+            let mut replacements = Vec::new();
+            let mut queues = status.turn_deliveries.iter().collect::<Vec<_>>();
+            queues.sort_by_key(|(_, delivery)| delivery.pending_supervisor_turn.as_ref().map_or(u64::MAX, |turn| turn.queued_order));
+            for (key, delivery) in queues {
+                if let Some(turn) = &delivery.pending_supervisor_turn {
+                    let receiver = format!("{project}/{}/{}/{}", convoy.metadata.name, turn.vessel, turn.role);
+                    let intent = flotilla_resources::legacy_message_spec(&receiver, &turn.message);
+                    let name = flotilla_resources::message_record_name(&receiver, &intent.sender, &turn.message.id);
+                    self.publish_message_intent(namespace, &name, &intent).await?;
+                    replacements.push((key.clone(), name, turn.message.id.clone()));
+                }
+                if let Some(brief) = &delivery.pending_brief {
+                    let receiver = format!("{project}/{}/{}/{}", convoy.metadata.name, brief.vessel, brief.role);
+                    let (sender, relation) = flotilla_resources::legacy_message_sender(&brief.sender);
+                    let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("pending-brief:{}", brief.queued_at));
+                    let intent = flotilla_resources::MessageSpec::builder()
+                        .sender(sender)
+                        .receiver(receiver)
+                        .relation(relation)
+                        .body(brief.content.clone())
+                        .build();
+                    self.publish_message_intent(namespace, &name, &intent).await?;
+                    replacements.push((key.clone(), name, String::new()));
+                }
+            }
+            // A fresh CAS preserves concurrent workflow observations. A failure
+            // leaves old intent intact; deterministic Message IDs make replay safe.
+            let current = convoys.get(&convoy.metadata.name).await.map_err(|error| error.to_string())?;
+            let mut next = current.status.clone().unwrap_or_default();
+            for (key, name, original_id) in replacements {
+                let Some(delivery) = next.turn_deliveries.get_mut(&key) else { continue };
+                let original = status.turn_deliveries.get(&key).expect("adopted queue");
+                if let Some(brief) = &original.pending_brief {
+                    if let Some(state) = next.crew_work.get_mut(&brief.vessel).and_then(|crew| crew.get_mut(&brief.role)) {
+                        state.pending_follow_up = Some(ResourceRef::new("flotilla.work/v1", "Message", namespace, &name));
+                    }
+                }
+                if delivery.pending_supervisor_turn == original.pending_supervisor_turn {
+                    delivery.pending_supervisor_turn = None;
+                }
+                if delivery.pending_brief == original.pending_brief {
+                    delivery.pending_brief = None;
+                }
+                for episode in &mut delivery.episodes {
+                    if matches!(&episode.outcome, flotilla_resources::TurnDeliveryOutcome::Queued { message_id, .. } if message_id == &original_id)
+                    {
+                        let rung = match &episode.outcome {
+                            flotilla_resources::TurnDeliveryOutcome::Queued { rung, .. } => *rung,
+                            _ => unreachable!(),
+                        };
+                        episode.outcome = flotilla_resources::TurnDeliveryOutcome::MessageAccepted {
+                            new_turn: true,
+                            message: ResourceRef::new("flotilla.work/v1", "Message", namespace, &name),
+                            rung,
+                            accepted_at: self.clock.now(),
+                        };
+                        episode.sender = CrewMessageSender::Unknown;
+                    }
+                }
+            }
+            let messages = self
+                .resource_backend
+                .including_replicas::<flotilla_resources::Message>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items;
+            let mut continuations = Vec::new();
+            for (vessel, crew) in &mut next.crew_work {
+                for (role, state) in crew {
+                    let receiver = format!("{project}/{}/{vessel}/{role}", convoy.metadata.name);
+                    if let Some(old_id) = &state.resume_brief_id {
+                        if let Some(message) = messages.iter().find(|message| {
+                            message.object.spec.receiver == receiver
+                                && flotilla_resources::message_record_name(&receiver, &message.object.spec.sender, old_id)
+                                    == message.object.metadata.name
+                        }) {
+                            state.resume_brief_id = Some(message.object.metadata.name.clone());
+                        }
+                    }
+                    if let Some(reference) = &state.pending_follow_up {
+                        if let Some(message) = messages.iter().find(|message| message.object.metadata.name == reference.name) {
+                            if let Some(message_status) = &message.object.status {
+                                if message_status.phase.has_delivery_evidence() {
+                                    continuations.push((
+                                        vessel.clone(),
+                                        role.clone(),
+                                        reference.name.clone(),
+                                        message.object.spec.body.clone(),
+                                        message_status.since,
+                                    ));
+                                } else if message_status.phase.is_terminal() {
+                                    state.pending_follow_up = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (vessel, role, name, body, at) in continuations {
+                use flotilla_resources::StatusPatch;
+                ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at: at, prompt: body, brief_id: Some(name) }.apply(&mut next);
+            }
+            for delivery in next.turn_deliveries.values_mut() {
+                for episode in &mut delivery.episodes {
+                    let flotilla_resources::TurnDeliveryOutcome::Queued { vessel, role, message_id, rung, .. } = &episode.outcome else {
+                        continue;
+                    };
+                    let receiver = format!("{project}/{}/{vessel}/{role}", convoy.metadata.name);
+                    let (sender, _) = flotilla_resources::legacy_message_sender(&episode.sender);
+                    let name = flotilla_resources::message_record_name(&receiver, &sender, message_id);
+                    match self.resource_backend.including_replicas::<flotilla_resources::Message>(namespace).get(&name).await {
+                        Ok(_) => {
+                            episode.outcome = flotilla_resources::TurnDeliveryOutcome::MessageAccepted {
+                                new_turn: true,
+                                message: ResourceRef::new("flotilla.work/v1", "Message", namespace, &name),
+                                rung: *rung,
+                                accepted_at: self.clock.now(),
+                            };
+                            episode.sender = CrewMessageSender::Unknown;
+                        }
+                        Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            }
+            if current.status.as_ref() == Some(&next) {
+                continue;
+            }
+            next.turn_deliveries.retain(|_, delivery| {
+                !delivery.episodes.is_empty()
+                    || delivery.failure.is_some()
+                    || delivery.pending_brief.is_some()
+                    || delivery.pending_supervisor_turn.is_some()
+            });
+            convoys
+                .update_status(&current.metadata.name, &current.metadata.resource_version, &next)
                 .await
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
 
-    /// Deliver turns on the session owner, then acknowledge them at the convoy
-    /// home after status replication, sharing the pending-brief transaction.
-    pub(super) async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
-        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
-        let convoys = self.resource_backend.clone().including_replicas::<ResourceConvoy>(namespace);
-        let mut errors = Vec::new();
-        for session in sessions.list().await.map_err(|error| error.to_string())?.items {
-            if let Err(error) = self.deliver_pending_supervisor_turn_for_session(&sessions, &convoys, &session).await {
-                errors.push(format!("terminal {}: {error}", session.metadata.name));
+    async fn publish_message_intent(
+        &self,
+        namespace: &str,
+        name: &str,
+        intent: &flotilla_resources::MessageSpec,
+    ) -> Result<ResourceRef, String> {
+        match self.resource_backend.including_replicas::<flotilla_resources::Message>(namespace).get(name).await {
+            Ok(existing) if existing.object.spec == *intent => {
+                return Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, &existing.object.metadata.name))
             }
+            Ok(_) => return Err("message producer ID already names different intent".into()),
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
         }
-
-        let local_convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let visible_sessions = self.resource_backend.clone().including_replicas::<ResourceTerminalSession>(namespace);
-        for convoy in local_convoys.list().await.map_err(|error| error.to_string())?.items {
-            // Serialize the observation-driven boundary with operator replacement,
-            // withdrawal, and crew completion so stale scans cannot displace a newer brief.
-            let message_lock = self.convoy_message_lock(namespace, &convoy.metadata.name).await;
-            let _message_guard = message_lock.lock().await;
-            let convoy = local_convoys.get(&convoy.metadata.name).await.map_err(|error| error.to_string())?;
-            if !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-                if let Some(pending) = convoy.status.as_ref().and_then(|status| status.pending_brief()) {
-                    let selector = BTreeMap::from([
-                        (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
-                        (VESSEL_LABEL.to_string(), pending.vessel.clone()),
-                        (ROLE_LABEL.to_string(), pending.role.clone()),
-                    ]);
-                    let visible = visible_sessions.list_matching_labels(&selector).await.map_err(|error| error.to_string())?;
-                    let boundary = visible.items.iter().any(|session| terminal_at_turn_boundary(&session.object, self.clock.now()));
-                    let attention = visible
-                        .items
-                        .iter()
-                        .filter_map(|session| session.object.status.as_ref())
-                        .filter_map(|status| status.attention.as_ref())
-                        .max_by_key(|attention| attention.as_of);
-                    macro_rules! log_pending_decision {
-                        ($level:ident, $reason:expr) => {{
-                            tracing::$level!(
-                                convoy = %convoy.metadata.name, source = ?pending.sender,
-                                vessel = %pending.vessel, role = %pending.role,
-                                attention_state = ?attention.map(|attention| attention.state),
-                                attention_source = ?attention.map(|attention| attention.source),
-                                attention_as_of = ?attention.map(|attention| attention.as_of),
-                                queued_at = %pending.queued_at,
-                                hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
-                                reason = $reason,
-                                "pending crew turn delivery decision"
-                            );
-                        }};
-                    }
-                    if boundary {
-                        log_pending_decision!(info, "release_fresh_idle_without_in_flight_turn");
-                    } else {
-                        log_pending_decision!(debug, "skip_without_fresh_idle_boundary");
-                    }
-                    if boundary {
-                        if let Err(error) = self
-                            .convoy_resume_with_sender_locked(
-                                namespace,
-                                &convoy.metadata.name,
-                                &pending.content,
-                                Some(&pending.vessel),
-                                Some(&pending.role),
-                                pending.sender.clone(),
-                            )
-                            .await
-                        {
-                            errors.push(format!("convoy {} pending brief: {error}", convoy.metadata.name));
-                        }
-                    }
-                }
-            }
-            let Some(status) = convoy.status else { continue };
-            for (message_id, turn) in
-                status.turn_deliveries.into_iter().filter_map(|(id, delivery)| delivery.pending_supervisor_turn.map(|turn| (id, turn)))
-            {
-                let selector = BTreeMap::from([
-                    (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
-                    (VESSEL_LABEL.to_string(), turn.vessel),
-                    (ROLE_LABEL.to_string(), turn.role),
-                ]);
-                let visible = match visible_sessions.list_matching_labels(&selector).await {
-                    Ok(visible) => visible,
-                    Err(error) => {
-                        errors.push(format!("convoy {}: {error}", convoy.metadata.name));
-                        continue;
-                    }
-                };
-                let delivered = visible.items.iter().any(|session| {
-                    let delivered_id = session.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
-                    match &session.object.spec.source {
-                        TerminalSessionSource::Agent { message: Some(head), .. } => head.delivered_through(delivered_id, &message_id),
-                        _ => delivered_id == Some(message_id.as_str()),
-                    }
-                });
-                if delivered {
-                    if let Err(error) =
-                        apply_resource_status_patch(&local_convoys, &convoy.metadata.name, &ConvoyStatusPatch::AcknowledgeSupervisorTurn {
-                            message_id,
-                        })
-                        .await
-                    {
-                        errors.push(format!("convoy {}: {error}", convoy.metadata.name));
-                    }
-                }
-            }
+        let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
+        if let Some(publisher) = publisher {
+            return publisher.publish(namespace, serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent})).await;
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
+        let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
+            .await
+            .map_err(|error| error.to_string())?;
+        if holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
+            return Err("receiver-home resource mutation router unavailable".into());
         }
+        let inbox = self
+            .message_inboxes
+            .lock()
+            .await
+            .entry(namespace.into())
+            .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .clone();
+        let admission = inbox
+            .accept(&InputMeta::builder().name(name.into()).build(), intent, self.clock.now())
+            .await
+            .map_err(|error| error.to_string())?;
+        let record = match admission {
+            flotilla_resources::MessageAdmission::Accepted(record) => record,
+            flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+        };
+        Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
 
     async fn execute_turn_delivery_hold(
         &self,
-        request: &crate::leaf_engine::TurnDeliveryRequest,
+        request: &crate::leaf_engine::CrewTurnIntent,
         act: &HoldAct,
         reason: &str,
     ) -> Result<(), String> {

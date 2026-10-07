@@ -210,6 +210,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
+        messages: Vec::new(),
         queued_turns: Vec::new(),
         unclaimed_work: vec![ExplainedUnclaimedWork { vessel: "work".into(), role: "coder".into(), evidence: "turn_idle".into() }],
         artifacts: vec![flotilla_protocol::ExplainedArtifact {
@@ -342,6 +343,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
+        messages: Vec::new(),
         queued_turns: Vec::new(),
         unclaimed_work: Vec::new(),
         decision_ledgers: Vec::new(),

@@ -101,6 +101,8 @@ define_patch_kinds! {
     ConvoyMarkCrewStalled => NONE,
     ConvoyHandoffCrewWork => CONTINUATION,
     ConvoyResumeCrewWork => CONTINUATION,
+    ConvoyQueueMessageFollowUp => DUPLICATE,
+    ConvoyBeginMessageFollowUp => CONTINUATION,
     ConvoySetPendingBrief => DUPLICATE,
     ConvoyClearPendingBrief => DUPLICATE,
     ConvoyDeliverPendingBrief => CONTINUATION,
@@ -180,6 +182,8 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkCrewStalled { .. } => PatchKind::ConvoyMarkCrewStalled,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
+        ConvoyStatusPatch::QueueMessageFollowUp { .. } => PatchKind::ConvoyQueueMessageFollowUp,
+        ConvoyStatusPatch::BeginMessageFollowUp { .. } => PatchKind::ConvoyBeginMessageFollowUp,
         ConvoyStatusPatch::SetPendingBrief { .. } => PatchKind::ConvoySetPendingBrief,
         ConvoyStatusPatch::ClearPendingBrief => PatchKind::ConvoyClearPendingBrief,
         ConvoyStatusPatch::DeliverPendingBrief { .. } => PatchKind::ConvoyDeliverPendingBrief,
@@ -286,6 +290,7 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
     CrewWorkState {
+        pending_follow_up: None,
         phase,
         resumed_at: None,
         resume_brief_id: None,
@@ -728,6 +733,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     retired_launches: Default::default(),
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
+                    legacy_message_receipts: Default::default(),
                     attention: None,
                     occupancy: Default::default(),
                     completion_pending: None,
@@ -866,6 +872,20 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             },
         },
         LifecycleCase {
+            name: "Message continuation queued",
+            kind: PatchKind::ConvoyQueueMessageFollowUp,
+            exercise: || {
+                let mut status = active_convoy_status();
+                let before = convoy_timestamps(&status);
+                apply_and_replay(&mut status, &ConvoyStatusPatch::QueueMessageFollowUp {
+                    vessel: "implement".into(),
+                    role: "coder".into(),
+                    message: Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "follow-up")),
+                });
+                (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
             name: "pending brief queued",
             kind: PatchKind::ConvoySetPendingBrief,
             exercise: || {
@@ -996,6 +1016,41 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "Message continuation reopens convoy once",
+            kind: PatchKind::ConvoyBeginMessageFollowUp,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
+                let reference = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "follow-up");
+                ConvoyStatusPatch::QueueMessageFollowUp {
+                    vessel: "implement".into(),
+                    role: "coder".into(),
+                    message: Some(reference.clone()),
+                }
+                .apply(&mut status);
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::BeginMessageFollowUp {
+                    vessel: "implement".into(),
+                    role: "coder".into(),
+                    message: reference,
+                    content: "new turn".into(),
+                    claim: flotilla_resources::SupersededCrewClaim {
+                        claimed_at: ts(30),
+                        message: Some("first turn complete".into()),
+                        disposition: None,
+                        decision_ledger_ref: None,
+                        decision_ledger_digest: None,
+                        completion_override: None,
+                        completed_while_crew_active: false,
+                    },
+                };
+                apply_and_replay(&mut status, &patch);
+                assert_eq!(status.crew_work["implement"]["coder"].superseded_claims.len(), 1);
+                assert!(status.crew_work["implement"]["coder"].pending_follow_up.is_none());
+                (before, convoy_timestamps(&status))
             },
         },
         LifecycleCase {

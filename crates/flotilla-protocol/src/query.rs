@@ -119,6 +119,23 @@ pub struct CrewListResponse {
     pub credential_alerts: Vec<String>,
 }
 
+/// Durable inbox projection shared by crew and convoy views.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewMessageView {
+    pub current_receiver: Option<String>,
+    pub name: String,
+    pub sender: String,
+    pub receiver: String,
+    pub relation: String,
+    pub phase: String,
+    pub since: String,
+    pub reason: Option<String>,
+    pub subject: Option<serde_json::Value>,
+    pub expectation: serde_json::Value,
+    pub crew_id: Option<String>,
+    pub session: Option<String>,
+}
+
 /// Current island membership, independent of the convoy's admission snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewProject {
@@ -172,6 +189,9 @@ mod project_repository_role_tests {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewListMember {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub messages: Vec<CrewMessageView>,
     pub role: String,
     pub kind: String,
     pub state: String,

@@ -24,7 +24,7 @@ use super::{
         validate_workflow_credentials, validate_workflow_credentials_with_capabilities, KindCandidate, PlacementTieBreak,
         RepositoryChangeRequestProvider,
     },
-    crew_ops::{convoy_sender_address, frame_crew_message, queue_pending_crew_message, terminal_meta_with_vessel_credentials},
+    crew_ops::{convoy_sender_address, queue_pending_crew_message, terminal_meta_with_vessel_credentials},
     *,
 };
 use crate::{
@@ -437,53 +437,68 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions
-        .create(&test_meta("racing-messages"), &ResourceTerminalSessionSpec {
-            env_ref: "env".to_string(),
-            role: "coder".to_string(),
-            source: TerminalSessionSource::Agent {
-                selector: Selector::for_capability("coding"),
-                brief: flotilla_resources::TerminalBrief {
-                    path: "brief.md".to_string(),
-                    content: "Initial".to_string(),
-                    artifact_digest: None,
-                    copies: Vec::new(),
+        .create(
+            &InputMeta::builder()
+                .name("racing-messages".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "convoy".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                ]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".to_string(),
+                        content: "Initial".to_string(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "convoy".to_string(),
+                        vessel_ref: "work".to_string(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(flotilla_resources::TerminalCrewContext {
-                    namespace: "flotilla".to_string(),
-                    convoy: "convoy".to_string(),
-                    vessel_ref: "work".to_string(),
-                }),
-                message: None,
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
             },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        )
         .await
         .expect("session");
+    backend
+        .using::<ResourceConvoy>("flotilla")
+        .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .await
+        .expect("convoy context");
     queue_pending_crew_message(&sessions, &session, CrewMessageSender::OperatorResume { principal: None }, "Continue the work")
         .await
         .expect("operator brief queued");
     let queued = sessions.get("racing-messages").await.expect("queued operator brief");
     queue_pending_crew_message(&sessions, &queued, CrewMessageSender::FlotillaNudge, "Please settle").await.expect("nudge queued");
-    let after_race = sessions.get("racing-messages").await.expect("session after race");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = after_race.spec.source else { panic!("operator brief was lost") };
-    assert_eq!(message.text, "[operator (unattributed) · via convoy resume]\n\nContinue the work");
-    assert_eq!(message.following.len(), 1);
-    assert!(matches!(message.following[0].sender, CrewMessageSender::FlotillaNudge));
-    assert_eq!(message.next_after(Some(&message.id)).map(|next| next.id.as_str()), Some(message.following[0].id.as_str()));
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("records").items;
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().any(|message| message.spec.sender == "principal:implicit" && message.spec.body.contains("Continue the work")));
+    assert!(records.iter().any(|message| message.spec.sender == "system:nudge"));
 
-    let concurrent = sessions.create(&test_meta("concurrent-messages"), &session.spec).await.expect("concurrent session");
+    let concurrent = sessions
+        .create(&InputMeta::builder().name("concurrent-messages".into()).labels(session.metadata.labels.clone()).build(), &session.spec)
+        .await
+        .expect("concurrent session");
     let (operator, nudge) = tokio::join!(
         queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::OperatorResume { principal: None }, "New guidance"),
         queue_pending_crew_message(&sessions, &concurrent, CrewMessageSender::FlotillaNudge, "Please settle"),
     );
     operator.expect("operator brief survives concurrent write");
     nudge.expect("nudge does not erase concurrent brief");
-    let concurrent = sessions.get("concurrent-messages").await.expect("session after concurrent writes");
-    let TerminalSessionSource::Agent { message: Some(head), .. } = concurrent.spec.source else { panic!("concurrent messages lost") };
-    assert_eq!(head.following.len(), 1);
-    assert!(std::iter::once(&head).chain(head.following.iter()).any(|message| message.text.contains("New guidance")));
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("concurrent records").items;
+    assert_eq!(records.len(), 4);
+    assert!(records.iter().any(|message| message.spec.body.contains("New guidance")));
 }
 
 // #2559: an idle reconciliation pass must neither write resources nor emit
@@ -592,15 +607,16 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                 )
                 .await
                 .expect("queued terminal");
-            let session = sessions
+            sessions
                 .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
                     phase: ResourceTerminalSessionPhase::Running,
                     ..Default::default()
                 })
                 .await
                 .expect("running terminal");
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "already queued turn", passes).await;
-
+            daemon.reconcile_pending_supervisor_turns_once(namespace).await.expect("one-time queue adoption");
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "adopted turn", passes).await;
+            let session = sessions.get("governor").await.expect("adopted terminal");
             let mut status = session.status.expect("running status");
             status.delivered_message_id = Some(message.id);
             sessions.update_status("governor", &session.metadata.resource_version, &status).await.expect("delivered turn");
@@ -755,15 +771,16 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         })
         .await
         .expect("running terminal");
-    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+    let request = crate::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("governor-convoy".to_string())
         .source("supervision-stalled-crew".to_string())
         .vessel("govern".to_string())
         .role("governor".to_string())
-        .brief("Supervise the stalled crew".to_string())
+        .brief("Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew".to_string())
         .subject_revision("stall-1".to_string())
-        .sender(CrewMessageSender::FlotillaEscalation { from: "coder@work in graphql-budget@flotilla".to_string() })
+        .sender("system:stall-judge".into())
+        .relation(flotilla_resources::MessageRelation::Supervisor)
         .build();
     // Boundary fake for publication to the owning host; receiver admission
     // still runs through the real daemon's ordinary resource mutation handler.
@@ -1061,84 +1078,35 @@ async fn resume_staging_fixture_with_clock(
     (daemon, backend, probe)
 }
 
-// #2560: an idle prompt after interruption releases the operator's queued
-// brief without a notify hook, through the same credential-staged delivery path.
+// Working crews already own staged credentials. Operator input is admitted as
+// durable intent; ordinary attention changes cannot fabricate its delivery receipt.
 #[tokio::test]
-async fn interrupted_prompt_releases_pending_brief_without_hook() {
-    let clock = Arc::new(VirtualClock::new(Utc::now()));
-    let (daemon, backend, probe) =
-        resume_staging_fixture_with_clock(ResourceBackend::InMemory(InMemoryBackend::default()), clock.clone()).await;
-    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+async fn working_resume_uses_message_delivery_instead_of_pending_brief_release() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
-    let convoy = convoys.get("resume-staging").await.expect("convoy");
-    let mut status = convoy.status.expect("status");
+    let current = convoys.get("resume-staging").await.expect("convoy");
+    let mut status = current.status.expect("status");
     status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-    convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("working crew");
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("resume-staging-session").await.expect("session");
-    let mut status = session.status.unwrap_or_default();
-    status.phase = ResourceTerminalSessionPhase::Running;
-    status.attention = Some(TerminalAttention {
-        state: TerminalAttentionState::Working,
-        source: TerminalAttentionSource::Screen,
-        as_of: daemon.clock.now(),
-    });
-    sessions.update_status(&session.metadata.name, &session.metadata.resource_version, &status).await.expect("working observation");
+    convoys.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await.expect("working crew");
     daemon
         .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"))
         .await
-        .expect("queue brief");
-    assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_some());
-    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("busy pass");
-    // Stale idle, questions, and unknown screens cannot consume a pending brief.
-    for (state, age) in
-        [(TerminalAttentionState::Idle, 121), (TerminalAttentionState::NeedsInput, 0), (TerminalAttentionState::Unobservable, 0)]
-    {
-        let session = sessions.get("resume-staging-session").await.expect("session");
-        let mut status = session.status.expect("status");
-        status.attention = Some(TerminalAttention {
-            state,
-            source: TerminalAttentionSource::Screen,
-            as_of: daemon.clock.now() - chrono::Duration::seconds(age),
-        });
-        sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &status)
-            .await
-            .expect("non-boundary observation");
-        daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("non-boundary pass");
-        assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_some());
-    }
-    clock.advance(chrono::Duration::seconds(10));
-    let session = sessions.get("resume-staging-session").await.expect("session");
-    let mut status = session.status.expect("status");
-    status.attention =
-        Some(TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Screen, as_of: daemon.clock.now() });
-    sessions.update_status(&session.metadata.name, &session.metadata.resource_version, &status).await.expect("interrupted idle prompt");
-    probe.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
-    assert!(daemon
-        .reconcile_pending_supervisor_turns_once("flotilla")
-        .await
-        .expect_err("staging failure")
-        .contains("credential staging failed"));
-    assert!(
-        convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_some(),
-        "failed staging preserves the queued brief"
-    );
-    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("release queued brief");
+        .expect("queue intent");
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("migration scan");
     assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_none());
-    let session = sessions.get("resume-staging-session").await.expect("session");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("queued delivery") };
-    assert!(message.text.contains("operator guidance"));
-    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("duplicate observation");
-    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].spec.body, "operator guidance");
+    assert_eq!(records[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
+    assert!(records[0].status.as_ref().expect("status").resolved_receiver.is_none());
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn resume_stages_credentials_before_message_and_retries_failure() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
     let resume = || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"));
     assert!(resume().await.expect_err("staging should fail").contains("credential staging failed"));
     assert_eq!(
@@ -1155,7 +1123,10 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     let TerminalSessionSource::Agent { message, .. } = sessions.get("resume-staging-session").await.expect("session").spec.source else {
         panic!("agent")
     };
-    assert_eq!(message.expect("queued message").text, "[operator (unattributed) · via convoy resume]\n\ncontinue");
+    assert!(message.is_none());
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].spec.body, "[operator (unattributed) · via convoy resume]\n\ncontinue");
 }
 
 #[tokio::test]
@@ -1172,22 +1143,26 @@ async fn resume_retries_a_racing_session_write_after_staging() {
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("resume-staging-session").await.expect("session");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("resume brief missing") };
-    assert!(message.text.contains("continue"));
+    assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
+    assert!(backend
+        .using::<flotilla_resources::Message>("flotilla")
+        .list()
+        .await
+        .expect("inbox")
+        .items
+        .iter()
+        .any(|message| message.spec.body.contains("continue")));
 }
 
 #[tokio::test]
 async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     #[derive(Default)]
     struct AcceptSupervision {
-        requests: std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>,
+        requests: std::sync::Mutex<Vec<crate::leaf_engine::CrewTurnIntent>>,
     }
     #[async_trait]
     impl crate::leaf_engine::TurnDeliveryActuator for AcceptSupervision {
-        async fn deliver(
-            &self,
-            request: &crate::leaf_engine::TurnDeliveryRequest,
-        ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+        async fn deliver(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
             self.requests.lock().expect("supervision requests").push(request.clone());
             Ok(crate::leaf_engine::CrewTurnAdmission {
                 new_turn: true,
@@ -1196,13 +1171,13 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                     "flotilla.work/v1",
                     "Message",
                     &request.namespace,
-                    format!("fake-{}", request.source),
+                    format!("fake-{}-{}", request.source, request.subject_revision),
                 ),
             })
         }
         async fn hold(
             &self,
-            _request: &crate::leaf_engine::TurnDeliveryRequest,
+            _request: &crate::leaf_engine::CrewTurnIntent,
             _act: &flotilla_resources::HoldAct,
             _reason: &str,
         ) -> Result<(), String> {
@@ -1345,9 +1320,10 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         let requests = supervision.requests.lock().expect("supervision requests");
         let escalation = requests.iter().find(|request| request.vessel == "watch").expect("governor escalation");
         // #2592: the supervisor must identify the convoy and act on the exact stalled crew.
-        assert_eq!(escalation.sender, CrewMessageSender::FlotillaEscalation { from: "coder@work in graphql-budget@project".to_string() });
-        let framed = frame_crew_message(&escalation.sender, &escalation.brief);
-        assert!(framed.starts_with("[flotilla · escalated from coder@work in graphql-budget@project · supervise the stalled crew]"));
+        assert_eq!(escalation.sender, "system:stall-judge");
+        assert_eq!(escalation.relation, flotilla_resources::MessageRelation::Supervisor);
+        let framed = &escalation.brief;
+        assert!(framed.starts_with("Escalated from coder@work in graphql-budget@project:"));
         assert!(framed.contains("convoy graphql-budget@project (resource ref: resume-staging)"), "{framed}");
         assert!(framed.contains("Reason: access. Evidence:"), "{framed}");
         assert!(framed.contains("repository permission missing"), "{framed}");
@@ -1425,11 +1401,18 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     assert_eq!(resumed.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert!(resumed.stalled.is_none());
     let source_session = sessions.get("resume-staging-session").await.expect("resumed source session");
-    let TerminalSessionSource::Agent { message: Some(guidance), .. } = source_session.spec.source else {
-        panic!("governor guidance should be queued")
-    };
-    assert_eq!(guidance.sender, CrewMessageSender::Governor { name: "governor@project".to_string() });
-    assert!(guidance.text.starts_with("[governor governor@project · guidance for your stalled work · reply by running `crew complete`]"));
+    assert!(matches!(source_session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
+    let guidance = backend
+        .using::<flotilla_resources::Message>("flotilla")
+        .list()
+        .await
+        .expect("guidance inbox")
+        .items
+        .into_iter()
+        .find(|message| message.spec.body.contains("continue with access"))
+        .expect("guidance Message");
+    assert_eq!(guidance.spec.sender, "project/governor");
+    assert_eq!(guidance.spec.relation, flotilla_resources::MessageRelation::Supervisor);
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions
         .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
@@ -1553,7 +1536,7 @@ async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
-    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+    let request = crate::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
         .source("review".to_string())
@@ -1561,7 +1544,7 @@ async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {
         .role("coder".to_string())
         .brief("continue".to_string())
         .subject_revision("new-head".to_string())
-        .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
+        .sender("system:turn-rules".into())
         .build();
     daemon.deliver_standing_turn(&request).await.expect("durable intent accepted after concurrent terminal edit");
     let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
@@ -1597,7 +1580,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
         })
         .await
         .expect("stopped session");
-    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+    let request = crate::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
         .source("review".to_string())
@@ -1605,7 +1588,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
         .role("coder".to_string())
         .brief("fresh turn".to_string())
         .subject_revision("next-head".to_string())
-        .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
+        .sender("system:turn-rules".into())
         .build();
     daemon.deliver_standing_turn(&request).await.expect("deliver fresh turn");
     let session = sessions.get("resume-staging-session").await.expect("updated session");
@@ -1625,7 +1608,7 @@ async fn fresh_turn_stores_intent_independently_of_boot_brief() {
 async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
-    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+    let request = crate::leaf_engine::CrewTurnIntent::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
         .source("review".to_string())
@@ -1633,7 +1616,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         .role("coder".to_string())
         .brief("same turn".to_string())
         .subject_revision("same-head".to_string())
-        .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
+        .sender("system:turn-rules".into())
         .build();
     daemon.deliver_standing_turn(&request).await.expect("first intent");
     let messages = backend.using::<flotilla_resources::Message>("flotilla");
@@ -1762,7 +1745,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             })
             .await
             .expect("session phase");
-        let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        let request = crate::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".to_string())
             .convoy("turn-credential-work".to_string())
             .source("conflicting".to_string())
@@ -1770,7 +1753,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .role("coder".to_string())
             .brief("rebase the PR".to_string())
             .subject_revision("new-head".to_string())
-            .sender(CrewMessageSender::FlotillaTurn { source: "conflicting".to_string() })
+            .sender("system:turn-rules".into())
             .build();
         assert!(daemon.deliver_standing_turn(&request).await.is_err(), "failed staging must prevent delivery");
         let after_failure = convoys.get("turn-credential-work").await.expect("convoy after failed staging").status.expect("status");
@@ -3137,13 +3120,10 @@ async fn mixed_observation_completion_refuses_and_recovers() {
 
 async fn completion_claim_observation_case(rate_limited: bool, missing_artifact: bool, mixed: bool) {
     #[derive(Default)]
-    struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>);
+    struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::CrewTurnIntent>>);
     #[async_trait]
     impl crate::leaf_engine::TurnDeliveryActuator for DeliveredTurns {
-        async fn deliver(
-            &self,
-            request: &crate::leaf_engine::TurnDeliveryRequest,
-        ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+        async fn deliver(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
             self.0.lock().expect("turns").push(request.clone());
             Ok(crate::leaf_engine::CrewTurnAdmission {
                 new_turn: true,
@@ -3152,12 +3132,12 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                     "flotilla.work/v1",
                     "Message",
                     &request.namespace,
-                    format!("fake-{}", request.source),
+                    format!("fake-{}-{}", request.source, request.subject_revision),
                 ),
             })
         }
 
-        async fn hold(&self, _: &crate::leaf_engine::TurnDeliveryRequest, _: &flotilla_resources::HoldAct, _: &str) -> Result<(), String> {
+        async fn hold(&self, _: &crate::leaf_engine::CrewTurnIntent, _: &flotilla_resources::HoldAct, _: &str) -> Result<(), String> {
             Ok(())
         }
     }
@@ -8674,8 +8654,15 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         let session = sessions.get("resume-staging-session").await.expect("same session");
         assert_eq!(session.spec.cwd, original_cwd);
         assert_eq!(session.status.expect("session status").phase, ResourceTerminalSessionPhase::Starting);
-        let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("follow-up missing") };
-        assert!(message.text.contains("Recover the unfinished review"));
+        assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
+        assert!(backend
+            .using::<flotilla_resources::Message>("flotilla")
+            .list()
+            .await
+            .expect("inbox")
+            .items
+            .iter()
+            .any(|message| message.spec.body.contains("Recover the unfinished review")));
         let status = convoys.get("resume-staging").await.expect("convoy").status.expect("status");
         assert!(status.pending_brief().is_none(), "an exited process cannot consume a pending brief");
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);

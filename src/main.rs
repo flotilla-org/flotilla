@@ -2248,7 +2248,13 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                     node_id,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::ResourceStatusPatch { namespace: args.namespace, kind: args.kind, name: args.name, status },
+                    action: CommandAction::ResourceStatusPatch {
+                        expected_resource_version: None,
+                        namespace: args.namespace,
+                        kind: args.kind,
+                        name: args.name,
+                        status,
+                    },
                 },
                 format,
             )

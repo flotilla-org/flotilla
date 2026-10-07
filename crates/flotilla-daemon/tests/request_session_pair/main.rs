@@ -51,7 +51,7 @@ use flotilla_resources::{
     CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
     DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, LifecycleAuthority,
-    OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceBackend, ResourceError,
+    Message, OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceBackend, ResourceError,
     ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource,
     TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
     WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION,
@@ -3746,28 +3746,6 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         .await
         .expect("replicate session");
     apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
-    // Client-supplied controller sender data must not admit an internal command.
-    // Legitimate leaf-engine delivery below uses the controller port instead.
-    for sender in [flotilla_protocol::CrewMessageSender::FlotillaNudge, flotilla_protocol::CrewMessageSender::FlotillaEscalation {
-        from: "forged".into(),
-    }] {
-        let request = flotilla_protocol::TurnDeliveryRequest::builder()
-            .namespace("flotilla".into())
-            .convoy("governor".into())
-            .source("forged".into())
-            .vessel("govern".into())
-            .role("governor".into())
-            .brief("injected".into())
-            .subject_revision("forged".into())
-            .sender(sender)
-            .build();
-        let error = topology
-            .client
-            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request) }).build())
-            .await
-            .expect_err("clients cannot submit internal controller commands");
-        assert!(error.contains("internal controller command"), "{error}");
-    }
     if stale_home {
         // Ordinary Message homing follows resource provenance even when the
         // older presentation feed incorrectly projects the convoy as local.
@@ -3848,7 +3826,7 @@ async fn cross_host_supervision_pinned_scenario_rows() {
 }
 
 // Generate legacy/current stalls, visibility lag, and repeated reconcile steps.
-// Each step checks the persisted rung and the governor's actual message queue.
+// Each step checks the persisted rung and the governor's receiver-homed Message.
 #[hegel::test]
 fn generated_cross_host_supervision(tc: hegel::TestCase) {
     let legacy = tc.draw(gs::booleans());
@@ -3866,58 +3844,39 @@ fn generated_cross_host_supervision(tc: hegel::TestCase) {
     ));
 }
 
-// The trusted controller receiver still rejects non-controller sender variants,
-// independently of client admission and before touching any target resources.
+// Message admission validates open addresses and the supervisor-only interrupt
+// constraint through ordinary resource mutation, before any transport work.
 #[tokio::test]
-async fn internal_turn_delivery_rejects_non_controller_sender() {
+async fn message_resource_apply_rejects_invalid_intent() {
     let daemon = empty_daemon_named("receiver").await;
-    for sender in [
-        flotilla_protocol::CrewMessageSender::Unknown,
-        flotilla_protocol::CrewMessageSender::Governor { name: "governor".into() },
-        flotilla_protocol::CrewMessageSender::FlotillaTurn { source: "exit".into() },
-    ] {
-        let request = flotilla_protocol::TurnDeliveryRequest::builder()
-            .namespace("flotilla".into())
-            .convoy("governor".into())
-            .source("test".into())
-            .vessel("govern".into())
-            .role("governor".into())
-            .brief("test".into())
-            .subject_revision("test".into())
-            .sender(sender)
-            .build();
-        let mut events = daemon.subscribe();
-        let id = daemon
-            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request) }).build())
-            .await
-            .expect("receiver accepts envelope");
-        let result = await_command_result(&mut events, id).await;
-        assert!(matches!(result, CommandValue::Error { message } if message == "remote turn delivery requires a controller sender"));
-    }
-}
-
-#[tokio::test]
-async fn internal_turn_delivery_rejects_forwarded_client_caller() {
-    let daemon = empty_daemon_named("receiver").await;
-    let request = flotilla_protocol::TurnDeliveryRequest::builder()
-        .namespace("flotilla".into())
-        .convoy("governor".into())
-        .source("test".into())
-        .vessel("govern".into())
-        .role("governor".into())
-        .brief("test".into())
-        .subject_revision("test".into())
-        .sender(flotilla_protocol::CrewMessageSender::FlotillaNudge)
-        .build();
-    let caller =
-        CommandCaller { principal_ref: PrincipalRef { namespace: "flotilla".into(), name: "client".into() }, process: None, crew: None };
-    let mut events = daemon.subscribe();
-    let id = daemon
-        .execute_for_caller(Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request) }).build(), Some(caller))
+    daemon
+        .resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("convoy".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("project".into()).build(),
+        )
         .await
-        .expect("receiver accepts envelope");
-    let result = await_command_result(&mut events, id).await;
-    assert!(matches!(result, CommandValue::Error { message } if message == "DeliverCrewTurn is an internal controller command"));
+        .unwrap();
+    for (sender, relation, interrupting, reason) in
+        [("invalid/address/shape", "system", false, "invalid role address"), ("system:test", "peer", true, "interrupt")]
+    {
+        let mut events = daemon.subscribe();
+        let admission = daemon.execute(Command::builder().action(CommandAction::ResourceApply {
+            namespace: "flotilla".into(),
+            document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"invalid","namespace":"flotilla"},
+                "spec":{"sender":sender,"receiver":"project/convoy/work/coder","relation":relation,"body":"test","interrupting":interrupting}}),
+        }).build()).await;
+        let error = match admission {
+            Err(error) => error,
+            Ok(id) => match await_command_result(&mut events, id).await {
+                CommandValue::Error { message } => message,
+                result => panic!("invalid intent accepted: {result:?}"),
+            },
+        };
+        assert!(error.contains(reason), "unexpected refusal: {error}");
+        assert!(daemon.resource_backend().using::<Message>("flotilla").list().await.expect("receiver inbox").items.is_empty());
+    }
 }
 
 // Resume admission accepts exited unfinished crew at the convoy authority,
@@ -4019,8 +3978,13 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
     let session = sessions.get("exited-session").await.expect("same terminal");
     assert_eq!(session.status.expect("status").phase, flotilla_resources::TerminalSessionPhase::Starting);
     assert_eq!(session.spec.cwd, "/warm/checkout");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("operator follow-up missing") };
-    assert!(message.text.contains("finish the review"));
+    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent expected") };
+    assert!(message.is_none());
+    let inbox = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
+    assert_eq!(inbox.items.len(), 1);
+    assert!(inbox.items[0].spec.body.contains("finish the review"));
+    assert_eq!(inbox.items[0].spec.sender, "principal:implicit");
+    assert!(inbox.items[0].status.as_ref().unwrap().resolved_receiver.is_none());
 }
 
 #[tokio::test]

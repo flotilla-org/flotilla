@@ -4,7 +4,7 @@ Date: 2026-09-29
 
 ## Status
 
-Accepted
+Accepted; amended by [ADR 0053](0055-agent-messages-are-durable-receiver-homed-records.md), which represents cross-vessel carries as typed Message references. Reference visibility gating follows in #2711.
 
 Grilled 2026-09-29, prompted by automatic multi-vessel allocation (ADR 0046 §3, #2143/#2188). Refines ADR 0042/0043's "cross-vessel handoffs go through artifacts". Relates to ADR 0045 (stalls), ADR 0049 (subject identity), #2111 and #2164 (staging before delivery), and #2165 (dehydration).
 

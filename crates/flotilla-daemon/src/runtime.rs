@@ -3545,7 +3545,11 @@ pub fn spawn_pending_supervisor_turn_task(
         async move {
             let convoys = backend.including_replicas::<Convoy>(&namespace).watch().await?;
             let sessions = backend.including_replicas::<TerminalSession>(&namespace).watch().await?;
-            Ok((convoys.map(|event| event.map(|_| ())).boxed(), sessions.map(|event| event.map(|_| ())).boxed()))
+            let messages = backend.including_replicas::<flotilla_resources::Message>(&namespace).watch().await?;
+            Ok((
+                futures::stream::select(convoys.map(|event| event.map(|_| ())), messages.map(|event| event.map(|_| ()))).boxed(),
+                sessions.map(|event| event.map(|_| ())).boxed(),
+            ))
         }
     })
 }
@@ -6566,6 +6570,9 @@ fn terminal_liveness_for_source(source: &TerminalSessionSource, liveness: Termin
 
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
+    async fn adopt_legacy_messages(&self, obj: &ResourceObject<TerminalSession>) -> Result<bool, ResourceError> {
+        self.state.daemon.resource_backend().using::<TerminalSession>(&obj.metadata.namespace).adopt_legacy_messages(obj, Utc::now()).await
+    }
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
         let backend = self.state.daemon.resource_backend();
         let records = backend.including_replicas::<Checkout>(&convoy.metadata.namespace).list().await.map_err(|error| error.to_string())?;
@@ -14682,7 +14689,7 @@ mod tests {
         }
 
         async fn deliver(&self, _session_name: &str, text: &str) -> Result<(), String> {
-            self.inputs.lock().unwrap().push(text.to_string());
+            self.inputs.lock().expect("captured input log").push(text.to_string());
             self.deliveries.fetch_add(1, Ordering::SeqCst);
             if self.submission_error {
                 Err("reply lost after PTY accepted input".into())
@@ -14815,6 +14822,20 @@ mod tests {
         assert_eq!(pool.inner.delivered.lock().await.len(), 1);
     }
 
+    async fn refresh_message_test_attention(runtime: &TerminalControllerRuntime, backend: &ResourceBackend, name: &str) {
+        let sessions = backend.using::<TerminalSession>(NAMESPACE);
+        let holder = sessions.get(name).await.expect("attention holder");
+        let observation = runtime.observe_attention(name, &holder.spec).await.expect("terminal observation").expect("observed attention");
+        flotilla_resources::apply_status_patch(&sessions, name, &flotilla_resources::TerminalSessionStatusPatch::Observe {
+            attention: observation.attention,
+            occupancy: observation.occupancy,
+            output_digest: observation.output_digest,
+            observed_at: Utc::now(),
+        })
+        .await
+        .expect("terminal controller attention projection");
+    }
+
     // A fresh idle composer accepts one batch; stable Working supplies evidence.
     // Once its task is gone, polling the durable intent never types it again.
     #[tokio::test(start_paused = true)]
@@ -14892,6 +14913,76 @@ mod tests {
         // With no retained task, a restart can observe evidence but never submit.
         assert!(matches!(MessageTransport::poll(&runtime, &batch).await, MessageTransportOutcome::Unconfirmed { .. }));
         assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+        // Cross-host delivery waits until the sender authority's convoy is
+        // replicated. The receiver's real inbox then submits all three records
+        // through the same terminal-pool boundary exactly once.
+        let sender_backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("message-sender"));
+        sender_backend
+            .using::<Convoy>(NAMESPACE)
+            .create(
+                &empty_meta("message"),
+                &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
+            )
+            .await
+            .expect("sender authority");
+        let current = sessions.get(ID).await.expect("current holder");
+        let mut meta = InputMeta::from(&current.metadata);
+        meta.labels.extend([
+            (flotilla_resources::CONVOY_LABEL.into(), "message".into()),
+            (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+            (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
+        ]);
+        let current = sessions.update(&meta, &current.metadata.resource_version, &current.spec).await.expect("holder address");
+        let mut status = current.status.clone().expect("holder status");
+        status.session_id = Some(ID.into());
+        status.crew =
+            Some(flotilla_resources::CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() });
+        sessions.update_status(ID, &current.metadata.resource_version, &status).await.expect("holder identity");
+        pool.inner.set_captured_screen(ID, "› Ask Codex to do anything").await;
+        let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
+        for index in 0..3 {
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender("flotilla/test".into())
+                .receiver("flotilla/message/work/coder".into())
+                .relation(flotilla_resources::MessageRelation::System)
+                .body(format!("replicated-{index}"))
+                .build();
+            inbox.accept(&empty_meta(&format!("replicated-{index}")), &intent, Utc::now()).await.expect("receiver-home intent");
+        }
+        inbox.reconcile_delivery(&runtime, Utc::now()).await.expect("await replication");
+        assert_eq!(pool.inner.delivered.lock().await.len(), 1, "no turn without replicated convoy context");
+        backend
+            .replica_writer::<Convoy>(NodeId::new("message-sender"), NAMESPACE)
+            .replace(&sender_backend.using::<Convoy>(NAMESPACE).list().await.expect("authority snapshot"), Utc::now())
+            .await
+            .expect("replicate authority");
+        refresh_message_test_attention(&runtime, &backend, ID).await;
+        inbox.reconcile_delivery(&runtime, Utc::now()).await.expect("batch submission");
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(200)).await;
+            tokio::task::yield_now().await;
+            refresh_message_test_attention(&runtime, &backend, ID).await;
+            inbox.reconcile_delivery(&runtime, Utc::now()).await.expect("acceptance observation");
+            if backend
+                .using::<flotilla_resources::Message>(NAMESPACE)
+                .list()
+                .await
+                .expect("inbox")
+                .items
+                .iter()
+                .all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence()))
+            {
+                break;
+            }
+        }
+        let records = backend.using::<flotilla_resources::Message>(NAMESPACE).list().await.expect("receipts").items;
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence()
+            && status.resolved_receiver.as_ref().is_some_and(|receiver| receiver.session == ID))));
+        let typed = pool.inner.delivered.lock().await;
+        assert_eq!(typed.len(), 2, "one additional input for three replicated messages");
+        assert!(typed[1].1.find("replicated-0").expect("first body") < typed[1].1.find("replicated-1").expect("second body"));
+        assert!(typed[1].1.find("replicated-1").expect("first body") < typed[1].1.find("replicated-2").expect("second body"));
     }
 
     // #2599: all senders share prompt readiness, FIFO order, and exact receipts.
@@ -14955,8 +15046,20 @@ mod tests {
                 head.append(review); // Duplicate wakes must not create a second turn.
                 head.append(make_message("supervisor-resume", CrewMessageSender::Governor { name: "porthole".into() }));
                 head.append(make_message("operator-brief", CrewMessageSender::OperatorResume { principal: None }));
-                session = sessions.update(&empty_meta(ID), &session.metadata.resource_version, &spec).await.expect("queue turns");
+                let mut meta = InputMeta::from(&session.metadata);
+                meta.labels.extend([
+                    (flotilla_resources::CONVOY_LABEL.into(), "hookless".into()),
+                    (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+                    (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
+                ]);
+                session = sessions.update(&meta, &session.metadata.resource_version, &spec).await.expect("queue old turns");
                 let mut status = session.status.clone().expect("status");
+                status.crew = Some(flotilla_resources::CrewSessionStatus {
+                    id: "crew-id".into(),
+                    adapter: "codex".into(),
+                    model: None,
+                    stance: "work".into(),
+                });
                 status.session_id = Some(ID.into());
                 status.delivered_message_id = Some("initial-brief".into());
                 session = sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("running status");
@@ -14971,83 +15074,59 @@ mod tests {
                         profile.host_direct_environment_name(),
                     )),
                 });
-                let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
-                let epoch = chrono::DateTime::parse_from_rfc3339("2026-10-04T15:45:11Z").expect("epoch").with_timezone(&Utc);
-                let started = tokio::time::Instant::now();
-                for (index, expected) in ["review-round-3", "supervisor-resume", "operator-brief"].into_iter().enumerate() {
-                    for screen in [
-                        "• Working (10m • esc to interrupt)\n› Ask Codex to do anything",
-                        "Would you like to run the following command?\n› 1. Yes\n  2. No",
-                        "Unknown screen",
-                        // #2648: draft text must retain the queued turn until
-                        // the person clears it, with or without a footer.
-                        "› please wait for my draft\n\ngpt-6.1-sol · /workspace",
-                        "› Ask Codex to do anything after I finish typing",
-                        "› Ask Codex to do anything\n  but wait for my second line\n\ngpt-6.1-sol · /workspace",
-                    ] {
-                        pool.inner.set_captured_screen(ID, screen).await;
-                        let busy = reconciler.prepare(&session).await.expect("non-boundary preparation");
-                        let outcome = reconciler.reconcile(&session, &busy, epoch);
-                        assert_eq!(outcome.requeue_after, Some(Duration::from_millis(200)));
-                        // Repeated non-idle observations may be coalesced.
-                        if let Some(patch) = outcome.patch {
-                            assert!(matches!(&patch, TerminalSessionStatusPatch::Observe { .. }));
-                            let mut status = session.status.clone().expect("status");
-                            patch.apply(&mut status);
-                            session = sessions
-                                .update_status(ID, &session.metadata.resource_version, &status)
-                                .await
-                                .expect("observe while pending");
-                        }
-                        assert_ne!(
-                            session.status.as_ref().expect("status").attention.as_ref().expect("attention").state,
-                            TerminalAttentionState::Idle,
-                            "pending delivery retains non-idle attention"
-                        );
-                        tokio::time::advance(Duration::from_millis(200)).await;
-                        tokio::task::yield_now().await;
-                        assert_eq!(pool.inner.delivered.lock().await.len(), index, "non-boundary must not consume the FIFO");
-                    }
-                    pool.inner.set_captured_screen(ID, COMPOSER).await;
-                    let now = epoch + chrono::Duration::from_std(started.elapsed()).expect("elapsed");
-                    let observation =
-                        observe_terminal_screen(&*pool, runtime.state.local_registry.agent_adapters.get("codex").map(|a| &**a), ID, now)
-                            .await
-                            .expect("observe")
-                            .expect("session");
-                    assert_eq!(observation.attention.as_ref().expect("attention").state, TerminalAttentionState::Idle);
-                    assert_eq!(observation.attention.expect("attention").as_of, now);
-                    for _ in 0..20 {
-                        tokio::time::advance(Duration::from_millis(200)).await;
-                        tokio::task::yield_now().await;
-                        let prepared = reconciler.prepare(&session).await.expect("prepare delivery");
-                        if let Some(patch) = reconciler.reconcile(&session, &prepared, now).patch {
-                            let delivered =
-                                matches!(&patch, TerminalSessionStatusPatch::MarkMessageDelivered { message_id } if message_id == expected);
-                            assert!(delivered || matches!(&patch, TerminalSessionStatusPatch::Observe { .. }));
-                            let mut status = session.status.clone().expect("status");
-                            patch.apply(&mut status);
-                            session = sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("receipt");
-                            if delivered {
-                                break;
-                            }
-                        }
-                    }
-                    assert_eq!(session.status.as_ref().expect("status").delivered_message_id.as_deref(), Some(expected));
-                    assert_eq!(pool.inner.delivered.lock().await.len(), index + 1);
+                // Upgrade keeps the three distinct producer identities but
+                // Message owns one batch and one evidence-backed receipt per record.
+                assert!(sessions.adopt_legacy_messages(&session, Utc::now()).await.expect("adopt old queue"));
+                let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
+                for screen in [
+                    "• Working (10m • esc to interrupt)\n› Ask Codex to do anything",
+                    "Would you like to run the following command?\n› 1. Yes\n  2. No",
+                    "Unknown screen",
+                    "› please wait for my draft\n\ngpt-6.1-sol · /workspace",
+                    "› Ask Codex to do anything after I finish typing",
+                    "› Ask Codex to do anything\n  but wait for my second line\n\ngpt-6.1-sol · /workspace",
+                ] {
+                    pool.inner.set_captured_screen(ID, screen).await;
+                    refresh_message_test_attention(&runtime, &backend, ID).await;
+                    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("non-boundary observation");
+                    tokio::time::advance(Duration::from_millis(200)).await;
+                    tokio::task::yield_now().await;
+                    assert!(pool.inner.delivered.lock().await.is_empty(), "active turns and drafts must retain all input");
+                    let observed = sessions.get(ID).await.expect("receiver attention after observation");
+                    assert_ne!(
+                        observed.status.expect("receiver status").attention.expect("refreshed attention").state,
+                        TerminalAttentionState::Idle
+                    );
                 }
                 pool.inner.set_captured_screen(ID, COMPOSER).await;
-                let prepared = reconciler.prepare(&session).await.expect("duplicate reconcile");
-                assert!(!matches!(
-                    reconciler.reconcile(&session, &prepared, epoch).patch,
-                    Some(TerminalSessionStatusPatch::MarkMessageDelivered { .. })
-                ));
+                for _ in 0..40 {
+                    tokio::time::advance(Duration::from_millis(200)).await;
+                    tokio::task::yield_now().await;
+                    refresh_message_test_attention(&runtime, &backend, ID).await;
+                    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("delivery observation");
+                    if backend
+                        .using::<flotilla_resources::Message>(NAMESPACE)
+                        .list()
+                        .await
+                        .expect("receiver delivery receipts")
+                        .items
+                        .iter()
+                        .all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence()))
+                    {
+                        break;
+                    }
+                }
+                let records = backend.using::<flotilla_resources::Message>(NAMESPACE).list().await.expect("adopted receiver inbox").items;
+                assert_eq!(records.len(), 3);
+                assert!(records.iter().all(|message| message.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())));
+                pool.inner.set_captured_screen(ID, COMPOSER).await;
+                inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("repeat receipt");
                 let delivered = pool.inner.delivered.lock().await;
-                assert_eq!(delivered.iter().map(|(_, text, _)| text.as_str()).collect::<Vec<_>>(), [
-                    "review-round-3",
-                    "supervisor-resume",
-                    "operator-brief"
-                ]);
+                assert_eq!(delivered.len(), 1, "all three upgraded inputs share one turn");
+                let text = &delivered[0].1;
+                assert!(text.find("review-round-3").expect("first body") < text.find("supervisor-resume").expect("second body"));
+                assert!(text.find("supervisor-resume").expect("first body") < text.find("operator-brief").expect("second body"));
+                assert!(delivered[0].2);
             }
         }
     }
@@ -15149,9 +15228,21 @@ mod tests {
             acknowledged: Default::default(),
             following: Vec::new(),
         });
-        session = sessions.update(&empty_meta("agent"), &session.metadata.resource_version, &spec).await.expect("queue turn");
+        let mut meta = InputMeta::from(&session.metadata);
+        meta.labels.extend([
+            (flotilla_resources::CONVOY_LABEL.into(), "held-pool".into()),
+            (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+            (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
+        ]);
+        session = sessions.update(&meta, &session.metadata.resource_version, &spec).await.expect("queue turn");
         let mut status = session.status.clone().expect("status");
         status.session_id = Some("agent".into());
+        status.crew = Some(flotilla_resources::CrewSessionStatus {
+            id: "held-crew".into(),
+            adapter: "codex".into(),
+            model: None,
+            stance: "work".into(),
+        });
         session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("running session");
         let runtime = Arc::new(TerminalControllerRuntime {
             state: Arc::new(ControllerRuntimeState::new(
@@ -15179,24 +15270,33 @@ mod tests {
             message: "accepted but reply lost".into(),
         };
         reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("hold").apply(&mut status);
-        session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("persist hold");
-        let prepared = reconciler.prepare(&session).await.expect("observe idle while held");
-        reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("idle attention").apply(&mut status);
-        assert_eq!(status.attention.as_ref().expect("attention").state, TerminalAttentionState::Idle);
-        assert!(status.degraded.is_some());
-        session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("persist observation");
-        // Capturing the first baseline is not evidence that input was consumed.
-        let prepared = reconciler.prepare(&session).await.expect("observe unchanged idle output");
-        if let Some(patch) = reconciler.reconcile(&session, &prepared, Utc::now()).patch {
-            patch.apply(&mut status);
-        }
-        assert!(status.delivered_message_id.is_none());
-        assert!(status.degraded.is_some());
+        sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("persist hold");
+        // The old held path observed a baseline before the upgrade. Preserve
+        // that real observation so changed output has a comparison witness.
+        refresh_message_test_attention(&runtime, &backend, "agent").await;
+        session = sessions.get("agent").await.expect("legacy held baseline");
+        assert!(sessions.adopt_legacy_messages(&session, Utc::now()).await.expect("adopt held delivery"));
+        let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
+        refresh_message_test_attention(&runtime, &backend, "agent").await;
+        inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe idle while held");
+        let observed = sessions.get("agent").await.expect("idle holder");
+        assert_eq!(
+            observed.status.as_ref().expect("holder status").attention.as_ref().expect("attention").state,
+            TerminalAttentionState::Idle
+        );
+        // Capturing a baseline is not evidence that input was consumed.
+        refresh_message_test_attention(&runtime, &backend, "agent").await;
+        inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe unchanged idle output");
+        let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
+        let held = messages.list().await.expect("held inbox").items;
+        assert_eq!(held.len(), 1);
+        assert!(!held[0].status.as_ref().expect("held status").phase.has_delivery_evidence());
+        assert!(held[0].status.as_ref().expect("held status").submission.is_some());
         pool.observations.store(100, Ordering::SeqCst);
-        let prepared = reconciler.prepare(&session).await.expect("observe late output");
-        reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("late acknowledgement").apply(&mut status);
-        assert_eq!(status.delivered_message_id.as_deref(), Some("held-turn"));
-        assert!(status.degraded.is_none());
+        refresh_message_test_attention(&runtime, &backend, "agent").await;
+        inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe late output");
+        let accepted = messages.list().await.expect("accepted inbox").items;
+        assert!(accepted[0].status.as_ref().expect("receipt status").phase.has_delivery_evidence());
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
     }
@@ -15554,16 +15654,16 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             }
-            deliveries.lock().unwrap().insert("agent".into(), PendingTerminalDelivery {
+            deliveries.lock().expect("pending transport tasks").insert("agent".into(), PendingTerminalDelivery {
                 message_batch: Some("batch".into()),
                 message: "framed input".into(),
                 task,
             });
             for text in ["framed input", "legacy follow-up"] {
                 assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", text), TerminalDeliveryLookup::InFlight));
-                assert_eq!(deliveries.lock().unwrap().len(), 1);
+                assert_eq!(deliveries.lock().expect("pending transport tasks").len(), 1);
             }
-            deliveries.lock().unwrap().remove("agent").unwrap().task.abort();
+            deliveries.lock().expect("pending transport tasks").remove("agent").expect("retained in-flight task").task.abort();
         }
     }
 
@@ -18029,18 +18129,20 @@ mod tests {
             .expect("reviewer session");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("reviewer identity").id.clone();
         assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
+        pool.set_captured_screen(&reviewer.metadata.name, "› Ask Codex to do anything").await;
         wait_until(|| {
             let pool = Arc::clone(&pool);
             async move {
-                pool.delivered.lock().await.iter().any(|(session, text, submit)| {
-                    session.ends_with("-reviewer")
-                        && text == "[handoff from coder@implement in crew-convoy]\n\nReview commit abc123"
-                        && *submit
-                })
+                pool.delivered
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(session, text, submit)| session.ends_with("-reviewer") && text.contains("Review commit abc123") && *submit)
             }
         })
         .await;
 
+        pool.set_captured_screen(&reviewer.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
         let mut rx = daemon.subscribe();
         let hand_back_id = daemon
             .execute(
@@ -18055,42 +18157,42 @@ mod tests {
             .await
             .expect("hand back to coder");
         assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
-        let coder_delivery_id = terminals
+        let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
+        let coder_delivery_id = messages
             .list()
             .await
-            .expect("terminal list")
+            .unwrap()
             .items
             .into_iter()
-            .find(|session| session.spec.role == "coder")
-            .and_then(|session| match session.spec.source {
-                TerminalSessionSource::Agent { message, .. } => message.map(|message| message.id),
-                TerminalSessionSource::Tool { .. } => None,
+            .find(|message| {
+                message.spec.receiver.ends_with("/implement/coder") && message.spec.body.ends_with("Address the review findings")
             })
-            .expect("running coder handoff should be queued through the reconciler");
+            .expect("running coder handoff should be accepted in its durable inbox")
+            .metadata
+            .name;
+        pool.set_captured_screen(&coder.metadata.name, "› Ask Codex to do anything").await;
         wait_until(|| {
             let pool = Arc::clone(&pool);
             async move {
-                pool.delivered.lock().await.iter().any(|(session, text, submit)| {
-                    session.ends_with("-coder")
-                        && text == "[handoff from reviewer@implement in crew-convoy]\n\nAddress the review findings"
-                        && *submit
-                })
+                pool.delivered
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(session, text, submit)| session.ends_with("-coder") && text.contains("Address the review findings") && *submit)
             }
         })
         .await;
+        pool.set_captured_screen(&coder.metadata.name, "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
         wait_until_with_timeout(Duration::from_secs(5), || {
-            let terminals = terminals.clone();
+            let messages = messages.clone();
             let coder_delivery_id = coder_delivery_id.clone();
             async move {
-                terminals
-                    .list()
+                messages
+                    .get(&coder_delivery_id)
                     .await
                     .ok()
-                    .and_then(|list| list.items.into_iter().find(|session| session.spec.role == "coder"))
-                    .and_then(|session| session.status)
-                    .and_then(|status| status.delivered_message_id)
-                    .as_deref()
-                    == Some(coder_delivery_id.as_str())
+                    .and_then(|message| message.status)
+                    .is_some_and(|status| status.phase.has_delivery_evidence())
             }
         })
         .await;
