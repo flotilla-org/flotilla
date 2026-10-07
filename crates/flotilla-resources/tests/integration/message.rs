@@ -1865,7 +1865,13 @@ async fn topic_receipt_and_reply_use_the_ancestor_holders_address() {
                 &TerminalSessionStatus {
                     phase: TerminalSessionPhase::Running,
                     session_id: Some("root-session".into()),
-                    crew: Some(CrewSessionStatus { id: "root-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                    crew: Some(CrewSessionStatus {
+                        id: "root-crew".into(),
+                        adapter: "codex".into(),
+                        model: None,
+                        stance: "work".into(),
+                        input_transports: Vec::new(),
+                    }),
                     ..Default::default()
                 },
             )
