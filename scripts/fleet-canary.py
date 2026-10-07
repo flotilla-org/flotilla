@@ -60,16 +60,22 @@ class Commands:
                 continue
             try:
                 process = Path('/proc') / str(pid)
-                if ((process / 'exe').resolve() != binary.resolve()
-                        or f'CLEAT_RUNTIME_DIR={runtime}'.encode() not in (process / 'environ').read_bytes().split(b'\0')):
+                try:
+                    matches = ((process / 'exe').resolve() == binary.resolve()
+                               and f'CLEAT_RUNTIME_DIR={runtime}'.encode() in (process / 'environ').read_bytes().split(b'\0'))
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    continue  # Stale or inaccessible identity evidence.
+                if not matches:
                     continue  # Stale PID file; never signal an unrelated process.
                 signal.pidfd_send_signal(descriptor, signal.SIGTERM)
                 if not select.select([descriptor], [], [], 10)[0]:
                     signal.pidfd_send_signal(descriptor, signal.SIGKILL)
                     if not select.select([descriptor], [], [], 10)[0]:
                         raise CanaryFailure('host Cleat daemon was not reaped')
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                pass
+            except ProcessLookupError:
+                pass  # The verified process exited before signalling.
+            except OSError as error:
+                raise CanaryFailure(f'host Cleat daemon could not be reaped: {error}') from error
             finally:
                 os.close(descriptor)
 

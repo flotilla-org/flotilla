@@ -229,6 +229,10 @@ class Contract(unittest.TestCase):
                     commands.reap_host_cleat(root, binary)
                 self.assertIsNone(unrelated.poll())
                 pid_file.write_text(str(owned.pid))
+                with patch.object(signal, 'pidfd_send_signal', side_effect=PermissionError('signal denied')):
+                    with self.assertRaisesRegex(canary.CanaryFailure, 'host Cleat daemon could not be reaped.*signal denied'):
+                        commands.reap_host_cleat(root, binary)
+                self.assertIsNone(owned.poll())
                 commands.reap_host_cleat(root, binary)
                 self.assertIsNotNone(owned.poll())
                 self.assertIsNone(unrelated.poll())

@@ -97,7 +97,8 @@ Cleat endpoint and sessions. It never prunes or kills fleet containers/sessions.
 
 All runs stop the canary daemon and reap any matching host Cleat daemon started
 by discovery. Host Cleat cleanup checks both its executable and private runtime
-environment, using Linux pidfds to avoid PID reuse; stale or inaccessible PID
+environment, using Linux pidfds (Linux 5.3+ and Python 3.9+) to avoid PID reuse;
+stale or inaccessible PID
 files never authorize signalling another process. Successful runs remove scratch
 state. Failures retain state, logs, and any surviving canary container for inspection. The diagnostic names the failed assertion and log directory;
 no active generation is switched. Inspect `daemon.log`, `commands.log`, and
