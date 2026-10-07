@@ -1,0 +1,12 @@
+# OS/job | cargo test arguments (whitespace-separated; no shell quoting).
+# all applies to both windows and macos; keep shared selectors on one line.
+windows| -p flotilla-client --locked --lib windows_tests::
+windows| -p flotilla-client --locked --lib endpoint::
+windows| --locked --bin flotilla remote_
+windows| --locked --bin flotilla daemon_endpoint_conflicts
+windows| -p flotilla-tui --locked --lib terminal::tests::
+windows| -p flotilla-tui --locked --lib remote_connector_keeps_viewer_locality
+windows| -p flotilla-manifest --locked --lib sink::tests::
+macos| -p flotilla-daemon --locked --lib server::caller::tests::
+tender-ssh| -p tender --locked --test ssh_adapter forward_carries_contract_and_reclaims_after_route_replacement -- --ignored --nocapture
+tender-ssh| -p tender --locked --features ssh-cleat-proof --test ssh_cleat -- --nocapture

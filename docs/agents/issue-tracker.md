@@ -32,6 +32,15 @@ gh api -X PATCH repos/flotilla-org/flotilla/issues/<number> -f type="TypeName"
 
 Triage-role labels are mapped in `docs/agents/triage-labels.md`. Topic labels (`bug`, `ui`, `multi-host`, `from-review`, `quick-win`, …) are documented in the "Issue Types and Labels" section of `CLAUDE.md` — combine as appropriate.
 
+## Crew pull request guidance
+
+New platform test coverage belongs in `ci/platform-tests/selectors.txt`, run by
+`ci/platform-tests/run.sh`; shared Windows/macOS coverage uses `all`. Adding or
+removing a selected test must not edit `.github/workflows/`. Add a new CI job
+only for a new runner type or OS, or for deliberate isolation; otherwise fit
+checks into an existing job on the same runner. Workflow jobs, runners,
+triggers, permissions and secrets remain operator-managed.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** External PRs go through the normal review flow; `/triage` only reads issues.
