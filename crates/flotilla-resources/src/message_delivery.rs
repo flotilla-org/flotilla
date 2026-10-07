@@ -11,7 +11,7 @@ use crate::{
         DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
     },
     message_expectation_open, message_supersedes, resolve_message_receiver, ControllerRetry, ControllerRetryDisposition, Demand,
-    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageRelation, MessageStatus,
+    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageQuery, MessageRelation, MessageStatus,
     MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError, ResourceObject, ResourceProvenance,
     StatusPatch, TerminalSession, TerminalSessionPhase,
 };
@@ -72,12 +72,11 @@ impl MessageInbox {
             let _admission = self.admission.lock().await;
             // A created record with no status is an interrupted admission. Finish
             // its predecessor cleanup before selecting any batch for transport.
-            for message in self.messages.list().await?.items.into_iter().filter(|message| message.status.is_none()) {
+            for message in self.messages.query(&MessageQuery::active()).await?.into_iter().filter(|message| message.status.is_none()) {
                 self.accept_locked(&InputMeta::from(&message.metadata), &message.spec, now).await?;
             }
         }
-        let replies = self.backend.including_replicas::<Message>(&self.namespace).list().await?.items;
-        let mut messages = self.messages.list().await?.items;
+        let mut messages = self.messages.query(&MessageQuery::active()).await?;
         messages.sort_by_key(|message| {
             (
                 message.metadata.creation_timestamp,
@@ -127,7 +126,9 @@ impl MessageInbox {
                 }
                 let mut answered = false;
                 if message.spec.expectation == MessageExpectation::Reply {
-                    for reply in &replies {
+                    for reply in
+                        self.backend.query_messages(&self.namespace, &MessageQuery::ReplyTo { name: message.metadata.name.clone() }).await?
+                    {
                         if reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
                             && reply.object.spec.receiver == message.spec.sender
                             && self.reply_sender_matches(message, &reply.object.spec.sender).await?
@@ -175,50 +176,6 @@ impl MessageInbox {
             };
             match holder {
                 Some(holder) if matches!(holder.provenance, ResourceProvenance::Local) => {
-                    if let Some(receipt) = holder.object.status.as_ref().and_then(|status| {
-                        status.legacy_message_receipts.iter().find_map(|(id, receipt)| {
-                            (crate::message_record_name(&message.spec.receiver, &message.spec.sender, id) == message.metadata.name
-                                && receipt.sender.as_ref().is_none_or(|sender| sender == &message.spec.sender))
-                            .then_some(receipt)
-                        })
-                    }) {
-                        if let (Some(_), Some(receiver)) = (&receipt.sender, &receipt.receiver) {
-                            apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Delivered {
-                                receiver: receiver.clone(),
-                                at: now,
-                            })
-                            .await?;
-                            continue;
-                        }
-                        if message.status.as_ref().is_none_or(|status| status.submission.is_none()) {
-                            let mut status = status_for(message);
-                            status.submission = Some(
-                                MessageSubmission::builder()
-                                    .batch_id(format!("legacy-receipt-{}", message.metadata.name))
-                                    .crew_id(String::new())
-                                    .session(String::new())
-                                    .started_at(now)
-                                    .members(vec![message.metadata.name.clone()])
-                                    .build(),
-                            );
-                            let wait = MessageStatusPatch::Wait {
-                                phase: MessagePhase::Deliverable,
-                                reason: "adopted receipt lacks its original sender or receiver identity".into(),
-                                at: now,
-                            };
-                            use crate::StatusPatch;
-                            wait.apply(&mut status);
-                            status.retry = Some(ControllerRetry {
-                                attempts: 1,
-                                first_failure_at: now,
-                                disposition: ControllerRetryDisposition::Terminal {
-                                    needs: "adopted receipt lacks its original sender or receiver identity".into(),
-                                },
-                            });
-                            self.write(message, &status).await?;
-                            continue;
-                        }
-                    }
                     groups
                         .entry(holder.object.metadata.name.clone())
                         .or_insert_with(|| (holder.object, Vec::new()))
@@ -229,11 +186,27 @@ impl MessageInbox {
                 None => self.wait(message, MessagePhase::Accepted, "receiver role has no current holder", now).await?,
             }
         }
+        let member_names: std::collections::BTreeSet<_> = messages
+            .iter()
+            .flat_map(|message| {
+                message
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.submission.as_ref())
+                    .into_iter()
+                    .flat_map(|submission| submission.members.iter().cloned())
+            })
+            .collect();
+        for name in member_names {
+            if !messages.iter().any(|message| message.metadata.name == name) {
+                messages.push(self.messages.get(&name).await?);
+            }
+        }
         for (_, (holder, pending)) in groups {
             self.deliver_group(transport, &holder, &pending, &messages, now).await?;
         }
         self.cleanup_delivery_gates(now).await?;
-        let current = self.messages.list().await?.items;
+        let current = self.messages.query(&MessageQuery::active()).await?;
         tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&current)).await.ok();
         Ok(())
     }
@@ -369,23 +342,6 @@ impl MessageInbox {
                 release(transport, &batch(holder, &members, submission.clone())).await;
                 self.clear_signal(&members[0]).await?;
                 return Ok(());
-            }
-            if (submission.crew_id.is_empty() || submission.session.is_empty()) && submission.legacy_launch.as_ref().is_some_and(|witness| {
-                witness.terminal == holder.metadata.name
-                    && witness.terminal_created_at == holder.metadata.creation_timestamp
-                    && witness.terminal_started_at.is_some()
-                    && holder.status.as_ref().and_then(|status| status.started_at) == witness.terminal_started_at
-                    && matches!(&holder.spec.source, crate::TerminalSessionSource::Agent { brief, .. } if brief.content == witness.content)
-            }) {
-                if let Some((crew, session)) =
-                    holder.status.as_ref().and_then(|status| status.crew.as_ref().zip(status.session_id.as_ref()))
-                {
-                    // Bind the exact adopted launch, then require ordinary evidence.
-                    if (submission.crew_id.is_empty() || submission.crew_id == crew.id) && (submission.session.is_empty() || submission.session == *session) {
-                        submission.crew_id = crew.id.clone();
-                        submission.session = session.clone();
-                    }
-                }
             }
             let receiver = holder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.id.as_str());
             let same_holder = holder.status.as_ref().and_then(|status| status.session_id.as_deref()) == Some(submission.session.as_str())
@@ -657,7 +613,7 @@ impl MessageInbox {
 
     // Repair a crash between terminal closure/receipt and gate deletion. Only
     // actual receiver gates are checked; historical Messages cause no deletes.
-    async fn cleanup_delivery_gates(&self, now: DateTime<Utc>) -> Result<(), ResourceError> {
+    async fn cleanup_delivery_gates(&self, _now: DateTime<Utc>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
         let gates: Vec<_> = demands
             .list()
@@ -674,9 +630,8 @@ impl MessageInbox {
         }
         let active: Vec<_> = self
             .messages
-            .list()
+            .query(&MessageQuery::active())
             .await?
-            .items
             .into_iter()
             .filter(|message| {
                 message.status.as_ref().is_some_and(|status| {
@@ -699,17 +654,9 @@ impl MessageInbox {
             if retained.contains(&gate.metadata.name) {
                 continue;
             }
-            let name = gate.metadata.name.strip_prefix("terminal-delivery-").expect("filtered gate");
-            let legacy_pending = match self.backend.using::<TerminalSession>(&self.namespace).get(name).await {
-                Ok(holder) => crate::delivery_hold::legacy_delivery_gate_needed(&holder, now),
-                Err(ResourceError::NotFound { .. }) => false,
+            match demands.delete(&gate.metadata.name).await {
+                Ok(()) | Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error),
-            };
-            if !legacy_pending {
-                match demands.delete(&gate.metadata.name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-                    Err(error) => return Err(error),
-                }
             }
         }
         Ok(())

@@ -336,6 +336,16 @@ impl SqliteBackend {
                 CREATE INDEX IF NOT EXISTS replica_objects_by_resource_name
                     ON replica_objects (group_name, version, kind, namespace, name, origin_root);
 
+                CREATE INDEX IF NOT EXISTS resource_objects_message_active ON resource_objects (group_name,version,kind,namespace,json_extract(body_json, '$.spec.receiver'),name) WHERE kind='Message' AND COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered');
+                CREATE INDEX IF NOT EXISTS resource_objects_message_reply ON resource_objects (group_name,version,kind,namespace,json_extract(body_json, '$.spec.in_reply_to'),name) WHERE kind='Message';
+                CREATE INDEX IF NOT EXISTS resource_objects_message_batch ON resource_objects (group_name,version,kind,namespace,json_extract(body_json, '$.status.submission.batch_id'),name) WHERE kind='Message';
+                CREATE INDEX IF NOT EXISTS replica_objects_message_active ON replica_objects (group_name,version,kind,namespace,json_extract(body_json, '$.spec.receiver'),name) WHERE kind='Message' AND COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered');
+                CREATE INDEX IF NOT EXISTS replica_objects_message_reply ON replica_objects (group_name,version,kind,namespace,json_extract(body_json, '$.spec.in_reply_to'),name) WHERE kind='Message';
+                CREATE INDEX IF NOT EXISTS replica_objects_message_batch ON replica_objects (group_name,version,kind,namespace,json_extract(body_json, '$.status.submission.batch_id'),name) WHERE kind='Message';
+                CREATE INDEX IF NOT EXISTS message_audit_age ON resource_objects (group_name,version,kind,namespace,julianday(json_extract(body_json, '$.status.since'))) WHERE kind='Message' AND COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered') AND json_extract(body_json, '$.spec.body_digest') IS NULL;
+                CREATE INDEX IF NOT EXISTS resource_objects_message_inbox ON resource_objects (group_name,version,kind,namespace,name) WHERE kind='Message' AND COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered');
+                CREATE INDEX IF NOT EXISTS replica_objects_message_inbox ON replica_objects (group_name,version,kind,namespace,name) WHERE kind='Message' AND COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered');
+                CREATE INDEX IF NOT EXISTS replica_message_audit_age ON replica_objects (group_name,version,kind,namespace,julianday(json_extract(body_json, '$.status.since'))) WHERE kind='Message' AND COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered') AND json_extract(body_json, '$.spec.body_digest') IS NULL;
                 CREATE TABLE IF NOT EXISTS replica_cursors (
                     origin_root TEXT NOT NULL,
                     group_name TEXT NOT NULL,
@@ -869,6 +879,52 @@ impl SqliteBackend {
                 entries.send(event);
             }
         }
+    }
+
+    pub(crate) async fn query_messages(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        let key = Self::store_key::<crate::Message>(namespace);
+        let (predicate, argument) = query.sql();
+        let index = query.sql_index(false);
+        let mut items = self.read_call("query Message inbox", move |connection| {
+            let sql = format!("SELECT body_json FROM resource_objects INDEXED BY {index} WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND kind='Message' AND ({predicate}) AND (?5 IS NULL OR ?5 IS NOT NULL) ORDER BY name");
+            let mut statement = connection.prepare(&sql).map_err(|error| Self::map_sqlite(error, "prepare Message query"))?;
+            let rows = statement.query_map(params![key.0, key.1, key.2, key.3, argument], |row| row.get::<_, String>(0)).map_err(|error| Self::map_sqlite(error, "query Message inbox"))?;
+            rows.map(|row| {
+                let body = row.map_err(|error| Self::map_sqlite(error, "read Message query"))?;
+                let value = serde_json::from_str(&body).map_err(|error| ResourceError::decode(error.to_string()))?;
+                Ok(ReadResourceObject { object: Self::decode_object(value)?, provenance: ResourceProvenance::Local })
+            }).collect::<Result<Vec<_>, ResourceError>>()
+        }).await?;
+        if include_replicas {
+            items.extend(self.query_message_replicas(namespace, query).await?);
+        }
+        Ok(items)
+    }
+
+    pub(crate) async fn query_message_replicas(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        let key = Self::store_key::<crate::Message>(namespace);
+        let (predicate, argument) = query.sql();
+        let index = query.sql_index(true);
+        self.read_call("query Message replicas", move |connection| {
+            let sql = format!("SELECT body_json, origin_root, last_synced_at FROM replica_objects INDEXED BY {index} WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND kind='Message' AND ({predicate}) AND (?5 IS NULL OR ?5 IS NOT NULL) ORDER BY origin_root,name");
+            let mut statement = connection.prepare(&sql).map_err(|error| Self::map_sqlite(error, "prepare Message replica query"))?;
+            let rows = statement.query_map(params![key.0, key.1, key.2, key.3, argument], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).map_err(|error| Self::map_sqlite(error, "query Message replicas"))?;
+            rows.map(|row| {
+                let (body, origin, synced_at) = row.map_err(|error| Self::map_sqlite(error, "read Message replica query"))?;
+                let value = serde_json::from_str(&body).map_err(|error| ResourceError::decode(error.to_string()))?;
+                let synced_at = chrono::DateTime::parse_from_rfc3339(&synced_at).map_err(|error| ResourceError::decode(error.to_string()))?.with_timezone(&Utc);
+                Ok(ReadResourceObject { object: Self::decode_object(value)?, provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin), last_synced_at: synced_at } })
+            }).collect::<Result<Vec<_>, ResourceError>>()
+        }).await
     }
 
     pub(crate) async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
@@ -2489,5 +2545,35 @@ mod tests {
         assert!(matches!(error, ResourceError::Conflict { .. }), "unexpected quarantine-delete error: {error}");
         assert!(backend.get_typed::<Environment>("flotilla", "contended").await.is_ok(), "the concurrent live resource must remain intact");
         assert_eq!(backend.diagnostics().await.expect("read diagnostics").decode_quarantines.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod message_query_plan_tests {
+    use super::*;
+
+    // Bounded inbox work requires SQLite to select indexed names before decoding,
+    // rather than visiting every terminal audit body in the namespace.
+    #[tokio::test]
+    async fn message_queries_use_history_independent_indexes() {
+        let backend = SqliteBackend::open_in_memory().unwrap();
+        backend.read_call("inspect Message query plans", |connection| {
+            for (query, expected) in [
+                (crate::MessageQuery::active(), "resource_objects_message_inbox"),
+                (crate::MessageQuery::Active { receiver: Some("project/role".into()) }, "resource_objects_message_active"),
+                (crate::MessageQuery::ReplyTo { name: "request".into() }, "resource_objects_message_reply"),
+                (crate::MessageQuery::Batch { id: "batch".into() }, "resource_objects_message_batch"),
+                (crate::MessageQuery::AuditBefore { before: Utc::now() }, "message_audit_age"),
+            ] {
+                let (predicate, argument) = query.sql();
+                let index = query.sql_index(false);
+                let sql = format!("EXPLAIN QUERY PLAN SELECT body_json FROM resource_objects INDEXED BY {index} WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND kind='Message' AND ({predicate}) AND (?5 IS NULL OR ?5 IS NOT NULL) ORDER BY name");
+                let mut statement = connection.prepare(&sql).unwrap();
+                let rows = statement.query_map(params!["flotilla.work", "v1", "Message", "flotilla", argument], |row| row.get::<_, String>(3)).unwrap();
+                let plan = rows.collect::<Result<Vec<_>, _>>().unwrap().join("\n");
+                assert!(plan.contains(expected), "{query:?} should use {expected}: {plan}");
+            }
+            Ok(())
+        }).await.unwrap();
     }
 }

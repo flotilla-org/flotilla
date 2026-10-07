@@ -1388,223 +1388,286 @@ async fn closed_batch_recovery_clears_only_its_existing_delivery_gate() {
     assert_eq!(transport.submissions.lock().expect("inputs").len(), 1);
 }
 
+// The next-generation pre-roll guard refuses every legacy authority witness
+// before typed decoding can discard retired fields; clean new shapes pass.
+#[hegel::test]
+fn migration_guard_refuses_legacy_authority_witnesses(tc: hegel::TestCase) {
+    let variant = tc.draw(gs::integers::<u8>().min_value(0).max_value(4));
+    let clean = tc.draw(gs::booleans());
+    let mut document = match variant {
+        0 => serde_json::json!({"kind":"TerminalSession", "status":{"legacy_message_receipts":{}}}),
+        1 => serde_json::json!({"kind":"TerminalSession", "spec":{"source":{"message":null}}}),
+        2 | 3 => serde_json::json!({"kind":"Convoy", "status":{"turn_deliveries":{"source":{}}}}),
+        _ => serde_json::json!({"kind":"Message", "status":{"submission":{"batch_id":"new"}}}),
+    };
+    if !clean {
+        match variant {
+            0 => document["status"]["legacy_message_receipts"]["receipt"] = serde_json::json!({"sender":"system:old"}),
+            1 => document["spec"]["source"]["message"] = serde_json::json!({"id":"old"}),
+            2 => document["status"]["turn_deliveries"]["source"]["pending_brief"] = serde_json::json!({"content":"old"}),
+            3 => document["status"]["turn_deliveries"]["source"]["pending_supervisor_turn"] = serde_json::json!({"message":{"id":"old"}}),
+            _ => document["status"]["submission"]["legacy_launch"] = serde_json::json!({"terminal":"old"}),
+        }
+    }
+    assert_eq!(flotilla_resources::validate_message_migration_complete(&document).is_ok(), clean);
+}
+
+// Legacy launch witnesses with ordinary receiver receipts or explicit operator
+// closure have no unresolved uncertainty and may be retired by the next decoder.
 #[tokio::test]
-async fn legacy_queue_adoption_retains_order_receipts_and_uncertainty() {
-    use flotilla_resources::*;
-    for reason in [None, Some(TERMINAL_DELIVERY_UNCONFIRMED_REASON), Some(TERMINAL_DELIVERY_EXPIRED_REASON)] {
-        let held = reason.is_some();
-        let (backend, _) = delivery_inbox().await;
-        let messages = backend.using::<Message>("flotilla");
-        for record in messages.list().await.expect("initial").items {
-            messages.delete(&record.metadata.name).await.expect("clear");
-        }
-        let terminals = backend.using::<TerminalSession>("flotilla");
-        let terminal = terminals.get("terminal").await.expect("terminal");
-        let mut intent = terminal.spec.clone();
-        let legacy = |id: &str, following| TerminalCrewMessage {
-            id: id.into(),
-            text: format!("legacy-{id}"),
-            sender: CrewMessageSender::FlotillaNudge,
-            delivery: CrewMessageDelivery::Queued,
-            following,
-            acknowledged: Default::default(),
-        };
-        if let TerminalSessionSource::Agent { message, .. } = &mut intent.source {
-            *message = Some(legacy("ack", vec![legacy("held", vec![]), legacy("next", vec![])]));
-        }
-        let terminal =
-            terminals.update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &intent).await.expect("old spec");
-        let mut status = terminal.status.clone().expect("status");
-        status.delivered_message_id = Some("ack".into());
-        if let Some(reason) = reason {
-            status.degraded = Some(TerminalSessionDegradedCondition {
-                reason: reason.into(),
-                message: "old ambiguous input".into(),
-                message_id: Some("held".into()),
-                consecutive_failures: 3,
-                observed_at: at(20),
-            });
-        }
-        let terminal = terminals.update_status("terminal", &terminal.metadata.resource_version, &status).await.expect("old receipt");
-        assert!(terminals.adopt_legacy_messages(&terminal, at(30)).await.expect("adopt"));
-        let adopted = terminals.get("terminal").await.expect("adopted terminal");
-        assert!(!terminals.adopt_legacy_messages(&adopted, at(31)).await.expect("repeat"));
-        let records = messages.list().await.expect("adopted messages").items;
-        assert_eq!(records.len(), 2);
-        let first = records.iter().find(|record| record.spec.body == "legacy-held").expect("pending head");
-        let second = records.iter().find(|record| record.spec.body == "legacy-next").expect("pending next");
-        assert!(first.status.as_ref().expect("status").accepted_sequence < second.status.as_ref().expect("status").accepted_sequence);
-        assert_eq!(first.status.as_ref().expect("status").submission.is_some(), held);
-        assert!(adopted.status.as_ref().unwrap().legacy_message_receipts.contains_key("ack"));
-        let replay = legacy("ack", vec![]);
-        let replay_spec = legacy_message_spec(&first.spec.receiver, &replay);
-        let replay_name = message_record_name(&replay_spec.receiver, &replay_spec.sender, &replay.id);
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
-        inbox.accept(&InputMeta::builder().name(replay_name.clone()).build(), &replay_spec, at(31)).await.unwrap();
-        let receipt_transport = FakeMessageTransport {
-            submissions: Default::default(),
-            observations: Default::default(),
-            outcome: MessageTransportOutcome::Pending,
-            accepted: Default::default(),
-            working: Default::default(),
-        };
-        inbox.reconcile_delivery(&receipt_transport, at(31)).await.unwrap();
-        let replay = messages.get(&replay_name).await.unwrap();
-        assert_eq!(replay.status.unwrap().phase, MessagePhase::Delivered, "late authority intent retains its original receipt");
-        assert!(!receipt_transport.submissions.lock().unwrap().iter().any(|text| text.contains("legacy-ack")));
-        if held {
-            assert_eq!(first.status.as_ref().expect("status").retry.as_ref().expect("retry").attempts, 3);
-            let transport = FakeMessageTransport {
-                submissions: Default::default(),
-                observations: Default::default(),
-                outcome: MessageTransportOutcome::Unconfirmed { reason: "old input still uncertain".into() },
-                accepted: Default::default(),
-                working: Default::default(),
-            };
-            let inbox = MessageInbox::new(backend.clone(), "flotilla");
-            inbox.reconcile_delivery(&transport, at(32)).await.expect("held observation");
-            assert!(transport.submissions.lock().expect("submissions").is_empty());
-            transport.accepted.store(true, std::sync::atomic::Ordering::SeqCst);
-            inbox.reconcile_delivery(&transport, at(33)).await.expect("late receipt");
-            assert_eq!(messages.get(&first.metadata.name).await.expect("receipt").status.expect("status").phase, MessagePhase::Delivered);
-            assert!(transport.submissions.lock().expect("submissions").is_empty());
-        }
+async fn migration_guard_accepts_resolved_legacy_launches() {
+    for status in [
+        serde_json::json!({"phase":"delivered", "resolved_receiver":{"crew_id":"crew", "session":"session", "delivered_at":at(20), "evidence":"receipt"}}),
+        serde_json::json!({"phase":"dead_lettered", "reason":"operator failed batch: explicitly resolved"}),
+    ] {
+        let mut document = serde_json::json!({"kind":"Message", "status":status});
+        document["status"]["submission"] = serde_json::json!({"legacy_launch":{"terminal":"old"}});
+        flotilla_resources::validate_message_migration_complete(&document).expect("resolved witness is eligible");
     }
 }
 
+// Both backing stores exclude terminal history, retain batch members/replies,
+// and preserve exact producer replay after age-based body compaction.
 #[tokio::test]
-async fn legacy_launch_adoption_requires_the_original_launch_witness() {
-    use flotilla_resources::*;
-    for (matches_launch, same_attempt, known_start) in [(true, true, true), (false, true, true), (true, false, true), (true, true, false)] {
-        let (backend, _) = delivery_inbox().await;
-        let messages = backend.using::<Message>("flotilla");
-        for record in messages.list().await.expect("initial").items {
-            messages.delete(&record.metadata.name).await.expect("clear");
-        }
-        let terminals = backend.using::<TerminalSession>("flotilla");
-        let terminal = terminals.get("terminal").await.expect("terminal");
-        let mut spec = terminal.spec.clone();
-        if let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source {
-            brief.content = "old launch input".into();
-            *message = Some(TerminalCrewMessage {
-                id: "launch".into(),
-                text: brief.content.clone(),
-                sender: CrewMessageSender::FlotillaNudge,
-                delivery: CrewMessageDelivery::LaunchBrief,
-                following: Vec::new(),
-                acknowledged: Default::default(),
-            });
-        }
-        let terminal = terminals
-            .update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &spec)
-            .await
-            .expect("stored launch");
-        let terminal = terminals
-            .update_status("terminal", &terminal.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Starting,
-                started_at: known_start.then(|| at(5)),
-                ..Default::default()
-            })
-            .await
-            .expect("launch lacks identity");
-        terminals.adopt_legacy_messages(&terminal, at(20)).await.expect("adopt launch");
-        let transport = FakeMessageTransport {
-            submissions: Default::default(),
-            observations: Default::default(),
-            outcome: MessageTransportOutcome::Unconfirmed { reason: "old launch".into() },
-            accepted: std::sync::atomic::AtomicBool::new(true),
-            working: Default::default(),
-        };
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
-        inbox.reconcile_delivery(&transport, at(21)).await.expect("hold unknown identity");
-        assert!(messages.list().await.expect("held").items[0].status.as_ref().expect("status").resolved_receiver.is_none());
-        let mut terminal = terminals.get("terminal").await.expect("adopted terminal");
-        if !matches_launch {
-            let mut spec = terminal.spec.clone();
-            if let TerminalSessionSource::Agent { brief, .. } = &mut spec.source {
-                brief.content = "replacement launch".into();
+async fn indexed_message_history_and_retention_contract() {
+    use flotilla_resources::{MessageInbox, MessageQuery, MessageSubmission, SqliteBackend};
+    for backend in
+        [ResourceBackend::InMemory(Default::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))]
+    {
+        let resolver = backend.using::<Message>("flotilla");
+        let inbox = MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(1);
+        let intent = spec(None, MessageExpectation::None);
+        for index in 0..256 {
+            let meta = InputMeta::builder().name(format!("history-{index}")).build();
+            inbox.accept(&meta, &intent, at(10)).await.expect("admit history");
+            let record = resolver.get(&meta.name).await.expect("record");
+            let mut status = record.status.unwrap();
+            status.phase = MessagePhase::Expired;
+            status.since = at(20);
+            if index == 2 {
+                status.phase = MessagePhase::Superseded;
+                status.canonical_predecessor = Some(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "history-1"));
             }
-            terminal = terminals
-                .update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &spec)
-                .await
-                .expect("replacement");
+            resolver.update_status(&meta.name, &record.metadata.resource_version, &status).await.expect("terminal history");
         }
-        terminals
-            .update_status("terminal", &terminal.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                started_at: Some(if same_attempt { at(5) } else { at(21) }),
-                session_id: Some("boot-session".into()),
-                crew: Some(CrewSessionStatus { id: "boot-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
-                ..Default::default()
-            })
-            .await
-            .expect("running launch");
-        inbox.reconcile_delivery(&transport, at(22)).await.expect("observe launch acceptance");
-        let receipt = messages.list().await.expect("receipt").items.remove(0).status.expect("status");
-        let original_attempt = matches_launch && same_attempt && known_start;
-        assert_eq!(receipt.phase.has_delivery_evidence(), original_attempt);
-        if original_attempt {
-            assert_eq!(receipt.resolved_receiver.expect("receiver").session, "boot-session");
-        }
-        assert!(transport.submissions.lock().expect("typed input").is_empty());
+        let active_meta = InputMeta::builder().name("active".into()).build();
+        inbox.accept(&active_meta, &intent, at(30)).await.expect("active input");
+        assert_eq!(resolver.query(&MessageQuery::active()).await.unwrap().len(), 1);
+        assert_eq!(resolver.query(&MessageQuery::Active { receiver: Some("other/role".into()) }).await.unwrap().len(), 0);
+        let active = resolver.get("active").await.unwrap();
+        let mut status = active.status.unwrap();
+        status.submission = Some(
+            MessageSubmission::builder()
+                .batch_id("recovery".into())
+                .crew_id("crew".into())
+                .session("session".into())
+                .started_at(at(30))
+                .members(vec!["active".into(), "history-0".into()])
+                .build(),
+        );
+        resolver.update_status("active", &active.metadata.resource_version, &status).await.unwrap();
+        assert_eq!(resolver.query(&MessageQuery::Batch { id: "recovery".into() }).await.unwrap().len(), 1);
+        assert_eq!(inbox.compact_audit(at(86420)).await.unwrap(), 0, "exact retention boundary keeps bodies");
+        assert_eq!(inbox.compact_audit(at(86421)).await.unwrap(), 255, "active recovery protects its terminal member");
+        let compacted = resolver.get("history-1").await.unwrap();
+        assert!(compacted.spec.body.is_empty());
+        assert!(compacted.spec.body_digest.is_some());
+        assert_eq!(compacted.status.unwrap().phase, MessagePhase::Expired);
+        let replay = inbox.accept(&InputMeta::builder().name("history-1".into()).build(), &intent, at(90000)).await.unwrap();
+        assert!(matches!(replay, flotilla_resources::MessageAdmission::Accepted(_)));
+        let suppressed = inbox.accept(&InputMeta::builder().name("history-2".into()).build(), &intent, at(90000)).await.unwrap();
+        assert!(
+            matches!(suppressed, flotilla_resources::MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "history-1")
+        );
+        assert!(!resolver.get("history-0").await.unwrap().spec.body.is_empty());
+        assert_eq!(inbox.compact_audit(at(90000)).await.unwrap(), 0, "compaction is idempotent");
+        let reply_spec = MessageSpec::builder()
+            .sender("flotilla/receiver".into())
+            .receiver("flotilla/checks".into())
+            .relation(MessageRelation::Peer)
+            .body("reply".into())
+            .in_reply_to("active".into())
+            .build();
+        inbox.accept(&InputMeta::builder().name("reply".into()).build(), &reply_spec, at(40)).await.unwrap();
+        assert_eq!(backend.query_messages("flotilla", &MessageQuery::ReplyTo { name: "active".into() }).await.unwrap().len(), 1);
+        resolver.delete("reply").await.unwrap();
+        assert!(backend.query_messages("flotilla", &MessageQuery::ReplyTo { name: "active".into() }).await.unwrap().is_empty());
     }
 }
 
-// Upgrade adoption preserves counted unsent failures and the shared delivery
-// backoff. Exhausted legacy input cannot gain another automatic attempt.
+// New-shape submissions retain receiver-owned receipts across compaction;
+// unresolved transport evidence is retained with its body for explicit recovery.
 #[tokio::test]
-async fn legacy_unsent_adoption_preserves_shared_backoff_and_attempt_limit() {
-    use flotilla_resources::*;
-    for (failures, delay) in [(1, Some(60)), (2, Some(120)), (3, None), (4, None)] {
-        let (backend, _) = delivery_inbox().await;
+async fn audit_compaction_keeps_receipts_and_uncertain_submissions() {
+    use flotilla_resources::{MessageInbox, MessageSubmission};
+    let (backend, _) = delivery_inbox().await;
+    let inbox = MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(1);
+    let messages = backend.using::<Message>("flotilla");
+    for uncertain in [false, true] {
+        let name = if uncertain { "uncertain" } else { "receipt" };
+        let intent = spec(None, MessageExpectation::None);
+        inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, at(10)).await.unwrap();
+        let record = messages.get(name).await.unwrap();
+        let mut status = record.status.unwrap();
+        status.phase = if uncertain { MessagePhase::DeadLettered } else { MessagePhase::Satisfied };
+        status.since = at(20);
+        status.submission = Some(
+            MessageSubmission::builder()
+                .batch_id(name.into())
+                .crew_id("crew".into())
+                .session("session".into())
+                .started_at(at(10))
+                .members(vec![name.into()])
+                .build(),
+        );
+        if !uncertain {
+            status.resolved_receiver = Some(
+                ResolvedMessageReceiver::builder()
+                    .crew_id("crew".into())
+                    .session("session".into())
+                    .delivered_at(at(15))
+                    .evidence("receipt".into())
+                    .build(),
+            );
+        }
+        messages.update_status(name, &record.metadata.resource_version, &status).await.unwrap();
+        if !uncertain {
+            let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+            let convoy = convoys.get("convoy").await.unwrap();
+            let mut convoy_status = convoy.status.unwrap_or_default();
+            let state = flotilla_resources::CrewWorkState::builder()
+                .phase(flotilla_resources::CrewWorkPhase::Done)
+                .pending_follow_up(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", name))
+                .build();
+            convoy_status.crew_work.entry("work".into()).or_default().insert("coder".into(), state);
+            let convoy = convoys.update_status("convoy", &convoy.metadata.resource_version, &convoy_status).await.unwrap();
+            assert_eq!(inbox.compact_audit(at(90000)).await.unwrap(), 0, "pending workflow continuation keeps its body");
+            assert!(!messages.get(name).await.unwrap().spec.body.is_empty());
+            convoy_status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().pending_follow_up = None;
+            convoys.update_status("convoy", &convoy.metadata.resource_version, &convoy_status).await.unwrap();
+        }
+        inbox.compact_audit(at(90000)).await.unwrap();
+        let compacted = messages.get(name).await.unwrap();
+        assert_eq!(compacted.status.as_ref(), Some(&status));
+        assert_eq!(compacted.spec.body.is_empty(), !uncertain);
+        assert_eq!(MessageInbox::new(backend.clone(), "flotilla").with_audit_retention_days(0).compact_audit(at(900000)).await.unwrap(), 0);
+    }
+}
+
+// Indexed results agree with the stored view after each generated lifecycle
+// step, including deletion/recreation and receiver-home replica replacement.
+#[hegel::test]
+fn message_indexes_follow_authority_and_replica_lifecycles(tc: hegel::TestCase) {
+    use flotilla_protocol::NodeId;
+    use flotilla_resources::{MessageQuery, SqliteBackend};
+    // Names collide deliberately; operations span empty, duplicate, terminal,
+    // and recreated records. Replica snapshots follow every authority step.
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    let operations: Vec<_> = (0..steps)
+        .map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(3)), tc.draw(gs::integers::<u8>().min_value(0).max_value(2))))
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        for backend in [ResourceBackend::InMemory(Default::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())] {
+            let resolver = backend.using::<Message>("flotilla");
+            for (step, (id, operation)) in operations.iter().enumerate() {
+                let name = format!("message-{id}");
+                match operation {
+                    0 => {
+                        if matches!(resolver.get(&name).await, Err(flotilla_resources::ResourceError::NotFound { .. })) {
+                            let mut intent = spec(None, MessageExpectation::None);
+                            intent.in_reply_to = Some(format!("request-{}", id % 2));
+                            resolver.create(&InputMeta::builder().name(name.clone()).build(), &intent).await.unwrap();
+                        }
+                    }
+                    1 => {
+                        if let Ok(record) = resolver.get(&name).await {
+                            if record.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
+                                resolver
+                                    .update_status(
+                                        &name,
+                                        &record.metadata.resource_version,
+                                        &MessageStatus::builder().phase(MessagePhase::Expired).since(at(step as i64)).build(),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    _ => {
+                        if resolver.get(&name).await.is_ok() {
+                            resolver.delete(&name).await.unwrap();
+                        }
+                    }
+                }
+                let snapshot = resolver.list().await.unwrap();
+                let expected: std::collections::BTreeSet<_> = snapshot
+                    .items
+                    .iter()
+                    .filter(|record| record.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+                    .map(|record| record.metadata.name.clone())
+                    .collect();
+                let indexed: std::collections::BTreeSet<_> =
+                    resolver.query(&MessageQuery::active()).await.unwrap().into_iter().map(|record| record.metadata.name).collect();
+                assert_eq!(indexed, expected);
+                backend
+                    .replica_writer::<Message>(NodeId::new("receiver-home"), "remote")
+                    .replace(&snapshot, at(step as i64))
+                    .await
+                    .unwrap();
+                let replica_active: std::collections::BTreeSet<_> = backend
+                    .query_messages("remote", &MessageQuery::active())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| record.object.metadata.name)
+                    .collect();
+                assert_eq!(replica_active, expected);
+                for id in 0..2 {
+                    let name = format!("request-{id}");
+                    let expected = snapshot.items.iter().filter(|record| record.spec.in_reply_to.as_ref() == Some(&name)).count();
+                    assert_eq!(backend.query_messages("remote", &MessageQuery::ReplyTo { name }).await.unwrap().len(), expected);
+                }
+            }
+        }
+    });
+}
+
+// Growing terminal history does not change the active delivery batch or the
+// number of holder observations made by a receiver reconciliation pass.
+#[tokio::test]
+async fn active_delivery_work_is_independent_of_audit_history() {
+    use flotilla_resources::MessageTransportOutcome;
+    for historical in [0, 256] {
+        let (backend, inbox) = delivery_inbox().await;
         let messages = backend.using::<Message>("flotilla");
-        for record in messages.list().await.expect("fixture inbox").items {
-            messages.delete(&record.metadata.name).await.expect("clear fixture");
+        for id in 0..historical {
+            let record = messages
+                .create(&InputMeta::builder().name(format!("old-{id}")).build(), &spec(None, MessageExpectation::None))
+                .await
+                .unwrap();
+            messages
+                .update_status(
+                    &record.metadata.name,
+                    &record.metadata.resource_version,
+                    &MessageStatus::builder().phase(MessagePhase::Expired).since(at(1)).build(),
+                )
+                .await
+                .unwrap();
         }
-        let terminals = backend.using::<TerminalSession>("flotilla");
-        let terminal = terminals.get("terminal").await.expect("fixture receiver");
-        let mut spec = terminal.spec.clone();
-        if let TerminalSessionSource::Agent { message, .. } = &mut spec.source {
-            *message = Some(TerminalCrewMessage {
-                id: "unsent".into(),
-                text: "old unsent input".into(),
-                sender: CrewMessageSender::FlotillaNudge,
-                delivery: CrewMessageDelivery::Queued,
-                following: Vec::new(),
-                acknowledged: Default::default(),
-            });
-        }
-        let terminal = terminals
-            .update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &spec)
-            .await
-            .expect("legacy payload");
-        let mut status = terminal.status.clone().expect("receiver status");
-        status.degraded = Some(TerminalSessionDegradedCondition {
-            reason: TERMINAL_DELIVERY_NOT_SUBMITTED_REASON.into(),
-            message: "definitely unsent".into(),
-            message_id: Some("unsent".into()),
-            consecutive_failures: failures,
-            observed_at: at(20),
-        });
-        let terminal = terminals.update_status("terminal", &terminal.metadata.resource_version, &status).await.expect("legacy retry count");
-        terminals.adopt_legacy_messages(&terminal, at(30)).await.expect("adopt unsent state");
-        let record = messages.list().await.expect("adopted input").items.remove(0);
-        let status = record.status.expect("adopted retry state");
-        assert!(status.submission.is_none(), "definitely unsent input has no possible-write witness");
-        let retry = status.retry.expect("preserved failure budget");
-        assert_eq!(retry.attempts, failures);
-        assert_eq!(retry.next_attempt_at(), delay.map(|seconds| at(20) + chrono::Duration::seconds(seconds)));
         let transport = FakeMessageTransport {
             submissions: Default::default(),
             observations: Default::default(),
-            outcome: MessageTransportOutcome::Unconfirmed { reason: "possible new input".into() },
+            outcome: MessageTransportOutcome::Accepted { evidence: "receipt".into() },
             accepted: Default::default(),
             working: Default::default(),
         };
-        let inbox = MessageInbox::new(backend.clone(), "flotilla");
-        inbox.reconcile_delivery(&transport, at(30)).await.expect("not due or exhausted");
-        assert!(transport.submissions.lock().expect("input log").is_empty());
-        inbox.reconcile_delivery(&transport, at(200)).await.expect("due retry or exhausted hold");
-        assert_eq!(transport.submissions.lock().expect("input log").len(), usize::from(delay.is_some()));
+        inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+        assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let submissions = transport.submissions.lock().unwrap().clone();
+        assert_eq!(submissions.len(), 1);
+        assert!(submissions[0].contains("body-0") && submissions[0].contains("body-1") && submissions[0].contains("body-2"));
+        assert!(!submissions[0].contains("review the settled checks"));
+        assert_eq!(messages.list().await.unwrap().items.len(), historical + 3, "audit identities stay present");
     }
 }

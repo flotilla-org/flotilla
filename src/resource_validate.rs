@@ -12,7 +12,7 @@ use flotilla_core::{
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
-use flotilla_resources::validate_resource_document;
+use flotilla_resources::{validate_message_migration_complete, validate_resource_document};
 #[cfg(unix)]
 use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS};
 use serde::Deserialize;
@@ -122,7 +122,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                         }
                     }
                 }
-                if let Err(error) = validate_resource_document(item) {
+                if let Err(error) = validate_message_migration_complete(item).and_then(|()| validate_resource_document(item)) {
                     eprintln!("{label}/{name}: {error}");
                     failed = true;
                 }
@@ -652,6 +652,83 @@ mod tests {
         let error = validate_resource_document(&document).expect_err("unknown nested status field must fail");
         assert!(error.to_string().contains("status.workflow_snapshot.vessels[0]"), "{error}");
         assert!(error.to_string().contains("retired_field"), "{error}");
+    }
+
+    // Process-boundary stand-in serves previous-generation raw records. The
+    // candidate must inspect all advertised stores and refuse a legacy receipt
+    // before new-generation typed decoders can silently drop the retired field.
+    #[tokio::test]
+    async fn daemon_gate_refuses_legacy_receipts_in_an_advertised_store() {
+        use flotilla_resources::{TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+        flotilla_core::tls::install_default_provider();
+        for legacy in [false, true] {
+            let backend = flotilla_resources::ResourceBackend::InMemory(Default::default());
+            let record = backend
+                .using::<TerminalSession>("flotilla")
+                .create(
+                    &InputMeta::builder().name("queue".into()).build(),
+                    &TerminalSessionSpec::builder()
+                        .env_ref("env".into())
+                        .role("tool".into())
+                        .source(TerminalSessionSource::Tool { command: "true".into() })
+                        .cwd("/workspace".into())
+                        .pool("cleat".into())
+                        .build(),
+                )
+                .await
+                .unwrap();
+            let mut document = serde_json::to_value(record.to_k8s_object()).unwrap();
+            document["status"] = serde_json::to_value(TerminalSessionStatus::default()).unwrap();
+            let mut old = document.clone();
+            if legacy {
+                old["status"]["legacy_message_receipts"] = serde_json::json!({"old-input":{"sender":null,"receiver":null}});
+            }
+            let socket_dir = TestSocketDir::new();
+            let socket = socket_dir.socket_path("old-message-api.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                for (path, body) in [
+                    (
+                        "/apis/flotilla.work/v1",
+                        serde_json::json!({"kinds":["terminalsessions"], "namespaces":{"terminalsessions":["flotilla"]},"stores":["/observed"]}),
+                    ),
+                    (
+                        "/observed/apis/flotilla.work/v1",
+                        serde_json::json!({"kinds":["terminalsessions"], "namespaces":{"terminalsessions":["flotilla"]}}),
+                    ),
+                    (
+                        "/apis/flotilla.work/v1/namespaces/flotilla/terminalsessions?replicaSources=true",
+                        serde_json::json!({"items":[document]}),
+                    ),
+                    (
+                        "/observed/apis/flotilla.work/v1/namespaces/flotilla/terminalsessions?replicaSources=true",
+                        serde_json::json!({"items":[old]}),
+                    ),
+                ] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    assert!(String::from_utf8_lossy(&request).starts_with(&format!("GET {path} HTTP/1.1")));
+                    let body = body.to_string();
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let result = validate_daemon(&socket, None, None).await;
+            assert_eq!(result.is_err(), legacy);
+            if !legacy {
+                assert_eq!(result.unwrap(), 2);
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

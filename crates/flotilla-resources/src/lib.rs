@@ -59,6 +59,8 @@ mod message_conditions;
 mod message_delivery;
 mod message_inbox;
 mod message_migration;
+mod message_query;
+mod message_retention;
 mod owner_gc;
 mod placement_policy;
 mod platform;
@@ -206,10 +208,10 @@ pub use registry::{
     get_resource_kind_all_provenances, get_resource_kind_including_replicas, home_bound_authorship_collisions, list_resource_kind,
     list_resource_kind_including_replicas, list_resource_kind_replica_sources, patch_resource_annotation, patch_resource_annotations,
     patch_resource_status, patch_resource_status_if_version, quarantine_undecodable_stored_objects, registered_resource_namespaces,
-    replica_cursor_for_resource_kind, resource_document_spec_hash, resource_list_api_version, validate_resource_document,
-    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
-    DynamicResourceDelete, DynamicResourceList, DynamicResourceObject, DynamicResourceWatch, HomeBoundAuthorshipCollision,
-    RegisteredResourceKind, MANIFEST_WRITER_SOURCE, REGISTERED_RESOURCE_KINDS,
+    replica_cursor_for_resource_kind, resource_document_spec_hash, resource_list_api_version, validate_message_migration_complete,
+    validate_resource_document, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
+    watch_resource_kind_replica_sources, DynamicResourceDelete, DynamicResourceList, DynamicResourceObject, DynamicResourceWatch,
+    HomeBoundAuthorshipCollision, RegisteredResourceKind, MANIFEST_WRITER_SOURCE, REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
@@ -287,8 +289,8 @@ macro_rules! for_each_registered_resource {
 }
 pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
 pub use message::{
-    message_record_name, LegacyMessageLaunch, LegacyMessageReceipt, Message, MessageExpectation, MessagePhase, MessageReference,
-    MessageRelation, MessageSpec, MessageStatus, MessageStatusPatch, MessageSubmission, ResolvedMessageReceiver,
+    message_record_name, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus,
+    MessageStatusPatch, MessageSubmission, ResolvedMessageReceiver,
 };
 pub use message_delivery::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
 pub use message_inbox::{
@@ -296,6 +298,7 @@ pub use message_inbox::{
     validate_message_address, MessageAddressContext, MessageAdmission, MessageInbox,
 };
 pub use message_migration::{legacy_message_sender, legacy_message_spec};
+pub use message_query::{message_query_document, MessageQuery};
 pub use workflow_template::{
     current_builtin_workflow_name, implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec,
     single_agent_workflow_spec, validate, AllocationDecision, ArtifactSubjectBinding, ClaimExit, CompletionCondition,

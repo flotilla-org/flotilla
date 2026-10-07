@@ -507,11 +507,10 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
 fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    // Generate repeated idle passes and both queue positions (head/following).
-    // Each case runs every lifecycle state against both real storage backends.
-    // The convoy turn stays a single message; its position in the terminal queue varies.
+    // Generate repeated idle passes and pending/terminal Message states.
+    // Every case uses both real storage backends with new-only terminal shapes.
     let passes = tc.draw(gs::integers::<usize>().min_value(2).max_value(4));
-    let following = tc.draw(gs::booleans());
+    let terminal_message = tc.draw(gs::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
         for sqlite in [false, true] {
@@ -536,19 +535,6 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
             let convoys = backend.clone().using::<ResourceConvoy>(namespace);
             assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "empty store", passes).await;
 
-            let message = TerminalCrewMessage {
-                id: "supervisor-turn".to_string(),
-                text: "Supervise".to_string(),
-                sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                delivery: CrewMessageDelivery::Queued,
-                acknowledged: Default::default(),
-                following: Vec::new(),
-            };
-            let mut head = message.clone();
-            if following {
-                head.id = "earlier-turn".to_string();
-                head.append(message.clone());
-            }
             let spec = ResourceTerminalSessionSpec {
                 env_ref: "env".to_string(),
                 role: "governor".to_string(),
@@ -565,7 +551,7 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                         convoy: "convoy".to_string(),
                         vessel_ref: "govern".to_string(),
                     }),
-                    message: Some(head),
+                    message: None,
                 },
                 cwd: "/workspace".to_string(),
                 env: Default::default(),
@@ -579,18 +565,7 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                 .await
                 .expect("convoy");
             convoys
-                .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                    turn_deliveries: BTreeMap::from([(message.id.clone(), flotilla_resources::TurnDeliveryStatus {
-                        pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
-                            vessel: "govern".to_string(),
-                            role: "governor".to_string(),
-                            message: message.clone(),
-                            queued_order: 1,
-                        }),
-                        ..Default::default()
-                    })]),
-                    ..Default::default()
-                })
+                .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus::default())
                 .await
                 .expect("pending turn");
             let session = sessions
@@ -614,23 +589,23 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                 })
                 .await
                 .expect("running terminal");
-            daemon.reconcile_pending_supervisor_turns_once(namespace).await.expect("one-time queue adoption");
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "adopted turn", passes).await;
-            let session = sessions.get("governor").await.expect("adopted terminal");
-            let mut status = session.status.expect("running status");
-            status.delivered_message_id = Some(message.id);
-            sessions.update_status("governor", &session.metadata.resource_version, &status).await.expect("delivered turn");
-            daemon.reconcile_pending_supervisor_turns_once(namespace).await.expect("acknowledge delivered turn");
-            // The real acknowledgment clears the pending convoy turn while retaining
-            // the terminal queue and its delivered-message status.
-            let acknowledged = convoys.get("convoy").await.expect("acknowledged convoy");
-            assert!(acknowledged
-                .status
-                .expect("convoy status")
-                .turn_deliveries
-                .values()
-                .all(|turn| turn.pending_supervisor_turn.is_none()));
-            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "already acknowledged turn", passes).await;
+            let intent = flotilla_resources::MessageSpec::builder()
+                .sender("system:test".into())
+                .receiver("noop-contract/convoy/govern/governor".into())
+                .relation(flotilla_resources::MessageRelation::System)
+                .body("supervise".into())
+                .build();
+            let inbox = daemon.message_inbox(namespace).await;
+            inbox.accept(&test_meta("input"), &intent, Utc::now()).await.expect("new Message");
+            if terminal_message {
+                let messages = backend.using::<flotilla_resources::Message>(namespace);
+                let record = messages.get("input").await.unwrap();
+                let mut status = record.status.unwrap();
+                status.phase = flotilla_resources::MessagePhase::Expired;
+                status.since = Utc::now();
+                messages.update_status("input", &record.metadata.resource_version, &status).await.unwrap();
+            }
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "new-only Message", passes).await;
         }
     });
 }
