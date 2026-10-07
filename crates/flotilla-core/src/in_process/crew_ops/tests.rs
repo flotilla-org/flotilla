@@ -1655,6 +1655,7 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
 fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let local_supervisor = tc.draw(gs::booleans());
+    let address_supervisor = tc.draw(gs::booleans());
     let retries = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let (crew, backend, _, _dir) = fixture(CrewWorkPhase::Done).await;
@@ -1665,6 +1666,14 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
             status.crew_work.get_mut("work").expect("work").insert("bosun".into(),
                 CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
             convoys.update_status("crew", &current.metadata.resource_version, &status).await.expect("supervisor");
+        }
+        if address_supervisor {
+            let current = convoys.get("crew").await.expect("convoy");
+            let mut status = current.status.expect("status");
+            status.workflow_snapshot.as_mut().expect("workflow").supervision = Some(vec![
+                flotilla_resources::SupervisionTarget::Address { address: "flotilla/attended".into() },
+            ]);
+            convoys.update_status("crew", &current.metadata.resource_version, &status).await.expect("address policy");
         }
         let mut request = crate::leaf_engine::CrewTurnIntent::builder()
             .namespace("flotilla".into()).convoy("crew".into()).source("checks-settled".into())
@@ -1681,7 +1690,7 @@ fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
         let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages");
         assert_eq!(messages.items.len(), 1, "retries cannot duplicate supervisor signals");
         let message = &messages.items[0];
-        assert_eq!(message.spec.receiver, if local_supervisor { "flotilla/crew/work/bosun" } else { "flotilla/governor" });
+        assert_eq!(message.spec.receiver, if address_supervisor { "flotilla/attended" } else if local_supervisor { "flotilla/crew/work/bosun" } else { "flotilla/governor" });
         assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::System);
         assert_eq!(message.spec.expectation, flotilla_resources::MessageExpectation::None);
         assert!(message.spec.body.contains("episode limit"));

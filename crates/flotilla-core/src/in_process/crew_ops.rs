@@ -3031,6 +3031,7 @@ impl CrewService {
                 // The existing project receiver resolver selects the session for this symbolic role.
                 // Vessel/crew selection belongs to that resolver, not hold delivery.
                 flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(format!("{project}/{convoy_role}")),
+                flotilla_resources::SupervisionTarget::Address { address } => Some(address.clone()),
                 flotilla_resources::SupervisionTarget::Operator => Some("principal:operator".into()),
             })
             .unwrap_or_else(|| "principal:operator".into());
