@@ -711,6 +711,9 @@ def write_launchd_agent(destination, label, daemon, path, skills, codex_home, co
 
 
 def refresh_darwin_payload(source, destination):
+    # Preserve recovery ordering: prune stale libraries first, then publish each
+    # file atomically. This is not a tree-wide transaction: a later copy failure
+    # can leave earlier replacements/pruning applied. Empty lib directories stay.
     source, destination = Path(source), Path(destination)
     files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
     files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
@@ -839,8 +842,17 @@ def main():
             systemd_path(args.path, args.home)
         elif args.command == "launchd-agent":
             write_launchd_agent(
-                args.destination, args.label, args.daemon, args.path, args.skills, args.codex_home,
-                args.config_dir, args.state_dir, args.socket, args.stderr_path, args.stdout_path,
+                args.destination,
+                args.label,
+                args.daemon,
+                args.path,
+                args.skills,
+                args.codex_home,
+                args.config_dir,
+                args.state_dir,
+                args.socket,
+                args.stderr_path,
+                args.stdout_path,
             )
         elif args.command == "darwin-payload":
             refresh_darwin_payload(args.source, args.destination)

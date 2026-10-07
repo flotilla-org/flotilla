@@ -115,11 +115,19 @@ class RecoveryHelperTests(unittest.TestCase):
                 (destination / "bin").mkdir(parents=True)
                 prior = destination / "bin" / "flotilla"
                 prior.write_text("prior")
+                # Pruning precedes publication and is not rolled back on failure;
+                # empty library directories deliberately remain, as in the heredoc.
+                library_dir = destination / "lib" / "nested"
+                library_dir.mkdir(parents=True)
+                stale = library_dir / "obsolete"
+                stale.write_text("stale")
                 collaborator = validation.shutil if boundary == "copy2" else validation.os
                 with patch.object(collaborator, boundary, side_effect=PermissionError):
                     with self.assertRaises(PermissionError):
                         validation.refresh_darwin_payload(source, destination)
                 self.assertEqual(prior.read_text(), "prior")
+                self.assertFalse(stale.exists())
+                self.assertTrue(library_dir.is_dir())
                 self.assertEqual(list(destination.rglob(".fleet-install-*")), [])
 
 
