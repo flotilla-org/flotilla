@@ -3840,6 +3840,7 @@ fn managed_terminal_changes_are_field_scoped_and_deduplicated() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
     let temp = tempfile::tempdir().expect("tempdir");

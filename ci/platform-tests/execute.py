@@ -20,6 +20,7 @@ def run(commands):
     for command in commands:
         tokens = command.split()
         package = default
+        explicit_package = None
         targets = []
         features = []
         filters = []
@@ -36,7 +37,9 @@ def run(commands):
                     raise ValueError(f"missing value for {token}")
                 value = tokens[index]
                 if token in ("-p", "--package"):
-                    package = value
+                    if explicit_package is not None and explicit_package != value:
+                        raise ValueError("each selector must name one package")
+                    explicit_package = package = value
                 elif token == "--features":
                     features.extend(value.split(","))
                 else:
@@ -51,15 +54,21 @@ def run(commands):
         if package not in packages:
             raise ValueError(f"unknown selector package: {package}")
         if not targets:
-            targets = [(t["kind"][0], t["name"]) for t in packages[package]["targets"]
-                       if t["test"] and t["kind"][0] in ("lib", "bin", "test")]
-        rows.append((packages[package]["id"], targets, filters + harness))
+            raise ValueError("selectors require --lib, --bin or --test; implicit targets include doctests")
+        rows.append((packages[package]["id"], targets, filters, harness))
         for args in [("-p", package)] + [("--" + kind,) if name is None else ("--" + kind, name)
                                          for kind, name in targets] + [("--features", f"{package}/{f}") for f in features]:
             if args not in union:
                 union.append(args)
-    argv = ["cargo", "--config", 'profile.dev.package."*".debug=0', "test", "--locked", "--no-run",
-            "--message-format=json", "--timings"] + [arg for args in union for arg in args]
+    version = subprocess.check_output(["rustc", "-vV"], text=True, encoding="utf-8")
+    host = next((line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: ")), None)
+    if not host:
+        raise ValueError("rustc did not report its host target")
+    runner = json.dumps([sys.executable, str(Path(__file__).resolve()), "--dispatch"])
+    common = ["cargo", "--config", 'profile.dev.package."*".debug=0',
+              "--config", f"target.{host}.runner={runner}", "test", "--locked"]
+    common += [arg for args in union for arg in args]
+    argv = common + ["--no-run", "--message-format=json", "--timings"]
     print("Unified build:", " ".join(argv), flush=True)
     build_start = time.monotonic()
     artifacts = []
@@ -73,28 +82,43 @@ def run(commands):
         if build.wait():
             raise subprocess.CalledProcessError(build.returncode, argv)
     print(f"Unified build seconds: {time.monotonic() - build_start:.2f}", flush=True)
-    for package, targets, args in rows:
+    # Cargo owns the runtime environment, including native library search paths
+    # and package variables. Every invocation keeps the same feature graph; the
+    # target runner prevents matching filters from leaking into other binaries.
+    for package, targets, filters, harness in rows:
         matched = [a for a in artifacts if a["package_id"] == package and any(
-            kind in a["target"]["kind"] and (name is None or name == a["target"]["name"])
+            kind_matches(kind, a["target"]["kind"]) and (name is None or name == a["target"]["name"])
             for kind, name in targets)]
         if not matched:
             raise ValueError(f"no test binary for {package}: {targets}")
-        for artifact in matched:
-            manifest = next(p["manifest_path"] for p in metadata["packages"] if p["id"] == package)
-            print("Selected target:", package, artifact["target"]["name"], args, flush=True)
-            test_start = time.monotonic()
-            subprocess.run([artifact["executable"], *args], check=True,
-                           cwd=Path(manifest).parent,
-                           env=dict(os.environ, CARGO_MANIFEST_DIR=str(Path(manifest).parent),
-                                    CARGO_MANIFEST_PATH=manifest))
-            print(f"Selected test seconds: {time.monotonic() - test_start:.2f}", flush=True)
+        print("Selected targets:", package, [a["target"]["name"] for a in matched], filters + harness, flush=True)
+        test_start = time.monotonic()
+        subprocess.run(common + filters + ["--", *harness],
+                       check=True, env=dict(os.environ, FLOTILLA_SELECTED_TEST_BINARIES=json.dumps(
+                           [str(Path(a["executable"]).resolve()) for a in matched])))
+        print(f"Selected test seconds (including Cargo dispatch): {time.monotonic() - test_start:.2f}", flush=True)
+
+
+def kind_matches(selector, kinds):
+    # Cargo may describe library targets with their crate types instead of `lib`.
+    libraries = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
+    return bool(libraries.intersection(kinds)) if selector == "lib" else selector in kinds
+
+
+def dispatch(binary, arguments):
+    selected = {os.path.normcase(path) for path in json.loads(os.environ["FLOTILLA_SELECTED_TEST_BINARIES"])}
+    if os.path.normcase(str(Path(binary).resolve())) in selected:
+        subprocess.run([binary, *arguments], check=True)
 
 
 if __name__ == "__main__":
     try:
-        run(sys.argv[1:])
-    except ValueError as error:
-        print(error, file=sys.stderr)
+        if sys.argv[1:2] == ["--dispatch"]:
+            dispatch(sys.argv[2], sys.argv[3:])
+        else:
+            run(sys.argv[1:])
+    except (ValueError, KeyError, StopIteration) as error:
+        print(f"invalid selector or Cargo metadata: {error}", file=sys.stderr)
         sys.exit(2)
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)

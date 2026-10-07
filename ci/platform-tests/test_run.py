@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -61,9 +62,54 @@ class RunnerTests(unittest.TestCase):
     def test_binary_failure_stops_execution(self):
         # Contract: test failures stop subsequent selectors even after a successful build.
         self.env["BINARY_EXIT"] = "9"
-        result, commands = self.run_job("windows", "windows|first\nwindows|second\n")
+        result, commands = self.run_job("windows", "windows|--lib first\nwindows|--lib second\n")
         self.assertEqual(result.returncode, 9)
         self.assertEqual(len([c for c in commands if c[0] == "execute"]), 1)
+
+    def test_cargo_runtime_context_and_multiple_artifacts(self):
+        # Contract: Cargo supplies package cwd, package variables and native search paths.
+        runtime = self.root / "runtime.jsonl"
+        self.env["RUNTIME_LOG"] = str(runtime)
+        result, commands = self.run_job("windows", "windows|-p flotilla-client --lib --bin flotilla same\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        contexts = [json.loads(line) for line in runtime.read_text().splitlines()]
+        self.assertEqual(len(contexts), 2)
+        for context in contexts:
+            self.assertEqual(context, {"cwd":str(self.root / "flotilla-client"), "package":"flotilla-client",
+                                       "version":"1.2.3", "libraries":str(self.root / "native")})
+        cargo_calls = [c for c in commands if c[0] != "execute"]
+        # All invocations use the same package/target/feature set.
+        self.assertEqual(cargo_calls[0][:cargo_calls[0].index("--no-run")],
+                         cargo_calls[1][:cargo_calls[0].index("--no-run")])
+
+    def test_library_crate_types(self):
+        # Contract: cdylib/rlib metadata still denotes a --lib test target.
+        self.env["LIBRARY_CRATE_TYPES"] = "1"
+        result, commands = self.run_job("windows", "windows|-p flotilla-client --lib selected\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in commands if c[0] == "execute"],
+                         [["execute", "flotilla-client", "lib", "selected"]])
+
+    def test_bad_cargo_json_fails_cleanly(self):
+        # Contract: malformed metadata/build messages fail closed without a traceback.
+        for variable in ["INVALID_METADATA", "INVALID_ARTIFACTS"]:
+            self.env[variable] = "1"
+            result, _ = self.run_job("windows", "windows|--lib selected\n")
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.env.pop(variable)
+            self.log.unlink(missing_ok=True)
+
+    def test_windows_uses_python_interpreter(self):
+        # Contract: Git Bash on Windows invokes `python`, without requiring `python3`.
+        marker = self.root / "python-used"
+        interpreter = self.root / "python"
+        interpreter.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec "{sys.executable}" "$@"\n')
+        interpreter.chmod(0o755)
+        self.env["OSTYPE"] = "msys"
+        result, _ = self.run_job("windows", "windows|--lib selected\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
 
     def test_checked_in_selectors_are_valid(self):
         # Contract: the checked-in list is accepted for every job without freezing its contents.
@@ -80,7 +126,7 @@ class RunnerTests(unittest.TestCase):
         for job, expected in [("windows", ["shared", "win"]), ("macos", ["shared", "mac"]),
                               ("tender-ssh", ["ssh"])]:
             self.log.unlink(missing_ok=True)
-            result, commands = self.run_job(job, "# comment\n\nall|shared\nwindows|win\nmacos|mac\ntender-ssh|ssh")
+            result, commands = self.run_job(job, "# comment\n\nall|--lib shared\nwindows|--lib win\nmacos|--lib mac\ntender-ssh|--lib ssh")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual([c[-1] for c in commands if c[0] == "execute"], expected)
 
@@ -93,7 +139,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_invalid_arguments_are_rejected_before_build(self):
         # Contract: missing option values, unsupported flags and unknown packages fail closed.
-        for arguments in ["--bin", "--features", "--unsupported", "-p missing --lib"]:
+        for arguments in ["--bin", "--features", "--unsupported", "-p missing --lib", "-p flotilla-client", "-p flotilla-client -p flotilla-tui --lib"]:
             result, commands = self.run_job("windows", f"windows|{arguments}\n")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertEqual(commands, [])
@@ -110,19 +156,19 @@ class RunnerTests(unittest.TestCase):
 
     def test_failure_stops_execution(self):
         # Contract: a failed test command fails the job without running later selectors.
-        result, commands = self.run_job("windows", "windows|first\nwindows|second\n", 7)
+        result, commands = self.run_job("windows", "windows|--lib first\nwindows|--lib second\n", 7)
         self.assertEqual(result.returncode, 7)
         self.assertEqual(len(commands), 1)
 
     def test_shell_metacharacters_are_literal(self):
         # Contract: selectors are argv, never evaluated as shell code.
-        result, commands = self.run_job("windows", "windows|$(touch sentinel) ; *\n")
+        result, commands = self.run_job("windows", "windows|--lib $(touch sentinel) ; *\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(commands[-1][3:], ["$(touch", "sentinel)", ";", "*"])
         self.assertFalse((self.root / "sentinel").exists())
 
     def test_crlf_and_duplicate_rows(self):
         # Contract: Windows checkout line endings do not enter argv; duplicates execute twice.
-        result, commands = self.run_job("windows", "# comment\r\nwindows|same\r\nwindows|same\r\n")
+        result, commands = self.run_job("windows", "# comment\r\nwindows|--lib same\r\nwindows|--lib same\r\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([c[-1] for c in commands if c[0] == "execute"], ["same", "same"])
