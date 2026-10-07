@@ -53,3 +53,5 @@ flotilla resource list Message
 Verify the escalation sender includes the full source convoy address and its receiver is the named supervisor role. Have that supervisor run the exact `crew supervise ... resume` command from the stall brief. Verify the ruling Message's `in_reply_to` names the escalation and its sender is the supervisor's fully qualified address. A failure or escalation ruling also leaves a reply Message.
 
 Existing PendingBrief and pending supervisor-turn records are read by the one-generation adoption pass and converted into Messages using deterministic IDs before their old queue fields are cleared. Do not create new legacy records on a live fleet; automated adoption tests cover this transition without regenerating the deployed golden corpus.
+
+After the first fleet roll deploying #2710, use [#2870](https://github.com/flotilla-org/flotilla/issues/2870) to retire the adoption scan, legacy sender serializer, and fixture helpers. Record the completed roll before removing the compatibility code. The same issue tracks the requirement to deploy #2711's receiver reference-visibility gate before enabling carries.
