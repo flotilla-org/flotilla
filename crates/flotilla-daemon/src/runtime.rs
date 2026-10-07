@@ -15217,6 +15217,42 @@ mod tests {
         runtime.shutdown();
     }
 
+    // These provisioning scenarios exercise a screen-only holder and a pool
+    // that records commands without starting processes. Native protocol coverage
+    // uses the injected app-server peer and the operator acceptance script.
+    struct ScreenOnlyAdapter(Arc<dyn AgentAdapter>);
+    #[async_trait]
+    impl AgentAdapter for ScreenOnlyAdapter {
+        fn id(&self) -> &'static str {
+            self.0.id()
+        }
+        async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &flotilla_resources::TerminalBrief) -> Result<(), String> {
+            self.0.prepare(cwd, brief).await
+        }
+        async fn prepare_with_vcs(
+            &self,
+            cwd: &ExecutionEnvironmentPath,
+            brief: &flotilla_resources::TerminalBrief,
+            env: &TerminalEnvVars,
+            vcs: &dyn flotilla_core::vcs::Vcs,
+        ) -> Result<(), String> {
+            self.0.prepare_with_vcs(cwd, brief, env, vcs).await
+        }
+        async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &flotilla_resources::TerminalBrief) -> Result<(), String> {
+            self.0.cleanup(cwd, brief).await
+        }
+        fn launch(&self, request: &AgentLaunchRequest) -> Result<flotilla_core::agent_adapter::AgentLaunchPlan, String> {
+            self.0.launch(request)
+        }
+        fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
+            self.0.classify_screen_attention(screen)
+        }
+    }
+    fn screen_only_codex(registry: &mut ProviderRegistry) {
+        let adapter = Arc::clone(registry.agent_adapters.get("codex").expect("Codex adapter"));
+        registry.agent_adapters.insert(Arc::new(ScreenOnlyAdapter(adapter)));
+    }
+
     async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
         crew_daemon_with_backend(config, ResourceBackend::InMemory(Default::default())).await
     }
@@ -18276,7 +18312,8 @@ mod tests {
         let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
         let current_socket = temp.path().join("current-daemon.sock");
         daemon.set_daemon_socket_path(current_socket.clone()).await;
-        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let mut local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        screen_only_codex(Arc::get_mut(&mut local_registry).expect("unshared test registry"));
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -18578,9 +18615,10 @@ mod tests {
         std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_path));
         let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
-        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let mut local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         assert!(local_registry.agent_adapters.get("codex").is_some());
         assert!(local_registry.agent_adapters.get("claude-code").is_some());
+        screen_only_codex(Arc::get_mut(&mut local_registry).expect("unshared test registry"));
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
         let backend = daemon.resource_backend();
 
@@ -18968,7 +19006,8 @@ mod tests {
         let mut convoy_watch =
             convoys.watch(flotilla_resources::WatchStart::resuming_from(&listed_before_restart)).await.expect("watch convoy recovery");
         let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
-        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
+        let mut local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
+        screen_only_codex(Arc::get_mut(&mut local_registry).expect("unshared test registry"));
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile after restart");
         let surviving_sessions = terminals
             .list()
