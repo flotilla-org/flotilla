@@ -12,7 +12,7 @@ import sys
 
 # Executed by the remote Python, never by a remote shell with interpolated paths.
 REMOTE = r'''
-import base64, hashlib, json, os, pathlib, sys
+import base64, hashlib, json, os, pathlib, sys, tempfile
 request = json.loads(base64.b64decode(sys.argv[1]))
 paths = [pathlib.Path(os.path.expanduser(p)) for p in request['paths']]
 if 'contents' in request:
@@ -26,18 +26,36 @@ if 'contents' in request:
     for b, data, mode in zip(backups, originals, modes):
         with b.open('xb') as f:
             f.write(data)
-        b.chmod(mode)
+            os.fchmod(f.fileno(), mode)
+            f.flush()
+            os.fsync(f.fileno())
+    created_temporaries = []
     try:
         for p, data, mode in zip(paths, request['contents'], modes):
             temporary = pathlib.Path(str(p) + '.new-' + request['generation'])
             with temporary.open('xb') as f:
+                created_temporaries.append(temporary)
                 f.write(base64.b64decode(data))
-            temporary.chmod(mode)
+                os.fchmod(f.fileno(), mode)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(temporary, p)
     except BaseException:
-        for p, data in zip(paths, originals):
-            p.write_bytes(data)
+        # Restore with atomic replacement; retain the original backups.
+        for p, b, mode in zip(paths, backups, modes):
+            with tempfile.NamedTemporaryFile(dir=p.parent, prefix=p.name + '.restore-', delete=False) as f:
+                restore = pathlib.Path(f.name)
+                created_temporaries.append(restore)
+                f.write(b.read_bytes())
+                os.fchmod(f.fileno(), mode)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(restore, p)
         raise
+    finally:
+        # Never remove another run's pre-existing collision file.
+        for temporary in created_temporaries:
+            temporary.unlink(missing_ok=True)
 print(json.dumps([hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else 'missing' for p in paths]))
 '''
 
@@ -52,10 +70,10 @@ def remote(host, request, command):
     if command:
         args = [command, host, invocation]
     elif host == 'raclette':
-        args = ['ssh', '-o', 'BatchMode=yes', 'silo',
+        args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'silo',
                 'qm guest exec 106 --pass-stdin 1 -- /bin/sh -c ' + shlex.quote(invocation)]
     else:
-        args = ['ssh', '-o', 'BatchMode=yes', host, invocation]
+        args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, invocation]
     result = subprocess.run(args, input=program, text=True, capture_output=True, check=True, timeout=120)
     output = json.loads(result.stdout)
     if host == 'raclette' and not command:
@@ -73,10 +91,15 @@ def digest(path):
 
 def check_pair(host, sources, paths, generation, sync, run):
     expected = [digest(p) for p in sources]
-    actual = run(host, {'paths': paths})
-    if actual != expected and sync:
-        actual = run(host, {'paths': paths, 'generation': generation,
-                            'contents': [base64.b64encode(p.read_bytes()).decode() for p in sources]})
+    try:
+        actual = run(host, {'paths': paths})
+        if actual != expected and sync:
+            actual = run(host, {'paths': paths, 'generation': generation,
+                                'contents': [base64.b64encode(p.read_bytes()).decode() for p in sources]})
+    except subprocess.CalledProcessError as error:
+        return [f'{host}: remote command failed: {error}; {error.stderr}']
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+        return [f'{host}: remote command failed: {error}']
     errors = [f'{host}:{path}: installed sha256={got}, generation sha256={want}'
               for path, got, want in zip(paths, actual, expected) if got != want]
     return errors
@@ -88,11 +111,11 @@ def check(root, generation, consumers, sync, run):
         ('raclette', ['lab-fleet-promote', 'lab-fleet-finalize-darwin', 'generation_validation.py'], '/usr/local/sbin/'),
         ('comte', ['lab-darwin-sign', 'generation_validation.py'], '~/.local/libexec/'),
     ]:
+        # Operator-owned lab tools must always remain read-only: no repair.
         errors += check_pair(host, [root / 'ci/fleet-candidates' / n for n in names],
                              [directory + n for n in names], generation, False, run)
     # A lab refusal never causes writes on consumers, even with --sync-bootstrap.
-    if errors:
-        return errors
+    sync = sync and not errors
     sources = [root / 'scripts/fleet-install', root / 'ci/fleet-candidates/generation_validation.py']
     for host in consumers:
         paths = ['~/.local/bin/fleet-install', '~/.local/bin/generation_validation.py']

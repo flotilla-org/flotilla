@@ -122,6 +122,126 @@ class Refusals(unittest.TestCase):
             self.assertEqual([p.read_bytes() for p in paths], [b'old', b'old'])
             self.assertEqual([Path(str(p) + '.pre-gen-1').read_bytes() for p in paths], [b'old', b'old'])
 
+    # Repair/rollback use flushed files and atomic replacements. A failure at
+    # the second replacement restores both originals and cleans owned temps.
+    def test_atomic_durable_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / n for n in ['fleet-install', 'generation_validation.py']]
+            for p in paths:
+                p.write_bytes(b'old')
+            events = Path(directory) / 'events.jsonl'
+            # Fake only the OS write boundary to fail the second replacement
+            # and observe atomic replacement/fsync; all file I/O remains real.
+            prelude = "import os, json\nevents_path = " + repr(str(events)) + "\n" + r'''
+replace_real, fsync_real = os.replace, os.fsync
+def event(data):
+    with open(events_path, 'a') as f:
+        f.write(json.dumps(data) + '\n')
+def replace(source, destination):
+    event(['replace', str(source), str(destination)])
+    if '.new-' in str(source) and str(destination).endswith('generation_validation.py'):
+        raise OSError('injected second replacement failure')
+    return replace_real(source, destination)
+def fsync(fd):
+    event(['fsync'])
+    return fsync_real(fd)
+os.replace, os.fsync = replace, fsync
+'''
+            request = {'paths': [str(p) for p in paths], 'generation': 'gen-1',
+                       'contents': [base64.b64encode(b'new').decode()] * 2}
+            payload = base64.b64encode(json.dumps(request).encode()).decode()
+            result = subprocess.run(['python3', '-', payload], input=prelude + preroll.REMOTE, text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([p.read_bytes() for p in paths], [b'old', b'old'])
+            recorded = [json.loads(line) for line in events.read_text().splitlines()]
+            restores = [e for e in recorded if e[0] == 'replace' and '.restore-' in e[1]]
+            self.assertEqual([e[2] for e in restores], [str(p) for p in paths])
+            self.assertEqual(sum(e[0] == 'fsync' for e in recorded), 6)
+            self.assertFalse(any(Path(directory).glob('*.new-*')))
+            self.assertFalse(any(Path(directory).glob('*.restore-*')))
+
+    # Repair refuses a missing or symlinked installed member before backing up
+    # or writing either file; the other member remains unchanged.
+    def test_unsafe_bootstrap_paths(self):
+        for unsafe in ['missing', 'symlink']:
+            with self.subTest(unsafe=unsafe), tempfile.TemporaryDirectory() as directory:
+                paths = [Path(directory) / name for name in ['fleet-install', 'generation_validation.py']]
+                paths[0].write_bytes(b'old installer')
+                if unsafe == 'symlink':
+                    target = Path(directory) / 'target'
+                    target.write_bytes(b'old validator')
+                    paths[1].symlink_to(target)
+                request = {'paths': [str(p) for p in paths], 'generation': 'gen-1',
+                           'contents': [base64.b64encode(b'new').decode()] * 2}
+                payload = base64.b64encode(json.dumps(request).encode()).decode()
+                result = subprocess.run(['python3', '-', payload], input=preroll.REMOTE, text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('unsafe/missing bootstrap', result.stderr)
+                self.assertEqual(paths[0].read_bytes(), b'old installer')
+                self.assertFalse(any(Path(directory).glob('*.pre-*')))
+
+    # A failed host does not hide errors on other hosts, and a lab failure
+    # prevents all bootstrap repairs while still collecting consumer errors.
+    def test_collect_remote_failures(self):
+        calls = []
+        def run(host, request):
+            calls.append((host, request))
+            raise subprocess.CalledProcessError(1, ['ssh', host], stderr='unreachable')
+        errors = preroll.check(ROOT, 'gen-1', ['feta', 'desk'], True, run)
+        self.assertEqual([host for host, _ in calls], ['raclette', 'comte', 'feta', 'desk'])
+        self.assertTrue(all('contents' not in request for _, request in calls))
+        for host in ['raclette', 'comte', 'feta', 'desk']:
+            self.assertTrue(any(host + ': remote command failed' in error for error in errors))
+
+    # Exercise main/argparse, subprocess injection, real comparisons and paired
+    # repair with a filesystem-mapped host executable instead of SSH.
+    def test_cli_host_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            files = {
+                'raclette': [('usr/local/sbin/' + name, ROOT / 'ci/fleet-candidates' / name) for name in
+                             ['lab-fleet-promote', 'lab-fleet-finalize-darwin', 'generation_validation.py']],
+                'comte': [('.local/libexec/' + name, ROOT / 'ci/fleet-candidates' / name) for name in
+                          ['lab-darwin-sign', 'generation_validation.py']],
+                'feta': [('.local/bin/fleet-install', ROOT / 'scripts/fleet-install'),
+                         ('.local/bin/generation_validation.py', ROOT / 'ci/fleet-candidates/generation_validation.py')],
+            }
+            for host, pairs in files.items():
+                for name, source in pairs:
+                    destination = fixture / host / name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(source.read_bytes())
+                    destination.chmod(0o755)
+            wrapper = fixture / 'host-command'
+            wrapper.write_text('#!/usr/bin/env python3\nimport sys\n' +
+                               'root = ' + repr(str(fixture)) + '\n' +
+                               'program = sys.stdin.read()\n' +
+                               'mapped = "str(pathlib.Path(" + repr(root) + ") / " + repr(sys.argv[1]) + " / p.lstrip(chr(126) + chr(47)))"\n' +
+                               'exec(program.replace("os.path.expanduser(p)", mapped))\n')
+            wrapper.chmod(0o755)
+            command = [str(ROOT / 'scripts/fleet-preroll-checks.sh'), 'gen-1', '--consumer', 'feta',
+                       '--host-command', str(wrapper)]
+            def invoke(*extra):
+                return subprocess.run(command + list(extra), text=True, capture_output=True)
+            result = invoke()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installer = fixture / 'feta/.local/bin/fleet-install'
+            validator = fixture / 'feta/.local/bin/generation_validation.py'
+            installer.write_bytes(b'old installer')
+            validator.write_bytes(b'old validator')
+            result = invoke()
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('installed sha256=', result.stderr)
+            self.assertIn('--sync-bootstrap', result.stderr)
+            result = invoke('--sync-bootstrap')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(Path(str(installer) + '.pre-gen-1').read_bytes(), b'old installer')
+            self.assertEqual(Path(str(validator) + '.pre-gen-1').read_bytes(), b'old validator')
+            self.assertEqual(installer.read_bytes(), (ROOT / 'scripts/fleet-install').read_bytes())
+            self.assertEqual(validator.read_bytes(), (ROOT / 'ci/fleet-candidates/generation_validation.py').read_bytes())
+            self.assertEqual(invoke().returncode, 0)
+            self.assertEqual(invoke('--consumer', '-unsafe').returncode, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

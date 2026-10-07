@@ -202,7 +202,9 @@ The read-only gate hashes raclette's `/usr/local/sbin/lab-fleet-promote`,
 `~/.local/libexec/lab-darwin-sign` and `generation_validation.py` via `ssh comte`.
 Each must match `ci/fleet-candidates/` in the generation source checkout.
 A refusal names the remote file and installed and generation SHA256 values.
-Missing files and remote failures refuse too. Lab copies are operator-owned:
+Missing files and remote failures refuse too. SSH uses a ten-second connect
+timeout, with a 120-second total command deadline. The gate collects lab and
+consumer failures in one refusal list; any lab failure disables all repairs. Lab copies are operator-owned:
 this gate never pushes or repairs them, even when bootstrap repair is requested.
 Sync lab tools through the existing operator deployment procedure and rerun.
 
@@ -218,11 +220,21 @@ scripts/fleet-preroll-checks.sh <generation> --source-root <generation-checkout>
 This explicit repair saves both installed files as `.pre-<generation>` before
 writing either generation file, preserves their modes, and rechecks both hashes.
 An existing backup, missing installed file, or symlink refuses repair. A write
-failure restores both old contents. Run without repair against the **full**
+failure restores both old contents with atomic file replacement. Backup,
+replacement and restore file contents are fsynced before proceeding. Run without repair against the **full**
 consumer list again before installing. Do not manually copy just one member.
 Repair assumes the operator has stopped concurrent bootstrap installs; it does
 not acquire the installer's mutation lock. Retain the backups for rollback
 inspection; bootstrap compatibility with old generations remains required.
+
+After a failed repair, stop any still-running repair process and inspect both
+installed files against the retained `.pre-<generation>` backups. The gate
+keeps those backups as recovery evidence and removes only temporary files it
+created. A pre-existing `.new-<generation>` collision is left untouched. After
+confirming the original pair is restored (or restoring both from the backups),
+remove both `.pre-<generation>` backups and any inspected stale
+`.new-<generation>` files together before retrying the paired sync command.
+Never remove these files while an install or repair is active.
 
 For live operator acceptance, first run the read-only full-list command above.
 On a lab tool mismatch, confirm the diagnostic names both hashes and that no
