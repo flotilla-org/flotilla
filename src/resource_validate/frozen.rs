@@ -452,7 +452,18 @@ fn validate_composition(composition: &ImageComposition) -> Result<(), String> {
 }
 
 pub(crate) fn load_tokens(path: Option<&Path>) -> Result<BTreeMap<String, PathBuf>> {
-    path.map(|path| serde_json::from_slice(&std::fs::read(path)?).map_err(|error| eyre!(error))).transpose().map(Option::unwrap_or_default)
+    use std::io::Read;
+    const MAX_TOKEN_MAP_BYTES: u64 = 1024 * 1024;
+    let Some(path) = path else { return Ok(BTreeMap::new()) };
+    let file = std::fs::File::open(path).map_err(|error| eyre!("read probe token map {}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_TOKEN_MAP_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| eyre!("read probe token map {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_TOKEN_MAP_BYTES {
+        return Err(eyre!("probe token map {} exceeds the 1 MiB limit", path.display()));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| eyre!("decode probe token map {}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -463,6 +474,28 @@ mod tests {
     };
 
     use super::*;
+
+    // Operator map errors name their input; bounded reads accept the limit and
+    // reject larger files while retaining optional and empty-map behavior.
+    #[test]
+    fn token_map_errors_name_the_path_and_bound_reads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("probe map.json");
+        assert!(load_tokens(None).expect("optional").is_empty());
+        assert!(load_tokens(Some(&path)).expect_err("missing map").to_string().contains(&path.display().to_string()));
+        std::fs::write(&path, b"invalid JSON").expect("malformed map");
+        assert!(load_tokens(Some(&path)).expect_err("decode map").to_string().contains(&path.display().to_string()));
+        let mut bytes = vec![b' '; 1024 * 1024];
+        bytes[..2].copy_from_slice(b"{}");
+        std::fs::write(&path, &bytes).expect("boundary map");
+        assert!(load_tokens(Some(&path)).expect("at limit").is_empty());
+        bytes.push(b' ');
+        std::fs::write(&path, &bytes).expect("oversized map");
+        let error = load_tokens(Some(&path)).expect_err("over limit").to_string();
+        assert!(error.contains(&path.display().to_string()) && error.contains("1 MiB"));
+        std::fs::write(&path, br#"{"bot":"/private/scoped-token"}"#).expect("map");
+        assert_eq!(load_tokens(Some(&path)).expect("valid map")["bot"], PathBuf::from("/private/scoped-token"));
+    }
 
     // Stands in for Git fetch and registry/cache lookup, the two external
     // boundaries. The durable inventory comes from a real in-memory backend.

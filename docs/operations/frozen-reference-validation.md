@@ -55,7 +55,7 @@ scripts/accept-frozen-references.sh \
   /absolute/path/to/probe-tokens.json
 ```
 
-The token map is JSON keyed by declared credential name, e.g.
+The token map is limited to 1 MiB and is JSON keyed by declared credential name, e.g.
 `{"github-skills-fork":"/private/path/to/scoped-token"}`. Use `{}` when no frozen
 skill needs a credential. Provision those tokens through the credential's normal
 operator path; do not reuse a crew token with a different repository scope.
