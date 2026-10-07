@@ -45,7 +45,10 @@ print(json.dumps([hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else
 def remote(host, request, command):
     """Injected executable boundary: HOST COMMAND; stdin is a Python program."""
     payload = base64.b64encode(json.dumps(request).encode()).decode()
-    invocation = 'python3 - ' + shlex.quote(payload)
+    # The real pair exceeds Linux's per-argument limit when base64 encoded.
+    # Carry it in the Python program on stdin, not in the SSH command.
+    program = REMOTE.replace('sys.argv[1]', repr(payload), 1)
+    invocation = 'python3 -'
     if command:
         args = [command, host, invocation]
     elif host == 'raclette':
@@ -53,7 +56,7 @@ def remote(host, request, command):
                 'qm guest exec 106 --pass-stdin 1 -- /bin/sh -c ' + shlex.quote(invocation)]
     else:
         args = ['ssh', '-o', 'BatchMode=yes', host, invocation]
-    result = subprocess.run(args, input=REMOTE, text=True, capture_output=True, check=True, timeout=120)
+    result = subprocess.run(args, input=program, text=True, capture_output=True, check=True, timeout=120)
     output = json.loads(result.stdout)
     if host == 'raclette' and not command:
         if not isinstance(output, dict) or output.get('exitcode') != 0:

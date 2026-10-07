@@ -89,11 +89,23 @@ class Refusals(unittest.TestCase):
             with patch.object(preroll.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')) as run:
                 self.assertEqual(preroll.remote(host, {'paths': ['file']}, None), ['hash'])
                 self.assertIn('silo' if host == 'raclette' else 'comte', run.call_args.args[0])
-                self.assertEqual(run.call_args.kwargs['input'], preroll.REMOTE)
+                self.assertIn('import base64', run.call_args.kwargs['input'])
+                self.assertNotIn('sys.argv[1]', run.call_args.kwargs['input'])
         for output in ['[]', '{}', 'not-json', '{"exitcode": 1, "err-data": "missing python"}']:
             with patch.object(preroll.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, output, '')):
                 with self.assertRaises((RuntimeError, ValueError)):
                     preroll.remote('raclette', {'paths': ['file']}, None)
+
+    # The actual pair is large enough to exceed Linux's argument limit if
+    # double-base64 encoded. Transport must send it on stdin with short argv.
+    def test_large_pair_uses_stdin(self):
+        request = {'paths': ['a', 'b'], 'generation': 'gen-1',
+                   'contents': [base64.b64encode(p.read_bytes()).decode() for p in
+                                [ROOT / 'scripts/fleet-install', ROOT / 'ci/fleet-candidates/generation_validation.py']]}
+        with patch.object(preroll.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '["a", "b"]', '')) as run:
+            preroll.remote('feta', request, '/injected-host-command')
+            self.assertLess(max(len(arg) for arg in run.call_args.args[0]), 1024)
+            self.assertGreater(len(run.call_args.kwargs['input']), 128 * 1024)
 
     # Contract: a failure writing the second member restores the first too.
     def test_sync_failure_restores_pair(self):
