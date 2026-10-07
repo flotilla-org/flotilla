@@ -252,6 +252,7 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
 
 pub fn pending_task_state() -> WorkState {
     WorkState {
+        provisioning_retry: None,
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,

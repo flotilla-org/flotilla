@@ -109,7 +109,7 @@ pub use checkout::{
 pub use clock::VirtualClock;
 pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
-pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling};
+pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, PROVISIONING_RETRY_BACKOFF};
 pub use convoy::{
     active_change_request_subjects, bound_change_request_record_name, change_request_address, change_request_address_with_forges,
     controller_patches, convoy_reference_context, convoy_sanctions_checkout_reclaim, convoy_subject_rows, evaluate_crew_completion,

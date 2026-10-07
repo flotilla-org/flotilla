@@ -237,7 +237,10 @@ while [ "$#" -gt 0 ]; do
     cp -R "$skill_dir"/. "$target"/
   done <"$selected_file"
 done
-cp "$manifest" "$staged/.flotilla-sources.json"
+case "$manifest" in
+  json:*) printf '%s\n' "${manifest#json:}" >"$staged/.flotilla-sources.json" ;;
+  *) cp "$manifest" "$staged/.flotilla-sources.json" ;;
+esac
 rm -rf "$destination"
 mv "$staged" "$destination"
 succeeded=true

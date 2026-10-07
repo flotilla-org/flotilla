@@ -4182,9 +4182,22 @@ async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_seco
         flotilla_resources::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
     let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
     let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
-    assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkInterrupted { .. })));
-    assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == &vessel_name)));
+    assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkProvisioningRetry { .. })));
+    // #2875: reboot recovery keeps the death cause and waits for a durable
+    // deadline, rather than replacing the governor at every watch tick.
+    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. })));
     flotilla_resources::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
+    clock.advance(ChronoDuration::seconds(29));
+    let convoy = convoys.get(&convoy_name).await.expect("backing off governor");
+    assert_eq!(convoy.status.as_ref().expect("status").work["work"].message.as_deref(), Some("Docker container stopped after host reboot"));
+    let waiting = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("failed vessel still observed"), clock.now());
+    assert!(!waiting
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. } | Actuation::CreateVessel { .. })));
+    clock.advance(ChronoDuration::seconds(1));
+    let retiring = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("failed vessel"), clock.now());
+    assert!(retiring.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == &vessel_name)));
     vessels.delete(&vessel_name).await.expect("retire lost vessel");
 
     let convoy = convoys.get(&convoy_name).await.expect("interrupted governor");
@@ -4195,6 +4208,13 @@ async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_seco
         "convoy annotations: {:?}",
         convoy.metadata.annotations
     );
+    flotilla_resources::apply_status_patch(&convoys, &convoy_name, &replacement.patch.expect("reserve next attempt"))
+        .await
+        .expect("retry reservation");
+    let convoy = convoys.get(&convoy_name).await.expect("reserved retry");
+    let stale_observation =
+        reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("replacement not yet observed"), clock.now());
+    assert!(!stale_observation.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
     let (meta, spec) = replacement
         .actuations
         .into_iter()
@@ -5487,12 +5507,14 @@ async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_o
     );
     clock.advance(ChronoDuration::seconds(30));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("second admission refusal").contains("retry at"));
-    for expected_delay in [120, 120, 120] {
+    // #2875: read-only refusals share the provisioning cadence and cap while
+    // remaining independent of the runtime strike budget.
+    for expected_delay in [60, 120, 240, 480, 900, 900] {
         clock.advance(ChronoDuration::seconds(expected_delay));
         assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("admission keeps retrying").contains("retry at"));
         let status = ensures.get("quartermaster").await.expect("ensure").status.expect("retry status");
         assert_eq!(status.restart_count, 0);
-        assert_eq!(status.retry_at.expect("deadline") - clock.now(), ChronoDuration::seconds(120));
+        assert_eq!(status.retry_at.expect("deadline") - clock.now(), ChronoDuration::seconds((expected_delay * 2).min(900)));
     }
     assert!(matches!(
         backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,

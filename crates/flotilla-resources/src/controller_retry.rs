@@ -38,6 +38,10 @@ pub struct RetryBackoff {
     pub maximum: Duration,
 }
 
+/// Provisioning and standing admission use the same bounded recovery cadence.
+pub const PROVISIONING_RETRY_BACKOFF: RetryBackoff =
+    RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(15 * 60) };
+
 impl RetryBackoff {
     pub fn delay(self, attempts: u32) -> Duration {
         self.initial.saturating_mul(1_u32 << attempts.saturating_sub(1).min(31)).min(self.maximum)

@@ -91,6 +91,7 @@ define_patch_kinds! {
     ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
     ConvoyWorkInterrupted => CONTINUATION,
+    ConvoyWorkProvisioningRetry => CONTINUATION,
     ConvoyForceWorkCompleted => DUPLICATE,
     ConvoyMarkWorkFailed => DUPLICATE,
     ConvoyMarkWorkCancelled => DUPLICATE,
@@ -172,6 +173,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::WorkLaunching { .. } => PatchKind::ConvoyWorkLaunching,
         ConvoyStatusPatch::WorkRunning { .. } => PatchKind::ConvoyWorkRunning,
         ConvoyStatusPatch::WorkInterrupted { .. } => PatchKind::ConvoyWorkInterrupted,
+        ConvoyStatusPatch::WorkProvisioningRetry { .. } => PatchKind::ConvoyWorkProvisioningRetry,
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
@@ -278,6 +280,7 @@ fn ts(seconds: i64) -> DateTime<Utc> {
 
 fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> WorkState {
     WorkState {
+        provisioning_retry: None,
         phase,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: Some(ts(5)),
@@ -960,6 +963,22 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     phase: WorkPhase::Running,
                     transitioned_at: ts(30),
                     message: None,
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, work_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "work provisioning retry",
+            kind: PatchKind::ConvoyWorkProvisioningRetry,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
+                let before = work_timestamps(&status);
+                let patch = ConvoyStatusPatch::WorkProvisioningRetry {
+                    work: "implement".into(),
+                    retry: flotilla_resources::ControllerRetry::retryable(None, ts(30), flotilla_resources::PROVISIONING_RETRY_BACKOFF),
+                    message: "skill staging failed".into(),
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, work_timestamps(&status))
