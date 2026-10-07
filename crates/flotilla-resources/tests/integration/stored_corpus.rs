@@ -161,3 +161,52 @@ fn previous_generation_crew_claims_decode_without_ledger_digest() {
     assert!(state.decision_ledger_digest.is_none());
     assert!(state.superseded_claims[0].decision_ledger_digest.is_none());
 }
+
+// FleetDesignation and ImageBuild predate the next captured fleet generation.
+// Fixed embedded predecessor shapes supplement the deployed corpus; never
+// regenerate the captured files to accommodate these additions.
+#[test]
+fn previous_generation_image_cache_and_availability_stay_decodable() {
+    for spec in [
+        serde_json::json!({"project": "fleet"}),
+        serde_json::json!({"project": "fleet", "image_cache": {
+            "repository": "registry.test/images", "pull_credential": "pull", "push_credential": "push"
+        }}),
+    ] {
+        decode_stored_resource_document(&serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "FleetDesignation", "spec": spec
+        }))
+        .expect("previous FleetDesignation");
+        let decoded: flotilla_resources::FleetDesignationSpec = serde_json::from_value(spec).expect("fleet spec");
+        assert!(decoded.image_gc.is_none());
+    }
+    let availability: flotilla_resources::ImageAvailability =
+        serde_json::from_str(r#"{"hosts":["builder"],"registry_ref":null,"failure":null}"#).expect("previous availability");
+    assert!(!availability.retired);
+    assert!(availability.retired_at.is_none());
+    let current: flotilla_resources::FleetDesignationSpec =
+        serde_json::from_str(r#"{"project":"fleet","image_gc":{"interval_seconds":60,"grace_seconds":3600}}"#)
+            .expect("opt-in policy with default mode");
+    assert_eq!(current.image_gc.expect("policy").mode, flotilla_resources::ImageGcMode::DryRun);
+}
+
+// The captured corpus covers older work selectors. Fixed host-action documents
+// cover the intervening pull/push generation and the new delete vocabulary.
+#[test]
+fn stored_image_grants_keep_pull_push_and_delete_vocabulary() {
+    for (action, expected) in [
+        ("image-pull", flotilla_resources::HostImageAction::ImagePull),
+        ("image-push", flotilla_resources::HostImageAction::ImagePush),
+        ("image-delete", flotilla_resources::HostImageAction::ImageDelete),
+    ] {
+        let spec = serde_json::json!({"credentials": ["registry"], "selector": {"host_action": {"action": action}}});
+        decode_stored_resource_document(&serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "CredentialGrant", "spec": spec
+        }))
+        .expect("stored host-action grant");
+        let grant: flotilla_resources::CredentialGrantSpec = serde_json::from_value(spec).expect("grant");
+        let selector = grant.selector.host_action.expect("host action");
+        assert_eq!(selector.action, expected);
+        assert!(selector.hosts.is_empty());
+    }
+}
