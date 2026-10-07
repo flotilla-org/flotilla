@@ -83,4 +83,8 @@ if bash "$repo_root/scripts/fleet-install" --canary test-generation >"$root/wron
 fi
 grep -Fq -- '--canary must run on feta' "$root/wrong-host.log"
 python3 "$repo_root/scripts/test-fleet-canary.py"
+# Build the actual CLI and daemon: admission must never be covered only by fakes.
+cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin flotilla --bin flotillad
+binary_dir="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$repo_root/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"] + "/debug")')"
+python3 "$repo_root/scripts/test-fleet-canary-real.py" "$binary_dir"
 echo 'fleet canary contract passed'

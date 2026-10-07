@@ -78,11 +78,15 @@ and should be retried after the other installation finishes.
 
 The second daemon has private config, state, HOME, socket, and
 `CLEAT_RUNTIME_DIR` under a short `/tmp/fleet-canary.*` path. No fleet config is
-copied and it has no peers. Its scratch Git repository has no remote or forge
-credential. The generation carries its frozen crew-image baseline; the canary
-uses that image with `docker_per_vessel`, the regular 50% host memory budget,
-four expected concurrent crews, and zero swap. The `fleet-canary` adapter is
-available only when `FLOTILLA_FLEET_CANARY=1` is discovered. It uses normal agent
+copied and it has no peers. Its scratch Git repository needs no forge
+credential. The scratch checkout has a private local bare repository as a
+`file://` remote, so convoy admission has a clonable transport; the host
+worktree checkout mode keeps that path outside the container. The generation
+carries its frozen crew-image baseline; the canary uses that image with
+`docker_per_vessel`, the shared crew memory-policy default
+(currently 80% of host RAM divided among four crews, with zero swap). The
+`fleet-canary` adapter is available only when `FLOTILLA_FLEET_CANARY=1` is
+discovered. It uses normal agent
 provisioning and skill staging, with a private config home and no model/login.
 
 The stub dumps its launch environment, effective Git configuration, and staged
@@ -100,7 +104,9 @@ by discovery. Host Cleat cleanup checks both its executable and private runtime
 environment, using Linux pidfds (Linux 5.3+ and Python 3.9+) to avoid PID reuse;
 stale or inaccessible PID
 files never authorize signalling another process. Successful runs remove scratch
-state. Failures retain state, logs, and any surviving canary container for inspection. The diagnostic names the failed assertion and log directory;
+state. Failures retain state, logs, and any surviving canary container for
+inspection. The diagnostic names the failed assertion and log directory, and failed
+commands include both stdout (including CLI JSON errors) and stderr;
 no active generation is switched. Inspect `daemon.log`, `commands.log`, and
 `crew-report.json` when present. After inspection, remove only the container ID
 recorded by that canary and its `/tmp/fleet-canary.*` directory.
@@ -119,6 +125,8 @@ generations for rollback. No workflow changes are needed.
 
 `scripts/test-fleet-install.sh` includes `scripts/test-fleet-canary.sh`, which
 covers gate ordering, refusal, visible bypass, stage-only execution, and the
-lifecycle scenarios through injected subprocess seams. Real feta/Docker runs
+lifecycle scenarios through injected subprocess seams. It also builds the CLI
+and daemon and runs the production setup through convoy admission against
+them, then stops without waiting for Docker. Real feta/Docker runs
 are the operator's acceptance after merge. This gate replaces the manual
 post-roll "does a fresh crew launch" check.

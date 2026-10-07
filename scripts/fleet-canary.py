@@ -35,7 +35,8 @@ class Commands:
         except subprocess.TimeoutExpired as error:
             raise CanaryFailure(f"command timed out: {' '.join(map(str, args))}") from error
         if result.returncode:
-            raise CanaryFailure(f"command failed: {args[0]} {' '.join(map(str, args[1:]))}: {result.stderr.strip()}")
+            raise CanaryFailure(f"command failed: {' '.join(map(str, args))}\n"
+                                f"stdout: {result.stdout.strip()}\nstderr: {result.stderr.strip()}")
         return result.stdout
 
     def start(self, args, log):
@@ -142,6 +143,11 @@ class Canary:
         self.cli('resource', 'apply', '--file', str(document))
 
     def exercise(self):
+        self.prepare()
+        self.run_convoy()
+
+    def prepare(self):
+        """Start the isolated daemon and admit the probe, before observing Docker."""
         for directory in ('config/run', 'state', 'home', 'cleat'):
             (self.root / directory).mkdir(parents=True)
         with (self.root / 'daemon.log').open('w') as log:
@@ -150,9 +156,9 @@ class Canary:
                 '--config-dir', str(self.root / 'config'), '--state-dir', str(self.root / 'state'),
                 '--socket', str(self.socket)], log)
             self.wait('isolated daemon ready', lambda: self.list('hosts'))
-            self.run_convoy()
+            self.admit_convoy()
 
-    def run_convoy(self):
+    def admit_convoy(self):
         hosts = self.list('hosts')
         if len(hosts) != 1:
             raise CanaryFailure('canary must have exactly one unfederated host')
@@ -165,6 +171,11 @@ class Canary:
         self.commands.run([*git, 'init', '--initial-branch=main'])
         self.commands.run([*git, 'add', '.'])
         self.commands.run([*git, '-c', 'user.name=Canary', '-c', 'user.email=canary@localhost', 'commit', '-m', 'canary probe'])
+        # A file transport makes the Repository clonable without forge credentials.
+        # Host worktrees use the checkout directly; Docker never needs this path.
+        remote = (self.root / 'upstream.git').as_uri()
+        self.commands.run(['git', 'clone', '--bare', str(repo), str(self.root / 'upstream.git')])
+        self.commands.run([*git, 'remote', 'add', 'origin', remote])
         # A local upstream preserves ordinary pushed/clean teardown checks
         # without a remote server or credentials. The probe makes no commits.
         self.commands.run([*git, 'config', 'branch.fleet-canary.remote', '.'])
@@ -175,10 +186,13 @@ class Canary:
             'pool': 'cleat', 'docker_per_vessel': {
                 'host_ref': host, 'image': {'image_baseline_ref': 'fleet-crew'},
                 'pull_policy': 'always',
-                'memory_policy': {'host_memory_percent': 50, 'expected_concurrent_crews': 4, 'swap_bytes': 0},
                 'agent_adapters': ['fleet-canary'], 'default_cwd': '/workspace',
                 'env': {'FLOTILLA_FLEET_CANARY': '1', 'CLAUDE_CONFIG_DIR': '/tmp/flotilla-config/canary'},
                 'checkout': {'worktree_on_host_and_mount': {'mount_path': '/workspace'}}}})
+        # --fulfilment pins a kind; a PlacementPolicy alone is not its definition.
+        self.apply('FulfilmentKind', 'fleet-canary', {
+            'host_ref': host, 'pool': 'cleat', 'realisation': 'docker_per_vessel',
+            'image': {'image_baseline_ref': 'fleet-crew'}})
         self.apply('WorkflowTemplate', 'fleet-canary', {
             'exit': 'claim', 'vessels': [{'name': 'work', 'crew': [
                 {'role': 'probe', 'selector': {'capability': 'code'}, 'completion_conditions': []}]}]})
@@ -186,6 +200,8 @@ class Canary:
                  '--branch', 'fleet-canary', '--workflow', 'fleet-canary', '--fulfilment', 'fleet-canary',
                  '--escalation-reason', 'fleet generation canary', '--agent', 'fleet-canary',
                  '--skill', 'rjwittams/rjw-skills@testing', '--no-attach')
+
+    def run_convoy(self):
         self.wait('vessel launches', lambda: any(item.get('status', {}).get('phase') == 'Ready' for item in self.list('vessels')))
         sessions = self.wait('terminal session reaches Running (Cleat accepted launch environment)',
                              lambda: [item for item in self.list('terminalsessions')
@@ -227,6 +243,17 @@ class Canary:
                 self.daemon.wait()
 
 
+def isolated_environment(release, root):
+    environment = {'HOME': str(root / 'home'), 'PATH': f'{release}/bin:/usr/local/bin:/usr/bin:/bin',
+                   'CLEAT_RUNTIME_DIR': str(root / 'cleat'), 'FLOTILLA_FLEET_CANARY': '1',
+                   'FLOTILLA_SKILLS_DIR': str(release / 'share/flotilla/skills'),
+                   'FLOTILLA_CODEX_HOME_TEMPLATE': str(release / 'share/flotilla/codex-home')}
+    # Registry authentication belongs to the host Docker client, never the crew.
+    # Keep its existing config while isolating model and forge credentials.
+    environment['DOCKER_CONFIG'] = os.environ.get('DOCKER_CONFIG', str(Path.home() / '.docker'))
+    return environment
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('release', type=Path)
@@ -235,13 +262,7 @@ def main(argv=None):
     # Keep socket paths SUN_LEN-safe independently of the operator's TMPDIR.
     root = Path(tempfile.mkdtemp(prefix='fleet-canary.', dir='/tmp'))
     root.chmod(0o700)
-    environment = {'HOME': str(root / 'home'), 'PATH': f'{args.release}/bin:/usr/local/bin:/usr/bin:/bin',
-                   'CLEAT_RUNTIME_DIR': str(root / 'cleat'), 'FLOTILLA_FLEET_CANARY': '1',
-                   'FLOTILLA_SKILLS_DIR': str(args.release / 'share/flotilla/skills'),
-                   'FLOTILLA_CODEX_HOME_TEMPLATE': str(args.release / 'share/flotilla/codex-home')}
-    # Registry authentication belongs to the host Docker client, never the crew.
-    # Keep its existing config while isolating model and forge credentials.
-    environment['DOCKER_CONFIG'] = os.environ.get('DOCKER_CONFIG', str(Path.home() / '.docker'))
+    environment = isolated_environment(args.release, root)
     print(f'fleet-install: canary logs: {root}', flush=True)
     success = False
     with (root / 'commands.log').open('w') as log:
