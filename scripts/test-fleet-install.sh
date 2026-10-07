@@ -5,6 +5,7 @@ export FLEET_INSTALL_SKIP_CANARY=1
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 installer="$repo_root/scripts/fleet-install"
+python3 "$repo_root/scripts/test-fleet-preroll-checks.py"
 python3 -m unittest discover -s "$repo_root/ci/fleet-candidates" -p "test_bootstrap_*.py"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-install-test.XXXXXX")"
 cleanup() {
