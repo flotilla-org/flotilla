@@ -100,6 +100,12 @@ impl CommandRunner for DockerEnvironmentRunner {
         self.inner.run_output("docker", &arg_refs, Path::new("/"), label).await
     }
 
+    async fn open_stream(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<super::super::CommandStream, String> {
+        let owned = self.docker_exec_args(cmd, args, cwd, true);
+        let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner.open_stream("docker", &refs, Path::new("/"), label).await
+    }
+
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let docker_args = self.docker_exec_args(cmd, args, cwd, true);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();

@@ -581,9 +581,21 @@ pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
     }
 }
 
+/// First-party app-server launch data from the adapter's existing grant policy.
+#[derive(Debug, Clone, bon::Builder)]
+pub struct AppServerLaunch {
+    pub binary: String,
+    pub prompt: String,
+    pub approval_policy: Option<String>,
+    pub sandbox: Option<String>,
+}
+
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
+    fn app_server_launch(&self, _request: &AgentLaunchRequest) -> Option<AppServerLaunch> {
+        None
+    }
     /// Return a fatal launch diagnostic; ambiguous exits remain resumable.
     fn classify_exit_failure(&self, _exit_code: i32, _screen: &str) -> Option<String> {
         None
@@ -748,6 +760,20 @@ impl CliAgentAdapter {
 
 #[async_trait]
 impl AgentAdapter for CliAgentAdapter {
+    fn app_server_launch(&self, request: &AgentLaunchRequest) -> Option<AppServerLaunch> {
+        if !cfg!(target_os = "linux") || !matches!(self.flavor, AdapterFlavor::Codex { .. }) {
+            return None;
+        }
+        let unattended = !self.flavor.autonomy_args(request.fulfilment_grants.as_ref()).is_empty();
+        Some(
+            AppServerLaunch::builder()
+                .binary(self.binary.clone())
+                .prompt(self.deliver_brief(&request.brief))
+                .maybe_approval_policy(unattended.then(|| "never".into()))
+                .maybe_sandbox(unattended.then(|| "danger-full-access".into()))
+                .build(),
+        )
+    }
     fn id(&self) -> &'static str {
         self.flavor.id()
     }
@@ -1988,6 +2014,47 @@ mod tests {
         assert!(prompt.contains("You can write issues."));
         assert!(!prompt.contains("Quoted assignment card."));
         assert!(flotilla_protocol::arg::shell_quote(&prompt).len() < 64 * 1024);
+    }
+
+    // Native and embedded launches use the same fulfilment policy and rendered
+    // brief. Restricted grants preserve Codex's configured policy defaults.
+    #[hegel::test]
+    fn codex_native_launch_preserves_the_adapter_grant_policy(tc: hegel::TestCase) {
+        use flotilla_resources::FulfilmentGrant;
+        use hegel::generators as gs;
+        // Absent grants, empty grants, scoped network, host reach, and a platform
+        // grant cover all autonomy branches without launching a process.
+        let grants = match tc.draw(gs::integers::<u8>().min_value(0).max_value(4)) {
+            0 => None,
+            1 => Some(BTreeSet::new()),
+            2 => Some(BTreeSet::from([FulfilmentGrant::network("scoped".into())])),
+            3 => Some(BTreeSet::from([FulfilmentGrant::host_account_reach()])),
+            _ => Some(BTreeSet::from([FulfilmentGrant::platform("linux".into())])),
+        };
+        let request = AgentLaunchRequest {
+            role: "coder".into(),
+            model: Some("test-model".into()),
+            environment: Vec::new(),
+            fulfilment_grants: grants,
+            brief: flotilla_resources::TerminalBrief {
+                path: "brief.md".into(),
+                content: "implement the work".into(),
+                artifact_digest: None,
+                copies: Vec::new(),
+            },
+        };
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("adapter");
+        let plan = codex.launch(&request).expect("embedded launch");
+        if cfg!(target_os = "linux") {
+            let native = codex.app_server_launch(&request).expect("native launch");
+            let unattended = plan.command.contains("--dangerously-bypass-approvals-and-sandbox");
+            assert_eq!(native.approval_policy.as_deref(), unattended.then_some("never"));
+            assert_eq!(native.sandbox.as_deref(), unattended.then_some("danger-full-access"));
+            assert_eq!(native.prompt, codex.deliver_brief(&request.brief));
+        } else {
+            assert!(codex.app_server_launch(&request).is_none());
+        }
     }
 
     #[tokio::test]

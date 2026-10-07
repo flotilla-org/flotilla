@@ -120,6 +120,12 @@ impl CommandRunner for SshCommandRunner {
         self.runner.run_output("ssh", &ssh_args, Path::new("/"), label).await
     }
 
+    async fn open_stream(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<super::CommandStream, String> {
+        let script = self.remote_exec_script(cmd, args, cwd);
+        let refs = self.ssh_shell_args(&script);
+        self.runner.open_stream("ssh", &refs, Path::new("/"), label).await
+    }
+
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);

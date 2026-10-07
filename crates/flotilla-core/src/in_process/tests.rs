@@ -1275,6 +1275,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
             &ResourceTerminalSessionStatus {
                 phase: ResourceTerminalSessionPhase::Running,
                 crew: Some(flotilla_resources::CrewSessionStatus {
+                    input_transports: Vec::new(),
                     id: "governor-crew".to_string(),
                     adapter: "codex".to_string(),
                     model: None,
@@ -5018,6 +5019,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
                         phase: ResourceTerminalSessionPhase::Running,
                         session_id: Some("session-one".to_string()),
                         crew: Some(flotilla_resources::CrewSessionStatus {
+                            input_transports: Vec::new(),
                             id: "crew-one".to_string(),
                             adapter: "codex".to_string(),
                             model: None,

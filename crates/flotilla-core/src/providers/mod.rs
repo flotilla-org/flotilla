@@ -174,6 +174,14 @@ pub trait CommandProcess: Send + Sync {
     async fn wait(&mut self) -> Result<std::process::ExitStatus, String>;
 }
 
+/// Binary bidirectional I/O for an environment-owned protocol process.
+pub trait CommandIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> CommandIo for T {}
+pub struct CommandStream {
+    pub io: Box<dyn CommandIo>,
+    pub process: Box<dyn CommandProcess>,
+}
+
 pub(crate) fn helper_exec_script(helper_path: &str, subcommand: &str, args: &[&str]) -> Result<String, String> {
     let helper_dir = Path::new(helper_path).parent().ok_or_else(|| format!("installed helper path has no parent: {helper_path}"))?;
     let mut parts = vec![
@@ -273,6 +281,12 @@ pub trait CommandRunner: Send + Sync {
         _label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
         Err("command runner does not support long-lived processes".to_string())
+    }
+
+    /// Spawn a protocol process with binary stdin/stdout. Stderr must be drained
+    /// independently. Dropping its handle terminates the local process.
+    async fn open_stream(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandStream, String> {
+        Err("command runner does not support protocol streams".into())
     }
 
     /// Run a command with bytes supplied on stdin. The input is deliberately
@@ -486,6 +500,20 @@ impl CommandRunner for ProcessCommandRunner {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             exit_code: output.status.code(),
         })
+    }
+
+    async fn open_stream(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandStream, String> {
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let input = child.stdin.take().expect("piped stdin");
+        let output = child.stdout.take().expect("piped stdout");
+        Ok(CommandStream { io: Box::new(tokio::io::join(output, input)), process: Box::new(TokioCommandProcess { child }) })
     }
 
     async fn spawn_long_lived(

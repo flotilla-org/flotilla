@@ -409,6 +409,7 @@ pub enum TerminalAttentionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalAttentionSource {
+    Protocol,
     Hook,
     Screen,
 }
@@ -417,7 +418,7 @@ impl TerminalAttentionSource {
     /// Delay before a stall judge trusts an idle observation from this source.
     pub const fn idle_debounce(self) -> chrono::Duration {
         match self {
-            Self::Hook => chrono::Duration::zero(),
+            Self::Hook | Self::Protocol => chrono::Duration::zero(),
             Self::Screen => chrono::Duration::seconds(5),
         }
     }
@@ -467,6 +468,12 @@ impl TerminalAttention {
         if incoming.as_of <= self.as_of {
             return false;
         }
+        if self.source == TerminalAttentionSource::Protocol
+            && incoming.source != TerminalAttentionSource::Protocol
+            && !self.is_stale_at(incoming.as_of)
+        {
+            return false;
+        }
         if self.source == TerminalAttentionSource::Hook
             && incoming.source == TerminalAttentionSource::Screen
             && !(self.state == TerminalAttentionState::Idle && incoming.state == TerminalAttentionState::Working)
@@ -481,8 +488,24 @@ impl TerminalAttention {
     }
 }
 
+/// Input methods declared by one holder incarnation, in preference order.
+/// An unavailable selected transport must fail closed; ambiguous input must
+/// never fall through to another method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HolderTransport {
+    AgentApi { adapter: String, endpoint: String, session: String },
+    Hook { name: String },
+    Screen,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewSessionStatus {
+    /// Previous-generation holders declare no methods and retain guarded screen
+    /// delivery. Remove this decode default after one fleet roll (ADR 0047).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub input_transports: Vec<HolderTransport>,
     pub id: String,
     pub adapter: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

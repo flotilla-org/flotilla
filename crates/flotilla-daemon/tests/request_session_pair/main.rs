@@ -3741,7 +3741,13 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
                 &session.metadata.resource_version,
                 &TerminalSessionStatus {
                     phase: flotilla_resources::TerminalSessionPhase::Running,
-                    crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
+                    crew: Some(CrewSessionStatus {
+                        input_transports: Vec::new(),
+                        id: crew_id.into(),
+                        adapter: "codex".into(),
+                        model: None,
+                        stance: role.into(),
+                    }),
                     attention: Some(flotilla_resources::TerminalAttention {
                         state: flotilla_resources::TerminalAttentionState::Working,
                         as_of: Utc::now(),

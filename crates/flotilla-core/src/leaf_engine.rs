@@ -1858,6 +1858,7 @@ impl ReconcilerWake {
                                     let source = match attention.source {
                                         TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
                                         TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
+                                        TerminalAttentionSource::Protocol => StallEvidenceSource::Protocol,
                                     };
                                     if attention.state == TerminalAttentionState::Idle {
                                         if pending_message

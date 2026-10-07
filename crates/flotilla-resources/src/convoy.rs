@@ -986,6 +986,7 @@ pub enum LeafMaker {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StallEvidenceSource {
+    Protocol,
     Screen,
     Hook,
     Observation,

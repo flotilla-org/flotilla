@@ -1,0 +1,2582 @@
+{
+  "events": [
+    {
+      "emittedAtMs": 1791402402098,
+      "method": "configWarning",
+      "params": {
+        "details": null,
+        "summary": "Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime."
+      }
+    },
+    {
+      "emittedAtMs": 1791402402099,
+      "method": "remoteControl/status/changed",
+      "params": {
+        "environmentId": null,
+        "installationId": "7e6a131d-647c-4617-8f85-12441c7955d2",
+        "serverName": "6c8469d33e78",
+        "status": "disabled"
+      }
+    },
+    {
+      "emittedAtMs": 1791402402100,
+      "method": "account/updated",
+      "params": {
+        "authMode": "chatgpt",
+        "planType": "pro"
+      }
+    },
+    {
+      "emittedAtMs": 1791402402131,
+      "method": "thread/started",
+      "params": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": null,
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "type": "idle"
+          },
+          "threadSource": null,
+          "turns": [],
+          "updatedAt": 1791402402
+        }
+      }
+    },
+    {
+      "emittedAtMs": 1791402402131,
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "error": null,
+        "failureReason": null,
+        "name": "codex_apps",
+        "status": "starting",
+        "threadId": "{thread}"
+      }
+    },
+    {
+      "emittedAtMs": 1791402402140,
+      "method": "thread/status/changed",
+      "params": {
+        "status": {
+          "activeFlags": [],
+          "type": "active"
+        },
+        "threadId": "{thread}"
+      }
+    },
+    {
+      "emittedAtMs": 1791402402140,
+      "method": "turn/started",
+      "params": {
+        "threadId": "{thread}",
+        "turn": {
+          "completedAt": null,
+          "durationMs": null,
+          "error": null,
+          "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+          "items": [],
+          "itemsView": "notLoaded",
+          "startedAt": 1791402402,
+          "status": "inProgress"
+        }
+      }
+    },
+    {
+      "emittedAtMs": 1791402402387,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; use `excludeTurns: true`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402402389,
+      "method": "thread/goal/cleared",
+      "params": {
+        "threadId": "{thread}"
+      }
+    },
+    {
+      "emittedAtMs": 1791402402391,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402402644,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402402897,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402402918,
+      "method": "mcpServer/startupStatus/updated",
+      "params": {
+        "error": null,
+        "failureReason": null,
+        "name": "codex_apps",
+        "status": "ready",
+        "threadId": "{thread}"
+      }
+    },
+    {
+      "emittedAtMs": 1791402403150,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402403269,
+      "method": "item/started",
+      "params": {
+        "item": {
+          "clientId": "fixture-batch",
+          "content": [
+            {
+              "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+              "text_elements": [],
+              "type": "text"
+            }
+          ],
+          "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+          "type": "userMessage"
+        },
+        "startedAtMs": 1791402403269,
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402403270,
+      "method": "item/completed",
+      "params": {
+        "completedAtMs": 1791402403269,
+        "item": {
+          "clientId": "fixture-batch",
+          "content": [
+            {
+              "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+              "text_elements": [],
+              "type": "text"
+            }
+          ],
+          "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+          "type": "userMessage"
+        },
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402403404,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402403657,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402403911,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402404164,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402404417,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402404671,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402404924,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402405054,
+      "method": "item/started",
+      "params": {
+        "item": {
+          "delivery": null,
+          "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+          "memoryCitation": null,
+          "phase": "commentary",
+          "questions": null,
+          "text": "",
+          "type": "agentMessage"
+        },
+        "startedAtMs": 1791402405053,
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405056,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "I",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405056,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "’ll",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405056,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " request",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405056,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " approval",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405056,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " to",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405177,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402405262,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " create",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405381,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " `/",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405431,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "tmp",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "/fl",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "ot",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "illa",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "-",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "approval",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "-pro",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405501,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "be",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405620,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "`,",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405684,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402405746,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " since",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405746,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " this",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " test",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " uses",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " a",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " read",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "-only",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": " sandbox",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405781,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": ".",
+        "itemId": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405785,
+      "method": "item/completed",
+      "params": {
+        "completedAtMs": 1791402405784,
+        "item": {
+          "delivery": null,
+          "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+          "memoryCitation": null,
+          "phase": "commentary",
+          "questions": null,
+          "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+          "type": "agentMessage"
+        },
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402405936,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402406190,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402406443,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402406697,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402406950,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    },
+    {
+      "emittedAtMs": 1791402406959,
+      "method": "thread/status/changed",
+      "params": {
+        "status": {
+          "activeFlags": [
+            "waitingOnApproval"
+          ],
+          "type": "active"
+        },
+        "threadId": "{thread}"
+      }
+    },
+    {
+      "emittedAtMs": 1791402406960,
+      "method": "item/started",
+      "params": {
+        "item": {
+          "aggregatedOutput": null,
+          "command": "/bin/bash -lc 'mkdir /tmp/flotilla-approval-probe'",
+          "commandActions": [
+            {
+              "command": "mkdir /tmp/flotilla-approval-probe",
+              "type": "unknown"
+            }
+          ],
+          "cwd": "{cwd}",
+          "durationMs": null,
+          "exitCode": null,
+          "id": "exec-e7ef4507-c50f-4aa2-8fbf-54f09728714f",
+          "pluginId": null,
+          "processId": null,
+          "scriptPath": null,
+          "source": "agent",
+          "status": "inProgress",
+          "type": "commandExecution"
+        },
+        "startedAtMs": 1791402406960,
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "id": 0,
+      "method": "item/commandExecution/requestApproval",
+      "params": {
+        "availableDecisions": [
+          "accept",
+          {
+            "acceptWithExecpolicyAmendment": {
+              "execpolicy_amendment": [
+                "mkdir",
+                "/tmp/flotilla-approval-probe"
+              ]
+            }
+          },
+          "cancel"
+        ],
+        "command": "/bin/bash -lc 'mkdir /tmp/flotilla-approval-probe'",
+        "commandActions": [
+          {
+            "command": "mkdir /tmp/flotilla-approval-probe",
+            "type": "unknown"
+          }
+        ],
+        "cwd": "{cwd}",
+        "environmentId": "local",
+        "itemId": "exec-e7ef4507-c50f-4aa2-8fbf-54f09728714f",
+        "kind": "command",
+        "proposedExecpolicyAmendment": [
+          "mkdir",
+          "/tmp/flotilla-approval-probe"
+        ],
+        "reason": "Do you approve creating /tmp/flotilla-approval-probe outside the read-only sandbox?",
+        "startedAtMs": 1791402406959,
+        "threadId": "{thread}",
+        "turnId": "01a117e7-6154-77a0-8360-d97842da21d6"
+      }
+    },
+    {
+      "emittedAtMs": 1791402407203,
+      "method": "deprecationNotice",
+      "params": {
+        "details": null,
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`."
+      }
+    }
+  ],
+  "interactions": [
+    {
+      "error": null,
+      "method": "thread/start",
+      "params": {
+        "approvalPolicy": "on-request",
+        "cwd": "{cwd}",
+        "model": "gpt-6.1-sol",
+        "sandbox": "read-only"
+      },
+      "result": {
+        "activePermissionProfile": null,
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "cwd": "{cwd}",
+        "disabledPluginIds": [],
+        "instructionSources": [
+          "{cwd}/AGENTS.md"
+        ],
+        "model": "gpt-6.1-sol",
+        "modelProvider": "openai",
+        "multiAgentMode": "explicitRequestOnly",
+        "reasoningEffort": null,
+        "runtimeWorkspaceRoots": [
+          "{cwd}"
+        ],
+        "sandbox": {
+          "networkAccess": false,
+          "type": "readOnly"
+        },
+        "serviceTier": null,
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": null,
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "type": "idle"
+          },
+          "threadSource": null,
+          "turns": [],
+          "updatedAt": 1791402402
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "turn/start",
+      "params": {
+        "clientUserMessageId": "fixture-batch",
+        "input": [
+          {
+            "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+            "text_elements": [],
+            "type": "text"
+          }
+        ],
+        "threadId": "{thread}"
+      },
+      "result": {
+        "turn": {
+          "completedAt": null,
+          "durationMs": null,
+          "error": null,
+          "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+          "items": [],
+          "itemsView": "notLoaded",
+          "startedAt": null,
+          "status": "inProgress"
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/resume",
+      "params": {
+        "excludeTurns": false,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "activePermissionProfile": null,
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "collaborationMode": {
+          "mode": "default",
+          "settings": {
+            "developer_instructions": null,
+            "model": "gpt-6.1-sol",
+            "reasoning_effort": null
+          }
+        },
+        "cwd": "{cwd}",
+        "disabledPluginIds": [],
+        "initialTurnsPage": null,
+        "instructionSources": [
+          "{cwd}/AGENTS.md"
+        ],
+        "itemsBackwardsCursor": null,
+        "model": "gpt-6.1-sol",
+        "modelProvider": "openai",
+        "multiAgentMode": "explicitRequestOnly",
+        "reasoningEffort": null,
+        "runtimeWorkspaceRoots": [
+          "{cwd}"
+        ],
+        "sandbox": {
+          "networkAccess": false,
+          "type": "readOnly"
+        },
+        "serviceTier": null,
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402402
+        },
+        "turnsBackwardsCursor": "{\"requestedThreadId\":\"{thread}\",\"rolloutOrdinal\":1,\"includeAnchor\":true,\"scope\":{\"kind\":\"turns\"}}"
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402402
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402402
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402402
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402402
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                },
+                {
+                  "delivery": null,
+                  "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+                  "memoryCitation": null,
+                  "phase": "commentary",
+                  "questions": null,
+                  "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+                  "type": "agentMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                },
+                {
+                  "delivery": null,
+                  "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+                  "memoryCitation": null,
+                  "phase": "commentary",
+                  "questions": null,
+                  "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+                  "type": "agentMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                },
+                {
+                  "delivery": null,
+                  "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+                  "memoryCitation": null,
+                  "phase": "commentary",
+                  "questions": null,
+                  "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+                  "type": "agentMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                },
+                {
+                  "delivery": null,
+                  "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+                  "memoryCitation": null,
+                  "phase": "commentary",
+                  "questions": null,
+                  "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+                  "type": "agentMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                },
+                {
+                  "delivery": null,
+                  "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+                  "memoryCitation": null,
+                  "phase": "commentary",
+                  "questions": null,
+                  "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+                  "type": "agentMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402403
+        }
+      }
+    },
+    {
+      "error": null,
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "{thread}"
+      },
+      "result": {
+        "thread": {
+          "agentNickname": null,
+          "agentRole": null,
+          "canAcceptDirectInput": true,
+          "cliVersion": "0.160.0",
+          "createdAt": 1791402402,
+          "cwd": "{cwd}",
+          "daybreakEnabled": null,
+          "environments": [
+            {
+              "cwd": "{cwd}",
+              "environmentId": "local",
+              "runtimeWorkspaceRoots": [
+                "{cwd}"
+              ]
+            }
+          ],
+          "ephemeral": false,
+          "extra": null,
+          "forkedFromId": null,
+          "gitInfo": {
+            "branch": "feat/message-transport",
+            "originUrl": "https://github.com/flotilla-org/flotilla.git",
+            "sha": "0f5f899b55f83020532a74cbad59db59b636478c"
+          },
+          "historyMode": "paginated",
+          "id": "{thread}",
+          "model": "gpt-6.1-sol",
+          "modelProvider": "openai",
+          "name": null,
+          "originator": "flotilla",
+          "parentThreadId": null,
+          "path": "/tmp/flotilla-transport-acceptance/sessions/2026/10/07/rollout-2026-10-07T19-46-42-{thread}.jsonl",
+          "preview": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+          "projectId": null,
+          "reasoningEffort": null,
+          "recencyAt": 1791402402,
+          "section": null,
+          "sectionEnteredAt": null,
+          "sessionId": "{thread}",
+          "source": "vscode",
+          "status": {
+            "activeFlags": [
+              "waitingOnApproval"
+            ],
+            "type": "active"
+          },
+          "threadSource": null,
+          "turns": [
+            {
+              "completedAt": null,
+              "durationMs": null,
+              "error": null,
+              "id": "01a117e7-6154-77a0-8360-d97842da21d6",
+              "items": [
+                {
+                  "clientId": "fixture-batch",
+                  "content": [
+                    {
+                      "text": "[flotilla batch: fixture-batch]\nUse your shell tool to run mkdir /tmp/flotilla-approval-probe with escalated permissions. Explicitly request approval because this test uses a read-only sandbox.",
+                      "text_elements": [],
+                      "type": "text"
+                    }
+                  ],
+                  "id": "01a117e7-65c5-7e43-b338-a1eea9e41eb1",
+                  "type": "userMessage"
+                },
+                {
+                  "delivery": null,
+                  "id": "msg_0c8c43a1c74d79fc016ac6a1a5060481919478980ee5e0b134",
+                  "memoryCitation": null,
+                  "phase": "commentary",
+                  "questions": null,
+                  "text": "I’ll request approval to create `/tmp/flotilla-approval-probe`, since this test uses a read-only sandbox.",
+                  "type": "agentMessage"
+                }
+              ],
+              "itemsView": "full",
+              "startedAt": 1791402402,
+              "status": "inProgress"
+            }
+          ],
+          "updatedAt": 1791402406
+        }
+      }
+    }
+  ]
+}

@@ -35,6 +35,7 @@ bytes = "1"
 minijinja = "2"
 serde_yml = "0.0.12"
 futures = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-webpki-roots"] }
 urlencoding = "2"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

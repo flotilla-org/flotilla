@@ -365,6 +365,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
                 &session.metadata.resource_version,
                 &flotilla_resources::TerminalSessionStatus {
                     crew: Some(flotilla_resources::CrewSessionStatus {
+                        input_transports: Vec::new(),
                         id: "governor-id".into(),
                         adapter: "codex".into(),
                         model: None,
@@ -1523,6 +1524,7 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
                 &governor_session.metadata.resource_version,
                 &flotilla_resources::TerminalSessionStatus {
                     crew: Some(flotilla_resources::CrewSessionStatus {
+                        input_transports: Vec::new(),
                         id: "governor-id".into(),
                         adapter: "codex".into(),
                         model: None,
