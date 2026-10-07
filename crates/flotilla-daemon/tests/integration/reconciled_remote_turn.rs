@@ -290,8 +290,11 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     }
     convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stored legacy queue");
     replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
-    wait_until("adoption after convoy replication", || async {
-        placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox").items.len() == 2
+    // Admission publishes immutable intent before its initial status. Seeing
+    // two objects alone is not evidence that both admissions have completed.
+    wait_until("completed adoption after convoy replication", || async {
+        let records = placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox").items;
+        records.len() == 2 && records.iter().all(|record| record.status.is_some())
     })
     .await;
     if closed_watch.is_some() {

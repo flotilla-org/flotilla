@@ -196,6 +196,13 @@ does not declare a new turn: the durable turn start survives stale or Unobservab
 evidence, and fresh activity restores ability. Fresh hook evidence still takes
 precedence for up to two minutes.
 
+Operator commands such as `flotilla crew resume` and `flotilla crew handoff`
+create a new Message for each explicit invocation. If a command loses its response,
+inspect `flotilla crew list` and the receiver's Message records before running it
+again: another CLI invocation can enqueue the same instruction a second time.
+Transport retries within the original command reuse its immutable Message ID;
+operation tokens across separate CLI invocations are tracked in #2710.
+
 Schema authors: WorkflowTemplate manifests in the external project-map/ops
 repositories may specify `stall_nudges`; their existing field names and defaults
 remain compatible, so no companion manifest edit is required. Convoy status and
