@@ -4,7 +4,7 @@
 pub mod supervisor;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::Path,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -70,7 +70,12 @@ pub trait AppServer: Send + Sync {
     fn available(&self) -> bool {
         true
     }
+    /// Drain newly received events once; lifecycle consumers must not replay them.
     fn events(&self) -> Vec<Value> {
+        Vec::new()
+    }
+    /// A bounded diagnostic snapshot for the fixture recorder, not an event cursor.
+    fn event_snapshot(&self) -> Vec<Value> {
         Vec::new()
     }
     async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError>;
@@ -85,7 +90,7 @@ struct Call {
 /// One subscribed protocol client. Dropping it cancels its proxy. Explicit
 /// request deadlines also detect daemon death without relying on socket EOF.
 pub struct AppServerClient {
-    events: Arc<StdMutex<Vec<Value>>>,
+    events: Arc<StdMutex<VecDeque<Value>>>,
     calls: mpsc::Sender<Call>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -104,7 +109,7 @@ impl AppServerClient {
             .map_err(|_| "app-server handshake timed out")?
             .map_err(|error| error.to_string())?;
         let (calls, mut receiver) = mpsc::channel::<Call>(32);
-        let events = Arc::new(StdMutex::new(Vec::new()));
+        let events = Arc::new(StdMutex::new(VecDeque::new()));
         let observed = Arc::clone(&events);
         let task = tokio::spawn(async move {
             let _process = stream.process;
@@ -116,8 +121,13 @@ impl AppServerClient {
                         let Some(call) = call else { break };
                         sequence += 1;
                         let mut message = json!({"method":call.method,"params":call.params});
-                        if let Some(reply) = call.reply { message["id"] = json!(sequence); pending.insert(sequence, reply); }
-                        if socket.send(WsMessage::Text(message.to_string().into())).await.is_err() { break; }
+                        if let Some(reply) = call.reply {
+                            message["id"] = json!(sequence);
+                            pending.insert(sequence, reply);
+                        }
+                        if socket.send(WsMessage::Text(message.to_string().into())).await.is_err() {
+                            break;
+                        }
                     }
                     event = socket.next() => {
                         match event {
@@ -125,17 +135,26 @@ impl AppServerClient {
                                 let Ok(value) = serde_json::from_str::<Value>(&text) else { break };
                                 if value.get("method").is_some() {
                                     let mut events = observed.lock().expect("app-server events lock");
-                                    if events.len() == 256 { events.remove(0); }
-                                    events.push(value);
+                                    if events.len() == 256 {
+                                        events.pop_front();
+                                    }
+                                    events.push_back(value);
                                     continue;
                                 }
                                 if let Some(reply) = value["id"].as_u64().and_then(|id| pending.remove(&id)) {
-                                    let result = if let Some(error) = value.get("error") { Err(RpcError::Rejected(error.to_string())) }
-                                        else { Ok(value["result"].clone()) };
+                                    let result = if let Some(error) = value.get("error") {
+                                        Err(RpcError::Rejected(error.to_string()))
+                                    } else {
+                                        Ok(value["result"].clone())
+                                    };
                                     let _ = reply.send(result);
                                 }
                             }
-                            Some(Ok(WsMessage::Ping(bytes))) => { if socket.send(WsMessage::Pong(bytes)).await.is_err() { break; } }
+                            Some(Ok(WsMessage::Ping(bytes))) => {
+                                if socket.send(WsMessage::Pong(bytes)).await.is_err() {
+                                    break;
+                                }
+                            }
                             Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
                             _ => {}
                         }
@@ -147,7 +166,20 @@ impl AppServerClient {
             }
         });
         let client = Arc::new(Self { events, calls, task });
-        client.request("initialize", json!({"clientInfo":{"name":"flotilla","title":"Flotilla","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await.map_err(|error| error.reason())?;
+        client
+            .request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "flotilla",
+                        "title": "Flotilla",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": { "experimentalApi": true }
+                }),
+            )
+            .await
+            .map_err(|error| error.reason())?;
         client
             .calls
             .send(Call { method: "initialized".into(), params: json!({}), reply: None })
@@ -161,8 +193,11 @@ impl AppServer for AppServerClient {
     fn available(&self) -> bool {
         !self.calls.is_closed()
     }
+    fn event_snapshot(&self) -> Vec<Value> {
+        self.events.lock().expect("app-server events lock").iter().cloned().collect()
+    }
     fn events(&self) -> Vec<Value> {
-        self.events.lock().expect("app-server events lock").clone()
+        self.events.lock().expect("app-server events lock").drain(..).collect()
     }
     async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let (reply, receive) = oneshot::channel();
@@ -175,6 +210,9 @@ impl AppServer for AppServerClient {
         })
         .await
         .unwrap_or_else(|_| {
+            // Every request is also a heartbeat. A missed deadline deliberately
+            // closes this client and all pending calls: none can be trusted as
+            // unsent, and reconnect must poll receipts rather than replay input.
             self.task.abort();
             Err(RpcError::Unavailable("app-server heartbeat/request deadline exceeded".into()))
         })
@@ -207,6 +245,7 @@ impl CodexTransport {
         Ok(response["thread"].clone())
     }
     fn evidence(thread: &Value, id: &str) -> Option<String> {
+        let marker = format!("[flotilla batch: {id}]\n");
         thread["turns"].as_array()?.iter().find_map(|turn| {
             turn["items"]
                 .as_array()?
@@ -216,8 +255,7 @@ impl CodexTransport {
                         && (item["clientId"].as_str() == Some(id)
                             || item["content"].as_array().is_some_and(|content| {
                                 content.iter().any(|part| {
-                                    part["type"] == "text"
-                                        && part["text"].as_str().is_some_and(|text| text.starts_with(&format!("[flotilla batch: {id}]\n")))
+                                    part["type"] == "text" && part["text"].as_str().is_some_and(|text| text.starts_with(&marker))
                                 })
                             }))
                 })

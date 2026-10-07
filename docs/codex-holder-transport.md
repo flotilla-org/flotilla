@@ -62,7 +62,7 @@ is ambiguous. A successful RPC response alone is not a delivery receipt. A
 native `userMessage` item with the matching `clientId` proves acceptance; the
 server-generated item ID is different. A batch marker in the user content also
 permits receipt recovery if persisted history omits `clientId`. Turn events and
-approval requests are exposed as `HolderEvent`; `waitingOnApproval` and
+approval requests are exposed as `HolderEvent` through a draining event stream; `waitingOnApproval` and
 `waitingOnUserInput` become `NeedsInput` attention. Flotilla never answers an
 approval request automatically. An attached Codex client supplies that decision.
 
@@ -74,13 +74,15 @@ active. `turn/steer` has a matching-turn precondition and fails safely when the
 observed turn changes.
 
 Graceful teardown signals the supervisor after validating its incarnation PID
-and endpoint, waits for cleanup, then removes the cleat session. On app-server
+and endpoint. It sends SIGTERM to the app-server, allows two seconds to flush,
+then force-stops an unresponsive server, reaps descendants, and removes the cleat
+session. Child signal/wait failures still run orphan cleanup. On app-server
 exit or crash, the supervisor kills and reaps reparented descendants, including
 tools that started a new process group. Cleanup is bounded and refuses to claim
 success when children remain. An external SIGKILL of the supervisor itself
-cannot run cleanup; a retained PID receipt makes that absence explicit rather
-than signalling a reused PID. Vessel teardown remains the enclosing cleanup
-mechanism. Before replacing a failed launch, retained server sessions must be
+cannot run cleanup. If its process is absent, stop warns and removes the stale
+PID/socket receipt so relaunch and teardown can proceed. A reused live PID is
+never signalled. Vessel teardown remains the enclosing cleanup mechanism. Before replacing a failed launch, retained server sessions must be
 stopped through their supervisor.
 
 ## Evidence and operator acceptance

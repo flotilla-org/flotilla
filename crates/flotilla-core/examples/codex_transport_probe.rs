@@ -79,10 +79,10 @@ async fn main() -> Result<(), String> {
                 })
             })
         });
-        let approval = rpc.inner.events().iter().any(|event| event["method"] == "item/commandExecution/requestApproval");
+        let approval = rpc.inner.event_snapshot().iter().any(|event| event["method"] == "item/commandExecution/requestApproval");
         if read["thread"]["status"]["type"] == "idle" || (mode == "approval" && approval) {
             let interactions = rpc.interactions.lock().expect("recording lock");
-            let encoded = serde_json::to_string_pretty(&json!({"interactions":*interactions,"events":rpc.inner.events()}))
+            let encoded = serde_json::to_string_pretty(&json!({"interactions":*interactions,"events":rpc.inner.event_snapshot()}))
                 .map_err(|error| error.to_string())?;
             // Mask environment paths, not the observed protocol layout or events.
             let encoded = encoded.replace(&cwd, "{cwd}").replace(thread, "{thread}");
@@ -110,8 +110,10 @@ async fn main() -> Result<(), String> {
     let _ = rpc.request("turn/interrupt", json!({"threadId":thread,"turnId":started["turn"]["id"]})).await;
     std::fs::write(
         "/tmp/codex-transport-failure.json",
-        serde_json::to_string_pretty(&json!({"interactions":*rpc.interactions.lock().expect("interactions"),"events":rpc.inner.events()}))
-            .map_err(|error| error.to_string())?,
+        serde_json::to_string_pretty(
+            &json!({"interactions":*rpc.interactions.lock().expect("interactions"),"events":rpc.inner.event_snapshot()}),
+        )
+        .map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
     Err("turn did not complete within acceptance bound; diagnostic in /tmp/codex-transport-failure.json".into())

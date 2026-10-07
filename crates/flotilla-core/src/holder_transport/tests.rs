@@ -65,7 +65,7 @@ struct Peer {
     thread: Mutex<Value>,
     calls: Mutex<Vec<String>>,
     error: Option<RpcError>,
-    events: Vec<Value>,
+    events: Mutex<Vec<Value>>,
 }
 impl Peer {
     fn new(active: bool, error: Option<RpcError>) -> Arc<Self> {
@@ -74,14 +74,14 @@ impl Peer {
             "turns":[{"id":"turn","status":if active {"inProgress"} else {"completed"},"items":[]}]})),
             calls: Mutex::new(Vec::new()),
             error,
-            events: Vec::new(),
+            events: Mutex::new(Vec::new()),
         })
     }
 }
 #[async_trait]
 impl AppServer for Peer {
     fn events(&self) -> Vec<Value> {
-        self.events.clone()
+        std::mem::take(&mut *self.events.lock().expect("events"))
     }
     async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         self.calls.lock().expect("calls").push(method.into());
@@ -214,11 +214,13 @@ async fn recorded_first_party_receipts_and_turn_events() {
         thread: Mutex::new(json!({})),
         calls: Mutex::new(Vec::new()),
         error: None,
-        events: fixture["events"].as_array().expect("events").clone(),
+        events: Mutex::new(fixture["events"].as_array().expect("events").clone()),
     });
     let transport = CodexTransport { rpc: peer, thread: "{thread}".into() };
-    assert!(transport.events().iter().any(|event| matches!(event, HolderEvent::TurnStarted { .. })));
-    assert!(transport.events().iter().any(|event| matches!(event, HolderEvent::TurnCompleted { status, .. } if status == "completed")));
+    let events = transport.events();
+    assert!(events.iter().any(|event| matches!(event, HolderEvent::TurnStarted { .. })));
+    assert!(events.iter().any(|event| matches!(event, HolderEvent::TurnCompleted { status, .. } if status == "completed")));
+    assert!(transport.events().is_empty(), "turn events are consumed once");
 }
 
 // Approval requests and resolution are structured observations. No approval
@@ -229,10 +231,10 @@ async fn structured_approvals_require_input_without_auto_approval() {
         thread: Mutex::new(json!({"id":"thread","status":{"type":"active","activeFlags":["waitingOnApproval"]},"turns":[]})),
         calls: Mutex::new(Vec::new()),
         error: None,
-        events: vec![
+        events: Mutex::new(vec![
             json!({"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread","turnId":"turn","itemId":"command"}}),
             json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":42}}),
-        ],
+        ]),
     });
     let transport = CodexTransport::resume(peer.clone(), "thread".into()).await.expect("resume");
     assert_eq!(transport.attention().await.expect("attention"), flotilla_resources::TerminalAttentionState::NeedsInput);
@@ -325,7 +327,10 @@ async fn heartbeat_timeout_cancels_the_protocol_process_without_reissuing_input(
     tokio::task::yield_now().await;
     assert!(stopped.load(Ordering::SeqCst));
     assert!(!client.available());
+    assert_eq!(client.event_snapshot().len(), 1);
     assert_eq!(client.events().len(), 1);
+    assert!(client.events().is_empty(), "approval event is delivered only once");
+    assert!(client.events().is_empty());
 }
 
 // Recorded steering must retain the active turn and produce a distinct native
@@ -349,7 +354,7 @@ fn recorded_steering_and_approval_contracts() {
         thread: Mutex::new(json!({})),
         calls: Mutex::new(Vec::new()),
         error: None,
-        events: approval["events"].as_array().expect("events").clone(),
+        events: Mutex::new(approval["events"].as_array().expect("events").clone()),
     });
     let transport = CodexTransport { rpc: peer, thread: "{thread}".into() };
     assert!(transport.events().iter().any(|event| matches!(event, HolderEvent::ApprovalRequested { .. })));
@@ -383,4 +388,45 @@ async fn launch_receipt_is_bounded_and_never_resubmitted() {
     assert!(peer.calls.lock().expect("calls").iter().all(|method| method == "thread/read"));
     peer.thread.lock().expect("thread")["turns"][0]["items"] = json!([{"type":"userMessage","clientId":"launch","id":"generated"}]);
     transport.wait_for_launch_receipt("launch").await.expect("correlated launch receipt");
+}
+
+// A turn may start in another client after the idle read. An explicit native
+// rejection is unsent, whereas losing the reply remains held for receipt polling.
+#[tokio::test]
+async fn turn_start_race_rejection_is_unsent_and_lost_reply_is_ambiguous() {
+    struct RacingPeer {
+        inner: Arc<Peer>,
+        lost: bool,
+    }
+    #[async_trait]
+    impl AppServer for RacingPeer {
+        async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+            if method == "turn/start" {
+                // Independent client starts a turn between read and start.
+                let mut thread = self.inner.thread.lock().expect("thread");
+                thread["status"]["type"] = json!("active");
+                thread["turns"][0]["status"] = json!("inProgress");
+                return Err(if self.lost {
+                    RpcError::Unavailable("reply lost after concurrent start".into())
+                } else {
+                    RpcError::Rejected("thread already active".into())
+                });
+            }
+            self.inner.request(method, params).await
+        }
+    }
+    for lost in [false, true] {
+        let rpc = Arc::new(RacingPeer { inner: Peer::new(false, None), lost });
+        let transport = CodexTransport::started(rpc.clone(), "thread".into());
+        let batch = batch(false).await;
+        let result = transport.submit(&batch).await;
+        if lost {
+            assert!(matches!(result, MessageTransportOutcome::Unconfirmed { .. }));
+        } else {
+            assert!(matches!(result, MessageTransportOutcome::NotSubmitted { .. }));
+        }
+        assert_eq!(rpc.inner.thread.lock().expect("thread")["status"]["type"], "active");
+        assert!(matches!(transport.poll(&batch).await, MessageTransportOutcome::Pending));
+        assert_eq!(rpc.inner.calls.lock().expect("calls").as_slice(), ["thread/read", "thread/read"]);
+    }
 }
