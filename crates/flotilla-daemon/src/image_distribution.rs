@@ -51,6 +51,9 @@ pub(crate) struct ImageDistributor<I> {
     retries: tokio::sync::Mutex<BTreeMap<String, Instant>>,
     #[builder(default)]
     pub(crate) next_collection: tokio::sync::Mutex<Option<Instant>>,
+    /// Pending durable health publication must not lose deletion evidence.
+    #[builder(default)]
+    pub(crate) collection_deleted_registry: tokio::sync::Mutex<BTreeSet<String>>,
     #[builder(default)]
     pub(crate) collection_gate: Arc<tokio::sync::RwLock<()>>,
 }

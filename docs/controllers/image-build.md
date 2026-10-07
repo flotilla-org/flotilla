@@ -238,9 +238,22 @@ of the retired build. A second grace interval quarantines retirement before byte
 are removed; a frozen reference arriving during quarantine cancels retirement.
 Apply waits for fresh fleet Host heartbeats, serializes local delivery/publication
 with collection, and re-reads reachability before each destructive operation.
-Disconnected fleets fail closed. The configured grace must exceed the deployment's
+Disconnected fleets fail closed. A non-deleting Host with a missing heartbeat or
+one older than 120 seconds blocks apply-mode collection (four missed default
+30-second heartbeats). Operators must delete decommissioned Host records; an
+offline record is deliberately not treated as proof that its pins are obsolete.
+Custom heartbeat intervals must stay below this freshness limit. Retirement
+conflicts are reported per build and retried after 30 seconds. Health publication
+failures preserve the collection outcome and retain deletion evidence in memory
+for republication; tombstones are pruned when no ImageBuild references them.
+The configured grace must exceed the deployment's
 replication/admission latency; the minimum is one hour. Schedule intervals must
 be at least one minute. Dry-run does not retire builds or remove tags/manifests.
+
+Reachability is deliberately re-read before every deletion so a pin arriving
+between two removals wins. For large stores, enable
+`RUST_LOG=flotilla_daemon::image_gc=debug` to measure each snapshot's elapsed time,
+build count and protected-string count before tuning scheduling or batch size.
 
 Docker container references and tags outside known Flotilla build, parent, or
 cache publication handles refuse collection. Only owned tags are removed and

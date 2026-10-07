@@ -4,6 +4,9 @@ use crate::{ApiPaths, InputMeta, NoStatusPatch, ReplicationClass, Resource, Reso
 
 /// The fleet store authors this singleton; Definitions federation distributes it.
 pub const FLEET_DESIGNATION_NAME: &str = "fleet";
+const MIN_GC_INTERVAL_SECONDS: u64 = 60;
+const MIN_GC_GRACE_SECONDS: u64 = 3600;
+const MAX_GC_PERIOD_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FleetDesignation;
@@ -23,7 +26,9 @@ impl Resource for FleetDesignation {
             cache.validate().map_err(ResourceError::invalid)?;
         }
         if let Some(gc) = &spec.image_gc {
-            if !(60..=31536000).contains(&gc.interval_seconds) || !(3600..=31536000).contains(&gc.grace_seconds) {
+            if !(MIN_GC_INTERVAL_SECONDS..=MAX_GC_PERIOD_SECONDS).contains(&gc.interval_seconds)
+                || !(MIN_GC_GRACE_SECONDS..=MAX_GC_PERIOD_SECONDS).contains(&gc.grace_seconds)
+            {
                 return Err(ResourceError::invalid("image GC needs an interval >= 60s and grace >= 3600s"));
             }
             if gc.registry_host.as_ref().is_some_and(|value| value.trim().is_empty())
@@ -49,7 +54,7 @@ pub struct FleetDesignationSpec {
     /// Optional shared OCI cache; ADR 0047 default may retire after one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_cache: Option<ImageCacheBinding>,
-    /// Opt-in collection. ADR 0047: remove this decoder default after one roll.
+    /// Opt-in collection; absent in fleets that have not enabled collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_gc: Option<ImageGcPolicy>,
 }

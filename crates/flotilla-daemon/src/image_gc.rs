@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use crate::image_distribution::{ImageDistributionIo, ImageDistributor};
 
 pub(crate) const HEALTH_CAPABILITY: &str = "image_gc";
+// Four missed default 30-second heartbeats. Custom heartbeat intervals must
+// remain below this limit when apply-mode collection is enabled.
+const MAX_HOST_HEARTBEAT_AGE_SECONDS: i64 = 120;
+const COLLECTION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct CollectionReport {
@@ -168,6 +172,7 @@ pub(crate) fn retention(
 
 impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
     async fn collection_snapshot(&self, grace: u64) -> Result<(BTreeMap<String, ResourceObject<ImageBuild>>, BTreeSet<String>), String> {
+        let started = Instant::now();
         if self
             .backend
             .diagnostics()
@@ -202,6 +207,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         let seconds = i64::try_from(grace).map_err(|_| "image GC grace too large")?;
         let cutoff = Utc::now().checked_sub_signed(chrono::Duration::seconds(seconds)).ok_or("image GC grace out of range")?;
         let protected = retention(&builds, &layers, protected, cutoff)?;
+        tracing::debug!(builds = builds.len(), pins = protected.len(), elapsed = ?started.elapsed(), "image GC reachability snapshot");
         Ok((builds, protected))
     }
 
@@ -224,17 +230,22 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         // when idle so a long transfer never stalls the scheduler. Finished
         // publications must first have their digest evidence drained by refresh.
         let Ok(_gate) = self.collection_gate.try_write() else {
-            *next = Some(Instant::now() + std::time::Duration::from_secs(30));
+            *next = Some(Instant::now() + COLLECTION_RETRY_DELAY);
             return Ok(());
         };
         if !self.publications.lock().await.is_empty() || self.jobs.lock().await.values().any(|job| !job.is_finished()) {
-            *next = Some(Instant::now() + std::time::Duration::from_secs(30));
+            *next = Some(Instant::now() + COLLECTION_RETRY_DELAY);
             return Ok(());
         }
         *next = Some(Instant::now() + std::time::Duration::from_secs(policy.interval_seconds));
-        let mut report =
-            CollectionReport { dry_run: policy.mode == ImageGcMode::DryRun, observed_at: Some(Utc::now()), ..Default::default() };
+        let mut report = CollectionReport {
+            dry_run: policy.mode == ImageGcMode::DryRun,
+            observed_at: Some(Utc::now()),
+            deleted_registry: self.collection_deleted_registry.lock().await.clone(),
+            ..Default::default()
+        };
         let result = async {
+            let grace_seconds = i64::try_from(policy.grace_seconds).map_err(|_| "image GC grace too large")?;
             let (builds, protected) = self.collection_snapshot(policy.grace_seconds).await?;
             let held = self.io.inventory().await?;
             if let Ok(host) = self.backend.using::<Host>(&self.namespace).get(&self.host).await {
@@ -244,9 +255,17 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                     .and_then(|status| status.capabilities.get(HEALTH_CAPABILITY))
                     .and_then(|report| report.get("deleted_registry"))
                 {
-                    report.deleted_registry = serde_json::from_value(deleted.clone()).map_err(|error| error.to_string())?;
+                    match serde_json::from_value::<BTreeSet<String>>(deleted.clone()) {
+                        Ok(deleted) => report.deleted_registry.extend(deleted),
+                        Err(error) => tracing::warn!(%error, "ignoring malformed image GC registry tombstones"),
+                    }
                 }
             }
+            // Bound tombstones to existing execution evidence. A removed build
+            // cannot generate another delete candidate, so its tombstone is free.
+            let published: BTreeSet<_> =
+                builds.values().filter_map(|build| build.status.as_ref()?.availability.registry_ref.as_ref()).collect();
+            report.deleted_registry.retain(|reference| published.contains(reference));
             for build in builds.values() {
                 let Some(status) = build.status.as_ref().filter(|status| status.phase == ImageBuildPhase::Built) else {
                     continue;
@@ -291,7 +310,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                         .status
                         .as_ref()
                         .and_then(|status| status.heartbeat_at)
-                        .is_none_or(|at| Utc::now().signed_duration_since(at).num_seconds() > 120)
+                        .is_none_or(|at| Utc::now().signed_duration_since(at).num_seconds() > MAX_HOST_HEARTBEAT_AGE_SECONDS)
                 {
                     return Err(format!("collection waits for fresh Host {} heartbeat", source.object.metadata.name));
                 }
@@ -300,16 +319,19 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
             // Retire the actuator's reusable availability before touching Docker.
             // New demands create successors instead of joining collected evidence.
             let objects = self.backend.using::<ImageBuild>(&self.namespace);
+            let mut retirement_failures = BTreeSet::new();
             for build in builds.values().filter(|build| build.spec.host_ref == self.host) {
                 if let Some(mut status) = build.status.clone().filter(|status| status.phase == ImageBuildPhase::Built) {
                     let retire = !protected.contains(&build.metadata.name);
                     if status.availability.retired != retire {
                         status.availability.retired = retire;
                         status.availability.retired_at = retire.then(Utc::now);
-                        objects
-                            .update_status(&build.metadata.name, &build.metadata.resource_version, &status)
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        if let Err(error) = objects.update_status(&build.metadata.name, &build.metadata.resource_version, &status).await {
+                            // This build stays quarantined. Continue independent
+                            // work and retry promptly from fresh evidence.
+                            retirement_failures.insert(build.metadata.name.clone());
+                            report.failures.push(format!("{} retirement: {error}", build.metadata.name));
+                        }
                     }
                 }
             }
@@ -317,7 +339,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
             // their frozen pins. Remote removal waits for the actuator's own
             // retirement evidence; no receiver invents retirement on its behalf.
             let quarantined = |id: &str| {
-                builds
+                let mut matches = builds
                     .values()
                     .filter(|build| {
                         build
@@ -326,14 +348,19 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                             .and_then(|status| status.identity.as_ref())
                             .is_some_and(|identity| identity.local_image_id == id)
                     })
-                    .all(|build| {
-                        build.status.as_ref().is_some_and(|status| {
-                            status.availability.retired
-                                && status
-                                    .availability
-                                    .retired_at
-                                    .is_some_and(|at| Utc::now().signed_duration_since(at).num_seconds() >= policy.grace_seconds as i64)
-                        })
+                    .peekable();
+                // Candidates come from builds, but explicitly refuse an empty
+                // match instead of relying on vacuous all().
+                matches.peek().is_some()
+                    && matches.all(|build| {
+                        !retirement_failures.contains(&build.metadata.name)
+                            && build.status.as_ref().is_some_and(|status| {
+                                status.availability.retired
+                                    && status
+                                        .availability
+                                        .retired_at
+                                        .is_some_and(|at| Utc::now().signed_duration_since(at).num_seconds() >= grace_seconds)
+                            })
                     })
             };
             for id in &report.local_candidates {
@@ -403,7 +430,16 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         if let Err(reason) = &result {
             report.failures.push(reason.clone());
         }
-        publish_report(&self.backend, &self.namespace, &self.host, &report).await?;
+        // Keep evidence until a subsequent health write can persist it. A
+        // publication failure must never replace the collection's own outcome.
+        *self.collection_deleted_registry.lock().await = report.deleted_registry.clone();
+        let publication = publish_report(&self.backend, &self.namespace, &self.host, &report).await;
+        if let Err(error) = &publication {
+            tracing::warn!(%error, "image GC health publication failed; deletion evidence retained for retry");
+        }
+        if publication.is_err() || !report.failures.is_empty() {
+            *next = Some(Instant::now() + COLLECTION_RETRY_DELAY);
+        }
         result
     }
 }
@@ -534,10 +570,20 @@ mod tests {
         images: Mutex<BTreeSet<String>>,
         removed_registry: Mutex<BTreeSet<String>>,
         fail: bool,
+        conflict_retirement: Mutex<Option<ResourceBackend>>,
+        delete_host_after_registry: Mutex<Option<ResourceBackend>>,
     }
     #[async_trait]
     impl ImageDistributionIo for Docker {
         async fn inventory(&self) -> Result<BTreeSet<String>, String> {
+            let backend = self.conflict_retirement.lock().expect("conflict hook").take();
+            if let Some(backend) = backend {
+                let builds = backend.using::<ImageBuild>("test");
+                let build = builds.get("build-1").await.expect("build");
+                let mut status = build.status.expect("status");
+                status.availability.failure = Some("concurrent inventory observation".into());
+                builds.update_status("build-1", &build.metadata.resource_version, &status).await.expect("concurrent update");
+            }
             Ok(self.images.lock().expect("images").clone())
         }
         async fn inspect(&self, id: &str) -> Result<PlacedImageIdentity, String> {
@@ -566,6 +612,10 @@ mod tests {
         async fn remove_registry(&self, _: &ImageCacheBinding, credential: &str, reference: &str) -> Result<(), String> {
             assert_eq!(credential, "delete-only");
             assert!(self.removed_registry.lock().expect("registry").insert(reference.into()), "do not re-delete a tombstoned manifest");
+            let backend = self.delete_host_after_registry.lock().expect("report hook").take();
+            if let Some(backend) = backend {
+                backend.using::<Host>("test").delete("host").await.expect("Host disappears after deletion");
+            }
             Ok(())
         }
         async fn disk_free(&self) -> Result<u64, String> {
@@ -634,6 +684,131 @@ mod tests {
             .namespace("test".into())
             .host("host".into())
             .build()
+    }
+
+    // HTTP boundary stand-in: concurrent status writers cause one or every
+    // CAS attempt to conflict. Each retry must read a fresh resource version.
+    #[cfg(not(feature = "skip-no-sandbox-tests"))]
+    #[tokio::test]
+    async fn report_retries_conflicts_and_bounds_exhaustion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            http::StatusCode,
+            routing::{get, put},
+            Json, Router,
+        };
+        use flotilla_resources::HttpBackend;
+
+        for conflicts in [1, 3] {
+            let collector = setup(ImageGcMode::DryRun, false, false, false).await;
+            let host = collector.backend.using::<Host>("test").get("host").await.expect("host");
+            let object = serde_json::to_value(host.to_k8s_object()).expect("wire host");
+            let reads = Arc::new(AtomicUsize::new(0));
+            let writes = Arc::new(AtomicUsize::new(0));
+            let read_count = Arc::clone(&reads);
+            let get_object = object.clone();
+            let write_count = Arc::clone(&writes);
+            let app = Router::new()
+                .route(
+                    "/apis/flotilla.work/v1/namespaces/test/hosts/host",
+                    get(move || {
+                        let mut object = get_object.clone();
+                        let version = read_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        object["metadata"]["resourceVersion"] = serde_json::json!(version.to_string());
+                        async move { Json(object) }
+                    }),
+                )
+                .route(
+                    "/apis/flotilla.work/v1/namespaces/test/hosts/host/status",
+                    put(move |Json(patch): Json<serde_json::Value>| {
+                        let attempt = write_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut object = object.clone();
+                        async move {
+                            assert_eq!(patch["metadata"]["resourceVersion"], attempt.to_string());
+                            assert_eq!(patch["status"]["capabilities"][HEALTH_CAPABILITY]["dry_run"], true);
+                            if attempt <= conflicts {
+                                (StatusCode::CONFLICT, Json(serde_json::json!({"message": "concurrent heartbeat"})))
+                            } else {
+                                object["status"] = patch["status"].clone();
+                                (StatusCode::OK, Json(object))
+                            }
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+            let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), format!("http://{address}")));
+            let result = publish_report(&backend, "test", "host", &CollectionReport { dry_run: true, ..Default::default() }).await;
+            assert_eq!(result.is_err(), conflicts == 3);
+            assert_eq!(reads.load(Ordering::SeqCst), if conflicts == 3 { 3 } else { 2 });
+            assert_eq!(writes.load(Ordering::SeqCst), reads.load(Ordering::SeqCst));
+            server.abort();
+        }
+    }
+
+    // Stored report corruption and references without build evidence cannot
+    // grow health status or prevent the next conservative dry-run.
+    #[tokio::test]
+    async fn registry_tombstones_recover_corruption_and_drop_orphans() {
+        let retained = format!("registry.test/images@{}", digest(101));
+        for deleted in [serde_json::json!([retained, "registry.test/images@orphan"]), serde_json::json!({"bad": "shape"})] {
+            let collector = setup(ImageGcMode::DryRun, true, false, false).await;
+            let hosts = collector.backend.using::<Host>("test");
+            let host = hosts.get("host").await.expect("host");
+            let mut status = host.status.expect("status");
+            status.capabilities.insert(HEALTH_CAPABILITY.into(), serde_json::json!({"deleted_registry": deleted}));
+            hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("stored report");
+            collector.collect_if_due().await.expect("report recovery");
+            let report = hosts.get("host").await.expect("host").status.expect("status").capabilities[HEALTH_CAPABILITY].clone();
+            assert_eq!(report["deleted_registry"], if deleted.is_array() { serde_json::json!([retained]) } else { serde_json::json!([]) });
+        }
+    }
+
+    // A stale retirement CAS affects one build and retries promptly; it must
+    // not prevent the rest of the run from reporting its outcome.
+    #[tokio::test]
+    async fn retirement_conflict_is_reported_and_retried() {
+        let collector = setup(ImageGcMode::Apply, false, false, false).await;
+        *collector.io.conflict_retirement.lock().expect("conflict hook") = Some(collector.backend.clone());
+        collector.collect_if_due().await.expect("one conflict is advisory");
+        let hosts = collector.backend.using::<Host>("test");
+        let status = hosts.get("host").await.expect("host").status.expect("status");
+        assert!(!status.capabilities[HEALTH_CAPABILITY]["failures"].as_array().expect("failures").is_empty());
+        assert!(collector.next_collection.lock().await.expect("retry") <= Instant::now() + COLLECTION_RETRY_DELAY);
+        *collector.next_collection.lock().await = None;
+        collector.collect_if_due().await.expect("retry");
+        assert!(
+            collector.backend.using::<ImageBuild>("test").get("build-1").await.expect("build").status.expect("status").availability.retired
+        );
+    }
+
+    // Successful deletion survives a lost Host health write. Restoring the Host
+    // must republish evidence rather than delete the same manifest again.
+    #[tokio::test]
+    async fn registry_deletion_survives_health_publication_failure() {
+        let collector = setup(ImageGcMode::Apply, true, false, false).await;
+        collector.collect_if_due().await.expect("retire");
+        let builds = collector.backend.using::<ImageBuild>("test");
+        let build = builds.get("build-1").await.expect("build");
+        let mut status = build.status.expect("status");
+        status.availability.retired_at = Some(Utc::now() - chrono::Duration::hours(2));
+        builds.update_status("build-1", &build.metadata.resource_version, &status).await.expect("quarantine elapsed");
+        *collector.io.delete_host_after_registry.lock().expect("report hook") = Some(collector.backend.clone());
+        *collector.next_collection.lock().await = None;
+        collector.collect_if_due().await.expect("deletion outcome survives report failure");
+        let hosts = collector.backend.using::<Host>("test");
+        let host = hosts.create(&InputMeta::builder().name("host".into()).build(), &HostSpec::default()).await.expect("restore host");
+        hosts
+            .update_status("host", &host.metadata.resource_version, &HostStatus { heartbeat_at: Some(Utc::now()), ..Default::default() })
+            .await
+            .expect("heartbeat");
+        *collector.next_collection.lock().await = None;
+        collector.collect_if_due().await.expect("republish deletion evidence");
+        assert_eq!(collector.io.removed_registry.lock().expect("registry").len(), 1);
+        let report = hosts.get("host").await.expect("host").status.expect("status").capabilities[HEALTH_CAPABILITY].clone();
+        assert_eq!(report["deleted_registry"], serde_json::json!([format!("registry.test/images@{}", digest(101))]));
     }
 
     // Active image IO and undrained publication evidence defer retirement,
