@@ -17,6 +17,14 @@ loader.exec_module(bench)
 
 
 class BenchmarkContract(unittest.TestCase):
+    def test_toolchain_defaults_to_repository_pin_and_honors_override(self):
+        # Glue: reuse the real shared pin reader; an explicit experimental
+        # toolchain must win without requiring a repository pin.
+        root = Path(__file__).resolve().parents[2]
+        expected = bench.output(['sh', '-c', '. ci/toolchain/pin.sh; read_rust_pin rust-toolchain.toml'], cwd=root)
+        self.assertEqual(bench.benchmark_toolchain(root, None), expected)
+        self.assertEqual(bench.benchmark_toolchain(Path('/missing'), 'experimental'), 'experimental')
+
     @settings(derandomize=True)
     @given(rounds=st.integers(min_value=0, max_value=8), count=st.integers(min_value=0, max_value=4))
     def test_pairs_alternate_and_balance(self, rounds, count):

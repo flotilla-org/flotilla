@@ -16,10 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zsh \
     && rm -rf /var/lib/apt/lists/*
 
-# Pinned nightly for rustfmt and coverage
-RUN rustup toolchain install nightly-2026-03-12 \
-    && rustup component add --toolchain nightly-2026-03-12 rustfmt llvm-tools-preview \
-    && rustup component add clippy
+# Use the repository's stable compiler, formatter, coverage and Clippy pin.
+COPY rust-toolchain.toml ci/toolchain/pin.sh /opt/flotilla/
+RUN . /opt/flotilla/pin.sh \
+    && rustup toolchain install "$(read_rust_pin /opt/flotilla/rust-toolchain.toml)" --profile minimal \
+    && (cd /opt/flotilla && rustup show active-toolchain) \
+    && rustup default "$(read_rust_pin /opt/flotilla/rust-toolchain.toml)"
 
 # Node.js (for npm-installed agent CLIs)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
