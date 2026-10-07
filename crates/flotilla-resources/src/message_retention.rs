@@ -44,9 +44,15 @@ impl MessageInbox {
         // Read potentially large audit/Convoy inventories outside inbox locks.
         // Refresh protection before each bounded batch, then release both locks
         // so admission and delivery can progress even on the first startup sweep.
+        // QueueMessageFollowUp producers publish a fresh UUID-named Message
+        // before queueing its reference. Such a new follow-up cannot name an
+        // old terminal record in this snapshot, even while we wait for locks.
+        // Existing/manual/replicated references are conservatively protected below.
         let candidates = self.messages.query(&MessageQuery::AuditBefore { before }).await?;
         let mut count = 0;
         for batch in candidates.chunks(100) {
+            // Deliberately pay O(batches × Convoys) outside the inbox locks:
+            // rescanning keeps protection fresh without another watch lifecycle.
             let mut protected = BTreeSet::new();
             for namespace in self.backend.stored_namespaces::<Convoy>().await? {
                 for convoy in self.backend.including_replicas::<Convoy>(&namespace).list().await?.items {
@@ -220,12 +226,22 @@ mod tests {
         assert_eq!(inbox.messages.get("new-work").await.unwrap().spec.body, "new work");
     }
 
+    async fn replicate_convoys_if_needed(replica: bool, source: &ResourceBackend, destination: &ResourceBackend) {
+        if replica {
+            destination
+                .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("home"), "workflow")
+                .replace(&source.using::<Convoy>("workflow").list().await.unwrap(), Utc::now())
+                .await
+                .unwrap();
+        }
+    }
+
     // A cross-namespace reference in either an authored or replicated Convoy
     // protects its target body. A same-name reference to another namespace does
     // not pin an unrelated Message forever.
     #[tokio::test]
     async fn followup_protection_respects_target_namespace_across_convoy_sources() {
-        use flotilla_protocol::{NodeId, ResourceRef};
+        use flotilla_protocol::ResourceRef;
 
         use crate::{ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState};
         for backend in [ResourceBackend::InMemory(Default::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())] {
@@ -249,35 +265,17 @@ mod tests {
                         .build(),
                 );
                 let convoy = convoys.update_status("convoy", &convoy.metadata.resource_version, &status).await.unwrap();
-                if replica {
-                    backend
-                        .replica_writer::<Convoy>(NodeId::new("home"), "workflow")
-                        .replace(&convoys.list().await.unwrap(), Utc::now())
-                        .await
-                        .unwrap();
-                }
+                replicate_convoys_if_needed(replica, &source, &backend).await;
                 let inbox = MessageInbox::new(backend.clone(), "messages").with_audit_retention_days(1);
                 assert_eq!(inbox.compact_audit(Utc.timestamp_opt(90000, 0).unwrap()).await.unwrap(), 0);
                 assert_eq!(inbox.messages.get("followup").await.unwrap().spec.body, "audit payload");
                 status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().pending_follow_up.as_mut().unwrap().namespace =
                     "other-messages".into();
                 convoys.update_status("convoy", &convoy.metadata.resource_version, &status).await.unwrap();
-                if replica {
-                    backend
-                        .replica_writer::<Convoy>(NodeId::new("home"), "workflow")
-                        .replace(&convoys.list().await.unwrap(), Utc::now())
-                        .await
-                        .unwrap();
-                }
+                replicate_convoys_if_needed(replica, &source, &backend).await;
                 assert_eq!(inbox.compact_audit(Utc.timestamp_opt(90000, 0).unwrap()).await.unwrap(), 1);
                 convoys.delete("convoy").await.unwrap();
-                if replica {
-                    backend
-                        .replica_writer::<Convoy>(NodeId::new("home"), "workflow")
-                        .replace(&convoys.list().await.unwrap(), Utc::now())
-                        .await
-                        .unwrap();
-                }
+                replicate_convoys_if_needed(replica, &source, &backend).await;
                 inbox.messages.delete("followup").await.unwrap();
             }
         }
