@@ -16,4 +16,6 @@ Install `ci/platform-tests/requirements.txt`, then run
 `ci/platform-tests/test-run.sh` and
 `python3 -m unittest discover -s ci/toolchain -p test_action.py` for the runner
 and composite-action contracts. Tests fake only the Cargo process boundary;
-they do not run platform tests on Linux.
+they do not run platform tests on Linux. Set `SELECTOR_TEST_BASH=/bin/bash`
+to exercise the runner with macOS's system Bash 3.2 (the operator workflow
+diff does this in the existing macOS job).

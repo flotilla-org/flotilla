@@ -1,5 +1,5 @@
 # OS/job | cargo test arguments (whitespace-separated; no shell quoting).
-# all applies to both windows and macos; keep shared selectors on one line.
+# all applies to both windows and macos; write shared coverage once under all.
 windows| -p flotilla-client --locked --lib windows_tests::
 windows| -p flotilla-client --locked --lib endpoint::
 windows| --locked --bin flotilla remote_

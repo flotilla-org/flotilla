@@ -34,7 +34,7 @@ class RunnerTests(unittest.TestCase):
 
     def run_job(self, job, selectors, exit_code=0):
         (self.ci / "selectors.txt").write_text(selectors)
-        result = subprocess.run(["bash", str(self.ci / "run.sh"), job],
+        result = subprocess.run([os.environ.get("SELECTOR_TEST_BASH", "bash"), str(self.ci / "run.sh"), job],
                                 cwd=self.root, env=dict(self.env, CARGO_EXIT=str(exit_code)),
                                 capture_output=True, text=True)
         commands = [json.loads(row) for row in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -58,9 +58,10 @@ class RunnerTests(unittest.TestCase):
 
     def test_empty_file_and_unknown_job(self):
         # Contract: an empty list is a no-op, but a misspelled job must be refused.
-        result, commands = self.run_job("windows", "# empty\n")
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(commands, [])
+        for selectors in ["# empty\n", "macos|other\n"]:
+            result, commands = self.run_job("windows", selectors)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(commands, [])
         result, commands = self.run_job("windwos", "windows|test")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(commands, [])
@@ -74,7 +75,7 @@ class RunnerTests(unittest.TestCase):
     def test_shell_metacharacters_are_literal(self):
         # Contract: selectors are argv, never evaluated as shell code.
         result, commands = self.run_job("windows", "windows|$(touch sentinel) ; *\n")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(commands[0][3:], ["$(touch", "sentinel)", ";", "*"])
         self.assertFalse((self.root / "sentinel").exists())
 
