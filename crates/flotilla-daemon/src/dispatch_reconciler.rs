@@ -33,7 +33,7 @@ type ProjectBoards = BTreeMap<String, Result<ProjectBoardInput, String>>;
 #[derive(Default)]
 struct MissionState {
     boards: MissionBoardIndex,
-    convoys: BTreeMap<String, ResourceObject<Convoy>>,
+    convoys: BTreeMap<String, Arc<ResourceObject<Convoy>>>,
     watch: Option<BoxStream<'static, Result<ReadWatchEvent<Convoy>, ResourceError>>>,
     occupancy: BTreeMap<String, Occupancy>,
     occupancy_rebuilds: usize,
@@ -53,8 +53,11 @@ struct PassIssueReads {
     issues: BTreeMap<IssueRef, Result<Issue, String>>,
 }
 
+// An unavailable shared inventory conservatively pauses enabled Projects.
+// Publish per-Project errors without discarding queues; disabled scopes still clear.
 struct PassInventories {
-    project_convoys: BTreeMap<String, Vec<ResourceObject<Convoy>>>,
+    error: Option<String>,
+    project_convoys: BTreeMap<String, Vec<Arc<ResourceObject<Convoy>>>>,
     landed_issues: HashSet<IssueRef>,
     holds: Vec<ResourceObject<DispatchHold>>,
     deployments: Vec<ResourceObject<DispatchDeployment>>,
@@ -241,9 +244,9 @@ impl DispatchReconciler {
     pub(crate) async fn reconcile_once(&self) -> Result<ReconcilePass, String> {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let mut mission = self.mission.lock().await;
-        let before = (mission.boards.rebuilds, mission.boards.updated_issues, mission.occupancy_rebuilds, mission.convoy_lists);
-        self.refresh_convoys(&mut mission).await?;
-        let mut project_convoys = BTreeMap::<String, Vec<ResourceObject<Convoy>>>::new();
+        let before = (mission.boards.rebuilds(), mission.boards.updated_issues(), mission.occupancy_rebuilds, mission.convoy_lists);
+        let convoy_error = self.refresh_convoys(&mut mission).await.err();
+        let mut project_convoys = BTreeMap::<String, Vec<Arc<ResourceObject<Convoy>>>>::new();
         let mut landed_issues = HashSet::new();
         for convoy in mission.convoys.values() {
             if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed) {
@@ -253,13 +256,23 @@ impl DispatchReconciler {
                 project_convoys.entry(project.clone()).or_default().push(convoy.clone());
             }
         }
+        let holds = self.resources.holds().await;
+        let deployments = self.resources.deployments().await;
+        let workflows = self.resources.workflows().await;
+        let observations = self.resources.observations().await;
+        let error = convoy_error
+            .or_else(|| holds.as_ref().err().cloned())
+            .or_else(|| deployments.as_ref().err().cloned())
+            .or_else(|| workflows.as_ref().err().cloned())
+            .or_else(|| observations.as_ref().err().cloned());
         let inventories = PassInventories {
+            error,
             project_convoys,
             landed_issues,
-            holds: self.resources.holds().await?,
-            deployments: self.resources.deployments().await?,
-            workflows: self.resources.workflows().await?,
-            observations: self.resources.observations().await?,
+            holds: holds.unwrap_or_default(),
+            deployments: deployments.unwrap_or_default(),
+            workflows: workflows.unwrap_or_default(),
+            observations: observations.unwrap_or_default(),
         };
         let local = self.backend.local_root().map_err(|e| e.to_string())?;
         let mut homes = BTreeMap::new();
@@ -321,8 +334,8 @@ impl DispatchReconciler {
         tracing::debug!(
             projects = scopes.len(),
             sources = sources.len(),
-            graph_rebuilds = mission.boards.rebuilds - before.0,
-            mission_issue_updates = mission.boards.updated_issues - before.1,
+            graph_rebuilds = mission.boards.rebuilds() - before.0,
+            mission_issue_updates = mission.boards.updated_issues() - before.1,
             occupancy_rebuilds = mission.occupancy_rebuilds - before.2,
             convoy_inventory_reads = mission.convoy_lists - before.3,
             "dispatch reconciliation work"
@@ -359,6 +372,9 @@ impl DispatchReconciler {
             return Ok(ReconcilePass::default());
         };
 
+        if let Some(error) = &inventories.error {
+            return Err(format!("dispatch pass inventory unavailable: {error}"));
+        }
         let existing = inventories.project_convoys.get(&project.metadata.name).map(Vec::as_slice).unwrap_or_default();
         let held = self.active_holds(project, now, inventories, reads).await?;
         let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
@@ -561,7 +577,7 @@ impl DispatchReconciler {
                 state.convoy_lists += 1;
                 state.convoys.clear();
                 for record in listed.items {
-                    state.convoys.entry(record.object.metadata.name.clone()).or_insert(record.object);
+                    state.convoys.entry(record.object.metadata.name.clone()).or_insert_with(|| Arc::new(record.object));
                 }
                 state.occupancy.clear();
                 state.watch = Some(watch);
@@ -580,7 +596,10 @@ impl DispatchReconciler {
                     let object = match self.backend.including_replicas::<Convoy>(&self.namespace).get(&name).await {
                         Ok(record) => Some(record.object),
                         Err(ResourceError::NotFound { .. }) => None,
-                        Err(error) => return Err(error.to_string()),
+                        Err(error) => {
+                            state.watch = None;
+                            return Err(error.to_string());
+                        }
                     };
                     if state.convoys.get(&name).map(|previous| (&previous.spec, &previous.status))
                         == object.as_ref().map(|next| (&next.spec, &next.status))
@@ -588,15 +607,15 @@ impl DispatchReconciler {
                         continue;
                     }
                     if let Some(previous) = state.convoys.remove(&name) {
-                        if let Some(project) = previous.spec.project_ref {
-                            state.occupancy.remove(&project);
+                        if let Some(project) = &previous.spec.project_ref {
+                            state.occupancy.remove(project);
                         }
                     }
                     if let Some(object) = object {
                         if let Some(project) = &object.spec.project_ref {
                             state.occupancy.remove(project);
                         }
-                        state.convoys.insert(name, object);
+                        state.convoys.insert(name, Arc::new(object));
                     }
                 }
                 Some(_) => {
@@ -612,7 +631,7 @@ impl DispatchReconciler {
         &self,
         project: &ResourceObject<Project>,
         previous_queue: &[DispatchQueueEntry],
-        convoys: &[ResourceObject<Convoy>],
+        convoys: &[Arc<ResourceObject<Convoy>>],
         now: DateTime<Utc>,
         inventories: &PassInventories,
     ) -> Result<usize, String> {
@@ -633,7 +652,7 @@ impl DispatchReconciler {
                     continue;
                 }
                 if !inventories.workflows.contains(pinned_workflow_ref(convoy)) {
-                    warn!(project = %project.metadata.name, convoy = %convoy.metadata.name, "cannot record dispatch observation without its workflow");
+                    warn!(project = %project.metadata.name, convoy = %convoy.metadata.name, issue = ?issue.reference, workflow = %pinned_workflow_ref(convoy), reason = "absent from pass inventory", "cannot record dispatch observation without its workflow");
                     continue;
                 }
                 let dispatched_at = convoy.metadata.creation_timestamp;
@@ -942,12 +961,16 @@ mod tests {
     struct CountedInventories {
         real: BackendDispatchResources,
         calls: Mutex<[usize; 4]>,
+        fail_holds: Mutex<bool>,
     }
 
     #[async_trait]
     impl DispatchResourceSource for CountedInventories {
         async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String> {
             self.calls.lock().expect("counts")[0] += 1;
+            if *self.fail_holds.lock().expect("failure") {
+                return Err("injected hold inventory outage".into());
+            }
             self.real.holds().await
         }
         async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String> {
@@ -983,6 +1006,7 @@ mod tests {
         let counted = Arc::new(CountedInventories {
             real: BackendDispatchResources { backend: backend.clone(), namespace: NAMESPACE.into() },
             calls: Mutex::new([0; 4]),
+            fail_holds: Mutex::new(false),
         });
         reconciler.resources = counted.clone();
         assert_eq!(reconciler.reconcile_once().await.expect("initial pass").queued, 13);
@@ -994,8 +1018,8 @@ mod tests {
         assert_eq!(*issues.facts_calls.lock().expect("fact counts"), 2, "one unique issue read per pass across 13 Projects");
         {
             let state = reconciler.mission.lock().await;
-            assert_eq!(state.boards.rebuilds, 13);
-            assert_eq!(state.boards.updated_issues, 0);
+            assert_eq!(state.boards.rebuilds(), 13);
+            assert_eq!(state.boards.updated_issues(), 0);
             assert_eq!(state.occupancy_rebuilds, 13);
             assert_eq!(state.convoy_lists, 1);
         }
@@ -1035,15 +1059,21 @@ mod tests {
         {
             let state = reconciler.mission.lock().await;
             assert_eq!(state.occupancy_rebuilds, 18);
-            assert_eq!(state.boards.rebuilds, 13);
+            assert_eq!(state.boards.rebuilds(), 13);
             assert_eq!(state.convoy_lists, 1);
         }
         // Inject a transport gap at the actual watch seam, then recover from
         // real in-memory resource inventory; no live fleet is involved.
         reconciler.mission.lock().await.watch = Some(futures::stream::empty().boxed());
-        assert!(reconciler.reconcile_once().await.is_err());
+        assert_eq!(reconciler.reconcile_once().await.expect("scoped watch error").project_errors, 13);
         reconciler.reconcile_once().await.expect("watch recovery");
         assert_eq!(reconciler.mission.lock().await.convoy_lists, 2);
+        *counted.fail_holds.lock().expect("failure") = true;
+        assert_eq!(reconciler.reconcile_once().await.expect("scoped inventory error").project_errors, 13);
+        let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert!(unavailable.dispatch_queue_error.is_some());
+        assert_eq!(unavailable.dispatch_queue[0].ready_observed_at, initial);
+        *counted.fail_holds.lock().expect("failure") = false;
         issues.failing_projects.lock().expect("failures").insert("overlap-0".into());
         let failed = reconciler.reconcile_once().await.expect("isolated error");
         assert_eq!(failed.project_errors, 1);

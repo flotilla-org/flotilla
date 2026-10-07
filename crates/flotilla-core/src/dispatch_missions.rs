@@ -147,8 +147,8 @@ pub type MissionSourceSnapshot = (u64, Arc<DispatchBoardRepository>);
 pub struct MissionBoardIndex {
     sources: BTreeMap<flotilla_protocol::IssueSource, MissionSourceSnapshot>,
     scopes: BTreeMap<String, MissionScope>,
-    pub rebuilds: usize,
-    pub updated_issues: usize,
+    rebuilds: usize,
+    updated_issues: usize,
 }
 
 struct MissionScope {
@@ -158,6 +158,12 @@ struct MissionScope {
 }
 
 impl MissionBoardIndex {
+    pub fn rebuilds(&self) -> usize {
+        self.rebuilds
+    }
+    pub fn updated_issues(&self) -> usize {
+        self.updated_issues
+    }
     pub fn apply_source(&mut self, source: flotilla_protocol::IssueSource, snapshot: Option<MissionSourceSnapshot>) {
         let unchanged = match (self.sources.get(&source), &snapshot) {
             (Some(previous), Some(next)) => previous.0 == next.0,
@@ -793,6 +799,34 @@ mod tests {
         assert!(index.scope("project", BTreeSet::from([source.clone()])).is_err());
         index.apply_source(source.clone(), Some((3, Arc::new(observation(source.clone(), vec![board_issue("1", None, &[], &[])])))));
         assert!(index.scope("project", BTreeSet::from([source])).is_ok());
+    }
+
+    #[test]
+    fn malformed_dependency_delta_recovers_without_partial_graph() {
+        let source = reference("1").source;
+        let unrelated = IssueSource { scope: "org/other".into(), ..source.clone() };
+        let mut index = MissionBoardIndex::default();
+        let initial = vec![board_issue("1", None, &[], &[]), board_issue("2", None, &[], &["1"])];
+        index.apply_source(source.clone(), Some((1, Arc::new(observation(source.clone(), initial)))));
+        index.apply_source(unrelated.clone(), Some((2, Arc::new(observation(unrelated.clone(), vec![])))));
+        index.scope("project", BTreeSet::from([source.clone()])).expect("initial");
+        let other = index.scope("other", BTreeSet::from([unrelated.clone()])).expect("unrelated");
+        let recovered =
+            vec![board_issue("1", None, &["value:7"], &[]), board_issue("2", None, &[], &["1"]), board_issue("3", None, &[], &["2"])];
+        let mut malformed = recovered.clone();
+        malformed[1].blocked_by[0].url = "not an issue URL".into();
+        index.apply_source(source.clone(), Some((3, Arc::new(observation(source.clone(), malformed)))));
+        assert!(index.scope("project", BTreeSet::from([source.clone()])).is_err());
+        assert!(Arc::ptr_eq(&other, &index.scope("other", BTreeSet::from([unrelated])).expect("unchanged")));
+        let rebuilds = index.rebuilds();
+        index.apply_source(source.clone(), Some((4, Arc::new(observation(source.clone(), recovered.clone())))));
+        let actual = index.scope("project", BTreeSet::from([source])).expect("recovery");
+        assert_eq!(index.rebuilds(), rebuilds + 1);
+        let expected = board(recovered);
+        let policy = DispatchPolicy::builder().build();
+        for id in ["1", "2", "3"] {
+            assert_eq!(actual.score(&issue(id), &policy), expected.score(&issue(id), &policy));
+        }
     }
 
     // Invalid explicit inputs are unavailable evidence; duplicate inputs cannot

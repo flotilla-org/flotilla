@@ -17,6 +17,7 @@ use flotilla_protocol::{DispatchBoardRepository, IssueSource};
 use futures::FutureExt;
 use tokio::{sync::Mutex, time::Instant};
 
+// Process-local identities: never persist or compare revisions across daemons.
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -35,16 +36,17 @@ struct Entry {
 type SharedEntry = Arc<Mutex<Entry>>;
 
 #[derive(Clone, Default)]
-pub(super) struct DispatchBoardCache(
-    Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>,
-    #[cfg(test)] pub(in crate::in_process) Arc<std::sync::atomic::AtomicUsize>,
-);
+pub(super) struct DispatchBoardCache {
+    entries: Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>,
+    #[cfg(test)]
+    pub(in crate::in_process) reads: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl DispatchBoardCache {
     /// Only a complete source inventory may retire entries. An old refresh owns
     /// its retired entry, so its completion cannot overwrite a re-added source.
     pub(super) async fn retain_sources(&self, sources: &BTreeSet<IssueSource>) {
-        self.0.lock().await.retain(|source, _| sources.contains(source));
+        self.entries.lock().await.retain(|source, _| sources.contains(source));
     }
 
     #[cfg(test)]
@@ -66,8 +68,8 @@ impl DispatchBoardCache {
         Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
     {
         #[cfg(test)]
-        self.1.fetch_add(1, Ordering::Relaxed);
-        let entry = self.0.lock().await.entry(source.clone()).or_default().clone();
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let entry = self.entries.lock().await.entry(source.clone()).or_default().clone();
         let mut entry_state = entry.lock().await;
         let state = &mut *entry_state;
         if !state.refreshing && state.last_attempt.is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL) {
@@ -124,7 +126,7 @@ pub(super) mod tests {
     use super::*;
 
     async fn settled(cache: &DispatchBoardCache, source: &IssueSource) {
-        let entry = cache.0.lock().await.get(source).expect("entry").clone();
+        let entry = cache.entries.lock().await.get(source).expect("entry").clone();
         settled_entry(entry).await;
     }
 
@@ -224,8 +226,19 @@ pub(super) mod tests {
         assert!(cache.read(&source, move || async { Ok(snapshot) }).await.is_err());
         settled(&cache, &source).await;
         // Make the observation old without using real-time sleeps.
-        cache.0.lock().await.get(&source).expect("entry").lock().await.board.as_mut().map(Arc::make_mut).expect("board").observed_at -=
-            chrono::Duration::seconds(120);
+        cache
+            .entries
+            .lock()
+            .await
+            .get(&source)
+            .expect("entry")
+            .lock()
+            .await
+            .board
+            .as_mut()
+            .map(Arc::make_mut)
+            .expect("board")
+            .observed_at -= chrono::Duration::seconds(120);
         tokio::time::advance(REFRESH_INTERVAL).await;
         let cached = cache.read(&source, || async { Err("forge offline".into()) }).await.expect("stale board");
         assert!(cached.age_seconds >= 120);
@@ -372,9 +385,9 @@ pub(super) mod tests {
             })
             .await
             .is_err());
-        let retired = cache.0.lock().await.get(&source).expect("old entry").clone();
+        let retired = cache.entries.lock().await.get(&source).expect("old entry").clone();
         cache.retain_sources(&BTreeSet::new()).await;
-        assert!(cache.0.lock().await.is_empty());
+        assert!(cache.entries.lock().await.is_empty());
         let new = board(&source, 2);
         assert!(cache.read(&source, move || async { Ok(new) }).await.is_err());
         settled(&cache, &source).await;
@@ -382,7 +395,7 @@ pub(super) mod tests {
         settled_entry(retired).await;
         let snapshot = cache.read(&source, || async { panic!("new source stays fresh") }).await.expect("new snapshot");
         assert_eq!(snapshot.issues.len(), 2);
-        assert_eq!(cache.0.lock().await.len(), 1);
+        assert_eq!(cache.entries.lock().await.len(), 1);
         cache.retain_sources(&BTreeSet::from([source.clone()])).await;
         assert_eq!(cache.read(&source, || async { panic!("retained source") }).await.expect("retained").issues, snapshot.issues);
     }
