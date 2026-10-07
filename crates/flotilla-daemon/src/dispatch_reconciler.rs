@@ -1,29 +1,128 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::{dispatch_missions::MissionBoard, in_process::InProcessDaemon};
+use flotilla_core::{
+    dispatch_missions::{MissionBoard, MissionBoardIndex, MissionSourceSnapshot},
+    in_process::InProcessDaemon,
+};
 use flotilla_protocol::{
     issue_query::{IssueQuery, READY_ISSUE_LABEL},
-    DispatchIssueFacts, Issue, IssueRef, IssueState, QueryScope,
+    DispatchIssueFacts, Issue, IssueRef, IssueState,
 };
 use flotilla_resources::{
     apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold,
     DispatchHoldStatusPatch, DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry,
-    HoldClearWhen, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend, ResourceError, ResourceObject,
-    SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
+    HoldClearWhen, InputMeta, Project, ProjectStatusPatch, ReadWatchEvent, ResolvedIssueSourceBinding, ResourceBackend, ResourceError,
+    ResourceObject, SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
 };
+use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tracing::{info, warn};
 
 const ISSUE_PAGE_SIZE: usize = 100;
 
+pub(crate) struct ProjectBoardInput {
+    readiness: Result<Vec<Issue>, String>,
+    boards: Vec<MissionSourceSnapshot>,
+}
+type ProjectBoards = BTreeMap<String, Result<ProjectBoardInput, String>>;
+
+#[derive(Default)]
+struct MissionState {
+    boards: MissionBoardIndex,
+    convoys: BTreeMap<String, Arc<ResourceObject<Convoy>>>,
+    watch: Option<BoxStream<'static, Result<ReadWatchEvent<Convoy>, ResourceError>>>,
+    occupancy: BTreeMap<String, Occupancy>,
+    occupancy_rebuilds: usize,
+    convoy_lists: usize,
+}
+
+struct Occupancy {
+    board: Arc<MissionBoard>,
+    policy: DispatchPolicy,
+    project_active: usize,
+    missions: BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+struct PassIssueReads {
+    facts: BTreeMap<IssueRef, Result<DispatchIssueFacts, String>>,
+    issues: BTreeMap<IssueRef, Result<Issue, String>>,
+}
+
+// An unavailable shared inventory conservatively pauses enabled Projects.
+// Publish per-Project errors without discarding queues; disabled scopes still clear.
+struct PassInventories {
+    error: Option<String>,
+    project_convoys: BTreeMap<String, Vec<Arc<ResourceObject<Convoy>>>>,
+    landed_issues: HashSet<IssueRef>,
+    holds: Vec<ResourceObject<DispatchHold>>,
+    deployments: Vec<ResourceObject<DispatchDeployment>>,
+    workflows: HashSet<String>,
+    observations: HashSet<String>,
+}
+
+#[async_trait]
+trait DispatchResourceSource: Send + Sync {
+    async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String>;
+    async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String>;
+    async fn workflows(&self) -> Result<HashSet<String>, String>;
+    async fn observations(&self) -> Result<HashSet<String>, String>;
+}
+
+struct BackendDispatchResources {
+    backend: ResourceBackend,
+    namespace: String,
+}
+
+#[async_trait]
+impl DispatchResourceSource for BackendDispatchResources {
+    async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String> {
+        self.backend.definitions::<DispatchHold>(&self.namespace).list().await.map_err(|e| e.to_string())
+    }
+    async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String> {
+        Ok(self
+            .backend
+            .including_replicas::<DispatchDeployment>(&self.namespace)
+            .list()
+            .await
+            .map_err(|e| e.to_string())?
+            .items
+            .into_iter()
+            .map(|record| record.object)
+            .collect())
+    }
+    async fn workflows(&self) -> Result<HashSet<String>, String> {
+        Ok(self
+            .backend
+            .definitions::<WorkflowTemplate>(&self.namespace)
+            .list()
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|object| object.metadata.name)
+            .collect())
+    }
+    async fn observations(&self) -> Result<HashSet<String>, String> {
+        Ok(self
+            .backend
+            .using::<DispatchObservation>(&self.namespace)
+            .list()
+            .await
+            .map_err(|e| e.to_string())?
+            .items
+            .into_iter()
+            .map(|object| object.metadata.name)
+            .collect())
+    }
+}
+
 #[async_trait]
 pub(crate) trait DispatchIssueSource: Send + Sync {
-    async fn boards(&self, project: &ResourceObject<Project>) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String>;
-    async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String>;
+    async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String>;
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String>;
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String>;
 }
@@ -40,29 +139,69 @@ impl DaemonDispatchIssueSource {
 
 #[async_trait]
 impl DispatchIssueSource for DaemonDispatchIssueSource {
-    async fn boards(&self, project: &ResourceObject<Project>) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
-        self.daemon.dispatch_board_repositories_internal(Some(&project.metadata.name)).await
-    }
-    async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
-        let scope = QueryScope::new(&project.metadata.namespace, &project.metadata.name);
-        let bindings = self.daemon.resolve_issue_source_bindings(&scope).await?;
-        let mut issues = Vec::new();
-        for binding in bindings {
-            let provider = self.daemon.issue_provider_for_source(&binding.source).await?;
-            let query = ready_issue_query(&binding);
-            let mut page = 1;
-            loop {
-                let result = provider.query(&binding.source, &query, page, ISSUE_PAGE_SIZE).await?;
-                issues.extend(result.items);
-                if !result.has_more {
-                    break;
+    async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
+        let snapshot = self.daemon.collect_dispatch_board_inputs(projects).await?;
+        let mut queries = BTreeMap::new();
+        let mut providers = BTreeMap::new();
+        let mut result = BTreeMap::new();
+        for project in projects {
+            let input = match &snapshot[&project.metadata.name] {
+                Err(error) => Err(error.clone()),
+                Ok((bindings, boards)) => {
+                    let mut readiness = Ok(Vec::new());
+                    if project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled) {
+                        for binding in bindings {
+                            let query = ready_issue_query(binding);
+                            let serialized = match serde_json::to_string(&query) {
+                                Ok(serialized) => serialized,
+                                Err(error) => {
+                                    readiness = Err(error.to_string());
+                                    break;
+                                }
+                            };
+                            let key = (binding.source.clone(), serialized);
+                            if !queries.contains_key(&key) {
+                                if !providers.contains_key(&binding.source) {
+                                    providers.insert(binding.source.clone(), self.daemon.issue_provider_for_source(&binding.source).await);
+                                }
+                                let items = match &providers[&binding.source] {
+                                    Err(error) => Err(error.clone()),
+                                    Ok(provider) => {
+                                        let mut items = Vec::new();
+                                        let mut page = 1;
+                                        loop {
+                                            match provider.query(&binding.source, &query, page, ISSUE_PAGE_SIZE).await {
+                                                Err(error) => break Err(error),
+                                                Ok(result) => {
+                                                    items.extend(result.items);
+                                                    if !result.has_more {
+                                                        break Ok(items);
+                                                    }
+                                                    page += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                };
+                                queries.insert(key.clone(), items);
+                            }
+                            match (&mut readiness, &queries[&key]) {
+                                (Ok(items), Ok(observed)) => items.extend(observed.iter().cloned()),
+                                (_, Err(error)) => {
+                                    readiness = Err(error.clone());
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(ProjectBoardInput { readiness, boards: boards.clone() })
                 }
-                page += 1;
-            }
+            };
+            result.insert(project.metadata.name.clone(), input);
         }
-        Ok(issues)
+        Ok(result)
     }
-
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
         self.daemon.fetch_issue_by_ref(reference).await
     }
@@ -92,11 +231,15 @@ pub(crate) struct DispatchReconciler {
     namespace: String,
     issues: Arc<dyn DispatchIssueSource>,
     clock: Arc<dyn Clock>,
+    mission: tokio::sync::Mutex<MissionState>,
+    resources: Arc<dyn DispatchResourceSource>,
 }
 
 impl DispatchReconciler {
     pub(crate) fn new(backend: ResourceBackend, namespace: impl Into<String>, issues: Arc<dyn DispatchIssueSource>) -> Self {
-        Self { backend, namespace: namespace.into(), issues, clock: Arc::new(SystemClock) }
+        let namespace = namespace.into();
+        let resources = Arc::new(BackendDispatchResources { backend: backend.clone(), namespace: namespace.clone() });
+        Self { backend, namespace, issues, clock: Arc::new(SystemClock), mission: Default::default(), resources }
     }
 
     #[cfg(test)]
@@ -107,15 +250,83 @@ impl DispatchReconciler {
 
     pub(crate) async fn reconcile_once(&self) -> Result<ReconcilePass, String> {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
-        let mut total = ReconcilePass::default();
-        for project in projects.items {
-            if flotilla_core::forge_observation::project_home(&self.backend, &self.namespace, &project.metadata.name).await?
-                != Some(self.backend.local_root().map_err(|error| error.to_string())?)
-            {
-                continue;
+        let mut mission = self.mission.lock().await;
+        let before = (mission.boards.rebuilds(), mission.boards.updated_issues(), mission.occupancy_rebuilds, mission.convoy_lists);
+        let convoy_error = self.refresh_convoys(&mut mission).await.err();
+        let mut project_convoys = BTreeMap::<String, Vec<Arc<ResourceObject<Convoy>>>>::new();
+        let mut landed_issues = HashSet::new();
+        for convoy in mission.convoys.values() {
+            if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed) {
+                landed_issues.extend(convoy.spec.issues.iter().map(|issue| issue.reference.clone()));
             }
-
-            match self.reconcile_project(&project, self.clock.now()).await {
+            if let Some(project) = &convoy.spec.project_ref {
+                project_convoys.entry(project.clone()).or_default().push(convoy.clone());
+            }
+        }
+        let holds = self.resources.holds().await;
+        let deployments = self.resources.deployments().await;
+        let workflows = self.resources.workflows().await;
+        let observations = self.resources.observations().await;
+        let error = convoy_error
+            .or_else(|| holds.as_ref().err().cloned())
+            .or_else(|| deployments.as_ref().err().cloned())
+            .or_else(|| workflows.as_ref().err().cloned())
+            .or_else(|| observations.as_ref().err().cloned());
+        let inventories = PassInventories {
+            error,
+            project_convoys,
+            landed_issues,
+            holds: holds.unwrap_or_default(),
+            deployments: deployments.unwrap_or_default(),
+            workflows: workflows.unwrap_or_default(),
+            observations: observations.unwrap_or_default(),
+        };
+        let local = self.backend.local_root().map_err(|e| e.to_string())?;
+        let mut homes = BTreeMap::new();
+        for record in
+            self.backend.including_replicas::<Project>(&self.namespace).list_replica_sources().await.map_err(|e| e.to_string())?.items
+        {
+            let root = match record.provenance {
+                flotilla_resources::ResourceProvenance::Local => local.clone(),
+                flotilla_resources::ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            };
+            let candidate = (record.object.metadata.creation_timestamp, root);
+            let entry = homes.entry(record.object.metadata.name).or_insert_with(|| candidate.clone());
+            *entry = candidate.min(entry.clone());
+        }
+        let projects = projects
+            .items
+            .into_iter()
+            .filter(|project| homes.get(&project.metadata.name).is_some_and(|(_, root)| root == &local))
+            .collect::<Vec<_>>();
+        let enabled = projects
+            .iter()
+            .filter(|project| project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled))
+            .cloned()
+            .collect::<Vec<_>>();
+        let boards = self.issues.collect_boards(&enabled).await.unwrap_or_else(|error| {
+            enabled
+                .iter()
+                .map(|project| (project.metadata.name.clone(), Err(format!("dispatch source inventory unavailable: {error}"))))
+                .collect()
+        });
+        let scopes = enabled.iter().map(|project| project.metadata.name.clone()).collect::<BTreeSet<_>>();
+        let mut sources = BTreeSet::new();
+        for input in boards.values().filter_map(|input| input.as_ref().ok()) {
+            for snapshot in &input.boards {
+                sources.insert(snapshot.1.source.clone());
+                mission.boards.apply_source(snapshot.1.source.clone(), Some(snapshot.clone()));
+            }
+        }
+        // Unavailable scopes retain last-good evidence until they recover.
+        if boards.values().all(Result::is_ok) {
+            mission.boards.retain(&scopes, &sources);
+        }
+        mission.occupancy.retain(|name, _| scopes.contains(name));
+        let mut total = ReconcilePass::default();
+        let mut reads = PassIssueReads::default();
+        for project in projects {
+            match self.reconcile_project(&project, self.clock.now(), &boards, &inventories, &mut mission, &mut reads).await {
                 Ok(outcome) => {
                     total.queued += outcome.queued;
                     total.blocked += outcome.blocked;
@@ -132,6 +343,15 @@ impl DispatchReconciler {
                 }
             }
         }
+        tracing::debug!(
+            projects = scopes.len(),
+            sources = sources.len(),
+            graph_rebuilds = mission.boards.rebuilds() - before.0,
+            mission_issue_updates = mission.boards.updated_issues() - before.1,
+            occupancy_rebuilds = mission.occupancy_rebuilds - before.2,
+            convoy_inventory_reads = mission.convoy_lists - before.3,
+            "dispatch reconciliation work"
+        );
         Ok(total)
     }
 
@@ -149,19 +369,28 @@ impl DispatchReconciler {
         .map_err(|error| error.to_string())
     }
 
-    async fn reconcile_project(&self, project: &ResourceObject<Project>, now: DateTime<Utc>) -> Result<ReconcilePass, String> {
+    async fn reconcile_project(
+        &self,
+        project: &ResourceObject<Project>,
+        now: DateTime<Utc>,
+        boards: &ProjectBoards,
+        inventories: &PassInventories,
+        mission: &mut MissionState,
+        reads: &mut PassIssueReads,
+    ) -> Result<ReconcilePass, String> {
         let Some(policy) = project.spec.dispatch_policy.as_ref().filter(|policy| policy.enabled) else {
             self.replace_queue(project, Vec::new(), None).await?;
             self.set_queue_error(project, None).await?;
             return Ok(ReconcilePass::default());
         };
 
-        let convoys = self.namespace_convoys(project).await?;
-        let held = self.active_holds(project, &convoys, now).await?;
-        let existing =
-            convoys.into_iter().filter(|convoy| convoy.spec.project_ref.as_deref() == Some(&project.metadata.name)).collect::<Vec<_>>();
+        if let Some(error) = &inventories.error {
+            return Err(format!("dispatch pass inventory unavailable: {error}"));
+        }
+        let existing = inventories.project_convoys.get(&project.metadata.name).map(Vec::as_slice).unwrap_or_default();
+        let held = self.active_holds(project, now, inventories, reads).await?;
         let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
-        let observations_recorded = self.observe_dispatches(project, previous_queue, &existing, now).await?;
+        let observations_recorded = self.observe_dispatches(project, previous_queue, existing, now, inventories).await?;
         let dispatched = existing
             .iter()
             .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
@@ -169,29 +398,45 @@ impl DispatchReconciler {
             .collect::<HashSet<_>>();
         let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
 
-        let board = MissionBoard::new(&self.issues.boards(project).await?)?;
-        let live = existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal())).collect::<Vec<_>>();
-        let project_active_crews = live.iter().map(|c| active_crew_count(c.status.as_ref())).sum();
-        let mut mission_active = BTreeMap::<String, usize>::new();
-        for convoy in &live {
-            let mut missions = HashSet::new();
-            for served in &convoy.spec.issues {
-                let issue = Issue::builder()
-                    .reference(served.reference.clone())
-                    .title(served.snapshot.title.clone())
-                    .labels(served.snapshot.labels.clone())
-                    .state(served.snapshot.state)
-                    .as_of(served.snapshot.as_of)
-                    .provider_name(String::new())
-                    .provider_display_name(String::new())
-                    .build();
-                missions.insert(board.score(&issue, policy)?.mission);
+        let input = boards[&project.metadata.name].as_ref().map_err(Clone::clone)?;
+        let board =
+            mission.boards.scope(&project.metadata.name, input.boards.iter().map(|snapshot| snapshot.1.source.clone()).collect())?;
+        let rebuild = mission
+            .occupancy
+            .get(&project.metadata.name)
+            .is_none_or(|cached| !Arc::ptr_eq(&cached.board, &board) || cached.policy != *policy);
+        if rebuild {
+            let live = existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal())).collect::<Vec<_>>();
+            let project_active = live.iter().map(|c| active_crew_count(c.status.as_ref())).sum();
+            let mut missions = BTreeMap::<String, usize>::new();
+            for convoy in live {
+                let mut served_missions = HashSet::new();
+                for served in &convoy.spec.issues {
+                    let issue = Issue::builder()
+                        .reference(served.reference.clone())
+                        .title(served.snapshot.title.clone())
+                        .labels(served.snapshot.labels.clone())
+                        .state(served.snapshot.state)
+                        .as_of(served.snapshot.as_of)
+                        .provider_name(String::new())
+                        .provider_display_name(String::new())
+                        .build();
+                    served_missions.insert(board.score(&issue, policy)?.mission);
+                }
+                for name in served_missions {
+                    *missions.entry(name).or_default() += active_crew_count(convoy.status.as_ref());
+                }
             }
-            for mission in missions {
-                *mission_active.entry(mission).or_default() += active_crew_count(convoy.status.as_ref());
-            }
+            mission.occupancy_rebuilds += 1;
+            mission.occupancy.insert(project.metadata.name.clone(), Occupancy {
+                board: board.clone(),
+                policy: policy.clone(),
+                project_active,
+                missions,
+            });
         }
-        let mut ready = self.issues.ready_issues(project).await?;
+        let occupancy = &mission.occupancy[&project.metadata.name];
+        let mut ready = input.readiness.clone()?;
         ready.retain(|issue| issue.state == IssueState::Open && issue.labels.iter().any(|label| label == READY_ISSUE_LABEL));
         ready.sort_by(|left, right| left.reference.cmp(&right.reference).then_with(|| right.as_of.cmp(&left.as_of)));
         ready.dedup_by(|left, right| left.reference == right.reference);
@@ -206,7 +451,7 @@ impl DispatchReconciler {
                 blocked += 1;
                 continue;
             }
-            let facts = self.issues.dispatch_facts(&issue.reference).await?;
+            let facts = self.cached_facts(&issue.reference, reads).await?;
             let is_ideation = |kind: &str| {
                 matches!(kind.rsplit(':').next().unwrap_or(kind).to_ascii_lowercase().as_str(), "grill" | "grilling" | "map" | "brainstorm")
             };
@@ -226,7 +471,10 @@ impl DispatchReconciler {
             let mut is_blocked = false;
             let mut blockers_unknown = false;
             for blocker in blockers {
-                match self.issues.fetch_issue(&blocker).await {
+                if !reads.issues.contains_key(&blocker) {
+                    reads.issues.insert(blocker.clone(), self.issues.fetch_issue(&blocker).await);
+                }
+                match reads.issues[&blocker].clone() {
                     Ok(blocker) if blocker.state == IssueState::Closed => {}
                     Ok(_) => is_blocked = true,
                     Err(error) => {
@@ -253,8 +501,8 @@ impl DispatchReconciler {
                 .filter(|entry| entry.issue_as_of == issue.as_of && entry.title == issue.title)
                 .map_or(now, |entry| entry.observed_at);
             let mut score = board.score(&issue, policy)?;
-            score.project_active_crews = project_active_crews;
-            score.mission_active_crews = mission_active.get(&score.mission).copied().unwrap_or(0);
+            score.project_active_crews = occupancy.project_active;
+            score.mission_active_crews = occupancy.missions.get(&score.mission).copied().unwrap_or(0);
             queue.push(DispatchQueueEntry {
                 score: Some(score),
                 issue: issue.reference,
@@ -282,37 +530,34 @@ impl DispatchReconciler {
         Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded, ..ReconcilePass::default() })
     }
 
+    async fn cached_facts(&self, reference: &IssueRef, reads: &mut PassIssueReads) -> Result<DispatchIssueFacts, String> {
+        if !reads.facts.contains_key(reference) {
+            reads.facts.insert(reference.clone(), self.issues.dispatch_facts(reference).await);
+        }
+        reads.facts[reference].clone()
+    }
+
     async fn active_holds(
         &self,
         project: &ResourceObject<Project>,
-        convoys: &[ResourceObject<Convoy>],
         now: DateTime<Utc>,
+        inventories: &PassInventories,
+        reads: &mut PassIssueReads,
     ) -> Result<HashSet<IssueRef>, String> {
-        let holds =
-            self.backend.definitions::<DispatchHold>(&project.metadata.namespace).list().await.map_err(|error| error.to_string())?;
-        let deployments = self
-            .backend
-            .clone()
-            .including_replicas::<DispatchDeployment>(&project.metadata.namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
         let mut active = HashSet::new();
-        for hold in holds {
+        for hold in &inventories.holds {
             if hold.spec.project_ref != project.metadata.name || hold.status.as_ref().is_some_and(|status| status.cleared_at.is_some()) {
                 continue;
             }
             let cleared = match &hold.spec.clear_when {
                 HoldClearWhen::Landed => {
-                    let convoy_landed = convoys.iter().any(|convoy| {
-                        convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
-                            && convoy.spec.issues.iter().any(|issue| issue.reference == hold.spec.land_after)
-                    });
-                    convoy_landed || self.issues.dispatch_facts(&hold.spec.land_after).await.map(|facts| facts.landed).unwrap_or(false)
+                    let convoy_landed = inventories.landed_issues.contains(&hold.spec.land_after);
+                    convoy_landed || self.cached_facts(&hold.spec.land_after, reads).await.map(|facts| facts.landed).unwrap_or(false)
                 }
-                HoldClearWhen::Deployed { installation } => deployments.items.iter().any(|deployment| {
-                    deployment.object.spec.issue == hold.spec.land_after && deployment.object.spec.installation == *installation
-                }),
+                HoldClearWhen::Deployed { installation } => inventories
+                    .deployments
+                    .iter()
+                    .any(|deployment| deployment.spec.issue == hold.spec.land_after && deployment.spec.installation == *installation),
             };
             if cleared {
                 // Clear only on the authoring store; replicas can project the satisfied
@@ -328,38 +573,84 @@ impl DispatchReconciler {
                     Err(error) => return Err(error.to_string()),
                 }
             } else {
-                active.insert(hold.spec.issue);
+                active.insert(hold.spec.issue.clone());
             }
         }
         Ok(active)
     }
 
-    async fn namespace_convoys(&self, project: &ResourceObject<Project>) -> Result<Vec<ResourceObject<Convoy>>, String> {
-        let listed = self
-            .backend
-            .clone()
-            .including_replicas::<Convoy>(&project.metadata.namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut by_name = BTreeMap::new();
-        for convoy in listed.items.into_iter().map(|item| item.object) {
-            by_name.entry(convoy.metadata.name.clone()).or_insert(convoy);
+    async fn refresh_convoys(&self, state: &mut MissionState) -> Result<(), String> {
+        loop {
+            if state.watch.is_none() {
+                let resolver = self.backend.including_replicas::<Convoy>(&self.namespace);
+                // Subscribe before listing: racing writes appear in either or both.
+                let watch = resolver.watch().await.map_err(|e| e.to_string())?;
+                let listed = resolver.list().await.map_err(|e| e.to_string())?;
+                state.convoy_lists += 1;
+                state.convoys.clear();
+                for record in listed.items {
+                    state.convoys.entry(record.object.metadata.name.clone()).or_insert_with(|| Arc::new(record.object));
+                }
+                state.occupancy.clear();
+                state.watch = Some(watch);
+            }
+            match state.watch.as_mut().expect("subscribed").next().now_or_never() {
+                None => return Ok(()),
+                Some(Some(Ok(event))) => {
+                    let name = match event {
+                        ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) | ReadWatchEvent::Deleted(record) => {
+                            record.object.metadata.name
+                        }
+                        ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
+                    };
+                    // Re-read only the changed name to preserve local-over-replica
+                    // precedence and reveal a replica when its local copy is removed.
+                    let object = match self.backend.including_replicas::<Convoy>(&self.namespace).get(&name).await {
+                        Ok(record) => Some(record.object),
+                        Err(ResourceError::NotFound { .. }) => None,
+                        Err(error) => {
+                            state.watch = None;
+                            return Err(error.to_string());
+                        }
+                    };
+                    if state.convoys.get(&name).map(|previous| (&previous.spec, &previous.status))
+                        == object.as_ref().map(|next| (&next.spec, &next.status))
+                    {
+                        continue;
+                    }
+                    if let Some(previous) = state.convoys.remove(&name) {
+                        if let Some(project) = &previous.spec.project_ref {
+                            state.occupancy.remove(project);
+                        }
+                    }
+                    if let Some(object) = object {
+                        if let Some(project) = &object.spec.project_ref {
+                            state.occupancy.remove(project);
+                        }
+                        state.convoys.insert(name, Arc::new(object));
+                    }
+                }
+                Some(_) => {
+                    state.watch = None;
+                    // Recover a gap from a fresh watch/list on the next pass.
+                    return Err("convoy watch interrupted; retry reconciliation".into());
+                }
+            }
         }
-        Ok(by_name.into_values().collect())
     }
 
     async fn observe_dispatches(
         &self,
         project: &ResourceObject<Project>,
         previous_queue: &[DispatchQueueEntry],
-        convoys: &[ResourceObject<Convoy>],
+        convoys: &[Arc<ResourceObject<Convoy>>],
         now: DateTime<Utc>,
+        inventories: &PassInventories,
     ) -> Result<usize, String> {
         let queued = previous_queue.iter().map(|entry| (&entry.issue, entry)).collect::<BTreeMap<_, _>>();
         let observations = self.backend.clone().using::<DispatchObservation>(&project.metadata.namespace);
-        let workflows = self.backend.definitions::<WorkflowTemplate>(&project.metadata.namespace);
         let mut recorded = 0;
+        let mut seen = HashSet::new();
         for convoy in convoys {
             for issue in &convoy.spec.issues {
                 let Some(queue_entry) = queued.get(&issue.reference) else { continue };
@@ -369,23 +660,19 @@ impl DispatchReconciler {
                     "issue": issue.reference,
                 });
                 let name = format!("dispatch-{}", content_hash(&identity).map_err(|error| error.to_string())?);
-                match observations.get(&name).await {
-                    Ok(_) => continue,
-                    Err(ResourceError::NotFound { .. }) => {}
-                    Err(error) => return Err(error.to_string()),
+                if inventories.observations.contains(&name) || !seen.insert(name.clone()) {
+                    continue;
                 }
-                match workflows.get(pinned_workflow_ref(convoy)).await {
-                    Ok(_) => {}
-                    Err(error) => {
-                        warn!(
-                            project = %project.metadata.name,
-                            convoy = %convoy.metadata.name,
-                            issue = %issue.reference.id,
-                            %error,
-                            "cannot record dispatch observation without its workflow; continuing queue reconciliation"
-                        );
-                        continue;
-                    }
+                if !inventories.workflows.contains(pinned_workflow_ref(convoy)) {
+                    warn!(
+                        project = %project.metadata.name,
+                        convoy = %convoy.metadata.name,
+                        issue = ?issue.reference,
+                        workflow = %pinned_workflow_ref(convoy),
+                        reason = "absent from pass inventory",
+                        "cannot record dispatch observation without its workflow"
+                    );
+                    continue;
                 }
                 let dispatched_at = convoy.metadata.creation_timestamp;
                 let time_from_ready_seconds =
@@ -497,13 +784,14 @@ mod tests {
         ready: Mutex<Vec<Issue>>,
         by_ref: Mutex<HashMap<IssueRef, Issue>>,
         ready_calls: Mutex<usize>,
+        facts_calls: Mutex<usize>,
         facts: Mutex<HashMap<IssueRef, DispatchIssueFacts>>,
         failing_projects: Mutex<HashSet<String>>,
+        failing_collection: Mutex<bool>,
         failing_refs: Mutex<HashSet<IssueRef>>,
     }
 
-    #[async_trait]
-    impl DispatchIssueSource for FakeIssues {
+    impl FakeIssues {
         async fn boards(&self, _project: &ResourceObject<Project>) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
             if let Some(boards) = &*self.board_override.lock().expect("board") {
                 return Ok(boards.clone());
@@ -554,7 +842,43 @@ mod tests {
             *self.ready_calls.lock().expect("ready calls lock") += 1;
             Ok(self.ready.lock().expect("ready lock").clone())
         }
+    }
 
+    #[async_trait]
+    impl DispatchIssueSource for FakeIssues {
+        async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
+            if *self.failing_collection.lock().expect("collection failure") {
+                return Err("injected source inventory outage".into());
+            }
+            let mut result = BTreeMap::new();
+            for project in projects {
+                result.insert(
+                    project.metadata.name.clone(),
+                    self.boards(project).await.map(|boards| ProjectBoardInput {
+                        readiness: Ok(vec![]),
+                        boards: boards
+                            .into_iter()
+                            .map(|board| {
+                                let revision =
+                                    flotilla_resources::content_hash(&serde_json::to_value(&board.issues).expect("issue values"))
+                                        .expect("issue hash");
+                                // The injected tracker has no cache cursor; hash its delivered facts.
+                                let revision = u64::from_str_radix(&revision, 16).expect("hash prefix");
+                                (revision, Arc::new(board))
+                            })
+                            .collect(),
+                    }),
+                );
+            }
+            for project in projects {
+                if project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled) {
+                    if let Some(Ok(input)) = result.get_mut(&project.metadata.name) {
+                        input.readiness = self.ready_issues(project).await;
+                    }
+                }
+            }
+            Ok(result)
+        }
         async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
             if self.failing_refs.lock().expect("failing refs lock").contains(reference) {
                 return Err("issue fetch unavailable".to_string());
@@ -562,6 +886,7 @@ mod tests {
             self.by_ref.lock().expect("issues lock").get(reference).cloned().ok_or_else(|| "missing issue".to_string())
         }
         async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String> {
+            *self.facts_calls.lock().expect("fact counts") += 1;
             Ok(self.facts.lock().expect("facts lock").get(reference).cloned().unwrap_or_default())
         }
     }
@@ -645,14 +970,152 @@ mod tests {
             ready: Mutex::new(ready),
             by_ref: Mutex::new(blockers.into_iter().map(|issue| (issue.reference.clone(), issue)).collect()),
             ready_calls: Mutex::new(0),
+            facts_calls: Mutex::new(0),
             facts: Mutex::new(HashMap::new()),
             failing_projects: Mutex::new(Default::default()),
+            failing_collection: Mutex::new(false),
             failing_refs: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
         let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
             .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         (backend, issues, clock, reconciler)
+    }
+
+    struct CountedInventories {
+        real: BackendDispatchResources,
+        calls: Mutex<[usize; 4]>,
+        fail_holds: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl DispatchResourceSource for CountedInventories {
+        async fn holds(&self) -> Result<Vec<ResourceObject<DispatchHold>>, String> {
+            self.calls.lock().expect("counts")[0] += 1;
+            if *self.fail_holds.lock().expect("failure") {
+                return Err("injected hold inventory outage".into());
+            }
+            self.real.holds().await
+        }
+        async fn deployments(&self) -> Result<Vec<ResourceObject<DispatchDeployment>>, String> {
+            self.calls.lock().expect("counts")[1] += 1;
+            self.real.deployments().await
+        }
+        async fn workflows(&self) -> Result<HashSet<String>, String> {
+            self.calls.lock().expect("counts")[2] += 1;
+            self.real.workflows().await
+        }
+        async fn observations(&self) -> Result<HashSet<String>, String> {
+            self.calls.lock().expect("counts")[3] += 1;
+            self.real.observations().await
+        }
+    }
+
+    // #2860/#2859: overlapping Projects share inventories; unchanged passes do
+    // no graph/occupancy work. Convoy add/update/remove and watch recovery affect
+    // occupancy independently of graph topology and preserve readiness aging.
+    #[tokio::test]
+    async fn pass_inventories_and_convoy_deltas_have_bounded_work() {
+        use flotilla_resources::ConvoyStatus;
+        let (backend, issues, clock, mut reconciler) =
+            harness(vec![issue("1", &["ready"], None, IssueState::Open)], vec![], policy(60)).await;
+        let spec = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").spec;
+        for id in 0..12 {
+            backend
+                .using::<Project>(NAMESPACE)
+                .create(&InputMeta::builder().name(format!("overlap-{id}")).build(), &spec)
+                .await
+                .expect("overlap");
+        }
+        let counted = Arc::new(CountedInventories {
+            real: BackendDispatchResources { backend: backend.clone(), namespace: NAMESPACE.into() },
+            calls: Mutex::new([0; 4]),
+            fail_holds: Mutex::new(false),
+        });
+        reconciler.resources = counted.clone();
+        assert_eq!(reconciler.reconcile_once().await.expect("initial pass").queued, 13);
+        let initial = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0]
+            .ready_observed_at;
+        clock.advance(Duration::seconds(120));
+        assert_eq!(reconciler.reconcile_once().await.expect("unchanged pass").queued, 13);
+        assert_eq!(*counted.calls.lock().expect("counts"), [2; 4]);
+        assert_eq!(*issues.facts_calls.lock().expect("fact counts"), 2, "one unique issue read per pass across 13 Projects");
+        {
+            let state = reconciler.mission.lock().await;
+            assert_eq!(state.boards.rebuilds(), 13);
+            assert_eq!(state.boards.updated_issues(), 0);
+            assert_eq!(state.occupancy_rebuilds, 13);
+            assert_eq!(state.convoy_lists, 1);
+        }
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        convoys
+            .create(
+                &InputMeta::builder().name("watched".into()).build(),
+                &ConvoySpec::builder().workflow_ref("implement".into()).project_ref("widgets".into()).build(),
+            )
+            .await
+            .expect("convoy add");
+        reconciler.reconcile_once().await.expect("add pass");
+        assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 14);
+        let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
+        assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
+        let mut moved = convoys.get("watched").await.expect("convoy");
+        moved.spec.project_ref = Some("overlap-0".into());
+        convoys.update(&InputMeta::from(&moved.metadata), &moved.metadata.resource_version, &moved.spec).await.expect("move convoy");
+        reconciler.reconcile_once().await.expect("move pass");
+        assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 16, "old and new scopes each update once");
+        let widgets = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("widgets").status.expect("status");
+        let moved_project = backend.using::<Project>(NAMESPACE).get("overlap-0").await.expect("destination").status.expect("status");
+        assert_eq!(widgets.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 0);
+        assert_eq!(moved_project.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
+        let current = convoys.get("watched").await.expect("convoy");
+        convoys
+            .update_status("watched", &current.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landed,
+                ..Default::default()
+            })
+            .await
+            .expect("convoy update");
+        reconciler.reconcile_once().await.expect("update pass");
+        assert_eq!(reconciler.mission.lock().await.occupancy_rebuilds, 17);
+        convoys.delete("watched").await.expect("convoy remove");
+        reconciler.reconcile_once().await.expect("remove pass");
+        {
+            let state = reconciler.mission.lock().await;
+            assert_eq!(state.occupancy_rebuilds, 18);
+            assert_eq!(state.boards.rebuilds(), 13);
+            assert_eq!(state.convoy_lists, 1);
+        }
+        // Inject a transport gap at the actual watch seam, then recover from
+        // real in-memory resource inventory; no live fleet is involved.
+        reconciler.mission.lock().await.watch = Some(futures::stream::empty().boxed());
+        assert_eq!(reconciler.reconcile_once().await.expect("scoped watch error").project_errors, 13);
+        reconciler.reconcile_once().await.expect("watch recovery");
+        assert_eq!(reconciler.mission.lock().await.convoy_lists, 2);
+        *counted.fail_holds.lock().expect("failure") = true;
+        assert_eq!(reconciler.reconcile_once().await.expect("scoped inventory error").project_errors, 13);
+        let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert!(unavailable.dispatch_queue_error.is_some());
+        assert_eq!(unavailable.dispatch_queue[0].ready_observed_at, initial);
+        *counted.fail_holds.lock().expect("failure") = false;
+        *issues.failing_collection.lock().expect("collection failure") = true;
+        assert_eq!(reconciler.reconcile_once().await.expect("source inventory outage").project_errors, 13);
+        let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert!(unavailable.dispatch_queue_error.as_ref().expect("error").contains("source inventory unavailable"));
+        assert_eq!(unavailable.dispatch_queue[0].ready_observed_at, initial);
+        *issues.failing_collection.lock().expect("collection failure") = false;
+        issues.failing_projects.lock().expect("failures").insert("overlap-0".into());
+        let failed = reconciler.reconcile_once().await.expect("isolated error");
+        assert_eq!(failed.project_errors, 1);
+        assert_eq!(failed.queued, 12);
+        issues.failing_projects.lock().expect("failures").clear();
+        reconciler.reconcile_once().await.expect("source recovery");
+        let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(status.dispatch_queue[0].ready_observed_at, initial);
+        assert!(status.dispatch_queue_attention.is_some());
+        let recovered = backend.using::<Project>(NAMESPACE).get("overlap-0").await.expect("recovered project").status.expect("status");
+        assert_eq!(recovered.dispatch_queue[0].ready_observed_at, initial);
+        assert!(recovered.dispatch_queue_error.is_none());
     }
 
     // #2868: local charter copies must not turn every daemon into a queue

@@ -10309,6 +10309,33 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         .expect("cold project");
     assert!(daemon.dispatch_board_internal(None).await.expect_err("complete source board").contains("initial observation"));
     assert_eq!(daemon.dispatch_board_internal(Some("large")).await.expect("healthy project").repositories[0].issues.len(), 400);
+    // #2860: overlapping Projects read each cached source once per pass,
+    // share the immutable observation, and isolate cold/broken bindings.
+    let shared_spec = projects.get("large").await.expect("large project").spec;
+    for id in 0..20 {
+        projects.create(&test_meta(&format!("overlap-{id}")), &shared_spec).await.expect("overlap");
+    }
+    let mut broken = shared_spec.clone();
+    broken.repositories = vec![flotilla_resources::ProjectRepositorySpec {
+        charter_store: None,
+        repo: flotilla_resources::RepositoryKey("missing".into()),
+        alias: None,
+        roles: Default::default(),
+        subpath: None,
+        default_branch: None,
+    }];
+    projects.create(&test_meta("broken"), &broken).await.expect("broken binding");
+    let inventory = projects.list().await.expect("projects").items;
+    let before = daemon.dispatch_board_cache.reads.load(Ordering::SeqCst);
+    let inputs = daemon.collect_dispatch_board_inputs(&inventory).await.expect("pass inputs");
+    assert_eq!(daemon.dispatch_board_cache.reads.load(Ordering::SeqCst) - before, 2);
+    assert!(inputs["cold"].is_err());
+    assert!(inputs["broken"].is_err());
+    let shared = &inputs["large"].as_ref().expect("large scope").1[0].1;
+    for id in 0..20 {
+        let overlapping = &inputs[&format!("overlap-{id}")].as_ref().expect("overlap scope").1[0].1;
+        assert!(Arc::ptr_eq(shared, overlapping));
+    }
 }
 
 // #2868: three daemons sharing a Project poll its source once per pass.
