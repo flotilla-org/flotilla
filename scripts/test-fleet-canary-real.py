@@ -4,7 +4,6 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -72,8 +71,8 @@ def main():
                 default = next(item for item in policy if item['metadata']['name'] == 'memory-default')
                 assert authored['spec']['docker_per_vessel']['memory_policy'] == default['spec']['docker_per_vessel']['memory_policy']
                 # A real clone proves the recorded transport is usable, not just syntactically accepted.
-                remote = subprocess.check_output(['git', '-C', str(probe / 'repository'),
-                                                  'remote', 'get-url', 'origin'], text=True).strip()
+                remote = commands.run(['git', '-C', str(probe / 'repository'),
+                                       'remote', 'get-url', 'origin']).strip()
                 commands.run(['git', 'clone', remote, str(root / 'clone')])
                 assert (root / 'clone/.flotilla/fleet-canary-agent.sh').is_file()
             except Exception:

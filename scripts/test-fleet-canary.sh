@@ -98,6 +98,9 @@ for line in Path(sys.argv[2]).read_text().splitlines():
     message = json.loads(line)
     if message.get('reason') == 'compiler-artifact' and message.get('executable'):
         artifacts[message['target']['name']] = message['executable']
+for name in ('flotilla', 'flotillad'):
+    if name not in artifacts:
+        raise SystemExit(f'missing cargo artifact: {name}')
 subprocess.run(['python3', str(Path(sys.argv[1]) / 'scripts/test-fleet-canary-real.py'),
                 artifacts['flotilla'], artifacts['flotillad']], check=True)
 PYTHON

@@ -167,6 +167,22 @@ class Contract(unittest.TestCase):
             with self.assertRaisesRegex(OSError, 'original setup failure'):
                 real.main()
 
+    # Missing executable artifacts must name the absent binary before launching the real test.
+    def test_missing_cargo_artifact_names_binary(self):
+        script = Path(__file__).with_name('test-fleet-canary.sh').read_text()
+        body = script.split("<<'PYTHON'\n", 1)[1].split('\nPYTHON', 1)[0]
+        for names, missing in [((), 'flotilla'), (('flotilla',), 'flotillad'), (('flotillad',), 'flotilla')]:
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as directory:
+                messages = Path(directory) / 'artifacts.jsonl'
+                messages.write_text('\n'.join(json.dumps({
+                    'reason': 'compiler-artifact', 'target': {'name': name}, 'executable': '/bin/' + name
+                }) for name in names))
+                with patch.object(os.sys, 'argv', ['test', directory, str(messages)]), \
+                        patch.object(subprocess, 'run') as run:
+                    with self.assertRaisesRegex(SystemExit, 'missing cargo artifact: ' + missing):
+                        exec(compile(body, 'Cargo artifact contract', 'exec'), {})
+                    run.assert_not_called()
+
     # No active daemon, service or generation link may be used by the probe.
     # A successful run observes Running before completion and reaps only its own resources.
     def test_isolated_launch_baseline_completion_and_reaping(self):
