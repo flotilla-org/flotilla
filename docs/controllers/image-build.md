@@ -176,3 +176,14 @@ manifest digests in one set; placement compares each against its corresponding
 identity field. It is not capped, since silently omitting a held digest changes
 placement costs. Large stores therefore increase Host replication payloads;
 a future partitioned inventory can address that without hiding availability.
+
+## Prelude verification
+
+Provides verification sources image preludes before executing the declared argv.
+The runner overrides ENTRYPOINT with `sh`, passes argv positionally, and sources
+`/etc/flotilla/prelude.d/*` in lexical order inside a subshell shared with the
+probe, preserving the caller's EXIT trap. Prelude failures and probe mismatches
+fail the build with their output retained in its Artifact. The shared runner's
+contents also participate in input hashes; changes invalidate verification keys.
+See [crew image acceptance](../crew-image.md#composed-spine-and-display-acceptance)
+for the display layer and the operator's Docker-host acceptance command.

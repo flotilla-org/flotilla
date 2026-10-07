@@ -372,3 +372,72 @@ Independent placements may still use a literal `docker_per_vessel.image`
 string. `pull_policy` remains per placement: `always` (default),
 `if_not_present`, or `never`. This does not resolve or build the recipe in
 `.flotilla/environment.yaml`.
+
+## Composed spine and display acceptance
+
+The fleet spine inputs live in `.flotilla/image-layers/`: base/toolchains,
+utilities, and harness fragments, plus the optional `capability-display-x11`.
+`inputs.json` records each source and version pin beside its fragment. Rust's
+stable pin remains `rust-toolchain.toml`. Apt packages, GitHub CLI and the uv
+installer are unresolved external inputs, so these layers declare `unpinned`
+and use non-shareable execution keys. They do not claim reproducible fleet cache
+identity merely because the repository revision is pinned.
+
+Regenerate the compatibility Dockerfile after editing fragments:
+
+```sh
+python3 ci/crew-image/compose.py > .flotilla/Dockerfile.crew
+```
+
+Generate fleet ImageLayer documents with the full commit containing the inputs
+and an operator-resolved Ubuntu base digest:
+
+```sh
+python3 ci/crew-image/compose.py --revision "$(git rev-parse HEAD)" \
+  --base 'ubuntu@sha256:<resolved-digest>' > /tmp/fleet-image-layers.yaml
+```
+
+These are opt-in Definitions, not an automatic fleet deployment. Select
+`spine-base`, `spine-utilities`, and `spine-harness` in the placement's layer
+selection. The existing composer inserts `capability-display-x11` when the
+need-set includes `display:headless-x11`. Its probe is `xdpyinfo`, which opens
+the display rather than accepting a binary/version or process-existence check.
+Existing literal images, arbitrary Dockerfile fragments and registry-less
+single-host builds continue to work. No Forgejo workflow is required.
+
+Crew launch sources regular files in `/etc/flotilla/prelude.d/*` in lexical
+order in a subshell of the launch shell, before the agent command. Prelude
+exports and the command share that scope; caller cleanup traps are preserved.
+Missing/empty directories are valid. Scripts must be portable to the launch shell and must not override
+shell error traps/options; a failing command stops launch, retains output and
+names the failed script and exit code. Build probes use the same source runner
+in `sh`, then execute the declared argv without shell interpolation. Prelude
+runner contents participate in verification input hashing. A mismatch fails
+ImageBuild, with full diagnostics retained in the build-log Artifact.
+
+The display prelude shares local Xvfb display `:99` across crew launches in a
+vessel, waits for it to open, and exports `DISPLAY`.
+Concurrent launches use the server that becomes ready; relaunches reuse it.
+Terminal teardown may send SIGHUP to Xvfb; a later launch restarts it if needed.
+The named readiness-attempt limit allows 100 retries with 0.1-second pauses.
+It disables TCP listening; empty Xauth state is intentional for trusted clients
+sharing this container-local Unix socket. Mesa software rendering is baked into
+image `Config.Env` as `LIBGL_ALWAYS_SOFTWARE=1`. Container `Config.Env` (image
+defaults plus declared overrides) is the crew baseline, including this variable;
+prelude exports extend it in the launch shell. The vessel's container lifetime
+owns its Xvfb processes.
+
+Before merging, the operator runs this exact command on feta from the PR branch:
+
+```sh
+ci/crew-image/accept-display.sh
+```
+
+It builds the composed spine with the display layer using local Buildx, without
+publishing to a registry, and runs the shared preludes as the operator's UID.
+`xdpyinfo` and `glxinfo -B` must both succeed and the software-rendering image
+variable must be present. The image tag defaults to
+`flotilla-crew-display:acceptance`; override with `FLOTILLA_ACCEPTANCE_IMAGE`.
+The script leaves the image in the local Docker store for inspection.
+Live wheelhouse admission with `--need display:headless-x11` remains the
+operator's post-deploy acceptance, replacing its apt-installing container (#2260).

@@ -86,8 +86,14 @@ fn hash_context(directory: &Path) -> Result<Vec<String>, String> {
 
 fn hash_layer_inputs_blocking(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
     let mut hashes = hash_context(context)?;
-    let verification = serde_json::to_vec(&(&layer.spec.fragment, &layer.spec.provides, &layer.spec.requires, &layer.spec.probes))
-        .map_err(|error| error.to_string())?;
+    let verification = serde_json::to_vec(&(
+        &layer.spec.fragment,
+        &layer.spec.provides,
+        &layer.spec.requires,
+        &layer.spec.probes,
+        flotilla_core::agent_process::with_preludes("exec \"$@\""),
+    ))
+    .map_err(|error| error.to_string())?;
     hashes.push(format!("sha256:{:x}", Sha256::digest(verification)));
     Ok(hashes)
 }
@@ -292,6 +298,9 @@ impl BuildxRunner {
                 .ok_or_else(|| deterministic(format!("no verification probe declared for {provide}")))?;
             let probe_name = format!("flotilla-probe-{:x}", Sha256::digest(format!("{name}\0{provide}")));
             let cpus = spec.reservation.cpu.to_string();
+            // Positional arguments preserve arbitrary probe argv without shell
+            // interpolation. Preludes and the probe share their export scope.
+            let script = flotilla_core::agent_process::with_preludes("exec \"$@\"");
             let mut args = vec![
                 "--config",
                 config_arg,
@@ -308,10 +317,13 @@ impl BuildxRunner {
                 "--pull=never",
                 "--network=none",
                 "--entrypoint",
-                &command[0],
+                "sh",
                 &identity.local_image_id,
+                "-c",
+                &script,
+                "flotilla-provide-probe",
             ];
-            args.extend(command.iter().skip(1).map(String::as_str));
+            args.extend(command.iter().map(String::as_str));
             let output = match self.output_with_timeout(&args, &context, PROBE_TIMEOUT).await {
                 Ok(output) => output,
                 Err(reason) => {
@@ -614,7 +626,10 @@ mod runner_contract {
                     })
                 }
                 "run" => {
-                    assert!(args.windows(2).any(|window| window == ["--entrypoint", "probe"]));
+                    assert!(args.windows(2).any(|window| window == ["--entrypoint", "sh"]));
+                    let shell = args.iter().position(|arg| *arg == "-c").expect("probe shell");
+                    assert_eq!(args[shell + 1], flotilla_core::agent_process::with_preludes("exec \"$@\""));
+                    assert_eq!(args[shell + 2], "flotilla-provide-probe");
                     assert!(args.contains(&"--pull=never"));
                     assert!(args.contains(&"--network=none"));
                     for pair in [["--cpus", "1"], ["--memory", "512m"], ["--pids-limit", "128"]] {
@@ -630,7 +645,7 @@ mod runner_contract {
                             exit_code: output.exit_code,
                         });
                     }
-                    assert_eq!(args.last(), Some(&"--version"));
+                    assert!(args[shell + 3..] == ["probe", "--version"] || args[shell + 3..] == ["xdpyinfo"]);
                     Ok(CommandOutput { stdout: "probe log\n".into(), stderr: String::new(), exit_code: Some(0) })
                 }
                 unexpected => panic!("unexpected Docker process {unexpected}"),
@@ -739,6 +754,66 @@ mod runner_contract {
         let again = builder.build("operation", &spec, &spec.inputs.parent_digest).await.expect("idempotent recovery");
         assert!(matches!(again, ImageBuildResult::Built { .. }));
         assert_eq!(processes.builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // #2730: display provides are credited only after a prelude-wrapped display
+    // open succeeds; a mismatch preserves probe output and fails the build.
+    #[tokio::test]
+    async fn display_probe_mismatch_fails_the_build() {
+        for succeeds in [false, true] {
+            let processes = Arc::new(DockerProcess {
+                probe_failure: (!succeeds).then(|| CommandOutput {
+                    stdout: "display diagnostic\n".into(),
+                    stderr: "xdpyinfo: unable to open display :99\n".into(),
+                    exit_code: Some(1),
+                }),
+                ..Default::default()
+            });
+            let (_temp, builder, mut spec) = fixture(processes).await;
+            spec.layer.spec.provides = BTreeSet::from(["display:headless-x11".into()]);
+            spec.layer.spec.probes = BTreeMap::from([("display:headless-x11".into(), vec!["xdpyinfo".into()])]);
+            spec.inputs.content_hashes = builder.resolve(&spec.layer, "amd64").await.expect("display inputs").content_hashes;
+            spec.recipe_key = spec.inputs.recipe_key().expect("display recipe");
+            let result = builder.build("display", &spec, &spec.inputs.parent_digest).await.expect("display build");
+            if succeeds {
+                let ImageBuildResult::Built { verified_provides, .. } = result else { panic!("display should verify") };
+                assert_eq!(verified_provides, BTreeSet::from(["display:headless-x11".into()]));
+            } else {
+                let ImageBuildResult::Failed { failure, log_ref } = result else { panic!("mismatch must fail") };
+                assert_eq!(failure.class, ImageBuildFailureClass::Deterministic);
+                assert!(failure.reason.contains("display:headless-x11"));
+                assert!(failure.reason.contains("unable to open display"));
+                let artifact = builder.backend.using::<Artifact>("test").get(&log_ref).await.expect("failure artifact");
+                let body = builder.blobs.get(&BlobDigest::parse(&artifact.spec.digest).expect("digest")).await.expect("blob").expect("log");
+                assert!(String::from_utf8(body).expect("log text").contains("display diagnostic"));
+            }
+        }
+    }
+
+    // A changed fragment, prelude input or probe must invalidate the recipe;
+    // repeated resolution of identical inputs must preserve its identity.
+    #[tokio::test]
+    async fn fragment_and_verification_changes_invalidate_recipe_keys() {
+        let (_temp, builder, spec) = fixture(Arc::new(DockerProcess::default())).await;
+        let context = builder.context(&spec.layer).await.expect("context");
+        let original = builder.resolve(&spec.layer, "amd64").await.expect("original inputs");
+        assert_eq!(original.content_hashes, spec.inputs.content_hashes);
+        for (path, contents) in [("Dockerfile", "ARG BASE\nFROM ${BASE}\nRUN echo changed\n"), ("prelude.sh", "export DISPLAY=:99\n")] {
+            std::fs::write(context.join(path), contents).expect("changed input");
+            let changed = builder.resolve(&spec.layer, "amd64").await.expect("changed inputs");
+            let mut inputs = spec.inputs.clone();
+            inputs.content_hashes = changed.content_hashes;
+            assert_ne!(inputs.recipe_key().expect("changed key"), spec.recipe_key);
+        }
+        let mut layer = spec.layer.clone();
+        layer.spec.probes.insert("test:probe".into(), vec!["xdpyinfo".into()]);
+        let unchanged = builder.resolve(&spec.layer, "amd64").await.expect("same context");
+        let changed = builder.resolve(&layer, "amd64").await.expect("probe inputs");
+        let mut before = spec.inputs.clone();
+        before.content_hashes = unchanged.content_hashes;
+        let mut after = before.clone();
+        after.content_hashes = changed.content_hashes;
+        assert_ne!(before.recipe_key().expect("before"), after.recipe_key().expect("after"));
     }
     // Real source hashes and Artifact storage surround injected Docker failures.
     #[tokio::test]

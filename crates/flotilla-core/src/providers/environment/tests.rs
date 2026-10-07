@@ -1100,7 +1100,7 @@ async fn env_vars_reads_configured_container_environment() {
     use flotilla_protocol::ImageId;
     // Cover absent, explicit, and explicitly empty HOME, plus null Config.Env.
     for (configured_home, null_environment) in [(None, false), (Some("/configured-home"), false), (Some(""), false), (None, true)] {
-        let mut entries = vec!["FOO=bar", "BAZ=qux", "TEXT=line one\nline two=tail", "EMPTY=", "MALFORMED"]
+        let mut entries = vec!["FOO=bar", "BAZ=qux", "LIBGL_ALWAYS_SOFTWARE=1", "TEXT=line one\nline two=tail", "EMPTY=", "MALFORMED"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -1137,6 +1137,7 @@ async fn env_vars_reads_configured_container_environment() {
         } else {
             assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
             assert_eq!(vars.get("BAZ"), Some(&"qux".to_string()));
+            assert_eq!(vars.get("LIBGL_ALWAYS_SOFTWARE").map(String::as_str), Some("1"));
             assert_eq!(vars.get("TEXT").map(String::as_str), Some("line one\nline two=tail"));
             assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
         }

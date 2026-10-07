@@ -59,6 +59,7 @@ if grep -Eq '^ENV TERM( |=)' "$dockerfile"; then
   exit 1
 fi
 python3 "$repo_root/ci/crew-image/test-tea-auth.py"
+python3 "$repo_root/ci/crew-image/test-compose.py"
 
 if grep -Eq ':(latest|"latest"|'"'"'latest'"'"')[[:space:]]*$' "$workflow"; then
   echo 'crew image workflow must never tag latest — the tag is the deployment contract' >&2

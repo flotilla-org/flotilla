@@ -25,7 +25,17 @@ pub fn exit_receipt(crew_id: &str) -> String {
 /// The terminal and checkout remain available for explicit or automatic resume.
 pub fn monitored_command(command: &str, crew_id: &str) -> String {
     let receipt = exit_receipt(crew_id);
+    let command = with_preludes(command);
     format!("(\n{command}\n)\nflotilla_agent_exit_code=$?\nmkdir -p .flotilla/agent-exits\nprintf '%s\\n' \"$flotilla_agent_exit_code\" > {receipt}")
+}
+
+/// Source image preludes in the command's shell before launching an agent or
+/// checking a provide. A missing directory is valid for arbitrary images.
+pub fn with_preludes(command: &str) -> String {
+    format!(
+        "{}\nflotilla_run_command() {{\n{command}\n}}\nflotilla_run_with_preludes flotilla_run_command \"$@\"",
+        include_str!("../../../ci/crew-image/prelude.sh")
+    )
 }
 
 /// Remove only this launch's receipt through its execution environment.
@@ -142,6 +152,53 @@ mod tests {
             assert!(result.success(), "the parent remains usable after child failure");
             assert_eq!(std::fs::read_to_string(cwd.path().join(exit_receipt(&crew))).expect("receipt").trim(), code.to_string());
             assert!(!cwd.path().join(exit_receipt("next launch")).exists(), "an old launch cannot mark its replacement exited");
+        }
+    }
+
+    // #2730: lexical preludes run in the agent's shell, exports reach it, and
+    // the first failure suppresses launch while retaining output and a receipt.
+    #[hegel::test]
+    fn preludes_order_exports_and_failures(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Empty directories, 1..8 files created in reverse order, failure at
+        // any position (including first/last), and sh/bash/zsh launch shells.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let failing = tc.draw(gs::integers::<usize>().min_value(0).max_value(count));
+        let mut shells = vec!["sh", "bash"];
+        if Command::new("zsh").arg("--version").output().is_ok() {
+            shells.push("zsh");
+        }
+        let shell = shells[tc.draw(gs::integers::<usize>().min_value(0).max_value(shells.len() - 1))];
+        let cwd = tempfile::tempdir().expect("checkout");
+        let preludes = cwd.path().join("preludes with spaces");
+        std::fs::create_dir(&preludes).expect("preludes");
+        for index in (0..count).rev() {
+            let body = if index == failing {
+                format!("printf 'diagnostic-{index}\\n'\nfalse\nprintf 'unreachable\\n'\n")
+            } else {
+                format!("export FLOTILLA_TEST_TRACE=\"${{FLOTILLA_TEST_TRACE-}}{index},\"\n")
+            };
+            std::fs::write(preludes.join(format!("{index:02}-step.sh")), body).expect("prelude");
+        }
+        let result = Command::new(shell)
+            .arg("-c")
+            .arg(monitored_command("printf 'agent:%s\\n' \"${FLOTILLA_TEST_TRACE-}\"", "prelude-test"))
+            .env("FLOTILLA_PRELUDE_DIR", &preludes)
+            .env_remove("FLOTILLA_TEST_TRACE")
+            .current_dir(cwd.path())
+            .output()
+            .expect("launch shell");
+        let stdout = String::from_utf8(result.stdout).expect("stdout");
+        let stderr = String::from_utf8(result.stderr).expect("stderr");
+        let receipt = std::fs::read_to_string(cwd.path().join(exit_receipt("prelude-test"))).expect("receipt");
+        if failing < count {
+            assert_eq!(stdout, format!("diagnostic-{failing}\n"));
+            assert!(stderr.contains(&format!("{failing:02}-step.sh (exit 1)")), "{stderr}");
+            assert_eq!(receipt.trim(), "1");
+        } else {
+            let trace = (0..count).map(|index| format!("{index},")).collect::<String>();
+            assert_eq!(stdout, format!("agent:{trace}\n"));
+            assert_eq!(receipt.trim(), "0");
         }
     }
     // Fake only the environment subprocess boundary; files remain real-backed.
