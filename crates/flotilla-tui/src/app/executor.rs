@@ -157,7 +157,6 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
         CommandValue::LedgerCommentCreationReserved { .. }
         | CommandValue::Ok
-        | CommandValue::CrewTurnDelivered { .. }
         | CommandValue::ResourceReconciled { .. }
         | CommandValue::ConvoyBriefDelivered { .. }
         | CommandValue::ConvoyBriefQueued { .. }

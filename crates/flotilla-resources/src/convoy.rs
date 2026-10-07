@@ -1070,7 +1070,7 @@ pub struct PendingBrief {
     pub content: String,
     pub queued_at: DateTime<Utc>,
     /// Decodes briefs queued before sender attribution; remove after the next fleet roll.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "crate::CrewMessageSender::is_unknown")]
     #[builder(default)]
     pub sender: crate::CrewMessageSender,
 }
@@ -1200,7 +1200,7 @@ pub struct TurnDeliveryEpisode {
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
     /// Decodes episodes stored before sender attribution; remove after the next fleet roll.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "crate::CrewMessageSender::is_unknown")]
     #[builder(default)]
     pub sender: crate::CrewMessageSender,
 }
@@ -1211,6 +1211,8 @@ pub enum TurnDeliveryOutcome {
     /// Producer admission evidence only. The referenced receiver-homed Message
     /// owns delivery status, retries and attention; this is a workflow latch.
     MessageAccepted {
+        /// False for duplicate/suppressed admissions: record the latch without
+        /// opening another workflow turn. This variant first ships with Message.
         new_turn: bool,
         message: flotilla_protocol::ResourceRef,
         rung: TurnDeliveryRung,
@@ -1338,6 +1340,10 @@ impl WorkCompletionAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewWorkState {
+    /// Workflow continuation awaiting a turn boundary; payload and delivery
+    /// remain in Message. Remove the decoder default after one fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_follow_up: Option<flotilla_protocol::ResourceRef>,
     pub phase: CrewWorkPhase,
     /// A resumed stalled crew is in grace until its new brief is delivered and
     /// a later idle observation ends that turn. The default decodes prior
@@ -1622,6 +1628,18 @@ pub enum ConvoyStatusPatch {
         resumed_at: DateTime<Utc>,
         prompt: String,
         brief_id: Option<String>,
+    },
+    QueueMessageFollowUp {
+        vessel: String,
+        role: String,
+        message: Option<flotilla_protocol::ResourceRef>,
+    },
+    BeginMessageFollowUp {
+        vessel: String,
+        role: String,
+        message: flotilla_protocol::ResourceRef,
+        content: String,
+        claim: SupersededCrewClaim,
     },
     SetPendingBrief {
         pending_brief: PendingBrief,
@@ -2012,6 +2030,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.finished_at = None;
                     }
                     state.phase = CrewWorkPhase::Done;
+                    state.pending_follow_up = None;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                     if disposition.is_some() {
@@ -2152,6 +2171,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.pending_follow_up = None;
                     if brief_id.is_some() {
                         state.resumed_at = Some(*resumed_at);
                         state.resume_brief_id = brief_id.clone();
@@ -2167,6 +2187,39 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 status.stalled = None;
                 clear_pending_brief_for(status, vessel, role);
+            }
+            Self::QueueMessageFollowUp { vessel, role, message } => {
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.pending_follow_up = message.clone();
+                }
+            }
+            Self::BeginMessageFollowUp { vessel, role, message, content, claim } => {
+                if !status
+                    .crew_work
+                    .get(vessel)
+                    .and_then(|crew| crew.get(role))
+                    .is_some_and(|state| state.pending_follow_up.as_ref() == Some(message))
+                {
+                    return;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.superseded_claims.push(claim.clone());
+                }
+                Self::ResumeCrewWork {
+                    vessel: vessel.clone(),
+                    role: role.clone(),
+                    resumed_at: claim.claimed_at,
+                    prompt: content.clone(),
+                    brief_id: Some(message.name.clone()),
+                }
+                .apply(status);
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.disposition = None;
+                    state.decision_ledger_ref = None;
+                    state.decision_ledger_digest = None;
+                    state.completion_override = None;
+                    state.completed_while_crew_active = false;
+                }
             }
             Self::SetPendingBrief { pending_brief } => {
                 status.turn_deliveries.entry(PENDING_BRIEF_DELIVERY_SOURCE.to_string()).or_default().pending_brief =

@@ -53,3 +53,11 @@ intent is revalidated and persisted under admission before submission.
 HTTP/Kubernetes resource versions are not assumed to fit an ordered `u64`.
 Admission uses the immutable creation timestamp and name fallback on that
 backend, retaining a numeric tie-breaker only for local backends.
+
+## First implementation
+
+Project-level roles resolve through their `ConvoyEnsure` holder declarations; convoy crew roles resolve through federated Convoy and TerminalSession resources. New intent follows ordinary resource mutation routing to the receiver terminal's authority, or its pinned vessel home while startup is pending. Fleet and principal holder declarations follow #2658. A known receiver home waits for an absent holder; without a declared home, routing refuses rather than guessing.
+
+Workflow episodes retain only Message admission references. The receiver persists batch membership and holder identity before transport I/O. Definitely unsent attempts have a three-attempt budget with exponential backoff; uncertain input stays held and observed without resubmission. Holds resolve on acceptance evidence and never stop attention refresh. An already-idle holder can receive a batch without a later idle transition, as required by #2755.
+
+Upgrade adoption publishes receiver-scoped records before clearing old payloads. It preserves unsent FIFO order, bounded retry state and uncertain submissions. Previous launch briefs awaiting a session retain an exact incarnation and content witness. Payload-free receipt witnesses prevent a delayed replicated authority queue from retyping previously acknowledged input. These witnesses and retired queue decoders can be removed after one fleet roll. Crew list and convoy explain share a durable inbox projection, including waiting reasons, state timestamps and delivery identities.

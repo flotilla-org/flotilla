@@ -39,7 +39,6 @@ fn command_action_name(command: &Command) -> &'static str {
         CommandAction::CrewComplete { .. } => "crew_complete",
         CommandAction::CrewFail { .. } => "crew_fail",
         CommandAction::CrewStall { .. } => "crew_stall",
-        CommandAction::DeliverCrewTurn { .. } => "deliver_crew_turn",
         CommandAction::CrewSupervise { .. } => "crew_supervise",
         CommandAction::CrewHandoff { .. } => "crew_handoff",
         CommandAction::ResourceApply { .. } => "resource_apply",
@@ -58,7 +57,6 @@ fn command_subject(action: &CommandAction) -> String {
         | CommandAction::ConvoyResume { namespace, name, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), name)
         }
-        CommandAction::DeliverCrewTurn { request } => format!("convoy:{}/{}", request.namespace, request.convoy),
         CommandAction::CrewSupervise { namespace, convoy, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), convoy)
         }
@@ -224,23 +222,15 @@ impl flotilla_core::leaf_engine::ResourceIntentPublisher for RemoteCommandRouter
             value => Err(format!("unexpected resource intent admission result: {value:?}")),
         }
     }
-}
-
-#[async_trait]
-impl flotilla_core::leaf_engine::RemoteTurnDelivery for RemoteCommandRouterInner {
-    async fn deliver(
-        self: Arc<Self>,
-        request: &flotilla_core::leaf_engine::TurnDeliveryRequest,
-    ) -> Result<flotilla_resources::TurnDeliveryRung, String> {
+    async fn patch_status(self: Arc<Self>, namespace: &str, kind: &str, name: &str, status: serde_json::Value) -> Result<(), String> {
         let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request.clone()) }).build();
-        // Controller deliveries have no interactive surface. Pending commands
-        // and their oneshots are keyed by unique request_id, not session_id;
-        // session_id is used only for query projection at the receiver.
+        let command = Command::builder()
+            .action(CommandAction::ResourceStatusPatch { namespace: namespace.into(), kind: kind.into(), name: name.into(), status })
+            .build();
         match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
-            CommandValue::CrewTurnDelivered { rung } => Ok(rung),
+            CommandValue::ResourceObject(_) => Ok(()),
             CommandValue::Error { message } => Err(message),
-            value => Err(format!("unexpected remote turn delivery result: {value:?}")),
+            value => Err(format!("unexpected resource status mutation result: {value:?}")),
         }
     }
 }
@@ -268,8 +258,6 @@ impl RemoteCommandRouter {
             retrying_crew_completions: Arc::new(StdMutex::new(HashMap::new())),
             blob_store: Arc::new(OnceLock::new()),
         });
-        let delivery: Arc<dyn flotilla_core::leaf_engine::RemoteTurnDelivery> = inner.clone();
-        inner.daemon.set_remote_turn_delivery(Arc::downgrade(&delivery));
         let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> = inner.clone();
         inner.daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
         Self { inner }
@@ -395,9 +383,6 @@ impl RemoteCommandRouter {
         mut command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, String> {
-        if matches!(command.action, CommandAction::DeliverCrewTurn { .. }) {
-            return Err("DeliverCrewTurn is an internal controller command".into());
-        }
         let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
         if let Some(completion) = &mut crew_completion {
@@ -458,7 +443,6 @@ impl RemoteCommandRouter {
         };
         let crew_convoy = match &command.action {
             CommandAction::QueryCrewList { context } => context.convoy.clone(),
-            CommandAction::DeliverCrewTurn { request } => Some(request.convoy.clone()),
             _ => None,
         };
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;

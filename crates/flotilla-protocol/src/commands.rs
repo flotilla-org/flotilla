@@ -14,20 +14,6 @@ use crate::{
     AttachableSetId, IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct TurnDeliveryRequest {
-    pub namespace: String,
-    pub convoy: String,
-    pub source: String,
-    pub vessel: String,
-    pub role: String,
-    pub brief: String,
-    pub subject_revision: String,
-    /// The firing subject, including discovered PRs absent from legacy convoy spec.
-    pub subject: Option<crate::Subject>,
-    pub sender: crate::CrewMessageSender,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TurnDeliveryRung {
@@ -459,6 +445,8 @@ pub struct ConvoyExplanation {
     pub change_requests: Vec<ExplainedChangeRequest>,
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<crate::query::CrewMessageView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_turns: Vec<ExplainedQueuedTurn>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -940,10 +928,6 @@ pub enum CommandAction {
         proposed_disposition: Option<StallProposedDisposition>,
         message: String,
     },
-    /// Internal controller delivery, routed to the target Convoy's home.
-    DeliverCrewTurn {
-        request: Box<TurnDeliveryRequest>,
-    },
     CrewSupervise {
         namespace: Option<String>,
         convoy: String,
@@ -1223,7 +1207,6 @@ impl Command {
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::CrewStall { .. } => "Stalling crew work...",
-            CommandAction::DeliverCrewTurn { .. } => "Delivering crew turn...",
             CommandAction::CrewSupervise { .. } => "Supervising crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::ConvoyStart { .. } => "Starting convoy...",
@@ -1323,9 +1306,6 @@ impl AttachBinding {
 pub enum CommandValue {
     LedgerCommentCreationReserved {
         granted: bool,
-    },
-    CrewTurnDelivered {
-        rung: TurnDeliveryRung,
     },
     Ok,
     CrewFollowUpDelivered,
@@ -1987,6 +1967,7 @@ mod tests {
                 vessel_ref: "convoy-a-implement".into(),
                 vessel: "implement".into(),
                 members: vec![CrewListMember {
+                    messages: Vec::new(),
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),

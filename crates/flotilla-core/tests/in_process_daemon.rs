@@ -65,6 +65,27 @@ use flotilla_resources::{
 use futures::StreamExt;
 use tokio::sync::Notify;
 
+// Boundary stand-in for the ordinary receiver-home ResourceApply router.
+struct ReceiverIntentPublisher {
+    inbox: flotilla_resources::MessageInbox,
+}
+#[async_trait]
+impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPublisher {
+    async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
+        if document["kind"] != "Message" || document["metadata"]["namespace"] != namespace {
+            return Err("invalid receiver-home resource document".into());
+        }
+        let spec = serde_json::from_value(document["spec"].clone()).map_err(|error| error.to_string())?;
+        let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().ok_or("missing name")?.into()).build();
+        let admission = self.inbox.accept(&meta, &spec, chrono::Utc::now()).await.map_err(|error| error.to_string())?;
+        let record = match admission {
+            flotilla_resources::MessageAdmission::Accepted(record) => record,
+            flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+        };
+        Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
+    }
+}
+
 async fn admitted_convoy(backend: &ResourceBackend, role: &str) -> flotilla_resources::ResourceObject<ResourceConvoy> {
     let selector = BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), role.to_string())]);
     backend
@@ -7861,6 +7882,9 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     let terminal_host =
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
+    let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
+        Arc::new(ReceiverIntentPublisher { inbox: flotilla_resources::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+    authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let snapshot = WorkflowSnapshot {
         cascade: None,
         exit: None,
@@ -7985,7 +8009,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     };
     authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect("queue remote handoff");
     let convoy = convoys.get("handoff-convoy").await.expect("convoy after handoff");
-    assert!(convoy.status.expect("convoy status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
     terminal_host
         .resource_backend()
         .replica_writer::<ResourceConvoy>(authority.node_id().clone(), "flotilla")
@@ -7995,7 +8019,11 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver handoff at session origin");
     let reviewer = sessions.get(&reviewer_name).await.expect("reviewer after delivery");
     let TerminalSessionSource::Agent { message, .. } = reviewer.spec.source else { panic!("agent session expected") };
-    assert!(message.expect("queued handoff").text.contains("Review this"));
+    assert!(message.is_none());
+    let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
+    assert_eq!(inbox.items.len(), 1);
+    assert!(inbox.items[0].spec.body.contains("Review this"));
+    assert_eq!(inbox.items[0].spec.sender, "flotilla/handoff-convoy/work/coder");
 
     sessions.delete(&reviewer_name).await.expect("remove target session");
     let (coder_name, labels, spec) = create_session("coder", 0);
@@ -8026,6 +8054,9 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     let terminal_host =
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
+    let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
+        Arc::new(ReceiverIntentPublisher { inbox: flotilla_resources::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+    authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -8096,7 +8127,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .expect("resume remote crew session");
     assert!(matches!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { .. }));
     let convoy = convoys.get("split-convoy").await.expect("convoy after resume");
-    assert!(convoy.status.expect("convoy status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
     assert!(authority.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("local sessions").items.is_empty());
     terminal_host
         .resource_backend()
@@ -8107,9 +8138,11 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
     terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at session origin");
     let session = sessions.get("split-session").await.expect("session after delivery");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent session expected") };
-    let message = message.expect("queued remote turn");
-    assert!(message.text.contains("Continue"));
-    assert!(matches!(message.sender, flotilla_resources::CrewMessageSender::OperatorResume { .. }));
+    assert!(message.is_none());
+    let inbox = terminal_host.resource_backend().using::<flotilla_resources::Message>("flotilla").list().await.unwrap();
+    assert_eq!(inbox.items.len(), 1);
+    assert!(inbox.items[0].spec.body.contains("Continue"));
+    assert_eq!(inbox.items[0].spec.sender, "principal:implicit");
 }
 
 #[tokio::test]
@@ -8145,21 +8178,27 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
         .expect("queue brief for busy crew");
 
     let convoy = convoys.get("busy-convoy").await.expect("read convoy");
-    let status = serde_json::to_value(convoy.status.expect("convoy status")).expect("serialize convoy status");
-    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Check the edge case");
-    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["vessel"], "work");
-    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["role"], "coder");
-    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["sender"]["kind"], "operator-resume");
-
+    let status = convoy.status.unwrap();
+    assert!(status.pending_brief().is_none());
+    let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
+    let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
+    assert_eq!(first.spec.body, "Check the edge case");
+    assert_eq!(first.spec.receiver, "flotilla/busy-convoy/work/coder");
+    assert_eq!(first.spec.sender, "principal:implicit");
     let outcome = daemon
         .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"))
         .await
         .expect("replace pending brief");
     assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
     let convoy = convoys.get("busy-convoy").await.expect("read updated convoy");
-    let status = serde_json::to_value(convoy.status.expect("convoy status")).expect("serialize convoy status");
-    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Use the newer instruction");
-
+    let status = convoy.status.unwrap();
+    let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
+    let replacement = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
+    assert_eq!(replacement.spec.body, "Use the newer instruction");
+    assert_eq!(
+        backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.unwrap().status.unwrap().phase,
+        flotilla_resources::MessagePhase::Superseded
+    );
     let withdrawn = daemon.convoy_withdraw_pending_brief_internal("flotilla", "busy-convoy").await.expect("withdraw pending brief");
     assert_eq!(withdrawn.as_deref(), Some("Use the newer instruction"));
     assert!(convoys.get("busy-convoy").await.expect("read withdrawn convoy").status.expect("convoy status").pending_brief().is_none());
@@ -8341,17 +8380,10 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .await
         .expect("resume unrelated crew");
     assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
-    assert_eq!(
-        convoys
-            .get("idle-convoy")
-            .await
-            .expect("read convoy with queued brief")
-            .status
-            .expect("convoy status")
-            .pending_brief()
-            .map(|brief| brief.content.as_str()),
-        Some("Finish the current turn")
-    );
+    let status = convoys.get("idle-convoy").await.unwrap().status.unwrap();
+    let reference = status.crew_work["work"]["coder"].pending_follow_up.as_ref().unwrap();
+    let first = backend.using::<flotilla_resources::Message>("flotilla").get(&reference.name).await.unwrap();
+    assert_eq!(first.spec.body, "Finish the current turn");
     apply_status_patch(&sessions, "idle-coder-session", &TerminalSessionStatusPatch::ObserveAttention {
         attention: TerminalAttention {
             state: TerminalAttentionState::Idle,
@@ -8372,17 +8404,37 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
         panic!("review session should remain agent-backed")
     };
-    let review_message = review_message.expect("queued review delivery");
-    assert!(matches!(review_message.sender, flotilla_resources::CrewMessageSender::OperatorResume { .. }));
-    assert_eq!(review_message.text, "[operator (unattributed) · via convoy resume]\n\nStart the review");
-    let coder_session = sessions.get("idle-coder-session").await.expect("read queued coder session");
-    let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else {
-        panic!("coder session should remain agent-backed")
-    };
-    assert_eq!(
-        coder_message.expect("queued coder delivery").text,
-        "[operator (unattributed) · via convoy resume]\n\nFinish the current turn"
-    );
+    assert!(review_message.is_none());
+    let coder_session = sessions.get("idle-coder-session").await.unwrap();
+    let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else { panic!("agent expected") };
+    assert!(coder_message.is_none());
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
+    assert!(records.iter().any(|message| message.spec.receiver.ends_with("/review/qa") && message.spec.body.ends_with("Start the review")));
+    assert!(records.iter().any(|message| message.spec.receiver.ends_with("/work/coder") && message.spec.body == "Finish the current turn"));
+    let accepted = backend.using::<flotilla_resources::Message>("flotilla").get(&first.metadata.name).await.expect("queued follow-up");
+    assert_eq!(accepted.status.expect("admitted status").phase, flotilla_resources::MessagePhase::Accepted);
+    let waiting = convoys.get("idle-convoy").await.expect("crew awaiting receipt").status.expect("status");
+    assert!(waiting.crew_work["work"]["coder"].message.is_none(), "admission is not a receiver receipt");
+    assert_eq!(waiting.crew_work["work"]["coder"].pending_follow_up.as_ref().expect("queued intent").name, first.metadata.name);
+    // Stand in only for the receiver transport receipt. The ordinary admission
+    // and workflow continuation use the real daemon and resource status patches.
+    let receipt_at = chrono::Utc::now();
+    apply_status_patch(
+        &backend.using::<flotilla_resources::Message>("flotilla"),
+        &first.metadata.name,
+        &flotilla_resources::MessageStatusPatch::Delivered {
+            receiver: flotilla_resources::ResolvedMessageReceiver::builder()
+                .crew_id("idle-crew".into())
+                .session("idle-coder".into())
+                .delivered_at(receipt_at)
+                .evidence("explicit receiver transport receipt".into())
+                .build(),
+            at: receipt_at,
+        },
+    )
+    .await
+    .expect("receiver delivery receipt");
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue after receiver receipt");
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
@@ -8492,12 +8544,16 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].disposition.as_deref(), Some("satisfied"));
     let session = sessions.get("coder-session").await.expect("read crew session");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
-    let message = message.expect("next turn message");
-    assert!(matches!(message.sender, flotilla_resources::CrewMessageSender::OperatorFollowUp { .. }));
-    let message = message.text;
-    assert!(message.starts_with("[operator (unattributed) · follow-up brief · reply by running `crew complete`]"), "{message}");
-    assert!(message.contains("run `flotilla crew complete` again"), "{message}");
-    assert!(message.ends_with("Begin the follow-up turn"), "{message}");
+    assert!(message.is_none());
+    let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.unwrap().items;
+    assert_eq!(records.len(), 1, "completion must not manufacture a second delivery");
+    assert_eq!(records[0].spec.body, "Begin the follow-up turn");
+    assert_eq!(
+        records[0].status.as_ref().unwrap().phase,
+        flotilla_resources::MessagePhase::Accepted,
+        "completion is not input acceptance evidence"
+    );
+    assert!(status.crew_work["work"]["coder"].pending_follow_up.is_none());
     assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Begin the follow-up turn"));
     assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].message.as_deref(), Some("first turn complete"));
     assert_eq!(

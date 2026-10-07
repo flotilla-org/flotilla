@@ -133,6 +133,9 @@ pub enum CrewMessageSender {
 }
 
 impl CrewMessageSender {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
     /// Compact identity and kind for line-oriented diagnostic output.
     pub fn short_label(&self) -> String {
         fn safe(value: &str) -> String {
@@ -247,8 +250,7 @@ pub use commands::{
     ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition, ExplainedUnclaimedWork,
     ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector,
     ResolvedPaneCommand, ResourceCursor, ResourceDigest, ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope,
-    ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus,
-    TurnDeliveryRequest, TurnDeliveryRung,
+    ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

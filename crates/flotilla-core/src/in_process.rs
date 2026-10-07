@@ -1236,6 +1236,7 @@ async fn discover_repo_for_environment(
 
 const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
 
+#[cfg(test)]
 fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::ResourceObject<T>) -> InputMeta {
     InputMeta::builder()
         .name(resource.metadata.name.clone())
@@ -3176,7 +3177,6 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
-            flotilla_protocol::CommandAction::DeliverCrewTurn { request } => (request.namespace.clone(), request.convoy.as_str()),
             flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), convoy.as_str())
             }
@@ -5370,11 +5370,7 @@ impl InProcessDaemon {
         self.crew_ops.set_resource_intent_publisher(publisher);
     }
 
-    pub fn set_remote_turn_delivery(&self, delivery: Weak<dyn crate::leaf_engine::RemoteTurnDelivery>) {
-        self.crew_ops.set_remote_turn_delivery(delivery)
-    }
-
-    pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+    pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::CrewTurnIntent) -> Result<TurnDeliveryRung, String> {
         self.crew_ops.deliver_turn(request).await.map(|admission| admission.rung)
     }
 
@@ -5476,7 +5472,9 @@ impl InProcessDaemon {
                 document.get("kind").and_then(serde_json::Value::as_str),
                 document.pointer("/metadata/name").and_then(serde_json::Value::as_str),
             ) {
-                (Some(kind), Some(name)) => Some((namespace.as_str(), kind, name)),
+                (Some(kind), Some(name)) => {
+                    Some((document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace), kind, name))
+                }
                 _ => None,
             },
             _ => None,
@@ -7269,21 +7267,6 @@ impl InProcessDaemon {
             }
             flotilla_protocol::CommandAction::CrewFail { .. } => return boxed_action!(self.execute_action_crew_fail(id, &command, &caller)),
             flotilla_protocol::CommandAction::CrewStall { .. } => return boxed_action!(self.execute_action_crew_stall(id, &command)),
-            flotilla_protocol::CommandAction::DeliverCrewTurn { request } => {
-                let identity = self.start_context_free_command(id, command.description().to_string());
-                let result = if caller.is_some() {
-                    CommandValue::Error { message: "DeliverCrewTurn is an internal controller command".into() }
-                } else if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. } | CrewMessageSender::FlotillaNudge) {
-                    match self.deliver_standing_turn(request).await {
-                        Ok(rung) => CommandValue::CrewTurnDelivered { rung },
-                        Err(message) => CommandValue::Error { message },
-                    }
-                } else {
-                    CommandValue::Error { message: "remote turn delivery requires a controller sender".into() }
-                };
-                self.finish_context_free_command(id, identity, result);
-                return Ok(id);
-            }
             flotilla_protocol::CommandAction::CrewSupervise { .. } => {
                 return boxed_action!(self.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref))
             }

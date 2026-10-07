@@ -65,7 +65,27 @@ pub struct EpisodeKeyFields {
     pub subject_revision: Option<String>,
 }
 
-pub use flotilla_protocol::TurnDeliveryRequest;
+/// In-process workflow activation context. Only the resulting Message resource
+/// crosses hosts; transport requests are not a wire protocol.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+pub struct CrewTurnIntent {
+    pub namespace: String,
+    pub convoy: String,
+    pub source: String,
+    pub vessel: String,
+    pub role: String,
+    pub brief: String,
+    pub subject_revision: String,
+    pub subject: Option<flotilla_protocol::Subject>,
+    pub sender: String,
+    #[builder(default = flotilla_resources::MessageRelation::System)]
+    pub relation: flotilla_resources::MessageRelation,
+    #[builder(default)]
+    pub references: Vec<flotilla_resources::MessageReference>,
+    pub message_subject: Option<flotilla_resources::MessageReference>,
+    #[builder(default)]
+    pub expectation: flotilla_resources::MessageExpectation,
+}
 
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,17 +100,15 @@ pub struct CrewTurnAdmission {
 #[async_trait]
 pub trait ResourceIntentPublisher: Send + Sync {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String>;
-}
-
-#[async_trait]
-pub trait RemoteTurnDelivery: Send + Sync {
-    async fn deliver(self: Arc<Self>, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String>;
+    async fn patch_status(self: Arc<Self>, _namespace: &str, _kind: &str, _name: &str, _status: serde_json::Value) -> Result<(), String> {
+        Err("resource status mutation router unavailable".into())
+    }
 }
 
 #[async_trait]
 pub trait TurnDeliveryActuator: Send + Sync {
-    async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<CrewTurnAdmission, String>;
-    async fn hold(&self, request: &TurnDeliveryRequest, act: &HoldAct, reason: &str) -> Result<(), String>;
+    async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String>;
+    async fn hold(&self, request: &CrewTurnIntent, act: &HoldAct, reason: &str) -> Result<(), String>;
 }
 
 // Bound silent turns, not their total runtime: long tool-using turns stay able.
@@ -186,11 +204,11 @@ struct UnavailableTurnDeliveryActuator;
 
 #[async_trait]
 impl TurnDeliveryActuator for UnavailableTurnDeliveryActuator {
-    async fn deliver(&self, _request: &TurnDeliveryRequest) -> Result<CrewTurnAdmission, String> {
+    async fn deliver(&self, _request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
         Err("turn-delivery actuator unavailable".to_string())
     }
 
-    async fn hold(&self, _request: &TurnDeliveryRequest, _act: &HoldAct, _reason: &str) -> Result<(), String> {
+    async fn hold(&self, _request: &CrewTurnIntent, _act: &HoldAct, _reason: &str) -> Result<(), String> {
         Err("turn-delivery hold actuator unavailable".to_string())
     }
 }
@@ -897,7 +915,7 @@ impl LeafSubscriptionTable {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
-        let (subject_revision, evidence_at, brief) = match &leaf.address {
+        let (subject_revision, evidence_at, brief, message_subject) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
                 let record = self
@@ -973,7 +991,19 @@ impl LeafSubscriptionTable {
                 // Merge is one terminal episode for the subject, independent of
                 // later head observations (including a previously unknown head).
                 let revision = if merged_settlement { format!("{}@merged", leaf.address) } else { head_sha };
-                (revision, evidence_at, brief)
+                let subject = cr.head_sha.value.as_ref().map_or_else(
+                    || flotilla_resources::MessageReference::ControlRecord {
+                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "ChangeRequest", &namespace, &record_name),
+                        revision: record.object.metadata.resource_version.clone(),
+                    },
+                    |head| flotilla_resources::MessageReference::ChangeRequest {
+                        service: service.clone(),
+                        scope: scope.clone(),
+                        number: *number,
+                        revision: head.clone(),
+                    },
+                );
+                (revision, evidence_at, brief, Some(subject))
             }
             LeafAddress::Issue { service, scope, number } => {
                 let record_name = flotilla_resources::issue_record_name(service, scope, *number);
@@ -1017,7 +1047,17 @@ impl LeafSubscriptionTable {
                         )
                     })
                     .unwrap_or_default();
-                (format!("{}@{}", leaf.address, updated_at.to_rfc3339()), evidence_at, brief)
+                (
+                    format!("{}@{}", leaf.address, updated_at.to_rfc3339()),
+                    evidence_at,
+                    brief,
+                    Some(flotilla_resources::MessageReference::Issue {
+                        service: service.clone(),
+                        scope: scope.clone(),
+                        number: *number,
+                        revision: updated_at.to_rfc3339(),
+                    }),
+                )
             }
             LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
                 if matches!(&rule.on.subject, flotilla_resources::SubjectVariable::Artifact {
@@ -1084,7 +1124,15 @@ impl LeafSubscriptionTable {
                         )
                     })
                     .unwrap_or_default();
-                (format!("{subject}@{}", artifact.spec.digest), evidence_at, brief)
+                (
+                    format!("{subject}@{}", artifact.spec.digest),
+                    evidence_at,
+                    brief,
+                    Some(flotilla_resources::MessageReference::Artifact {
+                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Artifact", &namespace, &name),
+                        revision: artifact.spec.digest.clone(),
+                    }),
+                )
             }
             _ => return Err(DeliveryError::permanent("turn-delivery leaf is not externally observed")),
         };
@@ -1104,7 +1152,7 @@ impl LeafSubscriptionTable {
             return Ok(());
         }
 
-        let request = TurnDeliveryRequest::builder()
+        let request = CrewTurnIntent::builder()
             .namespace(namespace.clone())
             .convoy(convoy_name.to_string())
             .source(source.to_string())
@@ -1125,7 +1173,9 @@ impl LeafSubscriptionTable {
                 }),
                 _ => None,
             })
-            .sender(flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() })
+            .sender("system:turn-rules".into())
+            .references(message_subject.clone().into_iter().collect())
+            .maybe_message_subject(message_subject)
             .build();
         let prior_episodes = status.turn_deliveries.get(source).map_or(0, |delivery| delivery.episodes.len()) as u32;
         let now = Utc::now();
@@ -1148,7 +1198,7 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
-                    sender: request.sender.clone(),
+                    sender: flotilla_resources::CrewMessageSender::Unknown,
                 },
                 ConvoyAttention { source: source.to_string(), reason, raised_at: now },
             )
@@ -1176,12 +1226,12 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::MessageAccepted {
-                        rung: admission.rung,
-                        accepted_at: Utc::now(),
                         new_turn: admission.new_turn,
+                        rung: admission.rung,
                         message: admission.message,
+                        accepted_at: Utc::now(),
                     },
-                    sender: request.sender.clone(),
+                    sender: flotilla_resources::CrewMessageSender::Unknown,
                 },
                 rule.to.vessel.clone(),
                 rule.to.role.clone(),
@@ -2123,7 +2173,7 @@ impl ReconcilerWake {
                                     convoy_message_address(convoy),
                                     convoy.metadata.name
                                 );
-                                let request = TurnDeliveryRequest::builder()
+                                let request = CrewTurnIntent::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(convoy.metadata.name.clone())
                                     .source(format!("stall-nudge-{}", condition.nudge_history.len() + 1))
@@ -2131,7 +2181,17 @@ impl ReconcilerWake {
                                     .role(role.clone())
                                     .brief(brief)
                                     .subject_revision(now.timestamp_micros().to_string())
-                                    .sender(flotilla_resources::CrewMessageSender::FlotillaNudge)
+                                    .sender("system:nudge".into())
+                                    .expectation(flotilla_resources::MessageExpectation::Outcome { condition: leaf.clone() })
+                                    .references(vec![flotilla_resources::MessageReference::ControlRecord {
+                                        resource: flotilla_protocol::ResourceRef::new(
+                                            "flotilla.work/v1",
+                                            "Convoy",
+                                            namespace,
+                                            &convoy.metadata.name,
+                                        ),
+                                        revision: convoy.metadata.resource_version.clone(),
+                                    }])
                                     .build();
                                 match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&request).await {
                                     Ok(_) => {
@@ -2338,8 +2398,11 @@ impl ReconcilerWake {
                                     unavailable_target = Some(target);
                                     continue;
                                 }
-                                let brief = stall_supervision_brief(convoy, &condition);
-                                let delivery = TurnDeliveryRequest::builder()
+                                let from = stalled_source_actor(&condition)
+                                    .map(|(vessel, role)| format!("{role}@{vessel} in {}", convoy_message_address(convoy)))
+                                    .unwrap_or_else(|| convoy_message_address(convoy));
+                                let brief = format!("Escalated from {from}:\n\n{}", stall_supervision_brief(convoy, &condition));
+                                let delivery = CrewTurnIntent::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(target_convoy.clone())
                                     .source(format!("supervision-{}-{index}", convoy.metadata.name))
@@ -2347,11 +2410,17 @@ impl ReconcilerWake {
                                     .role(target_role.clone())
                                     .brief(brief)
                                     .subject_revision(condition.began_at.timestamp_micros().to_string())
-                                    .sender(flotilla_resources::CrewMessageSender::FlotillaEscalation {
-                                        from: stalled_source_actor(&condition)
-                                            .map(|(vessel, role)| format!("{role}@{vessel} in {}", convoy_message_address(convoy)))
-                                            .unwrap_or_else(|| convoy_message_address(convoy)),
-                                    })
+                                    .sender("system:stall-judge".into())
+                                    .relation(flotilla_resources::MessageRelation::Supervisor)
+                                    .references(vec![flotilla_resources::MessageReference::ControlRecord {
+                                        resource: flotilla_protocol::ResourceRef::new(
+                                            "flotilla.work/v1",
+                                            "Convoy",
+                                            namespace,
+                                            &convoy.metadata.name,
+                                        ),
+                                        revision: convoy.metadata.resource_version.clone(),
+                                    }])
                                     .build();
                                 if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
                                     if prior.is_none_or(|prior| {
@@ -3631,7 +3700,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingTurnDelivery {
-        requests: std::sync::Mutex<Vec<TurnDeliveryRequest>>,
+        requests: std::sync::Mutex<Vec<CrewTurnIntent>>,
         holds: AtomicUsize,
         // Boundary fake: turn delivery may fail while the agent session reconnects.
         unavailable: AtomicBool,
@@ -3639,7 +3708,7 @@ mod tests {
 
     #[async_trait]
     impl TurnDeliveryActuator for RecordingTurnDelivery {
-        async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<CrewTurnAdmission, String> {
+        async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
             if self.unavailable.load(Ordering::SeqCst) {
                 return Err("supervisor reconnecting".into());
             }
@@ -3658,7 +3727,7 @@ mod tests {
             })
         }
 
-        async fn hold(&self, _request: &TurnDeliveryRequest, _act: &HoldAct, _reason: &str) -> Result<(), String> {
+        async fn hold(&self, _request: &CrewTurnIntent, _act: &HoldAct, _reason: &str) -> Result<(), String> {
             self.holds.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -6165,6 +6234,13 @@ mod tests {
             let current = convoys.get("checks-wake").await.expect("convoy");
             assert_eq!(current.status.expect("status").turn_deliveries["merged-unclaimed"].episodes.len(), 1);
         }
+        let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
+        if unknown_head {
+            assert!(matches!(subject, flotilla_resources::MessageReference::ControlRecord { resource, revision }
+                if resource.kind == "ChangeRequest" && !revision.is_empty()));
+        } else {
+            assert!(matches!(subject, flotilla_resources::MessageReference::ChangeRequest { revision, .. } if revision == "merged-head"));
+        }
         assert!(actuator.requests.lock().expect("requests")[0].brief.contains("PR merged"));
         assert!(actuator.requests.lock().expect("requests")[0].brief.contains("decision ledger"));
         let current = convoys.get("checks-wake").await.expect("convoy");
@@ -6708,7 +6784,8 @@ mod tests {
         let status = convoys.get("wake-turn").await.expect("convoy").status.expect("status");
         let episodes = &status.turn_deliveries[source].episodes;
         assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
-        assert_eq!(episodes[0].sender, flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() });
+        assert_eq!(episodes[0].sender, flotilla_resources::CrewMessageSender::Unknown);
+        assert!(serde_json::to_value(&episodes[0]).expect("episode").get("sender").is_none());
         // Message admission is a workflow latch, not confirmation of an agent turn.
         assert_eq!(serde_json::to_value(&episodes[0].outcome).unwrap()["kind"], "message-accepted");
         assert!(
@@ -8014,6 +8091,9 @@ mod tests {
         .expect("observed issue change wakes turn delivery");
         table.deliver_turn(subscription_id, "issue-turn", "issue", &rule, &leaf).await.expect("duplicate issue event");
         assert_eq!(actuator.requests.lock().expect("requests").len(), 1);
+        let subject = actuator.requests.lock().expect("requests")[0].message_subject.clone().expect("issue subject");
+        assert!(matches!(subject, flotilla_resources::MessageReference::Issue { number: 2052, revision, .. }
+            if revision == changed_at.to_rfc3339()));
         let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
         assert!(brief.contains("Target crew: `work/coder`"));
         assert!(brief.contains("Decision ledger: https://example.com/ledger"));

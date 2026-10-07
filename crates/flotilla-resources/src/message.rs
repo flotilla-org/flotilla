@@ -63,6 +63,9 @@ impl Resource for Message {
             if current.accepted_sequence.is_some() && current.accepted_sequence != requested.accepted_sequence {
                 return Err(ResourceError::invalid("message acceptance order cannot change"));
             }
+            if current.submission.is_some() && current.resolved_receiver.is_none() && requested.phase == MessagePhase::Expired {
+                return Err(ResourceError::invalid("possible input must establish acceptance before automatic expiry"));
+            }
             if current.phase.is_terminal() && current != requested {
                 return Err(ResourceError::invalid("terminal message status is immutable"));
             }
@@ -221,8 +224,31 @@ impl Default for MessageStatus {
     }
 }
 
+/// Payload-free previous-generation receipt. Missing sender/receiver identity
+/// remains uncertainty, never permission to associate it with a newer holder.
+/// Remove this shim one fleet roll after queue adoption.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyMessageReceipt {
+    pub sender: Option<String>,
+    pub receiver: Option<ResolvedMessageReceiver>,
+}
+
+/// Witness for a previous-generation launch whose session identity was not
+/// persisted yet. Remove this shim one fleet roll after queue adoption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyMessageLaunch {
+    pub terminal: String,
+    pub terminal_created_at: DateTime<Utc>,
+    /// A known attempt start prevents binding the same terminal after restart.
+    #[serde(default)]
+    pub terminal_started_at: Option<DateTime<Utc>>,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageSubmission {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_launch: Option<LegacyMessageLaunch>,
     pub batch_id: String,
     pub crew_id: String,
     pub session: String,
@@ -271,7 +297,12 @@ impl StatusPatch<MessageStatus> for MessageStatusPatch {
                 status.canonical_predecessor = Some(predecessor.clone());
                 (MessagePhase::Superseded, Some(format!("suppressed by {}", predecessor.name)), *at)
             }
-            Self::Finish { phase, reason, at } => (*phase, Some(reason.clone()), *at),
+            Self::Finish { phase, reason, at } => {
+                if status.submission.is_some() && status.resolved_receiver.is_none() && *phase == MessagePhase::Expired {
+                    return;
+                }
+                (*phase, Some(reason.clone()), *at)
+            }
         };
         if status.phase != phase || status.reason != reason {
             status.phase = phase;

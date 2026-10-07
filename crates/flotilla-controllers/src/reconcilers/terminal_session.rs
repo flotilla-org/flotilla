@@ -79,6 +79,10 @@ const RECEIPT_RETIREMENT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
+    /// Adopt stored input before any old queue can reach transport.
+    async fn adopt_legacy_messages(&self, _obj: &ResourceObject<TerminalSession>) -> Result<bool, ResourceError> {
+        Ok(false)
+    }
     /// Re-verify the convoy's teardown gate before reclaiming a retained
     /// terminal convoy's session at its actuator. Refuse without a verifier.
     async fn verify_reclaim(&self, _convoy: &ResourceObject<Convoy>) -> Result<(), String> {
@@ -390,6 +394,9 @@ where
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         if !self.actuates(obj) {
+            return Ok(TerminalPrepared::None);
+        }
+        if self.runtime.adopt_legacy_messages(obj).await? {
             return Ok(TerminalPrepared::None);
         }
         let environment = match self.environments.get(&obj.spec.env_ref).await {

@@ -316,6 +316,10 @@ pub struct TerminalSessionStatus {
     pub launch_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_message_id: Option<String>,
+    /// Payload-free upgrade receipts let replicated old authority queues retire
+    /// without retyping acknowledged input. Remove one fleet roll after Message adoption.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy_message_receipts: BTreeMap<String, crate::LegacyMessageReceipt>,
     /// A fresh observation of what the terminal's harness appears to be doing.
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,10 +568,11 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             Self::MarkStarting => {
                 let completion_pending = status.completion_pending.take();
                 let mut retired_launches = std::mem::take(&mut status.retired_launches);
+                let legacy_message_receipts = std::mem::take(&mut status.legacy_message_receipts);
                 if let Some(crew) = status.crew.take() {
                     retired_launches.insert(crew.id);
                 }
-                *status = TerminalSessionStatus { completion_pending, retired_launches, ..Default::default() };
+                *status = TerminalSessionStatus { completion_pending, retired_launches, legacy_message_receipts, ..Default::default() };
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),

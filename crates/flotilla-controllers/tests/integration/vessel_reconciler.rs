@@ -2966,6 +2966,7 @@ async fn create_running_terminal(
             retired_launches: Default::default(),
             launch_command: Some(command.to_string()),
             delivered_message_id: None,
+            legacy_message_receipts: Default::default(),
             attention: None,
             occupancy: Default::default(),
             completion_pending: None,

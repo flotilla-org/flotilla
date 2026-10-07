@@ -1387,3 +1387,224 @@ async fn closed_batch_recovery_clears_only_its_existing_delivery_gate() {
     assert_eq!(remaining[0].metadata.name, "manual-review");
     assert_eq!(transport.submissions.lock().expect("inputs").len(), 1);
 }
+
+#[tokio::test]
+async fn legacy_queue_adoption_retains_order_receipts_and_uncertainty() {
+    use flotilla_resources::*;
+    for reason in [None, Some(TERMINAL_DELIVERY_UNCONFIRMED_REASON), Some(TERMINAL_DELIVERY_EXPIRED_REASON)] {
+        let held = reason.is_some();
+        let (backend, _) = delivery_inbox().await;
+        let messages = backend.using::<Message>("flotilla");
+        for record in messages.list().await.expect("initial").items {
+            messages.delete(&record.metadata.name).await.expect("clear");
+        }
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        let terminal = terminals.get("terminal").await.expect("terminal");
+        let mut intent = terminal.spec.clone();
+        let legacy = |id: &str, following| TerminalCrewMessage {
+            id: id.into(),
+            text: format!("legacy-{id}"),
+            sender: CrewMessageSender::FlotillaNudge,
+            delivery: CrewMessageDelivery::Queued,
+            following,
+            acknowledged: Default::default(),
+        };
+        if let TerminalSessionSource::Agent { message, .. } = &mut intent.source {
+            *message = Some(legacy("ack", vec![legacy("held", vec![]), legacy("next", vec![])]));
+        }
+        let terminal =
+            terminals.update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &intent).await.expect("old spec");
+        let mut status = terminal.status.clone().expect("status");
+        status.delivered_message_id = Some("ack".into());
+        if let Some(reason) = reason {
+            status.degraded = Some(TerminalSessionDegradedCondition {
+                reason: reason.into(),
+                message: "old ambiguous input".into(),
+                message_id: Some("held".into()),
+                consecutive_failures: 3,
+                observed_at: at(20),
+            });
+        }
+        let terminal = terminals.update_status("terminal", &terminal.metadata.resource_version, &status).await.expect("old receipt");
+        assert!(terminals.adopt_legacy_messages(&terminal, at(30)).await.expect("adopt"));
+        let adopted = terminals.get("terminal").await.expect("adopted terminal");
+        assert!(!terminals.adopt_legacy_messages(&adopted, at(31)).await.expect("repeat"));
+        let records = messages.list().await.expect("adopted messages").items;
+        assert_eq!(records.len(), 2);
+        let first = records.iter().find(|record| record.spec.body == "legacy-held").expect("pending head");
+        let second = records.iter().find(|record| record.spec.body == "legacy-next").expect("pending next");
+        assert!(first.status.as_ref().expect("status").accepted_sequence < second.status.as_ref().expect("status").accepted_sequence);
+        assert_eq!(first.status.as_ref().expect("status").submission.is_some(), held);
+        assert!(adopted.status.as_ref().unwrap().legacy_message_receipts.contains_key("ack"));
+        let replay = legacy("ack", vec![]);
+        let replay_spec = legacy_message_spec(&first.spec.receiver, &replay);
+        let replay_name = message_record_name(&replay_spec.receiver, &replay_spec.sender, &replay.id);
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        inbox.accept(&InputMeta::builder().name(replay_name.clone()).build(), &replay_spec, at(31)).await.unwrap();
+        let receipt_transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Pending,
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        inbox.reconcile_delivery(&receipt_transport, at(31)).await.unwrap();
+        let replay = messages.get(&replay_name).await.unwrap();
+        assert_eq!(replay.status.unwrap().phase, MessagePhase::Delivered, "late authority intent retains its original receipt");
+        assert!(!receipt_transport.submissions.lock().unwrap().iter().any(|text| text.contains("legacy-ack")));
+        if held {
+            assert_eq!(first.status.as_ref().expect("status").retry.as_ref().expect("retry").attempts, 3);
+            let transport = FakeMessageTransport {
+                submissions: Default::default(),
+                observations: Default::default(),
+                outcome: MessageTransportOutcome::Unconfirmed { reason: "old input still uncertain".into() },
+                accepted: Default::default(),
+                working: Default::default(),
+            };
+            let inbox = MessageInbox::new(backend.clone(), "flotilla");
+            inbox.reconcile_delivery(&transport, at(32)).await.expect("held observation");
+            assert!(transport.submissions.lock().expect("submissions").is_empty());
+            transport.accepted.store(true, std::sync::atomic::Ordering::SeqCst);
+            inbox.reconcile_delivery(&transport, at(33)).await.expect("late receipt");
+            assert_eq!(messages.get(&first.metadata.name).await.expect("receipt").status.expect("status").phase, MessagePhase::Delivered);
+            assert!(transport.submissions.lock().expect("submissions").is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_launch_adoption_requires_the_original_launch_witness() {
+    use flotilla_resources::*;
+    for (matches_launch, same_attempt, known_start) in [(true, true, true), (false, true, true), (true, false, true), (true, true, false)] {
+        let (backend, _) = delivery_inbox().await;
+        let messages = backend.using::<Message>("flotilla");
+        for record in messages.list().await.expect("initial").items {
+            messages.delete(&record.metadata.name).await.expect("clear");
+        }
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        let terminal = terminals.get("terminal").await.expect("terminal");
+        let mut spec = terminal.spec.clone();
+        if let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source {
+            brief.content = "old launch input".into();
+            *message = Some(TerminalCrewMessage {
+                id: "launch".into(),
+                text: brief.content.clone(),
+                sender: CrewMessageSender::FlotillaNudge,
+                delivery: CrewMessageDelivery::LaunchBrief,
+                following: Vec::new(),
+                acknowledged: Default::default(),
+            });
+        }
+        let terminal = terminals
+            .update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &spec)
+            .await
+            .expect("stored launch");
+        let terminal = terminals
+            .update_status("terminal", &terminal.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Starting,
+                started_at: known_start.then(|| at(5)),
+                ..Default::default()
+            })
+            .await
+            .expect("launch lacks identity");
+        terminals.adopt_legacy_messages(&terminal, at(20)).await.expect("adopt launch");
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Unconfirmed { reason: "old launch".into() },
+            accepted: std::sync::atomic::AtomicBool::new(true),
+            working: Default::default(),
+        };
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        inbox.reconcile_delivery(&transport, at(21)).await.expect("hold unknown identity");
+        assert!(messages.list().await.expect("held").items[0].status.as_ref().expect("status").resolved_receiver.is_none());
+        let mut terminal = terminals.get("terminal").await.expect("adopted terminal");
+        if !matches_launch {
+            let mut spec = terminal.spec.clone();
+            if let TerminalSessionSource::Agent { brief, .. } = &mut spec.source {
+                brief.content = "replacement launch".into();
+            }
+            terminal = terminals
+                .update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &spec)
+                .await
+                .expect("replacement");
+        }
+        terminals
+            .update_status("terminal", &terminal.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                started_at: Some(if same_attempt { at(5) } else { at(21) }),
+                session_id: Some("boot-session".into()),
+                crew: Some(CrewSessionStatus { id: "boot-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                ..Default::default()
+            })
+            .await
+            .expect("running launch");
+        inbox.reconcile_delivery(&transport, at(22)).await.expect("observe launch acceptance");
+        let receipt = messages.list().await.expect("receipt").items.remove(0).status.expect("status");
+        let original_attempt = matches_launch && same_attempt && known_start;
+        assert_eq!(receipt.phase.has_delivery_evidence(), original_attempt);
+        if original_attempt {
+            assert_eq!(receipt.resolved_receiver.expect("receiver").session, "boot-session");
+        }
+        assert!(transport.submissions.lock().expect("typed input").is_empty());
+    }
+}
+
+// Upgrade adoption preserves counted unsent failures and the shared delivery
+// backoff. Exhausted legacy input cannot gain another automatic attempt.
+#[tokio::test]
+async fn legacy_unsent_adoption_preserves_shared_backoff_and_attempt_limit() {
+    use flotilla_resources::*;
+    for (failures, delay) in [(1, Some(60)), (2, Some(120)), (3, None), (4, None)] {
+        let (backend, _) = delivery_inbox().await;
+        let messages = backend.using::<Message>("flotilla");
+        for record in messages.list().await.expect("fixture inbox").items {
+            messages.delete(&record.metadata.name).await.expect("clear fixture");
+        }
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        let terminal = terminals.get("terminal").await.expect("fixture receiver");
+        let mut spec = terminal.spec.clone();
+        if let TerminalSessionSource::Agent { message, .. } = &mut spec.source {
+            *message = Some(TerminalCrewMessage {
+                id: "unsent".into(),
+                text: "old unsent input".into(),
+                sender: CrewMessageSender::FlotillaNudge,
+                delivery: CrewMessageDelivery::Queued,
+                following: Vec::new(),
+                acknowledged: Default::default(),
+            });
+        }
+        let terminal = terminals
+            .update(&InputMeta::from(&terminal.metadata), &terminal.metadata.resource_version, &spec)
+            .await
+            .expect("legacy payload");
+        let mut status = terminal.status.clone().expect("receiver status");
+        status.degraded = Some(TerminalSessionDegradedCondition {
+            reason: TERMINAL_DELIVERY_NOT_SUBMITTED_REASON.into(),
+            message: "definitely unsent".into(),
+            message_id: Some("unsent".into()),
+            consecutive_failures: failures,
+            observed_at: at(20),
+        });
+        let terminal = terminals.update_status("terminal", &terminal.metadata.resource_version, &status).await.expect("legacy retry count");
+        terminals.adopt_legacy_messages(&terminal, at(30)).await.expect("adopt unsent state");
+        let record = messages.list().await.expect("adopted input").items.remove(0);
+        let status = record.status.expect("adopted retry state");
+        assert!(status.submission.is_none(), "definitely unsent input has no possible-write witness");
+        let retry = status.retry.expect("preserved failure budget");
+        assert_eq!(retry.attempts, failures);
+        assert_eq!(retry.next_attempt_at(), delay.map(|seconds| at(20) + chrono::Duration::seconds(seconds)));
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Unconfirmed { reason: "possible new input".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        inbox.reconcile_delivery(&transport, at(30)).await.expect("not due or exhausted");
+        assert!(transport.submissions.lock().expect("input log").is_empty());
+        inbox.reconcile_delivery(&transport, at(200)).await.expect("due retry or exhausted hold");
+        assert_eq!(transport.submissions.lock().expect("input log").len(), usize::from(delay.is_some()));
+    }
+}

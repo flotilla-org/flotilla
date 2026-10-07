@@ -172,8 +172,10 @@ async fn resume_restores_work_until_credentials_are_staged() {
         displaced: None
     });
     let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("delivered message") };
-    assert_eq!(message.text, frame_crew_message(&CrewMessageSender::OperatorResume { principal: None }, "continue"));
+    assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
+    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].spec.body, frame_crew_message(&CrewMessageSender::OperatorResume { principal: None }, "continue"));
     assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -204,21 +206,16 @@ fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
                     crew.resume("flotilla", "crew", "", None, None).await.expect_err("empty prompt refused");
                 }
             }
-            let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-            assert_eq!(convoy.status.expect("status").pending_brief().map(|brief| brief.content.clone()), expected);
+            let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+            let pending: Vec<_> =
+                records.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect();
+            assert_eq!(pending.first().map(|message| message.spec.body.clone()), expected);
+            assert!(pending.len() <= 1, "replacement and withdrawal leave at most one pending operator message");
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
             let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
             assert!(matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }));
         }
     });
-}
-
-#[test]
-fn turn_delivery_restarts_a_lost_session() {
-    assert_eq!(
-        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Lost), "work", "coder").expect("delivery plan"),
-        TurnDeliverySessionPlan::RestartFresh
-    );
 }
 
 #[test]
@@ -257,13 +254,13 @@ fn crew_message_header_escapes_sender_supplied_delimiters() {
 // retaining the actuator cannot keep the service alive (#2221).
 #[tokio::test]
 async fn actuator_refuses_delivery_and_hold_after_service_stops() {
-    use crate::leaf_engine::{TurnDeliveryActuator, TurnDeliveryRequest};
+    use crate::leaf_engine::{CrewTurnIntent, TurnDeliveryActuator};
     let (crew, _backend, _probe, _config) = fixture(CrewWorkPhase::Done).await;
     let actuator = Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) });
     crew.set_turn_delivery_actuator(actuator.clone()).await;
     drop(crew);
     assert!(actuator.crew.upgrade().is_none(), "subscriptions and actuator must not form a strong cycle");
-    let request = TurnDeliveryRequest {
+    let request = CrewTurnIntent {
         namespace: "flotilla".into(),
         convoy: "crew".into(),
         source: "rule".into(),
@@ -272,7 +269,11 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
         brief: "continue".into(),
         subject_revision: "head".into(),
         subject: None,
-        sender: CrewMessageSender::FlotillaNudge,
+        sender: "system:nudge".into(),
+        relation: flotilla_resources::MessageRelation::System,
+        references: Vec::new(),
+        message_subject: None,
+        expectation: Default::default(),
     };
     assert_eq!(actuator.deliver(&request).await.expect_err("stopped delivery"), "daemon stopped before turn delivery");
     assert_eq!(
@@ -452,106 +453,172 @@ async fn turn_hold_resolves_discovered_pr_without_legacy_binding() {
     assert!(turn_hold_subject(&convoy, Some(&issue)).is_err());
 }
 
-// #2755: fresh Idle evidence releases a brief regardless of when it was queued,
-// but a pending terminal turn, delivery failure, or non-running phase blocks it.
-#[hegel::test]
-fn idle_boundary_requires_no_in_flight_turn(tc: hegel::TestCase) {
-    use flotilla_resources::{TerminalAttention, TerminalAttentionSource, TerminalSessionDegradedCondition, TerminalSessionStatus};
-    use hegel::generators as gs;
-    // Cross freshness boundaries and cover all phases/states, missing attention,
-    // empty/acknowledged/pending queues, pending completion, and degradation.
-    let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(121));
-    let phase = [
-        ResourceTerminalSessionPhase::Starting,
-        ResourceTerminalSessionPhase::Running,
-        ResourceTerminalSessionPhase::Stopped,
-        ResourceTerminalSessionPhase::Lost,
-        ResourceTerminalSessionPhase::Failed,
-    ][tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
-    let state = [
-        TerminalAttentionState::Idle,
-        TerminalAttentionState::Working,
-        TerminalAttentionState::NeedsInput,
-        TerminalAttentionState::Unobservable,
-    ][tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
-    let observed = tc.draw(gs::booleans());
-    let queued = tc.draw(gs::booleans());
-    let delivered = tc.draw(gs::booleans());
-    let acknowledged = tc.draw(gs::booleans());
-    let degradation = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
-    let completion_pending = tc.draw(gs::booleans());
-    let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z").expect("timestamp").with_timezone(&chrono::Utc);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let mut message = pending_crew_message(CrewMessageSender::Unknown, "brief");
-        message.id = "turn".into();
-        if acknowledged {
-            message.acknowledged.insert("turn".into());
+// A delivered-open subject suppresses the next intent. Admission returns the
+// predecessor's durable reference so producers cannot latch an absent Message.
+#[tokio::test]
+async fn turn_admission_returns_the_canonical_suppressed_message() {
+    use flotilla_resources::{Message, MessageExpectation, MessageReference, MessageStatusPatch, ResolvedMessageReceiver};
+
+    use crate::leaf_engine::CrewTurnIntent;
+    let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    let reference = MessageReference::ControlRecord {
+        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "crew"),
+        revision: "revision".into(),
+    };
+    let request = CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy("crew".into())
+        .source("first".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("reply to this subject".into())
+        .subject_revision("revision".into())
+        .sender("system:turn-rules".into())
+        .references(vec![reference.clone()])
+        .message_subject(reference)
+        .expectation(MessageExpectation::Reply)
+        .build();
+    let first = crew.deliver_turn(&request).await.expect("first admission");
+    flotilla_resources::apply_status_patch(&backend.using::<Message>("flotilla"), &first.message.name, &MessageStatusPatch::Delivered {
+        receiver: ResolvedMessageReceiver::builder()
+            .crew_id("crew-id".into())
+            .session("session".into())
+            .delivered_at(Utc::now())
+            .evidence("transport acceptance".into())
+            .build(),
+        at: Utc::now(),
+    })
+    .await
+    .expect("open receipt");
+    let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status;
+    let staging_calls = probe.calls.load(Ordering::SeqCst);
+    let mut successor = request.clone();
+    successor.source = "second".into();
+    successor.brief = "duplicate turn".into();
+    let suppressed = crew.deliver_turn(&successor).await.expect("suppression admission");
+    assert!(first.new_turn);
+    assert!(!suppressed.new_turn);
+    assert_eq!(suppressed.message, first.message);
+    assert_eq!(
+        backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status,
+        before,
+        "suppression must not reopen workflow state for an absent new turn"
+    );
+    assert_eq!(probe.calls.load(Ordering::SeqCst), staging_calls);
+    assert_eq!(backend.using::<Message>("flotilla").list().await.expect("inbox").items.len(), 1);
+}
+
+// A queued follow-up continues workflow only after Message acceptance evidence;
+// the authority watch consumes its reference without creating another input.
+#[tokio::test]
+async fn follow_up_reference_releases_from_message_evidence() {
+    use flotilla_resources::{Message, MessageStatusPatch, ResolvedMessageReceiver};
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    crew.resume("flotilla", "crew", "continue after this turn", Some("work"), Some("coder")).await.unwrap();
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let pending = convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].pending_follow_up.clone().unwrap();
+    crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
+    assert_eq!(convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].pending_follow_up.as_ref(), Some(&pending));
+    flotilla_resources::apply_status_patch(&backend.using::<Message>("flotilla"), &pending.name, &MessageStatusPatch::Delivered {
+        receiver: ResolvedMessageReceiver::builder()
+            .crew_id("crew-id".into())
+            .session("session".into())
+            .delivered_at(Utc::now())
+            .evidence("transport acceptance".into())
+            .build(),
+        at: Utc::now(),
+    })
+    .await
+    .unwrap();
+    crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
+    let state = convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].clone();
+    assert!(state.pending_follow_up.is_none());
+    assert_eq!(state.resume_brief_id.as_deref(), Some(pending.name.as_str()));
+    assert_eq!(state.message.as_deref(), Some("continue after this turn"));
+    assert_eq!(backend.using::<Message>("flotilla").list().await.unwrap().items.len(), 1);
+}
+
+// Receiver admission can suppress a turn before its Message has replicated to
+// the producer. The acknowledgement must restore speculative workflow activation.
+#[tokio::test]
+async fn remote_suppression_restores_workflow_before_replication() {
+    use flotilla_resources::{
+        Message, MessageExpectation, MessageInbox, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch,
+        ResolvedMessageReceiver,
+    };
+
+    use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
+    // Boundary stand-in for the ordinary cross-host resource mutation endpoint.
+    struct ReceiverPublisher(MessageInbox);
+    #[async_trait]
+    impl ResourceIntentPublisher for ReceiverPublisher {
+        async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
+            assert_eq!(document["kind"], "Message");
+            let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).unwrap();
+            let admission = self
+                .0
+                .accept(&InputMeta::builder().name(document["metadata"]["name"].as_str().unwrap().into()).build(), &spec, Utc::now())
+                .await
+                .unwrap();
+            let record = match admission {
+                flotilla_resources::MessageAdmission::Accepted(record) => record,
+                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+            };
+            Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
-        let spec = TerminalSessionSpec::builder()
-            .env_ref("env".into())
-            .role("coder".into())
-            .cwd("/workspace".into())
-            .pool("test".into())
-            .source(TerminalSessionSource::Agent {
-                selector: Selector::for_capability("code"),
-                brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "brief".into(), copies: Vec::new() },
-                context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "crew".into(), vessel_ref: "work".into() }),
-                message: queued.then_some(message),
-            })
-            .build();
-        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-        let mut session = sessions.create(&InputMeta::builder().name("session".into()).build(), &spec).await.expect("session");
-        session.status = Some(TerminalSessionStatus {
-            phase,
-            attention: observed.then_some(TerminalAttention {
-                state,
-                source: TerminalAttentionSource::Hook,
-                as_of: now - chrono::Duration::seconds(age),
-            }),
-            delivered_message_id: delivered.then(|| "turn".into()),
-            completion_pending: completion_pending.then(|| flotilla_resources::CrewCompletionPending {
-                message: None,
-                disposition: None,
-                decision_ledger_ref: None,
-                force: false,
-                principal_ref: None,
-                attempted_at: now,
-                authority: "host".into(),
-                last_error: "awaiting acknowledgement".into(),
-            }),
-            degraded: (degradation != 0).then(|| TerminalSessionDegradedCondition {
-                reason: ["", "DeliveryUnconfirmed", "DeliveryExpired", "ReconcileBackoff"][degradation].into(),
-                message: "failure".into(),
-                message_id: Some("turn".into()),
-                consecutive_failures: 1,
-                observed_at: now,
-            }),
-            ..Default::default()
-        });
-        let expected = phase == ResourceTerminalSessionPhase::Running
-            && observed
-            && state == TerminalAttentionState::Idle
-            && age < 120
-            && (!queued || delivered || acknowledged)
-            && (degradation == 0 || degradation == 3)
-            && !completion_pending;
-        assert_eq!(terminal_at_turn_boundary(&session, now), expected);
-        // Pin the admitted and pending-turn boundaries in every generated case
-        // so combinations of independent blockers cannot make the oracle vacuous.
-        session.status = Some(TerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: now }),
-            ..Default::default()
-        });
-        let TerminalSessionSource::Agent { message, .. } = &mut session.spec.source else { unreachable!() };
-        *message = None;
-        assert!(terminal_at_turn_boundary(&session, now));
-        let TerminalSessionSource::Agent { message, .. } = &mut session.spec.source else { unreachable!() };
-        *message = Some(pending_crew_message(CrewMessageSender::Unknown, "next turn"));
-        assert!(!terminal_at_turn_boundary(&session, now), "idle evidence cannot overtake a pending turn");
-    });
+    }
+    let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
+    probe.fail.store(false, Ordering::SeqCst);
+    let remote = ResourceBackend::InMemory(Default::default());
+    let inbox = MessageInbox::new(remote.clone(), "flotilla");
+    let subject = MessageReference::ControlRecord {
+        resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "crew"),
+        revision: "revision".into(),
+    };
+    let existing = MessageSpec::builder()
+        .sender("system:turn-rules".into())
+        .receiver("flotilla/crew/work/coder".into())
+        .relation(MessageRelation::System)
+        .body("prior open request".into())
+        .references(vec![subject.clone()])
+        .subject(subject.clone())
+        .expectation(MessageExpectation::Reply)
+        .build();
+    inbox.accept(&InputMeta::builder().name("canonical".into()).build(), &existing, Utc::now()).await.unwrap();
+    flotilla_resources::apply_status_patch(&remote.using::<Message>("flotilla"), "canonical", &MessageStatusPatch::Delivered {
+        receiver: ResolvedMessageReceiver::builder()
+            .crew_id("crew-id".into())
+            .session("session".into())
+            .delivered_at(Utc::now())
+            .evidence("accepted at receiver".into())
+            .build(),
+        at: Utc::now(),
+    })
+    .await
+    .unwrap();
+    let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(ReceiverPublisher(inbox));
+    crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
+    let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status;
+    let request = CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy("crew".into())
+        .source("second".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("duplicate request".into())
+        .subject_revision("revision".into())
+        .sender("system:turn-rules".into())
+        .references(vec![subject.clone()])
+        .message_subject(subject)
+        .expectation(MessageExpectation::Reply)
+        .build();
+    let admission = crew.deliver_turn(&request).await.unwrap();
+    assert!(!admission.new_turn);
+    assert_eq!(admission.message.name, "canonical");
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status, before);
+    assert_eq!(remote.using::<Message>("flotilla").list().await.unwrap().items.len(), 1);
+    assert!(backend.using::<Message>("flotilla").list().await.unwrap().items.is_empty());
 }
 
 // The receiver's ordinary resource mutation result is canonical even before
@@ -563,7 +630,7 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
         ResolvedMessageReceiver,
     };
 
-    use crate::leaf_engine::{ResourceIntentPublisher, TurnDeliveryRequest};
+    use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     struct ReceiverPublisher(MessageInbox);
     #[async_trait]
     impl ResourceIntentPublisher for ReceiverPublisher {
@@ -595,7 +662,7 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
             .relation(MessageRelation::System)
             .body("prior open request".into())
             .references(vec![subject.clone()])
-            .subject(subject)
+            .subject(subject.clone())
             .expectation(MessageExpectation::Reply)
             .build();
         inbox.accept(&InputMeta::builder().name("canonical".into()).build(), &intent, Utc::now()).await.unwrap();
@@ -616,7 +683,7 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
         }
         let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.unwrap().status;
         let staging = probe.calls.load(Ordering::SeqCst);
-        let request = TurnDeliveryRequest::builder()
+        let request = CrewTurnIntent::builder()
             .namespace("flotilla".into())
             .convoy("crew".into())
             .source("review".into())
@@ -624,12 +691,9 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
             .role("coder".into())
             .brief("duplicate request".into())
             .subject_revision("head".into())
-            .subject(flotilla_protocol::Subject {
-                kind: flotilla_protocol::SubjectKind::ChangeRequest,
-                source: flotilla_protocol::IssueSource { service: "github".into(), scope: "org/repo".into() },
-                id: "1".into(),
-            })
-            .sender(CrewMessageSender::FlotillaTurn { source: "review".into() })
+            .references(vec![subject.clone()])
+            .message_subject(subject)
+            .sender("system:turn-rules".into())
             .build();
         let admission = crew.deliver_turn(&request).await.unwrap();
         assert!(!admission.new_turn);
@@ -646,109 +710,14 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
 }
 
 #[tokio::test]
-async fn turn_messages_use_subject_revisions_instead_of_episode_keys() {
-    use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestSpec, Message, MessageReference, Observation};
-
-    use crate::leaf_engine::TurnDeliveryRequest;
-    for head in [None, Some("actual-head")] {
-        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
-        probe.fail.store(false, Ordering::SeqCst);
-        let name = change_request_record_name("github", "org/repo", 1);
-        let resolver = backend.using::<ResourceChangeRequest>("flotilla");
-        let mut record = resolver
-            .create(
-                &InputMeta::builder().name(name.clone()).build(),
-                &ChangeRequestSpec::builder()
-                    .service("github".into())
-                    .scope("org/repo".into())
-                    .number(1)
-                    .observing_authority("host".into())
-                    .build(),
-            )
-            .await
-            .unwrap();
-        if let Some(head) = head {
-            record = resolver
-                .update_status(&name, &record.metadata.resource_version, &ChangeRequestStatus {
-                    title: Observation::default(),
-                    author: Observation::default(),
-                    review_decision: Observation::default(),
-                    review_requested_from_owner: Observation::default(),
-                    state: Observation::default(),
-                    head_sha: Observation::known(head.into(), Utc::now()),
-                    checks: Observation::default(),
-                    review: ChangeRequestReviewObservation { actionable_at_head: Observation::default() },
-                    mergeable: Observation::default(),
-                })
-                .await
-                .unwrap();
-        }
-        let request = TurnDeliveryRequest::builder()
-            .namespace("flotilla".into())
-            .convoy("crew".into())
-            .source("merged".into())
-            .vessel("work".into())
-            .role("coder".into())
-            .brief("merged settlement".into())
-            .subject_revision("pr/github/org/repo/1@merged".into())
-            .subject(flotilla_protocol::Subject {
-                kind: flotilla_protocol::SubjectKind::ChangeRequest,
-                source: flotilla_protocol::IssueSource { service: "github".into(), scope: "org/repo".into() },
-                id: "1".into(),
-            })
-            .sender(CrewMessageSender::FlotillaTurn { source: "merged".into() })
-            .build();
-        let admitted = crew.deliver_turn(&request).await.unwrap();
-        let message = backend.using::<Message>("flotilla").get(&admitted.message.name).await.unwrap();
-        let expected = match head {
-            Some(head) => {
-                MessageReference::ChangeRequest { service: "github".into(), scope: "org/repo".into(), number: 1, revision: head.into() }
-            }
-            None => MessageReference::ControlRecord {
-                resource: ResourceRef::new("flotilla.work/v1", "ChangeRequest", "flotilla", name),
-                revision: record.metadata.resource_version,
-            },
-        };
-        assert_eq!(message.spec.subject, Some(expected));
-    }
-    let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
-    probe.fail.store(false, Ordering::SeqCst);
-    let revision = "2026-10-06T12:00:00+00:00";
-    let request = TurnDeliveryRequest::builder()
-        .namespace("flotilla".into())
-        .convoy("crew".into())
-        .source("issue".into())
-        .vessel("work".into())
-        .role("coder".into())
-        .brief("issue update".into())
-        .subject_revision(format!("issue/github/org/repo/1@{revision}"))
-        .subject(flotilla_protocol::Subject {
-            kind: flotilla_protocol::SubjectKind::Issue,
-            source: flotilla_protocol::IssueSource { service: "github".into(), scope: "org/repo".into() },
-            id: "1".into(),
-        })
-        .sender(CrewMessageSender::FlotillaTurn { source: "issue".into() })
-        .build();
-    let admitted = crew.deliver_turn(&request).await.unwrap();
-    let message = backend.using::<Message>("flotilla").get(&admitted.message.name).await.unwrap();
-    assert_eq!(
-        message.spec.subject,
-        Some(MessageReference::Issue { service: "github".into(), scope: "org/repo".into(), number: 1, revision: revision.into() })
-    );
-}
-
-// Legacy controller fallback is a system address, so a correlated reply can
-// return to its durable original Message without a project-role declaration.
-#[tokio::test]
 async fn unknown_controller_sender_has_a_creatable_system_reply() {
-    use flotilla_protocol::TurnDeliveryRequest;
     use flotilla_resources::Message;
 
-    use crate::in_process::InProcessDaemon;
+    use crate::{in_process::InProcessDaemon, leaf_engine::CrewTurnIntent};
 
     let (crew, backend, probe, config) = fixture(CrewWorkPhase::Done).await;
     probe.fail.store(false, Ordering::SeqCst);
-    let request = TurnDeliveryRequest::builder()
+    let request = CrewTurnIntent::builder()
         .namespace("flotilla".into())
         .convoy("crew".into())
         .source("legacy".into())
@@ -756,7 +725,7 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
         .role("coder".into())
         .brief("legacy controller turn".into())
         .subject_revision("legacy-head".into())
-        .sender(CrewMessageSender::Unknown)
+        .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
         .build();
     let admission = crew.deliver_turn(&request).await.expect("controller intent");
     let original = backend.using::<Message>("flotilla").get(&admission.message.name).await.expect("receiver intent");
@@ -787,7 +756,7 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
 // publication error and a receiver collision through the real crew service.
 #[tokio::test]
 async fn turn_publication_errors_restore_the_owned_activation() {
-    use crate::leaf_engine::{ResourceIntentPublisher, TurnDeliveryRequest};
+    use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     struct FailedPublisher;
     #[async_trait]
     impl ResourceIntentPublisher for FailedPublisher {
@@ -830,7 +799,7 @@ async fn turn_publication_errors_restore_the_owned_activation() {
                 Some(Arc::new(AdmissionCollision { probe: probe.clone(), backend: backend.clone() }));
         }
         let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("before admission").status;
-        let request = TurnDeliveryRequest::builder()
+        let request = CrewTurnIntent::builder()
             .namespace("flotilla".into())
             .convoy("crew".into())
             .source("failure".into())
@@ -838,7 +807,7 @@ async fn turn_publication_errors_restore_the_owned_activation() {
             .role("coder".into())
             .subject_revision("failure-head".into())
             .brief("continue".into())
-            .sender(CrewMessageSender::Unknown)
+            .sender(flotilla_resources::legacy_message_sender(&CrewMessageSender::Unknown).0)
             .build();
         let error = crew.deliver_turn(&request).await.expect_err("durable admission fails");
         assert!(error.contains(if external { "receiver publication unavailable" } else { "different intent" }), "{error}");
