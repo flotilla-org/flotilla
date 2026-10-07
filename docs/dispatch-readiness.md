@@ -80,8 +80,10 @@ order. Attention uses the oldest readiness clock, independent of priority.
 
 Native map ancestry (nearest map, including nested sub-issues) takes precedence
 over the first matching charter lane. A map is identified by its Map issue type
-or a `map`/`wayfinder:map` label. Lane rules require all their labels and preserve
-charter declaration order. Unmatched work belongs to `routine_lane`, default
+or a label whose final colon-separated segment is `map` (case-insensitive).
+This follows the same reserved ideation-label convention as readiness. Lane rules require all their labels and preserve
+charter declaration order. An empty label set is an intentional catch-all; place
+it after more specific lanes. Unmatched work belongs to `routine_lane`, default
 `routine`. A mission may reference a tracking issue or use charter attributes
 alone. Map missions without a charter name use the source-qualified map identity.
 
@@ -160,3 +162,10 @@ and score breakdown. Change a mission field/label, wait for the next successful
 background refresh and reconciler pass, and rerun to inspect the updated rank.
 The container tests use injected tracker collaborators and in-memory stores;
 this operator check needs a running daemon, without Docker requirements.
+
+Malformed mission attributes, parent cycles, malformed blocker URLs or missing
+tracking sources fail the Project closed. `status.dispatch_queue_error` exposes
+the reason; the last queue and readiness clocks remain stored but unavailable
+until a successful reconciliation clears the error. Live-convoy membership uses
+the current board with frozen issue labels, so mission accounting follows current
+ancestry and charter while retaining the admitted label snapshot.

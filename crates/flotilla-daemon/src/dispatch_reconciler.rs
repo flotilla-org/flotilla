@@ -998,6 +998,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_mission_publishes_error_preserves_queue_and_recovers() {
+        use flotilla_resources::DispatchMission;
+        let mut dispatch_policy = policy(60);
+        dispatch_policy.missions =
+            vec![DispatchMission::builder().name("routine".into()).issue(IssueRef { source: source(), id: "2".into() }).build()];
+        let (backend, issues, _, reconciler) =
+            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], dispatch_policy).await;
+        let projects = backend.using::<Project>(NAMESPACE);
+        reconciler.reconcile_once().await.expect("initial pass");
+        let before = projects.get("widgets").await.expect("project").status.expect("status");
+        let mut boards = issues.boards(&projects.get("widgets").await.expect("project")).await.expect("board");
+        boards[0].issues[0].labels.push("value:abc".into());
+        *issues.board_override.lock().expect("board") = Some(boards);
+        assert_eq!(reconciler.reconcile_once().await.expect("invalid pass").project_errors, 1);
+        let failed = projects.get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(failed.dispatch_queue, before.dispatch_queue);
+        assert!(failed.dispatch_queue_error.as_deref().expect("visible error").contains("value"));
+        *issues.board_override.lock().expect("board") = None;
+        reconciler.reconcile_once().await.expect("recovery");
+        let recovered = projects.get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(recovered.dispatch_queue, before.dispatch_queue);
+        assert!(recovered.dispatch_queue_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn attention_uses_oldest_entry_even_when_it_is_not_first() {
+        let (backend, _, _, reconciler) = harness(
+            vec![issue("1", &[READY_ISSUE_LABEL], None, IssueState::Open), issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)],
+            vec![],
+            policy(60),
+        )
+        .await;
+        reconciler.reconcile_once().await.expect("queue");
+        let mut queue = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue;
+        queue[1].ready_observed_at -= Duration::seconds(120);
+        let oldest = queue[1].ready_observed_at;
+        let attention = dispatch_queue_attention(&queue, &policy(60), None, queue[0].ready_observed_at).expect("stale");
+        assert_eq!(attention.oldest_ready_observed_at, oldest);
+        assert_eq!(attention.count, 2);
+    }
+
+    #[tokio::test]
     async fn source_outage_preserves_aging_and_deduplicates_errors_then_recovers() {
         let (backend, issues, clock, reconciler) =
             harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], policy(60)).await;

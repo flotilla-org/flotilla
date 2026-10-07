@@ -1,5 +1,8 @@
 //! Mission normalization and membership over one complete tracker observation.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
 use flotilla_protocol::{ClassOfService, DispatchBoardRepository, DispatchScore, Issue, IssueRef, MissionAttributes, MissionFields};
 use flotilla_resources::DispatchPolicy;
@@ -102,7 +105,7 @@ pub fn normalize_attributes(
         match name {
             "value" => fallback.value = Some(value.parse::<f64>().map_err(|_| "invalid value label")?.try_into()?),
             "cos" => fallback.class_of_service = Some(class(value)?),
-            _ => fallback.crew_limit = Some(value.parse().map_err(|_| "invalid crew-limit label")?),
+            _ => fallback.crew_limit = Some(value.parse().map_err(|_| format!("invalid crew-limit label crew-limit:{value}"))?),
         }
     }
     let sources = [
@@ -141,6 +144,7 @@ pub struct MissionBoard {
     labels: BTreeMap<IssueRef, Vec<String>>,
     fields: BTreeMap<IssueRef, MissionFields>,
     edges: BTreeMap<IssueRef, BTreeSet<IssueRef>>,
+    unblock_counts: Mutex<BTreeMap<IssueRef, usize>>,
 }
 
 impl MissionBoard {
@@ -151,6 +155,7 @@ impl MissionBoard {
             labels: BTreeMap::new(),
             fields: BTreeMap::new(),
             edges: BTreeMap::new(),
+            unblock_counts: Mutex::new(BTreeMap::new()),
         };
         let mut edges: BTreeMap<IssueRef, BTreeSet<IssueRef>> = BTreeMap::new();
         for board in boards {
@@ -187,6 +192,10 @@ impl MissionBoard {
     }
 
     fn unblock_count(&self, reference: &IssueRef) -> usize {
+        let mut counts = self.unblock_counts.lock().expect("unblock count cache");
+        if let Some(count) = counts.get(reference) {
+            return *count;
+        }
         let mut visited = BTreeSet::from([reference.clone()]);
         let mut pending = vec![reference.clone()];
         while let Some(next) = pending.pop() {
@@ -196,11 +205,14 @@ impl MissionBoard {
                 }
             }
         }
-        visited.len().saturating_sub(1)
+        let count = visited.len().saturating_sub(1);
+        counts.insert(reference.clone(), count);
+        count
     }
 
     pub fn score(&self, issue: &Issue, policy: &DispatchPolicy) -> Result<DispatchScore, String> {
-        let mut parent = self.parents.get(&canonical_reference(&issue.reference));
+        let reference = canonical_reference(&issue.reference);
+        let mut parent = self.parents.get(&reference);
         let mut map = None;
         while let Some(next) = parent {
             if self.maps.contains(next) {
@@ -242,7 +254,7 @@ impl MissionBoard {
                 .into(),
             )
             .attribute_sources(attribute_sources)
-            .unblock_count(self.unblock_count(&canonical_reference(&issue.reference)))
+            .unblock_count(self.unblock_count(&reference))
             .conflict_penalty(0)
             .project_share(policy.project_share)
             .project_active_crews(0)
@@ -450,6 +462,9 @@ mod tests {
         assert_eq!(score.unblock_count, 3);
         assert_eq!(board.score(&issue("2"), &policy).expect("nested").mission_issue, Some(reference("map")));
         assert_eq!(board.score(&issue("3"), &policy).expect("lane").mission, "stability");
+        let mut unmatched = issue("4");
+        unmatched.labels.clear();
+        assert_eq!(board.score(&unmatched, &policy).expect("catch-all lane").mission, "other");
         let empty = DispatchPolicy::builder().build();
         assert_eq!(board.score(&issue("3"), &empty).expect("routine").membership, "routine");
         assert_eq!(board.score(&issue("3"), &empty).expect("routine").mission, "routine");
