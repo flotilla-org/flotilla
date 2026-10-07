@@ -1,1 +1,2 @@
 PyYAML>=6,<7
+-r ../../scripts/tests/build-bench-requirements.txt
