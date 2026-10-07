@@ -19,6 +19,8 @@ runs:
       run: |
         source ci/toolchain/pin.sh
         echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+    # Inherited installer ref; SHA pinning and org-action rollout belong to:
+    # https://github.com/flotilla-org/flotilla/issues/2754
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ steps.pin.outputs.version }}
