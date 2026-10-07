@@ -4003,7 +4003,11 @@ mod tests {
         projects.apply(&InputMeta::builder().name("fleet".into()).build(), &fleet).await.expect("fleet");
         backend
             .definitions::<FleetDesignation>("flotilla")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec {
+                project: "fleet".into(),
+                image_cache: None,
+                image_gc: None,
+            })
             .await
             .expect("designation");
         let templates = backend.definitions::<WorkflowTemplate>("flotilla");

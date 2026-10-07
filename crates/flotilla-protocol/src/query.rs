@@ -467,6 +467,8 @@ pub struct FleetHostRow {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_conditions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_gc_summary: Option<String>,
     /// Expired or near-expiry credential material on this host, one entry per
     /// affected scope ("ambient claude login expired on 2026-07-30").
     #[builder(default)]

@@ -22,6 +22,22 @@ impl Resource for FleetDesignation {
         if let Some(cache) = &spec.image_cache {
             cache.validate().map_err(ResourceError::invalid)?;
         }
+        if let Some(gc) = &spec.image_gc {
+            if !(60..=31536000).contains(&gc.interval_seconds) || !(3600..=31536000).contains(&gc.grace_seconds) {
+                return Err(ResourceError::invalid("image GC needs an interval >= 60s and grace >= 3600s"));
+            }
+            if gc.registry_host.as_ref().is_some_and(|value| value.trim().is_empty())
+                || gc.registry_credential.as_ref().is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(ResourceError::invalid("registry GC host and credential must be nonempty"));
+            }
+            if gc.registry_host.is_some() != gc.registry_credential.is_some() {
+                return Err(ResourceError::invalid("registry GC needs both a host and a credential"));
+            }
+            if gc.registry_host.is_some() && spec.image_cache.is_none() {
+                return Err(ResourceError::invalid("registry GC needs a declared image cache"));
+            }
+        }
         Ok(())
     }
 }
@@ -33,6 +49,9 @@ pub struct FleetDesignationSpec {
     /// Optional shared OCI cache; ADR 0047 default may retire after one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_cache: Option<ImageCacheBinding>,
+    /// Opt-in collection. ADR 0047: remove this decoder default after one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_gc: Option<ImageGcPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,4 +77,27 @@ impl ImageCacheBinding {
         }
         Ok(())
     }
+}
+
+/// Collection uses immutable build identities, never general Docker pruning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+pub struct ImageGcPolicy {
+    #[serde(default)]
+    #[builder(default)]
+    pub mode: ImageGcMode,
+    pub interval_seconds: u64,
+    pub grace_seconds: u64,
+    #[serde(default)]
+    pub registry_host: Option<String>,
+    #[serde(default)]
+    pub registry_credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageGcMode {
+    #[default]
+    DryRun,
+    Apply,
 }

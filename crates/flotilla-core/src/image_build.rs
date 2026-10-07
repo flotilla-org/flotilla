@@ -46,6 +46,14 @@ impl ImageBuildAdmission {
         Self { backend, namespace: namespace.into(), inputs }
     }
 
+    async fn completed_candidates(&self) -> Result<Vec<flotilla_resources::ResourceObject<ImageBuild>>, String> {
+        Ok(flotilla_resources::list_image_builds(&self.backend, &self.namespace)
+            .await
+            .map_err(|error| error.to_string())?
+            .into_values()
+            .collect())
+    }
+
     /// Look up a completed pinned chain without authoring demand. Placement
     /// can compare acquisition costs before selecting a host.
     pub async fn completed(
@@ -54,8 +62,7 @@ impl ImageBuildAdmission {
         composition: &ImageComposition,
     ) -> Result<Option<flotilla_resources::ResourceObject<ImageBuild>>, String> {
         let architecture = canonical_image_architecture(architecture);
-        let candidates =
-            self.backend.including_replicas::<ImageBuild>(&self.namespace).list().await.map_err(|error| error.to_string())?.items;
+        let candidates = self.completed_candidates().await?;
         let mut parent_key = None;
         let mut parent_digest: Option<String> = None;
         let mut result = None;
@@ -82,17 +89,24 @@ impl ImageBuildAdmission {
                 .stability(source.stability)
                 .build();
             let key = inputs.recipe_key()?;
-            let Some(found) = candidates.iter().map(|source| &source.object).find(|build| {
+            let Some(found) = candidates.iter().find(|build| {
                 build.spec.recipe_key == key
                     && build.spec.inputs == inputs
-                    && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
+                    && build
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built && !status.availability.retired)
             }) else {
                 return Ok(None);
             };
             let found = flotilla_resources::read_image_build(&self.backend, &self.namespace, &found.metadata.name)
                 .await
                 .map_err(|error| error.to_string())?;
-            let Some(status) = found.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built) else {
+            let Some(status) = found
+                .status
+                .as_ref()
+                .filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built && !status.availability.retired)
+            else {
                 return Ok(None);
             };
             parent_digest = Some(status.identity.as_ref().ok_or("built image has no identity")?.local_image_id.clone());
@@ -218,27 +232,35 @@ impl ImageBuildAdmission {
             // A pinned recipe's built execution can serve every same-architecture
             // host. Unpinned execution keys remain scoped to their original demand.
             let shared = if inputs.stability == ImageInputStability::Pinned {
-                self.backend
-                    .including_replicas::<ImageBuild>(&self.namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .items
+                self.completed_candidates()
+                    .await?
                     .into_iter()
-                    .map(|source| source.object)
                     .filter(|build| {
                         build.spec.recipe_key == recipe_key
                             && build.spec.inputs == inputs
-                            && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
+                            && build.status.as_ref().is_some_and(|status| {
+                                status.phase == flotilla_resources::ImageBuildPhase::Built && !status.availability.retired
+                            })
                     })
                     .min_by_key(|build| (build.spec.host_ref != placement_host, build.metadata.name.clone()))
             } else {
                 None
             };
-            let name = shared
+            let mut name = shared
                 .as_ref()
                 .map(|build| build.metadata.name.clone())
                 .unwrap_or_else(|| format!("image-build-{}-{}", recipe_key.trim_start_matches("sha256:"), host_ref));
+            if shared.is_none() {
+                // Retired evidence remains immutable. A fresh execution gets a
+                // deterministic successor name; concurrent demands still join.
+                loop {
+                    match flotilla_resources::read_image_build(&self.backend, &self.namespace, &name).await {
+                        Ok(build) if build.status.as_ref().is_some_and(|status| status.availability.retired) => name.push_str("-rebuilt"),
+                        Ok(_) | Err(ResourceError::NotFound { .. }) => break,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            }
             let old_inputs = builds
                 .list()
                 .await
@@ -303,7 +325,11 @@ impl ImageBuildAdmission {
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            let Some(status) = execution.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built) else {
+            let Some(status) = execution
+                .status
+                .as_ref()
+                .filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built && !status.availability.retired)
+            else {
                 break;
             };
             parent_digest = Some(status.identity.as_ref().ok_or("built parent has no identity")?.local_image_id.clone());

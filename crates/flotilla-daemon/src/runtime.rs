@@ -4665,6 +4665,18 @@ fn spawn_controller_loops(
             }
         }));
     }
+    if let Some(distributor) = &state.image_distributor {
+        let distributor = Arc::clone(distributor);
+        controllers.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(reason) = distributor.collect_if_due().await {
+                    tracing::warn!(%reason, "image collection failed");
+                }
+            }
+        }));
+    }
     if let Some(runner) = &state.image_build_runner {
         let projection_backend = backend.clone();
         let projection_namespace = namespace_string.clone();

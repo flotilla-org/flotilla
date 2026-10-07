@@ -7031,7 +7031,11 @@ mod project_parent_tests {
         }
         backend
             .definitions::<FleetDesignation>("flotilla")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into(), image_cache: None })
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec {
+                project: "root".into(),
+                image_cache: None,
+                image_gc: None,
+            })
             .await
             .expect("designation");
         let state = AggregatorProjectionState::new();
