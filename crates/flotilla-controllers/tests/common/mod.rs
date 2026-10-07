@@ -57,7 +57,16 @@ pub fn work_state(
     message: Option<String>,
     placement: Option<flotilla_resources::PlacementStatus>,
 ) -> WorkState {
-    WorkState { phase, completion_authority: WorkCompletionAuthority::CrewRollup, ready_at, started_at, finished_at, message, placement }
+    WorkState {
+        provisioning_retry: None,
+        phase,
+        completion_authority: WorkCompletionAuthority::CrewRollup,
+        ready_at,
+        started_at,
+        finished_at,
+        message,
+        placement,
+    }
 }
 
 pub async fn create_convoy_with_single_task(

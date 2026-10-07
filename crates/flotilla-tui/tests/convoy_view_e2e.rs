@@ -183,6 +183,7 @@ async fn generated_table_action_completes_work() {
 
     let mut work = BTreeMap::new();
     work.insert("implement".to_string(), WorkState {
+        provisioning_retry: None,
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,

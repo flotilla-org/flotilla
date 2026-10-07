@@ -6,6 +6,7 @@ use common::{
     task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object, valid_convoy_spec, valid_workflow_template_object,
     workflow_template_meta,
 };
+use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, VesselReconciler};
 use flotilla_resources::{
     change_request_record_name,
     controller::{Actuation, ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
@@ -482,10 +483,9 @@ async fn reconcile_once_with_resources(
     }
 
     for workspace in workspaces {
-        let created = vessels
-            .create(&vessel_meta(&workspace.metadata.name, &workspace.spec.convoy_ref, &workspace.spec.vessel_name), &workspace.spec)
-            .await
-            .expect("workspace create should succeed");
+        let mut meta = vessel_meta(&workspace.metadata.name, &workspace.spec.convoy_ref, &workspace.spec.vessel_name);
+        meta.deletion_timestamp = workspace.metadata.deletion_timestamp;
+        let created = vessels.create(&meta, &workspace.spec).await.expect("workspace create should succeed");
         if let Some(status) = workspace.status.as_ref() {
             vessels
                 .update_status(&workspace.metadata.name, &created.metadata.resource_version, status)
@@ -2518,6 +2518,175 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
     ));
 }
 
+// The container runtime boundary injects the same failure returned by skill staging.
+struct FailedSkillStaging;
+#[async_trait]
+impl DockerEnvironmentRuntime for FailedSkillStaging {
+    async fn provision(&self, _: &str, _: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        Err("skill staging: pinned source unavailable".into())
+    }
+    async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy>) -> flotilla_resources::ResourceObject<Vessel> {
+    let backend = ResourceBackend::InMemory(Default::default());
+    backend.using::<Convoy>("flotilla").create(&convoy_meta(&convoy.metadata.name), &convoy.spec).await.expect("convoy");
+    let environments = backend.using::<flotilla_resources::Environment>("flotilla");
+    let environment = environments
+        .create(&InputMeta::builder().name("failed-skills".into()).build(), &flotilla_resources::EnvironmentSpec {
+            host_direct: None,
+            docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                host_ref: "host".into(),
+                image: "test".into(),
+                image_composition: None,
+                image_build_ref: None,
+                memory_policy: Default::default(),
+                declared_agent_adapters: Default::default(),
+                required_agent_adapters: Default::default(),
+                pull_policy: Default::default(),
+                mounts: Vec::new(),
+                env: Default::default(),
+            }),
+        })
+        .await
+        .expect("environment");
+    let env_reconciler = EnvironmentReconciler::new(Arc::new(FailedSkillStaging), backend.clone(), "flotilla");
+    let prepared = env_reconciler.prepare(&environment).await.expect("injected provisioning");
+    let mut env_status = Default::default();
+    env_reconciler.reconcile(&environment, &prepared, timestamp(20)).patch.expect("failed environment").apply(&mut env_status);
+    environments
+        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &env_status)
+        .await
+        .expect("persist failure");
+    let mut vessel = vessel_object(&convoy.metadata.name, "implement", VesselPhase::Provisioning, None);
+    vessel.status.as_mut().expect("status").environment_ref = Some(environment.metadata.name);
+    let reconciler = VesselReconciler::new(backend, "flotilla");
+    let prepared = reconciler.prepare(&vessel).await.expect("observe environment failure");
+    reconciler.reconcile(&vessel, &prepared, timestamp(21)).patch.expect("failed vessel").apply(vessel.status.as_mut().expect("status"));
+    assert_eq!(vessel.status.as_ref().expect("status").phase, VesselPhase::Failed);
+    assert_eq!(vessel.status.as_ref().expect("status").message.as_deref(), Some("skill staging: pinned source unavailable"));
+    vessel
+}
+
+// #2875: failure can first be observed during finalization. Preserve its cause
+// and deadline so disappearance does not bypass backoff from Ready work.
+#[tokio::test]
+async fn governor_deleting_failed_vessel_records_retry_before_it_disappears() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.work.get_mut("implement").expect("work").phase = WorkPhase::Ready;
+    let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
+    convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+    let mut vessel = vessel_object("standing", "implement", VesselPhase::Failed, Some("skill staging failed during reboot"));
+    vessel.metadata.deletion_timestamp = Some(timestamp(20));
+    let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(21)).await;
+    assert!(!outcome.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. } | Actuation::DeleteVessel { .. })));
+    outcome.patch.expect("persist failure during finalization").apply(convoy.status.as_mut().expect("status"));
+    assert_eq!(convoy.status.as_ref().expect("status").work["implement"].message.as_deref(), Some("skill staging failed during reboot"));
+    let missing = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(22)).await;
+    assert!(!missing.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. })));
+}
+
+// #2875: no reconcile tick can create another child while one is present,
+// including finalization; a deleting Ready child cannot be treated as recovered.
+#[tokio::test]
+async fn governor_does_not_recreate_an_existing_or_deleting_vessel() {
+    for phase in [VesselPhase::Pending, VesselPhase::Provisioning, VesselPhase::Ready, VesselPhase::Failed] {
+        for deleting in [false, true] {
+            let mut status = bootstrapped_tool_only_convoy_status();
+            status.phase = ConvoyPhase::Active;
+            status.work.get_mut("implement").expect("work").phase = WorkPhase::Interrupted;
+            let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
+            convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+            let mut vessel = vessel_object("standing", "implement", phase, None);
+            vessel.metadata.deletion_timestamp = deleting.then_some(timestamp(20));
+            let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(21)).await;
+            assert!(!outcome.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. })));
+            if deleting {
+                assert!(!matches!(outcome.patch, Some(ConvoyStatusPatch::WorkRunning { .. })), "finalizing child cannot recover work");
+                assert!(
+                    !outcome.actuations.iter().any(|act| matches!(act, Actuation::DeleteVessel { .. })),
+                    "do not delete a finalizing child again"
+                );
+                if phase == VesselPhase::Failed {
+                    assert!(
+                        matches!(outcome.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. })),
+                        "retain the failed child's retry"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// #2875: persistent failure bounds creates independently of watch frequency,
+// and the durable budget grows exponentially to a fifteen-minute ceiling.
+#[hegel::test]
+fn governor_failure_create_rate_is_bounded(tc: hegel::TestCase) {
+    // Generate watch bursts and empty/duplicate observations around each tick.
+    let bursts = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+    let late_tick = tc.draw(hegel::generators::integers::<i64>().min_value(0).max_value(2));
+    tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+        let mut status = bootstrapped_tool_only_convoy_status();
+        status.phase = ConvoyPhase::Active;
+        status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
+        let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
+        convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+        let failed = vessel_object("standing", "implement", VesselPhase::Failed, Some("skill staging failed: source unavailable"));
+        let first = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], Vec::new(), timestamp(0)).await;
+        first.patch.expect("retry").apply(convoy.status.as_mut().expect("status"));
+        let mut creates = 0;
+        let mut deadline = 30;
+        for attempt in 1..=8 {
+            for second in [deadline - 1, deadline + late_tick] {
+                for _ in 0..bursts {
+                    let outcome = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], Vec::new(), timestamp(second)).await;
+                    let deleted = outcome.actuations.iter().any(|act| matches!(act, Actuation::DeleteVessel { .. }));
+                    assert_eq!(deleted, second >= deadline);
+                    if deleted {
+                        let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(second)).await;
+                        creates += absent.actuations.iter().filter(|act| matches!(act, Actuation::CreateVessel { .. })).count();
+                        absent.patch.expect("reserve next retry").apply(convoy.status.as_mut().expect("status"));
+                        let retry =
+                            convoy.status.as_ref().expect("status").work["implement"].provisioning_retry.as_ref().expect("stored retry");
+                        // Independent oracle covers doubling, saturation and the boundary.
+                        deadline = second + (30_i64 * (1_i64 << attempt)).min(900);
+                        assert_eq!(retry.next_attempt_at(), Some(timestamp(deadline)));
+                        assert_eq!(creates, attempt as usize);
+                    }
+                }
+            }
+        }
+        assert_eq!(creates, 8);
+    });
+}
+
+// #2875: repeated provisioning failure must retain its cause and cannot
+// recreate a governor every watch tick, including after controller restart.
+#[tokio::test]
+async fn governor_provisioning_failure_backs_off_across_watch_ticks() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
+    let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
+    convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
+    let failed_vessel = skill_failure_vessel(&convoy).await;
+    let failed = reconcile_once_with_resources(&convoy, None, vec![failed_vessel.clone()], Vec::new(), timestamp(21)).await;
+    failed.patch.expect("visible failure and retry").apply(convoy.status.as_mut().expect("status"));
+    assert!(convoy.status.as_ref().expect("status").work["implement"].message.as_ref().expect("cause").contains("skill staging"));
+    // Every call constructs a new reconciler; the retry must be stored, not local.
+    for second in 22..51 {
+        for vessels in [vec![failed_vessel.clone()], Vec::new()] {
+            let outcome = reconcile_once_with_resources(&convoy, None, vessels, Vec::new(), timestamp(second)).await;
+            assert!(
+                !outcome.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. } | Actuation::DeleteVessel { .. })),
+                "no churn before backoff expires"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failing() {
     let mut status = bootstrapped_tool_only_convoy_status();
@@ -2534,15 +2703,15 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
         timestamp(21),
     )
     .await;
-    assert!(matches!(&failed.patch, Some(ConvoyStatusPatch::WorkInterrupted { .. })));
-    assert!(failed
+    assert!(matches!(&failed.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. })));
+    assert!(!failed
         .actuations
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "standing-implement")));
 
     failed.patch.expect("interrupted work").apply(convoy.status.as_mut().expect("status"));
     assert_ne!(convoy.status.as_ref().expect("status").phase, ConvoyPhase::Failed);
-    let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(22)).await;
+    let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(51)).await;
     assert_eq!(absent.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 1);
     assert!(!matches!(absent.patch, Some(ConvoyStatusPatch::MarkWorkFailed { .. })));
 
@@ -2551,7 +2720,7 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
         None,
         vec![vessel_object("standing", "implement", VesselPhase::Pending, None)],
         Vec::new(),
-        timestamp(23),
+        timestamp(52),
     )
     .await;
     assert_eq!(provisioning.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 0);
@@ -2560,7 +2729,7 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
         None,
         vec![vessel_object("standing", "implement", VesselPhase::Ready, None)],
         Vec::new(),
-        timestamp(24),
+        timestamp(53),
     )
     .await;
     assert!(matches!(recovered.patch, Some(ConvoyStatusPatch::WorkRunning { .. })));

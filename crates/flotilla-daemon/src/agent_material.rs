@@ -212,7 +212,9 @@ impl AgentMaterialRegistry {
         }
         .await;
         if let Err(ref error) = result {
+            let selected = decode_selected_skills(environment).unwrap_or_default();
             let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
+            let source_name = source_name.or_else(|| selected.first().map(|entry| entry.source.as_str()));
             let source = if let Some(path) = self.skills.source.clone() {
                 tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
                     .await
@@ -222,11 +224,17 @@ impl AgentMaterialRegistry {
             } else {
                 None
             };
+            let revision = selected
+                .iter()
+                .find(|entry| Some(entry.source.as_str()) == source_name)
+                .map(|entry| entry.revision.as_str())
+                .or_else(|| source.as_ref().map(|source| source.revision.as_str()));
             warn!(
                 environment = environment_ref,
-                source = source.as_ref().map_or("unknown", |source| source.name.as_str()),
-                revision = source.as_ref().map_or("unknown", |source| source.revision.as_str()),
+                source = source_name.unwrap_or("skill-bundle"),
+                revision = revision.unwrap_or("unresolved"),
                 credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
+                %error,
                 "skill staging failed"
             );
             if let Err(error) = remove_source_token_files(source_token_files, runner).await {
@@ -290,16 +298,18 @@ done"#,
         environment: &[(String, String)],
     ) -> Result<Vec<SkillSourceCredentialRequest>, String> {
         let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
-        Ok(self
-            .skill_source_credentials()
-            .await?
+        let sources = self.skills.selected_sources(&selected).await?;
+        Ok(sources
             .into_iter()
-            .filter(|request| selected.iter().any(|entry| entry.source == request.source && entry.revision == request.revision))
+            .filter_map(|source| {
+                source.credential.map(|credential| SkillSourceCredentialRequest {
+                    source: source.name,
+                    repository: source.repository,
+                    revision: source.revision,
+                    credential,
+                })
+            })
             .collect())
-    }
-
-    pub(crate) async fn skill_source_credentials(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
-        self.skills.credential_requests().await
     }
 
     pub(crate) async fn will_stage_skills(
@@ -532,7 +542,7 @@ struct SkillBundleManifest {
     sources: Vec<SkillSource>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SkillSource {
     name: String,
     repository: String,
@@ -540,6 +550,56 @@ struct SkillSource {
     credential: Option<String>,
     #[serde(default = "default_skill_source_paths")]
     paths: Vec<String>,
+}
+
+fn source_repository_path(repository: &str) -> Option<&str> {
+    let path = if let Some((_, path)) = repository.split_once("://") {
+        path.split_once('/').map(|(_, path)| path)
+    } else {
+        repository.split_once(':').map(|(_, path)| path)
+    };
+    path.map(|path| path.trim_end_matches(".git"))
+}
+
+/// A standing convoy retains its admission pin after a generation roll. The
+/// current supply still authorizes the repository, credential and path roots;
+/// only the revision comes from the durable selection (ADR 0052).
+fn resolve_frozen_sources(sources: &[SkillSource], selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<Vec<SkillSource>, String> {
+    let mut resolved = BTreeMap::new();
+    for entry in selected {
+        let source = sources.iter().find(|source| source.name == entry.source);
+        let credential = source.and_then(|source| source.credential.as_deref()).unwrap_or("none");
+        let context = format!("skill source {} revision {} credential {}", entry.source, entry.revision, credential);
+        let resolve = || -> Result<SkillSource, String> {
+            let source = source.ok_or_else(|| format!("{context}: source is not declared by this generation"))?;
+            if entry.revision.len() != 40 || !entry.revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("{context}: frozen revision must be a full commit SHA"));
+            }
+            flotilla_resources::validate_skill_ref(&entry.name).map_err(|error| format!("{context}: {error}"))?;
+            flotilla_resources::crew_defaults::validate_skill_path(&entry.path).map_err(|error| format!("{context}: {error}"))?;
+            if entry.repository != source.repository && source_repository_path(&source.repository) != Some(entry.repository.as_str()) {
+                return Err(format!(
+                    "{context}: frozen repository {} differs from authorized source {}",
+                    entry.repository, source.repository
+                ));
+            }
+            if !source.paths.iter().any(|path| flotilla_resources::crew_defaults::path_within_source(&entry.path, path)) {
+                return Err(format!("{context}: frozen skill {} is outside the authorized source paths", entry.path));
+            }
+            let mut source = source.clone();
+            source.revision = entry.revision.clone();
+            Ok(source)
+        };
+        let source = resolve().map_err(|error| format!("{error}\n{STAGE_SOURCE_PREFIX}{}", entry.source))?;
+        if resolved.keys().any(|(name, revision)| name == &source.name && revision != &source.revision) {
+            return Err(format!(
+                "{context}: one crew cannot select two revisions of the same source\n{STAGE_SOURCE_PREFIX}{}",
+                entry.source
+            ));
+        }
+        resolved.insert((source.name.clone(), source.revision.clone()), source);
+    }
+    Ok(resolved.into_values().collect())
 }
 
 fn default_skill_source_paths() -> Vec<String> {
@@ -583,26 +643,13 @@ impl SkillBundle {
         })
     }
 
-    async fn credential_requests(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
-        let source = self
-            .source
-            .clone()
-            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
-        let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
+    async fn selected_sources(&self, selected: &[flotilla_resources::SkillCatalogEntry]) -> Result<Vec<SkillSource>, String> {
+        let path =
+            self.source.clone().ok_or_else(|| format!("contained agent requires skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
+        let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
             .await
-            .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
-        Ok(inspection
-            .sources
-            .into_iter()
-            .filter_map(|source| {
-                source.credential.map(|credential| SkillSourceCredentialRequest {
-                    source: source.name,
-                    repository: source.repository,
-                    revision: source.revision,
-                    credential,
-                })
-            })
-            .collect())
+            .map_err(|error| format!("inspect skill sources task failed: {error}"))??;
+        resolve_frozen_sources(&inspection.sources, selected)
     }
 
     async fn stage(
@@ -632,33 +679,17 @@ impl SkillBundle {
         if destinations.is_empty() {
             return if cleanup_tokens { remove_source_token_files(source_token_files, runner).await } else { Ok(()) };
         }
-        let source = self
-            .source
-            .clone()
-            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
-        let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
-            .await
-            .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
-        let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
-        for entry in &selected {
-            flotilla_resources::validate_skill_ref(&entry.name)?;
-            flotilla_resources::crew_defaults::validate_skill_path(&entry.path)?;
-            if !inspection.sources.iter().any(|source| {
-                source.name == entry.source
-                    && source.revision == entry.revision
-                    && source.paths.iter().any(|path| flotilla_resources::crew_defaults::path_within_source(&entry.path, path))
-            }) {
-                return Err(format!("frozen skill {}@{} is not supplied at revision {}", entry.repository, entry.name, entry.revision));
-            }
-        }
+        let selected = decode_selected_skills(environment)?;
+        let sources = self.selected_sources(&selected).await?;
+        let manifest = serde_json::json!({"schema_version": 5, "sources": sources});
         let mut args = vec![
             "flotilla-stage-skills".to_string(),
-            format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
+            format!("json:{manifest}"),
             String::new(),
             String::new(),
             config_base.join("skill-source-cache").to_string_lossy().into_owned(),
         ];
-        for source in &inspection.sources {
+        for source in &sources {
             let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
             args.extend([
                 source.name.clone(),
@@ -1274,7 +1305,9 @@ esac
         let calls = runner.0.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "sh");
-        assert!(calls[0].1.contains(&format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}")));
+        let manifest = calls[0].1.iter().find_map(|arg| arg.strip_prefix("json:")).expect("resolved source manifest");
+        let manifest: SkillBundleManifest = serde_json::from_str(manifest).expect("manifest");
+        assert_eq!(manifest.sources[0].revision, "1".repeat(40));
         assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
         assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
         assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
@@ -2302,6 +2335,127 @@ esac
             name: name.into(),
             path: path.into(),
         }
+    }
+
+    // #2875: failures before the Git script carry the same named context and
+    // underlying cause in both returned status material and the warning.
+    #[tokio::test]
+    async fn skill_resolution_warning_reports_the_frozen_source_and_cause() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let bundle = registry.skills.source.as_ref().expect("source");
+        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("manifest");
+        let runner = promisor_runner(temp.path());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogCaptureWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
+            (
+                "FLOTILLA_RESOLVED_SKILLS".into(),
+                serde_json::to_string(&vec![crew_skill("private-source", "skills-other/private-folder")]).expect("selection"),
+            ),
+        ];
+        let error = registry
+            .stage_skills("governor", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]), &environment, &BTreeMap::new(), &runner)
+            .await
+            .expect_err("unauthorized path");
+        assert!(error.contains("outside the authorized source paths"));
+        let log = String::from_utf8(output.lock().expect("log").clone()).expect("UTF-8 log");
+        for expected in [
+            "skill staging failed",
+            "private-skills",
+            "1111111111111111111111111111111111111111",
+            "credential=",
+            "outside the authorized source paths",
+        ] {
+            assert!(log.contains(expected), "missing {expected}: {log}");
+        }
+        assert!(log.contains("credential=private-skills") || log.contains("credential=\"private-skills\""), "{log}");
+        assert!(!log.contains("source=unknown") && !log.contains("revision=unknown"), "{log}");
+    }
+
+    // #2875: retaining a frozen revision never authorizes another repository,
+    // an undeclared source, path traversal, or an unpinned ref. Diagnostics name
+    // the source, revision, credential and concrete refusal before any mint.
+    #[hegel::test]
+    fn frozen_skill_resolution_preserves_source_authority(tc: hegel::TestCase) {
+        let case = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(5));
+        let source = SkillSource {
+            name: "private-skills".into(),
+            repository: "https://github.com/example/private-skills.git".into(),
+            revision: "2".repeat(40),
+            credential: Some("private-skills".into()),
+            paths: vec!["skills".into()],
+        };
+        let mut entry = crew_skill("private-source", "skills/private-folder");
+        match case {
+            0 => entry.repository = "other/private-skills".into(),
+            1 => entry.path = "skills/../escape".into(),
+            2 => entry.path = "skills-other/private-folder".into(),
+            3 => entry.revision = "main".into(),
+            4 => entry.source = "undeclared".into(),
+            5 => entry.name = "../escape".into(),
+            _ => unreachable!(),
+        }
+        let error = resolve_frozen_sources(&[source], std::slice::from_ref(&entry)).expect_err("untrusted frozen material refused");
+        assert!(error.contains(&entry.source) && error.contains(&entry.revision) && error.contains("credential"), "{error}");
+        assert!(
+            error.contains("differs")
+                || error.contains("invalid")
+                || error.contains("outside")
+                || error.contains("full commit SHA")
+                || error.contains("not declared"),
+            "{error}"
+        );
+    }
+
+    // #2875: a standing governor's frozen selection survives a reboot into a
+    // newer generation, retaining its revision and narrowed source credential.
+    #[tokio::test]
+    async fn governor_frozen_skills_resolve_after_generation_restart() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let bundle = registry.skills.source.as_ref().expect("source");
+        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("new generation manifest");
+        let runner = promisor_runner(temp.path());
+        let base = runner.config_base.join("claude");
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR".into(), base.display().to_string()),
+            (
+                "FLOTILLA_CREW_SKILLS".into(),
+                serde_json::to_string(&BTreeMap::from([("governor", vec![crew_skill("private-source", "skills/private-folder")])]))
+                    .expect("frozen skills"),
+            ),
+        ];
+        let requests = registry.selected_skill_source_credentials(&environment).await.expect("resolve credentials");
+        assert_eq!(requests.len(), 1, "frozen revision still needs its source credential");
+        assert_eq!(requests[0].revision, "1".repeat(40));
+        let token = temp.path().join("token");
+        std::fs::write(&token, "test-token").expect("token");
+        registry
+            .stage_skills(
+                "governor",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]),
+                &environment,
+                &BTreeMap::from([("private-skills".into(), token)]),
+                &runner,
+            )
+            .await
+            .expect("stage frozen revision after restart");
+        assert!(base.join("crews/governor/skills/private-source/SKILL.md").is_file());
+        let staged: SkillBundleManifest = serde_json::from_slice(
+            &std::fs::read(base.join("crews/governor/skills").join(SKILL_BUNDLE_MANIFEST)).expect("staged manifest"),
+        )
+        .expect("manifest");
+        assert_eq!(staged.sources[0].revision, "1".repeat(40), "staged provenance retains the admission pin");
     }
 
     #[tokio::test]

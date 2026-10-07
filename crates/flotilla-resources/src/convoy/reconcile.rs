@@ -36,7 +36,7 @@ use crate::{
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
     InputMeta, InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource,
     ResourceError, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue,
-    TypedResolver, ENSURED_FROM_ANNOTATION,
+    TypedResolver, ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
 };
 
 fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
@@ -1149,11 +1149,21 @@ impl Reconciler for ConvoyReconciler {
         let reclaim_refused = self.teardown_runtime.is_some()
             && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal())
             && !prepared.reclaim_eligible;
+        let provisioning_requeue = obj
+            .status
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| status.work.values())
+            .filter_map(|state| state.provisioning_retry.as_ref())
+            .filter_map(ControllerRetry::next_attempt_at)
+            .filter(|deadline| *deadline > now)
+            .filter_map(|deadline| (deadline - now).to_std().ok())
+            .min();
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
             events: outcome.events.into_iter().map(|event| convoy_object_event(obj, event)).collect(),
-            requeue_after: reclaim_refused.then_some(self.landing_evidence_stale_after),
+            requeue_after: provisioning_requeue.or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)),
         }
     }
 
@@ -1420,6 +1430,7 @@ fn bootstrap_outcome(
         .iter()
         .map(|vessel| {
             (vessel.name.clone(), WorkState {
+                provisioning_retry: None,
                 phase: WorkPhase::Pending,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
@@ -1742,6 +1753,13 @@ fn vessel_outcome(
             continue;
         };
         let vessel = vessels.get(&vessel_resource_name(&convoy.metadata.name, &requirement.name));
+        // A deleting child still occupies the requirement until finalization.
+        // Record a failed child's cause and retry even if teardown won the race.
+        if vessel.is_some_and(|vessel| {
+            vessel.metadata.deletion_timestamp.is_some() && vessel.status.as_ref().map(|status| status.phase) != Some(VesselPhase::Failed)
+        }) {
+            continue;
+        }
         match state.phase {
             WorkPhase::Ready => {
                 if let Some(vessel) = vessel {
@@ -1860,8 +1878,22 @@ fn vessel_outcome(
                         _ => {}
                     }
                 } else if is_ensured(convoy) {
-                    let Some(outcome) = create_vessel_outcome(convoy, &requirement.name, now) else { continue };
-                    actuations.extend(outcome.actuations);
+                    let retry = state.provisioning_retry.as_ref();
+                    if retry.and_then(ControllerRetry::next_attempt_at).is_some_and(|deadline| now < deadline) {
+                        continue;
+                    }
+                    let next = ControllerRetry::retryable(retry, now, PROVISIONING_RETRY_BACKOFF);
+                    let message = state.message.clone().unwrap_or_else(|| format!("vessel {} disappeared", requirement.name));
+                    // Reserve the next attempt in this serialized pass. A stale
+                    // child observation or teardown race cannot trigger another create.
+                    let mut outcome = if retry.is_some() {
+                        let Some(outcome) = create_vessel_outcome(convoy, &requirement.name, now) else { continue };
+                        outcome
+                    } else {
+                        InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() }
+                    };
+                    outcome.patch = Some(ConvoyStatusPatch::WorkProvisioningRetry { work: requirement.name.clone(), retry: next, message });
+                    return outcome;
                 }
             }
             WorkPhase::Pending | WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => {}
@@ -2070,21 +2102,22 @@ fn failed_vessel_outcome(
     if !is_ensured(convoy) {
         return work_failed_outcome(work, from, vessel_failure_message(vessel), now, actuations);
     }
-    if vessel.metadata.deletion_timestamp.is_none() {
-        actuations.push(Actuation::DeleteVessel { name: vessel.metadata.name.clone() });
+    let retry = status.work.get(&work).and_then(|state| state.provisioning_retry.as_ref());
+    if let Some(retry) = retry {
+        if retry.next_attempt_at().is_some_and(|deadline| now >= deadline) && vessel.metadata.deletion_timestamp.is_none() {
+            actuations.push(Actuation::DeleteVessel { name: vessel.metadata.name.clone() });
+        }
+        let message = vessel_failure_message(vessel);
+        let patch = (status.work.get(&work).and_then(|state| state.message.as_ref()) != Some(&message))
+            .then(|| ConvoyStatusPatch::WorkProvisioningRetry { work: work.clone(), retry: retry.clone(), message });
+        return InternalReconcileOutcome { patch, actuations, events: Vec::new() };
     }
-    let interrupted_roles = status
-        .crew_work
-        .get(&work)
-        .into_iter()
-        .flat_map(|crew| crew.iter())
-        .filter(|(_, state)| state.phase == CrewWorkPhase::Working)
-        .map(|(role, _)| role.clone())
-        .collect();
-    let patch = (from != WorkPhase::Interrupted)
-        .then(|| provisioning_patches::work_interrupted(work.clone(), interrupted_roles, vessel_failure_message(vessel)));
-    let events = patch.as_ref().map(|_| ConvoyEvent::WorkPhaseChanged { work, from, to: WorkPhase::Interrupted }).into_iter().collect();
-    InternalReconcileOutcome { patch, actuations, events }
+    let patch = Some(ConvoyStatusPatch::WorkProvisioningRetry {
+        work: work.clone(),
+        retry: ControllerRetry::retryable(None, now, PROVISIONING_RETRY_BACKOFF),
+        message: vessel_failure_message(vessel),
+    });
+    InternalReconcileOutcome { patch, actuations, events: vec![ConvoyEvent::WorkPhaseChanged { work, from, to: WorkPhase::Interrupted }] }
 }
 
 fn vessel_failure_message(vessel: &ResourceObject<Vessel>) -> String {

@@ -2,7 +2,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -23,8 +22,7 @@ use flotilla_resources::{
     ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
     ConvoyEnsureStatusPatch, ConvoyPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec,
     DemandState, EventRecorder, Host as ResourceHost, InputMeta, ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository,
-    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, WorkflowTemplate,
-    DRIVER_ADMISSION_CONDITION_TYPE,
+    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -42,10 +40,8 @@ struct EnsureAdmissionRetry {
 }
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
-    ChronoDuration::from_std(
-        RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(15 * 60) }.delay(restart_count.saturating_add(1)),
-    )
-    .expect("ensure retry delay fits chrono")
+    ChronoDuration::from_std(flotilla_resources::PROVISIONING_RETRY_BACKOFF.delay(restart_count.saturating_add(1)))
+        .expect("ensure retry delay fits chrono")
 }
 
 fn record_ensure_admission_retry(
@@ -57,8 +53,7 @@ fn record_ensure_admission_retry(
     persisted: Option<&ControllerRetry>,
 ) -> (u32, DateTime<Utc>) {
     let previous = retries.get(&key).map(|entry| &entry.retry).or(persisted);
-    let retry =
-        ControllerRetry::retryable(previous, now, RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) });
+    let retry = ControllerRetry::retryable(previous, now, flotilla_resources::PROVISIONING_RETRY_BACKOFF);
     let result = (retry.attempts, retry.next_attempt_at().expect("new admission retry is retryable"));
     retries.insert(key, EnsureAdmissionRetry { config_hash, dependency_hash, retry });
     result
@@ -629,7 +624,15 @@ impl EnsurePass<'_> {
         if !resolved_escalation && !force_now && consecutive_failures > 0 {
             let latest = latest.expect("a positive failure count requires a generation");
             backing_inspector.verify_backing_dead(latest).await?;
-            let retry_at = latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1);
+            let retry_at = latest
+                .status
+                .as_ref()
+                .and_then(|status| status.finished_at)
+                .map(|failed_at| failed_at + ensure_retry_delay(consecutive_failures - 1))
+                .or_else(|| {
+                    ensure.status.as_ref().filter(|status| status.restart_count == consecutive_failures).and_then(|status| status.retry_at)
+                })
+                .unwrap_or(latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1));
             if !force_now && retry_at > self.clock.now() {
                 self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
                     strikes: consecutive_failures,
@@ -1309,6 +1312,38 @@ mod tests {
         let mut status = convoy.status.expect("resource status");
         status.phase = ConvoyPhase::Failed;
         convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("fixture operation succeeds");
+    }
+
+    // #2875: a long-lived driver's generation must back off from its failure,
+    // not its old creation time; reconstructing the controller retains the deadline.
+    #[tokio::test]
+    async fn driver_readmission_backs_off_from_failure_time() {
+        let (controller, admission, clock) = fixture().await;
+        controller.reconcile_convoy_ensures_once_with_backing_inspector(&admission, "test", &Backing::Dead).await.expect("admit");
+        fail_current(&admission).await;
+        let ensures = admission.backend.using::<ConvoyEnsure>("test");
+        let ensure = ensures.get("standing").await.expect("ensure");
+        let convoys = admission.backend.using::<ResourceConvoy>("test");
+        let name = ensure.status.as_ref().expect("status").convoy_ref.as_ref().expect("convoy");
+        let failed = convoys.get(name).await.expect("failed convoy");
+        clock.advance(failed.metadata.creation_timestamp + ChronoDuration::hours(24) - clock.now());
+        let mut status = failed.status.expect("status");
+        status.finished_at = Some(clock.now());
+        convoys.update_status(name, &failed.metadata.resource_version, &status).await.expect("failure time");
+        for _ in 0..3 {
+            let controller = EnsureReconciler::builder().resource_backend(admission.backend.clone()).clock(clock.clone()).build();
+            let ensure = ensures.get("standing").await.expect("ensure");
+            controller.pass(&admission).reconcile_driver_convoy_ensure("test", &ensure, &Backing::Dead, false).await.expect("backoff");
+            assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
+            clock.advance(ChronoDuration::seconds(10));
+        }
+        let ensure = ensures.get("standing").await.expect("ensure");
+        controller
+            .pass(&admission)
+            .reconcile_driver_convoy_ensure("test", &ensure, &Backing::Dead, false)
+            .await
+            .expect("readmit after delay");
+        assert_eq!(admission.commits.load(Ordering::SeqCst), 2);
     }
 
     // #2220: read-only admission refusals obey their deadline, survive controller

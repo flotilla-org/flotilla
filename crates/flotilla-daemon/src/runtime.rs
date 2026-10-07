@@ -5103,7 +5103,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 for request in requests {
                     let token_file = if let Some((repository, token_file)) = prepared_by_credential.get(&request.credential) {
                         if repository != &request.repository {
-                            tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, "skill-source credential mint failed");
+                            tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, error = "one credential cannot be narrowed to multiple source repositories", "skill-source credential mint failed");
                             let error = format!(
                                 "skill source {} credential {} mint failed: one credential cannot be narrowed to multiple source repositories",
                                 request.source, request.credential
@@ -5120,7 +5120,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                         token_file.clone()
                     } else {
                         let Some(store) = &self.state.credential_store else {
-                            tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, "skill-source credential mint failed");
+                            tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, error = "host-local credential store unavailable", "skill-source credential mint failed");
                             let error = format!(
                                 "skill source {} credential {} mint failed: host-local credential store unavailable",
                                 request.source, request.credential
@@ -5133,7 +5133,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                                 token_file
                             }
                             Err(error) => {
-                                tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, "skill-source credential mint failed");
+                                tracing::warn!(environment = name, source = %request.source, revision = %request.revision, credential = %request.credential, %error, "skill-source credential mint failed");
                                 let error =
                                     format!("skill source {} credential {} mint failed: {error}", request.source, request.credential);
                                 return Err(discard_failed_environment(

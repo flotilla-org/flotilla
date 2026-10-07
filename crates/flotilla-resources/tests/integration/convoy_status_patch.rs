@@ -76,6 +76,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
 
 fn pending_work() -> WorkState {
     WorkState {
+        provisioning_retry: None,
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
@@ -459,6 +460,7 @@ fn crew_completion_updates_only_the_calling_agent() {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Running,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
@@ -531,6 +533,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Running,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
@@ -661,6 +664,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Complete,
             completion_authority: WorkCompletionAuthority::HumanOverride,
             ready_at: Some(ts(8)),
@@ -721,6 +725,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Complete,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
@@ -772,6 +777,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Launching,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
@@ -820,6 +826,7 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Launching,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
@@ -907,6 +914,7 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         work: BTreeMap::from([
             ("implement".to_string(), pending_work()),
             ("review".to_string(), WorkState {
+                provisioning_retry: None,
                 phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(5)),
@@ -966,6 +974,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([
             ("implement".to_string(), WorkState {
+                provisioning_retry: None,
                 phase: WorkPhase::Failed,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(10)),
@@ -975,6 +984,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
                 placement: None,
             }),
             ("review".to_string(), WorkState {
+                provisioning_retry: None,
                 phase: WorkPhase::Running,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(20)),
@@ -1011,6 +1021,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
 #[test]
 fn roll_up_phase_only_touches_convoy_level_fields() {
     let review = WorkState {
+        provisioning_retry: None,
         phase: WorkPhase::Complete,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: Some(ts(10)),
@@ -1071,6 +1082,7 @@ fn forced_work_completion_claim_enters_landing() {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("review".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Running,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(10)),
@@ -1119,6 +1131,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
+            provisioning_retry: None,
             phase: WorkPhase::Running,
             completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: None,

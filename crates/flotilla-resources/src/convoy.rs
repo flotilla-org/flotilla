@@ -1286,6 +1286,10 @@ impl ConvoyPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkState {
+    /// Provisioning retry budget survives vessel teardown and controller restart.
+    /// ADR 0047: remove this decoder default one fleet roll after #2875.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning_retry: Option<crate::ControllerRetry>,
     pub phase: WorkPhase,
     /// Authority responsible for settling this work at the roll-up level.
     #[builder(default)]
@@ -1553,6 +1557,11 @@ pub enum ConvoyStatusPatch {
         /// Crew whose sessions the vessel actually launched. Latent agents are
         /// absent and stay `Pending` until a handoff starts them.
         launched_roles: BTreeSet<String>,
+    },
+    WorkProvisioningRetry {
+        work: String,
+        retry: crate::ControllerRetry,
+        message: String,
     },
     WorkInterrupted {
         work: String,
@@ -1920,6 +1929,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::WorkRunning { work, started_at, launched_roles } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    state.provisioning_retry = None;
+                }
+                if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = None;
@@ -1938,6 +1950,20 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.phase = CrewWorkPhase::Working;
                         state.message = None;
                     }
+                }
+            }
+            Self::WorkProvisioningRetry { work, retry, message } => {
+                let roles = status
+                    .crew_work
+                    .get(work)
+                    .into_iter()
+                    .flat_map(|crew| crew.iter())
+                    .filter(|(_, state)| state.phase == CrewWorkPhase::Working)
+                    .map(|(role, _)| role.clone())
+                    .collect();
+                Self::WorkInterrupted { work: work.clone(), roles, message: message.clone() }.apply(status);
+                if let Some(state) = status.work.get_mut(work) {
+                    state.provisioning_retry = Some(retry.clone());
                 }
             }
             Self::WorkInterrupted { work, roles, message } => {
