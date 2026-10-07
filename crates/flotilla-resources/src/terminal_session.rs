@@ -159,7 +159,7 @@ pub struct TerminalCrewMessage {
     pub text: String,
     /// Sender attribution for surfaces and audit. The default decodes records
     /// written before sender framing; remove after the next fleet roll.
-    #[serde(default)]
+    #[serde(default, serialize_with = "flotilla_protocol::serialize_legacy_crew_sender")]
     pub sender: CrewMessageSender,
     /// Decodes queued messages stored before launch-brief attribution; remove
     /// after the next fleet roll.

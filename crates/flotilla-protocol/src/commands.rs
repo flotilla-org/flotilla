@@ -356,7 +356,7 @@ pub struct ExplainedCrewDelivery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender: Option<crate::CrewMessageSender>,
+    pub sender: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_briefs: Vec<String>,
 }
@@ -903,6 +903,8 @@ pub enum CommandAction {
         context: CrewCommandContext,
         target: String,
         message: String,
+        #[serde(default)]
+        carries: Vec<crate::MessageReference>,
     },
     CrewComplete {
         context: CrewCommandContext,
@@ -1656,6 +1658,7 @@ mod tests {
                 .build(),
             Command::builder()
                 .action(CommandAction::CrewHandoff {
+                    carries: Vec::new(),
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: "reviewer".into(),
                     message: "review this".into(),

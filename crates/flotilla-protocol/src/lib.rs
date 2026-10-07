@@ -10,6 +10,8 @@ mod host;
 mod host_summary;
 pub mod issue_query;
 pub mod leaf;
+mod message_reference;
+pub use message_reference::MessageReference;
 mod lifecycle;
 pub mod output;
 pub mod path_context;
@@ -102,10 +104,12 @@ impl Default for PrincipalRef {
     }
 }
 
-/// Structured attribution for text delivered into a crew session. This wire
-/// type is also persisted in TerminalSession and Convoy records, so changes
-/// must preserve one generation of stored-data decoding (ADR 0047).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Previous-generation attribution, used only to decode and adopt stored queues.
+/// New producers use Message sender addresses and relations. Serialization of
+/// unadopted envelopes is isolated in serialize_legacy_crew_sender so they survive
+/// an unrelated CAS; production inputs never construct this envelope.
+/// Remove after the first fleet roll deploying #2710 (ADR 0047).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CrewMessageSender {
     #[default]
@@ -132,6 +136,40 @@ pub enum CrewMessageSender {
     Handoff {
         from: String,
     },
+}
+
+/// Preserve an unadopted previous-generation envelope during unrelated status CAS.
+/// New Message writers must never call this shim. Remove after the first fleet
+/// roll deploying #2710, together with CrewMessageSender (ADR 0047).
+pub fn serialize_legacy_crew_sender<S: serde::Serializer>(sender: &CrewMessageSender, serializer: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let fields = match sender {
+        CrewMessageSender::Unknown | CrewMessageSender::FlotillaNudge => 1,
+        _ => 2,
+    };
+    let mut record = serializer.serialize_map(Some(fields))?;
+    let kind = match sender {
+        CrewMessageSender::Unknown => "unknown",
+        CrewMessageSender::FlotillaNudge => "flotilla-nudge",
+        CrewMessageSender::FlotillaTurn { .. } => "flotilla-turn",
+        CrewMessageSender::FlotillaEscalation { .. } => "flotilla-escalation",
+        CrewMessageSender::OperatorResume { .. } => "operator-resume",
+        CrewMessageSender::OperatorFollowUp { .. } => "operator-follow-up",
+        CrewMessageSender::Governor { .. } => "governor",
+        CrewMessageSender::Bosun { .. } => "bosun",
+        CrewMessageSender::Handoff { .. } => "handoff",
+    };
+    record.serialize_entry("kind", kind)?;
+    match sender {
+        CrewMessageSender::FlotillaTurn { source } => record.serialize_entry("source", source)?,
+        CrewMessageSender::FlotillaEscalation { from } | CrewMessageSender::Handoff { from } => record.serialize_entry("from", from)?,
+        CrewMessageSender::OperatorResume { principal } | CrewMessageSender::OperatorFollowUp { principal } => {
+            record.serialize_entry("principal", principal)?
+        }
+        CrewMessageSender::Governor { name } | CrewMessageSender::Bosun { name } => record.serialize_entry("name", name)?,
+        CrewMessageSender::Unknown | CrewMessageSender::FlotillaNudge => {}
+    }
+    record.end()
 }
 
 impl CrewMessageSender {

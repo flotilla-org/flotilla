@@ -59,8 +59,11 @@ pub enum CrewVerb {
     Handoff {
         #[arg(long)]
         message: String,
+        /// Typed Message reference as JSON; repeat for each carried resource/revision.
+        #[arg(long = "carry", value_parser = parse_carry)]
+        carries: Vec<flotilla_protocol::MessageReference>,
     },
-    /// Resume stalled crew work with guidance
+    /// Resume stalled crew work, or send mid-turn guidance to working crew as an operator
     Resume {
         #[arg(long)]
         message: String,
@@ -75,6 +78,10 @@ pub enum CrewVerb {
         #[arg(long)]
         message: String,
     },
+}
+
+fn parse_carry(value: &str) -> Result<flotilla_protocol::MessageReference, String> {
+    serde_json::from_str(value).map_err(|error| format!("invalid typed Message reference: {error}"))
 }
 
 impl CrewNoun {
@@ -224,7 +231,9 @@ impl CrewNoun {
             (_, _, Some(_)) if self.force => {
                 return Err("--force is only valid with `flotilla crew complete` or `flotilla crew fail`".to_string())
             }
-            (_, _, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: subject.value, message },
+            (_, _, Some(CrewVerb::Handoff { message, carries })) => {
+                CommandAction::CrewHandoff { context, target: subject.value, message, carries }
+            }
             (_, _, Some(_)) => return Err("resume, fail, and escalate require `flotilla crew supervise`".to_string()),
             (_, _, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
         };
@@ -279,12 +288,17 @@ impl std::fmt::Display for CrewNoun {
         }
         if let Some(verb) = &self.verb {
             let (name, message) = match verb {
-                CrewVerb::Handoff { message } => ("handoff", message),
+                CrewVerb::Handoff { message, .. } => ("handoff", message),
                 CrewVerb::Resume { message } => ("resume", message),
                 CrewVerb::ConvertToFailed { message } => ("convert-to-failed", message),
                 CrewVerb::Escalate { message } => ("escalate", message),
             };
             write!(f, " {name} --message {}", quote_value(message))?;
+            if let CrewVerb::Handoff { carries, .. } = verb {
+                for carry in carries {
+                    write!(f, " --carry {}", quote_value(&serde_json::to_string(carry).expect("typed carry")))?;
+                }
+            }
         }
         Ok(())
     }
@@ -423,6 +437,7 @@ mod tests {
     fn handoff_preserves_target_and_message() {
         let noun = CrewNoun::try_parse_from(["crew", "reviewer", "handoff", "--message", "Review commit abc123"]).expect("parse handoff");
         assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
+            carries: Vec::new(),
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
             target: "reviewer".into(),
             message: "Review commit abc123".into(),
@@ -435,6 +450,7 @@ mod tests {
             let marked = format!("@{role}");
             let noun = CrewNoun::try_parse_from(["crew", &marked, "handoff", "--message", "continue"]).expect("parse marked crew role");
             assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
+                carries: Vec::new(),
                 context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 target: role.into(),
                 message: "continue".into(),
@@ -456,6 +472,7 @@ mod tests {
         let noun = CrewNoun::try_parse_from(["crew", "--subject", "@reviewer", "handoff", "--message", "continue"])
             .expect("parse explicit crew subject");
         assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
+            carries: Vec::new(),
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
             target: "@reviewer".into(),
             message: "continue".into(),
@@ -586,6 +603,24 @@ mod tests {
             "--message",
             "review-abc123",
         ]);
+    }
+
+    // Glue: the CLI forwards exactly the shared typed reference and preserves it on round-trip.
+    #[test]
+    fn handoff_carries_typed_references() {
+        let carry = r#"{"kind":"control_record","resource":{"api_version":"flotilla.work/v1","kind":"Convoy","namespace":"flotilla","name":"demo"},"revision":"rv-1"}"#;
+        let args = ["crew", "demo/review/reviewer", "handoff", "--message", "review", "--carry", carry];
+        let noun = CrewNoun::try_parse_from(args).expect("typed carry");
+        let CommandAction::CrewHandoff { target, carries, .. } = action(noun, Some("crew-123")) else { panic!("handoff action") };
+        assert_eq!(target, "demo/review/reviewer");
+        assert_eq!(carries.len(), 1);
+        assert_eq!(carries[0], flotilla_protocol::MessageReference::ControlRecord {
+            resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"),
+            revision: "rv-1".into(),
+        });
+        assert_round_trip::<CrewNoun>(&args);
+        CrewNoun::try_parse_from(["crew", "reviewer", "handoff", "--message", "review", "--carry", "scratch.log"])
+            .expect_err("untyped paths are not Message references");
     }
 
     #[test]

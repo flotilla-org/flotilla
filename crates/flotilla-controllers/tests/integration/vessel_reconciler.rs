@@ -2208,6 +2208,13 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     ];
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].credential_scopes =
         BTreeMap::from([("github-app".to_string(), BTreeSet::from([repo_ref.clone()]))]);
+    status.crew_work.insert(
+        "implement".into(),
+        BTreeMap::from([
+            ("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+            ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
+        ]),
+    );
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
@@ -2229,7 +2236,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .await
         .expect("workspace create");
 
-    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2262,6 +2269,54 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .actuations
         .iter()
         .all(|actuation| { !matches!(actuation, Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer") }));
+
+    // A cross-vessel handoff activates work before publishing its Message. The Vessel
+    // controller must then provision the formerly latent receiver without embedding input.
+    let (meta, spec) = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateTerminalSession { meta, spec } => Some((meta, spec)),
+            _ => None,
+        })
+        .expect("coder actuation");
+    let sessions = backend.using::<TerminalSession>(NAMESPACE);
+    let coder = sessions.create(meta, spec).await.expect("materialize coder");
+    sessions
+        .update_status(&coder.metadata.name, &coder.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            ..Default::default()
+        })
+        .await
+        .expect("running coder");
+    flotilla_resources::apply_status_patch(
+        &backend.using::<Convoy>(NAMESPACE),
+        "convoy-crew",
+        &flotilla_resources::external_patches::resume_crew_work(
+            "implement".into(),
+            "reviewer".into(),
+            Utc::now(),
+            "review carried revision".into(),
+            Some("handoff-message".into()),
+        ),
+    )
+    .await
+    .expect("handoff activation");
+    let deps = reconciler.prepare(&workspace).await.expect("activated deps");
+    let activated = reconciler.reconcile(&workspace, &deps, Utc::now());
+    let reviewer = activated
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer" => Some(spec),
+            _ => None,
+        })
+        .expect("activated reviewer must be provisioned");
+    let TerminalSessionSource::Agent { brief, message, .. } = &reviewer.source else {
+        panic!("reviewer agent launch");
+    };
+    assert!(brief.content.contains("- `reviewer`: active"));
+    assert_eq!(message, &None, "receiver input remains owned by Message delivery");
 }
 
 #[tokio::test]

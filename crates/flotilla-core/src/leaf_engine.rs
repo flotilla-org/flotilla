@@ -87,6 +87,19 @@ pub struct CrewTurnIntent {
     pub expectation: flotilla_resources::MessageExpectation,
 }
 
+pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
+    format!("{project}/{convoy}/{vessel}/{role}")
+}
+
+/// Immutable producer key shared by escalation publication and pre-replication replies.
+pub(crate) fn turn_message_producer_key(source: &str, subject_revision: &str) -> String {
+    format!("turn-delivery:{source}:{subject_revision}")
+}
+
+pub(crate) fn supervision_message_source(convoy: &str, index: usize) -> String {
+    format!("supervision-{convoy}-{index}")
+}
+
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewTurnAdmission {
@@ -2412,13 +2425,25 @@ impl ReconcilerWake {
                                 let delivery = CrewTurnIntent::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(target_convoy.clone())
-                                    .source(format!("supervision-{}-{index}", convoy.metadata.name))
+                                    .source(supervision_message_source(&convoy.metadata.name, index))
                                     .vessel(target_vessel.clone())
                                     .role(target_role.clone())
                                     .brief(brief)
                                     .subject_revision(condition.began_at.timestamp_micros().to_string())
-                                    .sender("system:stall-judge".into())
+                                    .sender(
+                                        stalled_source_actor(&condition)
+                                            .map(|(vessel, role)| {
+                                                crew_role_address(
+                                                    convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                                                    &convoy.metadata.name,
+                                                    vessel,
+                                                    role,
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "system:stall-judge".into()),
+                                    )
                                     .relation(flotilla_resources::MessageRelation::Supervisor)
+                                    .expectation(flotilla_resources::MessageExpectation::Reply)
                                     .references(vec![flotilla_resources::MessageReference::ControlRecord {
                                         resource: flotilla_protocol::ResourceRef::new(
                                             "flotilla.work/v1",
@@ -4653,6 +4678,9 @@ mod tests {
         let requests = delivery.requests.lock().expect("supervisor requests");
         assert!(!requests.is_empty(), "missing session should be supervised: {:?}", status.stalled);
         assert_eq!(requests[0].convoy, "governor");
+        // Escalations retain the fully-qualified source crew, including its convoy.
+        assert_eq!(requests[0].sender, "wheelhouse/stalled-work/work/coder");
+        assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
     }
 
     async fn create_governor_ensure(backend: &ResourceBackend, convoy_ref: &str) {
@@ -5089,6 +5117,9 @@ mod tests {
         let requests = delivery.requests.lock().expect("deliveries");
         assert_eq!(requests.len(), 1, "remote governor must receive its escalation");
         assert_eq!(requests[0].convoy, "governor");
+        // Escalations retain the fully-qualified source crew, including its convoy.
+        assert_eq!(requests[0].sender, "wheelhouse/stalled-work/work/coder");
+        assert_eq!(requests[0].expectation, flotilla_resources::MessageExpectation::Reply);
     }
 
     // ProjectCrew requires project scope; a missing ref must be diagnostic,
