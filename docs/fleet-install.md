@@ -179,3 +179,77 @@ emergency canary bypass before invoking `--canary`. It runs the finalized
 generation's Docker canary without changing `current`; inspect retained
 diagnostics on failure before proceeding with a normal install. No Docker or
 live fleet is needed for the local tests.
+
+## Automatic pre-roll refusals
+
+Before any consumer install, use a checkout of the **exact generation source
+revision**, after finalization. Run the operator gate from that checkout:
+
+```bash
+scripts/fleet-preroll-checks.sh <generation> --consumer feta --consumer comte --consumer <other-consumer>
+```
+
+Repeat `--consumer` for every installation consumer in the current fleet,
+including the desk and feta. The list is explicit so a changing fleet cannot
+silently inherit a stale hard-coded inventory. A successful gate is required
+before proceeding to the existing candidate record/ops validation, feta canary
+and install/health-check steps. Run it again if tools or bootstrap files change.
+The script never installs or changes the active generation.
+
+The read-only gate hashes raclette's `/usr/local/sbin/lab-fleet-promote`,
+`lab-fleet-finalize-darwin`, and `generation_validation.py` via
+`ssh silo 'qm guest exec 106 ...'`, and comte's
+`~/.local/libexec/lab-darwin-sign` and `generation_validation.py` via `ssh comte`.
+Each must match `ci/fleet-candidates/` in the generation source checkout.
+A refusal names the remote file and installed and generation SHA256 values.
+Missing files and remote failures refuse too. SSH uses a ten-second connect
+timeout, with a 120-second total command deadline. The gate collects lab and
+consumer failures in one refusal list; any lab failure disables all repairs. Lab copies are operator-owned:
+this gate never pushes or repairs them, even when bootstrap repair is requested.
+Sync lab tools through the existing operator deployment procedure and rerun.
+
+The gate then checks **both** `~/.local/bin/fleet-install` and its adjacent
+`generation_validation.py` on every consumer against `scripts/fleet-install`
+and `ci/fleet-candidates/generation_validation.py`. A mismatch refuses before
+installation and prints this exact paired sync command for the affected host:
+
+```bash
+scripts/fleet-preroll-checks.sh <generation> --source-root <generation-checkout> --consumer <host> --sync-bootstrap
+```
+
+This explicit repair saves both installed files as `.pre-<generation>` before
+writing either generation file, preserves their modes, and rechecks both hashes.
+An existing backup, missing installed file, or symlink refuses repair. A write
+failure restores both old contents with atomic file replacement. Backup,
+replacement and restore file contents are fsynced before proceeding. Run without repair against the **full**
+consumer list again before installing. Do not manually copy just one member.
+Repair assumes the operator has stopped concurrent bootstrap installs; it does
+not acquire the installer's mutation lock. Retain the backups for rollback
+inspection; bootstrap compatibility with old generations remains required.
+
+After a failed repair, stop any still-running repair process and inspect both
+installed files against the retained `.pre-<generation>` backups. The gate
+keeps those backups as recovery evidence and removes only temporary files it
+created. A pre-existing `.new-<generation>` collision is left untouched. After
+confirming the original pair is restored (or restoring both from the backups),
+remove both `.pre-<generation>` backups and any inspected stale
+`.new-<generation>` files together before retrying the paired sync command.
+Never remove these files while an install or repair is active.
+
+For live operator acceptance, first run the read-only full-list command above.
+On a lab tool mismatch, confirm the diagnostic names both hashes and that no
+consumer files changed; sync the operator-owned tool and rerun. For a bootstrap
+mismatch, confirm refusal, run the explicit paired command, inspect both
+`.pre-<generation>` backups, and rerun the full-list gate. Then run
+`scripts/fleet-bootstrap-acceptance.sh` on feta before normal installation.
+No live acceptance was run in a crew container without SSH or Docker.
+
+Local coverage is `python3 scripts/test-fleet-preroll-checks.py`, also included
+in `scripts/test-fleet-install.sh`. `--host-command /path/to/executable` injects
+the process boundary: it receives `HOST COMMAND` as two arguments, a Python
+program on stdin, and returns a JSON array of hashes on stdout. Production
+uses batch-mode SSH and Proxmox guest-exec; tests use no SSH or live fleet.
+Every target needs `python3` on its non-interactive SSH/guest-exec PATH,
+including comte on macOS; an interactive shell-only PATH setup is insufficient.
+A failed rollback names the original failure, each unrestored file, and both
+retained backups for operator recovery.
