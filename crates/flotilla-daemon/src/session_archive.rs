@@ -69,14 +69,21 @@ pub(crate) async fn sweep(
     now: DateTime<Utc>,
 ) -> Result<(), String> {
     let retention = chrono::Duration::try_days(i64::try_from(days).unwrap_or(i64::MAX)).unwrap_or(chrono::Duration::MAX);
+    let mut errors = Vec::new();
     for record in storage.archived().await? {
         if !live.contains(&(record.namespace.clone(), record.convoy.clone()))
             && record.archived_at.is_some_and(|at| now.signed_duration_since(at) > retention)
         {
-            storage.prune(&record).await?;
+            if let Err(error) = storage.prune(&record).await {
+                errors.push(format!("{}: {error}", record.id));
+            }
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub(crate) struct HostSessionArchive {
@@ -108,6 +115,9 @@ impl HostSessionArchive {
         log_path: Option<&str>,
         delivered_brief: Option<&str>,
     ) -> Result<Option<String>, String> {
+        // Hook dispatch and metadata observation may use different adapter instances.
+        static REGISTRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = REGISTRATION.lock().await;
         let TerminalSessionSource::Agent { context, brief, .. } = &spec.source else { return Ok(None) };
         let vessel = context.vessel_ref.strip_prefix(&format!("{}-", context.convoy)).unwrap_or(&context.vessel_ref);
         let brief_path =
@@ -239,7 +249,13 @@ async fn read_records(root: &Path, recursive: bool) -> Result<Vec<SessionRecord>
                 && (entry.file_name() == "session.json" || (!recursive && entry.path().extension().is_some_and(|ext| ext == "json")))
             {
                 let bytes = tokio::fs::read(entry.path()).await.map_err(|error| error.to_string())?;
-                records.push(serde_json::from_slice(&bytes).map_err(|error| format!("decode {}: {error}", entry.path().display()))?);
+                match serde_json::from_slice(&bytes) {
+                    Ok(record) => records.push(record),
+                    Err(error) if recursive => {
+                        tracing::warn!(path = %entry.path().display(), %error, "malformed archive identity preserved")
+                    }
+                    Err(error) => return Err(format!("decode {}: {error}", entry.path().display())),
+                }
             }
         }
     }
@@ -298,7 +314,7 @@ impl ArchiveStorage for HostSessionArchive {
         let destination = self.destination(record)?;
         let source = self.homes.join(component(environment)?).join(if record.adapter == "codex" { "codex" } else { "claude" });
         let crew = source.join("crews").join(component(&record.role)?);
-        let home = if tokio::fs::try_exists(&crew).await.map_err(|error| error.to_string())? { crew } else { source };
+        let home = if tokio::fs::try_exists(&crew).await.map_err(|error| error.to_string())? { crew } else { source.clone() };
         let base = self.homes.join(component(environment)?);
         let mut ancestor = base.clone();
         for part in home.strip_prefix(&base).map_err(|error| error.to_string())?.components() {
@@ -323,9 +339,12 @@ impl ArchiveStorage for HostSessionArchive {
             // Require the known transcript to exist, rather than silently claim
             // an archive when its only identified evidence is missing.
             tokio::fs::symlink_metadata(&log).await.map_err(|error| format!("identified session log {}: {error}", log.display()))?;
-            copy_evidence(&log, &temporary.join("identified-log.jsonl")).await?;
-            let relative = log.strip_prefix(&home).map_err(|error| error.to_string())?;
-            copy_evidence(&log, &temporary.join(relative)).await?;
+            // Legacy Claude logs may live at the adapter root even when a
+            // private role home exists. Both paths are within the managed home.
+            let relative = log.strip_prefix(&home).or_else(|_| log.strip_prefix(&source)).map_err(|error| error.to_string())?;
+            let archived_log = temporary.join(relative);
+            copy_evidence(&log, &archived_log).await?;
+            tokio::fs::hard_link(&archived_log, temporary.join("identified-log.jsonl")).await.map_err(|error| error.to_string())?;
         } else {
             // A launched harness may die before reporting its native identity.
             // Preserve its private log trees under the known launch ID.
@@ -375,7 +394,23 @@ impl ArchiveStorage for HostSessionArchive {
         read_records(&self.archive_root, true).await
     }
     async fn prune(&self, record: &SessionRecord) -> Result<(), String> {
-        tokio::fs::remove_dir_all(self.destination(record)?).await.map_err(|error| error.to_string())
+        let destination = self.destination(record)?;
+        match tokio::fs::remove_dir_all(&destination).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let mut parent = destination.parent();
+        while let Some(path) = parent.filter(|path| *path != self.archive_root) {
+            match tokio::fs::remove_dir(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+                Err(error) => return Err(error.to_string()),
+            }
+            parent = path.parent();
+        }
+        Ok(())
     }
 }
 
@@ -428,7 +463,11 @@ mod tests {
         }
         async fn prune(&self, record: &SessionRecord) -> Result<(), String> {
             self.calls.lock().expect("calls").push(record.id.clone());
-            Ok(())
+            if self.fail {
+                Err("prune unavailable".into())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -501,6 +540,45 @@ mod tests {
         sweep(&storage, &BTreeSet::new(), 30, Utc::now() + chrono::Duration::days(31)).await.expect("prune");
         assert!(!archived.exists());
     }
+
+    // Individual failures cannot starve later expired records.
+    #[tokio::test]
+    async fn retention_continues_after_prune_errors() {
+        let storage = MemoryStorage { records: vec![record("first", 31), record("second", 31)], calls: Mutex::new(vec![]), fail: true };
+        assert!(sweep(&storage, &BTreeSet::new(), 30, Utc::now()).await.is_err());
+        assert_eq!(*storage.calls.lock().expect("calls"), vec!["first", "second"]);
+    }
+
+    // Both private and legacy adapter-root Claude layouts retain identified logs.
+    #[tokio::test]
+    async fn claude_layout_and_malformed_archive_do_not_block_retention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env = TestEnvVars::new([("HOME", temp.path().to_str().expect("path"))]);
+        let storage = HostSessionArchive::new(&env);
+        let root = storage.homes.join("env/claude");
+        tokio::fs::create_dir_all(root.join("crews/coder")).await.expect("private home");
+        for (id, relative) in [("private", "crews/coder/projects/log.jsonl"), ("legacy", "projects/log.jsonl")] {
+            let log = root.join(relative);
+            tokio::fs::create_dir_all(log.parent().expect("parent")).await.expect("log parent");
+            tokio::fs::write(&log, id).await.expect("log");
+            let mut record = record(id, 0);
+            record.adapter = "claude-code".into();
+            record.log_path = Some(format!("{CONTAINER_CLAUDE_HOME}/{relative}"));
+            storage.archive("env", &record, Utc::now() - chrono::Duration::days(31)).await.expect("archive");
+            let archived = storage.destination(&record).expect("destination");
+            assert_eq!(tokio::fs::read_to_string(archived.join("identified-log.jsonl")).await.expect("log"), id);
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(archived.join("identified-log.jsonl")).expect("alias").nlink(), 2);
+        }
+        let malformed = storage.archive_root.join("bad/work/coder/session/session.json");
+        tokio::fs::create_dir_all(malformed.parent().expect("parent")).await.expect("malformed parent");
+        tokio::fs::write(&malformed, "invalid").await.expect("malformed");
+        sweep(&storage, &BTreeSet::new(), 30, Utc::now()).await.expect("other archives pruned");
+        assert!(malformed.exists());
+        assert!(!storage.archive_root.join("convoy").exists(), "empty parents reclaimed");
+        storage.prune(&record("private", 31)).await.expect("already removed is harmless");
+    }
+
     // Metadata identity comes from Codex's index, even before a log tree exists.
     #[tokio::test]
     async fn codex_metadata_reads_only_declared_thread_identities() {

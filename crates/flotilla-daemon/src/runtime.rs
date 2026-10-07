@@ -7047,37 +7047,45 @@ impl TerminalRuntime for TerminalControllerRuntime {
             spec.env_ref != self.state.host_direct_environment_name && adapter.as_ref().is_some_and(|adapter| adapter.id() == "codex")
         }) {
             let archive = &material.archive;
-            match archive.codex_metadata(&spec.env_ref, &spec.role).await {
-                Ok(logs) if !logs.is_empty() => {
-                    if let TerminalSessionSource::Agent { context, .. } = &spec.source {
-                        let sessions = self.state.daemon.resource_backend().using::<TerminalSession>(&context.namespace);
-                        for session in sessions.list().await.map_err(|error| error.to_string())?.items {
-                            if session.spec.env_ref == spec.env_ref && session.spec.role == spec.role {
-                                for (id, path) in &logs {
-                                    if let Some(location) = archive.register(spec, id, "codex", Some(path), None).await? {
-                                        if !session.status.as_ref().is_some_and(|status| {
-                                            status.session_logs.get(id) == Some(path) && status.session_archives.get(id) == Some(&location)
-                                        }) {
-                                            flotilla_resources::apply_status_patch(
-                                                &sessions,
-                                                &session.metadata.name,
-                                                &flotilla_resources::TerminalSessionStatusPatch::ObserveSessionLog {
-                                                    session_id: id.clone(),
-                                                    path: path.clone(),
-                                                    archive: location,
-                                                },
-                                            )
-                                            .await
-                                            .map_err(|error| error.to_string())?;
+            let capture = async {
+                match archive.codex_metadata(&spec.env_ref, &spec.role).await {
+                    Ok(logs) if !logs.is_empty() => {
+                        if let TerminalSessionSource::Agent { context, .. } = &spec.source {
+                            let sessions = self.state.daemon.resource_backend().using::<TerminalSession>(&context.namespace);
+                            for session in sessions.list().await.map_err(|error| error.to_string())?.items {
+                                if session.spec.env_ref == spec.env_ref && session.spec.role == spec.role {
+                                    for (id, path) in &logs {
+                                        if let Some(location) = archive.register(spec, id, "codex", Some(path), None).await? {
+                                            if !session.status.as_ref().is_some_and(|status| {
+                                                status.session_logs.get(id) == Some(path)
+                                                    && status.session_archives.get(id) == Some(&location)
+                                            }) {
+                                                flotilla_resources::apply_status_patch(
+                                                    &sessions,
+                                                    &session.metadata.name,
+                                                    &flotilla_resources::TerminalSessionStatusPatch::ObserveSessionLog {
+                                                        session_id: id.clone(),
+                                                        path: path.clone(),
+                                                        archive: location,
+                                                    },
+                                                )
+                                                .await
+                                                .map_err(|error| error.to_string())?;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Codex session metadata unavailable; will retry"),
                 }
-                Ok(_) => {}
-                Err(error) => warn!(%error, "Codex session metadata unavailable; will retry"),
+                Ok::<_, String>(())
+            }
+            .await;
+            if let Err(error) = capture {
+                warn!(%error, "session identity capture unavailable; attention observation continues");
             }
         }
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await

@@ -654,3 +654,39 @@ this per host in `~/.config/flotilla/daemon.toml`:
 ```toml
 session_archive_retention_days = 30
 ```
+
+### Recovering a blocked session archive
+
+A missing identity manifest or unavailable identified transcript holds the
+finalizer, including forced deletion. Force never bypasses evidence protection.
+Check the diagnostic on the placement host; paths use that daemon's `HOME`
+(the same `/var/lib/flotilla` fallback as agent-home provisioning when unset).
+Keep this environment stable across daemon restarts.
+
+For an identified log, restore the reported JSONL path from a trusted backup,
+or correct `log_path` in the matching
+`agent-homes/<environment>/.session-records/<session-id>.json` to the actual
+managed host-home JSONL path. Do not point it at auth or an external file.
+The finalizer retries automatically. Retry snapshots include later log bytes
+and reset `archived_at`, so retention runs from the last successful snapshot.
+
+For pre-roll homes without manifests, or irrecoverably missing logs, stop the
+harness and daemon first to avoid concurrent writes. Preserve the entire home
+in a private operator quarantine outside `agent-homes` (it may contain secrets):
+
+```bash
+# Substitute the exact environment name from the finalizer diagnostic.
+environment=env-convoy-example-work
+archive_base="$HOME/.local/share/flotilla"
+quarantine=$(mktemp -d "$HOME/flotilla-session-quarantine.XXXXXX")
+chmod 700 "$quarantine"
+mv -- "$archive_base/agent-homes/$environment" "$quarantine/home"
+```
+
+Review the quarantine locally, attribute each transcript using harness metadata
+or surviving session references, and copy only the documented evidence allowlist
+into the proper session archive. Keep credentials private and outside the archive;
+do not upload the quarantine. Verify retained logs and attribution before restarting
+the daemon. The now-absent managed home unblocks backing reclamation without
+requiring deletion of the quarantined evidence. Retention does not manage this
+operator quarantine; the operator owns its eventual cleanup.
