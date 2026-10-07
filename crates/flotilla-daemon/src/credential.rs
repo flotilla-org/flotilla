@@ -1008,6 +1008,82 @@ impl CredentialStore {
         }
     }
 
+    /// Registry host actions resolve only declared material and own their private
+    /// Docker configuration for this operation, including error/cancellation cleanup.
+    pub(crate) async fn image_registry_operation(
+        &self,
+        host: &str,
+        action: flotilla_resources::HostImageAction,
+        credential: &str,
+        repository: &str,
+        arguments: &[&str],
+    ) -> Result<String, String> {
+        use flotilla_resources::{CredentialGrant, Host, HostImageAction, ImageBuildCapacity};
+        let verb = match action {
+            HostImageAction::ImagePush => "push",
+            HostImageAction::ImagePull => "pull",
+        };
+        if arguments.len() != 2 || arguments[0] != verb || !image_registry_matches(arguments[1], repository.split('/').next().unwrap_or(""))
+        {
+            return Err("host image action requires its declared registry operation".into());
+        }
+        if !arguments[1].strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
+            return Err("host image operation does not target the declared repository".into());
+        }
+        if action == HostImageAction::ImagePull
+            && !arguments[1].rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
+        {
+            return Err("host image pull requires a manifest digest".into());
+        }
+        let hosts = self.backend.including_replicas::<Host>(&self.namespace).list().await.map_err(|error| error.to_string())?;
+        let declared_builder = hosts.items.iter().any(|source| {
+            source.object.metadata.name == host
+                && matches!(source.object.spec.image_build_capacity, Some(ImageBuildCapacity::Builder { slots, .. }) if slots > 0)
+        });
+        let grants = self.backend.definitions::<CredentialGrant>(&self.namespace).list().await.map_err(|error| error.to_string())?;
+        if !grants.iter().any(|grant| {
+            grant.spec.credentials.contains(credential) && grant.spec.selector.matches_host_action(host, action, declared_builder)
+        }) {
+            return Err(format!("host {host} has no {action:?} grant for credential {credential}"));
+        }
+        let spec = self.spec(credential).await?;
+        let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
+            return Err("image cache credential must use the docker-registry adapter".into());
+        };
+        if !image_registry_matches(repository, registry) {
+            return Err("image cache credential does not match declared registry".into());
+        }
+        let material = self.resolve_for_adapter(credential, &spec, None, None).await?;
+        let material = material.value.trim_end();
+        validate_scalar_material(credential, "docker-registry", material)?;
+        let root = self.state_dir.join("image-registry-operations");
+        tokio::fs::create_dir_all(&root).await.map_err(|error| error.to_string())?;
+        // TempDir removes the config on cancellation as well as every return path.
+        let config = tempfile::Builder::new().prefix("operation-").tempdir_in(root).map_err(|error| error.to_string())?;
+        tokio::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;
+        let directory = config.path().to_string_lossy();
+        let operation = async {
+            self.host_runner
+                .run_with_input(
+                    "docker",
+                    &["--config", &directory, "login", "--username", username, "--password-stdin", registry],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                    material.as_bytes(),
+                )
+                .await?;
+            let mut args = vec!["--config", directory.as_ref()];
+            args.extend_from_slice(arguments);
+            self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
+        };
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), operation)
+            .await
+            .map_err(|_| "image registry operation timed out".to_string())?
+            .map_err(|error| bounded_adapter_error(credential, "docker-registry", &error.replace(material, "[redacted]")))?;
+        // Return only Docker's non-secret operation output, never login output.
+        Ok(output.replace(material, "[redacted]"))
+    }
+
     pub(crate) async fn prepare_registry_pull(
         &self,
         environment_ref: &str,
@@ -5197,6 +5273,143 @@ interactions:
 
         assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    // #2729: image push needs a declared builder and a host-action grant.
+    // Each operation gets a distinct config that is gone when it returns;
+    // credentials are supplied on stdin and never in argv or a crew environment.
+    #[tokio::test]
+    async fn image_push_requires_host_grant_and_uses_throwaway_config() {
+        use flotilla_resources::{
+            CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, Host, HostActionSelector, HostImageAction, HostSpec,
+            ImageBuildCapacity, ImageBuildReservation,
+        };
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("registry".into()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "builder".into() },
+                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: Default::default(),
+            })
+            .await
+            .expect("credential");
+        let hosts = backend.using::<Host>("flotilla");
+        hosts.create(&InputMeta::builder().name("builder".into()).build(), &HostSpec::default()).await.expect("host");
+        let runner = Arc::new(RecordingRunner::default());
+        let state = tempfile::tempdir().expect("state");
+        let store = CredentialStore::new(
+            backend.clone(),
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "test-secret".into())]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            state.path().into(),
+        );
+        let operation = || {
+            store.image_registry_operation("builder", HostImageAction::ImagePush, "registry", "registry.example/images", &[
+                "push",
+                "registry.example/images:label",
+            ])
+        };
+        assert!(operation().await.expect_err("no grant").contains("no ImagePush grant"));
+        backend
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &InputMeta::builder().name("push".into()).build(),
+                &CredentialGrantSpec::builder()
+                    .selector(
+                        CredentialGrantSelector::builder()
+                            .host_action(HostActionSelector::builder().action(HostImageAction::ImagePush).build())
+                            .build(),
+                    )
+                    .credentials(BTreeSet::from(["registry".into()]))
+                    .build(),
+            )
+            .await
+            .expect("grant");
+        assert!(operation().await.is_err(), "implicit build capacity cannot authorize pushes");
+        assert!(runner.calls.lock().expect("calls").is_empty());
+        let host = hosts.get("builder").await.expect("host");
+        let mut spec = host.spec.clone();
+        spec.image_build_capacity = Some(ImageBuildCapacity::Builder {
+            architecture: "amd64".into(),
+            slots: 1,
+            reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1024 },
+        });
+        hosts.update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &spec).await.expect("builder");
+        operation().await.expect("push");
+        operation().await.expect("second push");
+        let calls = runner.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 4);
+        assert_ne!(calls[0].1[1], calls[2].1[1]);
+        for (index, (_, args, input)) in calls.iter().enumerate() {
+            assert_eq!(args[0], "--config");
+            assert!(!Path::new(&args[1]).exists(), "config removed after operation");
+            assert!(args[1].starts_with(state.path().to_str().expect("state path")));
+            assert!(!args.iter().any(|arg| arg.contains("test-secret")));
+            assert_eq!(input.as_slice(), if index % 2 == 0 { b"test-secret".as_slice() } else { &[] });
+        }
+    }
+
+    // Cancellation while login is in flight removes the config and never
+    // starts a pull; cleanup does not rely on the operation reaching a return.
+    #[tokio::test]
+    async fn cancelled_host_image_operation_removes_private_config() {
+        use flotilla_resources::{CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, HostActionSelector, HostImageAction};
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("registry".into()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "host".into() },
+                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: Default::default(),
+            })
+            .await
+            .expect("credential");
+        backend
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &InputMeta::builder().name("pull".into()).build(),
+                &CredentialGrantSpec::builder()
+                    .selector(
+                        CredentialGrantSelector::builder()
+                            .host_action(HostActionSelector::builder().action(HostImageAction::ImagePull).build())
+                            .build(),
+                    )
+                    .credentials(BTreeSet::from(["registry".into()]))
+                    .build(),
+            )
+            .await
+            .expect("grant");
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Semaphore::new(0)));
+        let runner = Arc::new(RecordingRunner { registry_login_gate: Some(gate.clone()), ..Default::default() });
+        let state = tempfile::tempdir().expect("state");
+        let store = Arc::new(CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "test-secret".into())]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            state.path().into(),
+        ));
+        let task = tokio::spawn(async move {
+            store
+                .image_registry_operation("host", HostImageAction::ImagePull, "registry", "registry.example/images", &[
+                    "pull",
+                    "registry.example/images@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                ])
+                .await
+        });
+        gate.0.notified().await;
+        let path = runner.calls.lock().expect("calls")[0].1[1].clone();
+        assert!(Path::new(&path).is_dir());
+        task.abort();
+        assert!(task.await.expect_err("cancelled").is_cancelled());
+        assert!(!Path::new(&path).exists());
+        assert_eq!(runner.calls.lock().expect("calls").len(), 1);
     }
 
     #[tokio::test]

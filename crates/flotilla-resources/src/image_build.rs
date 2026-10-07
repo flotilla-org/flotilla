@@ -37,7 +37,13 @@ impl Resource for ImageBuild {
     }
 
     fn validate_status_update(current: Option<&Self::Status>, requested: &Self::Status) -> Result<(), ResourceError> {
-        if current.is_some_and(|status| matches!(status.phase, ImageBuildPhase::Built | ImageBuildPhase::Failed) && status != requested) {
+        if current.is_some_and(|status| {
+            matches!(status.phase, ImageBuildPhase::Built | ImageBuildPhase::Failed) && {
+                let mut evidence = requested.clone();
+                evidence.availability = status.availability.clone();
+                status != &evidence
+            }
+        }) {
             return Err(ResourceError::invalid("completed image build execution evidence is immutable"));
         }
         Ok(())
@@ -109,6 +115,10 @@ pub struct ImageBuildFailure {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBuildStatus {
+    /// Mutable observations are separate from immutable execution evidence.
+    /// ADR 0047: previous records omit this; retain default for one roll.
+    #[serde(default)]
+    pub availability: ImageAvailability,
     pub phase: ImageBuildPhase,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -188,6 +198,31 @@ pub async fn read_image_build(
         (std::cmp::Reverse(actor), std::cmp::Reverse(phase), source.object.metadata.creation_timestamp)
     });
     sources.into_iter().next().map(|source| source.object).ok_or_else(|| ResourceError::not_found(name))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAvailability {
+    pub hosts: BTreeSet<String>,
+    /// Repository@manifest digest; local config IDs are never substituted.
+    pub registry_ref: Option<String>,
+    pub failure: Option<String>,
+}
+
+pub const IMAGE_DIGESTS_CAPABILITY: &str = "image_digests";
+
+pub fn is_image_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+}
+
+/// Ordered acquisition cost for an exact digest. Availability is an observation,
+/// never permission to substitute a different image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageAcquisitionCost {
+    Held,
+    RegistryPull,
+    BuildOrTransfer,
 }
 
 #[cfg(test)]

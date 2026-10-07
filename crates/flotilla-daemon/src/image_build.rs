@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use crate::blob_store::{BlobStore, TieredBlobStore};
 
 pub(crate) struct BuildxRunner {
+    pub distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::DockerImageIo>>>,
     pub runner: Arc<dyn CommandRunner>,
     pub vcs: Arc<dyn Vcs>,
     pub directory: PathBuf,
@@ -181,6 +182,20 @@ impl BuildxRunner {
     ) -> Result<(PlacedImageIdentity, BTreeSet<String>), ImageBuildFailure> {
         let deterministic = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Deterministic, reason };
         let transient = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Transient, reason };
+        if let (Some(distributor), Some(parent)) = (&self.distributor, &spec.parent_build_ref) {
+            let mut parent = flotilla_resources::read_image_build(&self.backend, &self.namespace, parent)
+                .await
+                .map_err(|error| transient(error.to_string()))?;
+            for _ in 0..3 {
+                match flotilla_resources::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", parent.metadata.name)).await
+                {
+                    Ok(next) => parent = next,
+                    Err(flotilla_resources::ResourceError::NotFound { .. }) => break,
+                    Err(error) => return Err(transient(error.to_string())),
+                }
+            }
+            distributor.ensure(&parent).await.map_err(transient)?;
+        }
         let context = self.context(&spec.layer).await.map_err(transient)?;
         let hashes = hash_layer_inputs(&context, &spec.layer).await.map_err(deterministic)?;
         if hashes != spec.inputs.content_hashes {
@@ -672,7 +687,15 @@ mod runner_contract {
         ));
         let backend = ResourceBackend::InMemory(Default::default());
         let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![("memory".into(), Arc::new(MemoryBlobStore::default()))]));
-        let builder = BuildxRunner { runner, vcs, directory, backend: backend.clone(), namespace: "test".into(), blobs: blobs.clone() };
+        let builder = BuildxRunner {
+            distributor: None,
+            runner,
+            vcs,
+            directory,
+            backend: backend.clone(),
+            namespace: "test".into(),
+            blobs: blobs.clone(),
+        };
         let inputs = builder.resolve(&layer, "amd64").await.expect("resolve");
         let inputs = ResolvedImageInputs::builder()
             .parent_digest(format!("sha256:{}", "1".repeat(64)))

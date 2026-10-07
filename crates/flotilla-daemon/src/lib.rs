@@ -31,3 +31,5 @@ pub mod server;
 pub mod supervisor;
 
 pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path";
+
+mod image_distribution;

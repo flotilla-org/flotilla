@@ -13,7 +13,7 @@ pub mod test_support;
 
 use std::{
     collections::HashMap,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -440,6 +440,10 @@ impl DaemonServer {
 
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| format!("failed to bind socket: {e}"))?;
         let _socket_guard = BoundSocketGuard::new(self.socket_path.clone())?;
+        // The resource API and image archives share the local administrative
+        // trust boundary. Only this daemon's Unix user may access the socket.
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("failed to protect daemon socket: {error}"))?;
 
         publish_socket_path(&self.socket_discovery_path, &self.socket_path)?;
 

@@ -839,7 +839,24 @@ impl DaemonRuntime {
                     Arc::clone(&runner),
                     GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
                 ));
+                let distributor = Arc::new(
+                    crate::image_distribution::ImageDistributor::builder()
+                        .io(Arc::new(
+                            crate::image_distribution::DockerImageIo::builder()
+                                .runner(Arc::clone(&runner))
+                                .credentials(Arc::clone(&credential_store))
+                                .daemon(Arc::downgrade(&daemon))
+                                .host(profile.host_id.clone())
+                                .namespace(options.namespace.clone())
+                                .build(),
+                        ))
+                        .backend(daemon.resource_backend())
+                        .namespace(options.namespace.clone())
+                        .host(profile.host_id.clone())
+                        .build(),
+                );
                 Arc::new(crate::image_build::BuildxRunner {
+                    distributor: Some(distributor),
                     runner,
                     vcs,
                     directory,
@@ -1522,6 +1539,7 @@ struct ControllerRuntimeState {
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     blob_store: Option<Arc<TieredBlobStore>>,
     image_build_runner: Option<Arc<crate::image_build::BuildxRunner>>,
+    image_distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::DockerImageIo>>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
     /// A fresh provider listing is still required for each absence judgement.
@@ -1659,6 +1677,7 @@ impl ControllerRuntimeState {
             agent_material: None,
             blob_store: None,
             image_build_runner: None,
+            image_distributor: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
@@ -1732,6 +1751,7 @@ impl ControllerRuntimeState {
     }
 
     fn with_image_build_runner(mut self, runner: Arc<crate::image_build::BuildxRunner>) -> Self {
+        self.image_distributor = runner.distributor.clone();
         self.image_build_runner = Some(runner);
         self
     }
@@ -4631,6 +4651,18 @@ fn spawn_controller_loops(
             }
         }),
     ];
+    if let Some(distributor) = &state.image_distributor {
+        let distributor = Arc::clone(distributor);
+        controllers.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(reason) = distributor.refresh().await {
+                    tracing::warn!(%reason, "image availability refresh failed");
+                }
+            }
+        }));
+    }
     if let Some(runner) = &state.image_build_runner {
         let projection_backend = backend.clone();
         let projection_namespace = namespace_string.clone();
@@ -4763,6 +4795,18 @@ impl EnvironmentToolContext for DockerToolContext<'_> {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
+    async fn ensure_image(
+        &self,
+        build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
+        host: &str,
+    ) -> Result<Option<flotilla_resources::PlacedImageIdentity>, String> {
+        if host != self.state.local_host_ref {
+            return Err("image distribution target is not the local daemon host".into());
+        }
+        let distributor = self.state.image_distributor.as_ref().ok_or("image distributor unavailable")?;
+        distributor.request(build).await
+    }
+
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
         let tools = self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?;
