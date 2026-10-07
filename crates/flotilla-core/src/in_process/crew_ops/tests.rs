@@ -1106,6 +1106,25 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     let mut meta = InputMeta::from(&session.metadata);
     meta.annotations.insert(CREDENTIAL_REFS_ANNOTATION.into(), "[\"github\"]".into());
     sessions.update(&meta, &session.metadata.resource_version, &session.spec).await.expect("session grant references");
+    let healthy = sessions.get("session").await.expect("healthy session");
+    let mut status = healthy.status.clone().unwrap_or_default();
+    status.phase = ResourceTerminalSessionPhase::Running;
+    sessions.update_status("session", &healthy.metadata.resource_version, &status).await.expect("running healthy session");
+    // A malformed running session sorts before the healthy session and must
+    // not starve it of observations. Its different role cannot receive this card.
+    let mut broken_spec = healthy.spec.clone();
+    broken_spec.role = "broken".into();
+    let broken = sessions
+        .create(
+            &InputMeta::builder()
+                .name("000-malformed".into())
+                .annotations(BTreeMap::from([(CREDENTIAL_REFS_ANNOTATION.into(), "not json".into())]))
+                .build(),
+            &broken_spec,
+        )
+        .await
+        .expect("broken session");
+    sessions.update_status("000-malformed", &broken.metadata.resource_version, &status).await.expect("running broken session");
     let first = crew.crew_capabilities_internal(&context).await.expect("first live card");
     assert!(first.contains("You can push `.github/workflows`"));
     let session = sessions.get("session").await.expect("session");
@@ -1126,7 +1145,13 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             assert!(crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card).await.is_err());
             continue;
         }
-        crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card).await.expect("recover published revision");
+        let error = crate::crew_capabilities::refresh_cards(&backend, "flotilla", source.as_ref()).await.expect_err("aggregate error");
+        assert!(error.contains("000-malformed"));
+        assert!(error.contains("invalid session credential references"));
+        assert_eq!(
+            sessions.get("session").await.expect("healthy refresh").metadata.annotations["flotilla.work/capabilities-revision"],
+            "2"
+        );
         let session = sessions.get("session").await.expect("session");
         crate::crew_capabilities::observe_card(&backend, "flotilla", &session, &card).await.expect("supersede recovered revision");
         crate::crew_capabilities::observe_card(&backend, "flotilla", &sessions.get("session").await.expect("session"), &card)
