@@ -10,9 +10,10 @@ cleat-environment-contract = []
 aws-lc-provider = ["flotilla-resources/aws-lc-provider"]
 replay = []
 skip-no-sandbox-tests = ["flotilla-resources/skip-no-sandbox-tests"]
-test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-support", "dep:axum"]
+test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-support", "dep:axum", "dep:tempfile"]
 
 [dependencies]
+tempfile = { version = "3", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
 flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }

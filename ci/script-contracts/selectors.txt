@@ -1,0 +1,2 @@
+# Python unittest modules run by the existing Ubuntu script-contracts job.
+scripts.tests.test_build_bench

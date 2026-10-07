@@ -1486,3 +1486,6 @@ mod tests {
         assert_eq!(admission.commits.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod scenarios;

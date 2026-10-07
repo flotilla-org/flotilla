@@ -156,20 +156,48 @@ impl Drop for Harness {
     }
 }
 
+fn daemon_alive(pid: i32, inspect: &impl Fn(i32) -> std::io::Result<String>) -> std::io::Result<bool> {
+    match inspect(pid) {
+        Ok(stat) => Ok(stat.rsplit_once(") ").expect("process stat").1.split_whitespace().next() != Some("Z")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 async fn assert_daemons_stopped(pids: &[i32]) {
     // Successful real scenarios prove Drop terminated the private daemon, not just its session.
+    let inspect = |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let alive = pids.iter().any(|pid| match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat.rsplit_once(") ").expect("process stat").1.split_whitespace().next() != Some("Z"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => panic!("inspect private daemon {pid}: {error}"),
-        });
+        let alive =
+            pids.iter().any(|&pid| daemon_alive(pid, &inspect).unwrap_or_else(|error| panic!("inspect private daemon {pid}: {error}")));
         if !alive {
             return;
         }
         assert!(tokio::time::Instant::now() < deadline, "private cleat daemon survived fixture cleanup: {pids:?}");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[test]
+fn teardown_inspection_exit_races_and_errors() {
+    // #2880: disappearance through either Linux errno means exited; other inspection errors must fail closed.
+    // The injected reader stands in for the /proc process boundary.
+    for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES, libc::EIO] {
+        let inspect = |pid| {
+            assert_eq!(pid, 42);
+            Err(std::io::Error::from_raw_os_error(errno))
+        };
+        let result = daemon_alive(42, &inspect);
+        if [libc::ENOENT, libc::ESRCH].contains(&errno) {
+            assert!(!result.expect("exited process"));
+        } else {
+            assert_eq!(result.expect_err("inspection failure preserved").raw_os_error(), Some(errno));
+        }
+    }
+    // Live processes hold teardown; zombies have already exited.
+    for (state, alive) in [("S", true), ("R", true), ("Z", false)] {
+        assert_eq!(daemon_alive(42, &|_| Ok(format!("42 (private daemon) {state} 1"))).expect("stat"), alive);
     }
 }
 
