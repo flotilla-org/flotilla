@@ -228,7 +228,11 @@ Keep its two newest distinct successful local digests (duplicate build outputs d
 not consume a rollback slot), their parent stages, and every identity/build ref
 mentioned in a stored Convoy, Environment, Vessel, or baseline. Frozen placement
 annotations and legacy literal Flotilla build/parent/cache handles are read too.
-Handles are mapped only through known immutable execution evidence. Landed convoy
+Handles are mapped only through known immutable execution evidence. Pin extraction
+intentionally scans every stored string, including names and annotations, and
+JSON embedded in those strings. An incidental string equal to an image ID can
+therefore retain it. When investigating unexpected retention, inspect those
+references as well as the frozen image fields. Landed convoy
 snapshots continue to pin their images
 until removed. Arbitrary images outside ImageBuild evidence are never candidates.
 
@@ -242,18 +246,26 @@ Disconnected fleets fail closed. A non-deleting Host with a missing heartbeat or
 one older than 120 seconds blocks apply-mode collection (four missed default
 30-second heartbeats). Operators must delete decommissioned Host records; an
 offline record is deliberately not treated as proof that its pins are obsolete.
-Custom heartbeat intervals must stay below this freshness limit. Retirement
+Custom heartbeat intervals must stay below this freshness limit. Dry-run reports
+the same freshness and replication refusals alongside its candidate preview. Retirement
 conflicts are reported per build and retried after 30 seconds. Health publication
 failures preserve the collection outcome and retain deletion evidence in memory
 for republication; tombstones are pruned when no ImageBuild references them.
-The configured grace must exceed the deployment's
-replication/admission latency; the minimum is one hour. Schedule intervals must
+Hosts must synchronize UTC clocks (for example with NTP). Retirement timestamps
+come from the actuator, so positive collector clock skew can shorten quarantine.
+The configured grace must exceed replication/admission latency plus the worst
+expected clock skew; the minimum is one hour. Schedule intervals must
 be at least one minute. Dry-run does not retire builds or remove tags/manifests.
 
 Reachability is deliberately re-read before every deletion so a pin arriving
 between two removals wins. For large stores, enable
 `RUST_LOG=flotilla_daemon::image_gc=debug` to measure each snapshot's elapsed time,
-build count and protected-string count before tuning scheduling or batch size.
+build count and protected-string count before tuning scheduling. Each run attempts
+at most 16 eligible local and 16 eligible registry removals; an exhausted budget
+is reported and resumes after 30 seconds. Candidate previews still list the full
+backlog, and each attempted removal retains its immediate reachability re-check.
+Per-store cursors advance after unsuccessful attempts too, so failing candidates
+do not starve later images; a daemon restart resets this in-memory cursor.
 
 Docker container references and tags outside known Flotilla build, parent, or
 cache publication handles refuse collection. Only owned tags are removed and

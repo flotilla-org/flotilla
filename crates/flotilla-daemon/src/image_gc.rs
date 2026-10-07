@@ -18,11 +18,13 @@ pub(crate) const HEALTH_CAPABILITY: &str = "image_gc";
 // Four missed default 30-second heartbeats. Custom heartbeat intervals must
 // remain below this limit when apply-mode collection is enabled.
 const MAX_HOST_HEARTBEAT_AGE_SECONDS: i64 = 120;
+const MAX_REMOVALS_PER_STORE_PER_RUN: usize = 16;
 const COLLECTION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct CollectionReport {
     pub dry_run: bool,
+    pub budget_exhausted: bool,
     pub observed_at: Option<DateTime<Utc>>,
     pub local_candidates: BTreeSet<String>,
     pub registry_candidates: BTreeSet<String>,
@@ -31,6 +33,14 @@ pub(crate) struct CollectionReport {
     pub reclaimed_local_bytes: u64,
     pub reclaimed_registry_bytes: Option<u64>,
     pub failures: Vec<String>,
+}
+
+fn candidates_after<'a>(candidates: &'a BTreeSet<String>, cursor: Option<&str>) -> Vec<&'a String> {
+    candidates
+        .iter()
+        .filter(|id| cursor.is_none_or(|cursor| id.as_str() > cursor))
+        .chain(candidates.iter().filter(|id| cursor.is_some_and(|cursor| id.as_str() <= cursor)))
+        .collect()
 }
 
 fn execution_tag(build: &ResourceObject<ImageBuild>) -> String {
@@ -288,9 +298,6 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                     }
                 }
             }
-            if report.dry_run {
-                return Ok::<(), String>(());
-            }
             // A disconnected/stale fleet cannot prove that no unseen admission
             // has frozen an old digest. Refuse mutation, rather than trusting a
             // stale inventory. Single-host installations need no registry/peers.
@@ -314,6 +321,9 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                 {
                     return Err(format!("collection waits for fresh Host {} heartbeat", source.object.metadata.name));
                 }
+            }
+            if report.dry_run {
+                return Ok::<(), String>(());
             }
             let free_before = self.io.disk_free().await?;
             // Retire the actuator's reusable availability before touching Docker.
@@ -363,10 +373,18 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                             })
                     })
             };
-            for id in &report.local_candidates {
+            let mut cursors = self.collection_cursors.lock().await;
+            let mut local_attempts = 0;
+            for id in candidates_after(&report.local_candidates, cursors.0.as_deref()) {
                 if !quarantined(id) {
                     continue;
                 }
+                if local_attempts == MAX_REMOVALS_PER_STORE_PER_RUN {
+                    report.budget_exhausted = true;
+                    break;
+                }
+                local_attempts += 1;
+                cursors.0 = Some(id.clone());
                 // Re-read immediately before each destructive operation. A newly
                 // frozen convoy wins over this run's earlier candidate set.
                 if self.collection_snapshot(policy.grace_seconds).await?.1.contains(id) {
@@ -395,7 +413,8 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                 }
             }
             if let (Some(cache), Some(credential)) = (&fleet.spec.image_cache, &policy.registry_credential) {
-                for reference in &report.registry_candidates {
+                let mut registry_attempts = 0;
+                for reference in candidates_after(&report.registry_candidates, cursors.1.as_deref()) {
                     if !builds
                         .values()
                         .filter(|build| {
@@ -411,6 +430,12 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                     {
                         continue;
                     }
+                    if registry_attempts == MAX_REMOVALS_PER_STORE_PER_RUN {
+                        report.budget_exhausted = true;
+                        break;
+                    }
+                    registry_attempts += 1;
+                    cursors.1 = Some(reference.clone());
                     let protected = self.collection_snapshot(policy.grace_seconds).await?.1;
                     if protected.contains(reference) || reference.rsplit_once('@').is_some_and(|(_, digest)| protected.contains(digest)) {
                         continue;
@@ -437,7 +462,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         if let Err(error) = &publication {
             tracing::warn!(%error, "image GC health publication failed; deletion evidence retained for retry");
         }
-        if publication.is_err() || !report.failures.is_empty() {
+        if publication.is_err() || !report.failures.is_empty() || report.budget_exhausted {
             *next = Some(Instant::now() + COLLECTION_RETRY_DELAY);
         }
         result
@@ -455,7 +480,7 @@ async fn publish_report(backend: &ResourceBackend, namespace: &str, host: &str, 
             .condition_type("ImageGarbageCollection")
             .value(if report.failures.is_empty() { ConditionValue::True } else { ConditionValue::False })
             .reason(if report.dry_run { "DryRun" } else { "Collection" })
-            .message(format!("{} local candidates, {} registry candidates; deleted {} local / {} registry; observed reclaimed local space {} bytes; registry bytes unknown; failures: {}", report.local_candidates.len(), report.registry_candidates.len(), report.deleted_local.len(), report.deleted_registry.len(), report.reclaimed_local_bytes, report.failures.join("; ")))
+            .message(format!("{} local candidates, {} registry candidates; deleted {} local / {} registry; observed reclaimed local space {} bytes; registry bytes unknown; budget exhausted: {}; failures: {}", report.local_candidates.len(), report.registry_candidates.len(), report.deleted_local.len(), report.deleted_registry.len(), report.reclaimed_local_bytes, report.budget_exhausted, report.failures.join("; ")))
             .observed_at(Utc::now())
             .blocks_readiness(false)
             .build());
@@ -570,6 +595,8 @@ mod tests {
         images: Mutex<BTreeSet<String>>,
         removed_registry: Mutex<BTreeSet<String>>,
         fail: bool,
+        blocked_images: Mutex<BTreeSet<String>>,
+        blocked_registry: Mutex<BTreeSet<String>>,
         conflict_retirement: Mutex<Option<ResourceBackend>>,
         delete_host_after_registry: Mutex<Option<ResourceBackend>>,
     }
@@ -603,7 +630,7 @@ mod tests {
             Err("unused".into())
         }
         async fn remove_local(&self, id: &str, _: &BTreeSet<String>) -> Result<(), String> {
-            if self.fail {
+            if self.fail || self.blocked_images.lock().expect("blocked images").contains(id) {
                 return Err("container still references image".into());
             }
             self.images.lock().expect("images").remove(id);
@@ -611,6 +638,9 @@ mod tests {
         }
         async fn remove_registry(&self, _: &ImageCacheBinding, credential: &str, reference: &str) -> Result<(), String> {
             assert_eq!(credential, "delete-only");
+            if self.blocked_registry.lock().expect("blocked registry").contains(reference) {
+                return Err("registry temporarily unavailable".into());
+            }
             assert!(self.removed_registry.lock().expect("registry").insert(reference.into()), "do not re-delete a tombstoned manifest");
             let backend = self.delete_host_after_registry.lock().expect("report hook").take();
             if let Some(backend) = backend {
@@ -684,6 +714,118 @@ mod tests {
             .namespace("test".into())
             .host("host".into())
             .build()
+    }
+
+    // Preview reports the same fleet refusals as apply without retiring or
+    // deleting anything, for both missing heartbeats and unhealthy replication.
+    #[tokio::test]
+    async fn dry_run_reports_apply_refusals_without_mutation() {
+        for stale in [true, false] {
+            let collector = setup(ImageGcMode::DryRun, false, stale, false).await;
+            let hosts = collector.backend.using::<Host>("test");
+            if !stale {
+                let host = hosts.get("host").await.expect("host");
+                let mut status = host.status.expect("status");
+                status.conditions.push(
+                    HostCondition::builder()
+                        .condition_type("ResourceReplicationStreams")
+                        .value(ConditionValue::False)
+                        .reason("Disconnected")
+                        .message("peer unavailable")
+                        .observed_at(Utc::now())
+                        .blocks_readiness(false)
+                        .build(),
+                );
+                hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("replication failure");
+            }
+            collector.collect_if_due().await.expect_err("preview surfaces apply refusal");
+            let report = hosts.get("host").await.expect("host").status.expect("status").capabilities[HEALTH_CAPABILITY].clone();
+            assert_eq!(report["local_candidates"], serde_json::json!([digest(1)]));
+            assert!(!report["failures"].as_array().expect("failures").is_empty());
+            assert_eq!(collector.io.inventory().await.expect("held").len(), 4);
+            assert!(collector
+                .backend
+                .using::<ImageBuild>("test")
+                .list()
+                .await
+                .expect("builds")
+                .items
+                .iter()
+                .all(|build| { !build.status.as_ref().expect("status").availability.retired }));
+        }
+    }
+
+    // A backlog makes bounded progress and schedules a prompt continuation;
+    // frozen, current and previous images survive every batch.
+    #[tokio::test]
+    async fn collection_bounds_backlog_and_continues_without_losing_roots() {
+        for registry in [false, true] {
+            let collector = setup(ImageGcMode::Apply, registry, false, false).await;
+            for index in 4..=21 {
+                version(&collector.backend, index, index).await;
+                collector.io.images.lock().expect("images").insert(digest(index));
+            }
+            collector.collect_if_due().await.expect("retire backlog");
+            let builds = collector.backend.using::<ImageBuild>("test");
+            for build in builds.list().await.expect("builds").items {
+                let mut status = build.status.expect("status");
+                if status.availability.retired {
+                    status.availability.retired_at = Some(Utc::now() - chrono::Duration::hours(2));
+                    builds
+                        .update_status(&build.metadata.name, &build.metadata.resource_version, &status)
+                        .await
+                        .expect("quarantine elapsed");
+                }
+            }
+            *collector.next_collection.lock().await = None;
+            collector.collect_if_due().await.expect("first bounded batch");
+            assert_eq!(collector.io.inventory().await.expect("held").len(), 22 - 16);
+            assert_eq!(collector.io.removed_registry.lock().expect("registry").len(), if registry { 16 } else { 0 });
+            let host = collector.backend.using::<Host>("test").get("host").await.expect("host");
+            assert_eq!(host.status.expect("status").capabilities[HEALTH_CAPABILITY]["budget_exhausted"], true);
+            *collector.next_collection.lock().await = None;
+            collector.collect_if_due().await.expect("remaining batch");
+            assert_eq!(collector.io.inventory().await.expect("roots"), BTreeSet::from([digest(0), digest(20), digest(21)]));
+            assert_eq!(collector.io.removed_registry.lock().expect("registry").len(), if registry { 19 } else { 0 });
+        }
+    }
+
+    // The per-run budget must advance past unsuccessful removals so blocked
+    // images cannot starve later, independently collectable images forever.
+    #[tokio::test]
+    async fn collection_batches_advance_past_failed_removals() {
+        for registry in [false, true] {
+            let collector = setup(ImageGcMode::Apply, registry, false, false).await;
+            for index in 4..=21 {
+                version(&collector.backend, index, index).await;
+                collector.io.images.lock().expect("images").insert(digest(index));
+            }
+            collector.collect_if_due().await.expect("retire backlog");
+            let builds = collector.backend.using::<ImageBuild>("test");
+            for build in builds.list().await.expect("builds").items {
+                let mut status = build.status.expect("status");
+                if status.availability.retired {
+                    status.availability.retired_at = Some(Utc::now() - chrono::Duration::hours(2));
+                    builds
+                        .update_status(&build.metadata.name, &build.metadata.resource_version, &status)
+                        .await
+                        .expect("quarantine elapsed");
+                }
+            }
+            *collector.io.blocked_images.lock().expect("blocked") = (1..=16).map(digest).collect();
+            *collector.io.blocked_registry.lock().expect("blocked registry") =
+                (101..=116).map(|index| format!("registry.test/images@{}", digest(index))).collect();
+            *collector.next_collection.lock().await = None;
+            collector.collect_if_due().await.expect("failed first batch");
+            assert_eq!(collector.io.inventory().await.expect("held").len(), 22);
+            *collector.next_collection.lock().await = None;
+            collector.collect_if_due().await.expect("advance to healthy candidates");
+            let held = collector.io.inventory().await.expect("held");
+            assert_eq!(held.len(), 19);
+            assert!((17..=19).all(|index| !held.contains(&digest(index))));
+            assert!([0, 20, 21].iter().all(|index| held.contains(&digest(*index))));
+            assert_eq!(collector.io.removed_registry.lock().expect("registry").len(), if registry { 3 } else { 0 });
+        }
     }
 
     // HTTP boundary stand-in: concurrent status writers cause one or every

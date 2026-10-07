@@ -54,6 +54,9 @@ pub(crate) struct ImageDistributor<I> {
     /// Pending durable health publication must not lose deletion evidence.
     #[builder(default)]
     pub(crate) collection_deleted_registry: tokio::sync::Mutex<BTreeSet<String>>,
+    /// Advance even on removal failures so bounded batches cannot starve.
+    #[builder(default)]
+    pub(crate) collection_cursors: tokio::sync::Mutex<(Option<String>, Option<String>)>,
     #[builder(default)]
     pub(crate) collection_gate: Arc<tokio::sync::RwLock<()>>,
 }
