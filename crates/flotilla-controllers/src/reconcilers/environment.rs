@@ -12,6 +12,10 @@ use flotilla_resources::{
 pub trait DockerEnvironmentRuntime: Send + Sync {
     async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String>;
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String>;
+    /// Recover a Docker backing whose identity was never committed to status.
+    async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
+        self.cleanup(environment_ref).await
+    }
     async fn cleanup(&self, _environment_ref: &str) -> Result<(), String> {
         Ok(())
     }
@@ -258,6 +262,8 @@ where
         }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
             self.docker.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
+        } else if obj.spec.docker.is_some() {
+            self.docker.destroy_unrecorded(&obj.metadata.name).await.map_err(ResourceError::other)?;
         } else {
             self.docker.cleanup(&obj.metadata.name).await.map_err(ResourceError::other)?;
         }

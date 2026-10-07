@@ -10,7 +10,7 @@ use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, Image
 use sha2::{Digest, Sha256};
 
 use super::{
-    runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
+    runner::DockerEnvironmentRunner, CreateOpts, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
     EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, PreparedEnvironmentAuth, ProvisionedEnvironment,
     ProvisionedMount, ProvisionedMountMode,
 };
@@ -305,6 +305,43 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         }
 
         Ok(handles)
+    }
+
+    async fn list_backings(&self) -> Result<Vec<EnvironmentBacking>, String> {
+        // Full immutable IDs prevent a delayed sweep removing a replacement
+        // container that reused an old name. Ignore mutable mount metadata.
+        let output = self
+            .inner
+            .runner
+            .run(
+                "docker",
+                &[
+                    "ps",
+                    "-a",
+                    "--no-trunc",
+                    "--filter",
+                    "label=flotilla.environment",
+                    "--format",
+                    r#"{{.ID}}\t{{.Label "flotilla.environment"}}"#,
+                ],
+                Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        output
+            .lines()
+            .map(|line| {
+                let (container_id, environment_id) = line.split_once('\t').ok_or("Docker backing identity is incomplete")?;
+                if container_id.len() != 64
+                    || !container_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || environment_id.is_empty()
+                    || environment_id.contains('\t')
+                {
+                    return Err("Docker backing identity is invalid".to_string());
+                }
+                Ok(EnvironmentBacking { environment_id: EnvironmentId::new(environment_id), container_id: container_id.into() })
+            })
+            .collect()
     }
 
     async fn destroy(&self, container_id: &str) -> Result<(), String> {

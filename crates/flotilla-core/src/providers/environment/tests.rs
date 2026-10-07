@@ -1614,3 +1614,41 @@ fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
         assert!(observation.termination.is_none());
     });
 }
+
+// #2840 recovery needs only a full immutable container ID and the environment
+// label; mount/image labels from earlier generations must not block listing.
+#[tokio::test]
+async fn list_backings_uses_immutable_identity_without_mount_metadata() {
+    let id = "a".repeat(64);
+    let runner = Arc::new(RecordingRunner::new_ok(&format!("{id}\tenv-orphan\n")));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let backings = provider.list_backings().await.expect("list backing identities");
+    assert_eq!(backings, vec![super::EnvironmentBacking { environment_id: EnvironmentId::new("env-orphan"), container_id: id }]);
+    assert_eq!(runner.calls(), vec![(
+        "docker".into(),
+        vec![
+            "ps".into(),
+            "-a".into(),
+            "--no-trunc".into(),
+            "--filter".into(),
+            "label=flotilla.environment".into(),
+            "--format".into(),
+            r#"{{.ID}}\t{{.Label "flotilla.environment"}}"#.into(),
+        ],
+        PathBuf::from("/")
+    )]);
+}
+
+// Empty listings are valid. Incomplete IDs or labels must fail closed, rather
+// than yielding a partially trustworthy set that could authorize reclamation.
+#[tokio::test]
+async fn list_backings_rejects_incomplete_identity() {
+    for output in
+        ["short\tenv\n".into(), format!("{}\t\n", "a".repeat(64)), "missing separator".into(), format!("{}\tenv\textra\n", "a".repeat(64))]
+    {
+        let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok(&output)));
+        assert!(provider.list_backings().await.is_err(), "invalid identity {output:?}");
+    }
+    let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
+    assert!(provider.list_backings().await.expect("empty listing").is_empty());
+}
