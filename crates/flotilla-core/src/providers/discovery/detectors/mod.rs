@@ -20,6 +20,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(EnvVarDetector::new("CLEAT_RUNTIME_DIR")),
         Box::new(EnvVarDetector::new("CLEAT_DAEMON")),
         Box::new(EnvVarDetector::new("CODEX_HOME")),
+        Box::new(EnvVarDetector::new("FLOTILLA_FLEET_CANARY")),
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
         Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
         Box::new(CommandDetector::new("agent", &["--version"], parse_first_dotted_version)),

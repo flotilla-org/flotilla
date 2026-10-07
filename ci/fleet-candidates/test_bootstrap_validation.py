@@ -27,6 +27,16 @@ class BootstrapValidationTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
+    # Canary files are optional for previous-generation rollback, but only the
+    # exact produced paths are accepted; traversal and extra executables refuse.
+    def test_canary_payload_boundary_preserves_previous_generations(self):
+        for platform in validation.PLATFORMS:
+            for path in ("fleet-canary.py", "fleet-canary-agent.sh", "crew-image-baseline.yaml"):
+                self.assertTrue(validation.allowed_payload(path, platform))
+                self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
+            for path in ("fleet-canary.sh", "../fleet-canary.py", "bin/fleet-canary.py"):
+                self.assertFalse(validation.allowed_payload(path, platform))
+
     # Exercise the executable boundary with installer argument ordering, including
     # a dash-leading package name. Validation failures produce concise refusals.
     def test_cli_dispatch(self):

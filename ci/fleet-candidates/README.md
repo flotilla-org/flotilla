@@ -361,3 +361,13 @@ The first live proof installed generation
 Kiwi and Udder. All three programs reported their versions on both platforms;
 Cleat resolved its bundled Ghostty library through the relative runtime path.
 The proof did not replace either host's active binaries or move `current`.
+
+### Canary before activation
+
+Normal `fleet-install` now gates every host on the finalized generation's
+isolated daemon and credential-free contained convoy on feta, before service
+mutation or the generation flip. See [the canary runbook](../../docs/fleet-install.md#pre-activation-canary-on-feta)
+for bootstrap synchronization on the first payload crossing, SSH/Docker
+requirements, retained failure logs, and the explicit emergency skip flag.
+The canary replaces the operator's manual fresh-crew post-roll launch check;
+real-host acceptance is performed after merge.
