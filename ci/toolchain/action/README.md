@@ -1,6 +1,8 @@
 # Pinned Rust setup
 
-After checkout, use `./ci/toolchain/action`. The action reads the checked-out
+Run from the repository root after a default-path checkout, using
+`./ci/toolchain/action`. The pin-read and compiler-assertion paths are relative
+to that root. The action reads the checked-out
 `rust-toolchain.toml`, installs that exact compiler, and runs
 `ci/toolchain/assert.sh` with Bash on Windows and POSIX runners.
 

@@ -3,7 +3,8 @@
 `selectors.txt` owns the selected Cargo tests. Each row is `scope|arguments`:
 `windows`, `macos`, `all` (both desktop OSes), or `tender-ssh` (the isolated
 real-SSH proof). Blank lines and full-line comments are ignored. Arguments are
-whitespace-separated literal argv, with no shell quoting or expansion. Duplicate
+whitespace-separated literal argv, with no shell quoting or expansion. Arguments
+cannot contain `|`, which is reserved for the scope delimiter. Duplicate
 rows execute twice; write shared coverage once using `all`.
 
 Run `ci/platform-tests/run.sh windows`, `macos`, or `tender-ssh`. The runner
