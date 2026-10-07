@@ -46,6 +46,9 @@ REQUIRED_PAYLOAD = {
     "bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json",
 }
+# Produced together by build-candidate.sh, optional when decoding a previous
+# generation so health rollback remains valid (ADR 0047).
+CANARY_PAYLOAD = {"fleet-canary.py", "fleet-canary-agent.sh", "crew-image-baseline.yaml"}
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12}))$")
@@ -84,7 +87,7 @@ def require_size(value, description="size", *, allow_zero=False):
 
 
 def allowed_payload(path, platform=None):
-    if path in REQUIRED_PAYLOAD:
+    if path in REQUIRED_PAYLOAD or path in CANARY_PAYLOAD:
         return True
     pure = PurePosixPath(path)
     library = (len(pure.parts) == 2 and pure.parts[0] == "lib"

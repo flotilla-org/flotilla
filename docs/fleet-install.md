@@ -62,3 +62,63 @@ reason `RestartBudgetExhausted`, visible in `flotilla fleet`. It retries with a
 fresh budget after five minutes. The alarm remains during backoff and clears
 only after a restarted run survives sixty seconds (or shuts down cleanly).
 The daemon need not be restarted to resume provisioning.
+
+## Pre-activation canary on feta
+
+After finalization, every normal `fleet-install latest` or explicit-generation
+install gates activation on a canary on feta. Before any launch service or
+`current` link changes, the incoming installer stages that generation on feta
+and runs its own unpacked `flotillad`, `flotilla`, and `cleat`. Consumers on other
+hosts send the incoming installer and validator over authenticated, batch-mode
+SSH; they do not rely on feta's installed bootstrap knowing the new command.
+Feta needs the existing package reader token, Docker setup (including registry
+authentication), and enough memory for the regular contained-crew policy. Each
+consumer runs the gate; parallel installs may refuse on feta's mutation lock
+and should be retried after the other installation finishes.
+
+The second daemon has private config, state, HOME, socket, and
+`CLEAT_RUNTIME_DIR` under a short `/tmp/fleet-canary.*` path. No fleet config is
+copied and it has no peers. Its scratch Git repository has no remote or forge
+credential. The generation carries its frozen crew-image baseline; the canary
+uses that image with `docker_per_vessel`, the regular 50% host memory budget,
+four expected concurrent crews, and zero swap. The `fleet-canary` adapter is
+available only when `FLOTILLA_FLEET_CANARY=1` is discovered. It uses normal agent
+provisioning and skill staging, with a private config home and no model/login.
+
+The stub dumps its launch environment, effective Git configuration, and staged
+`testing` skill. The installer observes a Ready vessel and Running terminal,
+checks `RUSTUP_HOME`, crew Git identity, `push.default`, skills, and absence of
+model/forge token variables, then releases the stub's completion claim. Real
+Cleat rejects its managed session coordinates supplied via `--env`; a Running
+session proves that launch boundary accepted the declared environment. The
+gate waits for Landed and the terminal/environment/vessel finalizers, and checks
+that its Docker container is gone. Container deletion also reaps its contained
+Cleat endpoint and sessions. It never prunes or kills fleet containers/sessions.
+
+All runs stop the canary daemon and reap any matching host Cleat daemon started
+by discovery. Host Cleat cleanup checks both its executable and private runtime
+environment, using Linux pidfds (Linux 5.3+ and Python 3.9+) to avoid PID reuse;
+stale or inaccessible PID
+files never authorize signalling another process. Successful runs remove scratch
+state. Failures retain state, logs, and any surviving canary container for inspection. The diagnostic names the failed assertion and log directory;
+no active generation is switched. Inspect `daemon.log`, `commands.log`, and
+`crew-report.json` when present. After inspection, remove only the container ID
+recorded by that canary and its `/tmp/fleet-canary.*` directory.
+
+`fleet-install --canary <generation>` stages and probes without activation and
+is accepted only on feta. For an explicit emergency bypass, use
+`fleet-install --skip-canary <generation>` (or `--skip-canary latest`); every
+activation prints a warning identifying `FLEET_INSTALL_SKIP_CANARY=1`, which can
+also be set explicitly in the environment. Rollback retains the previous-generation path and
+does not run a new canary. The real-Codex optional probe is not implemented.
+
+For the first generation carrying the canary payload, sync the reviewed
+`fleet-install` and `generation_validation.py` bootstrap pair before downloading
+it, as for previous payload-boundary crossings. The new validator accepts old
+generations for rollback. No workflow changes are needed.
+
+`scripts/test-fleet-install.sh` includes `scripts/test-fleet-canary.sh`, which
+covers gate ordering, refusal, visible bypass, stage-only execution, and the
+lifecycle scenarios through injected subprocess seams. Real feta/Docker runs
+are the operator's acceptance after merge. This gate replaces the manual
+post-roll "does a fresh crew launch" check.

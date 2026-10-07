@@ -119,12 +119,13 @@ impl AgentMaterialRegistry {
             cfg!(any(target_os = "linux", test)),
         ));
         let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter);
-        Self {
-            homes_dir,
-            codex_central_auth_path,
-            adapters: BTreeMap::from([(codex.id(), codex), (claude_code.id(), claude_code)]),
-            skills,
+        let mut adapters = BTreeMap::from([(codex.id(), codex), (claude_code.id(), Arc::clone(&claude_code))]);
+        // The canary exercises normal skill staging without login material.
+        // Its private config home uses the same layout as Claude crews.
+        if env.get("FLOTILLA_FLEET_CANARY").as_deref() == Some("1") {
+            adapters.insert("fleet-canary", claude_code);
         }
+        Self { homes_dir, codex_central_auth_path, adapters, skills }
     }
 
     pub(crate) async fn prepare(
@@ -1131,6 +1132,18 @@ esac
         AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
             ("HOME", home.to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
+        ])))
+    }
+
+    fn registry_for_adapter(home: &Path, adapter: &str) -> AgentMaterialRegistry {
+        if adapter != "fleet-canary" {
+            return registry(home);
+        }
+        let skills = write_skill_sources(home);
+        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
+            ("FLOTILLA_FLEET_CANARY", "1".to_string()),
         ])))
     }
 
@@ -2205,13 +2218,34 @@ esac
             .expect("existing home")
             .is_empty());
     }
+    // The canary must stage ordinary skills without reading a model login,
+    // and its material adapter must be absent from ordinary daemon registries.
+    #[tokio::test]
+    async fn canary_material_is_opt_in_and_credential_free() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(!registry(temp.path()).adapters.contains_key("fleet-canary"));
+        let skills = write_skill_sources(temp.path());
+        let registry = AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", temp.path().display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
+            ("FLOTILLA_FLEET_CANARY", "1".to_string()),
+        ])));
+        let deliveries = registry
+            .prepare("canary", &BTreeSet::from(["fleet-canary".to_string()]), &BTreeMap::new())
+            .await
+            .expect("no model login is required");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].mount.environment_path.as_path(), Path::new(CONTAINER_SKILLS_SOURCE));
+        assert!(!temp.path().join(".local/share/flotilla/agent-homes").exists());
+    }
+
     #[tokio::test]
     async fn only_frozen_skills_land_in_both_agent_homes() {
-        // Intended: both adapters install exactly the selected frontmatter names,
+        // Intended: agent layouts, including the canary alias, install only the selected frontmatter names,
         // even when the pinned source also supplies an unrelated skill.
-        for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID] {
+        for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID, "fleet-canary"] {
             let temp = tempfile::tempdir().expect("tempdir");
-            let registry = registry(temp.path());
+            let registry = registry_for_adapter(temp.path(), adapter);
             let bundle = registry.skills.source.as_ref().expect("source");
             std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
             let runner = promisor_runner(temp.path());
