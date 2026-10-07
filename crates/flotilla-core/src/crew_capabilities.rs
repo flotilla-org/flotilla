@@ -4,12 +4,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use flotilla_resources::{
-    message_record_name, vessel_placement_pin, Convoy, Environment, FulfilmentKind, ImageBuild, InputMeta, Message, MessageInbox,
-    MessageReference, MessageRelation, MessageSpec, ResourceBackend, ResourceError, ResourceObject, ResourceRef, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
+    message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMountMode, FulfilmentKind, ImageBuild, InputMeta, Message,
+    MessageInbox, MessageReference, MessageRelation, MessageSpec, ResourceBackend, ResourceError, ResourceObject, ResourceRef,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
+
+/// Shared delimiter for the appended card and oversized-brief fallback.
+pub const CAPABILITIES_HEADING: &str = "\n\n## Your capabilities";
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct CredentialCapability {
@@ -119,7 +122,8 @@ pub async fn session_card(
 ) -> Result<String, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
     let mut text = format!(
-        "## Your capabilities\n\nYou act as `{}` in project `{}`.\n\nRepositories in scope:\n",
+        "{}\n\nYou act as `{}` in project `{}`.\n\nRepositories in scope:\n",
+        CAPABILITIES_HEADING.trim_start(),
         spec.role,
         convoy.spec.project_ref.as_deref().unwrap_or(namespace)
     );
@@ -173,7 +177,11 @@ pub async fn session_card(
     if let Some(docker) = &environment.spec.docker {
         text.push_str(&format!("Placement: contained on `{}`, image `{}`.\n", docker.host_ref, docker.image));
         for mount in &docker.mounts {
-            text.push_str(&format!("- Mount `{}` → `{}` ({:?})\n", mount.source_path, mount.target_path, mount.mode));
+            let mode = match mount.mode {
+                EnvironmentMountMode::Ro => "read-only",
+                EnvironmentMountMode::Rw => "read-write",
+            };
+            text.push_str(&format!("- Mount `{}` → `{}` ({mode})\n", mount.source_path, mount.target_path));
         }
         if let Some(build) = &docker.image_build_ref {
             let build = backend.including_replicas::<ImageBuild>(namespace).get(build).await.map_err(|error| error.to_string())?.object;

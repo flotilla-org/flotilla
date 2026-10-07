@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::{
+    crew_capabilities::CAPABILITIES_HEADING,
     path_context::ExecutionEnvironmentPath,
     providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
 };
@@ -617,8 +618,8 @@ pub trait AgentAdapter: Send + Sync {
         } else {
             let card = brief
                 .content
-                .rsplit_once("\n\n## Your capabilities")
-                .map(|(_, card)| format!("\n\n## Your capabilities{card}"))
+                .rsplit_once(CAPABILITIES_HEADING)
+                .map(|(_, card)| format!("{CAPABILITIES_HEADING}{card}"))
                 .unwrap_or_default();
             let fallback =
                 format!("Read your crew brief at {} and follow it. Re-read that file after a context compaction.{}", brief.path, card);
@@ -1221,6 +1222,7 @@ mod tests {
             AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions,
             CrewBriefTemplateOverride, CrewBriefTemplateResolver, CLAUDE_MANAGED_SETTINGS_PATH,
         },
+        crew_capabilities::CAPABILITIES_HEADING,
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{factories::git::GitVcsFactory, EnvironmentAssertion, EnvironmentBag, Factory},
@@ -1974,9 +1976,12 @@ mod tests {
         assert!(adapter.deliver_brief(&brief).starts_with(&brief.content));
         brief.content.push('x');
         assert!(adapter.deliver_brief(&brief).starts_with("Read your crew brief at"));
-        brief.content.push_str("\n\n## Your capabilities\nYou can write issues.");
+        // Quoted headings in the assignment must not replace the final appended card.
+        brief.content.push_str(&format!("{CAPABILITIES_HEADING}\nQuoted assignment card."));
+        brief.content.push_str(&format!("{CAPABILITIES_HEADING}\nYou can write issues."));
         let prompt = adapter.deliver_brief(&brief);
         assert!(prompt.contains("You can write issues."));
+        assert!(!prompt.contains("Quoted assignment card."));
         assert!(flotilla_protocol::arg::shell_quote(&prompt).len() < 64 * 1024);
     }
 
