@@ -63,6 +63,10 @@ pub type CrewGithubLoginsByRequest = BTreeMap<u64, Vec<String>>;
 
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
+    /// Background servicing must not renew the demand that scheduled it.
+    fn for_background_refresh(&self) -> Option<std::sync::Arc<dyn ChangeRequestTracker>> {
+        None
+    }
     /// Observe bound requests together. The default uses individual provider
     /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA. Feedback

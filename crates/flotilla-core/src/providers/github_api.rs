@@ -343,6 +343,7 @@ pub trait GhApi: Send + Sync {
 }
 
 /// Cache entry: ETag + the JSON response body from last 200.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CacheEntry {
     etag: String,
     body: String,
@@ -359,11 +360,23 @@ pub struct GhApiClient {
     cache: Mutex<HashMap<String, CacheEntry>>,
     budget_backoff: Mutex<Option<(DateTime<Utc>, String)>>,
     runner: Arc<dyn CommandRunner>,
+    persistence: Option<std::path::PathBuf>,
 }
 
 impl GhApiClient {
+    /// Per-endpoint files avoid losing another provider's conditional cache.
+    pub fn with_persistence(mut self, directory: std::path::PathBuf) -> Self {
+        self.persistence = Some(directory);
+        self
+    }
+
+    fn cache_path(&self, endpoint: &str) -> Option<std::path::PathBuf> {
+        use sha2::{Digest, Sha256};
+        self.persistence.as_ref().map(|directory| directory.join(format!("{:x}.json", Sha256::digest(endpoint.as_bytes()))))
+    }
+
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { cache: Mutex::new(HashMap::new()), budget_backoff: Mutex::new(None), runner }
+        Self { cache: Mutex::new(HashMap::new()), budget_backoff: Mutex::new(None), runner, persistence: None }
     }
 }
 
@@ -404,6 +417,13 @@ impl GhApiClient {
             if let Some((reset, message)) = self.budget_backoff.lock().expect("GitHub budget lock poisoned").as_ref() {
                 if *reset > Utc::now() {
                     return Err(message.clone().into());
+                }
+            }
+        }
+        if let Some(path) = self.cache_path(endpoint) {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(entry) = serde_json::from_slice::<CacheEntry>(&bytes) {
+                    self.cache.lock().unwrap_or_else(|p| p.into_inner()).insert(endpoint.into(), entry);
                 }
             }
         }
@@ -462,11 +482,11 @@ impl GhApiClient {
 
         if let Some(ref etag) = parsed.etag {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.insert(endpoint.to_string(), CacheEntry {
-                etag: etag.clone(),
-                body: parsed.body.clone(),
-                has_next_page: parsed.has_next_page,
-            });
+            let entry = CacheEntry { etag: etag.clone(), body: parsed.body.clone(), has_next_page: parsed.has_next_page };
+            if let Some(path) = self.cache_path(endpoint) {
+                super::github_poll::persist(&path, &entry).map_err(GhApiFailure::from)?;
+            }
+            cache.insert(endpoint.to_string(), entry);
         }
 
         if parsed.status == 200 && is_issue_observation(endpoint) {
@@ -480,6 +500,26 @@ impl GhApiClient {
 
         Ok(parsed)
     }
+}
+
+/// Preserve the classified retry contract when crossing replicated read errors.
+pub(crate) fn classified_rate_error(error: String) -> ObservationError {
+    if let Some(retry_at) = rate_limit_reset(&error) {
+        let budget = error
+            .strip_prefix(RATE_LIMIT_PREFIX)
+            .and_then(|fields| fields.split_once(", identity="))
+            .map(|(budget, _)| budget)
+            .unwrap_or("GraphQL")
+            .to_string();
+        let kind = if error.contains("kind=secondary") { GithubRateLimitKind::Secondary } else { GithubRateLimitKind::Primary };
+        let retry_source = error
+            .split_once("retry_source=")
+            .and_then(|(_, value)| value.split(',').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(GithubRetrySource::RateLimitReset);
+        return ObservationError::RateLimited { budget, limit: GithubRateLimit { kind, retry_at: Some(retry_at), retry_source } };
+    }
+    ObservationError::Forge(error)
 }
 
 #[cfg(test)]

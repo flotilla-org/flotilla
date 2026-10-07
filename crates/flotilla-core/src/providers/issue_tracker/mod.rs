@@ -31,6 +31,10 @@ pub(crate) fn provider_for_source<'a>(
 /// adapter remain local to the host.
 #[async_trait]
 pub trait IssueProvider: Send + Sync {
+    /// Background servicing must not renew the demand that scheduled it.
+    fn for_background_refresh(&self) -> Option<Arc<dyn IssueProvider>> {
+        None
+    }
     fn supports(&self, source: &IssueSource) -> bool;
 
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String>;

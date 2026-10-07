@@ -109,6 +109,12 @@ impl DispatchReconciler {
         let projects = self.backend.clone().using::<Project>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let mut total = ReconcilePass::default();
         for project in projects.items {
+            if flotilla_core::forge_observation::project_home(&self.backend, &self.namespace, &project.metadata.name).await?
+                != Some(self.backend.local_root().map_err(|error| error.to_string())?)
+            {
+                continue;
+            }
+
             match self.reconcile_project(&project, self.clock.now()).await {
                 Ok(outcome) => {
                     total.queued += outcome.queued;
@@ -647,6 +653,28 @@ mod tests {
         let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
             .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         (backend, issues, clock, reconciler)
+    }
+
+    // #2868: local charter copies must not turn every daemon into a queue
+    // reconciler. The original Project home alone reads dispatch sources.
+    #[tokio::test]
+    async fn project_home_is_the_only_dispatch_reconciler() {
+        let (home, issues, _, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], Vec::new(), policy(3600)).await;
+        let project = home.using::<Project>(NAMESPACE).get("widgets").await.unwrap();
+        for root in ["second-reconciler", "third-reconciler"] {
+            let other = ResourceBackend::InMemory(Default::default()).with_local_root(flotilla_protocol::NodeId::new(root));
+            other.using::<Project>(NAMESPACE).create(&InputMeta::builder().name("widgets".into()).build(), &project.spec).await.unwrap();
+            other
+                .replica_writer::<Project>(home.local_root().unwrap(), NAMESPACE)
+                .replace(&home.using::<Project>(NAMESPACE).list().await.unwrap(), Utc::now())
+                .await
+                .unwrap();
+            let pass = DispatchReconciler::new(other, NAMESPACE, issues.clone()).reconcile_once().await.unwrap();
+            assert_eq!(pass, ReconcilePass::default());
+            assert_eq!(*issues.ready_calls.lock().unwrap(), 0);
+        }
+        reconciler.reconcile_once().await.unwrap();
+        assert_eq!(*issues.ready_calls.lock().unwrap(), 1);
     }
 
     fn native_edge(issues: &FakeIssues, issue_id: &str, blocker_id: &str) {

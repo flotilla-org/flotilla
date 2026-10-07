@@ -307,6 +307,11 @@ collaboration — change requests and, by default, issues. It is a portable
 external identity, not a local provider implementation or credential choice.
 _Avoid_: Tracker binding, provider, remote (a Git transport spelling).
 
+**Forge Observer**:
+The one ready Host responsible for observing a forge source across the fleet.
+Projects sharing a source share its observer; other Hosts consume those facts.
+Observer ownership is distinct from ownership of a Project's work queue.
+
 **Issue Source**:
 An external service and scope supplying issues, bound to a **Project** as a
 `(source, filter)` pair. Each **Membership Claim** derives one from its

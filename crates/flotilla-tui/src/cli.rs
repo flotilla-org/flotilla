@@ -257,6 +257,22 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
         }
         format!("{table}\n")
     };
+    if !response.forge_budgets.is_empty() {
+        output.push_str("\nForge budgets (hourly):\n");
+        for row in &response.forge_budgets {
+            output.push_str(&format!(
+                "  {} / {} / {}: {} calls, {} reported cost, {} calls without reported cost, remaining {}, retry {}\n",
+                row.host,
+                row.identity,
+                row.budget,
+                row.calls,
+                row.reported_cost,
+                row.unreported_calls,
+                row.remaining.map(|value| value.to_string()).unwrap_or_else(|| "unknown".into()),
+                row.retry_at.map(|at| at.to_rfc3339()).unwrap_or_else(|| "none".into())
+            ));
+        }
+    }
     output.push_str("\nDispatch queue:\n");
     output.push_str(&format_dispatch_queue_human(&response.dispatch_queue));
     output

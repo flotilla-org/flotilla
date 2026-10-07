@@ -1,3 +1,4 @@
+use crate::providers::github_poll::PollCache;
 mod observation;
 
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
@@ -93,6 +94,7 @@ pub struct GitHubChangeRequest {
     runner: Arc<dyn CommandRunner>,
     review_bot_login: String,
     operator_login: Option<String>,
+    poll: Option<PollCache>,
 }
 
 #[derive(Debug, bon::Builder)]
@@ -109,7 +111,20 @@ struct GhPr {
 
 impl GitHubChangeRequest {
     pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { provider_name, repo_slug, api, runner, review_bot_login: DEFAULT_REVIEW_BOT_LOGIN.to_string(), operator_login: None }
+        Self {
+            provider_name,
+            repo_slug,
+            api,
+            runner,
+            review_bot_login: DEFAULT_REVIEW_BOT_LOGIN.to_string(),
+            operator_login: None,
+            poll: None,
+        }
+    }
+
+    pub fn with_poll_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.poll = Some(PollCache::default().with_directory(directory));
+        self
     }
 
     pub fn with_review_bot_login(mut self, login: String) -> Self {
@@ -120,6 +135,99 @@ impl GitHubChangeRequest {
     pub fn with_operator_login(mut self, login: String) -> Self {
         self.operator_login = Some(login);
         self
+    }
+
+    async fn poll_pull_requests(&self) -> Result<Vec<serde_json::Value>, String> {
+        let poll = self.poll.as_ref().ok_or("durable PR observer is not configured")?;
+        let mut cache = poll.state.lock().await;
+        let key = format!("{}/pulls", self.repo_slug);
+        let state = cache.entry(key.clone()).or_insert(poll.load(&key)?);
+        let mut next = state.clone();
+        for item in next.pulls.changes(self.api.as_ref(), execution_root(), &self.repo_slug, "pulls").await? {
+            next.pulls.commit(&item, item.clone())?;
+        }
+        poll.save(&key, &next)?;
+        let items = next.pulls.details.values().cloned().collect();
+        *state = next;
+        Ok(items)
+    }
+
+    async fn observe_changed(
+        &self,
+        numbers: &[u64],
+        crew_logins: &super::CrewGithubLoginsByRequest,
+    ) -> Result<super::BoundObservations, ObservationError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (owner, name) = self.repo_slug.split_once('/').ok_or("GitHub repository must have owner/name scope")?;
+        let owner = serde_json::to_string(owner).map_err(|error| error.to_string())?;
+        let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
+        let mut query = format!("query {{ rateLimit {{ cost }} repository(owner:{owner}, name:{name}) {{");
+        // Keep every bound CR in one repository query so request count is
+        // independent of convoy count. If a repository exceeds GitHub's query
+        // limits, surface the forge error instead of silently omitting CRs.
+        for number in numbers {
+            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:20) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ id isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]) {{ nodes {{ ... on HeadRefForcePushedEvent {{ createdAt afterCommit {{ oid }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate pushedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
+        }
+        query.push_str(" } }");
+        let mut telemetry = ObservationTelemetry::new(&self.repo_slug, numbers.len());
+        let output = self.observation_call(&query, QueryShape::BoundBatch, numbers.len(), &mut telemetry).await?;
+        let success = output.success;
+        let stderr = output.stderr.clone();
+        let document = output.into_document()?;
+        if let Some(errors) = document["errors"].as_array() {
+            let unexpected = errors.iter().filter(|error| error["type"] != "NOT_FOUND").collect::<Vec<_>>();
+            if !unexpected.is_empty() {
+                return Err(format!("GitHub GraphQL observation: {unexpected:?}").into());
+            }
+        } else if !success {
+            return Err(format!("GitHub GraphQL observation failed: {stderr}").into());
+        }
+        let repository = &document["data"]["repository"];
+        if !repository.is_object() {
+            return Err(format!("GitHub GraphQL repository {} unavailable", self.repo_slug).into());
+        }
+        let observed_at = Utc::now();
+        let mut statuses = HashMap::new();
+        let (mut pages, mut nodes) = (0, 0);
+        let mut cooldown: Option<ObservationError> = None;
+        // The caller's order determines which PR receives history pagination
+        // priority when the shared follow-up budget is exhausted.
+        for number in numbers {
+            let request = &repository[format!("pr{number}")];
+            if request.is_null() {
+                continue;
+            }
+            if let Some(error) = &cooldown {
+                if Self::next_history_page(request).is_some() {
+                    statuses.insert(*number, Err(error.clone()));
+                    continue;
+                }
+            }
+            let mut request = request.clone();
+            if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes, &mut telemetry).await {
+                // Classification without a deadline remains an error, but does
+                // not invent a timed cooldown; the bounded batch may continue.
+                if error.retry_at().is_some() {
+                    cooldown = Some(error.clone());
+                }
+                statuses.insert(*number, Err(error));
+                continue;
+            }
+            request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
+            statuses.insert(
+                *number,
+                Ok(parse_gh_observation_value_with_crew_identity(
+                    &request,
+                    observed_at,
+                    &self.review_bot_login,
+                    self.operator_login.as_deref(),
+                    crew_logins.get(number).map(Vec::as_slice).unwrap_or(&[]),
+                )),
+            );
+        }
+        Ok(statuses)
     }
 
     async fn observation_call(
@@ -271,80 +379,79 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         numbers: &[u64],
         crew_logins: &super::CrewGithubLoginsByRequest,
     ) -> Result<super::BoundObservations, ObservationError> {
-        if numbers.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let (owner, name) = self.repo_slug.split_once('/').ok_or("GitHub repository must have owner/name scope")?;
-        let owner = serde_json::to_string(owner).map_err(|error| error.to_string())?;
-        let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
-        let mut query = format!("query {{ rateLimit {{ cost }} repository(owner:{owner}, name:{name}) {{");
-        // Keep every bound CR in one repository query so request count is
-        // independent of convoy count. If a repository exceeds GitHub's query
-        // limits, surface the forge error instead of silently omitting CRs.
-        for number in numbers {
-            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:20) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ id isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]) {{ nodes {{ ... on HeadRefForcePushedEvent {{ createdAt afterCommit {{ oid }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate pushedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
-        }
-        query.push_str(" } }");
-        let mut telemetry = ObservationTelemetry::new(&self.repo_slug, numbers.len());
-        let output = self.observation_call(&query, QueryShape::BoundBatch, numbers.len(), &mut telemetry).await?;
-        let success = output.success;
-        let stderr = output.stderr.clone();
-        let document = output.into_document()?;
-        if let Some(errors) = document["errors"].as_array() {
-            let unexpected = errors.iter().filter(|error| error["type"] != "NOT_FOUND").collect::<Vec<_>>();
-            if !unexpected.is_empty() {
-                return Err(format!("GitHub GraphQL observation: {unexpected:?}").into());
-            }
-        } else if !success {
-            return Err(format!("GitHub GraphQL observation failed: {stderr}").into());
-        }
-        let repository = &document["data"]["repository"];
-        if !repository.is_object() {
-            return Err(format!("GitHub GraphQL repository {} unavailable", self.repo_slug).into());
-        }
-        let observed_at = Utc::now();
+        let Some(poll) = &self.poll else {
+            return self.observe_changed(numbers, crew_logins).await;
+        };
+        let mut cache = poll.state.lock().await;
+        let key = format!("{}/bound", self.repo_slug);
+        let state = cache.entry(key.clone()).or_insert(poll.load(&key)?);
+        let mut next = state.clone();
+        let mut changed = Vec::new();
+        let mut revisions = HashMap::new();
         let mut statuses = HashMap::new();
-        let (mut pages, mut nodes) = (0, 0);
-        let mut cooldown: Option<ObservationError> = None;
-        // The caller's order determines which PR receives history pagination
-        // priority when the shared follow-up budget is exhausted.
         for number in numbers {
-            let request = &repository[format!("pr{number}")];
-            if request.is_null() {
-                continue;
+            let id = number.to_string();
+            let endpoint = format!("repos/{}/pulls/{number}", self.repo_slug);
+            let response =
+                self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+            let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+            let mut checks = Vec::new();
+            if let Some(sha) = value["head"]["sha"].as_str() {
+                for suffix in [format!("commits/{sha}/status"), format!("commits/{sha}/check-runs?per_page=100")] {
+                    let endpoint = format!("repos/{}/{suffix}", self.repo_slug);
+                    let response =
+                        self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+                    checks.push((response.etag, response.body));
+                }
             }
-            if let Some(error) = &cooldown {
-                if Self::next_history_page(request).is_some() {
-                    statuses.insert(*number, Err(error.clone()));
+            let revision =
+                serde_json::to_string(&(response.etag, &value["updated_at"], &value["head"]["sha"], checks, crew_logins.get(number)))
+                    .map_err(|e| e.to_string())?;
+            if next.pulls.revisions.get(&id) == Some(&revision) {
+                if let Some(detail) = next.pulls.details.get(&id) {
+                    let mut validated: flotilla_resources::ChangeRequestStatus =
+                        serde_json::from_value(detail.clone()).map_err(|e| e.to_string())?;
+                    let now = Utc::now();
+                    validated.title.observed_at = now;
+                    validated.author.observed_at = now;
+                    validated.review_decision.observed_at = now;
+                    validated.review_requested_from_owner.observed_at = now;
+                    validated.state.observed_at = now;
+                    validated.head_sha.observed_at = now;
+                    validated.checks.observed_at = now;
+                    validated.review.actionable_at_head.observed_at = now;
+                    validated.mergeable.observed_at = now;
+                    statuses.insert(*number, Ok(validated));
                     continue;
                 }
             }
-            let mut request = request.clone();
-            if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes, &mut telemetry).await {
-                // Classification without a deadline remains an error, but does
-                // not invent a timed cooldown; the bounded batch may continue.
-                if error.retry_at().is_some() {
-                    cooldown = Some(error.clone());
-                }
-                statuses.insert(*number, Err(error));
-                continue;
-            }
-            request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
-            statuses.insert(
-                *number,
-                Ok(parse_gh_observation_value_with_crew_identity(
-                    &request,
-                    observed_at,
-                    &self.review_bot_login,
-                    self.operator_login.as_deref(),
-                    crew_logins.get(number).map(Vec::as_slice).unwrap_or(&[]),
-                )),
-            );
+            revisions.insert(*number, revision);
+            changed.push(*number);
         }
+        for (number, result) in self.observe_changed(&changed, crew_logins).await? {
+            if let Ok(detail) = &result {
+                let id = number.to_string();
+                next.pulls.revisions.insert(id.clone(), revisions.remove(&number).ok_or("changed PR has no revision")?);
+                next.pulls.details.insert(id, serde_json::to_value(detail).map_err(|e| e.to_string())?);
+            }
+            statuses.insert(number, result);
+        }
+        poll.save(&key, &next)?;
+        *state = next;
         Ok(statuses)
     }
 
     async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+        if self.poll.is_some() {
+            return Ok(self
+                .poll_pull_requests()
+                .await?
+                .iter()
+                .filter(|v| v["state"] == "open")
+                .filter_map(|v| Self::parse_pull_request(v).map(|pr| self.gh_pr_to_change_request(&pr)))
+                .take(limit)
+                .collect());
+        }
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=open&per_page={}", self.repo_slug, per_page);
         let body = gh_api_get!(self.api, &endpoint, execution_root())?;
@@ -415,6 +522,16 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     }
 
     async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String> {
+        if self.poll.is_some() {
+            return Ok(self
+                .poll_pull_requests()
+                .await?
+                .iter()
+                .filter(|v| v["merged_at"].as_str().is_some())
+                .filter_map(|v| v["head"]["ref"].as_str().map(str::to_string))
+                .take(limit)
+                .collect());
+        }
         let per_page = clamp_per_page(limit);
         let endpoint = format!("repos/{}/pulls?state=closed&sort=updated&direction=desc&per_page={}", self.repo_slug, per_page);
         let body = gh_api_get!(self.api, &endpoint, execution_root())?;
@@ -1071,5 +1188,61 @@ mod tests {
         let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("partial GraphQL result");
         assert!(!statuses.contains_key(&1));
         assert!(statuses.contains_key(&2));
+    }
+    #[tokio::test]
+    async fn bound_details_survive_restart_and_refresh_when_checks_change() {
+        fn rest(etag: &str, body: serde_json::Value) -> String {
+            format!("HTTP/2 200 OK\r\nETag: {etag}\r\n\r\n{body}")
+        }
+        fn detail(title: &str) -> String {
+            format!(
+                "HTTP/2 200 OK\r\n\r\n{}",
+                serde_json::json!({"data":{"repository":{"pr1":{
+                "title":title,"state":"OPEN","headRefOid":"abc","reviewDecision":null,"mergeable":"MERGEABLE",
+                "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[]}}}}]}
+            }},"rateLimit":{"cost":1}}})
+            )
+        }
+        let unchanged = "HTTP/2 304 Not Modified\r\n\r\n".to_string();
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(rest("pr", serde_json::json!({"number":1,"updated_at":"2026-10-07T00:00:00Z","head":{"sha":"abc"}}))),
+            Ok(rest("status", serde_json::json!({"state":"pending"}))),
+            Ok(rest("checks-1", serde_json::json!({"check_runs":[]}))),
+            Ok(detail("Initial")),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(rest("checks-2", serde_json::json!({"check_runs":[{"status":"completed"}]}))),
+            Ok(detail("Refreshed")),
+        ]));
+        let directory = tempfile::tempdir().expect("persistent observation cache");
+        let make = || {
+            GitHubChangeRequest::new(
+                "github".into(),
+                "team/repo".into(),
+                Arc::new(GhApiClient::new(runner.clone()).with_persistence(directory.path().join("rest"))),
+                runner.clone(),
+            )
+            .with_poll_directory(directory.path().join("bound"))
+        };
+        let provider = make();
+        let first = provider.observe_bound(&[1], &Default::default()).await.expect("first");
+        assert_eq!(first[&1].as_ref().expect("observed").title.value.as_deref(), Some("Initial"));
+        provider.observe_bound(&[1], &Default::default()).await.expect("quiet");
+        drop(provider);
+        let provider = make();
+        let restarted = provider.observe_bound(&[1], &Default::default()).await.expect("restart");
+        assert_eq!(restarted[&1].as_ref().expect("cached").title.value.as_deref(), Some("Initial"));
+        let changed = provider.observe_bound(&[1], &Default::default()).await.expect("checks updated");
+        assert_eq!(changed[&1].as_ref().expect("refreshed").title.value.as_deref(), Some("Refreshed"));
+        let calls = runner.calls();
+        assert_eq!(calls.iter().filter(|(_, args)| args.contains(&"graphql".into())).count(), 2);
+        assert!(calls[4..10].iter().all(|(_, args)| args.iter().any(|arg| arg.starts_with("If-None-Match:"))));
+        assert_eq!(runner.remaining(), 0);
     }
 }

@@ -530,7 +530,7 @@ impl ReadProjections<'_> {
         };
         rows.sort_by(|left, right| right.is_local.cmp(&left.is_local).then_with(|| left.host.cmp(&right.host)));
         let dispatch_queue = Self::dispatch_queue(self.backend, namespace, None, Utc::now()).await?;
-        Ok(FleetHealthResponse { hosts: rows, dispatch_queue })
+        Ok(FleetHealthResponse { hosts: rows, dispatch_queue, forge_budgets: Vec::new() })
     }
 
     pub(super) async fn list_projects(

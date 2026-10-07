@@ -377,6 +377,8 @@ mod project_list_tests {
 pub struct FleetHealthResponse {
     pub hosts: Vec<FleetHostRow>,
     #[serde(default)]
+    pub forge_budgets: Vec<ForgeBudgetRow>,
+    #[serde(default)]
     pub dispatch_queue: DispatchQueueResponse,
 }
 
@@ -964,4 +966,18 @@ mod tests {
 
         assert_roundtrip(&response);
     }
+}
+
+/// Actual reported cost is separate from calls whose cost the CLI hides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeBudgetRow {
+    pub host: String,
+    pub identity: String,
+    pub budget: String,
+    pub window_start: chrono::DateTime<chrono::Utc>,
+    pub calls: u64,
+    pub reported_cost: u64,
+    pub unreported_calls: u64,
+    pub remaining: Option<u64>,
+    pub retry_at: Option<chrono::DateTime<chrono::Utc>>,
 }
