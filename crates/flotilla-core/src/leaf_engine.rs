@@ -87,6 +87,19 @@ pub struct CrewTurnIntent {
     pub expectation: flotilla_resources::MessageExpectation,
 }
 
+pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
+    format!("{project}/{convoy}/{vessel}/{role}")
+}
+
+/// Immutable producer key shared by escalation publication and pre-replication replies.
+pub(crate) fn turn_message_producer_key(source: &str, subject_revision: &str) -> String {
+    format!("turn-delivery:{source}:{subject_revision}")
+}
+
+pub(crate) fn supervision_message_source(convoy: &str, index: usize) -> String {
+    format!("supervision-{convoy}-{index}")
+}
+
 /// Canonical receiver admission is a workflow latch, not a delivery receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewTurnAdmission {
@@ -2412,7 +2425,7 @@ impl ReconcilerWake {
                                 let delivery = CrewTurnIntent::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(target_convoy.clone())
-                                    .source(format!("supervision-{}-{index}", convoy.metadata.name))
+                                    .source(supervision_message_source(&convoy.metadata.name, index))
                                     .vessel(target_vessel.clone())
                                     .role(target_role.clone())
                                     .brief(brief)
@@ -2420,10 +2433,11 @@ impl ReconcilerWake {
                                     .sender(
                                         stalled_source_actor(&condition)
                                             .map(|(vessel, role)| {
-                                                format!(
-                                                    "{}/{}/{vessel}/{role}",
+                                                crew_role_address(
                                                     convoy.spec.project_ref.as_deref().unwrap_or(namespace),
-                                                    convoy.metadata.name
+                                                    &convoy.metadata.name,
+                                                    vessel,
+                                                    role,
                                                 )
                                             })
                                             .unwrap_or_else(|| "system:stall-judge".into()),

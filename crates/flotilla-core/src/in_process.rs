@@ -6225,13 +6225,7 @@ impl InProcessDaemon {
                         prompt,
                         vessel.as_deref(),
                         role.as_deref(),
-                        crew_ops::MessageAttribution {
-                            sender: dispatching_principal_ref.as_ref().map_or_else(
-                                || format!("principal:{}", PrincipalRef::IMPLICIT_NAME),
-                                |principal| format!("principal:{}", principal.name),
-                            ),
-                            in_reply_to: None,
-                        },
+                        crew_ops::MessageAttribution::operator(dispatching_principal_ref.as_ref()),
                     ))
                     .await
                     {
