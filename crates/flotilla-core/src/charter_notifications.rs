@@ -56,11 +56,14 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
         options.has_credential_scope = requirement.is_some_and(|requirement| !requirement.credential_scopes.is_empty());
         let members = requirement
             .into_iter()
-            .flat_map(|requirement| requirement.crew.iter())
-            .map(|process| CrewBriefMember {
-                role: process.role.clone(),
-                state: "active".into(),
-                is_agent: matches!(process.source, CrewSource::Agent { .. }),
+            .flat_map(|requirement| {
+                // Match first-turn eager/latent launch labels; the address book
+                // below separately reports current holders from live records.
+                requirement.crew.iter().enumerate().map(move |(index, process)| CrewBriefMember {
+                    role: process.role.clone(),
+                    state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.into(),
+                    is_agent: matches!(process.source, CrewSource::Agent { .. }),
+                })
             })
             .collect::<Vec<_>>();
         let assignment = match prompt {
@@ -91,9 +94,9 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_resources::{
-        reconcile_charter_notifications_with_renderer, Convoy, ConvoySpec, InMemoryBackend, InputMeta, Message, MessageInbox, Project,
-        ProjectSpec, RoleDefinition, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSpec, CONVOY_LABEL,
-        ROLE_LABEL,
+        reconcile_charter_notifications_with_renderer, Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InMemoryBackend, InputMeta, Message,
+        MessageInbox, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
+        TerminalSessionSpec, VesselRequirement, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL,
     };
 
     use super::*;
@@ -110,7 +113,7 @@ mod tests {
             .create(&InputMeta::builder().name("root".into()).build(), &ProjectSpec::builder().display_name("root".into()).build())
             .await
             .expect("project");
-        backend
+        let convoy = backend
             .using::<Convoy>("flotilla")
             .create(
                 &InputMeta::builder().name("guide".into()).build(),
@@ -118,6 +121,38 @@ mod tests {
             )
             .await
             .expect("convoy");
+        let agent = |role: &str| {
+            CrewSpec::builder()
+                .role(role.into())
+                .source(CrewSource::Agent { selector: Selector::for_capability("coding"), prompt: None, brief_template: None })
+                .build()
+        };
+        backend
+            .using::<Convoy>("flotilla")
+            .update_status(
+                "guide",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        vessels: vec![VesselRequirement::builder()
+                            .name("work".into())
+                            .crew(vec![
+                                CrewSpec::builder().role("watch".into()).source(CrewSource::Tool { command: "true".into() }).build(),
+                                agent("guide"),
+                                agent("checker"),
+                            ])
+                            .build()],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("frozen launch plan");
         let holder_spec = TerminalSessionSpec::builder()
             .env_ref("env".into())
             .role("guide".into())
@@ -155,7 +190,10 @@ mod tests {
             .await
             .expect("holder");
         let inbox = MessageInbox::new(backend.clone(), "flotilla");
-        for (revision, template) in [("first", "Old {{ role }}"), ("second", "Newest {{ role }}")] {
+        for (revision, template) in [
+            ("first", "Old {{ role }}"),
+            ("second", "Newest {{ role }} {% for member in members %}{{ member.role }}={{ member.state }} {% endfor %}"),
+        ] {
             let project = projects.get("root").await.expect("project");
             let mut meta = InputMeta::from(&project.metadata);
             meta.annotations.insert("flotilla.work/charter-revision".into(), revision.into());
@@ -169,6 +207,9 @@ mod tests {
             messages.items.iter().filter(|message| !message.status.as_ref().expect("status").phase.is_terminal()).collect();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].spec.body.contains("Newest guide"));
+        assert!(pending[0].spec.body.contains("watch=active"));
+        assert!(pending[0].spec.body.contains("guide=active"));
+        assert!(pending[0].spec.body.contains("checker=latent"));
         assert!(pending[0].spec.body.contains("charter@second"));
         assert!(!pending[0].spec.body.contains("Old guide"));
         assert_eq!(backend.using::<TerminalSession>("flotilla").get("guide-terminal").await.expect("holder").spec, holder_spec);

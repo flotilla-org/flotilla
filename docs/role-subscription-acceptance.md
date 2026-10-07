@@ -61,8 +61,11 @@ the same Message ID.
 ## Live acceptance
 
 This container has no Docker. Automated acceptance uses in-memory resource
-stores and an injected transport. After rolling binaries, apply the above
-companion amendment to project-map, and use disposable crews:
+stores and an injected transport. Treat the companion project-map amendment as
+a prerequisite of the same rollout as these binaries: apply it before exercising
+subscription routing, preserving existing standing ensures. This checkout and
+credential scope do not include project-map; the rollout operator applies that
+companion change. Then use disposable crews:
 
 ```sh
 scripts/accept-supervision-routing.sh CREW_ID FLEET_PROJECT/governor --stall
