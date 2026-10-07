@@ -91,7 +91,8 @@ provisioning and skill staging, with a private config home and no model/login.
 
 The stub dumps its launch environment, effective Git configuration, and staged
 `testing` skill. The installer observes a Ready vessel and Running terminal,
-checks `RUSTUP_HOME`, crew Git identity, `push.default`, skills, and absence of
+checks `RUSTUP_HOME`, effective author and committer identity from `git var`
+(including environment overrides), `push.default`, skills, and absence of
 model/forge token variables, then releases the stub's completion claim. Real
 Cleat rejects its managed session coordinates supplied via `--env`; a Running
 session proves that launch boundary accepted the declared environment. The

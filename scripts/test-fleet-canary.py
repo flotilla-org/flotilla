@@ -19,10 +19,22 @@ spec = importlib.util.spec_from_file_location('fleet_canary', Path(__file__).wit
 canary = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(canary)
 
-REPORT = {'environment': {'RUSTUP_HOME': '/usr/local/rustup'},
-          'git': {'user.name': 'flotilla-crew[bot]',
-                  'user.email': '309902803+flotilla-crew[bot]@users.noreply.github.com',
-                  'push.default': 'current'}, 'skills': ['testing/SKILL.md']}
+CREW_NAME = 'flotilla-crew[bot]'
+CREW_EMAIL = '309902803+flotilla-crew[bot]@users.noreply.github.com'
+# Live crews receive identity and Git settings through environment injection;
+# user.name/user.email are empty in the repository config.
+REPORT = {'environment': {
+    'RUSTUP_HOME': '/usr/local/rustup',
+    'GIT_AUTHOR_NAME': CREW_NAME, 'GIT_AUTHOR_EMAIL': CREW_EMAIL,
+    'GIT_COMMITTER_NAME': CREW_NAME, 'GIT_COMMITTER_EMAIL': CREW_EMAIL,
+    'GIT_CONFIG_COUNT': '3', 'GIT_CONFIG_KEY_0': 'push.default', 'GIT_CONFIG_VALUE_0': 'current',
+    'GIT_CONFIG_KEY_1': 'branch.fleet-canary.remote', 'GIT_CONFIG_VALUE_1': '.',
+    'GIT_CONFIG_KEY_2': 'branch.fleet-canary.merge', 'GIT_CONFIG_VALUE_2': 'refs/heads/main'},
+    'git': {'user.name': '', 'user.email': '', 'push.default': 'current',
+            'GIT_AUTHOR_IDENT': f'{CREW_NAME} <{CREW_EMAIL}> 1791345600 +0000',
+            'GIT_COMMITTER_IDENT': f'{CREW_NAME} <{CREW_EMAIL}> 1791345601 +0000'},
+    'skills': ['testing/SKILL.md']}
+
 
 
 class Process:
@@ -317,12 +329,11 @@ class Contract(unittest.TestCase):
             cli.write_text('#!/bin/bash\nprintf "%s\\n" "$*" > "$CANARY_COMPLETE_LOG"\n')
             cli.chmod(0o755)
             subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
-            for key, value in REPORT['git'].items():
-                subprocess.check_call(['git', '-C', str(root), 'config', key, value])
             completion = root / 'completion'
             environment = {'PATH': f'{bin_dir}:/usr/local/bin:/usr/bin:/bin', 'HOME': str(root),
                            'CLAUDE_CONFIG_DIR': str(home), 'RUSTUP_HOME': '/usr/local/rustup',
-                           'CANARY_COMPLETE_LOG': str(completion)}
+                           'CANARY_COMPLETE_LOG': str(completion), 'GIT_CONFIG_NOSYSTEM': '1',
+                           **REPORT['environment']}
             stub = Path(__file__).with_name('fleet-canary-agent.sh')
             process = subprocess.Popen(['bash', str(stub), str(root)], cwd=root, env=environment,
                                        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -336,6 +347,8 @@ class Contract(unittest.TestCase):
                     except (OSError, json.JSONDecodeError):
                         time.sleep(0.02)
                 self.assertIsNotNone(report, 'stub must dump environment')
+                self.assertEqual(report['git']['user.name'], '')
+                self.assertEqual(report['git']['user.email'], '')
                 canary.verify_baseline(report)
                 self.assertFalse(completion.exists(), 'completion must wait for Running/baseline checks')
                 (root / 'fleet-canary-continue').touch()
@@ -350,6 +363,24 @@ class Contract(unittest.TestCase):
                 process.wait()
                 process.stderr.close()
 
+    # Effective author and committer must independently use the crew name and email,
+    # even if config or environment pairs claim a different identity.
+    def test_effective_git_identity_checks_name_and_email(self):
+        canary.verify_baseline(REPORT)
+        for key in ('GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT'):
+            for identity in (None, '', 42, f'Wrong Name <{CREW_EMAIL}> 1 +0000',
+                             f'{CREW_NAME} <wrong@example.com> 1 +0000',
+                             f'{CREW_NAME} <{CREW_EMAIL}>extra 1 +0000'):
+                report = copy.deepcopy(REPORT)
+                report['git'][key] = identity
+                # Matching environment pairs must not hide an incorrect effective identity.
+                with self.subTest(key=key, identity=identity), self.assertRaisesRegex(canary.CanaryFailure, key):
+                    canary.verify_baseline(report)
+        report = copy.deepcopy(REPORT)
+        report['git']['user.name'] = 'ignored config identity'
+        report['git']['user.email'] = 'ignored@example.com'
+        canary.verify_baseline(report)
+
     # Removing or corrupting any baseline field, including credential isolation,
     # must fail; valid environment values may include unrelated Cleat-owned coordinates.
     def test_each_baseline_requirement_is_enforced(self):
@@ -362,7 +393,7 @@ class Contract(unittest.TestCase):
             report['environment'][key] = 'incorrect'
             with self.subTest(key=key), self.assertRaisesRegex(canary.CanaryFailure, key):
                 canary.verify_baseline(report)
-        for key in REPORT['git']:
+        for key in ('GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT', 'push.default'):
             report = copy.deepcopy(REPORT)
             report['git'].pop(key)
             with self.subTest(key=key), self.assertRaisesRegex(canary.CanaryFailure, key):
