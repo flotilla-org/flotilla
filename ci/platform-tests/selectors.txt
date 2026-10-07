@@ -1,7 +1,7 @@
 # Format: scope|cargo test arguments (whitespace-separated; no shell quoting).
 # Arguments start after the first |; leading argument whitespace is ignored.
 # Scope names are exact, with no leading or trailing whitespace.
-# all applies to both windows and macos; write shared coverage once under all.
+# all runs only on windows/macos, never tender-ssh; write shared coverage once under all.
 windows| -p flotilla-client --locked --lib windows_tests::
 windows| -p flotilla-client --locked --lib endpoint::
 windows| --locked --bin flotilla remote_
