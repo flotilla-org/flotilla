@@ -1,7 +1,8 @@
-use flotilla_core::image_build::{ImageBuildInputResolver, ImageBuildSourceInputs};
+use flotilla_core::image_build::{ImageBuildAdmission, ImageBuildInputResolver, ImageBuildSourceInputs};
 use flotilla_resources::{
-    CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, FrozenImageLayer, FrozenImageLayers, ImageBuild, ImageComposition,
-    ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage, IMAGE_LAYERS_ANNOTATION,
+    CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, FrozenImageLayer, FrozenImageLayers, ImageAvailability, ImageBuild,
+    ImageBuildPhase, ImageBuildStatus, ImageComposition, ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection,
+    ImageLayerSpec, ImageLayerStage, PlacedImageIdentity, IMAGE_LAYERS_ANNOTATION,
 };
 
 use super::*;
@@ -37,7 +38,7 @@ fn layer(stage: ImageLayerStage, provides: &[&str]) -> ImageLayerSpec {
 // Behaviour (#2727/#2728): routing freezes baseline or explicit composition
 // on the selected host. Two admitted convoys share a pinned execution; the
 // generation-1 baseline remains authoritative during the transition.
-async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: bool) {
+async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: bool, retire: bool) {
     let hosts = vec![empty_daemon_named("image-home").await, empty_daemon_named("image-issuer").await];
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
@@ -123,6 +124,39 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
     for host in &hosts {
         seed_trusted_remote_convoy_project(host, "flotilla").await;
     }
+    // A collected recipe remains as immutable execution evidence. A queued
+    // copy at the issuer must not override the home actuator's retirement.
+    let retired_name = if build && retire {
+        let base = ImageComposition::builder()
+            .selection(ImageLayerSelection::builder().base("base".into()).build())
+            .needs(BTreeSet::new())
+            .layers(vec![FrozenImageLayer { name: "base".into(), spec: layer(ImageLayerStage::Base, &["os:debian-family"]) }])
+            .build();
+        let names =
+            ImageBuildAdmission::new(backend.clone(), "flotilla", Arc::new(BuildInputs)).join(&host_id, &base).await.expect("prior recipe");
+        let builds = backend.using::<ImageBuild>("flotilla");
+        let old = builds.get(&names[0]).await.expect("prior build");
+        hosts[1]
+            .resource_backend()
+            .using::<ImageBuild>("flotilla")
+            .create(&InputMeta::builder().name(names[0].clone()).build(), &old.spec)
+            .await
+            .expect("issuer demand copy");
+        builds
+            .update_status(&names[0], &old.metadata.resource_version, &ImageBuildStatus {
+                phase: ImageBuildPhase::Built,
+                finished_at: Some(chrono::Utc::now()),
+                identity: Some(PlacedImageIdentity { local_image_id: format!("sha256:{}", "3".repeat(64)), registry_digest: None }),
+                verified_provides: old.spec.layer.spec.provides.clone(),
+                availability: ImageAvailability { retired: true, retired_at: Some(chrono::Utc::now()), ..Default::default() },
+                ..Default::default()
+            })
+            .await
+            .expect("retired execution");
+        Some(names[0].clone())
+    } else {
+        None
+    };
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "image catalogue and placement replicate", || async {
         let issuer = mesh.hosts[issuer].resource_backend();
@@ -133,6 +167,12 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
             && issuer.definitions::<ImageLayer>("flotilla").get("display").await.is_ok()
             && issuer.definitions::<ImageLayer>("flotilla").get("base").await.is_ok()
             && issuer.definitions::<CrewImageBaseline>("flotilla").get("fleet-crew").await.is_ok()
+            && match &retired_name {
+                Some(name) => flotilla_resources::read_image_build(&issuer, "flotilla", name)
+                    .await
+                    .is_ok_and(|build| build.status.as_ref().is_some_and(|status| status.availability.retired)),
+                None => true,
+            }
     })
     .await;
     let need = if satisfiable { "display:headless-x11" } else { "display:missing" };
@@ -170,8 +210,14 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
     if build {
         assert_eq!(frozen.baseline_image, None);
         let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("joined builds").items;
-        assert_eq!(builds.len(), 1, "admission joins the first stage before accepting the convoy");
-        assert_eq!(builds[0].spec.host_ref, host_id);
+        assert_eq!(builds.len(), 1 + usize::from(retired_name.is_some()), "admission joins the first stage before accepting the convoy");
+        let active =
+            builds.iter().find(|build| build.status.as_ref().is_none_or(|status| !status.availability.retired)).expect("active execution");
+        assert_eq!(active.spec.host_ref, host_id);
+        assert_eq!(active.spec.layer.name, "base", "retired parent cannot be reused to advance the chain");
+        if let Some(old) = &retired_name {
+            assert_eq!(active.metadata.name, format!("{old}-rebuilt"));
+        }
         let second = CommandAction::ConvoyStart {
             intent: Box::new(
                 ConvoyStartIntent::builder()
@@ -186,9 +232,16 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         let command_id = mesh.clients[issuer].execute(Command::builder().action(second).build()).await.expect("second admission");
         assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted { .. }));
         assert_eq!(backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items.len(), 2);
-        assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared execution").items.len(), 1);
+        assert_eq!(
+            backend.using::<ImageBuild>("flotilla").list().await.expect("shared execution").items.len(),
+            1 + usize::from(retired_name.is_some())
+        );
 
-        assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
+        assert_eq!(
+            mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.len(),
+            usize::from(retired_name.is_some()),
+            "issuer only holds its prior demand copy"
+        );
     } else {
         assert_eq!(frozen.baseline_image.as_deref(), Some("crew:authoritative"));
     }
@@ -197,23 +250,32 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
 
 #[tokio::test]
 async fn layered_baseline_routing_pinned_rows() {
-    for (issuer, satisfiable, build) in
-        [(1, true, false), (0, true, false), (1, false, false), (1, true, true), (0, true, true), (1, false, true)]
-    {
-        layered_baseline_routing_row(issuer, satisfiable, build).await;
+    for (issuer, satisfiable, build, retired) in [
+        (1, true, false, false),
+        (0, true, false, false),
+        (1, false, false, false),
+        (1, true, true, false),
+        (0, true, true, false),
+        (1, false, true, false),
+        (0, true, true, true),
+        (1, true, true, true),
+    ] {
+        layered_baseline_routing_row(issuer, satisfiable, build, retired).await;
     }
 }
 
 #[hegel::test]
 fn generated_layered_baseline_routing(tc: hegel::TestCase) {
-    // Both issuer locations and satisfiable/unsatisfiable catalogue needs.
+    // Both issuer locations, satisfiable/unsatisfiable needs, baseline/build
+    // selection, and retired executions beside stale issuer demand copies.
     let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
     let satisfiable = tc.draw(gs::booleans());
     let build = tc.draw(gs::booleans());
+    let retired = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .build()
         .expect("runtime")
-        .block_on(layered_baseline_routing_row(issuer, satisfiable, build));
+        .block_on(layered_baseline_routing_row(issuer, satisfiable, build, retired));
 }

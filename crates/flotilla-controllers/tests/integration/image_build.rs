@@ -367,3 +367,36 @@ async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_iden
     assert_eq!(ready.local_image_id, Some(format!("sha256:{}", "3".repeat(64))));
     assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
 }
+
+// #2733: collection leaves immutable execution evidence, but future demand must
+// build a fresh execution instead of forever joining an unavailable old digest.
+#[tokio::test]
+async fn retired_recipe_demands_join_a_rebuilt_successor() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    host(&backend, "local", "amd64", None).await;
+    let admission = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs));
+    let composition = composition();
+    let original = admission.join("local", &composition).await.expect("original");
+    let runner = Arc::new(Runner { calls: AtomicUsize::new(0), failure: None });
+    let reconciler = ImageBuildReconciler::new(runner.clone(), backend.clone(), "test", "local");
+    tick(&backend, &reconciler, &original[0]).await;
+    tick(&backend, &reconciler, &original[0]).await;
+    let builds = backend.using::<ImageBuild>("test");
+    let built = builds.get(&original[0]).await.expect("built");
+    let mut status = built.status.clone().expect("status");
+    assert_eq!(status.phase, ImageBuildPhase::Built);
+    status.availability.retired = true;
+    status.availability.retired_at = Some(Utc::now());
+    builds.update_status(&original[0], &built.metadata.resource_version, &status).await.expect("retire");
+    assert!(admission.completed("amd64", &composition).await.expect("lookup").is_none());
+    let (first, second) = tokio::join!(admission.join("local", &composition), admission.join("local", &composition));
+    let successor = first.expect("successor");
+    assert_eq!(successor, second.expect("concurrent successor"));
+    assert_ne!(successor, original);
+    assert_eq!(successor[0], format!("{}-rebuilt", original[0]));
+    tick(&backend, &reconciler, &successor[0]).await;
+    tick(&backend, &reconciler, &successor[0]).await;
+    assert!(admission.completed("amd64", &composition).await.expect("new image").is_some());
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(builds.get(&original[0]).await.expect("original evidence").status, Some(status));
+}

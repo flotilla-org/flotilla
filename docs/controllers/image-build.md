@@ -65,7 +65,7 @@ and produces an infrastructure log and Host health condition.
 A local successful build provisions the Environment using its image ID with
 pulling disabled. A remote successful build waits for the distribution adapter to
 deliver and verify its digest before provisioning (see Availability and distribution
-below). Build garbage collection belongs to #2733.
+below). Build garbage collection is described below.
 
 Build args and pin values must be non-secret: they appear in Docker argv and may
 appear in build output. Credentials require a separate secret-delivery mechanism;
@@ -187,3 +187,129 @@ fail the build with their output retained in its Artifact. The shared runner's
 contents also participate in input hashes; changes invalidate verification keys.
 See [crew image acceptance](../crew-image.md#composed-spine-and-display-acceptance)
 for the display layer and the operator's Docker-host acceptance command.
+
+## Scheduled image garbage collection
+
+Opt in on FleetDesignation; omission leaves collection disabled. The mode defaults
+to `dry_run` when omitted. For example (retain the existing `project` and cache):
+
+```yaml
+image_gc:
+  mode: dry_run
+  interval_seconds: 86400
+  grace_seconds: 86400
+  # Optional. Omit both for registry-less hosts.
+  registry_host: builder-host-resource-name
+  registry_credential: image-cache-delete
+```
+
+Every Docker host observes the same policy and collects its own held images.
+Exactly the named registry host deletes published manifests. It requires Skopeo,
+a docker-registry CredentialSpec, and an exclusive host-action CredentialGrant:
+
+```yaml
+selector:
+  host_action:
+    action: image-delete
+    hosts: [builder-host-resource-name]
+credentials: [image-cache-delete]
+```
+
+Pull/push grants never authorize deletion. All credential operations use a private
+throwaway Docker configuration. Skopeo receives its explicit auth file and an
+exact `docker://repository@manifest-digest`, with TLS verification enabled by
+default. Neither a mutable tag nor a different repository is accepted. This
+requires registry manifest deletion support, independently of CI or Forgejo.
+
+Retention considers an architecture and ordered layer-name chain a composition
+family. Revisions, content hashes, arguments, and actual parent IDs are versions
+within that family. A family is live while all its layer definitions are present.
+Keep its two newest distinct successful local digests (duplicate build outputs do
+not consume a rollback slot), their parent stages, and every identity/build ref
+mentioned in a stored Convoy, Environment, Vessel, or baseline. Frozen placement
+annotations and legacy literal Flotilla build/parent/cache handles are read too.
+Handles are mapped only through known immutable execution evidence. Pin extraction
+intentionally scans every stored string, including names and annotations, and
+JSON embedded in those strings. An incidental string equal to an image ID can
+therefore retain it. When investigating unexpected retention, inspect those
+references as well as the frozen image fields. Landed convoy
+snapshots continue to pin their images
+until removed. Arbitrary images outside ImageBuild evidence are never candidates.
+
+Apply mode first retires the actuator's mutable availability, preserving terminal
+execution evidence. New demand joins a deterministic rebuilt successor instead
+of the retired build. A second grace interval quarantines retirement before bytes
+are removed; a frozen reference arriving during quarantine cancels retirement.
+Apply waits for fresh fleet Host heartbeats, serializes local delivery/publication
+with collection, and re-reads reachability before each destructive operation.
+Disconnected fleets fail closed. A non-deleting Host with a missing heartbeat or
+one older than 120 seconds blocks apply-mode collection (four missed default
+30-second heartbeats). Operators must delete decommissioned Host records; an
+offline record is deliberately not treated as proof that its pins are obsolete.
+Custom heartbeat intervals must stay below this freshness limit. Dry-run reports
+the same freshness and replication refusals alongside its candidate preview. Retirement
+conflicts are reported per build and retried after 30 seconds. Health publication
+failures preserve the collection outcome and retain deletion evidence in memory
+for republication; tombstones are pruned when no ImageBuild references them.
+Hosts must synchronize UTC clocks (for example with NTP). Retirement timestamps
+come from the actuator, so positive collector clock skew can shorten quarantine.
+The configured grace must exceed replication/admission latency plus the worst
+expected clock skew; the minimum is one hour. Schedule intervals must
+be at least one minute. Dry-run does not retire builds or remove tags/manifests.
+
+Reachability is deliberately re-read before every deletion so a pin arriving
+between two removals wins. For large stores, enable
+`RUST_LOG=flotilla_daemon::image_gc=debug` to measure each snapshot's elapsed time,
+build count and protected-string count before tuning scheduling. Each run attempts
+at most 16 eligible local and 16 eligible registry removals; an exhausted budget
+is reported and resumes after 30 seconds. Candidate previews still list the full
+backlog, and each attempted removal retains its immediate reachability re-check.
+Per-store cursors advance after unsuccessful attempts too, so failing candidates
+do not starve later images; a daemon restart resets this in-memory cursor.
+
+Docker container references and tags outside known Flotilla build, parent, or
+cache publication handles refuse collection. Only owned tags are removed and
+Docker removal never uses force. Partial failures retain retryable evidence.
+The latest Host.capabilities.image_gc report lists candidates, deleted identities,
+failures and the observed Docker-filesystem free-space increase. Heartbeats
+preserve this report; `flotilla host list` includes its summary in fleet health.
+Accounting measures a free-space delta, so unrelated concurrent writes or deletes
+can affect it. It does not sum image sizes, which would double-count shared layers.
+
+Use a fleet-owned cache repository: deleting a manifest digest can invalidate
+other tags that point to that manifest. Registry manifest deletion is scheduled,
+but registry physical blob collection is registry-specific. `reclaimed_registry_bytes` remains unknown: manifest deletion
+is not evidence that shared blobs have been freed. Configure the registry's native
+blob collector on its own schedule. For Distribution this requires its documented
+maintenance/read-only procedure and `registry garbage-collect CONFIG`; other
+registries may collect asynchronously. See the [Skopeo deletion contract](https://github.com/podman-container-tools/skopeo/blob/main/docs/skopeo-delete.1.md).
+
+### Operator acceptance on real hosts
+
+This vessel has no Docker; process boundaries are covered with injected
+collaborators. After deployment, use a disposable composition with four distinct
+successful versions. Freeze a convoy on the oldest, leave current and previous
+as the two newest, and enable dry-run. Verify that only the remaining obsolete
+version appears under Host.capabilities.image_gc.local_candidates (and the
+corresponding published manifest under registry_candidates). Switch to apply,
+wait through retirement quarantine, then run on each image host:
+
+```bash
+scripts/crew-image-gc-acceptance.py \
+  --keep sha256:CURRENT --keep sha256:PREVIOUS --keep sha256:FROZEN \
+  --collected sha256:OBSOLETE
+```
+
+Replace those placeholders with full 64-hex IDs. Provision a rollback convoy from
+the previous digest and confirm its frozen identity. Repeat with no registry to
+verify the single-host path. On the registry collector host add `--keep-manifest`
+for each retained repository@digest and `--collected-manifest` for the obsolete
+one, plus `--registry-authfile` pointing to explicitly staged operator credentials.
+On a Distribution storage host in maintenance mode, `--registry-config CONFIG`
+previews physical blob GC; add `--apply-registry-blobs` only after following that
+registry's maintenance procedure. Compare storage usage before/after that native
+collector; Flotilla does not invent physical registry-byte accounting.
+
+Also exercise a running container, an external tag, an unavailable credential,
+and an offline peer: collection must refuse each affected removal, report its
+reason in fleet health, and succeed on retry once the obstruction is cleared.

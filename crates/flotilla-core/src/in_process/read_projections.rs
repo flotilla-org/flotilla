@@ -527,6 +527,13 @@ impl ReadProjections<'_> {
                         .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
                         .staleness(staleness)
                         .observation_agreement(observation_agreement)
+                        .maybe_image_gc_summary(status.and_then(|status| {
+                            status
+                                .conditions
+                                .iter()
+                                .find(|condition| condition.condition_type == "ImageGarbageCollection")
+                                .map(|condition| condition.message.clone())
+                        }))
                         .degraded_conditions(degraded_conditions)
                         .credential_attention(credential_attention)
                         .build(),
@@ -2752,7 +2759,11 @@ mod project_hierarchy_projection_tests {
         }
         backend
             .definitions::<FleetDesignation>("flotilla")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into(), image_cache: None })
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec {
+                project: "root".into(),
+                image_cache: None,
+                image_gc: None,
+            })
             .await
             .expect("fleet");
         let response = ReadProjections::list_projects(&backend, "flotilla", chrono::Utc::now()).await.expect("list");

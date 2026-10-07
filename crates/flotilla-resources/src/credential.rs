@@ -350,6 +350,7 @@ pub enum RepositoryTrust {
 pub enum HostImageAction {
     ImagePull,
     ImagePush,
+    ImageDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -687,15 +688,17 @@ mod tests {
 mod host_action_tests {
     use super::*;
 
-    // #2729: host actions cannot leak to crews. Generate both actions, explicit
+    // #2729/#2733: host actions cannot leak to crews. Generate all three actions, explicit
     // and wildcard host sets, builder/vessel hosts, and wrong host identities.
     #[hegel::test]
     fn host_grants_are_disjoint_from_work(tc: hegel::TestCase) {
-        let push = tc.draw(hegel::generators::booleans());
+        let action_index = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
         let builder = tc.draw(hegel::generators::booleans());
         let wildcard = tc.draw(hegel::generators::booleans());
         let matching_host = tc.draw(hegel::generators::booleans());
-        let action = if push { HostImageAction::ImagePush } else { HostImageAction::ImagePull };
+        let actions = [HostImageAction::ImagePull, HostImageAction::ImagePush, HostImageAction::ImageDelete];
+        let action = actions[action_index];
+        let push = action == HostImageAction::ImagePush;
         let selector = CredentialGrantSelector::builder()
             .host_action(
                 HostActionSelector::builder()
@@ -708,7 +711,7 @@ mod host_action_tests {
         assert_eq!(selector.matches_host_action(host, action, builder), (wildcard || matching_host) && (!push || builder));
         assert!(!selector.matches(Some("fleet"), &BTreeMap::new(), "coder"));
         assert!(!selector.overlaps(&CredentialGrantSelector::builder().build()));
-        let other = if push { HostImageAction::ImagePull } else { HostImageAction::ImagePush };
+        let other = actions[(action_index + 1) % actions.len()];
         assert!(!selector.matches_host_action(host, other, true));
     }
 

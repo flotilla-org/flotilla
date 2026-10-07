@@ -4,6 +4,9 @@ use crate::{ApiPaths, InputMeta, NoStatusPatch, ReplicationClass, Resource, Reso
 
 /// The fleet store authors this singleton; Definitions federation distributes it.
 pub const FLEET_DESIGNATION_NAME: &str = "fleet";
+const MIN_GC_INTERVAL_SECONDS: u64 = 60;
+const MIN_GC_GRACE_SECONDS: u64 = 3600;
+const MAX_GC_PERIOD_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FleetDesignation;
@@ -22,6 +25,24 @@ impl Resource for FleetDesignation {
         if let Some(cache) = &spec.image_cache {
             cache.validate().map_err(ResourceError::invalid)?;
         }
+        if let Some(gc) = &spec.image_gc {
+            if !(MIN_GC_INTERVAL_SECONDS..=MAX_GC_PERIOD_SECONDS).contains(&gc.interval_seconds)
+                || !(MIN_GC_GRACE_SECONDS..=MAX_GC_PERIOD_SECONDS).contains(&gc.grace_seconds)
+            {
+                return Err(ResourceError::invalid("image GC needs an interval >= 60s and grace >= 3600s"));
+            }
+            if gc.registry_host.as_ref().is_some_and(|value| value.trim().is_empty())
+                || gc.registry_credential.as_ref().is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(ResourceError::invalid("registry GC host and credential must be nonempty"));
+            }
+            if gc.registry_host.is_some() != gc.registry_credential.is_some() {
+                return Err(ResourceError::invalid("registry GC needs both a host and a credential"));
+            }
+            if gc.registry_host.is_some() && spec.image_cache.is_none() {
+                return Err(ResourceError::invalid("registry GC needs a declared image cache"));
+            }
+        }
         Ok(())
     }
 }
@@ -33,6 +54,9 @@ pub struct FleetDesignationSpec {
     /// Optional shared OCI cache; ADR 0047 default may retire after one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_cache: Option<ImageCacheBinding>,
+    /// Opt-in collection; absent in fleets that have not enabled collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_gc: Option<ImageGcPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,4 +82,27 @@ impl ImageCacheBinding {
         }
         Ok(())
     }
+}
+
+/// Collection uses immutable build identities, never general Docker pruning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+pub struct ImageGcPolicy {
+    #[serde(default)]
+    #[builder(default)]
+    pub mode: ImageGcMode,
+    pub interval_seconds: u64,
+    pub grace_seconds: u64,
+    #[serde(default)]
+    pub registry_host: Option<String>,
+    #[serde(default)]
+    pub registry_credential: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageGcMode {
+    #[default]
+    DryRun,
+    Apply,
 }

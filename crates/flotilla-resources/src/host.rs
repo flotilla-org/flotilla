@@ -489,9 +489,13 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 // Image inventory is observed independently of heartbeat gathering.
                 // Preserve its latest value atomically when heartbeat has no update.
                 let image_inventory = status.capabilities.get(crate::IMAGE_DIGESTS_CAPABILITY).cloned();
+                let image_gc = status.capabilities.get("image_gc").cloned();
                 status.capabilities = capabilities.clone();
                 if let Some(inventory) = image_inventory {
                     status.capabilities.entry(crate::IMAGE_DIGESTS_CAPABILITY.into()).or_insert(inventory);
+                }
+                if let Some(report) = image_gc {
+                    status.capabilities.entry("image_gc".into()).or_insert(report);
                 }
                 status.description = description.as_deref().cloned();
                 // Placement capability keys are authoritative; do not persist a second
@@ -502,16 +506,18 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                     });
                 }
                 status.heartbeat_at = Some(*heartbeat_at);
-                // Sleep inhibition has its own writer. Apply heartbeat conditions to
-                // the latest status so a concurrent sleep update survives a retry.
-                let sleep_conditions = status
+                // Independently observed conditions have their own writers. Preserve
+                // their latest values when applying a heartbeat or retry.
+                let independent_conditions = status
                     .conditions
                     .iter()
-                    .filter(|condition| condition.condition_type == SLEEP_INHIBITION_CONDITION_TYPE)
+                    .filter(|condition| {
+                        condition.condition_type == SLEEP_INHIBITION_CONDITION_TYPE || condition.condition_type == "ImageGarbageCollection"
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 status.conditions.clone_from(conditions);
-                status.conditions.extend(sleep_conditions);
+                status.conditions.extend(independent_conditions);
                 status.ready = *ready && !status.readiness_blocked();
                 status.daemon_generation.clone_from(daemon_generation);
                 status.protocol_fingerprint.clone_from(protocol_fingerprint);

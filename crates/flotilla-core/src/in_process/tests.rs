@@ -9789,7 +9789,7 @@ async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
     projects.apply(&test_meta("fleet"), &fleet).await.expect("fleet");
     backend
         .definitions::<FleetDesignation>("flotilla")
-        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
+        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into(), image_cache: None, image_gc: None })
         .await
         .expect("fleet designation");
     let mut project = projects.get("standing-project").await.expect("project");

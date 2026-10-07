@@ -24,8 +24,8 @@ pub use crew_defaults::{
 mod crew_image_baseline;
 mod image_build;
 pub use image_build::{
-    read_image_build, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildReason,
-    ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch,
+    list_image_builds, read_image_build, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase,
+    ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch,
 };
 mod image_layer;
 pub use image_layer::{
@@ -305,6 +305,6 @@ pub use workflow_template::{
 
 pub mod role_cascade;
 pub use credential::{HostActionSelector, HostImageAction};
-pub use fleet_designation::ImageCacheBinding;
+pub use fleet_designation::{ImageCacheBinding, ImageGcMode, ImageGcPolicy};
 pub use image_build::{is_image_digest, ImageAcquisitionCost, ImageAvailability, IMAGE_DIGESTS_CAPABILITY};
 pub use role_cascade::{ResolvedCascade, ResolvedSetting, RoleCascadeLayer, RoleDefinition};

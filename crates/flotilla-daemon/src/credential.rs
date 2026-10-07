@@ -1022,6 +1022,7 @@ impl CredentialStore {
         let verb = match action {
             HostImageAction::ImagePush => "push",
             HostImageAction::ImagePull => "pull",
+            HostImageAction::ImageDelete => "delete",
         };
         if arguments.len() != 2 || arguments[0] != verb || !image_registry_matches(arguments[1], repository.split('/').next().unwrap_or(""))
         {
@@ -1030,10 +1031,10 @@ impl CredentialStore {
         if !arguments[1].strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
             return Err("host image operation does not target the declared repository".into());
         }
-        if action == HostImageAction::ImagePull
+        if matches!(action, HostImageAction::ImagePull | HostImageAction::ImageDelete)
             && !arguments[1].rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
         {
-            return Err("host image pull requires a manifest digest".into());
+            return Err(format!("host image {verb} requires a manifest digest"));
         }
         let hosts = self.backend.including_replicas::<Host>(&self.namespace).list().await.map_err(|error| error.to_string())?;
         let declared_builder = hosts.items.iter().any(|source| {
@@ -1072,15 +1073,27 @@ impl CredentialStore {
                     material.as_bytes(),
                 )
                 .await?;
-            let mut args = vec!["--config", directory.as_ref()];
-            args.extend_from_slice(arguments);
-            self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
+            if action == HostImageAction::ImageDelete {
+                let auth_file = config.path().join("config.json");
+                self.host_runner
+                    .run(
+                        "skopeo",
+                        &["delete", "--authfile", &auth_file.to_string_lossy(), &format!("docker://{}", arguments[1])],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
+                    .await
+            } else {
+                let mut args = vec!["--config", directory.as_ref()];
+                args.extend_from_slice(arguments);
+                self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
+            }
         };
         let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), operation)
             .await
             .map_err(|_| "image registry operation timed out".to_string())?
             .map_err(|error| bounded_adapter_error(credential, "docker-registry", &error.replace(material, "[redacted]")))?;
-        // Return only Docker's non-secret operation output, never login output.
+        // Return only non-secret operation output, never login output.
         Ok(output.replace(material, "[redacted]"))
     }
 
@@ -5351,6 +5364,114 @@ interactions:
             assert!(!args.iter().any(|arg| arg.contains("test-secret")));
             assert_eq!(input.as_slice(), if index % 2 == 0 { b"test-secret".as_slice() } else { &[] });
         }
+    }
+
+    // #2733: pull/push grants cannot delete. Deletion accepts only the declared
+    // repository's immutable manifest, with an explicit private auth file and
+    // no secret in argv. RecordingRunner stands in for Docker/Skopeo processes.
+    #[tokio::test]
+    async fn image_delete_requires_exclusive_grant_and_digest() {
+        use flotilla_resources::{
+            CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, Host, HostActionSelector, HostImageAction, HostSpec,
+        };
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("registry".into()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "collector".into() },
+                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: Default::default(),
+            })
+            .await
+            .expect("credential");
+        backend
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name("collector".into()).build(), &HostSpec::default())
+            .await
+            .expect("host");
+        let runner = Arc::new(RecordingRunner::default());
+        let state = tempfile::tempdir().expect("state");
+        let store = CredentialStore::new(
+            backend.clone(),
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "delete-secret".into())]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            state.path().into(),
+        );
+        let reference = format!("registry.example/images@sha256:{}", "1".repeat(64));
+        for action in [HostImageAction::ImagePull, HostImageAction::ImagePush] {
+            backend
+                .definitions::<CredentialGrant>("flotilla")
+                .create(
+                    &InputMeta::builder().name(format!("grant-{action:?}")).build(),
+                    &CredentialGrantSpec::builder()
+                        .selector(
+                            CredentialGrantSelector::builder().host_action(HostActionSelector::builder().action(action).build()).build(),
+                        )
+                        .credentials(BTreeSet::from(["registry".into()]))
+                        .build(),
+                )
+                .await
+                .expect("grant");
+        }
+        assert!(store
+            .image_registry_operation("collector", HostImageAction::ImageDelete, "registry", "registry.example/images", &[
+                "delete", &reference
+            ])
+            .await
+            .expect_err("no delete grant")
+            .contains("no ImageDelete grant"));
+        backend
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &InputMeta::builder().name("delete".into()).build(),
+                &CredentialGrantSpec::builder()
+                    .selector(
+                        CredentialGrantSelector::builder()
+                            .host_action(
+                                HostActionSelector::builder()
+                                    .action(HostImageAction::ImageDelete)
+                                    .hosts(BTreeSet::from(["collector".into()]))
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .credentials(BTreeSet::from(["registry".into()]))
+                    .build(),
+            )
+            .await
+            .expect("delete grant");
+        for target in [
+            "registry.example/images:latest".to_string(),
+            reference.replace("/images@", "/other@"),
+            reference.replace("registry.example", "attacker.example"),
+        ] {
+            assert!(store
+                .image_registry_operation("collector", HostImageAction::ImageDelete, "registry", "registry.example/images", &[
+                    "delete", &target
+                ])
+                .await
+                .is_err());
+        }
+        assert!(runner.calls.lock().expect("calls").is_empty());
+        store
+            .image_registry_operation("collector", HostImageAction::ImageDelete, "registry", "registry.example/images", &[
+                "delete", &reference,
+            ])
+            .await
+            .expect("delete");
+        let calls = runner.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "docker");
+        assert_eq!(calls[0].2, b"delete-secret");
+        assert_eq!(calls[1].0, "skopeo");
+        assert_eq!(&calls[1].1[..2], ["delete", "--authfile"]);
+        assert_eq!(calls[1].1[2], format!("{}/config.json", calls[0].1[1]));
+        assert_eq!(calls[1].1[3], format!("docker://{reference}"));
+        assert!(!Path::new(&calls[0].1[1]).exists(), "private config cleaned");
+        assert!(calls.iter().all(|(_, args, _)| args.iter().all(|arg| !arg.contains("delete-secret"))));
     }
 
     // Cancellation while login is in flight removes the config and never

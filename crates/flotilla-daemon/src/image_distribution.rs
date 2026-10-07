@@ -23,6 +23,15 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 #[async_trait]
 pub(crate) trait ImageDistributionIo: Send + Sync {
     async fn inventory(&self) -> Result<BTreeSet<String>, String>;
+    async fn remove_local(&self, _id: &str, _tags: &BTreeSet<String>) -> Result<(), String> {
+        Err("local image collection unavailable".into())
+    }
+    async fn remove_registry(&self, _cache: &ImageCacheBinding, _credential: &str, _reference: &str) -> Result<(), String> {
+        Err("registry image collection unavailable".into())
+    }
+    async fn disk_free(&self) -> Result<u64, String> {
+        Err("Docker storage accounting unavailable".into())
+    }
     async fn inspect(&self, reference: &str) -> Result<PlacedImageIdentity, String>;
     async fn push(&self, cache: &ImageCacheBinding, image_id: &str) -> Result<String, String>;
     async fn pull(&self, cache: &ImageCacheBinding, reference: &str) -> Result<(), String>;
@@ -37,9 +46,19 @@ pub(crate) struct ImageDistributor<I> {
     #[builder(default)]
     pub jobs: tokio::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<PlacedImageIdentity, String>>>>,
     #[builder(default)]
-    publications: tokio::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<String, String>>>>,
+    pub(crate) publications: tokio::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<String, String>>>>,
     #[builder(default)]
     retries: tokio::sync::Mutex<BTreeMap<String, Instant>>,
+    #[builder(default)]
+    pub(crate) next_collection: tokio::sync::Mutex<Option<Instant>>,
+    /// Pending durable health publication must not lose deletion evidence.
+    #[builder(default)]
+    pub(crate) collection_deleted_registry: tokio::sync::Mutex<BTreeSet<String>>,
+    /// Advance even on removal failures so bounded batches cannot starve.
+    #[builder(default)]
+    pub(crate) collection_cursors: tokio::sync::Mutex<(Option<String>, Option<String>)>,
+    #[builder(default)]
+    pub(crate) collection_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
@@ -78,7 +97,18 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
     /// Prefer the held exact ID, then a published registry digest; otherwise wait.
     /// Never change a build's identity to whatever a tag happens to name.
     pub async fn ensure(&self, build: &ResourceObject<ImageBuild>) -> Result<PlacedImageIdentity, String> {
-        let status = build.status.as_ref().filter(|status| status.phase == ImageBuildPhase::Built).ok_or("image build is not built")?;
+        let _gate = self.collection_gate.read().await;
+        let current = flotilla_resources::read_image_build(&self.backend, &self.namespace, &build.metadata.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if current.status.as_ref().is_some_and(|status| status.availability.retired) {
+            return Err("image build availability retired".into());
+        }
+        let status = build
+            .status
+            .as_ref()
+            .filter(|status| status.phase == ImageBuildPhase::Built && !status.availability.retired)
+            .ok_or("image build is not built")?;
         let expected = status.identity.as_ref().ok_or("built image has no identity")?;
         if !is_image_digest(&expected.local_image_id) {
             return Err("built image has no valid local digest".into());
@@ -114,6 +144,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
     /// locations from their latest inventories rather than trusting old delivery
     /// successes forever.
     pub async fn refresh(&self) -> Result<(), String> {
+        let _gate = self.collection_gate.read().await;
         let held = self.io.inventory().await?;
         let hosts = self.backend.using::<Host>(&self.namespace);
         let host = hosts.get(&self.host).await.map_err(|error| error.to_string())?;
@@ -130,7 +161,9 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                 continue;
             }
             let result: Result<(), String> = async {
-                let Some(mut status) = build.status.clone().filter(|status| status.phase == ImageBuildPhase::Built) else {
+                let Some(mut status) =
+                    build.status.clone().filter(|status| status.phase == ImageBuildPhase::Built && !status.availability.retired)
+                else {
                     return Ok(());
                 };
                 let identity = status.identity.as_ref().ok_or("built image has no identity")?;
@@ -186,7 +219,14 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                                 let io = Arc::clone(&self.io);
                                 let cache = cache.clone();
                                 let id = identity.local_image_id.clone();
-                                publications.insert(build.metadata.name.clone(), tokio::spawn(async move { io.push(&cache, &id).await }));
+                                let gate = Arc::clone(&self.collection_gate);
+                                publications.insert(
+                                    build.metadata.name.clone(),
+                                    tokio::spawn(async move {
+                                        let _gate = gate.read().await;
+                                        io.push(&cache, &id).await
+                                    }),
+                                );
                             }
                         }
                     }
@@ -245,6 +285,48 @@ impl ImageDistributionIo for DockerImageIo {
         // Docker local IDs and registry manifest digests are distinct namespaces.
         // Report both because placement checks the corresponding immutable identity.
         Ok(output.split_whitespace().filter(|line| is_image_digest(line)).map(String::from).collect())
+    }
+
+    async fn remove_local(&self, id: &str, tags: &BTreeSet<String>) -> Result<(), String> {
+        if !is_image_digest(id) {
+            return Err("collection requires a full local image ID".into());
+        }
+        // Docker refuses ID removal when several tags point at it. Remove only
+        // build/publication handles proven from immutable Flotilla evidence.
+        let containers = self.run(&["ps", "-a", "--filter", &format!("ancestor={id}"), "--format", "{{.ID}}"]).await?;
+        if !containers.trim().is_empty() {
+            return Err("container still references image".into());
+        }
+        let output = self.run(&["image", "inspect", "--format", "{{json .RepoTags}}", id]).await?;
+        let actual: Option<Vec<String>> = serde_json::from_str(&output).map_err(|error| error.to_string())?;
+        let actual = actual.unwrap_or_default();
+        if actual.iter().any(|tag| !tags.contains(tag)) {
+            return Err("image has tags outside Flotilla ownership".into());
+        }
+        for tag in actual {
+            if self.inspect(&tag).await?.local_image_id != id {
+                return Err("collection tag identity changed".into());
+            }
+            self.run(&["image", "rm", &tag]).await?;
+        }
+        if self.inventory().await?.contains(id) {
+            self.run(&["image", "rm", id]).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_registry(&self, cache: &ImageCacheBinding, credential: &str, reference: &str) -> Result<(), String> {
+        validate_registry_reference(cache, reference)?;
+        self.credentials
+            .image_registry_operation(&self.host, HostImageAction::ImageDelete, credential, &cache.repository, &["delete", reference])
+            .await
+            .map(|_| ())
+    }
+
+    async fn disk_free(&self) -> Result<u64, String> {
+        let root = self.run(&["info", "--format", "{{.DockerRootDir}}"]).await?;
+        let output = self.runner.run("df", &["-B1", "--output=avail", root.trim()], Path::new("/"), &ChannelLabel::Default).await?;
+        output.split_whitespace().last().ok_or("df has no free space")?.parse::<u64>().map_err(|error| error.to_string())
     }
 
     async fn inspect(&self, reference: &str) -> Result<PlacedImageIdentity, String> {
@@ -390,6 +472,7 @@ mod tests {
                 .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec {
                     project: "fleet".into(),
                     image_cache: Some(cache()),
+                    image_gc: None,
                 })
                 .await
                 .expect("cache");
@@ -425,6 +508,8 @@ mod tests {
             finished_at: Some(Utc::now()),
             identity: Some(PlacedImageIdentity { local_image_id: id.clone(), registry_digest: None }),
             availability: flotilla_resources::ImageAvailability {
+                retired: false,
+                retired_at: None,
                 hosts: BTreeSet::from(["builder".into()]),
                 registry_ref: registry.then(|| format!("{}@{manifest}", cache().repository)),
                 failure: None,
@@ -590,5 +675,98 @@ mod tests {
         build.status.as_mut().expect("status").availability.registry_ref = Some(format!("evil.test/image@sha256:{}", "1".repeat(64)));
         assert!(delivery.ensure(&build).await.is_err());
         assert!(delivery.io.calls.lock().expect("calls").is_empty());
+    }
+}
+#[cfg(test)]
+mod gc_process_tests {
+    use std::{path::PathBuf, sync::Mutex};
+
+    use flotilla_core::providers::{
+        discovery::{test_support::TestEnvVars, EnvironmentBag},
+        CommandOutput,
+    };
+    use flotilla_resources::InMemoryBackend;
+
+    use super::*;
+
+    // Process boundary stand-in: Docker must see a private config, full IDs,
+    // no force, a container check, and only explicitly owned tags for removal.
+    #[derive(Default)]
+    struct Docker {
+        blocked: bool,
+        external_tag: bool,
+        removed: Mutex<BTreeSet<String>>,
+        configs: Mutex<Vec<PathBuf>>,
+    }
+    #[async_trait]
+    impl CommandRunner for Docker {
+        async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "docker");
+            assert_eq!(args[0], "--config");
+            assert!(Path::new(args[1]).is_dir());
+            assert!(!args.contains(&"--force") && !args.contains(&"-f"));
+            self.configs.lock().expect("configs").push(args[1].into());
+            let id = format!("sha256:{}", "1".repeat(64));
+            let args = &args[2..];
+            if args[0] == "ps" {
+                assert_eq!(args, ["ps", "-a", "--filter", &format!("ancestor={id}"), "--format", "{{.ID}}"]);
+                return Ok(if self.blocked { "container".into() } else { String::new() });
+            }
+            if args[0..2] == ["image", "inspect"] {
+                if args[3] == "{{json .RepoTags}}" {
+                    assert_eq!(args[4], id);
+                    return Ok(serde_json::to_string(&if self.external_tag {
+                        vec!["flotilla-build:owned", "external:latest"]
+                    } else {
+                        vec!["flotilla-build:owned", "flotilla-parent:owned"]
+                    })
+                    .expect("tags"));
+                }
+                assert_eq!(args[3], "{{json .}}");
+                return Ok(serde_json::json!({"Id": id, "RepoDigests": []}).to_string());
+            }
+            if args[0..2] == ["image", "rm"] {
+                assert!(args[2] == "flotilla-build:owned" || args[2] == "flotilla-parent:owned");
+                self.removed.lock().expect("removed").insert(args[2].into());
+                return Ok(String::new());
+            }
+            assert_eq!(args[0..2], ["image", "ls"]);
+            assert_eq!(self.removed.lock().expect("removed").len(), 2);
+            Ok(String::new())
+        }
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Ok(CommandOutput { stdout: self.run(cmd, args, cwd, label).await?, stderr: String::new(), exit_code: Some(0) })
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            true
+        }
+    }
+
+    // #2733: shared image tags require explicit ownership; running/stopped
+    // containers and external tags refuse removal before any tag is touched.
+    #[tokio::test]
+    async fn image_gc_removes_only_owned_tags_without_force() {
+        for (blocked, external_tag) in [(false, false), (true, false), (false, true)] {
+            let runner = Arc::new(Docker { blocked, external_tag, ..Default::default() });
+            let state = tempfile::tempdir().expect("state");
+            let credentials = Arc::new(CredentialStore::new(
+                ResourceBackend::InMemory(InMemoryBackend::default()),
+                "test",
+                Arc::new(TestEnvVars::default()),
+                EnvironmentBag::new(),
+                runner.clone(),
+                state.path().into(),
+            ));
+            let io = DockerImageIo::builder().runner(runner.clone()).credentials(credentials).host("host".into()).build();
+            let result = io
+                .remove_local(
+                    &format!("sha256:{}", "1".repeat(64)),
+                    &BTreeSet::from(["flotilla-build:owned".into(), "flotilla-parent:owned".into()]),
+                )
+                .await;
+            assert_eq!(result.is_err(), blocked || external_tag);
+            assert_eq!(runner.removed.lock().expect("removed").len(), if blocked || external_tag { 0 } else { 2 });
+            assert!(runner.configs.lock().expect("configs").iter().all(|path| !path.exists()), "configs cleaned");
+        }
     }
 }

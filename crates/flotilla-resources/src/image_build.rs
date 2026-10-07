@@ -167,7 +167,7 @@ pub async fn read_image_build(
     namespace: &str,
     name: &str,
 ) -> Result<crate::ResourceObject<ImageBuild>, ResourceError> {
-    let mut sources = backend
+    let sources = backend
         .including_replicas::<ImageBuild>(namespace)
         .list()
         .await?
@@ -175,6 +175,26 @@ pub async fn read_image_build(
         .into_iter()
         .filter(|source| source.object.metadata.name == name)
         .collect::<Vec<_>>();
+    select_image_build(name, sources)
+}
+
+/// Resolve actuator evidence once per name from one complete list snapshot.
+/// Admission and collection must not use a stale demand copy over retirement.
+pub async fn list_image_builds(
+    backend: &crate::ResourceBackend,
+    namespace: &str,
+) -> Result<BTreeMap<String, crate::ResourceObject<ImageBuild>>, ResourceError> {
+    let mut grouped: BTreeMap<String, Vec<crate::ReadResourceObject<ImageBuild>>> = BTreeMap::new();
+    for source in backend.including_replicas::<ImageBuild>(namespace).list().await?.items {
+        grouped.entry(source.object.metadata.name.clone()).or_default().push(source);
+    }
+    grouped.into_iter().map(|(name, sources)| select_image_build(&name, sources).map(|build| (name, build))).collect()
+}
+
+fn select_image_build(
+    name: &str,
+    mut sources: Vec<crate::ReadResourceObject<ImageBuild>>,
+) -> Result<crate::ResourceObject<ImageBuild>, ResourceError> {
     if let Some(first) = sources.first() {
         if sources.iter().any(|source| {
             source.object.spec.inputs != first.object.spec.inputs || source.object.spec.recipe_key != first.object.spec.recipe_key
@@ -202,6 +222,12 @@ pub async fn read_image_build(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageAvailability {
+    /// Collection retires reusable availability, never execution evidence.
+    /// ADR 0047: remove these decoder defaults after one fleet roll.
+    #[serde(default)]
+    pub retired: bool,
+    #[serde(default)]
+    pub retired_at: Option<DateTime<Utc>>,
     pub hosts: BTreeSet<String>,
     /// Repository@manifest digest; local config IDs are never substituted.
     pub registry_ref: Option<String>,
