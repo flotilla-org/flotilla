@@ -626,9 +626,6 @@ mod tests {
         async fn pull(&self, _: &ImageCacheBinding, _: &str) -> Result<(), String> {
             Err("unused".into())
         }
-        async fn transfer(&self, _: &str, _: &str) -> Result<(), String> {
-            Err("unused".into())
-        }
         async fn remove_local(&self, id: &str, _: &BTreeSet<String>) -> Result<(), String> {
             if self.fail || self.blocked_images.lock().expect("blocked images").contains(id) {
                 return Err("container still references image".into());

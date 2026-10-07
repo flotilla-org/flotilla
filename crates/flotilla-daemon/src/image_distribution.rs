@@ -679,7 +679,7 @@ mod tests {
 }
 #[cfg(test)]
 mod gc_process_tests {
-    use std::sync::Mutex;
+    use std::{path::PathBuf, sync::Mutex};
 
     use flotilla_core::providers::{
         discovery::{test_support::TestEnvVars, EnvironmentBag},
@@ -757,13 +757,7 @@ mod gc_process_tests {
                 runner.clone(),
                 state.path().into(),
             ));
-            let io = DockerImageIo::builder()
-                .runner(runner.clone())
-                .credentials(credentials)
-                .daemon(Weak::new())
-                .host("host".into())
-                .namespace("test".into())
-                .build();
+            let io = DockerImageIo::builder().runner(runner.clone()).credentials(credentials).host("host".into()).build();
             let result = io
                 .remove_local(
                     &format!("sha256:{}", "1".repeat(64)),
