@@ -196,7 +196,9 @@ pub async fn session_card(
     Ok(text)
 }
 
-// Previous-generation cards are read for comparison, then replaced with a digest.
+// ADR 0047 shim introduced 2026-10-07: read previous-generation full cards
+// for comparison. Remove this read one fleet roll after the digest change deploys.
+// A calendar removal date depends on the operator's roll date.
 const CARD_ANNOTATION: &str = "flotilla.work/capabilities-card";
 const DIGEST_ANNOTATION: &str = "flotilla.work/capabilities-digest";
 const REVISION_ANNOTATION: &str = "flotilla.work/capabilities-revision";
@@ -228,9 +230,8 @@ pub async fn observe_card(
         .metadata
         .annotations
         .get(REVISION_ANNOTATION)
-        .map(|value| value.parse::<u64>())
-        .transpose()
-        .map_err(|error| error.to_string())?
+        .map(|value| value.parse::<u64>().map_err(|error| format!("invalid {REVISION_ANNOTATION} value {value:?}: {error}")))
+        .transpose()?
         .unwrap_or(0)
         .checked_add(1)
         .ok_or("capabilities revision overflow")?;
