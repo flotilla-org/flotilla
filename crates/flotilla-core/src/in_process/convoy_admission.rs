@@ -3806,11 +3806,7 @@ async fn image_placement_cost(
                 .is_some_and(|(repository, digest)| repository == cache.repository && flotilla_resources::is_image_digest(digest))
         })
     });
-    Ok(if registry {
-        flotilla_resources::ImageAcquisitionCost::RegistryPull
-    } else {
-        flotilla_resources::ImageAcquisitionCost::BuildOrTransfer
-    })
+    Ok(if registry { flotilla_resources::ImageAcquisitionCost::RegistryPull } else { flotilla_resources::ImageAcquisitionCost::Build })
 }
 
 #[cfg(test)]
@@ -4219,7 +4215,7 @@ mod tests {
         // when another economic class would prefer the more expensive image.
         for (left_cost, right_cost) in [
             (flotilla_resources::ImageAcquisitionCost::Held, flotilla_resources::ImageAcquisitionCost::RegistryPull),
-            (flotilla_resources::ImageAcquisitionCost::RegistryPull, flotilla_resources::ImageAcquisitionCost::BuildOrTransfer),
+            (flotilla_resources::ImageAcquisitionCost::RegistryPull, flotilla_resources::ImageAcquisitionCost::Build),
         ] {
             let mut left = candidate("left", FulfilmentCostClass::Metered, true, None, Some(1));
             let mut right = candidate("right", FulfilmentCostClass::OwnedIdle, true, None, Some(1));

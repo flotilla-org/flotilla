@@ -139,24 +139,19 @@ digest, then inspect both the registry digest and local image ID. Missing grants
 missing publication, or mismatched IDs leave the Environment in Provisioning with
 the reason. No older image or tag substitutes for the requested execution.
 
-Without a registry, a destination uses its authenticated resource-mesh route to
-request /image-transfer/sha256:<local-ID>, naming the source node and visited
-nodes in the query. Direct source routes are preferred; sparse meshes forward
-through other resource peers, exclude visited nodes, and refuse routes beyond
-eight hops. Intermediaries copy byte chunks directly without archive spooling.
-The source streams docker save to a
-temporary archive and serves it as a binary HTTP body; the destination streams it
-to a temporary archive and streams that file into docker load. This bounds
-memory independently of image size and leaves process/transport seams injectable.
-Archives and Docker configs are removed on success, errors and cancellation.
-The destination inspects the immutable local ID before provisioning with pulling
-disabled. Transfers run asynchronously so the Environment watch loop remains
-responsive. This uses resource replication's transport, not Plane-A peer merging.
+Without a held digest or a declared registry cache, a non-builder host remains
+in Provisioning with a visible reason: the requested digest is not held and no
+fleet registry cache is declared (#2272 ruling 6). A registry-less single-host
+installation still builds locally and provisions from its held image ID.
+Registry-less multi-host byte transfer is deferred to
+[#2850](https://github.com/flotilla-org/flotilla/issues/2850): a dedicated Tender
+raw-stream exposure between directly reachable peers, served separately from
+resource replication, with no relay routing.
 
 Placement prefers an exact held digest, then a published registry digest, then
-build or mesh transfer, after host liveness. Completed pinned stages can be reused
-across hosts; unpinned inputs never claim a shared recipe. A builder receives a
-shared parent before building the next stage. Environment and Vessel status pin
+build cost, after host liveness. Completed pinned stages can be reused
+across hosts; unpinned inputs never claim a shared recipe. A builder must hold or pull a verified
+shared parent before building the next stage; missing availability waits visibly. Environment and Vessel status pin
 the realised local ID and, when pulled, the registry digest; the admitted layer
 revisions remain frozen.
 
@@ -167,27 +162,14 @@ manifests remain valid; opting into the cache requires authoring the binding,
 registry declarations and host grants together. No workflow or CI registry
 credential is required.
 
-### Transfer trust and resource limits
+### Registry operations and failure handling
 
-Image archives use the same administrative socket trust boundary as resource
-reads: the daemon socket is owner-only (0600), and remote access uses the existing
-authenticated SSH/resource forwarding. Fleet peers and this Unix user are
-trusted to read image contents, which may include secrets, and to supply archive
-metadata. Docker load can restore repository tags from an archive; only the
-post-load immutable-ID inspection admits an Environment.
-
-Each daemon admits at most two image export/relay requests concurrently and
-refuses excess requests with HTTP 503. The permit is held through save and stream
-completion and is released on cancellation. Failed publication and delivery
-attempts cool down for five minutes before retrying; restart clears that
-in-memory cooldown. Refresh failures are isolated per build.
-
-Archives are streamed with bounded memory but Docker endpoints temporarily spool
-one image archive per admitted request. Relays propagate Content-Length when
-available and contextualize upstream stream errors; a lengthless truncated stream
-still must pass Docker load and the immutable-ID check. The production process
-runner sets kill_on_drop on both save/load children, so timeout or cancellation
-does not leave a Docker child running.
+Registry pulls and pushes use private per-operation Docker configs, removed on
+success, failure, or cancellation. Every delivered local ID is inspected; registry
+pulls additionally verify the published manifest digest. Failed publication and
+delivery attempts cool down for five minutes before retrying; restart clears
+that in-memory cooldown. Refresh failures are isolated per build. The
+administrative daemon socket remains owner-only (0600).
 
 Host inventory deliberately includes all held local image IDs and registry
 manifest digests in one set; placement compares each against its corresponding

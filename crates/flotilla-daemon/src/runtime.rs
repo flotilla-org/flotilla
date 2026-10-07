@@ -845,9 +845,7 @@ impl DaemonRuntime {
                             crate::image_distribution::DockerImageIo::builder()
                                 .runner(Arc::clone(&runner))
                                 .credentials(Arc::clone(&credential_store))
-                                .daemon(Arc::downgrade(&daemon))
                                 .host(profile.host_id.clone())
-                                .namespace(options.namespace.clone())
                                 .build(),
                         ))
                         .backend(daemon.resource_backend())
