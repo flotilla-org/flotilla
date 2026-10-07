@@ -83,4 +83,25 @@ if bash "$repo_root/scripts/fleet-install" --canary test-generation >"$root/wron
 fi
 grep -Fq -- '--canary must run on feta' "$root/wrong-host.log"
 python3 "$repo_root/scripts/test-fleet-canary.py"
+# Build the actual CLI and daemon: admission must never be covered only by fakes.
+cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin flotilla --bin flotillad \
+  --message-format=json >"$root/cargo-artifacts.jsonl"
+# Cargo reports the actual executables, including target/profile subdirectories.
+python3 - "$repo_root" "$root/cargo-artifacts.jsonl" <<'PYTHON'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+artifacts = {}
+for line in Path(sys.argv[2]).read_text().splitlines():
+    message = json.loads(line)
+    if message.get('reason') == 'compiler-artifact' and message.get('executable'):
+        artifacts[message['target']['name']] = message['executable']
+for name in ('flotilla', 'flotillad'):
+    if name not in artifacts:
+        raise SystemExit(f'missing cargo artifact: {name}')
+subprocess.run(['python3', str(Path(sys.argv[1]) / 'scripts/test-fleet-canary-real.py'),
+                artifacts['flotilla'], artifacts['flotillad']], check=True)
+PYTHON
 echo 'fleet canary contract passed'

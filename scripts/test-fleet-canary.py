@@ -112,8 +112,9 @@ class Processes:
             head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
             if upstream != head:
                 raise AssertionError('local upstream must contain the probe commit')
-            if subprocess.check_output(['git', '-C', str(repo), 'remote'], text=True).strip():
-                raise AssertionError('scratch repository must not use a forge')
+            remote = subprocess.check_output(['git', '-C', str(repo), 'remote', 'get-url', 'origin'], text=True).strip()
+            if remote != (self.root / 'upstream.git').as_uri():
+                raise AssertionError('scratch repository must use its private file transport')
             return ''
         if command[:2] == ['convoy', 'start']:
             if self.failure == 'admission':
@@ -140,6 +141,48 @@ class Contract(unittest.TestCase):
             gate.exercise()
             return None, processes
 
+    # CLI failures may put structured diagnostics on stdout, stderr, or both.
+    # Exercise the actual subprocess boundary, including empty streams.
+    def test_command_failure_preserves_both_streams(self):
+        commands = canary.Commands({}, io.StringIO())
+        for stdout, stderr in [('{"error":"admission refused"}', ''),
+                               ('', 'daemon unavailable'),
+                               ('{"error":"admission refused"}', 'daemon warning'), ('', '')]:
+            with self.subTest(stdout=stdout, stderr=stderr):
+                with self.assertRaises(canary.CanaryFailure) as error:
+                    commands.run([os.sys.executable, '-c',
+                                  'import sys; print(sys.argv[1]); print(sys.argv[2], file=sys.stderr); sys.exit(1)',
+                                  stdout, stderr])
+                self.assertIn('stdout: ' + stdout, str(error.exception))
+                self.assertIn('stderr: ' + stderr, str(error.exception))
+
+    # An early setup failure must remain visible even before daemon.log exists.
+    def test_real_setup_failure_preserves_original_error(self):
+        spec = importlib.util.spec_from_file_location('real_canary', Path(__file__).with_name('test-fleet-canary-real.py'))
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        with patch.object(os.sys, 'argv', ['test', '/unused/flotilla', '/unused/flotillad']), \
+                patch.object(real.canary.Canary, 'prepare', side_effect=OSError('original setup failure')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(OSError, 'original setup failure'):
+                real.main()
+
+    # Missing executable artifacts must name the absent binary before launching the real test.
+    def test_missing_cargo_artifact_names_binary(self):
+        script = Path(__file__).with_name('test-fleet-canary.sh').read_text()
+        body = script.split("<<'PYTHON'\n", 1)[1].split('\nPYTHON', 1)[0]
+        for names, missing in [((), 'flotilla'), (('flotilla',), 'flotillad'), (('flotillad',), 'flotilla')]:
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as directory:
+                messages = Path(directory) / 'artifacts.jsonl'
+                messages.write_text('\n'.join(json.dumps({
+                    'reason': 'compiler-artifact', 'target': {'name': name}, 'executable': '/bin/' + name
+                }) for name in names))
+                with patch.object(os.sys, 'argv', ['test', directory, str(messages)]), \
+                        patch.object(subprocess, 'run') as run:
+                    with self.assertRaisesRegex(SystemExit, 'missing cargo artifact: ' + missing):
+                        exec(compile(body, 'Cargo artifact contract', 'exec'), {})
+                    run.assert_not_called()
+
     # No active daemon, service or generation link may be used by the probe.
     # A successful run observes Running before completion and reaps only its own resources.
     def test_isolated_launch_baseline_completion_and_reaping(self):
@@ -147,7 +190,7 @@ class Contract(unittest.TestCase):
         self.assertTrue(processes.completed)
         placement = processes.manifests['PlacementPolicy']['spec']['docker_per_vessel']
         self.assertEqual(placement['image'], {'image_baseline_ref': 'fleet-crew'})
-        self.assertEqual(placement['memory_policy'], {'host_memory_percent': 50, 'expected_concurrent_crews': 4, 'swap_bytes': 0})
+        self.assertNotIn('memory_policy', placement, 'use the shared deserialization default')
         self.assertEqual(placement['host_ref'], 'canary-host')
         self.assertEqual(placement['env']['FLOTILLA_FLEET_CANARY'], '1')
         self.assertFalse(any('systemctl' in str(call) or 'fleet-container' in call for call in processes.calls))
