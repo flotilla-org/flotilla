@@ -3,67 +3,101 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{FileFootprint, FootprintObservation, HotFile, MergeOrderHint};
 
-/// Declare one repository-relative file/directory/glob per bullet in ## Touches.
+/// Declare a repository-relative file, directory or trailing-star pattern per bullet in ## Touches.
 /// With no section, predict from paths and unique basenames mentioned in prose.
 pub fn predict(body: &str, known: impl IntoIterator<Item = String>) -> FileFootprint {
-    let known = known.into_iter().collect::<BTreeSet<_>>();
-    let mut touches = None;
-    for line in body.lines() {
-        if line.trim() == "## Touches" {
-            touches = Some(Vec::new());
-            continue;
+    PredictionPaths::new(known).predict(body)
+}
+
+#[derive(Default)]
+struct PredictionPaths {
+    known: BTreeSet<String>,
+    basenames: BTreeMap<String, usize>,
+}
+impl PredictionPaths {
+    fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        let known = paths.into_iter().collect::<BTreeSet<_>>();
+        let mut basenames = BTreeMap::new();
+        for path in &known {
+            *basenames.entry(path.rsplit('/').next().unwrap_or(path).to_string()).or_default() += 1;
         }
-        if let Some(paths) = touches.as_mut() {
-            if line.starts_with("## ") {
-                break;
-            }
-            let path = line.trim().trim_start_matches(['-', '*']).trim().trim_matches('`');
-            if !path.is_empty() {
-                paths.push(path.to_string());
-            }
-        }
+        Self { known, basenames }
     }
-    let mut files = BTreeMap::new();
-    if let Some(paths) = touches {
-        for path in paths {
-            if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+
+    fn observation(observation: &FootprintObservation) -> Self {
+        Self::new(observation.history.iter().chain(observation.work.iter().map(|w| &w.footprint)).flat_map(|f| f.files.keys().cloned()))
+    }
+
+    fn predict(&self, body: &str) -> FileFootprint {
+        let known = &self.known;
+        let mut touches = None;
+        for line in body.lines() {
+            if line.trim() == "## Touches" {
+                touches = Some(Vec::new());
                 continue;
             }
-            let prefix = path.trim_end_matches('*').trim_end_matches('/');
-            let mut matched = false;
-            for candidate in &known {
-                if candidate == &path
-                    || candidate.starts_with(&format!("{prefix}/"))
-                    || path.ends_with('*') && candidate.starts_with(prefix)
-                {
-                    files.insert(candidate.clone(), interface_path(candidate));
-                    matched = true;
+            if let Some(paths) = touches.as_mut() {
+                if line.trim_start().starts_with("## ") {
+                    break;
+                }
+                let line = line.trim();
+                let Some(path) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) else { continue };
+                let path = path.trim().trim_matches('`');
+                if !path.is_empty() {
+                    paths.push(path.to_string());
                 }
             }
-            if !matched && !path.contains('*') {
-                files.insert(path.clone(), interface_path(&path));
+        }
+        let mut files = BTreeMap::new();
+        if let Some(paths) = touches {
+            for path in paths {
+                if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+                    continue;
+                }
+                if path.contains('*') && (path.matches('*').count() != 1 || !path.ends_with('*'))
+                    || path.contains('?')
+                    || path.contains('[')
+                {
+                    tracing::debug!(%path, "unsupported Touches glob; use a directory prefix or one trailing star");
+                    continue;
+                }
+                let prefix = path.trim_end_matches('*').trim_end_matches('/');
+                let directory_prefix = format!("{prefix}/");
+                let mut matched = false;
+                for candidate in known {
+                    if candidate == &path
+                        || candidate.starts_with(&directory_prefix)
+                        || path.ends_with('*') && candidate.starts_with(prefix)
+                    {
+                        files.insert(candidate.clone(), interface_path(candidate));
+                        matched = true;
+                    }
+                }
+                if !matched && path.contains('*') {
+                    tracing::debug!(%path, "Touches glob matched no observed paths");
+                }
+                if !matched && !path.contains('*') {
+                    files.insert(path.clone(), interface_path(&path));
+                }
+            }
+        } else {
+            let tokens = body.split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))).collect::<BTreeSet<_>>();
+            for path in known {
+                let basename = path.rsplit('/').next().unwrap_or(path);
+                let unique = self.basenames.get(basename) == Some(&1);
+                if tokens.contains(path.as_str()) || unique && tokens.contains(basename) {
+                    files.insert(path.clone(), interface_path(path));
+                }
             }
         }
-    } else {
-        let tokens = body.split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))).collect::<BTreeSet<_>>();
-        for path in &known {
-            let basename = path.rsplit('/').next().unwrap_or(path);
-            let unique = known.iter().filter(|other| other.rsplit('/').next() == Some(basename)).count() == 1;
-            if tokens.contains(path.as_str()) || unique && tokens.contains(basename) {
-                files.insert(path.clone(), interface_path(path));
-            }
-        }
+        FileFootprint { files }
     }
-    FileFootprint { files }
 }
 
 pub fn interface_path(path: &str) -> bool {
-    path.contains("/flotilla-protocol/")
-        || path.contains("/flotilla-resources/")
-        || path.contains("/protocol/")
-        || path.contains("/resources/")
+    path.split('/').any(|part| matches!(part, "flotilla-protocol" | "flotilla-resources" | "protocol" | "resources"))
         || path.ends_with(".crd.yaml")
-        || path.ends_with("/lib.rs")
+        || path.rsplit('/').next() == Some("lib.rs")
 }
 
 pub fn interface_patch(path: &str, patch: &str) -> bool {
@@ -119,6 +153,7 @@ pub fn reports(observation: &mut FootprintObservation) {
 
 pub struct ConflictBoard {
     repositories: BTreeMap<flotilla_protocol::IssueSource, FootprintObservation>,
+    prediction_paths: BTreeMap<flotilla_protocol::IssueSource, PredictionPaths>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +193,10 @@ impl ConflictBoard {
             }
             observation.work.retain(|work| work.convoy.as_deref().is_none_or(|name| live.contains(name)));
         }
+        let prediction_paths = repositories
+            .iter()
+            .map(|(source, observation)| (source.clone(), PredictionPaths::observation(observation)))
+            .collect::<BTreeMap<_, _>>();
         for convoy in convoys {
             if convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal()) {
                 continue;
@@ -170,20 +209,12 @@ impl ConflictBoard {
                 if observation.work.iter().any(|w| w.target == target || w.convoy.as_deref() == Some(convoy.metadata.name.as_str())) {
                     continue;
                 }
-                let known = observation
-                    .history
-                    .iter()
-                    .chain(observation.work.iter().map(|w| &w.footprint))
-                    .flat_map(|f| f.files.keys().cloned())
-                    .collect::<BTreeSet<_>>();
                 let mut footprint = FileFootprint::default();
                 for issue in &convoy.spec.issues {
                     footprint.files.extend(
-                        predict(
-                            &format!("{}\n{}", issue.snapshot.title, issue.snapshot.body.as_deref().unwrap_or_default()),
-                            known.iter().cloned(),
-                        )
-                        .files,
+                        prediction_paths[&source]
+                            .predict(&format!("{}\n{}", issue.snapshot.title, issue.snapshot.body.as_deref().unwrap_or_default()))
+                            .files,
                     );
                 }
                 observation.work.push(WorkFootprint {
@@ -196,7 +227,13 @@ impl ConflictBoard {
                 });
             }
         }
-        Self { repositories }
+        Self::indexed(repositories)
+    }
+
+    fn indexed(repositories: BTreeMap<flotilla_protocol::IssueSource, FootprintObservation>) -> Self {
+        let prediction_paths =
+            repositories.iter().map(|(source, observation)| (source.clone(), PredictionPaths::observation(observation))).collect();
+        Self { repositories, prediction_paths }
     }
 
     /// Retain predicted footprints and observed conflict outcomes even after
@@ -229,19 +266,14 @@ impl ConflictBoard {
         use flotilla_protocol::FootprintTarget;
         let mut measurements = Vec::new();
         for (source, observation) in &self.repositories {
-            let known = observation
-                .history
-                .iter()
-                .chain(observation.work.iter().map(|w| &w.footprint))
-                .flat_map(|f| f.files.keys().cloned())
-                .collect::<BTreeSet<_>>();
             let actual = serving.and_then(|name| {
                 observation
                     .work
                     .iter()
                     .find(|w| w.actual && (w.convoy.as_deref() == Some(name) || w.target == FootprintTarget::Convoy { name: name.into() }))
             });
-            let predicted = predict(&format!("{}\n{}", issue.title, issue.body.as_deref().unwrap_or_default()), known);
+            let predicted =
+                self.prediction_paths[source].predict(&format!("{}\n{}", issue.title, issue.body.as_deref().unwrap_or_default()));
             let candidate = actual.map_or(&predicted, |w| &w.footprint);
             for work in &observation.work {
                 if serving.is_some_and(|name| {
@@ -317,6 +349,35 @@ pub fn repository_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Touches supports literal paths, directories and one trailing star. Invalid
+    // paths and unsupported globs never become fictitious file evidence; a new
+    // literal file is retained. Later sections and prose cannot add paths.
+    #[test]
+    fn touches_edges_and_ambiguous_basenames() {
+        let known = vec!["src/a.rs".into(), "src/deep/b.rs".into(), "other/a.rs".into()];
+        let declared = predict(
+            "## Touches\n- ../outside.rs\n- /absolute.rs\n- src/**/*.rs\n- absent/*\n- src/\n- new.rs\nExplanation inside the section\n   ## Validation\n- unwanted.rs",
+            known.clone(),
+        );
+        assert_eq!(declared.files.keys().map(String::as_str).collect::<Vec<_>>(), ["new.rs", "src/a.rs", "src/deep/b.rs"]);
+        assert!(predict("a.rs", known.clone()).files.is_empty());
+        assert_eq!(predict("b.rs", known.clone()).files.keys().map(String::as_str).collect::<Vec<_>>(), ["src/deep/b.rs"]);
+        assert_eq!(predict("src/a.rs", known).files.keys().map(String::as_str).collect::<Vec<_>>(), ["src/a.rs"]);
+        assert!(predict("## Touches", Vec::new()).files.is_empty());
+    }
+
+    // Interface classification is independent of directory depth, including
+    // root protocol/resources directories and the repository's own lib.rs.
+    #[test]
+    fn root_and_nested_interface_paths() {
+        for path in ["protocol/x.rs", "resources/x.rs", "lib.rs", "nested/lib.rs", "crates/flotilla-protocol/src/a.rs", "thing.crd.yaml"] {
+            assert!(interface_path(path), "{path}");
+        }
+        for path in ["protocolish/x.rs", "myresources/x.rs", "lib.rs.bak", "src/private.rs"] {
+            assert!(!interface_path(path), "{path}");
+        }
+    }
+
     #[hegel::test]
     fn rarity_and_interfaces_weight_each_shared_file_once(tc: hegel::TestCase) {
         let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(60));
@@ -338,13 +399,8 @@ mod tests {
         assert_eq!(predict("## Touches\n- src/*", known).files.len(), 2);
         assert!(interface_patch("src/a.rs", "+pub trait Contract {}"));
     }
-}
-
-#[cfg(test)]
-mod observation_tests {
     use flotilla_protocol::{FootprintTarget, Issue, IssueRef, IssueSource, IssueState, WorkFootprint};
 
-    use super::*;
     // #2784: mirror clone transport must not change forge-scoped predictions
     // or hot-file reports. Real resource objects carry the admitted snapshot.
     #[tokio::test]
@@ -433,9 +489,8 @@ mod observation_tests {
             revision: "other".into(),
             conflicts: Some(false),
         };
-        let mut board = ConflictBoard {
-            repositories: BTreeMap::from([(source.clone(), FootprintObservation { work: vec![other], ..Default::default() })]),
-        };
+        let mut board =
+            ConflictBoard::indexed(BTreeMap::from([(source.clone(), FootprintObservation { work: vec![other], ..Default::default() })]));
         let predicted = board.measurements(&issue, Some("crew"));
         assert_eq!(predicted[0].source, source);
         assert_eq!(predicted[0].weight, 1);
@@ -477,6 +532,7 @@ mod observation_tests {
             ],
             ..Default::default()
         });
+        board = ConflictBoard::indexed(board.repositories);
         let isolated = board.measurements(&issue, Some("crew"));
         assert_eq!(isolated.len(), 2);
         assert_eq!(isolated.iter().map(|m| m.source.clone()).collect::<BTreeSet<_>>(), BTreeSet::from([source.clone(), second]));

@@ -23,6 +23,8 @@ use flotilla_resources::{
 use tracing::{info, warn};
 
 const ISSUE_PAGE_SIZE: usize = 100;
+const OVERLAP_RETENTION_DAYS: i64 = 30;
+const OVERLAP_RECORD_LIMIT: usize = 2048;
 
 #[async_trait]
 pub(crate) trait DispatchIssueSource: Send + Sync {
@@ -93,6 +95,7 @@ pub(crate) struct ReconcilePass {
 
 pub(crate) struct DispatchReconciler {
     backend: ResourceBackend,
+    overlap_backend: ResourceBackend,
     namespace: String,
     issues: Arc<dyn DispatchIssueSource>,
     clock: Arc<dyn Clock>,
@@ -100,7 +103,7 @@ pub(crate) struct DispatchReconciler {
 
 impl DispatchReconciler {
     pub(crate) fn new(backend: ResourceBackend, namespace: impl Into<String>, issues: Arc<dyn DispatchIssueSource>) -> Self {
-        Self { backend, namespace: namespace.into(), issues, clock: Arc::new(SystemClock) }
+        Self { overlap_backend: backend.clone(), backend, namespace: namespace.into(), issues, clock: Arc::new(SystemClock) }
     }
 
     #[cfg(test)]
@@ -149,6 +152,7 @@ impl DispatchReconciler {
 
     async fn reconcile_project(&self, project: &ResourceObject<Project>, now: DateTime<Utc>) -> Result<ReconcilePass, String> {
         let Some(policy) = project.spec.dispatch_policy.as_ref().filter(|policy| policy.enabled) else {
+            self.record_overlaps_best_effort(project, Vec::new(), now).await;
             self.replace_queue(project, Vec::new(), None).await?;
             self.set_queue_error(project, None).await?;
             return Ok(ReconcilePass::default());
@@ -188,6 +192,7 @@ impl DispatchReconciler {
         let live = existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal())).collect::<Vec<_>>();
         let project_active_crews = live.iter().map(|c| active_crew_count(c.status.as_ref())).sum();
         let mut mission_active = BTreeMap::<String, usize>::new();
+        let mut overlap_measurements = Vec::new();
         for convoy in &live {
             let mut missions = HashSet::new();
             for served in &convoy.spec.issues {
@@ -205,7 +210,8 @@ impl DispatchReconciler {
                     observed_issue.body = served.snapshot.body.clone();
                     let mut measurements = conflicts.measurements(&observed_issue, Some(&convoy.metadata.name));
                     measurements.extend(conflicts.outcomes(&convoy.metadata.name));
-                    self.record_overlaps(project, &observed_issue, measurements, now).await?;
+                    overlap_measurements
+                        .extend(measurements.into_iter().map(|measurement| (observed_issue.reference.clone(), measurement)));
                 }
                 missions.insert(board.score(&issue, policy)?.mission);
             }
@@ -277,7 +283,16 @@ impl DispatchReconciler {
             let mut score = board.score(&issue, policy)?;
             if let Some(overlap_policy) = &policy.overlap_policy {
                 let measurements = conflicts.measurements(&issue, None);
-                self.record_overlaps(project, &issue, measurements.clone(), now).await?;
+                overlap_measurements.extend(measurements.iter().cloned().map(|measurement| (issue.reference.clone(), measurement)));
+                let holds = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
+                let existing_holds = holds
+                    .list()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .items
+                    .into_iter()
+                    .map(|h| (h.metadata.name.clone(), h))
+                    .collect::<BTreeMap<_, _>>();
                 let mut desired = BTreeMap::new();
                 for measurement in &measurements {
                     if measurement.weight >= overlap_policy.land_after_threshold {
@@ -290,14 +305,18 @@ impl DispatchReconciler {
                             measurement.weight,
                             measurement.files
                         ]);
-                        let name = format!("overlap-{}", content_hash(&identity).map_err(|e| e.to_string())?);
+                        let mut name = format!("overlap-{}", content_hash(&identity).map_err(|e| e.to_string())?);
+                        // Cleared relationships remain immutable evidence. A recurring
+                        // overlap receives a fresh relationship, even after a revert.
+                        while let Some(cleared_at) = existing_holds.get(&name).and_then(|h| h.status.as_ref()).and_then(|s| s.cleared_at) {
+                            name = format!("overlap-{}", content_hash(&serde_json::json!([name, cleared_at])).map_err(|e| e.to_string())?);
+                        }
                         desired.insert(name, measurement);
                     } else {
                         score.conflict_penalty = score.conflict_penalty.saturating_add(measurement.weight);
                     }
                 }
-                let holds = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
-                for hold in holds.list().await.map_err(|e| e.to_string())?.items {
+                for hold in existing_holds.values() {
                     if hold.spec.author == "dispatch-footprints"
                         && hold.spec.project_ref == project.metadata.name
                         && hold.spec.issue == issue.reference
@@ -353,6 +372,7 @@ impl DispatchReconciler {
                 provenance,
             });
         }
+        self.record_overlaps_best_effort(project, overlap_measurements, now).await;
         queue.sort_by(|left, right| left.ready_observed_at.cmp(&right.ready_observed_at).then_with(|| left.issue.cmp(&right.issue)));
         let previous_attention = project.status.as_ref().and_then(|status| status.dispatch_queue_attention.as_ref());
         let attention = dispatch_queue_attention(&queue, policy, previous_attention, now);
@@ -370,20 +390,67 @@ impl DispatchReconciler {
         Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded, ..ReconcilePass::default() })
     }
 
+    async fn record_overlaps_best_effort(
+        &self,
+        project: &ResourceObject<Project>,
+        measurements: Vec<(IssueRef, ConflictMeasurement)>,
+        now: DateTime<Utc>,
+    ) {
+        if let Err(error) = self.record_overlaps(project, measurements, now).await {
+            warn!(project = %project.metadata.name, %error, "overlap telemetry unavailable; dispatch control continues");
+        }
+    }
+
     async fn record_overlaps(
         &self,
         project: &ResourceObject<Project>,
-        issue: &Issue,
-        measurements: Vec<ConflictMeasurement>,
+        measurements: Vec<(IssueRef, ConflictMeasurement)>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let observations = self.backend.clone().using::<DispatchOverlap>(&project.metadata.namespace);
-        for measurement in measurements {
+        let observations = self.overlap_backend.clone().using::<DispatchOverlap>(&project.metadata.namespace);
+        // One inventory read per Project pass, never one get per issue/work pair.
+        let mut records = observations
+            .list()
+            .await
+            .map_err(|e| e.to_string())?
+            .items
+            .into_iter()
+            .filter(|r| r.spec.project_ref == project.metadata.name)
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| a.spec.observed_at.cmp(&b.spec.observed_at).then(a.metadata.name.cmp(&b.metadata.name)));
+        let cutoff = now - Duration::days(OVERLAP_RETENTION_DAYS);
+        for record in &records {
+            if record.spec.observed_at < cutoff {
+                observations.delete(&record.metadata.name).await.map_err(|e| e.to_string())?;
+            }
+        }
+        records.retain(|record| record.spec.observed_at >= cutoff);
+        let mut latest = BTreeMap::new();
+        for record in &records {
+            if record.spec.observed_at >= cutoff {
+                latest.insert(
+                    (record.spec.issue.clone(), record.spec.source.clone(), record.spec.target.clone(), record.spec.outcome),
+                    record.spec.clone(),
+                );
+            }
+        }
+        let mut names = records.iter().map(|r| r.metadata.name.clone()).collect::<HashSet<_>>();
+        for (issue, measurement) in measurements {
+            let key = (issue.clone(), measurement.source.clone(), measurement.target.clone(), measurement.outcome);
+            // Retain a zero-weight transition out of a previously overlapping pair,
+            // but do not persist the otherwise quadratic set of disjoint pairs.
+            if !measurement.outcome
+                && measurement.weight == 0
+                && measurement.conflicts != Some(true)
+                && !latest.get(&key).is_some_and(|previous| previous.weight > 0)
+            {
+                continue;
+            }
             let spec = DispatchOverlapSpec {
                 outcome: measurement.outcome,
                 project_ref: project.metadata.name.clone(),
                 source: measurement.source,
-                issue: issue.reference.clone(),
+                issue,
                 target: measurement.target,
                 candidate_actual: measurement.candidate_actual,
                 target_actual: measurement.target_actual,
@@ -393,15 +460,27 @@ impl DispatchReconciler {
                 conflicts: measurement.conflicts,
                 observed_at: now,
             };
+            if latest.get(&key).is_some_and(|previous| {
+                let mut previous = previous.clone();
+                previous.observed_at = now;
+                previous == spec
+            }) {
+                continue;
+            }
             let mut identity = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
             identity.as_object_mut().expect("overlap object").remove("observed_at");
             let name = format!("overlap-{}", content_hash(&identity).map_err(|e| e.to_string())?);
-            match observations.get(&name).await {
-                Ok(_) => {}
-                Err(ResourceError::NotFound { .. }) => {
-                    observations.create(&InputMeta::builder().name(name).build(), &spec).await.map_err(|e| e.to_string())?;
-                }
-                Err(error) => return Err(error.to_string()),
+            if names.insert(name.clone()) {
+                let record = observations.create(&InputMeta::builder().name(name).build(), &spec).await.map_err(|e| e.to_string())?;
+                records.push(record);
+            }
+            latest.insert(key, spec);
+        }
+        records.sort_by(|a, b| a.spec.observed_at.cmp(&b.spec.observed_at).then(a.metadata.name.cmp(&b.metadata.name)));
+        let surplus = records.len().saturating_sub(OVERLAP_RECORD_LIMIT);
+        for (index, record) in records.iter().enumerate() {
+            if index < surplus {
+                observations.delete(&record.metadata.name).await.map_err(|e| e.to_string())?;
             }
         }
         Ok(())
@@ -888,6 +967,7 @@ mod tests {
             assert_eq!(observations.list().await.expect("observations").items.len(), 1);
             reconciler.reconcile_once().await.expect("identical pass");
             assert_eq!(observations.list().await.expect("deduped").items.len(), 1);
+            let original = boards.clone();
             let work = &mut boards[0].footprints.as_mut().expect("footprints").work[0];
             work.footprint.files = BTreeMap::from([("src/disjoint.rs".into(), false)]);
             work.revision = "second".into();
@@ -902,7 +982,94 @@ mod tests {
             for hold in backend.using::<DispatchHold>(NAMESPACE).list().await.expect("holds").items {
                 assert!(hold.status.expect("status").cleared_at.is_some());
             }
+            // A revert can restore the identical revision and overlap. Historical
+            // cleared holds stay cleared, but a new relationship must block again.
+            *issues.board_override.lock().expect("board") = Some(original);
+            let recurrent = reconciler.reconcile_once().await.expect("recurrent pass");
+            assert_eq!(recurrent.blocked, usize::from(threshold <= 5));
+            assert_eq!(recurrent.queued, usize::from(threshold > 5));
+            let holds = backend.using::<DispatchHold>(NAMESPACE).list().await.expect("holds").items;
+            assert_eq!(
+                holds.iter().filter(|h| !h.status.as_ref().is_some_and(|s| s.cleared_at.is_some())).count(),
+                usize::from(threshold <= 5)
+            );
+            // A telemetry storage failure must neither unblock a required hold nor
+            // withhold an otherwise-ready proposal. This real backend rejects an
+            // invalid URL before I/O, isolating the evidence-store failure boundary.
+            let mut telemetry_failure = reconciler;
+            telemetry_failure.overlap_backend =
+                ResourceBackend::Http(flotilla_resources::HttpBackend::new(flotilla_resources::tls::client(), "invalid URL"));
+            let survived = telemetry_failure.reconcile_once().await.expect("telemetry failure pass");
+            assert_eq!(survived.project_errors, 0);
+            assert_eq!(survived.blocked, recurrent.blocked);
+            assert_eq!(survived.queued, recurrent.queued);
         }
+    }
+
+    // Evidence retention is bounded independently of sliding-window/revision
+    // churn. Identical passes and initial disjoint pairs create no extra records;
+    // unknown/clear transitions and standalone outcomes remain distinguishable.
+    #[tokio::test]
+    async fn overlap_evidence_retention_and_sparse_pairs() {
+        use flotilla_protocol::FootprintTarget;
+        let (backend, _, clock, reconciler) = harness(vec![], vec![], policy(60)).await;
+        let project = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
+        let candidate = issue("1", &[READY_ISSUE_LABEL], None, IssueState::Open).reference;
+        let measurement = ConflictMeasurement {
+            outcome: false,
+            source: source(),
+            target: FootprintTarget::Convoy { name: "other".into() },
+            candidate_actual: false,
+            target_actual: true,
+            revision: "first".into(),
+            conflicts: None,
+            weight: 0,
+            files: vec![],
+        };
+        let observations = backend.using::<DispatchOverlap>(NAMESPACE);
+        reconciler.record_overlaps(&project, vec![(candidate.clone(), measurement.clone())], clock.now()).await.expect("disjoint");
+        assert!(observations.list().await.expect("empty evidence").items.is_empty());
+        let mut overlapping = measurement.clone();
+        overlapping.weight = 1;
+        overlapping.files = vec!["src/a.rs".into()];
+        reconciler.record_overlaps(&project, vec![(candidate.clone(), overlapping.clone())], clock.now()).await.expect("overlap");
+        reconciler.record_overlaps(&project, vec![(candidate.clone(), overlapping)], clock.now()).await.expect("identical");
+        assert_eq!(observations.list().await.expect("dedup").items.len(), 1);
+        reconciler
+            .record_overlaps(&project, vec![(candidate.clone(), measurement.clone())], clock.now())
+            .await
+            .expect("disjoint transition");
+        assert_eq!(observations.list().await.expect("transition").items.len(), 2);
+        let mut conflict = measurement.clone();
+        conflict.conflicts = Some(true);
+        let mut outcome = measurement.clone();
+        outcome.outcome = true;
+        reconciler
+            .record_overlaps(&project, vec![(candidate.clone(), conflict), (candidate.clone(), outcome)], clock.now())
+            .await
+            .expect("conflict and outcome");
+        assert_eq!(observations.list().await.expect("evidence").items.len(), 4);
+        let samples = (0..=OVERLAP_RECORD_LIMIT)
+            .map(|index| {
+                let mut sample = measurement.clone();
+                sample.weight = (index % 61) as u64 + 1;
+                sample.files = vec!["src/a.rs".into()];
+                sample.revision = format!("revision-{index}");
+                (candidate.clone(), sample)
+            })
+            .collect();
+        clock.advance(Duration::seconds(1));
+        reconciler.record_overlaps(&project, samples, clock.now()).await.expect("history churn");
+        assert_eq!(observations.list().await.expect("bounded evidence").items.len(), OVERLAP_RECORD_LIMIT);
+        clock.advance(Duration::days(OVERLAP_RETENTION_DAYS + 1));
+        reconciler.record_overlaps(&project, vec![], clock.now()).await.expect("expiry");
+        assert!(observations.list().await.expect("expired evidence").items.is_empty());
+        let mut renewed = measurement;
+        renewed.weight = (OVERLAP_RECORD_LIMIT % 61) as u64 + 1;
+        renewed.files = vec!["src/a.rs".into()];
+        renewed.revision = format!("revision-{}", OVERLAP_RECORD_LIMIT);
+        reconciler.record_overlaps(&project, vec![(candidate, renewed)], clock.now()).await.expect("renew expired evidence");
+        assert_eq!(observations.list().await.expect("fresh evidence").items.len(), 1);
     }
 
     #[tokio::test]

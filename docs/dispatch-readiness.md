@@ -181,7 +181,12 @@ all previous-generation manifests decode without this optional input.
 
 A ticket declares repository-relative paths, directory prefixes or trailing `*`
 globs as bullets in a `## Touches` section. The section ends at the next level-two
-heading. Without it, the first heuristic matches paths and unique basenames in
+heading, including indented headings. Only bullets contribute paths; prose is ignored.
+Globs support exactly one trailing `*`; mid-path patterns such as `src/**/*.rs`,
+`?` and character classes are unsupported. Unsupported or unmatched globs emit
+a debug diagnostic and contribute no invented paths. Absolute paths and `..`
+components are rejected. A new literal file is retained even before it appears
+in observation history. Without a Touches section, the heuristic matches paths and unique basenames in
 the ticket title/body against files seen in recent merges or active work. An
 empty prediction is reported as empty evidence, not a claim of disjointness.
 For a multi-repository Project, declared paths are interpreted conservatively
@@ -204,7 +209,9 @@ Below the configured per-target threshold, summed overlap becomes the last order
 `land_after_work` convoy or PR target. `land_after` remains the candidate issue
 anchor for stored-shape compatibility; explicit work targets take precedence.
 Automatic holds clear when overlap drops, a target leaves flight, or landing is
-observed. Refresh failures retain last-good observations and their age/error;
+observed. If identical overlap returns after clearing (for example a revert push),
+a fresh immutable hold is created; a cleared historical hold cannot bypass it.
+Refresh failures retain last-good observations and their age/error;
 an initial missing footprint observation makes this Project unavailable. Manual
 work-addressed holds require positive merged-PR or Landed-convoy evidence.
 
@@ -223,7 +230,13 @@ merge-conflict evidence even after its overlapping work has landed; pair records
 use `outcome: false` and contain shared paths. `conflicts: true` means a conflict was observed; false means the applicable
 work has confirmed clear mergeability, and null preserves unknown evidence. Their stable content
 identity deduplicates identical passes; changed diffs and conflict evidence add
-records. They are daemon-authored and have no out-of-repo manifest author.
+records. Initial disjoint pairs without an observed conflict are omitted; the
+transition from positive overlap to zero is retained. Each Project pass reads the
+evidence inventory once, avoiding per-pair backend reads. Evidence is best-effort:
+a read/write/GC failure is logged and cannot interrupt hold evaluation or queue
+publication. Retention is 30 days with at most 2,048 records per Project; oldest
+records are deleted on reconciliation, including when overlap policy is disabled.
+Export tuning data before this window if longer history is needed. They are daemon-authored and have no out-of-repo manifest author.
 
 On a candidate host, run `scripts/accept-dispatch-footprints NAME` to inspect
 observations and reports. Use two ready tickets declaring the same rare path,
