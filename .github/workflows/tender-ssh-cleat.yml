@@ -10,6 +10,7 @@ on:
       - "ci/toolchain/**"
       - "crates/tender/**"
       - "ci/tender/**"
+      - "ci/platform-tests/**"
       - ".github/workflows/tender-ssh-cleat.yml"
   push:
     branches: [main]
@@ -18,6 +19,7 @@ on:
       - "ci/toolchain/**"
       - "crates/tender/**"
       - "ci/tender/**"
+      - "ci/platform-tests/**"
       - ".github/workflows/tender-ssh-cleat.yml"
   workflow_dispatch:
 
@@ -41,19 +43,9 @@ jobs:
           ref: 00c072b207dc943f6c93fe3b6b09abaa257695a6
           path: cleat-source
           persist-credentials: false
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+        uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tender-ssh-cleat
@@ -70,8 +62,7 @@ jobs:
         run: |
           unset TMPDIR
           cargo --config 'profile.dev.package."*".debug=0' clippy -p tender --all-targets --locked --features ssh-cleat-proof -- -D warnings
-          cargo --config 'profile.dev.package."*".debug=0' test -p tender --locked --test ssh_adapter forward_carries_contract_and_reclaims_after_route_replacement -- --ignored --nocapture
-          cargo --config 'profile.dev.package."*".debug=0' test -p tender --locked --features ssh-cleat-proof --test ssh_cleat -- --nocapture
+          ci/platform-tests/run.sh tender-ssh
       - name: Record build and SSH provenance
         if: always()
         uses: actions/upload-artifact@v4

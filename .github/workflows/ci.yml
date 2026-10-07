@@ -24,20 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      # Stable is only needed here for the pin assertion; fmt runs on the
-      # temporary nightly until the stable rustfmt switch (#2794).
-      - uses: dtolnay/rust-toolchain@master
+        uses: ./ci/toolchain/action
         with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+          components: ''
+      # Formatting remains on the explicitly installed temporary nightly.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -81,17 +73,12 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "No script, CI, crew image or workflow changes; skipping script contracts."
           fi
-      - name: Read stable compiler pin
-        if: steps.filter.outputs.run == 'true'
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+        uses: ./ci/toolchain/action
         if: steps.filter.outputs.run == 'true'
         with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: ''
       - name: Test target cache policies
         if: steps.filter.outputs.run == 'true'
         run: |
@@ -105,9 +92,18 @@ jobs:
       - name: Test crew image workflow contract
         if: steps.filter.outputs.run == 'true'
         run: ci/crew-image/test-workflow.sh
-      - name: Test platform job classification
+      - name: Set up Python for script contracts
         if: steps.filter.outputs.run == 'true'
-        run: ci/platform-changes/test-classify.sh
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test platform CI contracts
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          ci/platform-changes/test-classify.sh
+          python3 -m pip install -r ci/platform-tests/requirements.txt
+          ci/platform-tests/test-run.sh
+          python3 -m unittest discover -s ci/toolchain -p test_action.py
 
   dag-scripts:
     name: DAG scripts
@@ -131,19 +127,9 @@ jobs:
     needs: fmt
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+        uses: ./ci/toolchain/action
       # Caches dependency artifacts only (workspace-member artifacts are
       # pruned before save) — the previous whole-target cache reached 4.5GB
       # and thrashed the repo's 10GB cache pool against compose's blobs.
@@ -157,20 +143,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
+        uses: ./ci/toolchain/action
         with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
           targets: wasm32-unknown-unknown
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "relay-wasm"
@@ -183,19 +160,9 @@ jobs:
     needs: fmt
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+        uses: ./ci/toolchain/action
       # Caches dependency artifacts only (workspace-member artifacts are
       # pruned before save) — the previous whole-target cache reached 4.5GB
       # and thrashed the repo's 10GB cache pool against compose's blobs.
@@ -252,19 +219,9 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+        uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-client"
@@ -282,20 +239,11 @@ jobs:
             echo "flotilla status unexpectedly succeeded without a daemon"; exit 1
           fi
           grep -q "no local daemon will be spawned" status.err || { cat status.err; exit 1; }
-      - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib windows_tests::"
-      - name: Test SSH endpoint parsing and failure diagnostics
-        run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib endpoint::"
-      - name: Test remote CLI selection and mismatch refusal
-        run: |
-          cargo --config 'profile.dev.package."*".debug=0' test --locked --bin flotilla remote_
-          cargo --config 'profile.dev.package."*".debug=0' test --locked --bin flotilla daemon_endpoint_conflicts
-      - name: Test attach routing, raw-mode lifetime and viewer locality
-        run: |
-          cargo --config 'profile.dev.package."*".debug=0' check -p flotilla-tui --all-targets --locked
-          cargo --config 'profile.dev.package."*".debug=0' test -p flotilla-tui --locked --lib terminal::tests::
-          cargo --config 'profile.dev.package."*".debug=0' test -p flotilla-tui --locked --lib remote_connector_keeps_viewer_locality
-      - name: Test Wheelhouse named-pipe HTTP contract
-        run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-manifest --locked --lib sink::tests::"
+      - name: Check TUI targets
+        run: cargo --config 'profile.dev.package."*".debug=0' check -p flotilla-tui --all-targets --locked
+      - name: Run selected Windows tests
+        shell: bash
+        run: ci/platform-tests/run.sh windows
 
   macos-peer-identity:
     name: macOS peer identity
@@ -304,20 +252,14 @@ jobs:
     if: needs.changes.outputs.macos == 'true'
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+        uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-peer-identity"
-      - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-daemon --locked --lib server::caller::tests::"
+      - name: Run selected macOS tests
+        shell: bash
+        run: |
+          SELECTOR_TEST_BASH=/bin/bash ci/platform-tests/test-run.sh
+          ci/platform-tests/run.sh macos
