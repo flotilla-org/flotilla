@@ -10,8 +10,10 @@ use std::{
 
 use chrono::Utc;
 use flotilla_protocol::{DispatchBoardRepository, IssueSource};
-use futures::FutureExt;
+use futures::{stream, FutureExt, StreamExt};
 use tokio::{sync::Mutex, time::Instant};
+
+use crate::providers::issue_tracker::{footprints::FootprintIndex, IssueProvider};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 // Allow paginated large-project forge reads several minutes while bounding hung refreshes.
@@ -23,23 +25,111 @@ struct Entry {
     last_attempt: Option<Instant>,
     refreshing: bool,
     error: Option<String>,
+    indices: Arc<Mutex<BoardIndices>>,
+}
+
+#[derive(Default)]
+pub(super) struct BoardIndices {
+    pub footprints: FootprintIndex,
+    pub mission_fields: BTreeMap<String, flotilla_protocol::MissionFields>,
+}
+
+impl BoardIndices {
+    pub(super) async fn refresh_missions(
+        &mut self,
+        provider: &dyn IssueProvider,
+        source: &IssueSource,
+        issues: &mut [flotilla_protocol::DispatchBoardIssue],
+        selected: &BTreeSet<String>,
+    ) {
+        let ids = selected.iter().cloned().collect::<Vec<_>>();
+        let fetched = stream::iter(ids)
+            .map(|id: String| async move {
+                let reference = flotilla_protocol::IssueRef { source: source.clone(), id: id.clone() };
+                let result = tokio::time::timeout(Duration::from_secs(20), provider.mission_fields(&reference))
+                    .await
+                    .unwrap_or_else(|_| Err("mission field item timed out".into()));
+                (id.clone(), result)
+            })
+            .buffer_unordered(8)
+            .collect::<BTreeMap<_, _>>()
+            .await;
+        let present = issues.iter().map(|issue| issue.id.clone()).collect::<BTreeSet<_>>();
+        self.mission_fields.retain(|id, _| present.contains(id));
+        for issue in issues {
+            match fetched.get(&issue.id) {
+                Some(Ok(fields)) => {
+                    self.mission_fields.insert(issue.id.clone(), fields.clone());
+                    issue.mission_fields = fields.clone();
+                    issue.mission_fields_error = None;
+                }
+                Some(Err(error)) => {
+                    issue.mission_fields_error = Some(error.clone());
+                    issue.mission_fields = self.mission_fields.get(&issue.id).cloned().unwrap_or_default();
+                }
+                None => {}
+            }
+        }
+    }
 }
 
 type SharedEntry = Arc<Mutex<Entry>>;
+type ProjectSources = BTreeMap<String, BTreeSet<IssueSource>>;
 
 #[derive(Clone, Default)]
-pub(super) struct DispatchBoardCache(Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>);
+pub(super) struct DispatchBoardCache(Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>, Arc<Mutex<Option<ProjectSources>>>);
 
 impl DispatchBoardCache {
+    pub(super) async fn set_project_sources(&self, sources: ProjectSources) {
+        *self.1.lock().await = Some(sources);
+    }
+
+    /// Serving does no resource inventory, forge calls, prediction or pair work.
+    pub(super) async fn snapshots(&self, project: Option<&str>) -> Result<Vec<DispatchBoardRepository>, String> {
+        let inventory = self.1.lock().await;
+        let inventory = inventory.as_ref().ok_or("initial observation source inventory in progress")?;
+        let sources = if let Some(project) = project {
+            inventory.get(project).cloned().ok_or_else(|| format!("board Project {project} is not in the source inventory"))?
+        } else {
+            inventory.values().flatten().cloned().collect()
+        };
+        let entries = self.0.lock().await;
+        let mut boards = Vec::new();
+        for source in sources {
+            let entry = entries.get(&source).ok_or_else(|| format!("initial observation in progress for {}", source.scope))?;
+            let state = entry.lock().await;
+            let mut board = state.board.clone().ok_or_else(|| {
+                format!(
+                    "board facts unavailable for {}: {}",
+                    source.scope,
+                    state.error.as_deref().unwrap_or("initial observation in progress")
+                )
+            })?;
+            board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
+            board.refresh_error = state.error.clone();
+            boards.push(board);
+        }
+        Ok(boards)
+    }
+
     /// Only a complete source inventory may retire entries. An old refresh owns
     /// its retired entry, so its completion cannot overwrite a re-added source.
     pub(super) async fn retain_sources(&self, sources: &BTreeSet<IssueSource>) {
         self.0.lock().await.retain(|source, _| sources.contains(source));
     }
 
+    #[cfg(test)]
     pub(super) async fn read<F, Fut>(&self, source: &IssueSource, load: F) -> Result<DispatchBoardRepository, String>
     where
         F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
+    {
+        self.read_indexed(source, move |_| load()).await
+    }
+
+    pub(super) async fn read_indexed<F, Fut>(&self, source: &IssueSource, load: F) -> Result<DispatchBoardRepository, String>
+    where
+        F: FnOnce(Arc<Mutex<BoardIndices>>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
     {
         let entry = self.0.lock().await.entry(source.clone()).or_default().clone();
@@ -49,10 +139,15 @@ impl DispatchBoardCache {
             state.refreshing = true;
             state.last_attempt = Some(Instant::now());
             let refresh_entry = entry.clone();
+            let indices = state.indices.clone();
             tokio::spawn(async move {
                 // Catch panics both while constructing and polling the future.
                 // Treat them as an observation failure so the source can retry.
-                let result = match tokio::time::timeout(REFRESH_TIMEOUT, AssertUnwindSafe(async move { load().await }).catch_unwind()).await
+                let result = match tokio::time::timeout(
+                    REFRESH_TIMEOUT,
+                    AssertUnwindSafe(async move { load(indices).await }).catch_unwind(),
+                )
+                .await
                 {
                     Ok(Ok(result)) => result,
                     Ok(Err(_)) => Err("board tracker refresh panicked".into()),
@@ -120,6 +215,7 @@ pub(super) mod tests {
             observed_at: Utc::now(),
             age_seconds: 0,
             refresh_error: None,
+            footprints: None,
             issues: (0..count)
                 .map(|id| {
                     DispatchBoardIssue::builder()
@@ -144,6 +240,91 @@ pub(super) mod tests {
                         .build()
                 })
                 .collect(),
+        }
+    }
+
+    // Failed mission-field items retain last-good values while peers/source facts
+    // refresh normally. Snapshot reads invoke neither the forge nor report work.
+    #[tokio::test(start_paused = true)]
+    async fn mission_item_failure_and_snapshot_reads_preserve_precomputed_work_bounds() {
+        use std::sync::atomic::AtomicBool;
+
+        use async_trait::async_trait;
+        use flotilla_protocol::{
+            issue_query::{IssueQuery, IssueResultPage},
+            Issue, IssueChangeset, IssueRef, MissionFields,
+        };
+        struct Forge {
+            failed: AtomicBool,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl IssueProvider for Forge {
+            fn supports(&self, _source: &IssueSource) -> bool {
+                true
+            }
+            async fn query(
+                &self,
+                _source: &IssueSource,
+                _params: &IssueQuery,
+                _page: u32,
+                _count: usize,
+            ) -> Result<IssueResultPage, String> {
+                Err("unused query".into())
+            }
+            async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+                Err("unused fetch".into())
+            }
+            async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+                Err("unused changes".into())
+            }
+            async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+                Err("unused browser".into())
+            }
+            async fn mission_fields(&self, _reference: &IssueRef) -> Result<MissionFields, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.failed.load(Ordering::SeqCst) {
+                    Err("field item unavailable".into())
+                } else {
+                    Ok(MissionFields { value: Some(5.0.try_into().expect("finite value")), ..Default::default() })
+                }
+            }
+        }
+        let cache = DispatchBoardCache::default();
+        let source = source("org/items");
+        cache.set_project_sources(BTreeMap::from([("project".into(), BTreeSet::from([source.clone()]))])).await;
+        let forge = Arc::new(Forge { failed: AtomicBool::new(false), calls: AtomicUsize::new(0) });
+        let prepares = Arc::new(AtomicUsize::new(0));
+        for pass in 0..2 {
+            let snapshot = board(&source, 2);
+            let load_source = source.clone();
+            let provider = forge.clone();
+            let count = prepares.clone();
+            let _ = cache
+                .read_indexed(&source, move |indices| async move {
+                    let mut snapshot = snapshot;
+                    let mut indices = indices.lock().await;
+                    indices.refresh_missions(provider.as_ref(), &load_source, &mut snapshot.issues, &BTreeSet::from(["0".into()])).await;
+                    let mut observation = flotilla_protocol::FootprintObservation::default();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    crate::dispatch_footprints::prepare_observation(&load_source, &mut observation, &[], &BTreeMap::new());
+                    snapshot.footprints = Some(observation);
+                    Ok(snapshot)
+                })
+                .await;
+            settled(&cache, &source).await;
+            for _ in 0..200 {
+                let snapshots = cache.snapshots(Some("project")).await.expect("served snapshot");
+                let snapshot = &snapshots[0];
+                assert!(snapshot.refresh_error.is_none());
+                assert_eq!(snapshot.issues[0].mission_fields.value, Some(5.0.try_into().expect("value")));
+                assert_eq!(snapshot.issues[0].mission_fields_error.is_some(), pass == 1);
+                assert!(snapshot.issues[1].mission_fields_error.is_none());
+                assert_eq!(forge.calls.load(Ordering::SeqCst), pass + 1);
+                assert_eq!(prepares.load(Ordering::SeqCst), pass + 1);
+            }
+            forge.failed.store(true, Ordering::SeqCst);
+            tokio::time::advance(REFRESH_INTERVAL).await;
         }
     }
 

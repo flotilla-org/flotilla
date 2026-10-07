@@ -45,6 +45,10 @@ spec:
                         properties:
                           service: {type: string}
                           scope: {type: string}
+                land_after_work:
+                  type: object
+                  nullable: true
+                  x-kubernetes-preserve-unknown-fields: true
                 reason: {type: string, minLength: 1}
                 author: {type: string, minLength: 1}
                 clear_when:

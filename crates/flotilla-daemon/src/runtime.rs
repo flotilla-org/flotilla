@@ -995,7 +995,7 @@ impl StartupRestoration {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
         // Warm all board sources independently of readiness reconciliation and
-        // interactive request cancellation. Reads schedule coalesced refreshes.
+        // interactive request cancellation. Only this background path schedules refreshes.
         let board_daemon = Arc::clone(daemon);
         controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
             options.controller_resync_interval,

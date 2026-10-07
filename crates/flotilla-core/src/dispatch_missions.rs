@@ -390,6 +390,7 @@ mod tests {
             observed_at: chrono::Utc::now(),
             age_seconds: 0,
             refresh_error: None,
+            footprints: None,
         }])
         .expect("mission board")
     }

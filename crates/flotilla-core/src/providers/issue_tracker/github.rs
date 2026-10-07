@@ -236,7 +236,7 @@ impl super::IssueProvider for GitHubIssueProvider {
                 "--limit",
                 &DISPATCH_BOARD_LIMIT.to_string(),
                 "--json",
-                "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
+                "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup,headRefOid,headRefName,headRepository,headRepositoryOwner"
             ],
             &self.host_root
         )?;
@@ -254,6 +254,14 @@ impl super::IssueProvider for GitHubIssueProvider {
                     .state(string("state")?.to_ascii_lowercase())
                     .maybe_merged_at(pr["mergedAt"].as_str().map(str::to_string))
                     .maybe_merge_state(pr["mergeStateStatus"].as_str().map(str::to_ascii_lowercase))
+                    .maybe_head_sha(pr["headRefOid"].as_str().map(str::to_string))
+                    .maybe_head_branch(pr["headRefName"].as_str().map(str::to_string))
+                    .maybe_head_repository(
+                        pr["headRepositoryOwner"]["login"]
+                            .as_str()
+                            .zip(pr["headRepository"]["name"].as_str())
+                            .map(|(owner, name)| format!("{owner}/{name}")),
+                    )
                     .ci(board_check_state(&pr["statusCheckRollup"]))
                     .build())
             })
@@ -264,10 +272,21 @@ impl super::IssueProvider for GitHubIssueProvider {
             observed_at: Utc::now(),
             age_seconds: 0,
             refresh_error: None,
+            footprints: None,
             source: source.clone(),
             issues,
             pull_requests,
         })
+    }
+
+    async fn footprints(
+        &self,
+        source: &IssueSource,
+        pull_requests: &[flotilla_protocol::DispatchBoardPullRequest],
+        branches: &[flotilla_protocol::BranchFootprintRequest],
+        index: &mut super::footprints::FootprintIndex,
+    ) -> Result<flotilla_protocol::FootprintObservation, String> {
+        Ok(index.refresh(self, source, pull_requests, branches).await)
     }
 
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
@@ -404,6 +423,94 @@ impl super::IssueProvider for GitHubIssueProvider {
         run!(self.runner, "gh", &["issue", "view", &reference.id, "--repo", &reference.source.scope, "--web"], &self.host_root)?;
         Ok(())
     }
+}
+
+#[async_trait]
+impl super::footprints::FootprintReader for GitHubIssueProvider {
+    async fn pull_request(
+        &self,
+        source: &IssueSource,
+        pr: &flotilla_protocol::DispatchBoardPullRequest,
+    ) -> Result<super::footprints::PullRequestFootprint, String> {
+        let endpoint = format!("repos/{}/pulls/{}", source.scope, pr.id);
+        let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+        let detail: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let head_sha = detail["head"]["sha"].as_str().ok_or("PR lacks head SHA")?;
+        if pr.head_sha.as_ref().is_some_and(|sha| sha != head_sha) {
+            return Err("PR head changed since the board observation".into());
+        }
+        let expected = detail["changed_files"].as_u64().ok_or("PR lacks changed_files")?;
+        if expected >= 3000 {
+            return Err("PR footprint reaches GitHub's 3000-file limit".into());
+        }
+        let mut files = Vec::new();
+        for page in 1..=30 {
+            let endpoint = format!("repos/{}/pulls/{}/files?per_page=100&page={page}", source.scope, pr.id);
+            let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+            let batch: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let count = batch.len();
+            files.extend(batch);
+            if count < 100 {
+                break;
+            }
+        }
+        if files.len() as u64 != expected {
+            return Err("PR footprint changed or was truncated during observation".into());
+        }
+        if pr.state == "open" {
+            let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+            let latest: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if latest["head"]["sha"] != detail["head"]["sha"] || latest["changed_files"] != detail["changed_files"] {
+                return Err("PR changed while collecting its footprint".into());
+            }
+        }
+        Ok(super::footprints::PullRequestFootprint {
+            footprint: parse_footprint_files(&files)?,
+            head_sha: head_sha.into(),
+            head_branch: detail["head"]["ref"].as_str().unwrap_or_default().into(),
+            head_repository: detail["head"]["repo"]["full_name"].as_str().unwrap_or_default().into(),
+        })
+    }
+
+    async fn branch_tip(&self, source: &IssueSource, branch: &str) -> Result<Option<String>, String> {
+        use crate::providers::ChannelLabel;
+        let branch = url::form_urlencoded::byte_serialize(branch.as_bytes()).collect::<String>();
+        let endpoint = format!("repos/{}/git/ref/heads/{branch}", source.scope);
+        match self.api.get_classified_response(&endpoint, &self.host_root, &ChannelLabel::GhApi(endpoint.clone())).await {
+            Ok(response) => {
+                let value: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+                Ok(Some(value["object"]["sha"].as_str().ok_or("branch ref lacks tip SHA")?.into()))
+            }
+            Err(error) if error.response.as_ref().is_some_and(|response| response.status == 404) => Ok(None),
+            Err(error) => Err(error.error.to_string()),
+        }
+    }
+
+    async fn compare(&self, source: &IssueSource, base: &str, tip: &str) -> Result<flotilla_protocol::FileFootprint, String> {
+        let base = url::form_urlencoded::byte_serialize(base.as_bytes()).collect::<String>();
+        let endpoint = format!("repos/{}/compare/{base}...{tip}?per_page=1&page=1", source.scope);
+        let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+        let comparison: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        comparison["ahead_by"].as_u64().ok_or("comparison lacks ahead_by")?;
+        let files = comparison["files"].as_array().ok_or("comparison lacks files")?;
+        if files.len() >= 300 {
+            return Err("branch footprint reaches GitHub's 300-file comparison limit".into());
+        }
+        parse_footprint_files(files)
+    }
+}
+
+fn parse_footprint_files(files: &[serde_json::Value]) -> Result<flotilla_protocol::FileFootprint, String> {
+    let mut footprint = flotilla_protocol::FileFootprint::default();
+    for file in files {
+        let path = file["filename"].as_str().ok_or("diff file lacks filename")?;
+        let interface = file["patch"].as_str().is_none_or(|patch| crate::dispatch_footprints::interface_patch(path, patch));
+        footprint.files.insert(path.into(), interface);
+        if let Some(previous) = file["previous_filename"].as_str() {
+            footprint.files.insert(previous.into(), interface);
+        }
+    }
+    Ok(footprint)
 }
 
 #[cfg(test)]
@@ -815,6 +922,118 @@ mod tests {
 
     // Daemon board facts use the documented gh JSON fields through the same
     // recorded process seam; clients need no tracker credentials of their own.
+    // #2784: missing patches are conservative, renames retain both paths,
+    // and malformed remote file rows are errors rather than empty footprints.
+    #[test]
+    fn footprint_files_preserve_renames_and_interface_uncertainty() {
+        let footprint = parse_footprint_files(&[
+            serde_json::json!({"filename":"src/new.rs","previous_filename":"src/old.rs","patch":"+pub trait Api {}"}),
+            serde_json::json!({"filename":"image.png"}),
+            serde_json::json!({"filename":"src/private.rs","patch":"+fn private() {}"}),
+        ])
+        .expect("files");
+        assert_eq!(footprint.files.len(), 4);
+        assert!(footprint.files["src/new.rs"]);
+        assert!(footprint.files["src/old.rs"]);
+        assert!(footprint.files["image.png"]);
+        assert!(!footprint.files["src/private.rs"]);
+        assert!(parse_footprint_files(&[serde_json::json!({"patch":"+foo"})]).is_err());
+    }
+
+    // #2784 HTTP contract: recorded authenticated PR pagination and branch
+    // comparisons; unpublished branches retain predictions, pushed diffs are actual.
+    #[tokio::test]
+    async fn footprints_record_replay() {
+        use flotilla_protocol::{BranchFootprintRequest, DispatchBoardPullRequest};
+
+        use crate::providers::github_api::{GhApiFailure, GhApiResponse};
+        let session = replay::test_session(&fixture("github_footprints.yaml"), Masks::new());
+        let runner = replay::test_runner(&session);
+        // Instrument the actual recorded forge seam, not the policy algorithm.
+        struct CountedApi {
+            inner: Arc<dyn GhApi>,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl GhApi for CountedApi {
+            async fn get(&self, endpoint: &str, root: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.get(endpoint, root, label).await
+            }
+            async fn get_with_headers(
+                &self,
+                endpoint: &str,
+                root: &Path,
+                label: &crate::providers::ChannelLabel,
+            ) -> Result<GhApiResponse, String> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.get_with_headers(endpoint, root, label).await
+            }
+            async fn get_classified_response(
+                &self,
+                endpoint: &str,
+                root: &Path,
+                label: &crate::providers::ChannelLabel,
+            ) -> Result<GhApiResponse, GhApiFailure> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.get_classified_response(endpoint, root, label).await
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api = Arc::new(CountedApi { inner: replay::test_gh_api(&session), calls: calls.clone() });
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/"));
+        let mut index = super::super::footprints::FootprintIndex::default();
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let prs = vec![
+            DispatchBoardPullRequest::builder()
+                .id("2853".into())
+                .url("https://github.com/flotilla-org/flotilla/pull/2853".into())
+                .state("open".into())
+                .head_sha("4fe646f9b5f50f3db944f85ae0729372fe7eac33".into())
+                .ci("pass".into())
+                .build(),
+            DispatchBoardPullRequest::builder()
+                .id("2858".into())
+                .url("https://github.com/flotilla-org/flotilla/pull/2858".into())
+                .state("merged".into())
+                .merged_at("2026-10-01T00:00:00Z".into())
+                .ci("pass".into())
+                .build(),
+        ];
+        let observation = provider.footprints(&source, &prs, &[], &mut index).await.expect("PR footprint");
+        assert_eq!(observation.work.len(), 1);
+        assert!(observation.work[0].actual);
+        assert!(observation.work[0].footprint.files.contains_key("crates/flotilla-core/src/dispatch_missions.rs"));
+        assert_eq!(observation.history.len(), 1);
+        let first_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(first_calls > 0);
+        let second = provider.footprints(&source, &prs, &[], &mut index).await.expect("unchanged refresh");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            first_calls,
+            "merged and unchanged open PRs make zero forge calls on the next refresh"
+        );
+        assert_eq!(second.history, observation.history);
+        assert_eq!(second.work, observation.work);
+        let branches = vec![
+            BranchFootprintRequest {
+                convoy: "pushed".into(),
+                base: "7485ea37ade8142536d74a7674d3f0cfaac055fa".into(),
+                branch: "convoy/dispatch-footprints".into(),
+            },
+            BranchFootprintRequest {
+                convoy: "unpublished".into(),
+                base: "main".into(),
+                branch: "flotilla-footprint-unpublished-example".into(),
+            },
+        ];
+        let observation = provider.footprints(&source, &[], &branches, &mut index).await.expect("branch footprint");
+        assert_eq!(observation.work.len(), 1);
+        assert_eq!(observation.work[0].convoy.as_deref(), Some("pushed"));
+        assert!(observation.work[0].actual);
+        session.finish();
+    }
+
     #[tokio::test]
     async fn dispatch_board_record_replay() {
         let session = replay::test_session(&fixture("github_dispatch_board.yaml"), Masks::new());

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Read-only candidate-host report. Configure overlap_policy before running.
+set -euo pipefail
+project=${1:?usage: accept-dispatch-footprints PROJECT}
+snapshot=$(mktemp)
+trap 'rm -f "$snapshot"' EXIT
+flotilla dispatch board --project "$project" --json > "$snapshot"
+python3 - "$snapshot" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as source:
+    board = json.load(source)
+observations = [repo for repo in board["repositories"] if repo["footprints"] is not None]
+assert observations, "enable overlap_policy and wait for a completed background observation"
+for repo in observations:
+    footprint = repo["footprints"]
+    assert len(footprint["history"]) <= 60
+    print(repo["source"], "age", repo["age_seconds"], "refresh error", repo["refresh_error"])
+    for work in footprint["work"]:
+        print("work", work["target"], "actual", work["actual"], "revision", work["revision"])
+    for hint in footprint["merge_order"]:
+        assert hint["weight"] > 0 and hint["files"]
+        print("merge order", hint)
+    for hot in footprint["hot_files"][:20]:
+        print("hot file", hot)
+print("Inspect DispatchHold and DispatchOverlap resources for admission and tuning evidence.")
+PY
