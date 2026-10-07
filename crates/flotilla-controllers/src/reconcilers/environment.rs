@@ -210,7 +210,10 @@ where
                             Ok(Some(delivered)) => delivered,
                             Ok(None) if build.spec.host_ref == spec.host_ref => identity.clone(),
                             Ok(None) => {
-                                return waiting(format!("ImageBuild {} awaiting digest transfer to {}", build.metadata.name, spec.host_ref))
+                                return waiting(format!(
+                                    "ImageBuild {} awaiting held digest or registry availability on {}",
+                                    build.metadata.name, spec.host_ref
+                                ))
                             }
                             Err(reason) => return waiting(format!("ImageBuild {} distribution waiting: {reason}", build.metadata.name)),
                         };

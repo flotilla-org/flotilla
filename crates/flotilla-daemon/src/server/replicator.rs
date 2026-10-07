@@ -169,9 +169,6 @@ impl PeerReplicatorSupervisors {
         let Some((cancellation, socket_path_source)) = self.begin_generation(&peer, generation, resource_socket_path.clone()) else {
             return;
         };
-        if let Some(path) = &resource_socket_path {
-            daemon.set_image_peer_socket(peer.as_str(), path.clone()).await;
-        }
         daemon.begin_peer_resource_replication(&peer).await;
         let transport = match resource_socket_path {
             Some(_) => ReplicationTransport::Http(socket_path_source),

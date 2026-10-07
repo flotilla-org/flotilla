@@ -222,7 +222,7 @@ pub fn is_image_digest(value: &str) -> bool {
 pub enum ImageAcquisitionCost {
     Held,
     RegistryPull,
-    BuildOrTransfer,
+    Build,
 }
 
 #[cfg(test)]

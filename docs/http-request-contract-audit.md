@@ -13,7 +13,6 @@ I searched all Rust sources for `tls::client`, `client_builder`, `reqwest`, requ
 | Codex tasks (`providers/coding_agent/codex.rs`) | Existing recorded HTTP fixtures, including `codex_tasks.yaml`, `codex_auth_retry.yaml`, `codex_label_fallback.yaml`. |
 | Cursor agent listing (`providers/coding_agent/cursor.rs`) | New HTTP stand-in enforces GET route, Basic test-key authorization and limit query. |
 | Anthropic Messages (`providers/ai_utility/claude_api.rs`) | New HTTP stand-in enforces POST route, API key/version/JSON headers, model/max_tokens/messages payload. |
-| Image archive mesh download (daemon image_distribution.rs) | In-process HTTP stand-in enforces GET with the exact digest path, preserves binary archive bytes, and refuses non-success responses before creating a loadable archive. Bounded duplex-stream tests exercise Docker save response framing and config cleanup. Registry login/push/pull use injected Docker process contracts, not direct registry HTTP. |
 | S3 blob store (`blob_store.rs`) | Existing recorded `src/fixtures/s3_blob_contract.yaml` exercises signed PUT/GET/HEAD/DELETE and the shared store behavior contract. |
 | Relay WebSocket upgrade, HTTP long poll and ack (`event_relay.rs`) | Exemption documented beside tests: owned ConsumerFrame/StreamFrame protocol, with in-memory lifecycle scenarios; no external-service header contract or live fixture. These scenarios do not claim HTTP transport compatibility coverage. |
 | Codex OAuth refresh (`codex_central.rs`) | Exemption documented beside tests: consumer OAuth endpoint has no published request contract for this adapter; replay would capture rotating live credentials. Fixed-response tests cover decoding and failure classification, not remote compatibility. |
@@ -21,5 +20,12 @@ I searched all Rust sources for `tls::client`, `client_builder`, `reqwest`, requ
 | Resource validation (`src/resource_validate.rs`) | Exemption beside tests: owned daemon API over local Unix socket, exercised against actual server by existing integration tests. |
 | Wheelhouse metadata POST (`flotilla-manifest/src/sink.rs`) | Exemption beside tests: owned local IPC protocol, existing socket HTTP stand-in covers POST routing and payloads. |
 | Shared TLS clients / `ReqwestHttpClient::execute` / `execute_to_file`, replay transports and request factories | Service-neutral construction/execution, grouped with consumers. Exemption beside transport tests; shared TLS User-Agent has existing wire coverage. Discovery factories and examples construct the audited adapters; they introduce no distinct request shape. |
+
+The former replication-plane image archive HTTP boundary was removed in the
+#2729 follow-up. [#2850](https://github.com/flotilla-org/flotilla/issues/2850)
+tracks registry-less image bytes through a separate Tender raw-stream exposure
+between directly reachable peers, without relay routing. Its byte-stream and
+Docker process contract coverage belongs with that implementation; there is no
+remaining replication HTTP image caller or contract to claim here.
 
 CLAUDE.md now requires enforcing stand-ins or recorded replay for outbound HTTP; arbitrary-request mocks alone are insufficient. The exemptions above identify compatibility gaps explicitly, rather than treating response-only mocks as service contracts.

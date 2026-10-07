@@ -294,10 +294,10 @@ fn stages_freeze_realised_parent_identity_before_building(tc: hegel::TestCase) {
 }
 
 // #2729: a completed pinned execution can serve a non-builder host, while a
-// vessel's provisioning waits for an injected transfer and pins the exact ID.
+// vessel waits visibly without availability, then pins an injected verified ID.
 #[tokio::test]
 async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_identity() {
-    struct Delivered;
+    struct Delivered(bool);
     #[async_trait]
     impl DockerEnvironmentRuntime for Delivered {
         async fn ensure_image(
@@ -306,6 +306,9 @@ async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_iden
             host: &str,
         ) -> Result<Option<PlacedImageIdentity>, String> {
             assert_eq!(host, "small");
+            if !self.0 {
+                return Err("requested digest is not held on this host and no fleet registry cache is declared".into());
+            }
             Ok(build.status.as_ref().and_then(|status| status.identity.clone()))
         }
         async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
@@ -346,7 +349,16 @@ async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_iden
         .create(&InputMeta::builder().name("remote".into()).build(), &EnvironmentSpec { host_direct: None, docker: Some(spec) })
         .await
         .expect("environment");
-    let environment = EnvironmentReconciler::new(Arc::new(Delivered), backend.clone(), "test");
+    let unavailable = EnvironmentReconciler::new(Arc::new(Delivered(false)), backend.clone(), "test");
+    let prepared = unavailable.prepare(&env).await.expect("wait");
+    let patch = unavailable.reconcile(&env, &prepared, Utc::now()).patch.expect("waiting");
+    apply_status_patch(&environments, "remote", &patch).await.expect("visible wait");
+    let env = environments.get("remote").await.expect("waiting environment");
+    let status = env.status.as_ref().expect("status");
+    assert_eq!(status.phase, EnvironmentPhase::Provisioning);
+    assert!(status.message.as_deref().expect("reason").contains("no fleet registry cache"));
+    assert!(status.local_image_id.is_none());
+    let environment = EnvironmentReconciler::new(Arc::new(Delivered(true)), backend.clone(), "test");
     let prepared = environment.prepare(&env).await.expect("deliver");
     let patch = environment.reconcile(&env, &prepared, Utc::now()).patch.expect("ready");
     apply_status_patch(&environments, "remote", &patch).await.expect("freeze");

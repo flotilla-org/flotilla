@@ -2,37 +2,30 @@
 //! registry publication are observations which may change independently.
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use flotilla_core::{
-    in_process::InProcessDaemon,
-    providers::{ChannelLabel, CommandRunner},
-};
+use flotilla_core::providers::{ChannelLabel, CommandRunner};
 use flotilla_resources::{
     is_image_digest, FleetDesignation, Host, HostImageAction, ImageBuild, ImageBuildPhase, ImageCacheBinding, PlacedImageIdentity,
     ResourceBackend, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY,
 };
-use tokio::io::AsyncWriteExt;
 
 use crate::credential::CredentialStore;
 
 const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
-/// The process/mesh seam. All methods operate on exact IDs, never mutable tags.
-/// Returning from pull/transfer does not attest identity: the caller inspects it.
+/// The Docker process seam. All methods operate on exact IDs, never mutable tags.
+/// Returning from pull does not attest identity: the caller inspects it.
 #[async_trait]
 pub(crate) trait ImageDistributionIo: Send + Sync {
     async fn inventory(&self) -> Result<BTreeSet<String>, String>;
     async fn inspect(&self, reference: &str) -> Result<PlacedImageIdentity, String>;
     async fn push(&self, cache: &ImageCacheBinding, image_id: &str) -> Result<String, String>;
     async fn pull(&self, cache: &ImageCacheBinding, reference: &str) -> Result<(), String>;
-    async fn transfer(&self, source: &str, image_id: &str) -> Result<(), String>;
 }
 
 #[derive(bon::Builder)]
@@ -82,7 +75,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         }
     }
 
-    /// Prefer the held exact ID, then a published registry digest, then mesh.
+    /// Prefer the held exact ID, then a published registry digest; otherwise wait.
     /// Never change a build's identity to whatever a tag happens to name.
     pub async fn ensure(&self, build: &ResourceObject<ImageBuild>) -> Result<PlacedImageIdentity, String> {
         let status = build.status.as_ref().filter(|status| status.phase == ImageBuildPhase::Built).ok_or("image build is not built")?;
@@ -99,13 +92,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
             self.io.pull(&cache, reference).await?;
             self.verify(reference, expected, Some(reference)).await
         } else {
-            let source = if status.availability.hosts.contains(&build.spec.host_ref) {
-                &build.spec.host_ref
-            } else {
-                status.availability.hosts.iter().find(|host| *host != &self.host).unwrap_or(&build.spec.host_ref)
-            };
-            self.io.transfer(source, &expected.local_image_id).await?;
-            self.verify(&expected.local_image_id, expected, None).await
+            Err("requested digest is not held on this host and no fleet registry cache is declared; waiting for image availability".into())
         }
     }
 
@@ -124,7 +111,7 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
     }
 
     /// Only the execution's actuator updates its availability. It derives host
-    /// locations from their latest inventories rather than trusting old transfer
+    /// locations from their latest inventories rather than trusting old delivery
     /// successes forever.
     pub async fn refresh(&self) -> Result<(), String> {
         let held = self.io.inventory().await?;
@@ -237,9 +224,7 @@ fn validate_registry_reference(cache: &ImageCacheBinding, reference: &str) -> Re
 pub(crate) struct DockerImageIo {
     pub runner: Arc<dyn CommandRunner>,
     pub credentials: Arc<CredentialStore>,
-    pub daemon: Weak<InProcessDaemon>,
     pub host: String,
-    pub namespace: String,
 }
 
 impl DockerImageIo {
@@ -304,142 +289,6 @@ impl ImageDistributionIo for DockerImageIo {
             .await?;
         Ok(())
     }
-
-    async fn transfer(&self, source: &str, image_id: &str) -> Result<(), String> {
-        if !is_image_digest(image_id) {
-            return Err("mesh transfer requires an exact local image ID".into());
-        }
-        let daemon = self.daemon.upgrade().ok_or("image distribution daemon stopped")?;
-        let hosts =
-            daemon.resource_backend().including_replicas::<Host>(&self.namespace).list().await.map_err(|error| error.to_string())?;
-        let peer = hosts
-            .items
-            .iter()
-            .find(|item| item.object.metadata.name == source)
-            .and_then(|item| item.object.status.as_ref())
-            .and_then(|status| status.description.as_ref())
-            .map(|description| description.node.node_id.as_str())
-            .unwrap_or(source);
-        let visited = vec![daemon.local_host_identity().node.node_id.to_string()];
-        let mut response = open_mesh_archive(&daemon, peer, image_id, &visited).await?;
-        let spool = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let archive = spool.path().join("image.tar");
-        save_response(&mut response, &archive).await?;
-        let config = spool.path().join("config");
-        tokio::fs::create_dir(&config).await.map_err(|error| error.to_string())?;
-        let directory = config.to_string_lossy();
-        tokio::time::timeout(
-            OPERATION_TIMEOUT,
-            self.runner.run_from_file("docker", &["--config", &directory, "load"], Path::new("/"), &archive),
-        )
-        .await
-        .map_err(|_| "Docker load timed out".to_string())??;
-        Ok(())
-    }
-}
-
-fn archive_url(base: &str, image: &str, source: &str, visited: &[String]) -> Result<url::Url, String> {
-    let mut url = url::Url::parse(base).map_err(|error| error.to_string())?;
-    url.set_path(&format!("/image-transfer/{image}"));
-    url.query_pairs_mut().append_pair("source", source).append_pair("visited", &visited.join(","));
-    Ok(url)
-}
-
-fn image_routes(routes: Vec<(String, PathBuf)>, source: &str, visited: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
-    if visited.len() > 8 {
-        return Err("image mesh route exceeds eight hops".into());
-    }
-    let mut routes = routes.into_iter().filter(|(peer, _)| !visited.contains(peer)).collect::<Vec<_>>();
-    routes.sort_by_key(|(peer, _)| peer != source);
-    Ok(routes)
-}
-
-async fn open_mesh_archive(daemon: &InProcessDaemon, source: &str, image: &str, visited: &[String]) -> Result<reqwest::Response, String> {
-    let routes = image_routes(daemon.image_peer_routes().await, source, visited)?;
-    let url = archive_url("http://localhost", image, source, visited)?;
-    for (_, path) in routes {
-        let client = reqwest::Client::builder().unix_socket(path).timeout(OPERATION_TIMEOUT).build().map_err(|error| error.to_string())?;
-        match client.get(url.clone()).send().await {
-            Ok(response) if response.status().is_success() => return Ok(response),
-            Ok(_) | Err(_) => continue,
-        }
-    }
-    Err(format!("no resource mesh route can export the digest from {source}"))
-}
-
-/// Resource transport forwarding supports sparse meshes without growing
-/// Plane-A routing. Visited nodes exclude cycles and the hop count is bounded.
-/// Intermediaries copy chunks directly; only Docker's endpoints spool archives.
-pub(crate) async fn relay_image<S: tokio::io::AsyncWrite + Unpin>(
-    stream: &mut S,
-    daemon: &InProcessDaemon,
-    source: &str,
-    image: &str,
-    mut visited: Vec<String>,
-) -> Result<(), String> {
-    let local = daemon.local_host_identity().node.node_id.to_string();
-    if visited.contains(&local) {
-        return Err("cyclic image mesh route".into());
-    }
-    visited.push(local);
-    let mut response = open_mesh_archive(daemon, source, image, &visited).await?;
-    let length = response.content_length().map(|length| format!("Content-Length: {length}\r\n")).unwrap_or_default();
-    stream
-        .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\n{length}Connection: close\r\n\r\n").as_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(chunk) = response.chunk().await.map_err(|error| format!("image archive stream interrupted: {error}"))? {
-        stream.write_all(&chunk).await.map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-async fn download_archive(client: &reqwest::Client, url: &str, archive: &Path) -> Result<(), String> {
-    let mut response =
-        client.get(url).send().await.map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?;
-    save_response(&mut response, archive).await
-}
-
-async fn save_response(response: &mut reqwest::Response, archive: &Path) -> Result<(), String> {
-    let mut file = tokio::fs::File::create(archive).await.map_err(|error| error.to_string())?;
-    while let Some(chunk) = response.chunk().await.map_err(|error| format!("image archive stream interrupted: {error}"))? {
-        file.write_all(&chunk).await.map_err(|error| error.to_string())?;
-    }
-    file.flush().await.map_err(|error| error.to_string())
-}
-
-/// Serve a Docker save archive on the trusted resource mesh. Paths contain only
-/// validated IDs, and all archive/config files disappear on cancellation.
-pub(crate) async fn serve_image<S: tokio::io::AsyncWrite + Unpin>(
-    stream: &mut S,
-    runner: &dyn CommandRunner,
-    image_id: &str,
-) -> Result<(), String> {
-    if !is_image_digest(image_id) {
-        return Err("invalid image transfer digest".into());
-    }
-    let spool = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let archive: PathBuf = spool.path().join("image.tar");
-    let config = spool.path().join("config");
-    tokio::fs::create_dir(&config).await.map_err(|error| error.to_string())?;
-    let config_arg = config.to_string_lossy();
-    tokio::time::timeout(
-        OPERATION_TIMEOUT,
-        runner.run_to_file("docker", &["--config", &config_arg, "save", image_id], Path::new("/"), &archive),
-    )
-    .await
-    .map_err(|_| "Docker save timed out".to_string())??;
-    let mut file = tokio::fs::File::open(archive).await.map_err(|error| error.to_string())?;
-    let size = file.metadata().await.map_err(|error| error.to_string())?.len();
-    stream
-        .write_all(
-            format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::io::copy(&mut file, stream).await.map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 impl<I> Drop for ImageDistributor<I> {
@@ -465,7 +314,7 @@ mod tests {
 
     use super::*;
 
-    // Stands in for the Docker process and authenticated mesh byte transport.
+    // Stands in for Docker inventory, inspection, and registry processes.
     // Inventories and inspect results model distinct Docker stores per host.
     struct Docker {
         held: Mutex<BTreeSet<String>>,
@@ -504,13 +353,6 @@ mod tests {
         async fn pull(&self, _cache: &ImageCacheBinding, reference: &str) -> Result<(), String> {
             assert!(reference.ends_with(&self.manifest));
             self.calls.lock().expect("calls").push("pull".into());
-            self.held.lock().expect("inventory").insert(self.id.clone());
-            Ok(())
-        }
-        async fn transfer(&self, source: &str, id: &str) -> Result<(), String> {
-            assert_eq!(source, "builder");
-            assert_eq!(id, self.id);
-            self.calls.lock().expect("calls").push("transfer".into());
             self.held.lock().expect("inventory").insert(self.id.clone());
             Ok(())
         }
@@ -666,31 +508,28 @@ mod tests {
         assert_eq!(retry_ready(Some(start + RETRY_COOLDOWN), start + Duration::from_secs(seconds)), seconds >= 300);
     }
 
-    // #2729: registry and registry-less paths deliver the same exact local
-    // digest. Generate digest bytes, held/missing states and both transports;
-    // each subsequent request must prefer the newly held digest.
+    // #2729 split: held or registry-delivered images retain the exact ID.
+    // Without either, delivery refuses with a visible waiting reason and
+    // does not invoke another transport or substitute an image.
     #[hegel::test]
-    fn both_routes_deliver_the_immutable_digest(tc: hegel::TestCase) {
+    fn held_or_registry_digest_delivers_otherwise_waits(tc: hegel::TestCase) {
         let registry = tc.draw(hegel::generators::booleans());
         let held = tc.draw(hegel::generators::booleans());
         let byte = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(254));
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
             let (delivery, build) = setup(registry, held, false, byte).await;
+            if !registry && !held {
+                let reason = delivery.ensure(&build).await.expect_err("wait without transport");
+                assert!(reason.contains("not held") && reason.contains("no fleet registry cache"));
+                assert!(delivery.io.calls.lock().expect("calls").is_empty());
+                return;
+            }
             let first = delivery.ensure(&build).await.expect("deliver");
             assert_eq!(first.local_image_id, build.status.as_ref().expect("status").identity.as_ref().expect("identity").local_image_id);
             let second = delivery.ensure(&build).await.expect("held");
             assert_eq!(second.local_image_id, first.local_image_id);
             let calls = delivery.io.calls.lock().expect("calls");
-            assert_eq!(
-                calls.as_slice(),
-                if held {
-                    vec![]
-                } else if registry {
-                    vec!["pull"]
-                } else {
-                    vec!["transfer"]
-                }
-            );
+            assert_eq!(calls.as_slice(), if held { vec![] } else { vec!["pull"] });
         });
     }
 
@@ -701,7 +540,7 @@ mod tests {
         let registry = tc.draw(hegel::generators::booleans());
         let held = tc.draw(hegel::generators::booleans());
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let (delivery, build) = setup(registry, held, true, 3).await;
+            let (delivery, build) = setup(registry, held || !registry, true, 3).await;
             assert!(delivery.ensure(&build).await.expect_err("reject corruption").contains("does not match"));
         });
     }
@@ -742,7 +581,7 @@ mod tests {
     }
 
     // A declared cache is required to publish a manifest before pull; a missing
-    // publication or wrong repository must not silently choose mesh or a tag.
+    // publication or wrong repository must not silently choose another transport or a tag.
     #[tokio::test]
     async fn declared_cache_refuses_missing_or_wrong_publication() {
         let (delivery, mut build) = setup(true, false, false, 3).await;
@@ -751,173 +590,5 @@ mod tests {
         build.status.as_mut().expect("status").availability.registry_ref = Some(format!("evil.test/image@sha256:{}", "1".repeat(64)));
         assert!(delivery.ensure(&build).await.is_err());
         assert!(delivery.io.calls.lock().expect("calls").is_empty());
-    }
-}
-
-#[cfg(test)]
-mod stream_tests {
-    use std::sync::Mutex;
-
-    use flotilla_core::providers::CommandOutput;
-    use tokio::io::AsyncReadExt;
-
-    use super::*;
-
-    // Stands in for Docker save's binary process stdout, including zero and
-    // non-UTF8 bytes. The resource response uses real bounded Tokio streams.
-    struct Save {
-        config: Mutex<Option<PathBuf>>,
-        bytes: Vec<u8>,
-    }
-    #[async_trait]
-    impl CommandRunner for Save {
-        async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-            Err("unexpected text command".into())
-        }
-        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-            Err("unexpected text command".into())
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            false
-        }
-        async fn run_to_file(&self, cmd: &str, args: &[&str], _: &Path, destination: &Path) -> Result<(), String> {
-            assert_eq!(cmd, "docker");
-            assert_eq!(args[0], "--config");
-            assert_eq!(args[2], "save");
-            assert!(is_image_digest(args[3]));
-            assert!(Path::new(args[1]).is_dir());
-            *self.config.lock().expect("config") = Some(args[1].into());
-            tokio::fs::write(destination, &self.bytes).await.map_err(|error| error.to_string())
-        }
-    }
-
-    // #2729: the save archive crosses the resource transport without text
-    // conversion or loss, with accurate HTTP framing and operation cleanup.
-    // Generate lengths across the 1KiB buffer boundary, including empty output.
-    #[hegel::test]
-    fn mesh_archive_preserves_binary_bytes_and_cleans_config(tc: hegel::TestCase) {
-        let length = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4096));
-        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let bytes = (0..length).map(|index| (index % 256) as u8).collect::<Vec<_>>();
-            let save = Arc::new(Save { config: Mutex::new(None), bytes: bytes.clone() });
-            let (mut reader, mut writer) = tokio::io::duplex(1024);
-            let source = save.clone();
-            let sending =
-                tokio::spawn(async move { serve_image(&mut writer, source.as_ref(), &format!("sha256:{}", "3".repeat(64))).await });
-            let mut received = Vec::new();
-            reader.read_to_end(&mut received).await.expect("response");
-            sending.await.expect("task").expect("save");
-            let split = received.windows(4).position(|bytes| bytes == b"\r\n\r\n").expect("headers") + 4;
-            assert_eq!(&received[split..], bytes.as_slice());
-            assert!(std::str::from_utf8(&received[..split]).expect("headers").contains(&format!("Content-Length: {length}\r\n")));
-            assert!(!save.config.lock().expect("config").as_ref().expect("path").exists());
-        });
-    }
-
-    // A tag or malformed digest is rejected before invoking Docker save.
-    #[tokio::test]
-    async fn mesh_export_refuses_tags_without_a_process() {
-        let save = Save { config: Mutex::new(None), bytes: vec![] };
-        let mut sink = tokio::io::sink();
-        for reference in ["image:latest", "sha256:123", "sha256:../../path", ""] {
-            assert!(serve_image(&mut sink, &save, reference).await.is_err());
-        }
-        assert!(save.config.lock().expect("config").is_none());
-    }
-}
-
-#[cfg(test)]
-mod http_contract {
-    use axum::{
-        extract::Path as RequestPath,
-        http::{Method, StatusCode, Uri},
-        routing::get,
-        Router,
-    };
-
-    use super::*;
-
-    // #2729 HTTP glue: one GET endpoint is sufficient. This in-process stand-in
-    // enforces the digest path/method and supplies binary bytes, not JSON/text.
-    #[tokio::test]
-    async fn mesh_download_obeys_http_contract_and_refuses_non_success() {
-        let expected = format!("sha256:{}", "3".repeat(64));
-        let bytes = (0..65536).map(|index| (index % 256) as u8).collect::<Vec<_>>();
-        let reply = bytes.clone();
-        let accepted = expected.clone();
-        let app = Router::new().route(
-            "/image-transfer/{digest}",
-            get(move |RequestPath(digest): RequestPath<String>, uri: Uri, method: Method| {
-                let accepted = accepted.clone();
-                let reply = reply.clone();
-                async move {
-                    assert_eq!(method, Method::GET);
-                    let query =
-                        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()).into_owned().collect::<BTreeMap<_, _>>();
-                    assert_eq!(query.get("source").map(String::as_str), Some("builder"));
-                    assert_eq!(query.get("visited").map(String::as_str), Some("consumer,relay"));
-                    if digest != accepted {
-                        return (StatusCode::NOT_FOUND, Vec::new());
-                    }
-                    (StatusCode::OK, reply)
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("HTTP listener");
-        let address = listener.local_addr().expect("address");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve");
-        });
-        let directory = tempfile::tempdir().expect("archive");
-        let archive = directory.path().join("image.tar");
-        let client = reqwest::Client::new();
-        let url = archive_url(&format!("http://{address}"), &expected, "builder", &["consumer".into(), "relay".into()]).expect("URL");
-        download_archive(&client, url.as_str(), &archive).await.expect("download");
-        assert_eq!(tokio::fs::read(&archive).await.expect("bytes"), bytes);
-        let missing = directory.path().join("missing.tar");
-        let url = archive_url(&format!("http://{address}"), &format!("sha256:{}", "4".repeat(64)), "builder", &[
-            "consumer".into(),
-            "relay".into(),
-        ])
-        .expect("URL");
-        assert!(download_archive(&client, url.as_str(), &missing).await.is_err());
-        assert!(!missing.exists(), "HTTP refusal must not create an archive to load");
-        server.abort();
-    }
-}
-
-#[cfg(test)]
-mod route_tests {
-    use super::*;
-
-    // Sparse resource meshes may relay through an intermediate host. Generate
-    // visited paths across the eight-hop boundary, both direct and indirect
-    // targets, and visited direct/relay neighbors. No node is revisited.
-    #[hegel::test]
-    fn resource_image_routes_prefer_direct_and_exclude_cycles(tc: hegel::TestCase) {
-        let length = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(9));
-        let direct = tc.draw(hegel::generators::booleans());
-        let seen_target = tc.draw(hegel::generators::booleans());
-        let seen_relay = tc.draw(hegel::generators::booleans());
-        let mut visited = (0..length).map(|index| format!("node-{index}")).collect::<Vec<_>>();
-        if seen_target {
-            visited.push("builder".into());
-        }
-        if seen_relay {
-            visited.push("relay".into());
-        }
-        let source = if direct { "builder" } else { "other" };
-        let routes = vec![("relay".into(), PathBuf::from("/relay")), ("builder".into(), PathBuf::from("/builder"))];
-        let result = image_routes(routes, source, &visited);
-        if visited.len() > 8 {
-            assert!(result.is_err());
-            return;
-        }
-        let routes = result.expect("bounded route");
-        assert!(routes.iter().all(|(peer, _)| !visited.contains(peer)));
-        assert_eq!(routes.len(), usize::from(!seen_target) + usize::from(!seen_relay));
-        if direct && !seen_target {
-            assert_eq!(routes.first().expect("direct").0, "builder");
-        }
     }
 }

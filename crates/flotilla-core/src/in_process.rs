@@ -1364,8 +1364,6 @@ impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
 }
 
 pub struct InProcessDaemon {
-    image_transfer_slots: Arc<tokio::sync::Semaphore>,
-    image_peer_sockets: RwLock<BTreeMap<String, PathBuf>>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1882,8 +1880,6 @@ impl InProcessDaemon {
             repository_providers: Mutex::new(HashMap::new()),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
-            image_transfer_slots: Arc::new(tokio::sync::Semaphore::new(2)),
-            image_peer_sockets: RwLock::new(BTreeMap::new()),
             convoy_admission: ConvoyAdmission::builder()
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
@@ -2716,21 +2712,6 @@ impl InProcessDaemon {
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
         self.aggregator_projection_state.clone()
-    }
-
-    /// Resource mesh routes are owned by each authenticated replication generation.
-    /// Bound archive exports and relays together; refuse overload instead of
-    /// queuing unbounded requests holding sockets and temporary archives.
-    pub fn try_image_transfer(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-        Arc::clone(&self.image_transfer_slots).try_acquire_owned().map_err(|_| "image transfer capacity exhausted".into())
-    }
-
-    pub async fn set_image_peer_socket(&self, peer: &str, path: PathBuf) {
-        self.image_peer_sockets.write().await.insert(peer.into(), path);
-    }
-
-    pub async fn image_peer_routes(&self) -> Vec<(String, PathBuf)> {
-        self.image_peer_sockets.read().await.iter().map(|(peer, path)| (peer.clone(), path.clone())).collect()
     }
 
     pub async fn set_image_build_input_resolver(&self, resolver: Arc<dyn crate::image_build::ImageBuildInputResolver>) {
