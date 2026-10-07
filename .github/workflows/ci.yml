@@ -105,6 +105,61 @@ jobs:
           ci/platform-tests/test-run.sh
           python3 -m unittest discover -s ci/toolchain -p test_action.py
 
+  cleat-environment:
+    name: Cleat launch environment contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide whether launch inputs changed
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [ "$EVENT" = push ] || [ -z "$BASE" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE"...HEAD | grep -qE '^(crates/.*(terminal|cleat)|crates/flotilla-core/src/providers/discovery/|crates/flotilla-core/Cargo.toml|ci/cleat-environment/|ci/fork-actions/runtime/cleat/|ci/fleet-candidates/cleat-toolchain.sh|ci/toolchain/|rust-toolchain.toml|Cargo.toml|Cargo.lock|.github/workflows/ci.yml)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Read compiler pin
+        if: steps.filter.outputs.run == 'true'
+        id: rust-pin
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.filter.outputs.run == 'true'
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.filter.outputs.run == 'true'
+        with:
+          shared-key: cleat-environment
+      - name: Build pinned old and new cleat
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          git clone https://github.com/flotilla-org/cleat.git "$RUNNER_TEMP/cleat-source"
+          ci/cleat-environment/build.sh "$RUNNER_TEMP/cleat-source" "$RUNNER_TEMP/cleat-environment"
+      - name: Run shared fake and real launch contracts
+        if: steps.filter.outputs.run == 'true'
+        env:
+          FLOTILLA_TEST_CLEAT_OLD: ${{ runner.temp }}/cleat-environment/old/cleat
+          FLOTILLA_TEST_CLEAT_NEW: ${{ runner.temp }}/cleat-environment/new/cleat
+        run: |
+          ci/cleat-environment/test.sh
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.filter.outputs.run == 'true'
+        with:
+          name: cleat-environment-provenance
+          path: ${{ runner.temp }}/cleat-environment/*-provenance.txt
+          if-no-files-found: warn
+
   dag-scripts:
     name: DAG scripts
     runs-on: ubuntu-latest

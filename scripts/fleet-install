@@ -35,6 +35,7 @@ PLATFORM=""
 AUTH_HEADER_FILE=""
 WORK_DIR=""
 READ_ONLY=0
+CANARY_ONLY=0
 INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
@@ -854,6 +855,7 @@ activate_staged_generation() {
   [[ -d "$release" ]] || die "staged generation is missing: $generation"
   [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
   verify_installed_release "$release" "$release/.generation.json"
+  run_generation_canary "$generation"
   if [[ -n "$(current_generation)" ]]; then
     printf 'fleet-install: validating live stored records with candidate generation %s\n' "$generation"
     "$release/bin/flotilla" --socket "$DAEMON_SOCKET" resource validate --from-daemon \
@@ -912,6 +914,52 @@ require_handoff_lock() {
     || die 'installer activation handoff does not own the fleet-install mutation lock'
 }
 
+# Every consumer gates before activation, including Darwin consumers. The
+# dedicated stage-only command on feta never changes its active generation.
+run_generation_canary() {
+  local generation="$1"
+  if [[ "${FLEET_INSTALL_SKIP_CANARY:-0}" == 1 ]]; then
+    printf 'fleet-install: WARNING canary explicitly skipped (FLEET_INSTALL_SKIP_CANARY=1, set by --skip-canary or environment) for %s\n' "$generation" >&2
+    return
+  fi
+  local hostname
+  hostname="$(hostname -s)"
+  if [[ "$hostname" == feta ]]; then
+    local probe="$RELEASES_DIR/$generation/fleet-canary.py"
+    [[ -f "$probe" ]] || die "generation has no fleet canary: $probe"
+    python3 "$probe" "$RELEASES_DIR/$generation" \
+      || die "canary failed for $generation; inspect the canary log location above; no generation switched"
+  else
+    printf 'fleet-install: gating %s with canary on feta\n' "$generation"
+    # The fleet's installed bootstrap may predate --canary. Send this
+    # verified incoming installer and validator, then stage the Linux artifact
+    # through feta's own package credential. No remote is repointed or activated.
+    make_work_dir
+    local bootstrap="$WORK_DIR/canary-bootstrap"
+    mkdir -p "$bootstrap"
+    cp "${BASH_SOURCE[0]}" "$bootstrap/install.sh"
+    cp "$GENERATION_VALIDATOR" "$bootstrap/generation_validation.py"
+    tar -C "$bootstrap" -cf - install.sh generation_validation.py | \
+      ssh -o BatchMode=yes -T feta "set -eu; staging=\$(mktemp -d /tmp/fleet-canary-bootstrap.XXXXXX); trap 'rm -rf -- \"\$staging\"' EXIT; tar -xf - -C \"\$staging\"; bash \"\$staging/install.sh\" --canary $generation" \
+      || die "canary on feta failed for $generation; inspect its log location above; no generation switched"
+  fi
+}
+
+finish_staging() {
+  local generation="$1" rollback_generation="$2" confirmation_token="$3"
+  if ((CANARY_ONLY)); then
+    [[ "$(hostname -s)" == feta ]] || die '--canary must run on feta'
+    run_generation_canary "$generation"
+    printf 'fleet-install: generation %s staged (no activation)\n' "$generation"
+    return
+  fi
+  if [[ -n "$(current_generation)" ]]; then
+    handoff_activation "$generation" "$rollback_generation" "$confirmation_token"
+  else
+    activate_staged_generation "$generation" "$rollback_generation" "$confirmation_token"
+  fi
+}
+
 install_generation() {
   local generation="$1"
   require_generation "$generation"
@@ -941,14 +989,8 @@ PY
     local installed_outer="$WORK_DIR/installed-generation.json"
     require_generation_manifest "$generation" "$installed_outer"
     verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
-    if [[ -n "$old" ]]; then
-      handoff_activation "$generation" "$rollback_generation" "$confirmation_token"
-    else
-      # Fresh installs have no trusted installed generation to hand off from;
-      # the bootstrap installer completes their first activation itself.
-      activate_staged_generation "$generation" "$rollback_generation" "$confirmation_token"
-    fi
-    printf 'fleet-install: generation %s is installed\n' "$generation"
+    finish_staging "$generation" "$rollback_generation" "$confirmation_token"
+    ((CANARY_ONLY)) || printf 'fleet-install: generation %s is installed\n' "$generation"
     return
   fi
   make_work_dir
@@ -970,14 +1012,8 @@ PY
   extract_and_verify "$archive" "$unpack" "$outer"
   mv "$unpack/release" "$RELEASES_DIR/$generation"
   chmod -R a-w "$RELEASES_DIR/$generation"
-  if [[ -n "$old" ]]; then
-    handoff_activation "$generation" "$rollback_generation" "$confirmation_token"
-  else
-    # The bootstrap installer owns the fresh-install path; subsequent
-    # generations adopt their own installer through handoff_activation.
-    activate_staged_generation "$generation" "$rollback_generation" "$confirmation_token"
-  fi
-  printf 'fleet-install: generation %s is installed\n' "$generation"
+  finish_staging "$generation" "$rollback_generation" "$confirmation_token"
+  ((CANARY_ONLY)) || printf 'fleet-install: generation %s is installed\n' "$generation"
 }
 
 show_status() {
@@ -1046,11 +1082,24 @@ prune_after_confirmation() {
 }
 
 usage() {
-  echo 'usage: fleet-install status | latest | <generation> | rollback | --prune-dry-run | --prune' >&2
+  echo 'usage: fleet-install [--skip-canary] <latest|generation> | --canary <generation> | status | rollback | --prune-dry-run | --prune' >&2
   exit 2
 }
 
 main() {
+  if [[ "${1:-}" == --skip-canary ]]; then
+    [[ $# -eq 2 && "$2" != -* && "$2" != rollback && "$2" != status ]] || usage
+    export FLEET_INSTALL_SKIP_CANARY=1
+    shift
+  fi
+  if [[ "${1:-}" == --canary ]]; then
+    [[ $# -eq 2 ]] || usage
+    [[ "$(hostname -s)" == feta ]] || die '--canary must run on feta'
+    CANARY_ONLY=1
+    PLATFORM="$(host_platform)"
+    install_generation "$2"
+    return
+  fi
   if [[ "${1:-}" == __validate_fixture ]]; then
     [[ $# -eq 2 ]] || usage
     require_generation_validator

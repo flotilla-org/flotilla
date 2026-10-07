@@ -10,8 +10,19 @@ use flotilla_resources::{
 
 #[async_trait]
 pub trait DockerEnvironmentRuntime: Send + Sync {
+    async fn ensure_image(
+        &self,
+        _build: &ResourceObject<flotilla_resources::ImageBuild>,
+        _host: &str,
+    ) -> Result<Option<flotilla_resources::PlacedImageIdentity>, String> {
+        Ok(None)
+    }
     async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String>;
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String>;
+    /// Recover a Docker backing whose identity was never committed to status.
+    async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
+        self.cleanup(environment_ref).await
+    }
     async fn cleanup(&self, _environment_ref: &str) -> Result<(), String> {
         Ok(())
     }
@@ -111,6 +122,7 @@ where
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => {
                 if let Some(original) = &obj.spec.docker {
                     let mut spec = original.clone();
+                    let mut resolved_identity = None;
                     let mut progress = obj.status.as_ref().map(|status| status.image_build_refs.clone()).unwrap_or_default();
                     if let Some(composition) = &original.image_composition {
                         let Some(inputs) = &self.image_inputs else {
@@ -194,17 +206,28 @@ where
                             return waiting(format!("ImageBuild {} built; awaiting next composition stage", build.metadata.name));
                         }
                         let identity = status.identity.as_ref().ok_or_else(|| ResourceError::invalid("built image has no identity"))?;
-                        if build.spec.host_ref != spec.host_ref {
-                            return waiting(format!(
-                                "ImageBuild {} built on {}; awaiting digest transfer to {}",
-                                build.metadata.name, build.spec.host_ref, spec.host_ref
-                            ));
-                        }
-                        spec.image = identity.local_image_id.clone();
+                        let delivered = match self.docker.ensure_image(&build, &spec.host_ref).await {
+                            Ok(Some(delivered)) => delivered,
+                            Ok(None) if build.spec.host_ref == spec.host_ref => identity.clone(),
+                            Ok(None) => {
+                                return waiting(format!("ImageBuild {} awaiting digest transfer to {}", build.metadata.name, spec.host_ref))
+                            }
+                            Err(reason) => return waiting(format!("ImageBuild {} distribution waiting: {reason}", build.metadata.name)),
+                        };
+                        spec.image = delivered.local_image_id.clone();
+                        resolved_identity = Some(delivered);
                         spec.pull_policy = DockerImagePullPolicy::Never;
                     }
                     match self.docker.provision(&obj.metadata.name, &spec).await {
-                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Ok(mut provisioning) => {
+                            if let Some(identity) = resolved_identity {
+                                if provisioning.local_image_id != identity.local_image_id {
+                                    return Ok(EnvironmentPrepared::Failed("provisioned image differs from delivered digest".into()));
+                                }
+                                provisioning.registry_digest = identity.registry_digest;
+                            }
+                            Ok(EnvironmentPrepared::Ready(provisioning))
+                        }
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
@@ -258,6 +281,8 @@ where
         }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
             self.docker.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
+        } else if obj.spec.docker.is_some() {
+            self.docker.destroy_unrecorded(&obj.metadata.name).await.map_err(ResourceError::other)?;
         } else {
             self.docker.cleanup(&obj.metadata.name).await.map_err(ResourceError::other)?;
         }

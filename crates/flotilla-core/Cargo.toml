@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+cleat-environment-contract = []
 aws-lc-provider = ["flotilla-resources/aws-lc-provider"]
 replay = []
 skip-no-sandbox-tests = ["flotilla-resources/skip-no-sandbox-tests"]

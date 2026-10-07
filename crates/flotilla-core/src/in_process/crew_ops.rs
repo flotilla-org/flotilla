@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
-    CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef,
+    CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, change_request_address_with_forges, change_request_record_name,
@@ -58,6 +58,10 @@ use crate::{
 #[derive(bon::Builder)]
 pub(super) struct CrewService {
     resource_backend: ResourceBackend,
+    #[builder(default)]
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
+    #[builder(default)]
+    resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
     /// Serializes pending-brief state with its terminal-session delivery side effect.
     #[builder(default)]
@@ -128,7 +132,7 @@ fn turn_delivery_session_plan(
 
 #[async_trait]
 impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
-    async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+    async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
         self.crew.upgrade().ok_or_else(|| "daemon stopped before turn delivery".to_string())?.deliver_turn(request).await
     }
 
@@ -145,7 +149,7 @@ fn turn_hold_subject(
     convoy: &ResourceObject<ResourceConvoy>,
     firing_subject: Option<&flotilla_protocol::Subject>,
 ) -> Result<flotilla_protocol::Subject, String> {
-    let subject = if let Some(subject) = firing_subject {
+    let subject = if let Some(subject) = firing_subject.filter(|subject| subject.kind == flotilla_protocol::SubjectKind::ChangeRequest) {
         subject.clone()
     } else {
         let subjects = flotilla_resources::active_change_request_subjects(convoy)?;
@@ -304,23 +308,6 @@ pub(super) fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> Stri
     format!("[{}]\n\n{body}", crew_message_header(sender))
 }
 
-fn turn_delivery_text(request: &crate::leaf_engine::TurnDeliveryRequest, status: &flotilla_resources::ConvoyStatus) -> String {
-    if matches!(request.sender, CrewMessageSender::FlotillaNudge)
-        && status
-            .crew_work
-            .get(&request.vessel)
-            .and_then(|crew| crew.get(&request.role))
-            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Stalled)
-    {
-        "[flotilla · nudge · declared stall recorded]\n\nYour stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you."
-            .to_string()
-    } else {
-        frame_crew_message(&request.sender, &request.brief)
-    }
-}
-
-/// Fresh idle evidence is a boundary only when no submitted or queued turn
-/// still needs acknowledgement. Its timestamp need not postdate a new brief.
 fn terminal_at_turn_boundary(session: &ResourceObject<ResourceTerminalSession>, now: chrono::DateTime<chrono::Utc>) -> bool {
     session.status.as_ref().is_some_and(|status| {
         status.phase == ResourceTerminalSessionPhase::Running
@@ -438,6 +425,10 @@ async fn queue_crew_message_object(
 }
 
 impl CrewService {
+    pub(super) fn set_resource_intent_publisher(&self, publisher: Weak<dyn crate::leaf_engine::ResourceIntentPublisher>) {
+        *self.resource_intent_publisher.write().expect("resource intent publisher lock") = Some(publisher);
+    }
+
     pub(super) fn message_observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
         (self.leaf_subscriptions.change_request_stale_after(), self.leaf_subscriptions.issue_stale_after())
     }
@@ -2101,209 +2092,296 @@ impl CrewService {
         *self.remote_turn_delivery.write().expect("remote turn delivery lock") = Some(delivery);
     }
 
-    pub(super) async fn deliver_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+    pub(super) async fn deliver_turn(
+        &self,
+        request: &crate::leaf_engine::TurnDeliveryRequest,
+    ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+        use flotilla_resources::{MessageExpectation, MessageReference, MessageRelation, MessageSpec};
         let target = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(&request.namespace)
             .get(&request.convoy)
             .await
             .map_err(|error| error.to_string())?;
-        if matches!(target.provenance, ResourceProvenance::Replica { .. }) {
-            let delivery = self
-                .remote_turn_delivery
-                .read()
-                .expect("remote turn delivery lock")
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .ok_or_else(|| "remote turn delivery router unavailable".to_string())?;
-            return delivery.deliver(request).await;
-        }
-        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&request.namespace);
-        let session = sessions
-            .list_matching_labels(&BTreeMap::from([
-                (CONVOY_LABEL.to_string(), request.convoy.clone()),
-                (VESSEL_LABEL.to_string(), request.vessel.clone()),
-                (ROLE_LABEL.to_string(), request.role.clone()),
-            ]))
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .next();
-        let Some(session) = session else {
-            return self.queue_remote_supervisor_turn(request).await;
+        let convoy = &target.object;
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
+        let context = flotilla_resources::MessageAddressContext {
+            project: project.to_string(),
+            convoy: request.convoy.clone(),
+            vessel: request.vessel.clone(),
         };
-        let mut spec = session.spec.clone();
-        let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
-            return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
+        let receiver = flotilla_resources::qualify_message_address(&request.role, &context).map_err(|error| error.to_string())?;
+        let sender = match &request.sender {
+            CrewMessageSender::FlotillaTurn { .. } => "system:turn-rules".to_string(),
+            CrewMessageSender::FlotillaNudge => "system:nudge".to_string(),
+            CrewMessageSender::FlotillaEscalation { .. } => "system:stall-judge".to_string(),
+            CrewMessageSender::Unknown => "system:legacy".to_string(),
+            CrewMessageSender::OperatorResume { .. }
+            | CrewMessageSender::OperatorFollowUp { .. }
+            | CrewMessageSender::Governor { .. }
+            | CrewMessageSender::Bosun { .. }
+            | CrewMessageSender::Handoff { .. } => {
+                return Err("operator and crew senders require their declared message path".into());
+            }
         };
-        if let Some(head) = message {
-            head.prune_acknowledged(session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()));
-        }
-        let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
-        let previous_status = convoys
-            .get(&request.convoy)
-            .await
-            .map_err(|error| error.to_string())?
-            .status
-            .ok_or_else(|| format!("convoy `{}` has no status", request.convoy))?;
-        let delivery_message = TerminalCrewMessage {
-            id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
-            text: turn_delivery_text(request, &previous_status),
-            sender: request.sender.clone(),
-            delivery: CrewMessageDelivery::Queued,
-            acknowledged: Default::default(),
-            following: Vec::new(),
-        };
-        let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
-        if message.as_ref().is_some_and(|head| head.delivered_through(delivered_id, &delivery_message.id)) {
-            return Ok(match plan {
-                TurnDeliverySessionPlan::QueueWarm => TurnDeliveryRung::WarmSession,
-                TurnDeliverySessionPlan::QueueFresh | TurnDeliverySessionPlan::RestartFresh => TurnDeliveryRung::FreshAgent,
-            });
-        }
-        let reopened = apply_resource_status_patch(
-            &convoys,
-            &request.convoy,
-            &convoy_external_patches::resume_crew_work(
-                request.vessel.clone(),
-                request.role.clone(),
-                chrono::Utc::now(),
-                request.brief.clone(),
-                None,
-            ),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        self.reconcile_or_restore_crew_work(
-            &request.namespace,
-            &session.spec.env_ref,
-            &convoys,
-            &request.convoy,
-            previous_status.clone(),
-            &reopened,
-        )
-        .await?;
-        match plan {
-            TurnDeliverySessionPlan::QueueWarm | TurnDeliverySessionPlan::QueueFresh => {
-                if let Some(head) = message {
-                    head.append(delivery_message);
-                } else {
-                    *message = Some(delivery_message);
-                }
-            }
-            TurnDeliverySessionPlan::RestartFresh => {
-                if let Some(head) = message {
-                    head.append(delivery_message);
-                } else {
-                    *message = Some(delivery_message);
-                }
-                if let Some(head) = message {
-                    brief.content =
-                        head.mark_next_for_launch(delivered_id).ok_or_else(|| "turn delivery has no pending message".to_string())?;
-                    brief.artifact_digest = None;
-                }
-            }
-        }
-        if let Err(error) = sessions.update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec).await {
-            return Err(self
-                .restore_crew_work_after_delivery_failure(
-                    &convoys,
-                    &request.convoy,
-                    &reopened.metadata.resource_version,
-                    &previous_status,
-                    error.to_string(),
-                )
-                .await);
-        }
-        match plan {
-            TurnDeliverySessionPlan::QueueWarm => Ok(TurnDeliveryRung::WarmSession),
-            TurnDeliverySessionPlan::RestartFresh => {
-                if let Err(error) =
-                    apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting).await
-                {
-                    return Err(self
-                        .restore_crew_work_after_delivery_failure(
-                            &convoys,
-                            &request.convoy,
-                            &reopened.metadata.resource_version,
-                            &previous_status,
-                            error.to_string(),
-                        )
-                        .await);
-                }
-                Ok(TurnDeliveryRung::FreshAgent)
-            }
-            TurnDeliverySessionPlan::QueueFresh => Ok(TurnDeliveryRung::FreshAgent),
-        }
-    }
-
-    async fn queue_remote_supervisor_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
-        if !matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. } | CrewMessageSender::FlotillaNudge) {
-            return Err(format!("turn-delivery sender is not permitted for remote target {}/{}", request.vessel, request.role));
-        }
-        let selector = BTreeMap::from([
-            (CONVOY_LABEL.to_string(), request.convoy.clone()),
-            (VESSEL_LABEL.to_string(), request.vessel.clone()),
-            (ROLE_LABEL.to_string(), request.role.clone()),
-        ]);
-        let remote = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&request.namespace)
-            .list_matching_labels(&selector)
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .find(|session| matches!(session.provenance, ResourceProvenance::Replica { .. }));
-        if matches!(request.sender, CrewMessageSender::FlotillaNudge) && remote.is_none() {
-            return Err(format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role));
-        }
-        let plan = if let Some(remote) = remote {
-            if !matches!(remote.object.spec.source, TerminalSessionSource::Agent { .. }) {
-                return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
-            }
-            turn_delivery_session_plan(remote.object.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?
+        let relation = if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. }) {
+            MessageRelation::Supervisor
         } else {
-            // The placement host may not have published its new session yet.
-            // Keep the turn on the governor convoy and surface attention until
-            // an owning session confirms delivery.
-            TurnDeliverySessionPlan::QueueFresh
+            MessageRelation::System
         };
-        let convoy = self
-            .resource_backend
-            .clone()
-            .using::<ResourceConvoy>(&request.namespace)
-            .get(&request.convoy)
+        // Episode keys identify a workflow firing; Message revisions identify
+        // its observed subject. A merged episode is not a head SHA.
+        let subject = if let Some(subject) = &request.subject {
+            let number = subject.id.parse::<u64>().map_err(|_| "turn subject is not a numeric forge object".to_string())?;
+            Some(match subject.kind {
+                flotilla_protocol::SubjectKind::ChangeRequest => {
+                    if request.subject_revision.ends_with("@merged") {
+                        let name = change_request_record_name(&subject.source.service, &subject.source.scope, number);
+                        let record = self
+                            .resource_backend
+                            .including_replicas::<ResourceChangeRequest>(&request.namespace)
+                            .get(&name)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .object;
+                        record
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.head_sha.value.clone())
+                            .map(|head| MessageReference::ChangeRequest {
+                                service: subject.source.service.clone(),
+                                scope: subject.source.scope.clone(),
+                                number,
+                                revision: head,
+                            })
+                            .unwrap_or_else(|| MessageReference::ControlRecord {
+                                resource: ResourceRef::new("flotilla.work/v1", "ChangeRequest", &request.namespace, &name),
+                                revision: record.metadata.resource_version,
+                            })
+                    } else {
+                        MessageReference::ChangeRequest {
+                            service: subject.source.service.clone(),
+                            scope: subject.source.scope.clone(),
+                            number,
+                            revision: request.subject_revision.clone(),
+                        }
+                    }
+                }
+                flotilla_protocol::SubjectKind::Issue => MessageReference::Issue {
+                    service: subject.source.service.clone(),
+                    scope: subject.source.scope.clone(),
+                    number,
+                    revision: request
+                        .subject_revision
+                        .rsplit_once('@')
+                        .map_or(request.subject_revision.as_str(), |(_, revision)| revision)
+                        .to_string(),
+                },
+            })
+        } else {
+            None
+        };
+        let subject = if subject.is_none() && matches!(request.sender, CrewMessageSender::FlotillaTurn { .. }) {
+            let artifact = if let Some((head, digest)) = request.subject_revision.split_once('@') {
+                self.resource_backend
+                    .including_replicas::<flotilla_resources::Artifact>(&request.namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .into_iter()
+                    .find(|artifact| artifact.object.spec.digest == digest && artifact.object.spec.subject == head)
+            } else {
+                None
+            };
+            artifact
+                .map(|artifact| MessageReference::Artifact {
+                    resource: flotilla_protocol::ResourceRef::new(
+                        "flotilla.work/v1",
+                        "Artifact",
+                        &request.namespace,
+                        &artifact.object.metadata.name,
+                    ),
+                    revision: artifact.object.spec.digest,
+                })
+                .or_else(|| {
+                    Some(MessageReference::ControlRecord {
+                        resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", &request.namespace, &request.convoy),
+                        revision: request.subject_revision.clone(),
+                    })
+                })
+        } else {
+            subject
+        };
+        let expectation = if matches!(request.sender, CrewMessageSender::FlotillaNudge) {
+            MessageExpectation::Outcome {
+                condition: format!("work/{}/{} .crew.{}.phase == Done", request.convoy, request.vessel, request.role)
+                    .parse()
+                    .map_err(|error: String| error)?,
+            }
+        } else {
+            MessageExpectation::None
+        };
+        let body = match &request.sender {
+            CrewMessageSender::FlotillaEscalation { from } => format!("Escalated from {from}:\n\n{}", request.brief),
+            _ => request.brief.clone(),
+        };
+        let intent = MessageSpec::builder()
+            .sender(sender.clone())
+            .receiver(receiver.clone())
+            .relation(relation)
+            .body(body)
+            .references(subject.clone().into_iter().collect())
+            .maybe_subject(subject)
+            .expectation(expectation)
+            .build();
+        let name = flotilla_resources::message_record_name(
+            &receiver,
+            &sender,
+            &format!("turn-delivery:{}:{}", request.source, request.subject_revision),
+        );
+        let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
             .await
             .map_err(|error| error.to_string())?;
-        let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{}` has no status", request.convoy))?;
-        let message = TerminalCrewMessage {
-            id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
-            text: turn_delivery_text(request, status),
-            sender: request.sender.clone(),
-            delivery: CrewMessageDelivery::Queued,
-            acknowledged: Default::default(),
-            following: Vec::new(),
+        // This is the observed admission rung, not a transport or session receipt.
+        let rung = if holder
+            .as_ref()
+            .is_some_and(|holder| holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Running))
+        {
+            TurnDeliveryRung::WarmSession
+        } else {
+            TurnDeliveryRung::FreshAgent
         };
-        let turn = flotilla_resources::PendingSupervisorTurn {
-            vessel: request.vessel.clone(),
-            role: request.role.clone(),
-            message,
-            queued_order: 0,
+        match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
+            Ok(existing) if existing.object.spec == intent => {
+                return Ok(crate::leaf_engine::CrewTurnAdmission {
+                    new_turn: false,
+                    rung,
+                    message: existing
+                        .object
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.canonical_predecessor.clone())
+                        .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
+                })
+            }
+            Ok(_) => return Err("message producer ID already names different intent".into()),
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let records = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::Message>(&request.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(existing) = records.items.iter().find(|record| {
+            intent.supersedes.is_none()
+                && flotilla_resources::message_supersedes(&intent, &record.object)
+                && flotilla_resources::message_expectation_open(&record.object)
+        }) {
+            return Ok(crate::leaf_engine::CrewTurnAdmission {
+                new_turn: false,
+                rung,
+                message: ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &existing.object.metadata.name),
+            });
+        }
+        let mut activation = None;
+        let publication: Result<ResourceRef, String> = async {
+            // Workflow activation remains at the convoy authority and precedes
+            // publication, so a delivered turn has its staged work credentials.
+            if matches!(target.provenance, ResourceProvenance::Local) {
+                if let (Some(previous), Some(holder)) = (&convoy.status, &holder) {
+                    let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
+                    let reopened = apply_resource_status_patch(
+                        &convoys,
+                        &request.convoy,
+                        &convoy_external_patches::resume_crew_work(
+                            request.vessel.clone(),
+                            request.role.clone(),
+                            self.clock.now(),
+                            request.brief.clone(),
+                            Some(name.clone()),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    activation = Some((reopened.status.clone().expect("activated workflow"), previous.clone()));
+                    self.reconcile_resumed_work_credentials(&request.namespace, &holder.object.spec.env_ref).await?;
+                    if matches!(holder.provenance, ResourceProvenance::Local)
+                        && holder.object.status.as_ref().is_some_and(|status| {
+                            matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
+                        })
+                    {
+                        apply_resource_status_patch(
+                            &self.resource_backend.using::<ResourceTerminalSession>(&request.namespace),
+                            &holder.object.metadata.name,
+                            &TerminalSessionStatusPatch::MarkStarting,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
+            let message = if let Some(publisher) = publisher {
+                let document = serde_json::json!({
+                    "apiVersion": "flotilla.work/v1", "kind": "Message",
+                    "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
+                });
+                publisher.publish(&request.namespace, document).await?
+            } else {
+                if matches!(target.provenance, ResourceProvenance::Replica { .. })
+                    || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
+                {
+                    return Err("receiver-home resource mutation router unavailable".into());
+                }
+                let inbox = self
+                    .message_inboxes
+                    .lock()
+                    .await
+                    .entry(request.namespace.clone())
+                    .or_insert_with(|| {
+                        flotilla_resources::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
+                            self.leaf_subscriptions.change_request_stale_after(),
+                            self.leaf_subscriptions.issue_stale_after(),
+                        )
+                    })
+                    .clone();
+                let admission = inbox
+                    .accept(&InputMeta::builder().name(name.clone()).build(), &intent, self.clock.now())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let record = match admission {
+                    flotilla_resources::MessageAdmission::Accepted(record) => record,
+                    flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                };
+                ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
+            };
+            Ok(message)
+        }
+        .await;
+        let should_restore = match &publication {
+            Err(_) => true,
+            Ok(message) => message.name != name,
         };
-        apply_resource_status_patch(
-            &self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace),
-            &request.convoy,
-            &ConvoyStatusPatch::QueueSupervisorTurn { turn },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        Ok(match plan {
-            TurnDeliverySessionPlan::QueueWarm => TurnDeliveryRung::WarmSession,
-            TurnDeliverySessionPlan::QueueFresh | TurnDeliverySessionPlan::RestartFresh => TurnDeliveryRung::FreshAgent,
-        })
+        if should_restore {
+            if let Some((activated, previous)) = activation {
+                let patch =
+                    convoy_external_patches::restore_turn_activation(request.vessel.clone(), request.role.clone(), activated, previous);
+                if let Err(error) =
+                    apply_resource_status_patch(&self.resource_backend.using::<ResourceConvoy>(&request.namespace), &request.convoy, &patch)
+                        .await
+                {
+                    let cause = publication.as_ref().err().map_or("receiver suppression", String::as_str);
+                    return Err(format!("{cause}; could not restore turn activation: {error}"));
+                }
+            }
+        }
+        let message = publication?;
+        let new_turn = message.name == name;
+
+        Ok(crate::leaf_engine::CrewTurnAdmission { new_turn, rung, message })
     }
 
     async fn deliver_pending_supervisor_turn_for_session(

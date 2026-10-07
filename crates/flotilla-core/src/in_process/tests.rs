@@ -10,7 +10,7 @@ use flotilla_resources::{
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
     EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, Event, FulfilmentFacts,
     FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, ImageAcquisitionCost, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
     ProjectRepositorySpec, RepositoryStatus, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
@@ -765,55 +765,32 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         .subject_revision("stall-1".to_string())
         .sender(CrewMessageSender::FlotillaEscalation { from: "coder@work in graphql-budget@flotilla".to_string() })
         .build();
-    daemon.deliver_standing_turn(&request).await.expect("remote governor turn accepted");
-    let queued = convoys.get("governor-convoy").await.expect("governor convoy after turn");
-    assert_eq!(queued.status.as_ref().and_then(|status| status.attention.as_ref()), Some(&existing_attention));
-    assert!(queued
-        .status
-        .as_ref()
-        .is_some_and(|status| status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())));
-    placement
-        .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
-        .replace(&convoys.list().await.expect("home convoys"), Utc::now())
-        .await
-        .expect("replicate queued turn to placement host");
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("placement consumes turn");
-    let delivered = sessions.get("governor-terminal").await.expect("governor terminal after turn");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = delivered.spec.source else { panic!("governor turn queued") };
-    // #2592: remote turn delivery preserves the source convoy in the rendered header.
-    assert_eq!(
-        message.text,
-        "[flotilla · escalated from coder@work in graphql-budget@flotilla · supervise the stalled crew]\n\nSupervise the stalled crew"
-    );
-    let delivered = sessions.get("governor-terminal").await.expect("governor terminal for acknowledgment");
-    let mut delivered_status = delivered.status.expect("running terminal status");
-    delivered_status.delivered_message_id = Some(message.id);
-    sessions
-        .update_status("governor-terminal", &delivered.metadata.resource_version, &delivered_status)
-        .await
-        .expect("confirm governor delivery");
-    home.replica_writer::<ResourceTerminalSession>(NodeId::new("placement"), "flotilla")
-        .replace(&sessions.list().await.expect("confirmed placement terminals"), Utc::now())
-        .await
-        .expect("replicate delivery confirmation");
-    let bad_sessions = home.clone().using::<ResourceTerminalSession>("flotilla");
-    let bad = bad_sessions
-        .create(&InputMeta::builder().name("bad-local-terminal".to_string()).labels(session.metadata.labels.clone()).build(), &session.spec)
-        .await
-        .expect("failed local session");
-    bad_sessions
-        .update_status(&bad.metadata.name, &bad.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Failed,
-            ..Default::default()
-        })
-        .await
-        .expect("mark local session failed");
-    let error = daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect_err("failed session is reported");
-    assert!(error.contains("bad-local-terminal"));
-    let acknowledged = convoys.get("governor-convoy").await.expect("governor convoy after acknowledgment");
-    let status = acknowledged.status.expect("governor status");
-    assert!(!status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
-    assert_eq!(status.attention, Some(existing_attention));
+    // Boundary fake for publication to the owning host; receiver admission
+    // still runs through the real daemon's ordinary resource mutation handler.
+    struct PlacementPublisher(Arc<InProcessDaemon>);
+    #[async_trait]
+    impl crate::leaf_engine::ResourceIntentPublisher for PlacementPublisher {
+        async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
+            let admitted = self.0.apply_intent_document(namespace, document).await.map_err(|error| error.to_string())?;
+            Ok(flotilla_protocol::ResourceRef::new(
+                "flotilla.work/v1",
+                admitted.kind,
+                admitted.namespace,
+                admitted.value["metadata"]["name"].as_str().expect("admitted resource name"),
+            ))
+        }
+    }
+    let publisher: Arc<dyn crate::leaf_engine::ResourceIntentPublisher> = Arc::new(PlacementPublisher(placement_daemon));
+    daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
+    daemon.deliver_standing_turn(&request).await.expect("remote governor intent accepted");
+    let messages = placement.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver messages").items;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].spec.receiver, "flotilla/governor-convoy/govern/governor");
+    assert_eq!(messages[0].spec.relation, flotilla_resources::MessageRelation::Supervisor);
+    assert_eq!(messages[0].spec.body, "Escalated from coder@work in graphql-budget@flotilla:\n\nSupervise the stalled crew");
+    assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
+    assert!(home.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
+    assert_eq!(convoys.get("governor-convoy").await.expect("governor").status.expect("status").attention, Some(existing_attention));
 }
 
 #[test]
@@ -851,6 +828,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
             },
             free_slots: Some(1),
             host_ready: true,
+            image_cost: ImageAcquisitionCost::Held,
             sleeping_until: None,
         };
         let no_need = BTreeSet::new();
@@ -1206,9 +1184,21 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     }
     #[async_trait]
     impl crate::leaf_engine::TurnDeliveryActuator for AcceptSupervision {
-        async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<flotilla_resources::TurnDeliveryRung, String> {
+        async fn deliver(
+            &self,
+            request: &crate::leaf_engine::TurnDeliveryRequest,
+        ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
             self.requests.lock().expect("supervision requests").push(request.clone());
-            Ok(flotilla_resources::TurnDeliveryRung::WarmSession)
+            Ok(crate::leaf_engine::CrewTurnAdmission {
+                new_turn: true,
+                rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                message: flotilla_protocol::ResourceRef::new(
+                    "flotilla.work/v1",
+                    "Message",
+                    &request.namespace,
+                    format!("fake-{}", request.source),
+                ),
+            })
         }
         async fn hold(
             &self,
@@ -1559,7 +1549,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
 }
 
 #[tokio::test]
-async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() {
+async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1573,14 +1563,21 @@ async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() 
         .subject_revision("new-head".to_string())
         .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
         .build();
-    daemon.deliver_standing_turn(&request).await.expect_err("stale session write");
+    daemon.deliver_standing_turn(&request).await.expect("durable intent accepted after concurrent terminal edit");
     let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
-    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].spec.body, "continue");
+    let session = backend.using::<ResourceTerminalSession>("flotilla").get("resume-staging-session").await.expect("session");
+    assert!(matches!(&session.spec.source, TerminalSessionSource::Agent { brief, .. } if brief.content.ends_with(" (concurrent edit)")));
 }
 
+// A fresh turn is durable intent independent of the boot brief; it waits for
+// the replacement holder's readiness and transport acceptance evidence.
 #[tokio::test]
-async fn fresh_turn_replaces_the_old_brief_digest() {
+async fn fresh_turn_stores_intent_independently_of_boot_brief() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
@@ -1613,36 +1610,21 @@ async fn fresh_turn_replaces_the_old_brief_digest() {
     daemon.deliver_standing_turn(&request).await.expect("deliver fresh turn");
     let session = sessions.get("resume-staging-session").await.expect("updated session");
     let TerminalSessionSource::Agent { brief, message, .. } = session.spec.source else { panic!("agent session") };
-    assert_eq!(brief.content, "[flotilla · turn: review · reply by running `crew complete`]\n\nfresh turn");
-    assert_eq!(brief.artifact_digest, None);
-    assert_eq!(message.expect("fresh message record").sender, CrewMessageSender::FlotillaTurn { source: "review".to_string() });
+    assert!(brief.content.is_empty());
+    assert_eq!(brief.artifact_digest, Some("a".repeat(64)));
+    assert!(message.is_none());
+    let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].spec.body, "fresh turn");
+    assert_eq!(messages[0].spec.sender, "system:turn-rules");
+    assert_eq!(messages[0].spec.receiver, "flotilla/resume-staging/work/coder");
+    assert_eq!(session.status.expect("status").phase, ResourceTerminalSessionPhase::Starting);
 }
 
 #[tokio::test]
 async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
-    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.get("resume-staging-session").await.expect("session");
-    let mut spec = session.spec.clone();
-    let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent session") };
-    *message = Some(flotilla_resources::TerminalCrewMessage {
-        id: "turn-delivery:review:same-head".into(),
-        text: "previously delivered".into(),
-        sender: CrewMessageSender::FlotillaTurn { source: "review".into() },
-        delivery: flotilla_resources::CrewMessageDelivery::Queued,
-        acknowledged: Default::default(),
-        following: Vec::new(),
-    });
-    let session =
-        sessions.update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec).await.expect("stored turn");
-    sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Lost,
-            delivered_message_id: Some("turn-delivery:review:same-head".into()),
-            ..Default::default()
-        })
-        .await
-        .expect("lost after delivery");
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let request = crate::leaf_engine::TurnDeliveryRequest::builder()
         .namespace("flotilla".to_string())
         .convoy("resume-staging".to_string())
@@ -1653,11 +1635,36 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         .subject_revision("same-head".to_string())
         .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
         .build();
-    assert_eq!(daemon.deliver_standing_turn(&request).await.expect("duplicate is already delivered"), TurnDeliveryRung::FreshAgent);
-    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
+    daemon.deliver_standing_turn(&request).await.expect("first intent");
+    let messages = backend.using::<flotilla_resources::Message>("flotilla");
+    let message = messages.list().await.expect("messages").items.remove(0);
+    flotilla_resources::apply_status_patch(&messages, &message.metadata.name, &flotilla_resources::MessageStatusPatch::Delivered {
+        receiver: flotilla_resources::ResolvedMessageReceiver::builder()
+            .crew_id("crew".into())
+            .session("old-session".into())
+            .delivered_at(Utc::now())
+            .evidence("holder accepted input".into())
+            .build(),
+        at: Utc::now(),
+    })
+    .await
+    .expect("receipt");
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("resume-staging-session").await.expect("session");
-    assert_eq!(session.spec, spec);
-    assert_eq!(session.status.expect("status").phase, ResourceTerminalSessionPhase::Lost);
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Lost,
+            ..Default::default()
+        })
+        .await
+        .expect("lost after delivery");
+    assert_eq!(daemon.deliver_standing_turn(&request).await.expect("duplicate already accepted"), TurnDeliveryRung::FreshAgent);
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(messages.list().await.expect("messages").items.len(), 1);
+    assert_eq!(
+        sessions.get("resume-staging-session").await.expect("session").status.expect("status").phase,
+        ResourceTerminalSessionPhase::Lost
+    );
 }
 
 #[tokio::test]
@@ -1777,17 +1784,14 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         daemon.deliver_standing_turn(&request).await.expect("retry conflicting turn");
         let delivered = sessions.get("turn-credential-session").await.expect("delivered session");
         assert_eq!(*credentials.delivered.lock().await, BTreeSet::from(["github-crew-pr".to_string()]));
-        let TerminalSessionSource::Agent { brief, message, .. } = delivered.spec.source else { panic!("agent session expected") };
+        let TerminalSessionSource::Agent { message, .. } = delivered.spec.source else { panic!("agent session expected") };
+        assert!(message.is_none());
+        let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("accepted messages").items;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].spec.body, "rebase the PR");
+        assert_eq!(messages[0].status.as_ref().expect("status").phase, flotilla_resources::MessagePhase::Accepted);
         if phase == ResourceTerminalSessionPhase::Stopped {
-            assert_eq!(brief.content, "[flotilla · turn: conflicting · reply by running `crew complete`]\n\nrebase the PR");
-            assert_eq!(message.expect("fresh message record").sender, CrewMessageSender::FlotillaTurn {
-                source: "conflicting".to_string()
-            });
-        } else {
-            assert_eq!(
-                message.expect("queued message").text,
-                "[flotilla · turn: conflicting · reply by running `crew complete`]\n\nrebase the PR"
-            );
+            assert_eq!(delivered.status.expect("status").phase, ResourceTerminalSessionPhase::Starting);
         }
     }
 }
@@ -1841,17 +1845,32 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             assert!(message.is_none());
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
-            assert_eq!(message.expect("nudge").text, "[flotilla · nudge · reply by running `crew complete` or `crew stall`]\n\nFor coder@work in resume-staging (resource ref: resume-staging):\nYou owe a settlement claim for work/coder: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.");
+            assert!(message.is_none());
+            let messages = backend.using::<flotilla_resources::Message>("flotilla");
+            let nudge = messages.list().await.expect("nudges").items.remove(0);
+            assert!(nudge.spec.body.contains("You owe a settlement claim for work/coder"));
+            assert!(matches!(nudge.spec.expectation, flotilla_resources::MessageExpectation::Outcome { .. }));
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
             for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
-                let session = sessions.get("resume-staging-session").await.expect("session");
-                let mut spec = session.spec.clone();
-                let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
-                *message = None;
-                sessions
-                    .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
-                    .await
-                    .expect("consume nudge");
+                for nudge in messages.list().await.expect("nudges").items {
+                    if nudge.status.as_ref().is_some_and(|status| status.phase.is_waiting()) {
+                        flotilla_resources::apply_status_patch(
+                            &messages,
+                            &nudge.metadata.name,
+                            &flotilla_resources::MessageStatusPatch::Delivered {
+                                receiver: flotilla_resources::ResolvedMessageReceiver::builder()
+                                    .crew_id("crew".into())
+                                    .session("resume-staging-session".into())
+                                    .delivered_at(Utc::now())
+                                    .evidence("agent accepted nudge".into())
+                                    .build(),
+                                at: Utc::now(),
+                            },
+                        )
+                        .await
+                        .expect("consume nudge");
+                    }
+                }
                 let session = sessions.get("resume-staging-session").await.expect("session");
                 session_status.attention.as_mut().expect("attention").as_of = chrono::Utc::now() + chrono::Duration::seconds(offset);
                 sessions
@@ -3121,9 +3140,21 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>);
     #[async_trait]
     impl crate::leaf_engine::TurnDeliveryActuator for DeliveredTurns {
-        async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<flotilla_resources::TurnDeliveryRung, String> {
+        async fn deliver(
+            &self,
+            request: &crate::leaf_engine::TurnDeliveryRequest,
+        ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
             self.0.lock().expect("turns").push(request.clone());
-            Ok(flotilla_resources::TurnDeliveryRung::WarmSession)
+            Ok(crate::leaf_engine::CrewTurnAdmission {
+                new_turn: true,
+                rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                message: flotilla_protocol::ResourceRef::new(
+                    "flotilla.work/v1",
+                    "Message",
+                    &request.namespace,
+                    format!("fake-{}", request.source),
+                ),
+            })
         }
 
         async fn hold(&self, _: &crate::leaf_engine::TurnDeliveryRequest, _: &flotilla_resources::HoldAct, _: &str) -> Result<(), String> {
@@ -9771,7 +9802,7 @@ async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
     projects.apply(&test_meta("fleet"), &fleet).await.expect("fleet");
     backend
         .definitions::<FleetDesignation>("flotilla")
-        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into() })
+        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
         .await
         .expect("fleet designation");
     let mut project = projects.get("standing-project").await.expect("project");
@@ -10078,4 +10109,151 @@ async fn message_apply_retries_only_conflicts_with_a_finite_budget() {
     .await;
     assert!(result.is_err());
     assert_eq!(attempts, 1);
+}
+
+// Tracker boundary: deliberately suspend native forge observations so the board
+// scenario can prove interactive reads never wait for remote work.
+struct SuspendedBoardProvider {
+    calls: AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl IssueProvider for SuspendedBoardProvider {
+    fn supports(&self, _: &flotilla_protocol::IssueSource) -> bool {
+        true
+    }
+    async fn query(
+        &self,
+        _: &flotilla_protocol::IssueSource,
+        _: &flotilla_protocol::issue_query::IssueQuery,
+        _: u32,
+        _: usize,
+    ) -> Result<flotilla_protocol::issue_query::IssueResultPage, String> {
+        unreachable!("board uses native facts")
+    }
+    async fn fetch_by_id(&self, _: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
+        unreachable!("no per-issue fetch")
+    }
+    async fn list_changed_since(
+        &self,
+        _: &flotilla_protocol::IssueSource,
+        _: &str,
+        _: usize,
+    ) -> Result<flotilla_protocol::IssueChangeset, String> {
+        unreachable!("no incremental fetch")
+    }
+    async fn open_in_browser(&self, _: &flotilla_protocol::IssueRef) -> Result<(), String> {
+        unreachable!("no browser")
+    }
+    async fn dispatch_board(&self, source: &flotilla_protocol::IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.release.acquire().await.expect("release observation").forget();
+        Ok(super::dispatch_board::tests::board(source, 400))
+    }
+}
+
+// #2842: realistic Project status and 400 serving convoys must not turn a
+// board read into per-issue forge calls or wait on an unfinished bulk fetch.
+#[tokio::test]
+async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
+    use flotilla_resources::{DispatchQueueEntry, ProjectStatus};
+    let temp = tempfile::tempdir().expect("config");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-board-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "org/large".into() };
+    let provider = Arc::new(SuspendedBoardProvider { calls: AtomicUsize::new(0), release: tokio::sync::Semaphore::new(0) });
+    let projects = backend.using::<Project>("flotilla");
+    let mut binding = flotilla_resources::IssueSourceBindingSpec::from(source.clone());
+    binding.alias = Some("large".into());
+    let now = Utc::now();
+    for name in ["large", "shared"] {
+        projects
+            .create(
+                &test_meta(name),
+                &ProjectSpec::builder().display_name(name.to_string()).issue_source_bindings(vec![binding.clone()]).build(),
+            )
+            .await
+            .expect("project");
+        let project = projects.get(name).await.expect("current project");
+        projects
+            .update_status(name, &project.metadata.resource_version, &ProjectStatus {
+                dispatch_queue: (0..400)
+                    .map(|id| DispatchQueueEntry {
+                        issue: flotilla_protocol::IssueRef { source: source.clone(), id: id.to_string() },
+                        title: format!("Issue {id}"),
+                        issue_as_of: now,
+                        ready_observed_at: now,
+                        observed_at: now,
+                        provenance: "test".into(),
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .await
+            .expect("readiness projection");
+    }
+    for id in 0..400 {
+        backend
+            .using::<ResourceConvoy>("flotilla")
+            .create(
+                &test_meta(&format!("convoy-{id}")),
+                &ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("large".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+    }
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let cold = tokio::time::timeout(Duration::from_secs(1), daemon.dispatch_board_internal(Some("large")))
+        .await
+        .expect("interactive read must not wait for forge");
+    assert!(cold.expect_err("cold facts fail closed").contains("initial observation"));
+    // Background warming and another Project must share the same source flight.
+    assert!(daemon.refresh_dispatch_boards_internal().await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background fetch started");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    provider.release.add_permits(1);
+    let board = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(board) = daemon.dispatch_board_internal(Some("large")).await {
+                break board;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observation published");
+    assert_eq!(board.readiness.entries.len(), 400);
+    assert_eq!(board.repositories.len(), 1);
+    assert_eq!(board.repositories[0].issues.len(), 400);
+    assert_eq!(board.repositories[0].pull_requests.len(), 400);
+    assert_eq!(daemon.dispatch_board_internal(None).await.expect("shared board").readiness.entries.len(), 800);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    // A complete board never silently omits a selected cold source, while a
+    // healthy Project remains available independently of that other source.
+    let mut cold_binding = binding;
+    cold_binding.source.scope = "org/cold".into();
+    cold_binding.alias = Some("cold".into());
+    projects
+        .create(
+            &test_meta("cold"),
+            &ProjectSpec::builder().display_name("Cold".to_string()).issue_source_bindings(vec![cold_binding]).build(),
+        )
+        .await
+        .expect("cold project");
+    assert!(daemon.dispatch_board_internal(None).await.expect_err("complete source board").contains("initial observation"));
+    assert_eq!(daemon.dispatch_board_internal(Some("large")).await.expect("healthy project").repositories[0].issues.len(), 400);
 }

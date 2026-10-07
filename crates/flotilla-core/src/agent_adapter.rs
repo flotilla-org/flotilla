@@ -16,6 +16,8 @@ use crate::{
     providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
 };
 
+mod fleet_canary;
+
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
 pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
 const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/crew.md");
@@ -1130,6 +1132,9 @@ pub struct AgentAdapterRegistry {
 impl AgentAdapterRegistry {
     pub fn discover(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Self {
         let mut registry = Self::default();
+        if env.find_env_var("FLOTILLA_FLEET_CANARY") == Some("1") {
+            registry.insert(Arc::new(fleet_canary::FleetCanaryAdapter));
+        }
         if let Some(binary) = env.find_binary("claude") {
             let state_path = env.find_env_var("CLAUDE_CONFIG_DIR").map(|config_dir| PathBuf::from(config_dir).join(".claude.json"));
             let state_lock = Arc::new(Mutex::new(()));

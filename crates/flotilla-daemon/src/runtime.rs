@@ -839,7 +839,24 @@ impl DaemonRuntime {
                     Arc::clone(&runner),
                     GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
                 ));
+                let distributor = Arc::new(
+                    crate::image_distribution::ImageDistributor::builder()
+                        .io(Arc::new(
+                            crate::image_distribution::DockerImageIo::builder()
+                                .runner(Arc::clone(&runner))
+                                .credentials(Arc::clone(&credential_store))
+                                .daemon(Arc::downgrade(&daemon))
+                                .host(profile.host_id.clone())
+                                .namespace(options.namespace.clone())
+                                .build(),
+                        ))
+                        .backend(daemon.resource_backend())
+                        .namespace(options.namespace.clone())
+                        .host(profile.host_id.clone())
+                        .build(),
+                );
                 Arc::new(crate::image_build::BuildxRunner {
+                    distributor: Some(distributor),
                     runner,
                     vcs,
                     directory,
@@ -979,6 +996,21 @@ impl StartupRestoration {
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
+        // Warm all board sources independently of readiness reconciliation and
+        // interactive request cancellation. Reads schedule coalesced refreshes.
+        let board_daemon = Arc::clone(daemon);
+        controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
+            options.controller_resync_interval,
+            PeriodicTaskStart::Immediate,
+            move || {
+                let daemon = Arc::clone(&board_daemon);
+                async move {
+                    if let Err(error) = daemon.refresh_dispatch_boards_internal().await {
+                        tracing::debug!(%error, "dispatch board observation unavailable");
+                    }
+                }
+            },
+        )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
             Arc::clone(daemon),
             options.namespace.clone(),
@@ -998,6 +1030,7 @@ impl StartupRestoration {
             options.namespace.clone(),
             options.controller_resync_interval,
         )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_environment_orphan_sweep_task(Arc::clone(state))));
         controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(
             Arc::clone(state),
             options.namespace.clone(),
@@ -1506,6 +1539,7 @@ struct ControllerRuntimeState {
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     blob_store: Option<Arc<TieredBlobStore>>,
     image_build_runner: Option<Arc<crate::image_build::BuildxRunner>>,
+    image_distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::DockerImageIo>>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
     /// A fresh provider listing is still required for each absence judgement.
@@ -1643,6 +1677,7 @@ impl ControllerRuntimeState {
             agent_material: None,
             blob_store: None,
             image_build_runner: None,
+            image_distributor: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
@@ -1716,6 +1751,7 @@ impl ControllerRuntimeState {
     }
 
     fn with_image_build_runner(mut self, runner: Arc<crate::image_build::BuildxRunner>) -> Self {
+        self.image_distributor = runner.distributor.clone();
         self.image_build_runner = Some(runner);
         self
     }
@@ -3675,6 +3711,31 @@ fn spawn_provisioned_environment_reconciliation_task(
     })
 }
 
+fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeState>) -> JoinHandle<()> {
+    use crate::environment_orphans::{EnvironmentOrphanSweep, ORPHAN_SWEEP_INTERVAL};
+
+    // Called only after StartupRestoration has completed. A retry of restoration
+    // creates a new sweep, so neither startup nor daemon restarts inherit grace.
+    let mut sweep = EnvironmentOrphanSweep::default();
+    sweep.mark_ready();
+    let sweep = Arc::new(Mutex::new(sweep));
+    spawn_periodic_task(ORPHAN_SWEEP_INTERVAL, PeriodicTaskStart::AfterInterval, move || {
+        let state = Arc::clone(&state);
+        let sweep = Arc::clone(&sweep);
+        async move {
+            let Some((_, provider)) = state.local_registry.environment_providers.get("docker") else {
+                return;
+            };
+            let runtime = DockerControllerRuntime { state: Arc::clone(&state) };
+            if let Err(error) =
+                sweep.lock().await.sweep(&state.daemon.resource_backend(), &**provider, &runtime, tokio::time::Instant::now()).await
+            {
+                warn!(%error, host = %state.local_host_ref, "orphan environment sweep failed; will retry");
+            }
+        }
+    })
+}
+
 /// Keeps every live Codex crew's read-only `auth.json` copy current with the
 /// central login this host refreshes.
 ///
@@ -4590,6 +4651,18 @@ fn spawn_controller_loops(
             }
         }),
     ];
+    if let Some(distributor) = &state.image_distributor {
+        let distributor = Arc::clone(distributor);
+        controllers.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(reason) = distributor.refresh().await {
+                    tracing::warn!(%reason, "image availability refresh failed");
+                }
+            }
+        }));
+    }
     if let Some(runner) = &state.image_build_runner {
         let projection_backend = backend.clone();
         let projection_namespace = namespace_string.clone();
@@ -4722,6 +4795,18 @@ impl EnvironmentToolContext for DockerToolContext<'_> {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
+    async fn ensure_image(
+        &self,
+        build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
+        host: &str,
+    ) -> Result<Option<flotilla_resources::PlacedImageIdentity>, String> {
+        if host != self.state.local_host_ref {
+            return Err("image distribution target is not the local daemon host".into());
+        }
+        let distributor = self.state.image_distributor.as_ref().ok_or("image distributor unavailable")?;
+        distributor.request(build).await
+    }
+
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
         let tools = self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?;
@@ -5153,17 +5238,51 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 provider.destroy(container_id).await?;
             }
         }
+        // Recovery addresses Docker by full immutable ID, while adopted handles
+        // may still be indexed by container name. Remove the requested map key above,
+        // then retire any other cached handle whose Environment ID matches.
+        self.state.provisioned_environments.lock().await.retain(|_, active| active.handle.id().as_str() != environment_ref);
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         self.cleanup(environment_ref).await
     }
 
+    async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
+        let (_, provider) = self
+            .state
+            .local_registry
+            .environment_providers
+            .get("docker")
+            .ok_or("docker environment provider unavailable during backing recovery")?;
+        // The record may predate status persistence, or the daemon may have
+        // restarted after Docker creation. Mutable mount labels are irrelevant.
+        for backing in provider.list_backings().await? {
+            if backing.environment_id.as_str() == environment_ref {
+                self.destroy(environment_ref, &backing.container_id).await?;
+            }
+        }
+        self.cleanup(environment_ref).await
+    }
+
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
+        let mut components = Path::new(environment_ref).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
+            // Resource names are not globally constrained to DNS labels. Legacy or
+            // malformed identities must not escape the state root or wedge deletion.
+            warn!(environment = environment_ref, "skipping environment state cleanup: identity must name one state directory");
+            return Ok(());
+        }
         let mut cleanup_errors =
             forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
         if let Some(registry) = self.state.agent_material.as_deref() {
             if let Err(error) = registry.remove_environment_home(environment_ref).await {
                 cleanup_errors.push(error);
             }
+        }
+        let cleat_state = self.state.config.state_dir().as_path().join("contained-cleat").join(environment_ref);
+        match tokio::fs::remove_dir_all(&cleat_state).await {
+            Ok(()) => info!(environment = environment_ref, path = %cleat_state.display(), "removed contained-cleat environment state"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => cleanup_errors.push(format!("remove contained-cleat state {}: {error}", cleat_state.display())),
         }
         if !cleanup_errors.is_empty() {
             return Err(cleanup_errors.join("; "));
@@ -9206,8 +9325,13 @@ mod tests {
             Ok(self.handles.clone())
         }
 
-        async fn destroy(&self, _container_id: &str) -> Result<(), String> {
-            Err("not used".to_string())
+        async fn destroy(&self, container_id: &str) -> Result<(), String> {
+            let handle = self
+                .handles
+                .iter()
+                .find(|handle| handle.container_name() == Some(container_id))
+                .ok_or_else(|| format!("container {container_id} not found"))?;
+            handle.destroy().await
         }
     }
 
@@ -10196,13 +10320,96 @@ mod tests {
             .with_agent_material(agent_material),
         );
 
-        DockerControllerRuntime { state }
+        let cleat_state = state.config.state_dir().as_path().join("contained-cleat/contained-restarted");
+        fs::create_dir_all(&cleat_state).expect("contained-cleat state");
+        fs::write(cleat_state.join("session"), "durable session").expect("session state");
+        let outside_state = state.config.state_dir().as_path().join("keep");
+        fs::create_dir_all(&outside_state).expect("unrelated state");
+        fs::write(outside_state.join("sentinel"), "keep").expect("sentinel");
+        let runtime = DockerControllerRuntime { state };
+        for invalid in ["../keep", "..", "/", ""] {
+            runtime.cleanup(invalid).await.expect("unsafe names must not wedge finalization");
+        }
+        assert!(outside_state.join("sentinel").exists(), "unsafe cleanup must preserve unrelated state");
+        runtime
             .destroy("contained-restarted", "test-interior")
             .await
             .expect("restart teardown should rediscover and destroy the container");
 
         assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
         assert!(!environment_home.exists(), "durable environment teardown must remove its persistent agent home");
+        assert!(!cleat_state.exists(), "durable teardown must remove contained-cleat state too");
+    }
+
+    // #2840: a restart can lose the container status after Docker creation.
+    // Finalization must rediscover the backing rather than deleting only local files.
+    #[tokio::test]
+    async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"orphan-status-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("dinghy"),
+        )
+        .await;
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("env-lost-status"),
+            image: ImageId::new("image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::new(),
+            destroyed: Arc::clone(&destroyed),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.environment_providers.insert(
+            "docker",
+            flotilla_core::providers::discovery::ProviderDescriptor::named(
+                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "docker",
+            ),
+            Arc::new(AdoptionEnvironmentProvider { handles: vec![Arc::clone(&handle)] }),
+        );
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(registry),
+            None,
+            "host-test".into(),
+            None,
+            "host-direct-host-test".into(),
+        ));
+        // Restart discarded both status identity and the in-process handle cache.
+        assert!(state.provisioned_environments.lock().await.is_empty());
+        let backend = state.daemon.resource_backend();
+        let environment = backend
+            .using::<Environment>(NAMESPACE)
+            .create(&empty_meta("env-lost-status"), &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref: "host-test".into(),
+                    image: "image".into(),
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            })
+            .await
+            .expect("environment without saved status");
+        EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, NAMESPACE)
+            .run_finalizer(&environment)
+            .await
+            .expect("finalize without status");
+        assert!(destroyed.load(Ordering::SeqCst), "missing status must not leave the backing container running");
     }
 
     #[tokio::test]

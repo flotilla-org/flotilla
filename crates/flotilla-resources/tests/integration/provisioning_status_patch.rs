@@ -10,7 +10,10 @@ use flotilla_resources::{
 
 #[test]
 fn host_status_patch_updates_heartbeat_snapshot() {
+    // #2729: heartbeat cannot overwrite the image inventory's independent observation.
     let mut status = HostStatus::default();
+    let inventory = serde_json::json!([format!("sha256:{}", "3".repeat(64))]);
+    status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), inventory.clone());
     let observed_at = Utc.with_ymd_and_hms(2026, 8, 3, 12, 40, 0).single().expect("valid timestamp");
     HostStatusPatch::Heartbeat {
         description: None,
@@ -31,6 +34,7 @@ fn host_status_patch_updates_heartbeat_snapshot() {
     .apply(&mut status);
 
     assert_eq!(status.capabilities.get("docker"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(status.capabilities.get(flotilla_resources::IMAGE_DIGESTS_CAPABILITY), Some(&inventory));
     assert!(status.heartbeat_at.is_some());
     assert!(status.ready);
     // Heartbeat telemetry is in bytes and persists on the host status.

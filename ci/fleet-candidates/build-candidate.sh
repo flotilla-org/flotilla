@@ -199,6 +199,9 @@ else
 fi
 
 cp "$flotilla_root/scripts/fleet-install" "$bundle/install.sh"
+cp "$flotilla_root/scripts/fleet-canary.py" "$bundle/fleet-canary.py"
+cp "$flotilla_root/scripts/fleet-canary-agent.sh" "$bundle/fleet-canary-agent.sh"
+cp "$flotilla_root/.flotilla/crew-image-baseline.yaml" "$bundle/crew-image-baseline.yaml"
 cp "$flotilla_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
 chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
 

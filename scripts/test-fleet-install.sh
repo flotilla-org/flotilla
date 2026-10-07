@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# This suite covers installation; the separate canary suite covers its gate.
+export FLEET_INSTALL_SKIP_CANARY=1
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 installer="$repo_root/scripts/fleet-install"
@@ -1177,4 +1179,5 @@ with tempfile.TemporaryDirectory() as root:
     assert not (destination / "lib" / "obsolete").exists()
 PYTHON
 
+"$repo_root/scripts/test-fleet-canary.sh"
 echo 'fleet-install contract passed'

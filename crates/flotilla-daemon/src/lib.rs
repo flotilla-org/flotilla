@@ -10,6 +10,7 @@ mod charter_delegation;
 mod codex_central;
 mod credential;
 mod dispatch_reconciler;
+mod environment_orphans;
 mod environment_tools;
 mod event_relay;
 mod fulfilment_probe;
@@ -30,3 +31,5 @@ pub mod server;
 pub mod supervisor;
 
 pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path";
+
+mod image_distribution;

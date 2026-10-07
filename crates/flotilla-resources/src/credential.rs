@@ -15,7 +15,31 @@ pub const CREDENTIAL_PERMISSIONS_ENV: &str = "FLOTILLA_CREDENTIAL_PERMISSIONS";
 pub const CREDENTIAL_PERMISSIONS_SESSION_TAG: &str = "flotilla-credential-permissions";
 
 define_resource!(CredentialSpec, "credentialspecs", CredentialSpecSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
-define_resource!(CredentialGrant, "credentialgrants", CredentialGrantSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialGrant;
+impl crate::Resource for CredentialGrant {
+    type Spec = CredentialGrantSpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+    const API_PATHS: crate::ApiPaths =
+        crate::ApiPaths { group: "flotilla.work", version: "v1", plural: "credentialgrants", kind: "CredentialGrant" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
+    fn validate_spec(_meta: &crate::InputMeta, spec: &Self::Spec) -> Result<(), crate::ResourceError> {
+        let selector = &spec.selector;
+        if selector.host_action.is_some()
+            && (!selector.projects.is_empty()
+                || !selector.repositories.is_empty()
+                || !selector.roles.is_empty()
+                || selector.repository_trust.is_some())
+        {
+            return Err(crate::ResourceError::invalid("host-action and work credential selectors are mutually exclusive"));
+        }
+        if selector.host_action.is_some() && !spec.landing_credentials.is_empty() {
+            return Err(crate::ResourceError::invalid("host-action grants cannot contain landing credentials"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CredentialSpecSpec {
@@ -298,6 +322,9 @@ pub enum LandingCredentialScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialGrantSelector {
+    /// Host actions never match work. ADR 0047: retain this default for one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_action: Option<HostActionSelector>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub projects: BTreeSet<String>,
@@ -318,10 +345,48 @@ pub enum RepositoryTrust {
     Fork,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostImageAction {
+    ImagePull,
+    ImagePush,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+pub struct HostActionSelector {
+    pub action: HostImageAction,
+    /// Empty selects all eligible hosts; push additionally requires declared build capacity.
+    #[builder(default)]
+    #[serde(default)]
+    pub hosts: BTreeSet<String>,
+}
+
 impl CredentialGrantSelector {
+    pub fn matches_host_action(&self, host: &str, action: HostImageAction, declared_builder: bool) -> bool {
+        self.projects.is_empty()
+            && self.repositories.is_empty()
+            && self.roles.is_empty()
+            && self.repository_trust.is_none()
+            && self.host_action.as_ref().is_some_and(|selector| {
+                selector.action == action
+                    && (selector.hosts.is_empty() || selector.hosts.contains(host))
+                    && (action != HostImageAction::ImagePush || declared_builder)
+            })
+    }
+
     /// Whether both selectors can match the same work, independent of installed workflows.
     /// Repository selectors are existential, so disjoint sets can match a multi-repository vessel.
     pub fn overlaps(&self, other: &Self) -> bool {
+        if self.host_action.is_some() || other.host_action.is_some() {
+            return match (&self.host_action, &other.host_action) {
+                (Some(left), Some(right)) => {
+                    left.action == right.action
+                        && (left.hosts.is_empty() || right.hosts.is_empty() || !left.hosts.is_disjoint(&right.hosts))
+                }
+                _ => false,
+            };
+        }
         fn compatible<T: Ord>(left: &BTreeSet<T>, right: &BTreeSet<T>) -> bool {
             left.is_empty() || right.is_empty() || !left.is_disjoint(right)
         }
@@ -378,7 +443,8 @@ impl CredentialGrantSelector {
     }
 
     pub fn matches(&self, project: Option<&str>, repositories: &BTreeMap<RepositoryKey, RepositoryTrust>, role: &str) -> bool {
-        (self.projects.is_empty() || project.is_some_and(|project| self.projects.contains(project)))
+        self.host_action.is_none()
+            && (self.projects.is_empty() || project.is_some_and(|project| self.projects.contains(project)))
             && (self.roles.is_empty() || self.roles.contains(role))
             && (self.repositories.is_empty() || self.repositories.iter().any(|repository| repositories.contains_key(repository)))
             && self.repository_trust.is_none_or(|trust| {
@@ -614,5 +680,43 @@ mod tests {
         .expect("serialize declaration");
         assert!(!encoded.contains("secret-material"));
         assert!(!encoded.contains("\"material\""));
+    }
+}
+
+#[cfg(test)]
+mod host_action_tests {
+    use super::*;
+
+    // #2729: host actions cannot leak to crews. Generate both actions, explicit
+    // and wildcard host sets, builder/vessel hosts, and wrong host identities.
+    #[hegel::test]
+    fn host_grants_are_disjoint_from_work(tc: hegel::TestCase) {
+        let push = tc.draw(hegel::generators::booleans());
+        let builder = tc.draw(hegel::generators::booleans());
+        let wildcard = tc.draw(hegel::generators::booleans());
+        let matching_host = tc.draw(hegel::generators::booleans());
+        let action = if push { HostImageAction::ImagePush } else { HostImageAction::ImagePull };
+        let selector = CredentialGrantSelector::builder()
+            .host_action(
+                HostActionSelector::builder()
+                    .action(action)
+                    .hosts(if wildcard { BTreeSet::new() } else { BTreeSet::from(["builder".into()]) })
+                    .build(),
+            )
+            .build();
+        let host = if matching_host { "builder" } else { "other" };
+        assert_eq!(selector.matches_host_action(host, action, builder), (wildcard || matching_host) && (!push || builder));
+        assert!(!selector.matches(Some("fleet"), &BTreeMap::new(), "coder"));
+        assert!(!selector.overlaps(&CredentialGrantSelector::builder().build()));
+        let other = if push { HostImageAction::ImagePull } else { HostImageAction::ImagePush };
+        assert!(!selector.matches_host_action(host, other, true));
+    }
+
+    // Previous-generation work grants omit host_action and retain their behavior.
+    #[test]
+    fn old_work_selector_decodes_without_host_actions() {
+        let selector: CredentialGrantSelector = serde_json::from_str("{}").expect("old selector");
+        assert!(selector.matches(None, &BTreeMap::new(), "coder"));
+        assert!(!selector.matches_host_action("builder", HostImageAction::ImagePush, true));
     }
 }

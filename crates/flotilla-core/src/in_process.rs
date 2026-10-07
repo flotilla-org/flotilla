@@ -730,6 +730,7 @@ fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
     EnvironmentId::new(format!("static-ssh-{suffix}"))
 }
 
+mod dispatch_board;
 mod read_projections;
 #[cfg(test)]
 mod repository_lifecycle_tests;
@@ -1362,6 +1363,8 @@ impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
 }
 
 pub struct InProcessDaemon {
+    image_transfer_slots: Arc<tokio::sync::Semaphore>,
+    image_peer_sockets: RwLock<BTreeMap<String, PathBuf>>,
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_source: Arc<BroadcastEventSink>,
@@ -1380,6 +1383,7 @@ pub struct InProcessDaemon {
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
     issue_query_port: Arc<dyn IssueQueryPort>,
+    dispatch_board_cache: dispatch_board::DispatchBoardCache,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_providers: Arc<CheckoutProviders>,
     repository_providers: Mutex<HashMap<(String, RepositoryKey), Arc<repository_operations::RepositoryProviderLease>>>,
@@ -1398,7 +1402,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
-    message_inboxes: Mutex<HashMap<String, flotilla_resources::MessageInbox>>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
     clock: Arc<dyn Clock>,
     regard_lifecycle: Arc<RegardLifecycle>,
     observed_resource_backend: ResourceBackend,
@@ -1835,8 +1839,10 @@ impl InProcessDaemon {
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .build(),
         );
+        let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let crew_ops = Arc::new(
             CrewService::builder()
+                .message_inboxes(Arc::clone(&message_inboxes))
                 .resource_backend(resource_backend.clone())
                 .leaf_subscriptions(leaf_subscriptions.clone())
                 .clock(Arc::clone(&clock))
@@ -1850,6 +1856,7 @@ impl InProcessDaemon {
                 .build(),
         );
         let daemon = Arc::new_cyclic(|self_weak| Self {
+            dispatch_board_cache: dispatch_board::DispatchBoardCache::default(),
             repos: Arc::clone(&repos),
             repo_order: RwLock::new(order),
             event_source,
@@ -1874,6 +1881,8 @@ impl InProcessDaemon {
             repository_providers: Mutex::new(HashMap::new()),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
+            image_transfer_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            image_peer_sockets: RwLock::new(BTreeMap::new()),
             convoy_admission: ConvoyAdmission::builder()
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
@@ -1904,7 +1913,7 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             resource_backend: resource_backend.clone(),
-            message_inboxes: Mutex::new(HashMap::new()),
+            message_inboxes,
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
@@ -2706,6 +2715,21 @@ impl InProcessDaemon {
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
         self.aggregator_projection_state.clone()
+    }
+
+    /// Resource mesh routes are owned by each authenticated replication generation.
+    /// Bound archive exports and relays together; refuse overload instead of
+    /// queuing unbounded requests holding sockets and temporary archives.
+    pub fn try_image_transfer(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        Arc::clone(&self.image_transfer_slots).try_acquire_owned().map_err(|_| "image transfer capacity exhausted".into())
+    }
+
+    pub async fn set_image_peer_socket(&self, peer: &str, path: PathBuf) {
+        self.image_peer_sockets.write().await.insert(peer.into(), path);
+    }
+
+    pub async fn image_peer_routes(&self) -> Vec<(String, PathBuf)> {
+        self.image_peer_sockets.read().await.iter().map(|(peer, path)| (peer.clone(), path.clone())).collect()
     }
 
     pub async fn set_image_build_input_resolver(&self, resolver: Arc<dyn crate::image_build::ImageBuildInputResolver>) {
@@ -4912,21 +4936,58 @@ impl InProcessDaemon {
 
     pub async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
         let readiness = self.dispatch_queue_internal(project_filter).await?;
+        let repositories = self.dispatch_board_repositories(project_filter).await?;
+        Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
+    }
+
+    /// Schedule tracker observations without waiting for the forge or coupling
+    /// board freshness to the availability of dispatch readiness evidence.
+    pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
+        self.dispatch_board_repositories(None).await.map(|_| ())
+    }
+
+    async fn dispatch_board_repositories(
+        &self,
+        project_filter: Option<&str>,
+    ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut sources = std::collections::BTreeSet::new();
+        let mut errors = Vec::new();
         for project in projects {
             if project_filter.is_some_and(|name| name != project.metadata.name) {
                 continue;
             }
             let scope = flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name);
-            sources.extend(self.resolve_issue_source_bindings(&scope).await?.into_iter().map(|binding| binding.source));
+            match self.resolve_issue_source_bindings(&scope).await {
+                Ok(bindings) => sources.extend(bindings.into_iter().map(|binding| binding.source)),
+                Err(error) => errors.push(error),
+            }
+        }
+        if project_filter.is_none() && errors.is_empty() {
+            self.dispatch_board_cache.retain_sources(&sources).await;
         }
         let mut repositories = Vec::new();
         for source in sources {
-            repositories.push(self.issue_provider_for_source(&source).await?.dispatch_board(&source).await?);
+            let daemon = self.self_weak.clone();
+            let tracker_source = source.clone();
+            match self
+                .dispatch_board_cache
+                .read(&source, move || async move {
+                    let daemon = daemon.upgrade().ok_or("daemon stopped")?;
+                    daemon.issue_provider_for_source(&tracker_source).await?.dispatch_board(&tracker_source).await
+                })
+                .await
+            {
+                Ok(board) => repositories.push(board),
+                Err(error) => errors.push(error),
+            }
         }
-        Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
+        if errors.is_empty() {
+            Ok(repositories)
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {
@@ -5364,12 +5425,16 @@ impl InProcessDaemon {
         self.crew_ops.reconcile_crew_stalls_once(namespace).await
     }
 
+    pub fn set_resource_intent_publisher(&self, publisher: Weak<dyn crate::leaf_engine::ResourceIntentPublisher>) {
+        self.crew_ops.set_resource_intent_publisher(publisher);
+    }
+
     pub fn set_remote_turn_delivery(&self, delivery: Weak<dyn crate::leaf_engine::RemoteTurnDelivery>) {
         self.crew_ops.set_remote_turn_delivery(delivery)
     }
 
     pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
-        self.crew_ops.deliver_turn(request).await
+        self.crew_ops.deliver_turn(request).await.map(|admission| admission.rung)
     }
 
     pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {

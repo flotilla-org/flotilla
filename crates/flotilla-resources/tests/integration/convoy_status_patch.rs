@@ -1358,3 +1358,56 @@ fn refusal_causes_survive_status_patch_and_storage(tc: hegel::TestCase) {
     let restored: ConvoyStatus = serde_json::from_str(&stored).expect("deserialize status");
     assert_eq!(restored.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes, causes);
 }
+
+// A failed or suppressed producer restores only its own speculative activation;
+// concurrent target changes, other crews and aggregate work remain authoritative.
+#[hegel::test]
+fn turn_activation_restoration_preserves_concurrent_status(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let phase =
+        [CrewWorkPhase::Done, CrewWorkPhase::Stalled, CrewWorkPhase::Pending][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
+    let target_changed = tc.draw(gs::booleans());
+    let other_changed = tc.draw(gs::booleans());
+    let work_changed = tc.draw(gs::booleans());
+    let previous = ConvoyStatus {
+        phase: ConvoyPhase::Landing,
+        work: BTreeMap::from([("implement".into(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+        crew_work: BTreeMap::from([(
+            "implement".into(),
+            BTreeMap::from([("coder".into(), crew_work(phase)), ("reviewer".into(), crew_work(CrewWorkPhase::Done))]),
+        )]),
+        ..Default::default()
+    };
+    let mut activated = previous.clone();
+    external_patches::resume_crew_work("implement".into(), "coder".into(), ts(20), "continue".into(), Some("intent".into()))
+        .apply(&mut activated);
+    let mut current = activated.clone();
+    if target_changed {
+        current.crew_work.get_mut("implement").expect("crew").get_mut("coder").expect("target").message = Some("newer action".into());
+    }
+    if other_changed {
+        current.crew_work.get_mut("implement").expect("crew").get_mut("reviewer").expect("other crew").message =
+            Some("concurrent review".into());
+    }
+    if work_changed {
+        current.work.get_mut("implement").expect("aggregate work").phase = WorkPhase::Failed;
+    }
+    let before_restore = current.clone();
+    let patch = external_patches::restore_turn_activation("implement".into(), "coder".into(), activated, previous.clone());
+    patch.apply(&mut current);
+    if target_changed {
+        assert_eq!(current, before_restore);
+    } else {
+        assert_eq!(current.crew_work["implement"]["coder"], previous.crew_work["implement"]["coder"]);
+        assert_eq!(current.crew_work["implement"]["reviewer"], before_restore.crew_work["implement"]["reviewer"]);
+        if !other_changed && !work_changed {
+            assert_eq!(current, previous);
+        } else {
+            assert_eq!(current.work, before_restore.work);
+            assert_eq!(current.phase, ConvoyPhase::Active);
+        }
+    }
+    let restored = current.clone();
+    patch.apply(&mut current);
+    assert_eq!(current, restored, "restoration is idempotent");
+}
