@@ -5180,7 +5180,8 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }
         }
         // Recovery addresses Docker by full immutable ID, while adopted handles
-        // may still be indexed by name. Retire both after successful destruction.
+        // may still be indexed by container name. Remove the requested map key above,
+        // then retire any other cached handle whose Environment ID matches.
         self.state.provisioned_environments.lock().await.retain(|_, active| active.handle.id().as_str() != environment_ref);
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         self.cleanup(environment_ref).await
@@ -5206,7 +5207,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
         let mut components = Path::new(environment_ref).components();
         if !matches!(components.next(), Some(std::path::Component::Normal(_))) || components.next().is_some() {
-            return Err("environment identity must name one state directory".to_string());
+            // Resource names are not globally constrained to DNS labels. Legacy or
+            // malformed identities must not escape the state root or wedge deletion.
+            warn!(environment = environment_ref, "skipping environment state cleanup: identity must name one state directory");
+            return Ok(());
         }
         let mut cleanup_errors =
             forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
@@ -10260,7 +10264,15 @@ mod tests {
         let cleat_state = state.config.state_dir().as_path().join("contained-cleat/contained-restarted");
         fs::create_dir_all(&cleat_state).expect("contained-cleat state");
         fs::write(cleat_state.join("session"), "durable session").expect("session state");
-        DockerControllerRuntime { state }
+        let outside_state = state.config.state_dir().as_path().join("keep");
+        fs::create_dir_all(&outside_state).expect("unrelated state");
+        fs::write(outside_state.join("sentinel"), "keep").expect("sentinel");
+        let runtime = DockerControllerRuntime { state };
+        for invalid in ["../keep", "..", "/", ""] {
+            runtime.cleanup(invalid).await.expect("unsafe names must not wedge finalization");
+        }
+        assert!(outside_state.join("sentinel").exists(), "unsafe cleanup must preserve unrelated state");
+        runtime
             .destroy("contained-restarted", "test-interior")
             .await
             .expect("restart teardown should rediscover and destroy the container");

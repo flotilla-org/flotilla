@@ -3,6 +3,9 @@
 //! Environments do not replicate (ADR 0016): only a successful read of this
 //! host's embedded authoritative store can prove absence. Never substitute a
 //! fleet/replica view or a remote HTTP backend here.
+//! The Docker endpoint must have one authoritative Flotilla daemon: legacy
+//! environment labels do not identify a config directory or daemon owner.
+//! See docs/development.md for deployment isolation and recovery diagnostics.
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
