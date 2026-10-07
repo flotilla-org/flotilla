@@ -8,7 +8,7 @@ use clap::{
 use crate::{commands::host::HostNounPartial, noun::NounCommand, quote_value};
 
 pub const ADDRESS_MARKER: char = '@';
-const CREW_COMMAND_SUBJECTS: &[&str] = &["list", "stalls", "complete", "fail", "stall", "supervise"];
+const CREW_COMMAND_SUBJECTS: &[&str] = &["capabilities", "list", "stalls", "complete", "fail", "stall", "supervise"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectNoun {

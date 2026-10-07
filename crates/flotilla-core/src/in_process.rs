@@ -5292,6 +5292,19 @@ impl InProcessDaemon {
         self.crew_ops.pending_crew_completions().await
     }
 
+    pub async fn set_session_capability_source(&self, source: Arc<dyn crate::crew_capabilities::SessionCapabilitySource>) {
+        *self.crew_ops.capability_source.write().await = Some(source);
+    }
+
+    pub async fn refresh_capability_cards(&self, namespace: &str) -> Result<(), String> {
+        let source = self.crew_ops.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
+        crate::crew_capabilities::refresh_cards(&self.resource_backend, namespace, &*source).await
+    }
+
+    pub async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {
+        self.crew_ops.crew_capabilities_internal(requested).await
+    }
+
     pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
         self.crew_ops.crew_list_internal(requested).await
     }
@@ -7705,6 +7718,10 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
+            CommandAction::QueryCrewCapabilities { context } => match self.crew_capabilities_internal(context).await {
+                Ok(card) => Ok(CommandValue::CrewCapabilities { card }),
+                Err(message) => Ok(CommandValue::Error { message }),
+            },
             CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),

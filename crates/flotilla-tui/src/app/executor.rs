@@ -210,6 +210,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::FulfilmentList(_)
         | CommandValue::FleetList(_)
         | CommandValue::CrewStalls(_)
+        | CommandValue::CrewCapabilities { .. }
         | CommandValue::CrewList(_)
         | CommandValue::DaemonLogs { .. }
         | CommandValue::ProjectExplanation(_)

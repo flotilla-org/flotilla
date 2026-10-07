@@ -76,3 +76,5 @@ pub use flotilla_resources::tls;
 
 #[cfg(test)]
 extern crate self as flotilla_core;
+
+pub mod crew_capabilities;

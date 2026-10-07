@@ -4347,3 +4347,162 @@ fn generated_message_role_waiting_home(tc: hegel::TestCase) {
         .expect("scenario runtime")
         .block_on(run_message_role_waiting_home_case(remote, admitted));
 }
+
+async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
+    use flotilla_core::crew_capabilities::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
+    // Credential-delivery I/O is the boundary; routing and stores are real.
+    struct Delivery(bool);
+    #[async_trait]
+    impl SessionCapabilitySource for Delivery {
+        async fn credentials(&self, _: &str, references: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
+            assert_eq!(references, &BTreeSet::from(["github".into()]));
+            let mut permissions = BTreeMap::from([("contents".into(), "write".into())]);
+            if self.0 {
+                permissions.insert("workflows".into(), "write".into());
+            }
+            Ok(vec![CredentialCapability::builder()
+                .name("github".into())
+                .repositories(vec!["flotilla-org/flotilla".into()])
+                .permissions(permissions)
+                .build()])
+        }
+    }
+    let leader = empty_daemon_named("capabilities-desk").await;
+    let follower = empty_daemon_named("capabilities-session").await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect capability scenario");
+    let owner = if remote { &topology.follower } else { &topology.leader };
+    let role = if workflows { "governor" } else { "coder" };
+    topology.leader.set_session_capability_source(Arc::new(Delivery(!workflows))).await;
+    owner.set_session_capability_source(Arc::new(Delivery(workflows))).await;
+    let convoys = topology.leader.resource_backend().using::<Convoy>("flotilla");
+    let convoy =
+        convoys.create(&convoy_meta("capabilities", "capabilities"), &convoy_spec("scratch", "capabilities")).await.expect("convoy");
+    convoys
+        .update_status("capabilities", &convoy.metadata.resource_version, &ConvoyStatus {
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                vessels: vec![VesselRequirement::builder().name("work".into()).crew(vec![]).build()],
+                exit: None,
+                turn_delivery: Default::default(),
+                stall_nudges: Default::default(),
+                supervision: None,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("workflow");
+    let backend = owner.resource_backend();
+    backend
+        .using::<Vessel>("flotilla")
+        .create(&InputMeta::builder().name("capabilities-work".into()).build(), &VesselSpec {
+            convoy_ref: "capabilities".into(),
+            vessel_name: "work".into(),
+            placement_policy_ref: "policy".into(),
+            adopted_checkout_refs: Default::default(),
+        })
+        .await
+        .expect("vessel");
+    backend
+        .using::<Environment>("flotilla")
+        .create(&InputMeta::builder().name("capabilities-env".into()).build(), &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "session-host".into(), repo_default_dir: "/repo".into() }),
+            docker: None,
+        })
+        .await
+        .expect("environment");
+    backend
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("capabilities-terminal".into())
+                .annotations(BTreeMap::from([(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"github\"]".into())]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("capabilities-env".into())
+                .role(role.into())
+                .pool("cleat".into())
+                .cwd("/repo".into())
+                .source(TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("code"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: String::new(), artifact_digest: None, copies: vec![] },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "capabilities".into(),
+                        vessel_ref: "capabilities-work".into(),
+                    }),
+                    message: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("session");
+    if remote {
+        apply_convoy_replica_feed(&topology.follower, "flotilla", "capabilities", topology.leader_host.clone()).await;
+        topology
+            .follower
+            .resource_backend()
+            .replica_writer::<Convoy>(topology.leader.node_id().clone(), "flotilla")
+            .replace(&convoys.list().await.expect("convoys"), Utc::now())
+            .await
+            .expect("convoy replica");
+        topology
+            .leader
+            .resource_backend()
+            .replica_writer::<Vessel>(owner.node_id().clone(), "flotilla")
+            .replace(&backend.using::<Vessel>("flotilla").list().await.expect("vessels"), Utc::now())
+            .await
+            .expect("vessel replica");
+        topology
+            .leader
+            .resource_backend()
+            .replica_writer::<TerminalSession>(owner.node_id().clone(), "flotilla")
+            .replace(&backend.using::<TerminalSession>("flotilla").list().await.expect("sessions"), Utc::now())
+            .await
+            .expect("session replica");
+    }
+    let context = CrewCommandContext::builder()
+        .namespace("flotilla".into())
+        .convoy("capabilities".into())
+        .vessel_ref("capabilities-work".into())
+        .role(role.into())
+        .build();
+    let target = topology
+        .leader
+        .resolve_command_target(&CommandAction::QueryCrewCapabilities { context: context.clone() }, None)
+        .await
+        .expect("target");
+    assert_eq!(target.reason, flotilla_core::command_target::TargetReason::CrewSessionHome);
+    assert_eq!(target.host, if remote { TargetHost::Node(owner.node_id().clone()) } else { TargetHost::Local });
+    let response = topology
+        .client
+        .execute_query(Command::builder().action(CommandAction::QueryCrewCapabilities { context }).build(), uuid::Uuid::new_v4())
+        .await
+        .expect("query capabilities");
+    let CommandValue::CrewCapabilities { card } = response else { panic!("capabilities response: {response:?}") };
+    assert!(card.contains(&format!("You act as `{role}`")));
+    assert_eq!(card.contains("You can push `.github/workflows`"), workflows);
+}
+
+// Pinned local/remote rows prove capabilities come from the session's actual
+// delivery host, even when the convoy authority has a different grant.
+#[tokio::test]
+async fn router_capabilities_scenarios_use_session_home() {
+    for remote in [false, true] {
+        for workflows in [false, true] {
+            capabilities_routing_scenario(remote, workflows).await;
+        }
+    }
+}
+
+#[hegel::test]
+fn generated_capabilities_queries_use_session_home(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let remote = tc.draw(gs::booleans());
+    let workflows = tc.draw(gs::booleans());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(capabilities_routing_scenario(remote, workflows));
+}

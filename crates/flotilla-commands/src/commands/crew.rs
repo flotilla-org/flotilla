@@ -122,7 +122,7 @@ impl CrewNoun {
                 }
                 CommandAction::QueryCrewStalls { full: self.full }
             }
-            ("list", SubjectInterpretation::Ordinary, None)
+            ("capabilities" | "list", SubjectInterpretation::Ordinary, None)
                 if self.message.is_none()
                     && self.reason.is_none()
                     && self.propose.is_none()
@@ -130,10 +130,14 @@ impl CrewNoun {
                     && self.decision_ledger_ref.is_none()
                     && !self.force =>
             {
-                CommandAction::QueryCrewList { context }
+                if subject.value == "capabilities" {
+                    CommandAction::QueryCrewCapabilities { context }
+                } else {
+                    CommandAction::QueryCrewList { context }
+                }
             }
-            ("list", SubjectInterpretation::Ordinary, None) => {
-                return Err("`flotilla crew list` does not accept completion options".to_string());
+            ("capabilities" | "list", SubjectInterpretation::Ordinary, None) => {
+                return Err(format!("`flotilla crew {}` does not accept completion options", subject.value));
             }
             ("complete", SubjectInterpretation::Ordinary, None) => {
                 if self.reason.is_some() {
@@ -315,6 +319,21 @@ mod tests {
         assert!(invalid.resolve().is_err());
         let scoped = CrewNoun::try_parse_from(["crew", "stalls", "--convoy", "one"]).expect("parse selectors");
         assert!(scoped.resolve().expect_err("fleet-wide").contains("does not accept crew selectors"));
+    }
+
+    // Glue: the reserved command preserves ambient identity and round-trips.
+    #[test]
+    fn capabilities_uses_ambient_identity_and_rejects_completion_options() {
+        let noun = CrewNoun::try_parse_from(["crew", "capabilities"]).expect("parse");
+        assert_eq!(action(noun.clone(), Some("crew-123")), CommandAction::QueryCrewCapabilities {
+            context: CrewCommandContext::builder().crew_id("crew-123".into()).build(),
+        });
+        assert_eq!(CrewNoun::try_parse_from(noun.to_string().split_whitespace()).expect("round-trip"), noun);
+        let invalid = CrewNoun::try_parse_from(["crew", "capabilities", "--message", "done"]).expect("parse");
+        assert!(invalid
+            .resolve_with_crew_id(Some("crew-123".into()))
+            .expect_err("invalid options")
+            .contains("does not accept completion options"));
     }
 
     #[test]

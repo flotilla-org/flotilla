@@ -103,6 +103,7 @@ impl InProcessDaemon {
             | A::ResourceStatusPatch { .. }
             | A::ResourceDelete { .. }
             | A::RepositoryRemoteRemove { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
+            A::QueryCrewCapabilities { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Command),
             A::ArchiveSession { .. } | A::TeleportSession { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Steps),
             A::QueryHostList { .. }
             | A::QueryExplainProject { .. }
@@ -167,6 +168,20 @@ impl InProcessDaemon {
                     .await
                     .map_err(TargetError::Admission)?
                     .map_or(TargetHost::Local, TargetHost::Placement)
+            }
+            A::QueryCrewCapabilities { context } => {
+                let routing = self.resolve_crew_routing_context(context).await.map_err(TargetError::CrewSessionHome)?;
+                let session_name =
+                    routing.session_name.ok_or_else(|| TargetError::CrewSessionHome("capabilities requires a live crew session".into()))?;
+                let session_action = A::ResourceReconcileNow {
+                    namespace: routing.command_context.namespace.expect("resolved namespace"),
+                    kind: "TerminalSession".into(),
+                    name: session_name,
+                };
+                self.resource_mutation_origin(&session_action)
+                    .await
+                    .map_err(TargetError::CrewSessionHome)?
+                    .map_or(TargetHost::Local, TargetHost::Node)
             }
             A::ArchiveSession { session_id } | A::TeleportSession { session_id, .. } => {
                 let session_action = A::ResourceReconcileNow {
