@@ -1,15 +1,6 @@
+# Formatting uses the stable compiler pin in rust-toolchain.toml: `cargo fmt`.
 # Wider lines, fewer chain/arg explosions.
-# Requires nightly rustfmt: `cargo +nightly-2026-03-12 fmt`
-# Temporary formatter is pinned to nightly-2026-03-12 until #2794 lands.
-# Compilation, Clippy, and coverage use the stable rust-toolchain.toml pin.
-# Stable silently ignores the unstable keys below.
-
 max_width = 140
 # "Max" sets all sub-widths (chain, fn_call, attr, array, struct_lit,
 # single_line_if_else) equal to max_width.
 use_small_heuristics = "Max"
-
-# Unstable (nightly-only)
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
-overflow_delimited_expr = true
