@@ -80,7 +80,10 @@ session. Child signal/wait failures still run orphan cleanup. On app-server
 exit or crash, the supervisor kills and reaps reparented descendants, including
 tools that started a new process group. Cleanup is bounded and refuses to claim
 success when children remain. An external SIGKILL of the supervisor itself
-cannot run cleanup. If its process is absent, stop warns and removes the stale
+cannot run cleanup. Stop polls process liveness as well as the receipt; an absent
+or zombie supervisor immediately falls through to stale receipt recovery. The
+stop wait allows ten seconds (child grace, orphan sweeps, and scheduling margin),
+and callers allow fifteen seconds for helper startup and completion. Stop warns and removes the stale
 PID/socket receipt so relaunch and teardown can proceed. A reused live PID is
 never signalled. Vessel teardown remains the enclosing cleanup mechanism. Before replacing a failed launch, retained server sessions must be
 stopped through their supervisor.

@@ -32,7 +32,9 @@ use flotilla_core::{
     crew_capabilities::{CredentialCapability, SessionCapabilitySource},
     daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
-    holder_transport::{select_transport, AppServer, AppServerClient, CodexTransport, TransportCapability},
+    holder_transport::{
+        select_transport, supervisor::STOP_COMMAND_TIMEOUT, AppServer, AppServerClient, CodexTransport, TransportCapability,
+    },
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -6574,7 +6576,7 @@ async fn cleanup_failed_native_launch(
             &["codex-app-server-stop", "--socket", endpoint],
             Path::new("/"),
             &ChannelLabel::Default,
-            Duration::from_secs(10),
+            STOP_COMMAND_TIMEOUT,
         )
         .await
     {
@@ -6606,7 +6608,7 @@ impl TerminalControllerRuntime {
                     &["codex-app-server-stop", "--socket", &endpoint],
                     Path::new("/"),
                     &ChannelLabel::Default,
-                    Duration::from_secs(10),
+                    STOP_COMMAND_TIMEOUT,
                 )
                 .await?;
             pool.kill_session(&server.session_name).await?;
@@ -7392,7 +7394,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         &["codex-app-server-stop", "--socket", endpoint],
                         Path::new("/"),
                         &ChannelLabel::Default,
-                        Duration::from_secs(10),
+                        STOP_COMMAND_TIMEOUT,
                     )
                     .await?;
             }
