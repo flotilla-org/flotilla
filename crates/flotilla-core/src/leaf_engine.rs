@@ -67,6 +67,21 @@ pub struct EpisodeKeyFields {
 
 pub use flotilla_protocol::TurnDeliveryRequest;
 
+/// Canonical receiver admission is a workflow latch, not a delivery receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewTurnAdmission {
+    pub new_turn: bool,
+    pub rung: TurnDeliveryRung,
+    pub message: flotilla_protocol::ResourceRef,
+}
+
+/// Producers publish ordinary resource intent through the command router;
+/// receiver homes own delivery and no transport request crosses this seam.
+#[async_trait]
+pub trait ResourceIntentPublisher: Send + Sync {
+    async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String>;
+}
+
 #[async_trait]
 pub trait RemoteTurnDelivery: Send + Sync {
     async fn deliver(self: Arc<Self>, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String>;
@@ -74,7 +89,7 @@ pub trait RemoteTurnDelivery: Send + Sync {
 
 #[async_trait]
 pub trait TurnDeliveryActuator: Send + Sync {
-    async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String>;
+    async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<CrewTurnAdmission, String>;
     async fn hold(&self, request: &TurnDeliveryRequest, act: &HoldAct, reason: &str) -> Result<(), String>;
 }
 
@@ -171,7 +186,7 @@ struct UnavailableTurnDeliveryActuator;
 
 #[async_trait]
 impl TurnDeliveryActuator for UnavailableTurnDeliveryActuator {
-    async fn deliver(&self, _request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+    async fn deliver(&self, _request: &TurnDeliveryRequest) -> Result<CrewTurnAdmission, String> {
         Err("turn-delivery actuator unavailable".to_string())
     }
 
@@ -1103,6 +1118,11 @@ impl LeafSubscriptionTable {
                     source: flotilla_protocol::IssueSource { service: service.clone(), scope: scope.clone() },
                     id: number.to_string(),
                 }),
+                LeafAddress::Issue { service, scope, number } => Some(flotilla_protocol::Subject {
+                    kind: flotilla_protocol::SubjectKind::Issue,
+                    source: flotilla_protocol::IssueSource { service: service.clone(), scope: scope.clone() },
+                    id: number.to_string(),
+                }),
                 _ => None,
             })
             .sender(flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() })
@@ -1113,7 +1133,7 @@ impl LeafSubscriptionTable {
             let reason =
                 format!("turn delivery refused after {} consecutive episodes for condition source `{source}`", self.inner.episode_limit);
             let actuator = self.inner.turn_delivery.lock().await.clone();
-            if request.subject.is_none() {
+            if request.subject.as_ref().is_none_or(|subject| subject.kind != flotilla_protocol::SubjectKind::ChangeRequest) {
                 match flotilla_resources::active_change_request_subjects(&convoy)?.len() {
                     0 => return Err(DeliveryError::permanent("turn-delivery convoy has no bound change request for hold")),
                     1 => {}
@@ -1148,22 +1168,18 @@ impl LeafSubscriptionTable {
             if sessions.items.iter().any(|session| !matches!(session.object.spec.source, TerminalSessionSource::Agent { .. })) {
                 return Err(DeliveryError::permanent("turn-delivery target is not an agent"));
             }
-            let rung = actuator.deliver(&request).await?;
+            let admission = actuator.deliver(&request).await?;
             external_patches::record_turn_delivery(
                 source.to_string(),
                 TurnDeliveryEpisode {
                     subject_revision: subject_revision.clone(),
                     evidence_at,
                     judged_claim_at: judged_at,
-                    outcome: TurnDeliveryOutcome::Queued {
-                        rung,
-                        // Start the age at acceptance, after credential staging and remote delivery.
-                        // The earlier `now` is also wall time and precedes the actuator call.
-                        queued_at: Utc::now(),
-                        vessel: rule.to.vessel.clone(),
-                        role: rule.to.role.clone(),
-                        message_id: format!("turn-delivery:{source}:{subject_revision}"),
-                        blocking_reason: "waiting for terminal readiness or submission evidence".into(),
+                    outcome: TurnDeliveryOutcome::MessageAccepted {
+                        rung: admission.rung,
+                        accepted_at: Utc::now(),
+                        new_turn: admission.new_turn,
+                        message: admission.message,
                     },
                     sender: request.sender.clone(),
                 },
@@ -1253,6 +1269,16 @@ pub(crate) fn queued_turn_session<'a>(
     })
 }
 
+pub(crate) fn durable_message_evidence(message: &ResourceObject<flotilla_resources::Message>) -> (bool, String) {
+    match &message.status {
+        Some(status) if status.phase.has_delivery_evidence() => (true, String::new()),
+        Some(status) => {
+            (false, format!("message {:?}: {}", status.phase, status.reason.as_deref().unwrap_or("waiting for receiver evidence")))
+        }
+        None => (false, "message Accepted: waiting for receiver resolution".into()),
+    }
+}
+
 pub(crate) fn queued_turn_evidence(session: Option<&ResourceObject<TerminalSession>>, message_id: &str) -> (bool, String) {
     let Some(session) = session else { return (false, "terminal session unavailable".into()) };
     let status = session.status.as_ref();
@@ -1338,7 +1364,18 @@ impl ReconcilerWake {
         for (source, delivery) in &status.turn_deliveries {
             for episode in &delivery.episodes {
                 let TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } = &episode.outcome else { continue };
-                let (confirmed, blocking_reason) = queued_turn_evidence(queued_turn_session(sessions, vessel, role), message_id);
+                let (confirmed, blocking_reason) = match self
+                    .subscriptions
+                    .inner
+                    .backend
+                    .including_replicas::<flotilla_resources::Message>(namespace)
+                    .get(message_id)
+                    .await
+                {
+                    Ok(message) => durable_message_evidence(&message.object),
+                    Err(ResourceError::NotFound { .. }) => queued_turn_evidence(queued_turn_session(sessions, vessel, role), message_id),
+                    Err(error) => return Err(error.to_string()),
+                };
                 observations.push(flotilla_resources::QueuedTurnObservation {
                     source: source.clone(),
                     subject_revision: episode.subject_revision.clone(),
@@ -1383,6 +1420,8 @@ impl ReconcilerWake {
         let observations = observation_list.items;
         let checkouts = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let vessels = backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let messages =
+            backend.including_replicas::<flotilla_resources::Message>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let rows = self.subscriptions.rows().await;
         self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
         for convoy in convoys.values() {
@@ -1551,12 +1590,52 @@ impl ReconcilerWake {
                             progress_changed = true;
                         }
                         obligation.progress.extend(progress);
+                        let receiver_address = format!(
+                            "{}/{}/{}/{}",
+                            convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                            convoy.metadata.name,
+                            vessel,
+                            role
+                        );
+                        let current_message = messages
+                            .iter()
+                            .filter(|message| {
+                                message.object.spec.receiver == receiver_address
+                                    && message
+                                        .object
+                                        .status
+                                        .as_ref()
+                                        .is_none_or(|status| !status.phase.is_terminal() || status.phase.has_delivery_evidence())
+                            })
+                            .max_by_key(|message| {
+                                (
+                                    message.object.status.as_ref().and_then(|status| status.accepted_sequence),
+                                    message.object.metadata.creation_timestamp,
+                                )
+                            });
                         let session_status = session.and_then(|session| session.status.as_ref());
-                        let message_id = session.and_then(|session| match &session.spec.source {
-                            TerminalSessionSource::Agent { message, .. } => message.as_ref().map(|message| message.id.clone()),
-                            _ => None,
+                        let message_id = current_message.map(|message| message.object.metadata.name.clone()).or_else(|| {
+                            session.and_then(|session| match &session.spec.source {
+                                TerminalSessionSource::Agent { message, .. } => message.as_ref().map(|message| message.id.clone()),
+                                _ => None,
+                            })
                         });
-                        let delivered_id = session_status.and_then(|status| status.delivered_message_id.clone());
+                        let delivered_id = messages
+                            .iter()
+                            .filter(|message| {
+                                message.object.spec.receiver == receiver_address
+                                    && message.object.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())
+                            })
+                            .max_by_key(|message| {
+                                message
+                                    .object
+                                    .status
+                                    .as_ref()
+                                    .and_then(|status| status.resolved_receiver.as_ref())
+                                    .map(|receiver| receiver.delivered_at)
+                            })
+                            .map(|message| message.object.metadata.name.clone())
+                            .or_else(|| session_status.and_then(|status| status.delivered_message_id.clone()));
                         if message_id != obligation.message_id || delivered_id != obligation.delivered_message_id {
                             if message_id.is_some() || delivered_id.is_some() {
                                 obligation.reply_after = Some(now);
@@ -1570,7 +1649,10 @@ impl ReconcilerWake {
                             obligation.reply_after = None;
                             obligation.last_tool_activity_at = tool_activity;
                         }
-                        let pending_message = session.is_some_and(|session| match &session.spec.source {
+                        let pending_message = messages.iter().any(|message| {
+                            message.object.spec.receiver == receiver_address
+                                && message.object.status.as_ref().is_none_or(|status| status.phase.is_waiting())
+                        }) || session.is_some_and(|session| match &session.spec.source {
                             TerminalSessionSource::Agent { message: Some(message), .. } => !message
                                 .delivered_through(session_status.and_then(|status| status.delivered_message_id.as_deref()), &message.id),
                             _ => false,
@@ -1988,7 +2070,10 @@ impl ReconcilerWake {
                             if now.signed_duration_since(resumed_at) >= chrono::Duration::minutes(2) {
                                 return false;
                             }
-                            let operator_brief_delivered = session.is_some_and(|session| {
+                            let operator_brief_delivered = messages.iter().any(|message| {
+                                message.object.metadata.name == brief_id
+                                    && message.object.status.as_ref().is_some_and(|status| status.phase.has_delivery_evidence())
+                            }) || session.is_some_and(|session| {
                                 let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
                                 matches!(&session.spec.source, TerminalSessionSource::Agent { message: Some(message), .. }
                                     if message.delivered_through(delivered_id, brief_id))
@@ -2021,8 +2106,18 @@ impl ReconcilerWake {
                             condition.rung = StallRung::Nudge;
                             if due {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
-                                let obligation =
-                                    if let Some(refusal) = refusal { refusal_nudge_brief(refusal) } else { actor_obligation(leaf)? };
+                                let declared_stall = status
+                                    .crew_work
+                                    .get(vessel)
+                                    .and_then(|crew| crew.get(role))
+                                    .is_some_and(|crew| crew.phase == flotilla_resources::CrewWorkPhase::Stalled);
+                                let obligation = if declared_stall {
+                                    "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
+                                } else if let Some(refusal) = refusal {
+                                    refusal_nudge_brief(refusal)
+                                } else {
+                                    actor_obligation(leaf)?
+                                };
                                 let brief = format!(
                                     "For {role}@{vessel} in {} (resource ref: {}):\n{obligation}",
                                     convoy_message_address(convoy),
@@ -3544,14 +3639,23 @@ mod tests {
 
     #[async_trait]
     impl TurnDeliveryActuator for RecordingTurnDelivery {
-        async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+        async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<CrewTurnAdmission, String> {
             if self.unavailable.load(Ordering::SeqCst) {
                 return Err("supervisor reconnecting".into());
             }
             let mut requests = self.requests.lock().expect("record turn-delivery request");
             let rung = if requests.is_empty() { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
             requests.push(request.clone());
-            Ok(rung)
+            Ok(CrewTurnAdmission {
+                new_turn: true,
+                rung,
+                message: flotilla_protocol::ResourceRef::new(
+                    "flotilla.work/v1",
+                    "Message",
+                    &request.namespace,
+                    format!("fake-{}-{}", request.source, request.subject_revision),
+                ),
+            })
         }
 
         async fn hold(&self, _request: &TurnDeliveryRequest, _act: &HoldAct, _reason: &str) -> Result<(), String> {
@@ -4088,6 +4192,31 @@ mod tests {
         observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(1081)).await;
         observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(1082)).await;
         assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "reply Stop must not rearm the nudge budget");
+    }
+
+    // A declared stall asks for changed evidence; a working crew retains the
+    // ordinary settlement obligation. Exercise the real nudge producer at idle.
+    #[tokio::test]
+    async fn declared_stall_nudges_preserve_the_changed_evidence_guidance() {
+        for phase in [CrewWorkPhase::Working, CrewWorkPhase::Stalled] {
+            let (backend, wake, delivery) = idle_nudge_scenario().await;
+            let convoys = backend.using::<Convoy>("flotilla");
+            let convoy = convoys.get("stalled-work").await.expect("nudge authority");
+            let mut status = convoy.status.expect("crew state");
+            status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("actor").phase = phase;
+            convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("declared crew phase");
+            let start = Utc::now();
+            for second in [0, 60, 120, 180] {
+                observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+            }
+            let requests = delivery.requests.lock().expect("durable nudge admissions");
+            let request = requests.first().expect("settlement nudge");
+            assert_eq!(request.brief.contains("Your stall is recorded. What changed since your report?"), phase == CrewWorkPhase::Stalled);
+            if phase == CrewWorkPhase::Stalled {
+                assert!(request.brief.contains("update the stall with new evidence"));
+                assert!(request.brief.contains("ask your supervisor to resume you"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -6580,9 +6709,11 @@ mod tests {
         let episodes = &status.turn_deliveries[source].episodes;
         assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
         assert_eq!(episodes[0].sender, flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() });
-        // #2684: accepting a terminal FIFO entry is not confirmation of an agent turn.
-        assert_eq!(serde_json::to_value(&episodes[0].outcome).unwrap()["kind"], "queued");
-        assert!(matches!(episodes[1].outcome, TurnDeliveryOutcome::Queued { rung: TurnDeliveryRung::FreshAgent, .. }));
+        // Message admission is a workflow latch, not confirmation of an agent turn.
+        assert_eq!(serde_json::to_value(&episodes[0].outcome).unwrap()["kind"], "message-accepted");
+        assert!(
+            matches!(&episodes[1].outcome, TurnDeliveryOutcome::MessageAccepted { rung: TurnDeliveryRung::FreshAgent, message, .. } if message.kind == "Message")
+        );
         assert!(matches!(episodes[3].outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }));
         assert_eq!(actuator.requests.lock().expect("requests").len(), 3);
         assert_eq!(actuator.holds.load(Ordering::SeqCst), 1);

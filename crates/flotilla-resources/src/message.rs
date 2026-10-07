@@ -280,3 +280,15 @@ impl StatusPatch<MessageStatus> for MessageStatusPatch {
         }
     }
 }
+
+/// Receiver-scoped producer identity prevents unrelated convoy queues from
+/// colliding when their local producer keys happen to be equal.
+pub fn message_record_name(receiver: &str, sender: &str, producer_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for component in [receiver, sender, producer_key] {
+        hash.update((component.len() as u64).to_be_bytes());
+        hash.update(component.as_bytes());
+    }
+    format!("message-{:x}", hash.finalize())
+}

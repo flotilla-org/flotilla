@@ -1208,6 +1208,14 @@ pub struct TurnDeliveryEpisode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TurnDeliveryOutcome {
+    /// Producer admission evidence only. The referenced receiver-homed Message
+    /// owns delivery status, retries and attention; this is a workflow latch.
+    MessageAccepted {
+        new_turn: bool,
+        message: flotilla_protocol::ResourceRef,
+        rung: TurnDeliveryRung,
+        accepted_at: DateTime<Utc>,
+    },
     /// Accepted into the terminal FIFO; no agent turn has been confirmed yet.
     Queued {
         rung: TurnDeliveryRung,
@@ -1433,6 +1441,13 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    /// Restore only a speculative turn activation still owned by this attempt.
+    RestoreTurnActivation {
+        vessel: String,
+        role: String,
+        activated: Box<ConvoyStatus>,
+        previous: Box<ConvoyStatus>,
+    },
     ObserveEnvironment {
         vessel: String,
         observation: flotilla_protocol::EnvironmentRuntimeObservation,
@@ -1673,6 +1688,34 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             return;
         }
         match self {
+            Self::RestoreTurnActivation { vessel, role, activated, previous } => {
+                let owned = activated.crew_work.get(vessel).and_then(|crew| crew.get(role));
+                let current = status.crew_work.get(vessel).and_then(|crew| crew.get(role));
+                // Admission has failed or returned a suppressed predecessor. A
+                // concurrent workflow action now owns the crew; leave it alone.
+                if current != owned {
+                    return;
+                }
+                if let Some(prior) = previous.crew_work.get(vessel).and_then(|crew| crew.get(role)) {
+                    status.crew_work.entry(vessel.clone()).or_default().insert(role.clone(), prior.clone());
+                }
+                if status.crew_work.get(vessel) == previous.crew_work.get(vessel) && status.work.get(vessel) == activated.work.get(vessel) {
+                    if let Some(prior) = previous.work.get(vessel) {
+                        status.work.insert(vessel.clone(), prior.clone());
+                    }
+                }
+                if status.work == previous.work
+                    && status.crew_work == previous.crew_work
+                    && status.phase == activated.phase
+                    && status.finished_at == activated.finished_at
+                {
+                    status.phase = previous.phase;
+                    status.finished_at = previous.finished_at;
+                    if status.stalled == activated.stalled {
+                        status.stalled = previous.stalled.clone();
+                    }
+                }
+            }
             Self::ObserveEnvironment { vessel, observation } => {
                 status.environment_observations.entry(vessel.clone()).or_default().merge(observation)
             }
@@ -2189,6 +2232,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
                 }
+                if matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { new_turn: false, .. }) {
+                    return;
+                }
                 status.attention = None;
                 if let Some(work) = status.work.get_mut(vessel) {
                     work.phase = WorkPhase::Running;
@@ -2471,6 +2517,10 @@ pub mod external_patches {
         message: String,
     ) -> ConvoyStatusPatch {
         ConvoyStatusPatch::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message }
+    }
+
+    pub fn restore_turn_activation(vessel: String, role: String, activated: ConvoyStatus, previous: ConvoyStatus) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::RestoreTurnActivation { vessel, role, activated: Box::new(activated), previous: Box::new(previous) }
     }
 
     pub fn resume_crew_work(

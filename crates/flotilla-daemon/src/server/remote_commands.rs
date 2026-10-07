@@ -205,6 +205,28 @@ impl std::ops::Deref for RemoteCommandRouter {
 }
 
 #[async_trait]
+impl flotilla_core::leaf_engine::ResourceIntentPublisher for RemoteCommandRouterInner {
+    async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
+        let router = RemoteCommandRouter { inner: self };
+        let command = Command::builder().action(CommandAction::ResourceApply { namespace: namespace.to_string(), document }).build();
+        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
+            CommandValue::ResourceObject(object) => Ok(flotilla_protocol::ResourceRef::new(
+                object.value.get("apiVersion").and_then(serde_json::Value::as_str).unwrap_or("flotilla.work/v1"),
+                &object.kind,
+                &object.namespace,
+                object
+                    .value
+                    .pointer("/metadata/name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("resource admission response has no name")?,
+            )),
+            CommandValue::Error { message } => Err(message),
+            value => Err(format!("unexpected resource intent admission result: {value:?}")),
+        }
+    }
+}
+
+#[async_trait]
 impl flotilla_core::leaf_engine::RemoteTurnDelivery for RemoteCommandRouterInner {
     async fn deliver(
         self: Arc<Self>,
@@ -248,6 +270,8 @@ impl RemoteCommandRouter {
         });
         let delivery: Arc<dyn flotilla_core::leaf_engine::RemoteTurnDelivery> = inner.clone();
         inner.daemon.set_remote_turn_delivery(Arc::downgrade(&delivery));
+        let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> = inner.clone();
+        inner.daemon.set_resource_intent_publisher(Arc::downgrade(&publisher));
         Self { inner }
     }
 
@@ -422,8 +446,8 @@ impl RemoteCommandRouter {
     }
 
     /// Return the destination's acknowledgement for a remote command or query.
-    /// Local queries retain surface projection; controller mutations must resolve
-    /// remotely, since this port is invoked only for replica-owned targets.
+    /// Local queries retain surface projection; resource mutations await the same
+    /// acknowledgement at both local and remote receiver homes.
     async fn dispatch_and_wait(&self, mut command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
         let target =
@@ -441,10 +465,24 @@ impl RemoteCommandRouter {
         command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
 
         if target_node_id == *self.daemon.node_id() {
-            if !command.action.is_query() {
-                return Err("remote controller delivery resolved to the local host".into());
+            if command.action.is_query() {
+                return self.execute_projected_query(command, session_id).await;
             }
-            return self.execute_projected_query(command, session_id).await;
+            let mut events = self.daemon.subscribe();
+            let command_id = self.daemon.execute_for_caller(command, None).await?;
+            return tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match events.recv().await {
+                        Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => return Ok(result),
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err("local resource acknowledgement channel closed".into())
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "timed out waiting for local resource acknowledgement".to_string())?;
         }
 
         let request_id = {

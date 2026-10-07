@@ -3769,16 +3769,9 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         assert!(error.contains("internal controller command"), "{error}");
     }
     if stale_home {
-        // A replica-owned target misprojected as local must refuse delivery,
-        // retain the stall, and recover within one pass after the view heals.
+        // Ordinary Message homing follows resource provenance even when the
+        // older presentation feed incorrectly projects the convoy as local.
         apply_convoy_replica_feed(a, "flotilla", "governor", a.host_name().clone()).await;
-        a.reconcile_crew_stalls_once("flotilla").await.expect("misprojected home pass");
-        let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
-        assert_eq!(stall.rung, flotilla_resources::StallRung::Operator);
-        assert!(stall.supervisor.is_none());
-        assert!(!stall.supervision_exhausted);
-        assert!(stall.evidence.contains("remote controller delivery resolved to the local host"), "{}", stall.evidence);
-        apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
     }
 
     for _ in 0..passes {
@@ -3786,23 +3779,20 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
         assert_eq!(stall.rung, flotilla_resources::StallRung::Governor);
         assert_eq!(stall.supervisor.expect("governor").convoy, "governor");
+        let messages = b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox");
+        assert_eq!(messages.items.len(), 1, "repeat passes must not publish duplicates");
+        assert!(a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source inbox").items.is_empty());
         let session = b_backend.using::<TerminalSession>("flotilla").get("governor-session").await.expect("governor session");
-        let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else {
-            panic!("governor must receive escalation in same pass")
-        };
-        // #2592: every routed escalation identifies its source convoy and exact stalled crew.
         assert!(
-            message.text.starts_with("[flotilla · escalated from coder@work in coder@project · supervise the stalled crew]"),
-            "{}",
-            message.text
+            matches!(session.spec.source, TerminalSessionSource::Agent { message: None, .. }),
+            "escalation uses durable Message intent"
         );
-        assert!(
-            message.text.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"),
-            "{}",
-            message.text
-        );
-        assert!(message.text.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{}", message.text);
-        assert!(message.following.is_empty(), "repeat passes must not redeliver");
+        let message = &messages.items[0];
+        assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
+        assert_eq!(message.spec.sender, "system:stall-judge");
+        assert!(message.spec.body.starts_with("Escalated from coder@work in coder@project:"), "{}", message.spec.body);
+        assert!(message.spec.body.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"));
+        assert!(message.spec.body.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"));
     }
     // The governor may issue supervision from B: route back to A and
     // validate B's replicated identity at the stalled convoy's home.
