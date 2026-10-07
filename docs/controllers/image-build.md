@@ -199,7 +199,8 @@ a future partitioned inventory can address that without hiding availability.
 
 Provides verification sources image preludes before executing the declared argv.
 The runner overrides ENTRYPOINT with `sh`, passes argv positionally, and sources
-`/etc/flotilla/prelude.d/*` in lexical order. Prelude failures and probe mismatches
+`/etc/flotilla/prelude.d/*` in lexical order inside a subshell shared with the
+probe, preserving the caller's EXIT trap. Prelude failures and probe mismatches
 fail the build with their output retained in its Artifact. The shared runner's
 contents also participate in input hashes; changes invalidate verification keys.
 See [crew image acceptance](../crew-image.md#composed-spine-and-display-acceptance)

@@ -11,4 +11,4 @@ docker buildx build --builder default --load --progress=plain \
 # Identical sourced prelude contract to the daemon's build probe wrapper.
 docker run --rm --network=none --pull=never --user "$(id -u):$(id -g)" \
     --entrypoint sh "$image" -c "$(cat "$repo_root/ci/crew-image/prelude.sh")
-xdpyinfo && glxinfo -B && test \"\$LIBGL_ALWAYS_SOFTWARE\" = 1"
+flotilla_run_with_preludes sh -c 'xdpyinfo && glxinfo -B && test \"\$LIBGL_ALWAYS_SOFTWARE\" = 1'"

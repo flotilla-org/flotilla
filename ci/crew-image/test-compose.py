@@ -8,6 +8,7 @@ import tempfile
 import subprocess
 import os
 import re
+import shutil
 
 from compose import ROOT, dockerfile, manifests
 
@@ -119,7 +120,90 @@ with open(os.environ['DOCKER_CALLS'], 'a') as log:
             self.assertIn('test:display', argv[1])
 
 
+class CallerCleanup(unittest.TestCase):
+    def test_success_and_failure_preserve_caller_exit_traps(self):
+        # Real shells execute the shared runner. Caller cleanup survives both a
+        # successful export and an early prelude failure, without double firing.
+        for shell in ['sh', 'bash', 'zsh']:
+            if shutil.which(shell) is None:
+                continue
+            for fails in [False, True]:
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / '10-step').write_text('false\n' if fails else 'export TRACE=ready\n')
+                    script = (ROOT / 'ci/crew-image/prelude.sh').read_text()
+                    command = ("trap 'printf \"cleanup\\n\"' 0\n" + script +
+                               "\nflotilla_run_with_preludes sh -c 'printf \"agent:%s\\n\" \"$TRACE\"'\nexit $?\n")
+                    result = subprocess.run([shell, '-c', command],
+                                            env=dict(os.environ, FLOTILLA_PRELUDE_DIR=str(root)),
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1 if fails else 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines().count('cleanup'), 1)
+                    self.assertEqual('agent:ready' in result.stdout, not fails)
+
+
 class DisplayPrelude(unittest.TestCase):
+    def test_concurrent_launches_accept_the_server_that_wins(self):
+        # Inject Xvfb and display-open processes with a first-probe barrier. Both
+        # launch shells see the display absent; only one server can claim it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / 'preludes'
+            scripts.mkdir()
+            (root / 'initial-probes').mkdir()
+            (root / 'starts').mkdir()
+            (scripts / '50-display-x11.sh').write_text(
+                (ROOT / '.flotilla/image-layers/50-display-x11.sh').read_text())
+            (root / 'xdpyinfo').write_text("""#!/usr/bin/env python3
+import os, pathlib, time, sys
+root = pathlib.Path(os.environ['DISPLAY_TEST_ROOT'])
+marker = root / 'initial-probes' / str(os.getppid())
+if not marker.exists():
+    marker.touch()
+    deadline = time.monotonic() + 5
+    while len(list((root / 'initial-probes').iterdir())) < 2:
+        if time.monotonic() > deadline: sys.exit(8)
+        time.sleep(.001)
+    sys.exit(1)
+sys.exit(0 if (root / 'ready').exists() else 1)
+""")
+            (root / 'Xvfb').write_text("""#!/usr/bin/env python3
+import os, pathlib, time, sys
+root = pathlib.Path(os.environ['DISPLAY_TEST_ROOT'])
+(root / 'starts' / str(os.getpid())).touch()
+try:
+    (root / 'server').mkdir()
+except FileExistsError:
+    print('server already active', file=sys.stderr)
+    sys.exit(1)
+deadline = time.monotonic() + 5
+while len(list((root / 'starts').iterdir())) < 2:
+    if time.monotonic() > deadline: sys.exit(8)
+    time.sleep(.001)
+(root / 'ready').touch()
+""")
+            for binary in ['Xvfb', 'xdpyinfo']:
+                (root / binary).chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                       FLOTILLA_PRELUDE_DIR=str(scripts), DISPLAY_TEST_ROOT=str(root))
+            script = (ROOT / 'ci/crew-image/prelude.sh').read_text()
+            command = script + "\nflotilla_run_with_preludes sh -c 'printf \"agent:%s\\n\" \"$DISPLAY\"'"
+            processes = [subprocess.Popen(['sh', '-c', command], env=env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                         for _ in range(2)]
+            try:
+                for process in processes:
+                    stdout, stderr = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, 0, stderr)
+                    self.assertEqual(stdout, 'agent::99\n')
+                self.assertEqual(len(list((root / 'starts').iterdir())), 2)
+                self.assertTrue((root / 'server').is_dir())
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+
     def test_display_exports_and_open_failure_surface(self):
         # Fake only Xvfb and xdpyinfo process boundaries. Source the real
         # scripts so startup/export/readiness and diagnostics remain observable.
@@ -140,7 +224,9 @@ class DisplayPrelude(unittest.TestCase):
                 env = dict(os.environ, PATH=str(root) + ':/usr/bin:/bin',
                            FLOTILLA_PRELUDE_DIR=str(scripts), DISPLAY_READY=str(root / 'ready'), DISPLAY_STARTS=str(root / 'starts'))
                 script = (ROOT / 'ci/crew-image/prelude.sh').read_text()
-                result = subprocess.run(['sh', '-c', script + '\nprintf "agent:%s\\n" "$DISPLAY"'],
+                result = subprocess.run(['sh', '-c', script + '''
+flotilla_run_with_preludes sh -c 'printf "agent:%s\\n" "$DISPLAY"'
+'''],
                                         env=env, capture_output=True, text=True)
                 if mismatch:
                     self.assertEqual(result.returncode, 1)
@@ -150,7 +236,9 @@ class DisplayPrelude(unittest.TestCase):
                 else:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, 'agent::99\n')
-                    again = subprocess.run(['sh', '-c', script + '\nprintf "agent:%s\\n" "$DISPLAY"'],
+                    again = subprocess.run(['sh', '-c', script + '''
+flotilla_run_with_preludes sh -c 'printf "agent:%s\\n" "$DISPLAY"'
+'''],
                                            env=env, capture_output=True, text=True)
                     self.assertEqual(again.returncode, 0, again.stderr)
                     self.assertEqual(again.stdout, 'agent::99\n')

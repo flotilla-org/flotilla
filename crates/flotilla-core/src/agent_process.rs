@@ -32,7 +32,10 @@ pub fn monitored_command(command: &str, crew_id: &str) -> String {
 /// Source image preludes in the command's shell before launching an agent or
 /// checking a provide. A missing directory is valid for arbitrary images.
 pub fn with_preludes(command: &str) -> String {
-    format!("{}\n{command}", include_str!("../../../ci/crew-image/prelude.sh"))
+    format!(
+        "{}\nflotilla_run_command() {{\n{command}\n}}\nflotilla_run_with_preludes flotilla_run_command \"$@\"",
+        include_str!("../../../ci/crew-image/prelude.sh")
+    )
 }
 
 /// Remove only this launch's receipt through its execution environment.

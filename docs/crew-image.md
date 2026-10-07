@@ -406,8 +406,9 @@ Existing literal images, arbitrary Dockerfile fragments and registry-less
 single-host builds continue to work. No Forgejo workflow is required.
 
 Crew launch sources regular files in `/etc/flotilla/prelude.d/*` in lexical
-order in the launch shell, before the agent command. Missing/empty directories
-are valid. Scripts must be portable to the launch shell and must not override
+order in a subshell of the launch shell, before the agent command. Prelude
+exports and the command share that scope; caller cleanup traps are preserved.
+Missing/empty directories are valid. Scripts must be portable to the launch shell and must not override
 shell error traps/options; a failing command stops launch, retains output and
 names the failed script and exit code. Build probes use the same source runner
 in `sh`, then execute the declared argv without shell interpolation. Prelude
@@ -415,8 +416,12 @@ runner contents participate in verification input hashing. A mismatch fails
 ImageBuild, with full diagnostics retained in the build-log Artifact.
 
 The display prelude shares local Xvfb display `:99` across crew launches in a
-vessel, waits at most ten seconds for it to open, and exports `DISPLAY`.
-Concurrent launches use the server that becomes ready; relaunches reuse it. It disables TCP listening. Mesa software rendering is baked into
+vessel, waits for it to open, and exports `DISPLAY`.
+Concurrent launches use the server that becomes ready; relaunches reuse it.
+Terminal teardown may send SIGHUP to Xvfb; a later launch restarts it if needed.
+The named readiness-attempt limit allows 100 retries with 0.1-second pauses.
+It disables TCP listening; empty Xauth state is intentional for trusted clients
+sharing this container-local Unix socket. Mesa software rendering is baked into
 image `Config.Env` as `LIBGL_ALWAYS_SOFTWARE=1`. Container `Config.Env` (image
 defaults plus declared overrides) is the crew baseline, including this variable;
 prelude exports extend it in the launch shell. The vessel's container lifetime
