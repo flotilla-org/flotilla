@@ -1067,15 +1067,36 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::ConfigStore,
         daemon::DaemonHandle,
-        in_process::tests::{create_identity_convoy, create_running_session, create_test_environment, standing_ensure_fixture, test_meta},
+        in_process::{
+            tests::{create_identity_convoy, create_running_session, create_test_environment, test_meta},
+            InProcessDaemon,
+        },
+        providers::discovery::test_support::fake_discovery,
     };
+
+    // Attach scenarios need a daemon and providers, independent of standing-convoy admission.
+    async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"attach-test\"\n").expect("daemon config");
+        let backend = ResourceBackend::InMemory(Default::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("local"),
+            backend.clone(),
+        )
+        .await;
+        (daemon, backend, temp)
+    }
 
     // Transient checkout resolution must retain its selected host without
     // claiming a durable TerminalSession identity, including cross-host hops.
     #[tokio::test]
     async fn transient_checkout_preserves_host_binding() {
-        let (daemon, _backend, _clock, temp) = standing_ensure_fixture().await;
+        let (daemon, _backend, temp) = attach_fixture().await;
         std::fs::write(temp.path().join("hosts.toml"), "[hosts.kiwi]\nhostname = \"daemon-route\"\nexpected_host_name = \"kiwi\"\n")
             .expect("host routes");
         let resolver = daemon.attach_resolver();
@@ -1182,7 +1203,7 @@ mod tests {
     }
     #[tokio::test]
     async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_hop() {
-        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        let (daemon, backend, _temp) = attach_fixture().await;
         create_identity_convoy(&backend, "convoy-andamento", "governor", Some("andamento")).await;
         create_identity_convoy(&backend, "convoy-flotilla", "governor", Some("flotilla")).await;
         let local_host = daemon.local_host_id().expect("local host identity").to_string();
@@ -1248,7 +1269,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_convoy_with_live_session_remains_attachable_and_listed() {
-        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        let (daemon, backend, _temp) = attach_fixture().await;
         create_identity_convoy(&backend, "convoy-failed", "coder", Some("flotilla")).await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
@@ -1297,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_role_prefers_newest_connectable_generation() {
-        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        let (daemon, backend, _temp) = attach_fixture().await;
         create_identity_convoy(&backend, "convoy-old", "coder", Some("flotilla")).await;
         let mut successor = ConvoySpec::builder().workflow_ref("review".to_string()).role("coder".to_string()).generation(2).build();
         successor.project_ref = Some("flotilla".to_string());
@@ -1346,7 +1367,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleted_terminal_session_is_named_in_attach_error() {
-        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        let (daemon, backend, _temp) = attach_fixture().await;
         create_identity_convoy(&backend, "convoy-gone", "coder", Some("flotilla")).await;
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend

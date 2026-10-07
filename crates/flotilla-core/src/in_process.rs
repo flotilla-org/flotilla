@@ -12,13 +12,10 @@ pub(crate) use crew_ops::convoy_message_address;
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
 use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator};
 
-// Exercise the real controller in the existing private daemon scenario harness
-// without adding a production dependency from core back to controllers.
 #[path = "in_process/convoy_admission.rs"]
 mod convoy_admission;
-#[cfg(test)]
-#[path = "../../flotilla-controllers/src/reconcilers/convoy_ensure.rs"]
-mod ensure_controller_under_test;
+#[cfg(feature = "test-support")]
+pub mod ensure_scenarios;
 mod project_ops;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
 mod repository_operations;
@@ -87,9 +84,8 @@ use flotilla_resources::{
 };
 #[cfg(test)]
 use flotilla_resources::{
-    CheckoutIntegrationStatus, ConditionValue, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyPhase, CrewCompletionRefusalCause,
-    Demand as ResourceDemand, DemandKind, DemandSpec, HoldAct, IntegrationCondition, Presentation as ResourcePresentation,
-    TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE,
+    CheckoutIntegrationStatus, ConditionValue, ConvoyPhase, CrewCompletionRefusalCause, HoldAct, IntegrationCondition,
+    TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
 };
 use futures::{FutureExt, StreamExt};
 use project_ops::{is_declaration_backed_project, validate_project_name};
@@ -99,8 +95,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
-#[cfg(test)]
-use crate::ops_entry::{PRESENTS_AS_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION};
 use crate::{
     agent_adapter::{required_agent_adapters, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
@@ -2043,16 +2037,6 @@ impl InProcessDaemon {
                 }
             }
         });
-
-        #[cfg(test)]
-        daemon
-            .install_convoy_ensure_reconciler(Arc::new(
-                ensure_controller_under_test::EnsureReconciler::builder()
-                    .resource_backend(daemon.resource_backend.clone())
-                    .clock(Arc::clone(&daemon.clock))
-                    .build(),
-            ))
-            .await;
 
         daemon
     }
@@ -4103,23 +4087,9 @@ impl InProcessDaemon {
     async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String> {
         self.convoy_ensure_reconciler().await?.reap_ensured_convoy(self, namespace, ensure_name, convoy_name, force).await
     }
-    #[cfg(test)]
-    async fn ensure_admission_dependency_hash(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
-        ensure_controller_under_test::EnsureReconciler::builder()
-            .resource_backend(self.resource_backend.clone())
-            .clock(Arc::clone(&self.clock))
-            .build()
-            .ensure_admission_dependency_hash(self, namespace, ensure)
-            .await
-    }
-    #[cfg(test)]
-    async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
-        ensure_controller_under_test::EnsureReconciler::builder()
-            .resource_backend(self.resource_backend.clone())
-            .clock(Arc::clone(&self.clock))
-            .build()
-            .start_ensured_convoy(self, namespace, ensure)
-            .await
+    #[cfg(feature = "test-support")]
+    pub fn clock_for_scenarios(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
     }
     async fn prepare_ensured_convoy(
         &self,
@@ -4228,17 +4198,6 @@ impl InProcessDaemon {
 
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
         self.convoy_admission.check_remote_placement_free_space_floor(namespace, placement).await
-    }
-
-    #[cfg(test)]
-    async fn write_admission_briefs(
-        &self,
-        namespace: &str,
-        name: &str,
-        spec: &ConvoySpec,
-        workflow: &WorkflowTemplateSpec,
-    ) -> Result<bool, String> {
-        self.convoy_admission.write_admission_briefs(namespace, name, spec, workflow).await
     }
 
     async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
@@ -5542,7 +5501,7 @@ impl InProcessDaemon {
         self.crew_ops.abandon(namespace, name, reason, principal_ref).await
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     async fn abandon_convoy_internal_with_hook<F, Fut>(
         &self,
         namespace: &str,
