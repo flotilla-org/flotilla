@@ -21,4 +21,11 @@ I searched all Rust sources for `tls::client`, `client_builder`, `reqwest`, requ
 | Wheelhouse metadata POST (`flotilla-manifest/src/sink.rs`) | Exemption beside tests: owned local IPC protocol, existing socket HTTP stand-in covers POST routing and payloads. |
 | Shared TLS clients / `ReqwestHttpClient::execute` / `execute_to_file`, replay transports and request factories | Service-neutral construction/execution, grouped with consumers. Exemption beside transport tests; shared TLS User-Agent has existing wire coverage. Discovery factories and examples construct the audited adapters; they introduce no distinct request shape. |
 
+The former replication-plane image archive HTTP boundary was removed in the
+#2729 follow-up. [#2850](https://github.com/flotilla-org/flotilla/issues/2850)
+tracks registry-less image bytes through a separate Tender raw-stream exposure
+between directly reachable peers, without relay routing. Its byte-stream and
+Docker process contract coverage belongs with that implementation; there is no
+remaining replication HTTP image caller or contract to claim here.
+
 CLAUDE.md now requires enforcing stand-ins or recorded replay for outbound HTTP; arbitrary-request mocks alone are insufficient. The exemptions above identify compatibility gaps explicitly, rather than treating response-only mocks as service contracts.
