@@ -2,6 +2,8 @@
 # Both source revisions pin their own Rust/Zig/Ghostty inputs; include the
 # preparation scripts too, since they can override those source pins.
 # This cache is for the Linux cleat job; sha256sum is supplied by its runner.
+# Local runs without ImageOS/ImageVersion use a distinct fallback identity.
+# Add every new sourced build/preparation input to the digest list below.
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
