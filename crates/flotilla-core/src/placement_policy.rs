@@ -104,6 +104,7 @@ mod tests {
         PlacementPolicySpec::builder()
             .pool(pool.to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: host.to_string(),
                 image: "registration-default:latest".to_string().into(),

@@ -39,6 +39,7 @@ fn live_policy_set_migrates_to_kinds() {
     let docker = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "feta".to_string(),
             image: "crew:v1".into(),

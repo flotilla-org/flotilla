@@ -22,6 +22,7 @@ fn docker(pool: &str, priority: i32, host: &str, image: &str) -> PlacementPolicy
         .pool(pool.to_string())
         .priority(priority)
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: host.to_string(),
             image: image.to_string().into(),

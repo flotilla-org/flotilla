@@ -2963,6 +2963,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
             &PlacementPolicySpec::builder()
                 .pool(profile.docker_pool.clone())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: profile.host_id.clone(),
                     image: DEFAULT_DOCKER_IMAGE.to_string().into(),
@@ -4889,8 +4890,8 @@ struct DockerControllerRuntime {
 }
 
 impl DockerControllerRuntime {
-    // One-generation bridge until #2731. New records freeze baseline provenance;
-    // old records recover it through their owning Vessel's placement policy.
+    // One-generation bridge until #2731. New snapshots and Environments freeze
+    // baseline provenance; old records recover it through the live policy.
     async fn legacy_baseline_for_environment(&self, name: &str) -> Result<bool, String> {
         let backend = self.state.daemon.resource_backend();
         let environment = match backend.using::<Environment>(&self.state.namespace).get(name).await {
@@ -4916,10 +4917,7 @@ impl DockerControllerRuntime {
             Err(ResourceError::NotFound { .. }) => return Ok(false),
             Err(error) => return Err(error.to_string()),
         };
-        Ok(policy
-            .spec
-            .docker_per_vessel
-            .is_some_and(|docker| matches!(docker.image, flotilla_resources::DockerImageSource::Baseline { .. })))
+        Ok(policy.spec.docker_per_vessel.is_some_and(|docker| docker.legacy_image_baseline_ref().is_some()))
     }
 
     async fn provider_for_environment(
@@ -12783,6 +12781,7 @@ mod tests {
             PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: feta_host_ref.clone(),
                     image: "test-image".to_string().into(),
@@ -13686,10 +13685,256 @@ mod tests {
         assert!(!can_fill_git_credential().await);
     }
 
+    // The only fake boundary is the Docker CLI: preparation must inspect the
+    // admitted tag and resolve its local digest, without a real Docker daemon.
+    struct HeldBaselineRunner {
+        image: String,
+    }
+    #[async_trait]
+    impl CommandRunner for HeldBaselineRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "docker");
+            match args {
+                ["image", "inspect", image] if *image == self.image => Ok(String::new()),
+                ["pull", image] if *image == self.image => Ok(String::new()),
+                ["image", "inspect", "--format", "{{.Id}}", image] if *image == self.image => Ok(format!("sha256:{}", "a".repeat(64))),
+                _ => panic!("unexpected Docker invocation: {args:?}"),
+            }
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("unexpected output invocation")
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
+        }
+    }
+
+    // #2941: a baseline policy must survive real admission's prepared snapshot,
+    // Vessel creation and Environment preparation; an authored literal tag must refuse.
+    #[tokio::test]
+    async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
+        use flotilla_core::providers::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+        use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
+
+        // Exhaust baseline sources with/without layers and an authored literal.
+        // Timing/interleavings do not affect this immutable admission chain;
+        // old live records and routed duplicate admissions have separate coverage.
+        for (baseline, layers) in [(true, false), (true, true), (false, false)] {
+            let temp = TempDir::new().expect("tempdir");
+            fs::write(temp.path().join("daemon.toml"), "machine_id = \"fresh-baseline-admission\"\n").expect("config");
+            let config = Arc::new(ConfigStore::with_base(temp.path()));
+            let daemon = InProcessDaemon::new(
+                Vec::new(),
+                config.clone(),
+                fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+                flotilla_protocol::HostName::new("udder"),
+            )
+            .await;
+            let backend = daemon.resource_backend();
+            let selection = if layers {
+                use flotilla_resources::{ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage};
+                backend
+                    .definitions::<ImageLayer>(NAMESPACE)
+                    .apply(
+                        &empty_meta("base"),
+                        &ImageLayerSpec::builder()
+                            .stage(ImageLayerStage::Base)
+                            .parent(ImageLayerParent::Image(format!("debian@sha256:{}", "a".repeat(64))))
+                            .repository("https://example.test/images".into())
+                            .revision("1".repeat(40))
+                            .fragment("Dockerfile.base".into())
+                            .build(),
+                    )
+                    .await
+                    .expect("base layer");
+                Some(ImageLayerSelection::builder().base("base".into()).build())
+            } else {
+                None
+            };
+            backend
+                .definitions::<CrewImageBaseline>(NAMESPACE)
+                .apply(&empty_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:baseline".into(), layers: selection })
+                .await
+                .expect("baseline");
+            let hosts = backend.using::<Host>(NAMESPACE);
+            let host = hosts.create(&empty_meta(daemon.local_host_id().expect("host").as_str()), &HostSpec::default()).await.expect("host");
+            hosts
+                .update_status(
+                    &host.metadata.name,
+                    &host.metadata.resource_version,
+                    &HostStatus {
+                        ready: true,
+                        heartbeat_at: Some(Utc::now()),
+                        admission_free_space_floor_bytes: Some(0),
+                        capabilities: BTreeMap::from([("docker".into(), json!(true)), ("os".into(), json!("linux"))]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("host status");
+            let repositories = backend.using::<Repository>(NAMESPACE);
+            let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+            let repository =
+                flotilla_resources::ensure_repository(&repositories, &repository_spec.key(), &repository_spec).await.expect("repository");
+            repositories
+                .update_status(
+                    &repository.metadata.name,
+                    &repository.metadata.resource_version,
+                    &flotilla_resources::RepositoryStatus { default_branch: Some("main".into()), ..Default::default() },
+                )
+                .await
+                .expect("default branch");
+            let image = if baseline {
+                DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }
+            } else {
+                DockerImageSource::Literal("crew:baseline".into())
+            };
+            backend
+                .using::<PlacementPolicy>(NAMESPACE)
+                .create(
+                    &empty_meta("crew-policy"),
+                    &PlacementPolicySpec::builder()
+                        .pool("cleat".into())
+                        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                            legacy_image_baseline_ref: None,
+                            host_ref: daemon.local_host_id().expect("host").to_string(),
+                            image,
+                            pull_policy: flotilla_resources::DockerImagePullPolicy::IfNotPresent,
+                            memory_policy: Default::default(),
+                            agent_adapters: Default::default(),
+                            default_cwd: None,
+                            env: Default::default(),
+                            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
+                        })
+                        .build(),
+                )
+                .await
+                .expect("policy");
+            backend
+                .using::<WorkflowTemplate>(NAMESPACE)
+                .create(
+                    &empty_meta("baseline-workflow"),
+                    &WorkflowTemplateSpec::builder()
+                        .vessels(vec![VesselRequirement::builder()
+                            .name("work".into())
+                            .crew(vec![CrewSpec::builder().role("tool".into()).source(CrewSource::Tool { command: "true".into() }).build()])
+                            .build()])
+                        .build(),
+                )
+                .await
+                .expect("workflow");
+            let mut events = daemon.subscribe();
+            let id = daemon
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::ConvoyCreate {
+                            name: "baseline-convoy".into(),
+                            workflow_ref: "baseline-workflow".into(),
+                            inputs: Vec::new(),
+                            repository_url: Some("https://github.com/flotilla-org/flotilla".into()),
+                            r#ref: Some("test/baseline".into()),
+                            project_ref: None,
+                            placement_policy: Some("crew-policy".into()),
+                            adopted_checkout: None,
+                        })
+                        .build(),
+                )
+                .await
+                .expect("admit");
+            let result = wait_for_command_result(&mut events, id).await;
+            assert!(matches!(result, CommandValue::ConvoyCreated { .. }), "admission: {result:?}");
+            let convoys = backend.using::<Convoy>(NAMESPACE);
+            let name = convoy_record_name(&backend, "baseline-convoy").await;
+            let convoy_reconciler =
+                ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)).with_vessels(backend.using::<Vessel>(NAMESPACE));
+            let mut created_vessel = None;
+            for _ in 0..4 {
+                let convoy = convoys.get(&name).await.expect("convoy");
+                let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
+                let outcome = convoy_reconciler.reconcile(&convoy, &prepared, Utc::now());
+                if let Some((meta, spec)) = outcome.actuations.into_iter().find_map(|actuation| match actuation {
+                    Actuation::CreateVessel { meta, spec } => Some((meta, spec)),
+                    _ => None,
+                }) {
+                    created_vessel = Some(backend.using::<Vessel>(NAMESPACE).create(&meta, &spec).await.expect("vessel"));
+                    break;
+                }
+                let patch = outcome.patch.expect("convoy must advance toward Vessel");
+                flotilla_resources::apply_status_patch(&convoys, &name, &patch).await.expect("advance convoy");
+            }
+            let vessel = created_vessel.expect("convoy must create a Vessel within four transitions");
+            assert!(vessel.spec.placement_policy_ref.starts_with("placement-snapshot-"));
+            let snapshot = backend.using::<PlacementPolicy>(NAMESPACE).get(&vessel.spec.placement_policy_ref).await.expect("snapshot");
+            let docker = snapshot.spec.docker_per_vessel.expect("docker snapshot");
+            assert_eq!(docker.legacy_image_baseline_ref.as_deref(), baseline.then_some("fleet-crew"));
+            assert_eq!(matches!(docker.image, DockerImageSource::Composition { .. }), layers);
+            // Mutating the live baseline after admission must not change the frozen image.
+            backend
+                .definitions::<CrewImageBaseline>(NAMESPACE)
+                .apply(&empty_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:changed".into(), layers: None })
+                .await
+                .expect("change live baseline");
+            let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+            let prepared = reconciler.prepare(&vessel).await.expect("prepare vessel");
+            let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+            let (meta, spec) = outcome
+                .actuations
+                .into_iter()
+                .find_map(|actuation| match actuation {
+                    Actuation::CreateEnvironment { meta, spec } => Some((meta, spec)),
+                    _ => None,
+                })
+                .expect("Vessel must create Environment");
+            assert_eq!(spec.docker.as_ref().expect("docker").image, "crew:baseline");
+            assert_eq!(meta.labels.get("flotilla.work/legacy-image-baseline").map(String::as_str), baseline.then_some("fleet-crew"));
+            let environment = backend.using::<Environment>(NAMESPACE).create(&meta, &spec).await.expect("environment");
+            let state = Arc::new(ControllerRuntimeState::new(
+                daemon.clone(),
+                config,
+                passthrough_registry(),
+                None,
+                daemon.local_host_id().expect("host").to_string(),
+                None,
+                "host-direct-test".into(),
+            ));
+            let runtime = DockerControllerRuntime { state };
+            let legacy_baseline = runtime.legacy_baseline_for_environment(&environment.metadata.name).await.expect("provenance");
+            let provider = DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner { image: "crew:baseline".into() }));
+            let result = provider.prepare(&environment.spec, &PrepareOpts { legacy_baseline, ..Default::default() }).await;
+            if baseline {
+                assert!(result.is_ok(), "baseline prepare: {:?}", result.err());
+            } else {
+                assert_eq!(
+                    result.err().expect("literal must refuse"),
+                    "Docker environments require a pinned digest; mutable tags are unsupported"
+                );
+            }
+            assert_eq!(legacy_baseline, baseline);
+            if baseline {
+                // Recovery also works if an Environment lacks the new label:
+                // its owning Vessel still names the immutable prepared snapshot.
+                let mut meta = InputMeta::from(&environment.metadata);
+                meta.labels.remove("flotilla.work/legacy-image-baseline");
+                backend
+                    .using::<Environment>(NAMESPACE)
+                    .update(&meta, &environment.metadata.resource_version, &environment.spec)
+                    .await
+                    .expect("unlabeled snapshot-backed Environment");
+                let legacy_baseline =
+                    runtime.legacy_baseline_for_environment(&environment.metadata.name).await.expect("snapshot provenance");
+                provider
+                    .prepare(&environment.spec, &PrepareOpts { legacy_baseline, ..Default::default() })
+                    .await
+                    .expect("snapshot provenance prepares without Environment label");
+            }
+        }
+    }
+
     // Pre-#2731 records have no provenance label; the owning Vessel's baseline
     // policy admits them. A literal policy or an unowned tag is never admitted.
     #[tokio::test]
     async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_provenance() {
+        use flotilla_core::providers::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -13706,6 +13951,7 @@ mod tests {
         let policy_spec = PlacementPolicySpec::builder()
             .pool("cleat".into())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 host_ref: "udder".into(),
                 image: flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() },
                 pull_policy: Default::default(),
@@ -13757,15 +14003,52 @@ mod tests {
         ));
         let runtime = DockerControllerRuntime { state };
         assert!(runtime.legacy_baseline_for_environment("live-environment").await.expect("baseline provenance"));
+        let provider = DockerEnvironmentProvider::new(Arc::new(HeldBaselineRunner {
+            image: environment.spec.docker.as_ref().expect("docker").image.clone(),
+        }));
+        provider
+            .prepare(
+                &environment.spec,
+                &PrepareOpts {
+                    legacy_baseline: runtime.legacy_baseline_for_environment("live-environment").await.expect("old provenance"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unlabeled live baseline prepares");
         assert!(!runtime.legacy_baseline_for_environment("unknown").await.expect("absent record"));
         let mut literal = policy.spec.clone();
         literal.docker_per_vessel.as_mut().expect("docker").image = flotilla_resources::DockerImageSource::Literal("crew:tag".into());
         policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &literal).await.expect("literal policy");
         assert!(!runtime.legacy_baseline_for_environment("live-environment").await.expect("literal is not baseline"));
+        assert_eq!(
+            provider
+                .prepare(
+                    &environment.spec,
+                    &PrepareOpts {
+                        legacy_baseline: runtime.legacy_baseline_for_environment("live-environment").await.expect("literal provenance"),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .err()
+                .expect("literal refuses"),
+            "Docker environments require a pinned digest; mutable tags are unsupported"
+        );
         let mut meta = InputMeta::from(&environment.metadata);
         meta.labels.insert("flotilla.work/legacy-image-baseline".into(), "fleet-crew".into());
         environments.update(&meta, &environment.metadata.resource_version, &environment.spec).await.expect("freeze baseline provenance");
         assert!(runtime.legacy_baseline_for_environment("live-environment").await.expect("frozen baseline survives policy changes"));
+        provider
+            .prepare(
+                &environment.spec,
+                &PrepareOpts {
+                    legacy_baseline: runtime.legacy_baseline_for_environment("live-environment").await.expect("frozen provenance"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("labeled live baseline prepares after policy change");
     }
 
     #[tokio::test]
@@ -17785,6 +18068,7 @@ mod tests {
         let docker_spec = PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: "udder".to_string(),
                 image: "crew:test".into(),
@@ -17904,6 +18188,7 @@ mod tests {
             let spec = PlacementPolicySpec::builder()
                 .pool("cleat".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: host.to_string(),
                     image: "crew:test".into(),
@@ -17920,6 +18205,7 @@ mod tests {
             let mut spec = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
             if docker {
                 spec.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: host.to_string(),
                     image: "ubuntu:24.04".into(),
@@ -17969,6 +18255,7 @@ mod tests {
         invalid.host_direct =
             Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
         invalid.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "kiwi".to_string(),
             image: "crew:test".into(),
@@ -18114,6 +18401,7 @@ mod tests {
                     .pool("operator-edited-pool".to_string())
                     .priority(20)
                     .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                        legacy_image_baseline_ref: None,
                         memory_policy: Default::default(),
                         host_ref: "operator-edited-host".to_string(),
                         image: "operator/image:latest".to_string().into(),
@@ -18137,6 +18425,7 @@ mod tests {
         assert_eq!(
             reconciled.spec.docker_per_vessel,
             Some(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: profile.host_id,
                 image: "operator/image:latest".to_string().into(),

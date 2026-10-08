@@ -450,6 +450,7 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: host_ref.to_string(),
                     image: "crew:latest".to_string().into(),

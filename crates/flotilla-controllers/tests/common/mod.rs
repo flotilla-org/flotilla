@@ -212,6 +212,7 @@ pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace:
         PlacementPolicySpec::builder()
             .pool(fixture.pool)
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: fixture.host_ref,
                 image: fixture.image.into(),
