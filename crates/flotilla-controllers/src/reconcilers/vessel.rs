@@ -1613,13 +1613,19 @@ fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &s
 }
 
 fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTreeMap<String, String> {
-    policy
+    let mut labels: BTreeMap<String, String> = policy
         .metadata
         .labels
         .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
         .map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone()))
         .into_iter()
-        .collect()
+        .collect();
+    if let Some(docker) = &policy.spec.docker_per_vessel {
+        if let DockerImageSource::Baseline { image_baseline_ref } = &docker.image {
+            labels.insert("flotilla.work/legacy-image-baseline".into(), image_baseline_ref.clone());
+        }
+    }
+    labels
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {

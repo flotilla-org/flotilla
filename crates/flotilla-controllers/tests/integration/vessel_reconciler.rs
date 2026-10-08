@@ -3404,7 +3404,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
             let outcome = reconciler.reconcile(vessel, &prepared, Utc::now());
             assert!(
                 outcome.actuations.iter().any(|actuation| matches!(actuation,
-                    Actuation::CreateEnvironment { spec, .. } if spec.docker.as_ref().is_some_and(|docker| docker.image == image)
+                    Actuation::CreateEnvironment { spec, meta } if spec.docker.as_ref().is_some_and(|docker| docker.image == image && docker.image_build_ref.is_none()) && meta.labels.get("flotilla.work/legacy-image-baseline").map(String::as_str) == Some("fleet-crew")
                 )),
                 "each host must provision the new image: {:?}",
                 outcome.actuations

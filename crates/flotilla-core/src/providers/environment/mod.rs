@@ -53,6 +53,9 @@ pub struct ProvisionOpts {
 /// RegistryAuth handle; callers never select an image through these options.
 #[derive(Debug, Clone, Default)]
 pub struct PrepareOpts {
+    /// Transitional admission for baseline-sourced tags until #2731 cuts the
+    /// fleet over to ImageBuild. Only the resource controller verifies provenance.
+    pub legacy_baseline: bool,
     pub prepared_auth: PreparedEnvironmentAuth,
 }
 

@@ -30,6 +30,24 @@ pub struct DockerEnvironmentProvider {
 }
 
 impl DockerEnvironmentProvider {
+    async fn pull_prepared_image(&self, image: &str, opts: &PrepareOpts) -> Result<(), String> {
+        let directory = match &opts.prepared_auth {
+            PreparedEnvironmentAuth::RegistryConfig { directory } => Some(directory.to_string()),
+            PreparedEnvironmentAuth::NoRegistryCredential => None,
+        };
+        let mut args = Vec::new();
+        if let Some(directory) = &directory {
+            args.extend(["--config", directory.as_str()]);
+        }
+        args.extend(["pull", image]);
+        self.inner
+            .runner
+            .run("docker", &args, Path::new("/"), &ChannelLabel::Default)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("pinned image pull failed: {error}"))
+    }
+
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self { inner: Arc::new(DockerEnvironmentProviderInner::new(runner)), preparation_owner: Arc::new(()) }
     }
@@ -54,26 +72,41 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let spec = spec.docker.as_ref().expect("kind checked");
         let registry_digest = spec.image.rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest));
         if !flotilla_resources::is_image_digest(&spec.image) && !registry_digest {
-            return Err("Docker environments require a pinned digest; mutable tags are unsupported".into());
+            // #2731 has not cut fleet baselines over to ImageBuild. Admission is
+            // verified by the controller, never inferred from a tag's spelling.
+            if !opts.legacy_baseline
+                || spec.image_build_ref.is_some()
+                || spec.image_composition.is_some()
+                || spec.image.contains('@')
+                || spec.image.is_empty()
+            {
+                return Err("Docker environments require a pinned digest; mutable tags are unsupported".into());
+            }
+            let held = self.inner.image_exists(&spec.image, Path::new("/")).await?;
+            match spec.pull_policy {
+                flotilla_resources::DockerImagePullPolicy::Always => self.pull_prepared_image(&spec.image, opts).await?,
+                flotilla_resources::DockerImagePullPolicy::IfNotPresent if !held => self.pull_prepared_image(&spec.image, opts).await?,
+                flotilla_resources::DockerImagePullPolicy::Never if !held => {
+                    return Err("baseline image is absent and pull policy is never".into())
+                }
+                _ => {}
+            }
+            let digest = self
+                .inner
+                .runner
+                .run("docker", &["image", "inspect", "--format", "{{.Id}}", &spec.image], Path::new("/"), &ChannelLabel::Default)
+                .await?;
+            let digest = digest.trim();
+            if !flotilla_resources::is_image_digest(digest) {
+                return Err("baseline image did not resolve to a local digest".into());
+            }
+            return Ok(super::PreparedEnvironment::new(&self.preparation_owner, ImageId::new(digest)));
         }
         if !self.inner.image_exists(&spec.image, Path::new("/")).await? {
             if !registry_digest {
                 return Err("waiting on build: requested digest is absent from this provider's cache".into());
             }
-            let mut args = Vec::new();
-            let directory = match &opts.prepared_auth {
-                PreparedEnvironmentAuth::RegistryConfig { directory } => Some(directory.to_string()),
-                PreparedEnvironmentAuth::NoRegistryCredential => None,
-            };
-            if let Some(directory) = &directory {
-                args.extend(["--config", directory.as_str()]);
-            }
-            args.extend(["pull", spec.image.as_str()]);
-            self.inner
-                .runner
-                .run("docker", &args, Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("pinned image pull failed: {error}"))?;
+            self.pull_prepared_image(&spec.image, opts).await?;
             if !self.inner.image_exists(&spec.image, Path::new("/")).await? {
                 return Err("pinned image pull succeeded but digest is not present".into());
             }

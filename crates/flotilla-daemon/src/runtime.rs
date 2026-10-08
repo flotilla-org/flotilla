@@ -4886,6 +4886,39 @@ struct DockerControllerRuntime {
 }
 
 impl DockerControllerRuntime {
+    // One-generation bridge until #2731. New records freeze baseline provenance;
+    // old records recover it through their owning Vessel's placement policy.
+    async fn legacy_baseline_for_environment(&self, name: &str) -> Result<bool, String> {
+        let backend = self.state.daemon.resource_backend();
+        let environment = match backend.using::<Environment>(&self.state.namespace).get(name).await {
+            Ok(environment) => environment,
+            Err(ResourceError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        if environment.metadata.labels.contains_key("flotilla.work/legacy-image-baseline") {
+            return Ok(true);
+        }
+        let Some(owner) =
+            environment.metadata.owner_references.iter().find(|owner| owner.controller && owner.kind == Vessel::API_PATHS.kind)
+        else {
+            return Ok(false);
+        };
+        let vessel = match backend.using::<Vessel>(&self.state.namespace).get(&owner.name).await {
+            Ok(vessel) => vessel,
+            Err(ResourceError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        let policy = match backend.using::<PlacementPolicy>(&self.state.namespace).get(&vessel.spec.placement_policy_ref).await {
+            Ok(policy) => policy,
+            Err(ResourceError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        Ok(policy
+            .spec
+            .docker_per_vessel
+            .is_some_and(|docker| matches!(docker.image, flotilla_resources::DockerImageSource::Baseline { .. })))
+    }
+
     async fn provider_for_environment(
         &self,
         name: &str,
@@ -4966,6 +4999,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
         let tools = self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?;
         for tool in &tools {
@@ -5113,7 +5147,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let prepared = match provider
             .prepare(
                 &EnvironmentSpec { host_direct: None, docker: Some(spec.clone()) },
-                &flotilla_core::providers::environment::PrepareOpts { prepared_auth: opts.prepared_auth.clone() },
+                &flotilla_core::providers::environment::PrepareOpts { legacy_baseline, prepared_auth: opts.prepared_auth.clone() },
             )
             .await
         {
@@ -13565,6 +13599,89 @@ mod tests {
         vessels.delete("credential-work-vessel").await.expect("tear down vessel");
         reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke credentials after vessel teardown");
         assert!(!can_fill_git_credential().await);
+    }
+
+    // Pre-#2731 records have no provenance label; the owning Vessel's baseline
+    // policy admits them. A literal policy or an unowned tag is never admitted.
+    #[tokio::test]
+    async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_provenance() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"baseline-admission-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            config.clone(),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            flotilla_protocol::HostName::new("udder"),
+        )
+        .await;
+        let backend = daemon.resource_backend();
+        let policy_spec = PlacementPolicySpec::builder()
+            .pool("cleat".into())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: "udder".into(),
+                image: flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() },
+                pull_policy: Default::default(),
+                memory_policy: Default::default(),
+                agent_adapters: Default::default(),
+                default_cwd: None,
+                env: Default::default(),
+                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
+            })
+            .build();
+        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+        let policy = policies.create(&empty_meta("live-policy"), &policy_spec).await.expect("policy");
+        backend
+            .using::<Vessel>(NAMESPACE)
+            .create(
+                &empty_meta("live-vessel"),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "live-convoy".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "live-policy".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
+            .await
+            .expect("vessel");
+        create_ready_docker_environment(&daemon, "live-environment", "backing", Default::default()).await;
+        let environments = backend.using::<Environment>(NAMESPACE);
+        let mut environment = environments.get("live-environment").await.expect("record");
+        let docker = environment.spec.docker.as_mut().expect("docker");
+        docker.image = "forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-10-02.d9e59d8c.dbd6e440".into();
+        docker.image_build_ref = None;
+        docker.image_composition = None;
+        let mut meta = InputMeta::from(&environment.metadata);
+        meta.owner_references = vec![flotilla_resources::OwnerReference {
+            api_version: "flotilla.work/v1".into(),
+            kind: Vessel::API_PATHS.kind.into(),
+            name: "live-vessel".into(),
+            controller: true,
+        }];
+        let environment =
+            environments.update(&meta, &environment.metadata.resource_version, &environment.spec).await.expect("legacy record");
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon.clone(),
+            config,
+            passthrough_registry(),
+            None,
+            daemon.local_host_id().expect("host").to_string(),
+            None,
+            "host-direct-test".into(),
+        ));
+        let runtime = DockerControllerRuntime { state };
+        assert!(runtime.legacy_baseline_for_environment("live-environment").await.expect("baseline provenance"));
+        assert!(!runtime.legacy_baseline_for_environment("unknown").await.expect("absent record"));
+        let mut literal = policy.spec.clone();
+        literal.docker_per_vessel.as_mut().expect("docker").image = flotilla_resources::DockerImageSource::Literal("crew:tag".into());
+        policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &literal).await.expect("literal policy");
+        assert!(!runtime.legacy_baseline_for_environment("live-environment").await.expect("literal is not baseline"));
+        let mut meta = InputMeta::from(&environment.metadata);
+        meta.labels.insert("flotilla.work/legacy-image-baseline".into(), "fleet-crew".into());
+        environments.update(&meta, &environment.metadata.resource_version, &environment.spec).await.expect("freeze baseline provenance");
+        assert!(runtime.legacy_baseline_for_environment("live-environment").await.expect("frozen baseline survives policy changes"));
     }
 
     #[tokio::test]

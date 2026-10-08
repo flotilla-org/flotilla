@@ -1713,6 +1713,7 @@ async fn preparation_pulls_only_pinned_registry_content() {
     let mut spec = pinned_spec();
     spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
     let opts = super::PrepareOpts {
+        legacy_baseline: false,
         prepared_auth: super::PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new("/private/operation-auth") },
     };
     let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
@@ -1746,5 +1747,41 @@ async fn preparation_refuses_mutable_or_malformed_image_identity() {
         spec.docker.as_mut().expect("docker").image = image.into();
         assert!(provider.prepare(&spec, &Default::default()).await.is_err());
         assert!(runner.calls().is_empty());
+    }
+}
+
+// Live pre-#2731 fleet records carry a baseline tag and no ImageBuild ref.
+// A controller-admitted baseline remains launchable, but runs the resolved digest.
+#[tokio::test]
+async fn live_baseline_tag_without_image_build_provisions_a_digest() {
+    let tag = "forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-10-02.d9e59d8c.dbd6e440";
+    let digest = format!("sha256:{}", "b".repeat(64));
+    for held in [false, true] {
+        let runner = Arc::new(QueuedRunner::new([
+            if held { Ok("held".into()) } else { Err("not held".into()) },
+            Ok("pulled".into()),
+            Ok(digest.clone()),
+            Ok("container-id".into()),
+            Ok(digest.clone()),
+        ]));
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let mut spec = pinned_spec();
+        let docker = spec.docker.as_mut().expect("docker");
+        docker.image = tag.into();
+        docker.image_build_ref = None;
+        docker.image_composition = None;
+        docker.pull_policy = flotilla_resources::DockerImagePullPolicy::Always;
+        let prepared = provider
+            .prepare(&spec, &super::PrepareOpts { legacy_baseline: true, ..Default::default() })
+            .await
+            .expect("prepare live baseline");
+        let handle =
+            provider.provision(EnvironmentId::new("live-baseline"), &prepared, Default::default()).await.expect("launch live record");
+        assert_eq!(handle.image().as_str(), digest);
+        let calls = runner.calls();
+        assert_eq!(calls[1].1, ["pull", tag]);
+        assert!(calls[3].1.contains(&digest));
+        assert!(!calls[3].1.contains(&tag.to_string()));
+        assert!(calls[3].1.windows(2).any(|args| args == ["--pull", "never"]));
     }
 }
