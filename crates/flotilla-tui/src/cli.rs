@@ -414,7 +414,6 @@ fn format_cli_list_human(response: &CliListResponse) -> String {
             CliListKind::Checkout => "No active checkouts found.\n".into(),
             CliListKind::Cr => "No open change requests found.\n".into(),
             CliListKind::Agent => "No active agent sessions found.\n".into(),
-            CliListKind::Workspace => "No active workspaces found.\n".into(),
         };
     }
     let mut table = Table::new();

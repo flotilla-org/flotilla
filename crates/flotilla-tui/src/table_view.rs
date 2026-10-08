@@ -13,7 +13,7 @@ use flotilla_protocol::{
     issue_query::READY_ISSUE_LABEL,
     result_set::{SurfaceState, Timestamp},
     AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId,
-    QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience, SessionPhase, ViewAddress,
+    QueryScope, RepositoryKey, ResultSetCondition, ResultSetState, Salience, SessionPhase, ViewAddress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -412,7 +412,6 @@ pub struct DetailField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableIntent {
     OpenInPm(OpenInPmTarget),
-    AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
     DeleteConvoy { row_id: RowId, namespace: String, name: String, host: Option<HostName> },
     OpenChangeRequest { id: String, repository_key: RepositoryKey, host: Option<HostName> },
@@ -520,9 +519,6 @@ struct VesselProjection {
     convoy: String,
     convoy_name: String,
     origin_host: Option<HostName>,
-    project_ref: Option<String>,
-    repo_hint: Option<RepoKey>,
-    vessel_count: usize,
     vessel: VesselSummary,
 }
 
@@ -621,9 +617,6 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 convoy: name.clone(),
                 convoy_name: convoy.name.clone(),
                 origin_host: convoy.origin_host.clone(),
-                project_ref: convoy.project_ref.clone(),
-                repo_hint: convoy.repo_hint.clone(),
-                vessel_count: convoy.vessels.len(),
                 vessel: vessel.clone(),
             });
             let subjects = convoy_subjects_label(&convoy.subjects, false);
@@ -645,9 +638,6 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                     convoy: convoy.clone(),
                     convoy_name: convoy_row.name.clone(),
                     origin_host: convoy_row.origin_host.clone(),
-                    project_ref: convoy_row.project_ref.clone(),
-                    repo_hint: convoy_row.repo_hint.clone(),
-                    vessel_count: convoy_row.vessels.len(),
                     vessel: vessel_row.clone(),
                 }],
             ))
@@ -1008,7 +998,7 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 7] = [
 ];
 
 static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 3] = [
-    ActionSpec { id: "attach", label: "Attach workspace", key: 'a', resolve: attach_vessel },
+    ActionSpec { id: "attach", label: "Attach session", key: 'a', resolve: attach_vessel },
     ActionSpec { id: "force_complete", label: "Force-complete work", key: 'x', resolve: force_complete_vessel },
     ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_vessel_in_pm },
 ];
@@ -1284,26 +1274,11 @@ fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
 }
 
 fn open_convoy_in_pm(row: &ConvoySummary) -> Option<TableIntent> {
-    let vessel = row
-        .vessels
-        .iter()
-        .find(|vessel| vessel.workspace_ref.is_some())
-        .or_else(|| row.vessels.iter().find(|vessel| vessel.materialize_ref.is_some()))
-        .or_else(|| row.vessels.first());
-    let label = vessel.map_or_else(
-        || row.name.clone(),
-        |vessel| if row.vessels.len() == 1 { row.name.clone() } else { format!("{}:{}", row.name, vessel.name) },
-    );
     Some(TableIntent::OpenInPm(OpenInPmTarget {
         namespace: row.namespace.clone(),
-        convoy: row.address(),
-        vessel: vessel.map(|vessel| vessel.name.clone()),
-        label,
-        host: row.origin_host.clone().or_else(|| vessel.and_then(|vessel| vessel.host.clone())),
-        project_ref: row.project_ref.clone(),
-        repo_hint: row.repo_hint.clone(),
-        workspace_ref: vessel.and_then(|vessel| vessel.workspace_ref.clone()),
-        materialize_ref: vessel.and_then(|vessel| vessel.materialize_ref.clone()),
+        convoy: row.resource_name.clone(),
+        vessel: None,
+        host: row.origin_host.clone(),
     }))
 }
 
@@ -1440,11 +1415,7 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
 }
 
 fn attach_vessel(row: &VesselProjection) -> Option<TableIntent> {
-    Some(TableIntent::AttachWorkspace {
-        workspace_ref: row.vessel.workspace_ref.clone()?,
-        host: row.vessel.host.clone()?,
-        repo_hint: row.repo_hint.clone(),
-    })
+    Some(TableIntent::AttachPane { reference: row.vessel.materialize_ref.clone()?, host: row.vessel.host.clone()? })
 }
 
 fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
@@ -1452,12 +1423,7 @@ fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
         namespace: row.namespace.clone(),
         convoy: row.convoy.clone(),
         vessel: Some(row.vessel.name.clone()),
-        label: if row.vessel_count == 1 { row.convoy_name.clone() } else { format!("{}:{}", row.convoy_name, row.vessel.name) },
         host: row.origin_host.clone().or_else(|| row.vessel.host.clone()),
-        project_ref: row.project_ref.clone(),
-        repo_hint: row.repo_hint.clone(),
-        workspace_ref: row.vessel.workspace_ref.clone(),
-        materialize_ref: row.vessel.materialize_ref.clone(),
     }))
 }
 
@@ -1499,7 +1465,8 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 mod tests {
     use flotilla_protocol::{
         test_support::TestIssue, AwarenessCounts, AwarenessFamilySummary, AwarenessKind, AwarenessNode, AwarenessState,
-        DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef, ResultSetCondition, ResultSetState,
+        DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepoKey, RepositoryKey, ResourceRef, ResultSetCondition,
+        ResultSetState,
     };
 
     use super::*;
@@ -1861,6 +1828,12 @@ mod tests {
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
         assert!(view.rows[0].actions.iter().any(|action| action.id == "open_in_pm" && action.label == "Open in PM" && action.key == 'o'));
+        // Focus uses the stored resource name, not the display address with a project suffix.
+        let TableIntent::OpenInPm(target) = &view.rows[0].actions.iter().find(|action| action.id == "open_in_pm").unwrap().intent else {
+            panic!("expected focus target");
+        };
+        assert_eq!(target.resource_ref(), ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "tables").on_host(HostName::new("kiwi")));
+
         assert!(view.rows[0].actions.iter().any(|action| {
             action
                 == &AvailableAction {
@@ -1914,16 +1887,18 @@ mod tests {
         assert!(implement.rows[0].describe.contains(&DetailField { label: "Local image ID", value: "sha256:test-image".to_string() }));
     }
 
+    // Attach uses the TerminalSession capability without a personal workspace.
     #[test]
     fn vessel_actions_are_resolved_only_when_capability_fields_allow_them() {
         let mut actionable = vessel("implement", &[], WorkPhase::Running);
-        actionable.workspace_ref = Some("workspace-1".into());
+        actionable.materialize_ref = Some("terminal-1".into());
         actionable.completion_target =
             Some(WorkCompletionTarget { convoy: "tables".into(), vessel: "implement".into(), host: HostName::new("kiwi") });
         let row = convoy(vec![actionable, vessel("review", &["implement"], WorkPhase::Pending)]);
         let view = project_convoys("convoy/dev/tables", &[&row]).expect("project table");
 
         assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete", "open_in_pm"]);
+        assert_eq!(view.rows[0].actions[0].intent, TableIntent::AttachPane { reference: "terminal-1".into(), host: HostName::new("kiwi") });
         assert_eq!(view.rows[1].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["open_in_pm"]);
     }
 

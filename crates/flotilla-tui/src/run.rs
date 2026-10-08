@@ -220,7 +220,6 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 app.set_error_message(message);
             }
         }
-        app.drain_background_updates();
 
         // ── Re-sync query subscriptions after tab-set changes ──
         if app.subscriptions_dirty {

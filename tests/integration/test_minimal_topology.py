@@ -4,7 +4,9 @@ All tests run commands on node-a (the "user's desktop") and validate
 that multi-host peering with node-b works via the CLI JSON output.
 """
 
-from conftest import create_headless_checkout, docker_exec, flotilla_json, wait_for
+import pytest
+
+from conftest import docker_exec, flotilla_json, wait_for
 
 
 def test_both_daemons_running(topology):
@@ -107,57 +109,22 @@ def test_repository_federates_by_canonical_remote(topology):
     )
 
 
-def test_remote_prepare_terminal_returns_attachable_set_id(topology):
-    """Remote prepare-terminal returns a Flotilla-owned attachable set id."""
-    canonical_remote = "https://example.com/integration/prepare-terminal"
-    repository_keys = []
-    for node in ("node-a", "node-b"):
-        clone = docker_exec(
-            topology[node],
-            "git clone /home/flotilla/repo /home/flotilla/prepare-repo && "
-            f"git -C /home/flotilla/prepare-repo remote set-url origin {canonical_remote}",
-        )
-        assert clone.returncode == 0, f"prepare clone failed on {node}: {clone.stderr}"
-        flotilla_json(topology[node], "repo add /home/flotilla/prepare-repo")
-        repositories = flotilla_json(topology[node], "resource list repositories")["records"]
-        repository_keys.append(next(
-            record["object"]["metadata"]["name"]
-            for record in repositories
-            if record["object"]["spec"]["identity"] == {
-                "kind": "remote",
-                "canonical_remote": canonical_remote,
-            }
-        ))
-
-    # Both clones represent the same Repository, while their Checkout facts
-    # still belong to their respective hosts.
-    assert repository_keys[0] == repository_keys[1]
-    repository_key = repository_keys[0]
-    checkout_path = create_headless_checkout(
-        topology["node-b"],
-        "/home/flotilla/prepare-repo",
-        repository_key,
-        "feat-prepare",
+@pytest.mark.parametrize(
+    ("command", "diagnostic"),
+    [
+        ("repo retired-surface-repo prepare-terminal /unused", "unexpected argument 'prepare-terminal' found"),
+        ("workspace retired-workspace select", "unrecognized subcommand 'workspace'"),
+        ("agent retired-agent teleport", "unrecognized subcommand 'teleport'"),
+    ],
+)
+def test_remote_personal_workspace_commands_are_retired(topology, command, diagnostic):
+    """Host routing rejects the retired personal-workspace CLI before dispatch (#2915)."""
+    result = docker_exec(
+        topology["node-a"], f"flotilla --json host node-b {command}"
     )
-
-    prepared = flotilla_json(
-        topology["node-a"],
-        f"host node-b repo {repository_key} prepare-terminal {checkout_path}",
-        timeout=60,
-    )
-    assert prepared["kind"] == "terminal_prepared"
-    assert prepared.get("attachable_set_id"), (
-        "remote prepare-terminal should include attachable_set_id"
-    )
-
-    registry = docker_exec(
-        topology["node-b"],
-        "test -f ~/.config/flotilla/attachables/registry.json && cat ~/.config/flotilla/attachables/registry.json",
-    )
-    assert registry.returncode == 0, (
-        "remote prepare-terminal should create attachables registry\n"
-        f"stdout: {registry.stdout}\nstderr: {registry.stderr}"
-    )
+    assert result.returncode != 0, f"retired command unexpectedly succeeded: {command}"
+    assert diagnostic in result.stderr, result.stderr
+    assert not result.stdout, result.stdout
 
 
 def test_daemon_launcher_executes_binary_with_log_environment(tmp_path, monkeypatch):

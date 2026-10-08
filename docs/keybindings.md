@@ -28,6 +28,13 @@
 | `a` | Add repo tab |
 | `c` | Toggle providers panel |
 
+On convoy vessel rows, `a` attaches to the vessel's TerminalSession. `o` emits
+only a focus Regard for the convoy or vessel; the connected PM owns realization
+from its catalog recipe. It does not create or select a workspace directly.
+
+The personal `workspace [select]`, `repo prepare-terminal`, and `agent teleport`
+CLI commands have been retired.
+
 ## Multi-select (issues)
 
 | Key | Action |
@@ -65,5 +72,4 @@ The action menu (Space or right-click) shows context-sensitive options based on 
 | Generate branch name | Issue with no branch (uses AI) |
 | Open PR in browser | Item has an associated PR |
 | Open issue in browser | Item has associated issues |
-| Teleport session | Cloud agent session (opens in terminal) |
 | Archive session | Cloud agent session (marks as archived) |

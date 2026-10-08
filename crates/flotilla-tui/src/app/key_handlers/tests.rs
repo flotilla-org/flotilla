@@ -1,7 +1,4 @@
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::KeyCode;
 use flotilla_protocol::{qualified_path::HostId, CommandAction, EnvironmentId, HostName, NodeId, NodeInfo, RepoSelector, ViewAddress};
@@ -42,35 +39,12 @@ use crate::{
         test_support::{key, stub_app},
         PeerStatus, TuiHostState,
     },
-    pm_open::{OpenInPmTarget, PmConnector},
+    pm_open::OpenInPmTarget,
     table_view::{ProjectPanelKind, RowId, TableIntent, TableIssueStart},
 };
 
-#[derive(Default)]
-struct RecordingPmConnector {
-    calls: Mutex<Vec<OpenInPmTarget>>,
-}
-
-#[async_trait::async_trait]
-impl PmConnector for RecordingPmConnector {
-    async fn open(&self, target: &OpenInPmTarget, _working_directory: &Path) -> Result<(), String> {
-        self.calls.lock().expect("recording connector lock").push(target.clone());
-        Ok(())
-    }
-}
-
 fn pm_target(host: HostName) -> OpenInPmTarget {
-    OpenInPmTarget {
-        namespace: "dev".into(),
-        convoy: "tables".into(),
-        vessel: Some("implement".into()),
-        label: "tables".into(),
-        host: Some(host),
-        project_ref: Some("flotilla".into()),
-        repo_hint: None,
-        workspace_ref: None,
-        materialize_ref: Some("terminal-implement".into()),
-    }
+    OpenInPmTarget { namespace: "dev".into(), convoy: "tables".into(), vessel: Some("implement".into()), host: Some(host) }
 }
 
 fn issue(id: &str, ready: bool) -> TableIssueStart {
@@ -108,35 +82,21 @@ fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
     );
 }
 
+// Opening in the PM emits focus for any home, even without a connected PM.
 #[tokio::test]
-async fn open_in_pm_dispatches_only_local_targets_to_the_injected_connector() {
-    let mut app = stub_app();
-    let local = app.model.my_host().expect("stub local host").clone();
-    let connector = Arc::new(RecordingPmConnector::default());
-    app.pm_connector = Some(connector.clone());
-
-    let local_target = pm_target(local.clone());
-    app.execute_table_intent(TableIntent::OpenInPm(local_target.clone()));
-    tokio::task::yield_now().await;
-    app.drain_background_updates();
-
-    assert_eq!(*connector.calls.lock().expect("recorded calls"), vec![local_target]);
-    assert_eq!(app.model.status_message.as_deref(), Some("Opened tables in PM"));
-
-    let remote_target = pm_target(HostName::new(format!("remote-{}", local.as_str())));
-    app.execute_table_intent(TableIntent::OpenInPm(remote_target));
-    assert_eq!(connector.calls.lock().expect("recorded calls").len(), 1);
-    assert!(app.model.status_message.as_deref().is_some_and(|message| message.contains("not reachable from this PM yet")));
-}
-
-#[test]
-fn open_in_pm_without_a_connector_reports_that_no_pm_is_connected() {
-    let mut app = stub_app();
-    let local = app.model.my_host().expect("stub local host").clone();
-
-    app.execute_table_intent(TableIntent::OpenInPm(pm_target(local)));
-
-    assert_eq!(app.model.status_message.as_deref(), Some("No presentation manager is connected"));
+async fn open_in_pm_emits_focus_without_a_connector() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let daemon = super::super::test_support::StubDaemon::builder().observations(observations.clone()).build();
+    let mut app = super::super::test_support::stub_app_with_daemon(Arc::new(daemon), vec![]);
+    for host in [HostName::local(), HostName::new("remote")] {
+        let target = pm_target(host);
+        let reference = target.resource_ref();
+        app.execute_table_intent(TableIntent::OpenInPm(target));
+        tokio::task::yield_now().await;
+        assert_eq!(observations.lock().expect("focus observations").last(), Some(&(app.session_id, vec![reference])));
+        assert!(app.proto_commands.take_next().is_none());
+        assert!(app.model.status_message.is_none());
+    }
 }
 
 #[test]

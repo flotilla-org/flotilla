@@ -25,7 +25,6 @@ use flotilla_protocol::{
 use indexmap::IndexMap;
 pub use open_views::{OpenView, OpenViews, ViewTarget};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tui_input::Input;
 pub use ui_state::{DirEntry, ProjectIssueStartContext, TabId, UiState};
 use ui_state::{NotificationKind, Notifications, PendingStatus};
@@ -33,7 +32,6 @@ use ui_state::{NotificationKind, Notifications, PendingStatus};
 use crate::{
     convoy_model::{ConvoyId, ConvoySummary},
     keymap::Keymap,
-    pm_open::PmConnector,
     theme::Theme,
     widgets::{file_picker::FilePickerWidget, screen::Screen},
 };
@@ -372,11 +370,6 @@ pub struct ProjectIssueStartBatch {
     rejected: Vec<String>,
 }
 
-struct PmOpenUpdate {
-    label: String,
-    result: Result<(), String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisibleStatusItem {
     pub id: usize,
@@ -516,11 +509,6 @@ pub struct App {
     /// ephemeral searches beyond the window.
     pub query_tables: QueryTableCache,
     pub pending_fetch_more: HashSet<flotilla_protocol::QueryId>,
-    /// Connected presentation-manager realization path, when this TUI is
-    /// running inside a supported PM.
-    pub pm_connector: Option<Arc<dyn PmConnector>>,
-    pm_update_tx: mpsc::UnboundedSender<PmOpenUpdate>,
-    pm_update_rx: mpsc::UnboundedReceiver<PmOpenUpdate>,
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
     /// Drop guard that gives in-process subscribers the same teardown
@@ -627,7 +615,6 @@ impl App {
         let loaded_config = config.load_config();
         let keymap = Keymap::from_config(&loaded_config.ui.keys);
         let screen = Screen::new();
-        let (pm_update_tx, pm_update_rx) = mpsc::unbounded_channel();
         let session_id = uuid::Uuid::new_v4();
         let query_subscription = daemon.query_subscription(session_id);
 
@@ -652,9 +639,6 @@ impl App {
             screen,
             query_tables: QueryTableCache::default(),
             pending_fetch_more: HashSet::new(),
-            pm_connector: None,
-            pm_update_tx,
-            pm_update_rx,
             session_id,
             _query_subscription: query_subscription,
             namespaces: HashMap::new(),
@@ -664,11 +648,6 @@ impl App {
             pending_attach_plan: None,
             local_attach_effects: LocalAttachEffects::default(),
         }
-    }
-
-    pub fn with_pm_connector(mut self, connector: Option<Arc<dyn PmConnector>>) -> Self {
-        self.pm_connector = connector;
-        self
     }
 
     /// Attach this UI session to a replacement daemon while retaining the
@@ -947,15 +926,6 @@ impl App {
         self.ui.notifications.push(NotificationKind::Error, message.clone());
         self.model.status_message = Some(message);
         self.ui.status_bar.dismissed_status_ids.remove(&0);
-    }
-
-    pub(crate) fn drain_background_updates(&mut self) {
-        while let Ok(update) = self.pm_update_rx.try_recv() {
-            match update.result {
-                Ok(()) => self.set_status_message(Some(format!("Opened {} in PM", update.label))),
-                Err(error) => self.set_error_message(format!("Could not open {} in PM: {error}", update.label)),
-            }
-        }
     }
 
     // ── Widget stack helpers ──

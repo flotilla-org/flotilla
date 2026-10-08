@@ -13,7 +13,6 @@ import pytest
 
 from conftest import (
     compose,
-    create_headless_checkout,
     daemon_log,
     docker_exec,
     flotilla_json,
@@ -278,48 +277,13 @@ def test_provider_heterogeneity(hub_spoke_topology):
     assert no_gemini.returncode != 0
 
 
-def test_terminal_without_persistent_pool_uses_passthrough(hub_spoke_topology):
-    """The follower without a persistent pool returns executable fallback commands."""
-    checkout_path = create_headless_checkout(
-        "homelab-2",
-        REPO_PATH,
-        hub_spoke_topology["homelab-2"],
-        "feat-passthrough",
-        compose_file=HUB_SPOKE_COMPOSE,
-    )
-    # The executor plans in the coordinator context before dispatching the remote step.
-    # #2500 owns retiring this bridge, as in test_minimal_topology.
-    planning_repository_key = hub_spoke_topology["workstation"]
-    prepared = hub_json(
+@pytest.mark.parametrize("host", ["homelab-1", "homelab-2"])
+def test_remote_personal_terminal_preparation_is_retired(hub_spoke_topology, host):
+    """Retired prepare-terminal is rejected for both persistent and passthrough hosts (#2915)."""
+    result = hub_exec(
         "workstation",
-        f"host homelab-2 repo {planning_repository_key} prepare-terminal {checkout_path}",
-        timeout=60,
+        f"flotilla --json host {host} repo retired-surface-repo prepare-terminal /unused",
     )
-    assert prepared["kind"] == "terminal_prepared"
-    assert prepared["attachable_set_id"]
-    assert prepared["commands"]
-
-
-
-def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
-    """Repeated preparation keeps the checkout's attachable-set identity."""
-    checkout_path = create_headless_checkout(
-        "homelab-1",
-        REPO_PATH,
-        hub_spoke_topology["homelab-1"],
-        "feat-workspace-reprepare",
-        compose_file=HUB_SPOKE_COMPOSE,
-    )
-    # #2500 owns the coordinator-local planning context for remote terminal steps.
-    planning_repository_key = hub_spoke_topology["workstation"]
-    command = (
-        f"host homelab-1 repo {planning_repository_key} prepare-terminal {checkout_path}"
-    )
-
-    first = hub_json("workstation", command, timeout=60)
-    second = hub_json("workstation", command, timeout=60)
-
-    assert first["kind"] == "terminal_prepared"
-    assert second["kind"] == "terminal_prepared"
-    assert first["attachable_set_id"] == second["attachable_set_id"]
-    assert first["commands"] == second["commands"]
+    assert result.returncode != 0, "retired prepare-terminal unexpectedly succeeded"
+    assert "unexpected argument 'prepare-terminal' found" in result.stderr, result.stderr
+    assert not result.stdout, result.stdout

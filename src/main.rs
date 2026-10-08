@@ -321,8 +321,6 @@ enum DomainCommand {
     Issue(flotilla_commands::commands::issue::IssueNoun),
     /// Cloud agents
     Agent(flotilla_commands::commands::agent::AgentNoun),
-    /// Workspaces
-    Workspace(flotilla_commands::commands::workspace::WorkspaceNoun),
     /// Manage and route to hosts
     Host(flotilla_commands::commands::host::HostNounPartial),
     /// Inspect fulfilment kinds and live facts
@@ -385,7 +383,6 @@ impl DomainCommand {
             DomainCommand::Cr(noun) => noun.resolve(),
             DomainCommand::Issue(noun) => noun.resolve(),
             DomainCommand::Agent(noun) => noun.resolve(),
-            DomainCommand::Workspace(noun) => noun.resolve(),
             DomainCommand::Host(partial) => {
                 use flotilla_commands::Refinable;
                 partial.refine().and_then(|noun| noun.resolve())
@@ -1246,7 +1243,6 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         tracing::warn!(requested = %theme_name, using = %initial_theme.name, "unknown theme, falling back");
     }
 
-    let pm_connector = flotilla_tui::pm_open::detect_connector();
     let repos_info = daemon.list_repos().await.unwrap_or_default();
     let default_landing = if scoped_view.is_none() && config.load_open_views().is_none() && !startup_repo_roots.is_empty() {
         match daemon
@@ -1272,8 +1268,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let mut app = match scoped_view.clone() {
         Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
         None => app::App::new_with_default_landing(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), default_landing),
-    }
-    .with_pm_connector(pm_connector.clone());
+    };
     restore_tui_handoff(&mut app);
 
     loop {
@@ -4447,7 +4442,7 @@ mod tests {
 
     #[test]
     fn cli_parses_bare_list_nouns_with_json_output() {
-        for noun in ["repo", "checkout", "cr", "issue", "agent", "workspace"] {
+        for noun in ["repo", "checkout", "cr", "issue", "agent"] {
             let cli = Cli::try_parse_from(["flotilla", noun, "--json"]).expect("bare noun should parse");
             assert!(cli.json, "{noun} must keep the global JSON flag");
             assert!(cli.command.is_some());
@@ -4728,17 +4723,24 @@ mod tests {
         assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Issue(_)))));
     }
 
+    // Retired personal-workspace surfaces must be rejected.
     #[test]
-    fn cli_parses_agent_noun() {
-        let cli = Cli::try_parse_from(["flotilla", "agent", "claude-1", "teleport"]).expect("agent cli should parse");
-        let Some(SubCommand::Domain(DomainCommand::Agent(noun))) = cli.command else { panic!("expected agent command") };
-        assert!(matches!(noun.verb, Some(flotilla_commands::commands::agent::AgentVerb::Teleport { .. })));
+    fn cli_rejects_retired_workspace_surfaces() {
+        for args in [
+            vec!["flotilla", "workspace"],
+            vec!["flotilla", "workspace", "ws", "select"],
+            vec!["flotilla", "repo", "repo", "prepare-terminal", "/tmp/wt"],
+            vec!["flotilla", "agent", "agent", "teleport"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
-    fn cli_parses_workspace_noun() {
-        let cli = Cli::try_parse_from(["flotilla", "workspace", "feat-ws", "select"]).expect("workspace cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Workspace(_)))));
+    fn cli_parses_agent_noun() {
+        let cli = Cli::try_parse_from(["flotilla", "agent", "claude-1", "archive"]).expect("agent cli should parse");
+        let Some(SubCommand::Domain(DomainCommand::Agent(noun))) = cli.command else { panic!("expected agent command") };
+        assert!(matches!(noun.verb, Some(flotilla_commands::commands::agent::AgentVerb::Archive)));
     }
 
     #[test]
