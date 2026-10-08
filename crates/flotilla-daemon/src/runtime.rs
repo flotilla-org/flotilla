@@ -15872,6 +15872,23 @@ mod tests {
                 .expect("record batch member");
         }
         assert_eq!(MessageTransport::submit(&runtime, &batch).await, MessageTransportOutcome::Pending);
+        // Unrelated hook/tool activity while the task owns input cannot invent
+        // receipt, even with fresh Working evidence after submission began.
+        let holder = sessions.get(ID).await.expect("pending holder");
+        let original = holder.status.clone().expect("pending status");
+        let mut status = original.clone();
+        let activity_at = batch.submission.started_at + chrono::Duration::seconds(1);
+        status.session_id = Some(ID.into());
+        status.attention = Some(flotilla_resources::TerminalAttention {
+            state: TerminalAttentionState::Working,
+            as_of: activity_at,
+            source: TerminalAttentionSource::Hook,
+        });
+        status.last_tool_activity_at = Some(activity_at);
+        let holder = sessions.update_status(ID, &holder.metadata.resource_version, &status).await.expect("unrelated activity");
+        let observation = MessageTransport::observe(&runtime, &holder, Some(&batch.submission)).await.expect("pending observation");
+        assert!(!observation.ready && !observation.working && observation.evidence.is_none());
+        sessions.update_status(ID, &holder.metadata.resource_version, &original).await.expect("restore holder observation");
         let mut accepted = false;
         for _ in 0..30 {
             tokio::time::advance(Duration::from_millis(200)).await;
