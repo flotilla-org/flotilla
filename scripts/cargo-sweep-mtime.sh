@@ -8,6 +8,11 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/cargo-sweep-support.sh"
 readonly retention_days=3
+archive_retention_days=${FLOTILLA_SESSION_ARCHIVE_RETENTION_DAYS:-30}
+if [[ ! $archive_retention_days =~ ^[0-9]+$ ]]; then
+  echo "FLOTILLA_SESSION_ARCHIVE_RETENTION_DAYS must be a nonnegative integer" >&2
+  exit 1
+fi
 state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/flotilla
 log_file=${FLOTILLA_SWEEP_LOG:-"$state_dir/cargo-sweep-mtime.log"}
 lock_dir=$state_dir/cargo-sweep-mtime.lock
@@ -71,6 +76,11 @@ if [[ -d $convoy_root ]]; then
 fi
 
 {
+  # Archive homes are exactly two directories below the archive root.
+  archive_root=$HOME/.local/share/flotilla/session-archive
+  if [[ -d $archive_root ]]; then
+    find "$archive_root" -mindepth 2 -maxdepth 2 -type d -mmin +"$((10#$archive_retention_days * 1440))" -exec rm -rf -- {} +
+  fi
   started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
   total_reclaimed_bytes=0
   failed_roots=0

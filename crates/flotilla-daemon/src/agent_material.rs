@@ -373,13 +373,40 @@ done"#,
         install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
     }
 
-    pub(crate) async fn remove_environment_home(&self, environment_ref: &str) -> Result<(), String> {
+    pub(crate) async fn archive_environment_home(&self, convoy_ref: &str, environment_ref: &str) -> Result<(), String> {
         let home = self.homes_dir.join(environment_ref);
-        match fs::remove_dir_all(&home).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("remove persistent agent home {}: {error}", home.display())),
+        if !fs::try_exists(&home).await.map_err(|error| error.to_string())? {
+            return Ok(());
         }
+        let archive = self.homes_dir.parent().expect("agent homes parent").join("session-archive").join(convoy_ref);
+        fs::create_dir_all(&archive).await.map_err(|error| format!("create session archive: {error}"))?;
+        let mut destination = archive.join(environment_ref);
+        loop {
+            // Reserve an empty destination exclusively. Rename replaces only our
+            // reservation, never a pre-existing archive, even during concurrent cleanup.
+            match fs::create_dir(&destination).await {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    destination =
+                        archive.join(format!("{environment_ref}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+                }
+                Err(error) => return Err(format!("reserve session archive: {error}")),
+            }
+        }
+        // Retention starts at teardown, rather than the last session write.
+        let result = async {
+            let directory = fs::File::open(&home).await?;
+            directory.into_std().await.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+            fs::rename(&home, &destination).await
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = fs::remove_dir(&destination).await;
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("archive persistent agent home {}: {error}", home.display()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2307,7 +2334,7 @@ esac
     }
 
     #[tokio::test]
-    async fn environment_home_removal_deletes_persistent_agent_state_and_is_idempotent() {
+    async fn environment_home_archival_preserves_sessions_and_collisions() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path());
         let environment_home = temp.path().join(".local/share/flotilla/agent-homes/env-a");
@@ -2315,10 +2342,21 @@ esac
         std::fs::create_dir_all(session.parent().expect("session has parent")).expect("session directory");
         std::fs::write(&session, "{\"type\":\"session_meta\"}\n").expect("session state");
 
-        registry.remove_environment_home("env-a").await.expect("remove environment home");
+        registry.archive_environment_home("convoy-a", "env-a").await.expect("remove environment home");
         assert!(!environment_home.exists(), "environment deletion must remove persistent agent state");
 
-        registry.remove_environment_home("env-a").await.expect("repeat environment home removal");
+        // Teardown preserves session contents; repeated environments never overwrite an archive.
+        let archive = temp.path().join(".local/share/flotilla/session-archive/convoy-a");
+        assert_eq!(
+            std::fs::read_to_string(archive.join("env-a/codex/sessions/2026/09/16/rollout.jsonl")).unwrap(),
+            "{\"type\":\"session_meta\"}\n"
+        );
+        std::fs::create_dir_all(&environment_home).unwrap();
+        std::fs::write(environment_home.join("second-session"), "second").unwrap();
+        registry.archive_environment_home("convoy-a", "env-a").await.unwrap();
+        assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 2);
+        assert!(archive.join("env-a/codex/sessions/2026/09/16/rollout.jsonl").exists());
+        registry.archive_environment_home("convoy-a", "env-a").await.expect("idempotent cleanup");
     }
 
     #[tokio::test]

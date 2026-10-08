@@ -459,3 +459,9 @@ primes with `--no-run` and times just the subsequent test invocation. The `check
 cost probe, not a recommendation to drop lint coverage. A primed private target is
 only a phase-2 probe, not a shared-cache implementation. Load averages are sampled
 once per second; they describe the whole host, rather than only the vessel.
+
+The daily per-host sweep also removes session archives older than 30 days. Set
+`FLOTILLA_SESSION_ARCHIVE_RETENTION_DAYS` in the sweep environment to override
+that age. Environment teardown archives agent homes under
+`~/.local/share/flotilla/session-archive/<convoy>/<env>`; unowned environments use
+`unowned` as the convoy directory. Existing archives receive a timestamp suffix.
