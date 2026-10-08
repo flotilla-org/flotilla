@@ -956,6 +956,8 @@ fn codex_composer_visible(screen: &str) -> bool {
 fn codex_footer_chrome(line: &str) -> bool {
     // rust-v0.160.0 rows beneath the model footer: the shortcuts hint, which may
     // share its row with a right-aligned warning, and wrapped warning rows.
+    // #2927 captured scrollback footer: keep the complete hint so a draft
+    // beginning with "New activity" cannot be mistaken for footer chrome.
     line.starts_with("? for shortcuts") || line.starts_with('⚠') || line == "New activity · enter/esc latest · ? shortcuts"
 }
 

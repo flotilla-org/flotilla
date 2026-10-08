@@ -70,7 +70,9 @@ impl MessageInbox {
 impl MessageInbox {
     /// Called after a held transport becomes ready, immediately before input.
     /// A rejected member cancels the whole unsent batch; surviving members can
-    /// be selected afresh rather than typing a stale concatenated body.
+    /// be selected afresh rather than typing a stale concatenated body. Earlier
+    /// supersessions remain durable if a later member has unknown evidence;
+    /// that member stays held, and the original batch is never partially typed.
     pub async fn validate_delivery_members(&self, names: &[String], now: DateTime<Utc>) -> Result<bool, ResourceError> {
         let mut valid = true;
         for name in names {

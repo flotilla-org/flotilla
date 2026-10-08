@@ -2257,3 +2257,69 @@ fn delivery_guard_admission_compatibility() {
     other.delivery_condition = Some("convoy/work .status.phase == Landed".parse().unwrap());
     assert!(!current.same_intent(&other));
 }
+
+// A legacy condition receipt that never replicates is known-unsent, but not
+// tight-looped: the deployed retry budget backs off and raises one operator gate.
+#[tokio::test]
+async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
+    use flotilla_resources::*;
+    struct GuardedTransport {
+        inbox: MessageInbox,
+        inner: FakeMessageTransport,
+    }
+    #[async_trait::async_trait]
+    impl MessageTransport for GuardedTransport {
+        async fn observe(
+            &self,
+            holder: &ResourceObject<TerminalSession>,
+            submission: Option<&MessageSubmission>,
+        ) -> Result<MessageObservation, String> {
+            self.inner.observe(holder, submission).await
+        }
+        async fn submit(&self, batch: &MessageBatch) -> MessageTransportOutcome {
+            self.inner.submissions.lock().unwrap().push(batch.id.clone());
+            let error = self.inbox.validate_delivery_members(&batch.submission.members, at(20)).await.unwrap_err();
+            MessageTransportOutcome::NotSubmitted { reason: error.to_string() }
+        }
+        async fn poll(&self, _: &MessageBatch) -> MessageTransportOutcome {
+            panic!("known-unsent guard failures have no pending write to poll")
+        }
+    }
+    let (backend, inbox) = delivery_inbox().await;
+    let messages = backend.using::<Message>("flotilla");
+    for index in 0..3 {
+        messages.delete(&format!("message-{index}")).await.unwrap();
+    }
+    let convoy = backend.using::<Convoy>("flotilla").get("convoy").await.unwrap();
+    let mut intent = spec(
+        Some(MessageReference::ControlRecord {
+            resource: flotilla_protocol::ResourceRef::new(api_version(Convoy::API_PATHS), "Convoy", "flotilla", "convoy"),
+            revision: convoy.metadata.resource_version,
+        }),
+        MessageExpectation::None,
+    );
+    intent.sender = "system:turn-rules".into();
+    inbox.accept(&InputMeta::builder().name("legacy".into()).build(), &intent, at(10)).await.unwrap();
+    let transport = GuardedTransport {
+        inbox: MessageInbox::new(backend.clone(), "flotilla"),
+        inner: FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Pending,
+            accepted: Default::default(),
+            working: Default::default(),
+        },
+    };
+    for (second, attempts) in [(20, 1), (21, 1), (79, 1), (80, 2), (81, 2), (199, 2), (200, 3), (500, 3), (10000, 3)] {
+        inbox.reconcile_delivery(&transport, at(second)).await.unwrap();
+        assert_eq!(transport.inner.submissions.lock().unwrap().len(), attempts);
+        let status = messages.get("legacy").await.unwrap().status.unwrap();
+        assert!(status.resolved_receiver.is_none());
+        assert!(status.submission.is_none());
+    }
+    assert_eq!(backend.using::<Demand>("flotilla").list().await.unwrap().items.len(), 1);
+    assert!(matches!(
+        messages.get("legacy").await.unwrap().status.unwrap().retry.unwrap().disposition,
+        ControllerRetryDisposition::Terminal { .. }
+    ));
+}
