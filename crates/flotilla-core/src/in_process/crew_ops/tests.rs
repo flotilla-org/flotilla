@@ -187,6 +187,20 @@ async fn resume_restores_work_until_credentials_are_staged() {
     assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
 }
 
+// Convoy resume stores only the author's text, at both active and completed turn boundaries (#2923).
+#[tokio::test]
+async fn convoy_resume_body_is_author_text() {
+    for phase in [CrewWorkPhase::Working, CrewWorkPhase::Done] {
+        let (crew, backend, probe, _config) = fixture(phase).await;
+        probe.fail.store(false, Ordering::SeqCst);
+        let prompt = "Continue the fix.\n\nKeep this paragraph.";
+        crew.resume("flotilla", "crew", prompt, None, None).await.expect("resume");
+        let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages").items;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].spec.body, prompt);
+    }
+}
+
 // Working crew without fresh idle evidence queues replacements; withdrawal is idempotent (#2221).
 #[hegel::test]
 fn queued_resume_replaces_and_withdraws_without_staging(tc: hegel::TestCase) {
@@ -1277,8 +1291,12 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     inbox.reconcile_delivery(&transport, Utc::now()).await.expect("idempotent receipt");
     let submitted = transport.submitted.lock().await;
     assert_eq!(submitted.len(), 1);
-    assert!(submitted[0].text.contains(&card));
-    assert!(submitted[0].text.contains("capabilities@5"));
+    // The latest revision is traceable through the submission and stored subject, not a JSON header (#2923).
+    assert_eq!(submitted[0].submission.members, vec![latest.metadata.name.clone()]);
+    assert!(
+        matches!(&latest.spec.subject, Some(flotilla_resources::MessageReference::ControlRecord { revision, .. }) if revision == "capabilities@5")
+    );
+    assert_eq!(submitted[0].text, format!("[from flotilla (system) · capabilities · re TerminalSession session]\n\n{card}"));
 }
 
 // Handoffs route to the addressed vessel, preserve typed carries, and admit once per command.
