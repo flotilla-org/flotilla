@@ -384,7 +384,16 @@ done"#,
         if !fs::try_exists(&home).await.map_err(|error| error.to_string())? {
             return Ok(());
         }
-        let archive = self.homes_dir.parent().ok_or("agent homes parent missing")?.join("session-archive").join(convoy_ref);
+        let archive_root = self.homes_dir.parent().ok_or("agent homes parent missing")?.join("session-archive");
+        fs::create_dir_all(&archive_root).await.map_err(|error| format!("create session archive root: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|error| format!("protect session archive root: {error}"))?;
+        }
+        let archive = archive_root.join(convoy_ref);
         fs::create_dir_all(&archive).await.map_err(|error| format!("create session archive: {error}"))?;
         let mut destination = archive.join(environment_ref);
         loop {
@@ -400,6 +409,8 @@ done"#,
             }
         }
         // Retention starts at teardown, rather than the last session write.
+        // A failed reset must preserve the home for retry: otherwise an old
+        // home could be expired immediately after successful archival.
         let result = async {
             let directory = fs::File::open(&home).await?;
             directory.into_std().await.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
@@ -2372,6 +2383,7 @@ esac
             .unwrap();
         assert_eq!(std::fs::read_to_string(suffixed.join("second-session")).unwrap(), "second");
         assert!(!archive.join("env-a/codex/auth.json").exists());
+        assert_eq!(std::fs::metadata(archive.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         for invalid in ["../escape", "..", "/", ""] {
             assert!(registry.archive_environment_home("convoy-a", invalid).await.is_err());
             assert!(registry.archive_environment_home(invalid, "env-a").await.is_err());
