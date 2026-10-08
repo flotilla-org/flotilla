@@ -61,7 +61,7 @@ A replacement convoy can continue a pushed branch and its open PR without
 superseding the review. First preserve any surviving uncommitted or unpushed
 work and push it to the existing remote branch. Retire the old convoy and its
 physical checkout; a failed or deleted convoy releases its logical binding,
-while a live convoy remains a holder.
+while a live convoy keeps it.
 
 ```bash
 flotilla convoy start --project flotilla --continue-pr 2866 --workflow single-agent \

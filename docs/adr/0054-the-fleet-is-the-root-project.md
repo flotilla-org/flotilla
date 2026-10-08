@@ -7,10 +7,12 @@ Date: 2026-10-05
 Accepted. Records the owner ruling and charter-delivery amendment in #2658.
 Amends ADR 0039 and ADR 0052. #2718 implements the structural first slice;
 follow-on implementation is identified below.
+ADR 0059 retires the word "holder": the agent session filling a role is the
+AgentSession its role binding names.
 
 ## Decision
 
-The fleet is a designated Project, reusing Project charters, role holders,
+The fleet is a designated Project, reusing Project charters, role bindings,
 standing ensures, grants and issue sources. Its charter repository is today's
 project-map; renaming it is optional. Flotilla the product remains a separate,
 ordinary Project. A distinct fleet scope would duplicate the Project machinery.
@@ -69,7 +71,7 @@ overlapping sources are errors. #2721 implements bounded delegation.
 
 The fleet repository supplies root role definitions and defaults, crew defaults,
 credentials and grants, forges, crew images, fulfilment kinds, placement policies
-(moving out of per-host files), fleet role holders, parents and registrations.
+(moving out of per-host files), fleet role bindings, parents and registrations.
 Project charters supply local contents and overrides. Dogfood both source choices:
 katzensteg-, porthole- and ghostty-ops stay delegated; flotilla and zellij go inline
 in the fleet repository. An agent that edits its ops repository can still be

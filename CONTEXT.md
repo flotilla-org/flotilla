@@ -12,9 +12,13 @@ Flotilla is one member of a product family that communicates over HTTP-over-UDS
 
 **Message**:
 A durable communication addressed to a role and homed on its receiver. It names
-its sender, relationship, references and expectation. Delivery means there is
-evidence that a resolved holder accepted the input; satisfaction means the
-expectation has been met.
+its sender, relationship, references and expectation. Its delivery receipt
+records what the receiving **AgentChannel** proves: `sent` (the transport
+accepted the input) or `received` (the harness echoed it back). Activity after
+delivery is a separate derived observation. Whether the input was acted on is
+judged only by the expectation: satisfaction means a reply or outcome has met
+it (ADR 0055, amended by ADR 0059).
+_Avoid_: Delivered (as a claim that the agent acted), prompt.
 
 **Message Subject**:
 The typed reference and revision a Message is regarding. Messages from the same
@@ -22,9 +26,25 @@ sender to the same receiver regarding the same subject revision share a
 supersession relationship.
 
 **Role Address**:
-The name of a communication recipient or sender, independent of the current
-holder. A convoy-relative address is qualified when the Message is created;
-the holder is resolved when it can be delivered.
+The name of a communication recipient or sender, independent of which
+**AgentSession** currently fills it. The role forms are `project/role` (a
+Project role, such as `andamento/governor`) and `project/convoy/vessel/role`
+(one crew role in one vessel). The other address forms are `principal:<name>`,
+`system:<subsystem>` and `topic:<project>/<name>` (ADR 0055). The fleet is an
+ordinary Project, so a fleet role is `<fleet project>/role`. A convoy-relative
+address is qualified when the Message is created; the AgentSession named by the
+role's current **Role Binding** is resolved when the Message can be delivered.
+A Project role served by a **Standing Convoy** is also that convoy's stable
+identity: what operators attach to, what ensures maintain, and what surfaces
+display. It resolves to the live **Convoy generation**; in project context a
+bare role suffices, and in bare context resolution needs fleet-wide uniqueness
+or the qualified form (ADR 0032). The `convoy` and `attach` commands accept the
+same address spelled `role@project` (e.g. `governor@andamento`); written docs
+use `project/role`. Convoy record names are generated machine identifiers and
+are never a human surface. *(Reconciled 2026-10-08, #2913: this entry and a
+second "Role address" entry for the standing-convoy identity were merged.)*
+_Avoid_: Holder (retired), convoy name (for the human-facing identity),
+triple-barrelled generated names.
 
 **Fleet**:
 The whole set of development resources Flotilla coordinates across hosts. The
@@ -55,8 +75,8 @@ code dependencies form a separate graph.
 
 **Charter**:
 A Project's declared contents, defaults and prose, supplied inline or by a
-delegated repository source. Charter prose is delivered to role holders through
-briefs and superseding Messages.
+delegated repository source. Charter prose is delivered to the AgentSessions
+bound to its roles through briefs and superseding Messages.
 
 **Repository**:
 The machine-independent identity of one source repository, shared by every
@@ -64,6 +84,16 @@ checkout, clone, and Project reference to it. A Repository persists even when
 no checkout currently exists.
 _Avoid_: Project (the stewarded work context), Checkout (one materialisation),
 Repo (too easily conflates all three).
+
+**Checkout**:
+The resource for one materialised working copy of a **Repository** at a path:
+a `worktree` of a shared clone, a `fresh_clone`, or an `observed` checkout the
+**Fleet Observer** discovered. A convoy's managed checkouts are created by its
+Vessel but owned by the Convoy, so they survive vessel replacement. Status
+carries the path, commit and integration observations (pushed, landed, change
+request). Observed checkouts are **Convergent Facts**.
+_Avoid_: Worktree (one kind), clone, repo, Workspace Set (the list a convoy's
+vessels get).
 
 **Membership Claim**:
 How a **Project** includes a **Repository**: a `(Repository, optional subpath)`
@@ -87,13 +117,6 @@ convoy data, defaulting to the admitted Project's member claims. A single-entry
 set roots the vessel at the repository checkout itself; a multi-entry set
 produces a parent directory of sibling checkouts.
 _Avoid_: workspace (the multiplexer sense), checkout set.
-
-**Hull**:
-A durable workspace directory whose identity outlives the work aboard it.
-Convoys are its **tenants**: filesystem paths are hull-named (never
-convoy-named) so caches, build artifacts, and path-keyed trust survive
-re-tasking. Hulls carry durable memorable ship names.
-_Avoid_: workspace, worktree, vessel (the unit of execution, not of residence).
 
 **Provenance Edge**:
 A recorded link from a resource to the resource it came from — used for
@@ -134,6 +157,16 @@ ordered globally across the fleet.
 **Placement Queue**:
 A host's resource users awaiting reservations, inheriting the priority of their
 waiting convoy or highest-priority consumer.
+
+**WorkflowTemplate**:
+The **Definition** resource declaring a workflow: its roles (each a
+**CrewSpec**), handoffs, allocation, **Exit Table**, turn delivery rules, stall
+nudges and supervision. `vessels` remains an older grouping hint that the
+builtins still use. **Code-seeded Builtins** such as `scratch` and
+`single-agent` exist at every root; projects define others in their ops
+repository. Admission freezes the chosen template into a prepared
+`workflow-snapshot-<hash>` WorkflowTemplate that the **Convoy** references.
+_Avoid_: Workflow file, pipeline, recipe.
 
 **Convoy**:
 A named instance of a workflow — the primary unit of *launched* work. What a
@@ -189,9 +222,14 @@ aboard the Vessels are the dramatis personae; the Legs are the script.
 _Avoid_: Task, TaskWorkspace, workspace, container.
 
 **Hull**:
-An allocated but **uncrewed** Vessel-precursor: an **Environment** plus an
-established filesystem/checkout, no processes yet. **Vessel = Hull + Crew.**
-(Portfolio-defined term; see the project-map glossary.)
+An allocated but **uncrewed** Vessel-precursor: an **Environment** plus its
+established checkouts, before any crew launches. **Vessel = Hull + Crew**
+(ADR 0010's Hull/Crew boundary). A way of talking, not a resource kind: no code
+models it. (Portfolio-defined term; see the project-map glossary.)
+*(Reconciled 2026-10-08, #2913: a second entry defined Hull as a durable,
+hull-named workspace directory whose tenants are convoys. That meaning is
+retired: checkout paths are convoy-named, and the tenancy design never
+landed.)*
 _Avoid_: empty vessel, workspace, berth.
 
 **Clyde**:
@@ -203,19 +241,22 @@ network setup) deliberately unpinned.
 _Avoid_: Astillero (renamed 2026-07-06), sandbox aggregator.
 
 **Crew**:
-The set of **Processes** (agents and terminals, typically a cleat pool) running
-aboard a **Vessel** for a **Leg** — the thing one attaches to. The Hull carries
-what any crew would find aboard; the Crew launch carries who is aboard and why
-they are here (identity, model, **Brief**) — operating under the Vessel's shared
-**Stance**.
-_Avoid_: Attachable set, session group.
+The **AgentSessions** working in or for a **Vessel**, including a session whose
+agent loop runs elsewhere but works for that vessel. Non-agent **Processes**
+(tools, services, the cleat daemon) are never crew: they are vessel-declared
+processes. An operator-style session that does not work for a vessel is not
+crew. The **Hull** carries what any crew would find aboard; the crew launch
+carries who is aboard and why they are here (identity, model, **Brief**),
+operating under the Vessel's shared **Stance** (ADR 0010, amended by ADR 0059).
+_Avoid_: Attachable set, session group, crew member (for a tool or service).
 
 **AgentAdapter**:
 The single per-harness definition (claude, codex, pi) of everything Flotilla
 knows about that harness: config templates, skill mirror paths, credential
 file formats, launch synthesis, resume/re-prompt mechanics. Consumed in two
 phases — hull-prep (at rest) and crew-launch (runtime). Verbs: prepare,
-launch, deliver_brief, re_prompt, stance.
+launch, deliver_brief, re_prompt, stance. It also declares which
+**Transports** the harness supports, by harness version (ADR 0059).
 _Avoid_: Provider (that is the Fleet Observer's word), driver, plugin.
 
 **Crew defaults**:
@@ -273,17 +314,72 @@ _Avoid_: Permissions (that word belongs to minted credentials, ADR 0044).
 
 **Brief**:
 The per-crew-member statement of why they are here — a durable file in the
-vessel workspace (also delivered agent-natively). Each turn is started by a
-brief; accumulated briefs on a revisited vessel are the script as executed,
-per character. A brief is the question: it may declare the
+vessel workspace (also delivered agent-natively). A brief starts a **new**
+conversation for a role: the first start, or the fresh-agent rung of the
+**Delivery Ladder**. Reviving an **AgentSession** does not re-brief it; material
+changes made while it was parked arrive as superseding `system:` Messages
+(ADR 0059). Accumulated briefs on a revisited vessel are the script as
+executed, per character. A brief is the question: it may declare the
 valid **Dispositions** as its answers (ADR 0027).
 _Avoid_: Prompt (the delivery mechanism), task description.
 
 **Process**:
-A running program aboard a **Vessel**, as a member of its **Crew**, resolved to
-a placement by selectors (e.g. `capability: code`) rather than by template
-variable substitution.
-_Avoid_: Pane, terminal (those are presentation concerns).
+Anything executing aboard a **Vessel**: an **AgentSession**'s harness process,
+tools, services (a Codex app-server, an MCP server), the cleat daemon for its
+environment, and one-shot jobs. A terminal is something some processes have,
+not what makes them processes. Tools that workflows declare as crew today
+(`CrewSource::Tool`) are vessel-declared processes (ADR 0059). Today only
+terminal-backed processes are modelled, as **TerminalSessions**; the cleat
+daemon and services have no record yet.
+_Avoid_: Pane, terminal (presentation concerns), crew member (for a non-agent
+process), session.
+
+**TerminalSession**:
+The **Home-bound Runtime** resource for one terminal-backed **Process** in a
+Vessel, run under cleat. Its spec names the environment, role and source (an
+agent selector or a tool command). Its status carries the phase (`Starting`,
+`Running`, `Lost`, `Stopped`, `Failed`) and the cleat session and endpoint.
+Today it also stands in for the agent's conversation; ADR 0059 gives that its
+own **AgentSession**, leaving the TerminalSession as where a session's harness
+runs right now.
+_Avoid_: Session (bare), AgentSession (the conversation, which outlives it),
+attachable, pane.
+
+**AgentSession**:
+One durable agent conversation: harness and model, the harness's thread or
+conversation id, its transcript and agent home, its grants, and its **Park
+Depth** (`live`, `parked`, `archived`). It outlives any single **Process**;
+reviving it resumes the same conversation on a new process. It fills roles
+through **Role Bindings** (ADR 0059).
+_Avoid_: Holder (retired), session (bare: cloud agents, cleat and zellij all
+claim it), TerminalSession, agent (the abstract notion).
+
+**Role Binding**:
+The record that an **AgentSession** fills a **Role Address**, from when until
+when, kept with history. A role resolves to the AgentSession its current
+binding names. With no current binding the role is *unbound*, and Messages to
+it wait. More than one current binding for a role is refused. Starting a new
+conversation for a role means a new AgentSession and a new binding (ADR 0059).
+_Avoid_: Holder, assignment.
+
+**AgentChannel**:
+How input reaches an **AgentSession** now: its current binding to a
+**Transport** at a concrete endpoint on the session's current **Process**. It is
+bound when the session is launched or revived. A later fallback is an explicit
+re-bind with a recorded reason, never a fallthrough at send time. Message
+delivery receipts record what the bound AgentChannel proves (ADR 0059).
+_Avoid_: Channel (bare: it collides with Claude Code's Channels), holder
+transport, connection.
+
+**Transport**:
+A way of putting input into a harness: `keystroke` (typing into its terminal
+through cleat), `codex-app-server` (JSON-RPC turns) or `claude-channels`
+(Claude Code's Channels). The **AgentAdapter** declares which transports a
+harness supports, by harness version; an **AgentChannel** records which one a
+session uses (ADR 0059). Distinct from the **Federation** transport (ssh) and
+the daemon's framed socket sessions; say "agent transport" where context leaves
+it unclear.
+_Avoid_: Channel (bare), delivery method, holder transport.
 
 **CloudAgent**:
 A coding agent whose harness loop runs remotely / under management (Claude Code,
@@ -356,7 +452,7 @@ unavailable.
 
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
-convoy-era term. Adopted attachables, persistent agents, loose work sessions.
+convoy-era term. Adopted terminals, persistent agents, loose work sessions.
 Appears in the `independents` query and nowhere else; joining a Convoy removes
 it there (convoy-bound sessions surface on vessel rows instead), so nothing is
 ever double-listed.
@@ -505,7 +601,7 @@ One incarnation of a standing **Convoy**: a single Convoy record holding that
 life's crew turns, archive pointers, and terminal reason (ADR 0032). Records
 are never reused across restarts — an ensure rebuilds by admitting the next
 generation; terminal generations are retained as history. At most one live
-generation exists per **Role address**. Distinct from the store-lifespan
+generation exists per **Role Address**. Distinct from the store-lifespan
 sense of **Generation**, and from **Fleet generation** in the deployment
 pipeline.
 _Avoid_: Incarnation (in code), husk (except informally for a terminal
@@ -526,17 +622,6 @@ Composition checks that the selected components meet each other's requirements;
 rollback selects a previous generation. Distinct from **Generation** of the
 observed store and **Convoy generation** of a standing convoy.
 _Avoid_: Monolithic build, rebuild, convoy incarnation.
-
-**Role address**:
-The stable identity of a standing **Convoy**: `{project, role}`, written
-`role@project` (e.g. `governor@andamento`). What operators attach to, what
-ensures maintain, what surfaces display. Resolves via selector to the live
-**Convoy generation** — in project context a bare role suffices; in bare
-context resolution requires fleet-wide uniqueness or the qualified form.
-Convoy record names are generated machine identifiers and are never a human
-surface (ADR 0032).
-_Avoid_: Convoy name (for the human-facing identity), triple-barrelled
-generated names.
 
 **Provisioning**:
 Bringing an execution context into being — a checkout, an **Environment**
@@ -559,6 +644,8 @@ _Avoid_: Sandbox (reserve for the future restricted-execution feature), VM.
 **Presentation**:
 How running work is surfaced to a person — which panes/surfaces show which
 **Processes**, across multiplexers and external windows. Dual to placement.
+Multiplexer adapters consume the `pm connect` metadata stream (ADR 0051); the
+in-daemon **PresentationManager providers** are retired (ADR 0059).
 _Avoid_: Layout, UI, workspace template (the latter is one mechanism).
 
 **Demand**:
@@ -676,7 +763,7 @@ The concept of a persistent agent that operates the fleet rather than writing
 code — stewardship (Governor), convoy-driving (Bosun), ideation (Navigator),
 accounting (Purser), presentation (Yeoman). Dispatch and allocation are
 deterministic substrate decisions; the Quartermaster dispatch-agent idea is
-retired (ADR 0055).
+retired (ADR 0058).
 _Avoid_: Bot, assistant.
 
 **Settlement Claim**:
@@ -731,6 +818,16 @@ its name (ADR 0028). `exit: claim` is the declarable degenerate case for
 artifact-less work.
 _Avoid_: Success criteria, completion condition.
 
+**Landed**:
+The **Convoy** phase meaning the work is over in the world: a row of its
+**Exit Table** fired on a **World Terminal** (for example the change request
+merged), and the convoy records that disposition's name (ADR 0028). It is
+terminal, like `Failed` and `Abandoned`: nothing re-opens it. More work is an
+explicit continuation, either a new generation or a new convoy with
+`--continue-pr` (ADR 0059).
+_Avoid_: Done (a crew work phase), merged (one possible world terminal),
+complete.
+
 **Durability Fence**:
 The obligation a **Settlement Claim** carries: everything the convoy will
 ever need again is durable at claim time — commits pushed, session log
@@ -741,9 +838,12 @@ _Avoid_: Checkpoint, sync.
 
 **Delivery Ladder**:
 The degradation ladder ensure-flavored turn delivery walks to restore agent
-context: warm session → adapter resume from the session log → fresh agent
-with a reconstructed brief, the never-fails floor (ADR 0028). Every delivery
-records its rung; rung selection is an experiment, not an edict.
+context (ADR 0028, amended by ADR 0059): revive the role's bound
+**AgentSession**, either already live or parked and resumed on a new process
+with a re-bound **AgentChannel**; otherwise start a new AgentSession for the
+role with a reconstructed **Brief**, the never-fails floor. Only the floor
+starts a new conversation. Every delivery records its rung; rung selection is
+an experiment, not an edict.
 _Avoid_: Retry, failover.
 
 **Leaf Engine**:
@@ -808,10 +908,40 @@ The resource that owns reconciliation of one declared manifest root, such as pro
 _Avoid_: Manifest annotations as state; refusal flag.
 
 **Park Depth**:
-Where on the vessel-is-a-cache spectrum a parked vessel sits: warm process →
-suspended vessel → no vessel, logs archived (ADR 0028). Depth changes
-delivery latency and re-provisioning work, never what `Landing` means.
+How deeply something is parked. A vessel sits on the vessel-is-a-cache
+spectrum: warm process → suspended vessel → no vessel, logs archived
+(ADR 0028). An **AgentSession** is `live` (a process runs its harness),
+`parked` (no process; the conversation can resume from its transcript and
+agent home) or `archived` (transcript and agent home kept in durable storage
+away from any vessel) (ADR 0059). Depth changes delivery latency and
+re-provisioning work, never what `Landing` means.
 _Avoid_: Hibernation tier, vessel state (the vessel has its own lifecycle).
+
+## Retired terms
+
+These words name models that are retired. Code may still contain them until
+removal lands; new docs and code use the replacement.
+
+**AttachableSet**:
+The per-host, checkout-keyed terminal registry (`attachables/registry.json`)
+behind the prepare-terminal and personal-checkout workspace commands.
+Retired: terminals are **TerminalSessions**, later **Processes** (ADR 0059).
+_Avoid_: attachable set (as a model of terminals).
+
+**PresentationManager provider**:
+An in-daemon provider (cmux, zellij) that laid out multiplexer workspaces,
+driven by the presentation reconciler. Retired with that reconciler:
+multiplexer adapters consume the `pm connect` metadata stream from outside
+flotilla's core (ADR 0051, ADR 0059, #2916).
+
+**Personal-checkout workspace**:
+A multiplexer workspace prepared for a hand-managed checkout through an
+AttachableSet. Retired with it (ADR 0059).
+
+**Holder**:
+The undefined "live session filling a role" in ADR 0055's first wording.
+Retired: say the **AgentSession** named by the role's current **Role
+Binding**, or *unbound* when there is none (ADR 0059).
 
 ## External Collaborators
 

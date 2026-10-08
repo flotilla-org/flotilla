@@ -3,7 +3,7 @@
 The fleet is the Project named by `FleetDesignation`; `fleet` is not a special
 Project or role spelling. Declare local presence with existing `ConvoyEnsure`
 records for standing roles. Definitions supply shape and subscriptions, and
-inherit per field. A definition alone never invents an automated holder.
+inherit per field. A definition alone never invents an automated role binding.
 
 In the **project-map fleet charter**, extend the designated fleet Project's
 `role_definitions` (preserving its other fields):
@@ -40,9 +40,9 @@ fields are optional, so old charter and stored records remain decodable.
 
 A local project governor can inherit the governor subscription or override it
 with `{topic: supervision, priority: 0}`. Its presence remains local. Resolution
-uses the sender's Project first, then each ancestor, skipping missing holders.
-Within a Project, priorities order recipients. The sender's own holder is
-excluded. `topic:PROJECT/supervision` addresses this resolver directly; other
+uses the sender's Project first, then each ancestor, skipping roles with no bound
+AgentSession. Within a Project, priorities order recipients. The sender's own
+session is excluded. `topic:PROJECT/supervision` addresses this resolver directly; other
 local topics receive ancestor subscriptions only when `subtree` is true.
 
 First-turn brief artifacts include an address book. `flotilla message contacts`
@@ -52,9 +52,9 @@ in descendants. The current baseline has no Project dependency declarations
 (#2724 owns that graph), so no dependency or dependee contacts are invented.
 Applied charter revisions produce system notifications regarding the Project
 and `charter@REVISION`; pending revisions supersede at the receiver's turn
-boundary. Managed holders receive a full brief rendered with the live role
+boundary. Managed sessions receive a full brief rendered with the live role
 template, while their running session and initial brief remain unchanged. Adopted
-holders receive charter prose through their current role claim; their external
+sessions receive charter prose through their current role claim; their external
 first-turn lifecycle belongs to #2659. Unchanged revisions and restarts reuse
 the same Message ID.
 
@@ -76,9 +76,9 @@ actual Project, convoy, vessel and role. Repeat with a local project governor;
 expect `PROJECT/governor`. Repeat with an unoccupied intermediate parent; expect
 the next occupied ancestor. Replace a governor generation and run the script
 without `--stall`; contacts must show the new terminal. A governor stall must
-skip its own holder and advance toward its parent's subscriber.
+skip its own session and advance toward its parent's subscriber.
 
-For charter notifications, make two quick charter commits while the holder is
+For charter notifications, make two quick charter commits while the bound session is
 working. At its next turn boundary, verify it receives only the newer revision.
 Inspect `flotilla resource list Message` for one superseded revision and one
 accepted/delivered notification. Reconcile again and verify no duplicate input.
