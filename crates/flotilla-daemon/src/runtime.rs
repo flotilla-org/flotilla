@@ -713,6 +713,9 @@ impl DaemonRuntime {
         )
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
+        // The preceding quarantine scan isolates undecodable stored rows before
+        // typed listing. No Presentation producer runs before or after retirement;
+        // unexpected store errors abort startup rather than silently skipping rows.
         phase(
             "purge_retired_presentations",
             flotilla_resources::purge_retired_presentations(&daemon.resource_backend(), &options.namespace),

@@ -93,10 +93,14 @@ impl StatusPatch<PresentationStatus> for PresentationStatusPatch {
 
 /// ADR 0047 one-generation cleanup. Remove one fleet roll after #2915 step 3.
 /// Presentation creation has stopped; release its retired finalizer even when
-/// deletion already began, then delete each local row without provider teardown.
+/// deletion already began, then request deletion without provider teardown.
+/// Only the retired finalizer is released; unrelated finalizers may keep rows
+/// pending deletion. Call after stored-record quarantine and before controllers.
 pub async fn purge_retired_presentations(backend: &crate::ResourceBackend, namespace: &str) -> Result<(), crate::ResourceError> {
     let resolver = backend.clone().using::<Presentation>(namespace);
-    for object in resolver.list().await?.items {
+    let objects = resolver.list().await?.items;
+    let original_count = objects.len();
+    for object in objects {
         if object.metadata.finalizers.iter().any(|name| name == "flotilla.work/presentation-teardown") {
             let meta = crate::InputMeta::from(&object.metadata).without_finalizer("flotilla.work/presentation-teardown");
             match resolver.update(&meta, &object.metadata.resource_version, &object.spec).await {
@@ -110,5 +114,7 @@ pub async fn purge_retired_presentations(backend: &crate::ResourceBackend, names
             Err(error) => return Err(error),
         }
     }
+    let remaining = resolver.list().await?.items.len();
+    tracing::info!(namespace, purged = original_count.saturating_sub(remaining), remaining, "retired Presentation cleanup complete");
     Ok(())
 }
