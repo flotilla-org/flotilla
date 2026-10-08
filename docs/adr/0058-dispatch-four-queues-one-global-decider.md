@@ -2,6 +2,8 @@
 
 Accepted by the owner grill on 2026-10-06 ([#1394 ruling](https://github.com/flotilla-org/flotilla/issues/1394#issuecomment-6017608090)). The earlier Quartermaster dispatch-agent direction is retired. Deterministic daemon substrate owns global queue decisions; governors, operators and decision models change judgment inputs, and a rare human emergency override remains. A navigator organises fleet ideation with operator selection.
 
+This record was first filed as ADR 0055, the same number as the Message ADR. It was renumbered to 0058 on 2026-10-08 (#2913); issue comments written before then call it ADR 0055.
+
 The four queues have separate owners and meanings:
 
 1. **Work, per Project:** contract-ready issues, batched by governors into resolved convoy requests; several issues may belong to one convoy.
