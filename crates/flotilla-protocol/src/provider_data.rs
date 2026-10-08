@@ -1,13 +1,10 @@
-use std::{cmp::Ordering, path::PathBuf};
+use std::cmp::Ordering;
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    qualified_path::{qualified_path_or_host_path, QualifiedPath},
-    EnvironmentId, HostName,
-};
+use crate::{qualified_path::QualifiedPath, EnvironmentId, HostName};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkout {
@@ -298,26 +295,6 @@ pub enum SessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct AttachableSetId(String);
-
-impl AttachableSetId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for AttachableSetId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct AttachableId(String);
 
 impl AttachableId {
@@ -337,22 +314,6 @@ impl std::fmt::Display for AttachableId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttachableSet {
-    pub id: AttachableSetId,
-    #[serde(default)]
-    pub host_affinity: Option<HostName>,
-    #[serde(default)]
-    #[serde(with = "qualified_path_or_host_path::option")]
-    pub checkout: Option<QualifiedPath>,
-    #[serde(default)]
-    pub template_identity: Option<String>,
-    #[serde(default)]
-    pub environment_id: Option<EnvironmentId>,
-    #[serde(default)]
-    pub members: Vec<AttachableId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalStatus {
     Running,
     Disconnected,
@@ -360,26 +321,8 @@ pub enum TerminalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneExitAttention {
-    pub exit_code: i32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedTerminal {
-    pub set_id: AttachableSetId,
-    pub role: String,
-    pub command: String,
-    pub working_directory: PathBuf,
-    pub status: TerminalStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attention: Option<PaneExitAttention>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
-    #[serde(default)]
-    pub attachable_set_id: Option<AttachableSetId>,
 }
 
 /// Deliberate on-demand provider interchange for a single repository.

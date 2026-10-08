@@ -134,10 +134,7 @@ impl PresentationManager for RecordingPresentationManager {
             return Err(message);
         }
         self.created.lock().expect("created lock").push(config.clone());
-        Ok((
-            format!("workspace:{}", self.created.lock().expect("created lock").len()),
-            Workspace { name: config.name.clone(), attachable_set_id: None },
-        ))
+        Ok((format!("workspace:{}", self.created.lock().expect("created lock").len()), Workspace { name: config.name.clone() }))
     }
 
     async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {

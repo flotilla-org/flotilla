@@ -65,9 +65,7 @@ pub mod salience;
 mod scoped_store;
 mod standing_roles;
 pub mod step;
-pub mod template;
 pub mod terminal_health;
-pub mod terminal_manager;
 pub mod vcs;
 
 pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";

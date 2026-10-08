@@ -1,17 +1,12 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use super::{
     build_plan,
     checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
-    session_actions::resolve_attach_command,
-    workspace_config, workspace_label_for_host, ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
+    ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
 use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use crate::{
-    attachable::{AttachableStore, BindingObjectKind, ProviderBinding, SharedAttachableStore},
     environment_manager::EnvironmentManager,
     event_sink::RecordingEventSink,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -43,12 +38,11 @@ fn desc(name: &str) -> ProviderDescriptor {
 }
 use async_trait::async_trait;
 use flotilla_protocol::{
-    arg::Arg,
     issue_query::{IssueQuery, IssueResultPage},
-    qualified_path::{HostId, QualifiedPath},
+    qualified_path::HostId,
     test_support::{TestCheckout, TestIssue, TestSession},
     CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, IssueChangeset, IssueRef, IssueSource,
-    NodeId, PreparedTerminalCommand, RepoSelector, ResolvedPaneCommand, TerminalStatus,
+    NodeId, RepoSelector,
 };
 
 fn hp(path: &str) -> HostPath {
@@ -142,16 +136,6 @@ impl MockWorkspaceManager {
         }
     }
 
-    fn failing(msg: &str) -> Self {
-        Self {
-            existing: vec![],
-            create_result: tokio::sync::Mutex::new(Err(msg.to_string())),
-            select_result: tokio::sync::Mutex::new(Err(msg.to_string())),
-            created_configs: tokio::sync::Mutex::new(Vec::new()),
-            calls: tokio::sync::Mutex::new(vec![]),
-        }
-    }
-
     fn with_existing(existing: Vec<(String, Workspace)>) -> Self {
         Self {
             existing,
@@ -174,7 +158,7 @@ impl PresentationManager for MockWorkspaceManager {
         self.calls.lock().await.push(format!("create_workspace:{}", config.name));
         let result = self.create_result.lock().await;
         match &*result {
-            Ok(()) => Ok(("mock-ref".to_string(), Workspace { name: config.name.clone(), attachable_set_id: None })),
+            Ok(()) => Ok(("mock-ref".to_string(), Workspace { name: config.name.clone() })),
             Err(e) => Err(e.clone()),
         }
     }
@@ -317,10 +301,6 @@ impl MockCloudAgent {
     fn failing(msg: &str) -> Self {
         Self { archive_result: tokio::sync::Mutex::new(Err(msg.to_string())), attach_command: "mock-attach-cmd".to_string() }
     }
-
-    fn with_attach(attach_command: &str) -> Self {
-        Self { archive_result: tokio::sync::Mutex::new(Ok(())), attach_command: attach_command.to_string() }
-    }
 }
 
 #[async_trait]
@@ -435,10 +415,6 @@ fn remove_checkout_action(branch: &str) -> CommandAction {
     CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(branch.to_string()) }
 }
 
-fn test_attachable_store(base: &DaemonHostPath) -> SharedAttachableStore {
-    crate::attachable::shared_file_backed_attachable_store(base)
-}
-
 fn assert_error_contains(result: CommandValue, expected_substring: &str) {
     match result {
         CommandValue::Error { message } => {
@@ -504,45 +480,8 @@ fn assert_ok(result: CommandValue) {
 }
 
 // -----------------------------------------------------------------------
-// Tests: CreateWorkspaceForCheckout
+// Tests: ArchiveSession
 // -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn create_workspace_for_checkout_not_found() {
-    let registry = empty_registry();
-    let data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_error_contains(result, "checkout not found");
-}
-
-#[tokio::test]
-async fn create_workspace_for_checkout_fails_without_ws_manager() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let path = PathBuf::from("/repo/wt-feat");
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_error_contains(result, "no workspace manager is active");
-}
 
 #[tokio::test]
 async fn archive_session_uses_provider_from_session_ref() {
@@ -560,581 +499,24 @@ async fn archive_session_uses_provider_from_session_ref() {
 }
 
 #[tokio::test]
-async fn create_workspace_for_checkout_success_with_ws_manager() {
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let path = PathBuf::from("/repo/wt-feat");
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_ok(result);
-}
-
-#[tokio::test]
-async fn create_workspace_for_checkout_persists_workspace_binding() {
-    let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    let mut data = empty_data();
-    let checkout_path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::CreateWorkspaceForCheckout { checkout_path: checkout_path.clone(), label: "feat".into() },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    assert_ok(result);
-    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
-    let object_id = store
-        .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
-        .expect("workspace binding should exist");
-    let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), checkout_path).into()));
-}
-
-#[tokio::test]
-async fn create_workspace_for_checkout_ws_manager_fails() {
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws creation failed")));
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let path = PathBuf::from("/repo/wt-feat");
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::CreateWorkspaceForCheckout { checkout_path: path, label: "feat".into() },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_error_eq(result, "ws creation failed");
-}
-#[tokio::test]
-async fn prepare_terminal_for_checkout_returns_terminal_commands() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    match result {
-        CommandValue::TerminalPrepared { repo_identity, target_node_id, branch, checkout_path, attachable_set_id, commands } => {
-            assert_eq!(repo_identity, flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
-            assert_eq!(target_node_id, local_node_id());
-            assert_eq!(branch, "feat");
-            assert_eq!(checkout_path, path);
-            assert!(attachable_set_id.is_some(), "prepare should allocate an attachable set");
-            assert_eq!(commands, vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("claude".into())] }]);
-        }
-        other => panic!("expected TerminalPrepared, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn prepare_terminal_for_checkout_includes_attachable_set_id_when_present() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    {
-        let mut store = attachable_store.lock().expect("store lock");
-        let ensured_set_id = store.ensure_terminal_set(Some(local_host()), Some(HostPath::new(local_host(), path.clone()).into()));
-        store.save().expect("save attachable store");
-        assert_eq!(
-            store.registry().sets.get(&ensured_set_id).and_then(|set| set.checkout.clone()),
-            Some(HostPath::new(local_host(), path.clone()).into())
-        );
-    }
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    match result {
-        CommandValue::TerminalPrepared { attachable_set_id, .. } => {
-            let set_id = attachable_set_id.expect("attachable set id");
-            let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
-            assert!(store.registry().sets.contains_key(&set_id), "prepare should reuse persisted set");
-        }
-        other => panic!("expected TerminalPrepared, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn prepare_terminal_for_checkout_reuses_host_id_qualified_attachable_set() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    let checkout_key = flotilla_protocol::qualified_path::QualifiedPath::host(HostId::new("persisted-local-host-id"), path.clone());
-    data.checkouts.insert(checkout_key.clone(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    let ensured_set_id = {
-        let mut store = attachable_store.lock().expect("store lock");
-        let ensured_set_id = store.ensure_terminal_set(Some(local_host()), Some(checkout_key.clone()));
-        store.save().expect("save attachable store");
-        ensured_set_id
-    };
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    match result {
-        CommandValue::TerminalPrepared { attachable_set_id, .. } => {
-            assert_eq!(attachable_set_id.as_ref(), Some(&ensured_set_id), "prepare should reuse host-id-qualified attachable set");
-        }
-        other => panic!("expected TerminalPrepared, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn prepare_terminal_for_checkout_creates_and_persists_attachable_set() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::PrepareTerminalForCheckout { checkout_path: path.clone(), commands: vec![] },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    let set_id = match result {
-        CommandValue::TerminalPrepared { attachable_set_id, .. } => attachable_set_id.expect("attachable set id"),
-        other => panic!("expected TerminalPrepared, got {other:?}"),
-    };
-
-    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
-    let set = store.registry().sets.get(&set_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), path).into()));
-    assert!(temp.path().join("attachables").join("registry.json").exists(), "registry should be written");
-}
-
-#[tokio::test]
-async fn create_workspace_from_prepared_terminal_wraps_remote_commands_in_ssh() {
-    let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    let repo_root = temp.path().join("repo");
-    std::fs::create_dir_all(&repo_root).expect("create repo root");
-    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
-        .expect("write hosts config");
-    let attachable_set_id = {
-        let mut store = attachable_store.lock().expect("store lock");
-        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()))
-    };
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::CreateWorkspaceFromPreparedTerminal {
-            target_node_id: node_id("desktop"),
-            branch: "feat".into(),
-            checkout_path: PathBuf::from("/remote/feat"),
-            attachable_set_id: Some(attachable_set_id),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }],
-        },
-        registry,
-        empty_data(),
-        runner,
-        ExecutionEnvironmentPath::new(repo_root.clone()),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    assert_ok(result);
-    let created = workspace_manager.created_configs.lock().await;
-    assert_eq!(created.len(), 1);
-    assert_eq!(created[0].working_directory, ExecutionEnvironmentPath::new(&repo_root));
-    let resolved = &created[0].attach_commands;
-    assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].0, "main");
-    assert!(resolved[0].1.contains("ssh -t"));
-    assert!(resolved[0].1.contains("desktop.local"));
-    assert!(resolved[0].1.contains("/remote/feat"));
-    assert!(resolved[0].1.contains("bash -l"));
-    assert!(resolved[0].1.contains("${SHELL:-/bin/sh} -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
-}
-
-#[tokio::test]
-async fn create_workspace_from_prepared_terminal_prefixes_name_with_host() {
-    let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    let repo_root = temp.path().join("repo");
-    std::fs::create_dir_all(&repo_root).expect("create repo root");
-    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
-        .expect("write hosts config");
-    let attachable_set_id = {
-        let mut store = attachable_store.lock().expect("store lock");
-        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()))
-    };
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::CreateWorkspaceFromPreparedTerminal {
-            target_node_id: node_id("desktop"),
-            branch: "feat".into(),
-            checkout_path: PathBuf::from("/remote/feat"),
-            attachable_set_id: Some(attachable_set_id),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-        },
-        registry,
-        empty_data(),
-        runner,
-        ExecutionEnvironmentPath::new(repo_root),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    assert_ok(result);
-    let created = workspace_manager.created_configs.lock().await;
-    assert_eq!(created.len(), 1);
-    assert_eq!(created[0].name, "feat@desktop", "workspace name should be branch@host");
-}
-
-#[tokio::test]
-async fn create_workspace_from_prepared_terminal_persists_remote_attachable_set_binding() {
-    let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    let repo_root = temp.path().join("repo");
-    std::fs::create_dir_all(&repo_root).expect("create repo root");
-    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
-        .expect("write hosts config");
-
-    let set_id = {
-        let mut store = attachable_store.lock().expect("store lock");
-        let set_id =
-            store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()));
-        store.save().expect("save attachable store");
-        set_id
-    };
-    let result = run_build_plan_to_completion_with(
-        CommandAction::CreateWorkspaceFromPreparedTerminal {
-            target_node_id: node_id("desktop"),
-            branch: "feat".into(),
-            checkout_path: PathBuf::from("/remote/feat"),
-            attachable_set_id: Some(set_id.clone()),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-        },
-        registry,
-        empty_data(),
-        runner,
-        ExecutionEnvironmentPath::new(repo_root),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    assert_ok(result);
-    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
-    let object_id = store
-        .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
-        .expect("workspace binding should exist");
-    assert_eq!(object_id, set_id.as_str());
-    let set = store.registry().sets.get(&set_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(HostName::new("desktop"), PathBuf::from("/remote/feat")).into()));
-}
-
-#[tokio::test]
-async fn create_workspace_for_checkout_selects_existing_workspace() {
-    let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace { name: "feat".to_string(), attachable_set_id: None };
-    let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:42".to_string(), existing_workspace)]));
-
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-
-    // Pre-populate the attachable store with a set for the checkout and a
-    // workspace binding so the binding-based lookup finds it.
-    let attachable_store = crate::attachable::shared_in_memory_attachable_store();
-    {
-        let mut store = attachable_store.lock().expect("lock store");
-        let host = local_host();
-        let checkout = HostPath::new(host.clone(), PathBuf::from("/repo/wt-feat"));
-        let set_id = store.ensure_terminal_set(Some(host), Some(checkout.into()));
-        store.replace_binding(ProviderBinding {
-            provider_category: "workspace_manager".into(),
-            provider_name: "cmux".into(),
-            object_kind: BindingObjectKind::AttachableSet,
-            object_id: set_id.to_string(),
-            external_ref: "workspace:42".into(),
-        });
-    }
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::CreateWorkspaceForCheckout { checkout_path, label: "feat".into() },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        config_base(),
-        attachable_store,
-    )
-    .await;
-
-    // Binding-based lookup finds the existing workspace and selects it
-    // instead of creating a new one.
-    assert_ok(result);
-    let calls = ws_mgr.calls.lock().await;
-    assert!(calls.iter().any(|c| c.starts_with("select_workspace")), "should select existing workspace, got: {calls:?}");
-    assert!(!calls.iter().any(|c| c.starts_with("create_workspace")), "should NOT create workspace when binding exists, got: {calls:?}");
-}
-
-#[tokio::test]
-async fn checkout_action_creates_workspace_after_checkout() {
-    // Fresh checkout has no binding in the store, so a new workspace is
-    // always created (binding-based lookup returns None).
-    let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![(
-        "workspace:99".to_string(),
-        Workspace { name: "feat-x".to_string(), attachable_set_id: None },
-    )]));
+async fn checkout_action_does_not_create_workspace() {
+    // #2918: a personal checkout neither selects an existing PM workspace
+    // nor creates a new one, even when a PM provider is available.
+    let ws_mgr =
+        Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:99".to_string(), Workspace { name: "feat-x".to_string() })]));
 
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
-    let attachable_store = crate::attachable::shared_in_memory_attachable_store();
 
-    let result = run_build_plan_to_completion_with(
-        fresh_checkout_action("feat-x"),
-        registry,
-        empty_data(),
-        runner,
-        repo_root(),
-        config_base(),
-        attachable_store,
-    )
-    .await;
+    let result =
+        run_build_plan_to_completion_with(fresh_checkout_action("feat-x"), registry, empty_data(), runner, repo_root(), config_base())
+            .await;
 
     assert_checkout_created_branch(result, "feat-x");
     let calls = ws_mgr.calls.lock().await;
-    assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "should create workspace, got: {calls:?}");
-}
-
-#[tokio::test]
-async fn create_workspace_from_prepared_terminal_uses_local_fallback_for_remote_only_repo() {
-    let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-    std::fs::write(temp.path().join("hosts.toml"), "[hosts.desktop]\nhostname = \"desktop.local\"\nexpected_host_name = \"desktop\"\n")
-        .expect("write hosts config");
-    let attachable_set_id = {
-        let mut store = attachable_store.lock().expect("store lock");
-        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/remote/feat").into()))
-    };
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::CreateWorkspaceFromPreparedTerminal {
-            target_node_id: node_id("desktop"),
-            branch: "feat".into(),
-            checkout_path: PathBuf::from("/remote/feat"),
-            attachable_set_id: Some(attachable_set_id),
-            commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash -l".into())] }],
-        },
-        registry,
-        empty_data(),
-        runner,
-        ExecutionEnvironmentPath::new("<remote>/desktop/home/dev/repo"),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    assert_ok(result);
-    let created = workspace_manager.created_configs.lock().await;
-    assert_eq!(created.len(), 1);
-    assert!(!created[0].working_directory.as_path().to_string_lossy().starts_with("<remote>/"));
-    assert!(created[0].working_directory.as_path().exists(), "fallback working directory should exist");
-    let resolved = &created[0].attach_commands;
-    assert!(resolved[0].1.contains("${SHELL:-/bin/sh} -l -c"), "expected login shell wrapper, got: {}", resolved[0].1);
-}
-
-#[tokio::test]
-async fn teleport_session_creates_workspace_even_when_one_exists() {
-    // Teleport must always create a new workspace because the attach command
-    // is session-specific. Reusing an existing workspace would attach to
-    // whatever session was there before, not the requested one.
-    let checkout_path = PathBuf::from("/repo/wt-feat");
-    let existing_workspace = Workspace { name: "feat".to_string(), attachable_set_id: None };
-    let ws_mgr = Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:77".to_string(), existing_workspace)]));
-
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.presentation_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::TeleportSession {
-            session_id: "sess-1".to_string(),
-            branch: Some("feat".to_string()),
-            checkout_key: Some(checkout_path),
-        },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_ok(result);
-    let calls = ws_mgr.calls.lock().await;
-    assert!(calls.iter().any(|c| c.starts_with("create_workspace")), "teleport should always create a new workspace, got: {calls:?}");
-    assert!(!calls.iter().any(|c| c.starts_with("select_workspace")), "teleport should NOT select existing workspace, got: {calls:?}");
-}
-
-#[tokio::test]
-async fn teleport_session_persists_workspace_binding() {
-    let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
-    let terminal_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    registry.terminal_pools.insert("cleat", desc("cleat"), terminal_pool);
-    let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let checkout_key = QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat");
-    data.checkouts.insert(checkout_key.clone(), TestCheckout::new("feat").build());
-    let runner = runner_ok();
-    let temp = tempfile::tempdir().expect("tempdir");
-    let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::TeleportSession {
-            session_id: "sess-1".into(),
-            branch: Some("feat".into()),
-            checkout_key: Some(PathBuf::from("/repo/wt-feat")),
-        },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        DaemonHostPath::new(temp.path()),
-        attachable_store,
-    )
-    .await;
-
-    assert_ok(result);
-    let store = AttachableStore::with_base(&crate::path_context::DaemonHostPath::new(temp.path()));
-    let object_id = store
-        .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
-        .expect("workspace binding should exist");
-    let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(store.registry().sets.len(), 1, "teleport should use one canonical attachable set");
-    assert_eq!(set.checkout, Some(checkout_key));
-    assert!(!set.members.is_empty(), "workspace binding should point to the set holding the terminal");
-}
-// -----------------------------------------------------------------------
-// Tests: SelectWorkspace
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn select_workspace_no_manager() {
-    let registry = empty_registry();
-    let runner = runner_ok();
-
-    let result =
-        run_build_plan_to_completion(CommandAction::SelectWorkspace { ws_ref: "my-ws".to_string() }, registry, empty_data(), runner).await;
-
-    assert_error_contains(result, "no workspace manager is active");
-}
-
-#[tokio::test]
-async fn select_workspace_success() {
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let runner = runner_ok();
-
-    let result =
-        run_build_plan_to_completion(CommandAction::SelectWorkspace { ws_ref: "my-ws".to_string() }, registry, empty_data(), runner).await;
-
-    assert_ok(result);
-}
-
-#[tokio::test]
-async fn select_workspace_failure() {
-    let mut registry = empty_registry();
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("select failed")));
-    let runner = runner_ok();
-
-    let result =
-        run_build_plan_to_completion(CommandAction::SelectWorkspace { ws_ref: "bad-ws".to_string() }, registry, empty_data(), runner).await;
-
-    assert_error_eq(result, "select failed");
+    assert!(calls.is_empty(), "checkout must not call the presentation manager, got: {calls:?}");
 }
 
 // -----------------------------------------------------------------------
@@ -1197,19 +579,6 @@ async fn create_checkout_failure() {
     assert_error_eq(result, "branch already exists");
 }
 
-#[tokio::test]
-async fn create_checkout_success_ws_manager_fails_still_returns_created() {
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
-    let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
-
-    let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
-
-    // Workspace failure is logged but checkout still reports success
-    assert_checkout_created_branch(result, "feat-x");
-}
-
 // -----------------------------------------------------------------------
 // Tests: RemoveCheckout
 // -----------------------------------------------------------------------
@@ -1252,142 +621,11 @@ async fn remove_checkout_failure() {
     assert_error_eq(result, "cannot remove trunk");
 }
 
-#[tokio::test]
-async fn remove_checkout_resolves_for_remote_host() {
-    let remote = HostName::new("remote-box");
-    let remote_hp = HostPath::new(remote.clone(), PathBuf::from("/repo/wt-feat"));
-    let mut data = empty_data();
-    data.checkouts.insert(remote_hp.into(), TestCheckout::new("feat").build());
-
-    let config_base = config_base();
-    let plan = build_plan(
-        command_with_host("remote-box", remove_checkout_action("feat")),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(empty_registry()),
-        Arc::new(data),
-        config_base.clone(),
-        test_attachable_store(&config_base),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await;
-
-    let plan = plan.expect("remote host target should resolve remote-owned checkout");
-    assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
-}
-
-#[tokio::test]
-async fn remove_checkout_disambiguates_by_target_host() {
-    // Same branch on two hosts — command.host should disambiguate
-    let local = hp("/repo/wt-feat");
-    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat"));
-    let mut data = empty_data();
-    data.checkouts.insert(local.into(), TestCheckout::new("feat").build());
-    data.checkouts.insert(remote.into(), TestCheckout::new("feat").build());
-
-    let config_base = config_base();
-    let plan = build_plan(
-        command_with_host("remote-box", remove_checkout_action("feat")),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(empty_registry()),
-        Arc::new(data),
-        config_base.clone(),
-        test_attachable_store(&config_base),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await;
-
-    let plan = plan.expect("build_plan should resolve the targeted checkout");
-    assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
-    match &plan.steps[0].action {
-        StepAction::RemoveCheckout { deleted_checkout_paths, .. } => {
-            assert_eq!(deleted_checkout_paths.len(), 1);
-            assert_eq!(deleted_checkout_paths[0].path, PathBuf::from("/repo/wt-feat"));
-            assert_eq!(deleted_checkout_paths[0].host_name(), Some(&HostName::new("remote-box")));
-        }
-        other => panic!("expected RemoveCheckout step, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn remove_checkout_remote_node_ignores_local_duplicate_branch() {
-    let local = hp("/repo/wt-feat-local");
-    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat-remote"));
-    let mut data = empty_data();
-    data.checkouts.insert(local.into(), TestCheckout::new("feat").build());
-    let mut remote_checkout = TestCheckout::new("feat").build();
-    remote_checkout.host_name = Some(HostName::new("remote-box"));
-    data.checkouts.insert(remote.into(), remote_checkout);
-
-    let config_base = config_base();
-    let plan = build_plan(
-        Command::builder()
-            .action(remove_checkout_action("feat"))
-            .node_id(NodeId::new("remote-box"))
-            .context_repo(RepoSelector::Identity(repo_identity()))
-            .build(),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(empty_registry()),
-        Arc::new(data),
-        config_base.clone(),
-        test_attachable_store(&config_base),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await
-    .expect("build_plan should resolve remote checkout without considering local duplicate");
-
-    assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
-    match &plan.steps[0].action {
-        StepAction::RemoveCheckout { deleted_checkout_paths, .. } => {
-            assert_eq!(deleted_checkout_paths.len(), 1);
-            assert_eq!(deleted_checkout_paths[0].path, PathBuf::from("/repo/wt-feat-remote"));
-        }
-        other => panic!("expected RemoveCheckout step, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn fetch_checkout_status_targets_remote_node_when_command_is_remote() {
-    let registry = empty_registry();
-    let config_base = config_base();
-    let plan = build_plan(
-        Command::builder()
-            .action(CommandAction::FetchCheckoutStatus {
-                branch: "feat".to_string(),
-                checkout_path: Some(PathBuf::from("/repo/wt")),
-                change_request_id: None,
-            })
-            .node_id(NodeId::new("remote-box"))
-            .context_repo(RepoSelector::Identity(repo_identity()))
-            .build(),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(empty_data()),
-        config_base.clone(),
-        test_attachable_store(&config_base),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await
-    .expect("build_plan should succeed");
-
-    assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
-}
-
 // -----------------------------------------------------------------------
-// Tests: RemoveCheckout — terminal cleanup
+// Tests: RemoveCheckout — terminal lifecycle independence
 // -----------------------------------------------------------------------
 
+// Terminal-provider boundary double: expose a live session at the checkout and record kills.
 struct MockTerminalPool {
     killed: tokio::sync::Mutex<Vec<String>>,
 }
@@ -1395,7 +633,11 @@ struct MockTerminalPool {
 #[async_trait]
 impl TerminalPool for MockTerminalPool {
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
-        Ok(vec![])
+        Ok(vec![TerminalSession::builder()
+            .session_name("existing-session".into())
+            .status(flotilla_protocol::TerminalStatus::Running)
+            .working_directory(ExecutionEnvironmentPath::new("/repo/wt-feat-x"))
+            .build()])
     }
     async fn ensure_session(
         &self,
@@ -1422,42 +664,9 @@ impl TerminalPool for MockTerminalPool {
     }
 }
 
-struct FailingEnsureTerminalPool;
-
-#[async_trait]
-impl TerminalPool for FailingEnsureTerminalPool {
-    async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
-        Ok(vec![])
-    }
-
-    async fn ensure_session(
-        &self,
-        _session_name: &str,
-        _cmd: &str,
-        _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &TerminalEnvVars,
-        _tags: &[TerminalSessionTag],
-    ) -> Result<(), String> {
-        Err("failed to start terminal".to_string())
-    }
-
-    fn attach_args(
-        &self,
-        session_name: &str,
-        _cmd: &str,
-        _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &TerminalEnvVars,
-    ) -> Result<Vec<Arg>, String> {
-        Ok(vec![Arg::Literal(format!("attach:{session_name}"))])
-    }
-
-    async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
-        Ok(())
-    }
-}
-
+// #2918: removing a checkout leaves its live terminal for the TerminalSession lifecycle to manage.
 #[tokio::test]
-async fn remove_checkout_succeeds_with_terminal_pool() {
+async fn remove_checkout_preserves_terminal_sessions() {
     let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
 
     let mut registry = empty_registry();
@@ -1470,6 +679,7 @@ async fn remove_checkout_succeeds_with_terminal_pool() {
     let result = run_build_plan_to_completion(remove_checkout_action("feat-x"), registry, data, runner).await;
 
     assert_checkout_removed_branch(result, "feat-x");
+    assert!(mock_pool.killed.lock().await.is_empty(), "TerminalSession lifecycle owns terminal teardown");
 }
 
 // -----------------------------------------------------------------------
@@ -1967,159 +1177,6 @@ async fn generate_branch_name_unknown_issue_key_still_uses_ai_context() {
 }
 
 // -----------------------------------------------------------------------
-// Tests: TeleportSession
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn teleport_session_with_checkout_key() {
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert(
-        "claude",
-        desc("claude"),
-        Arc::new(MockCloudAgent::with_attach("claude --teleport")), // base; mock appends session_id
-    );
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_ok(result);
-}
-
-#[tokio::test]
-async fn teleport_session_uses_provider_specific_attach_command() {
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::with_attach("claude --teleport")));
-    registry.cloud_agents.insert("cursor", desc("cursor"), Arc::new(MockCloudAgent::with_attach("agent --resume")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("cursor", "sess-1").build());
-    let runner = runner_ok();
-
-    let attach = resolve_attach_command("sess-1", &registry, &data).await.expect("resolve attach command");
-    assert_eq!(attach, "agent --resume sess-1");
-
-    let result = run_build_plan_to_completion(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_ok(result);
-}
-
-#[tokio::test]
-async fn teleport_session_with_branch_creates_checkout() {
-    let terminal_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    registry.terminal_pools.insert("cleat", desc("cleat"), terminal_pool);
-    let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-    let attachable_store = crate::attachable::shared_in_memory_attachable_store();
-
-    let result = run_build_plan_to_completion_with(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: None },
-        registry,
-        data,
-        runner,
-        repo_root(),
-        config_base(),
-        attachable_store.clone(),
-    )
-    .await;
-
-    assert_ok(result);
-    let store = attachable_store.lock().expect("attachable store lock");
-    assert_eq!(store.registry().sets.len(), 1, "fresh teleport checkout should use one canonical set");
-    let set = store.registry().sets.values().next().expect("canonical set");
-    assert_eq!(set.checkout, Some(QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat")));
-    assert!(!set.members.is_empty(), "canonical set should hold the terminal");
-    assert_eq!(store.lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref"), Some(set.id.as_str()));
-}
-
-#[tokio::test]
-async fn teleport_session_no_path_no_branch() {
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    let mut data = empty_data();
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: None, checkout_key: None },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_error_contains(result, "checkout path not resolved by prior step");
-}
-
-#[tokio::test]
-async fn teleport_session_ws_manager_fails() {
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_error_eq(result, "ws failed");
-}
-
-#[tokio::test]
-async fn teleport_session_uses_session_as_name_when_no_branch() {
-    // When checkout_key is present but branch is None, uses "session" as name.
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-
-    let result = run_build_plan_to_completion(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: None, checkout_key: Some(path) },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    assert_ok(result);
-}
-
-// -----------------------------------------------------------------------
 // Tests: Daemon-level commands rejected
 // -----------------------------------------------------------------------
 
@@ -2142,45 +1199,17 @@ async fn daemon_level_commands_return_error() {
 }
 
 // -----------------------------------------------------------------------
-// Tests: workspace_config helper
-// -----------------------------------------------------------------------
-
-#[test]
-fn workspace_config_builds_correct_struct() {
-    let config = workspace_config(Path::new("/nonexistent-repo"), "my-branch", Path::new("/repo/wt"), "claude", config_base().as_path());
-
-    assert_eq!(config.name, "my-branch");
-    assert_eq!(config.working_directory, ExecutionEnvironmentPath::new("/repo/wt"));
-    assert_eq!(config.template_vars.get("main_command"), Some(&"claude".to_string()));
-    assert!(config.template_yaml.is_none(), "no template file should exist at test paths");
-}
-
-// -----------------------------------------------------------------------
 // Helper to run build_plan with Arc-wrapped arguments
 // -----------------------------------------------------------------------
 
 async fn run_build_plan(
     action: CommandAction,
-    registry: ProviderRegistry,
+    _registry: ProviderRegistry,
     providers_data: ProviderData,
     _runner: MockRunner,
 ) -> Result<crate::step::StepPlan, PlannerRefusal> {
-    let config_base = config_base();
-    build_plan(
-        local_command(action),
-        RepoExecutionContext {
-            identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            root: repo_root(),
-        },
-        Arc::new(registry),
-        Arc::new(providers_data),
-        config_base.clone(),
-        test_attachable_store(&config_base),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await
+    let _config_base = config_base();
+    build_plan(local_command(action), Arc::new(providers_data), local_node_id(), local_host()).await
 }
 
 async fn run_build_plan_to_completion(
@@ -2190,8 +1219,7 @@ async fn run_build_plan_to_completion(
     runner: MockRunner,
 ) -> CommandValue {
     let config_base = config_base();
-    let attachable_store = test_attachable_store(&config_base);
-    run_build_plan_to_completion_with(action, registry, providers_data, runner, repo_root(), config_base, attachable_store).await
+    run_build_plan_to_completion_with(action, registry, providers_data, runner, repo_root(), config_base).await
 }
 
 async fn run_build_plan_to_completion_with(
@@ -2201,7 +1229,6 @@ async fn run_build_plan_to_completion_with(
     runner: MockRunner,
     root: ExecutionEnvironmentPath,
     config_base: DaemonHostPath,
-    attachable_store: SharedAttachableStore,
 ) -> CommandValue {
     use tokio_util::sync::CancellationToken;
 
@@ -2220,18 +1247,7 @@ async fn run_build_plan_to_completion_with(
         }
         None => test_vcs_resolver(runner.clone()),
     };
-    let plan = build_plan(
-        local_command(action),
-        repo.clone(),
-        Arc::clone(&registry),
-        Arc::clone(&providers_data),
-        config_base.clone(),
-        attachable_store.clone(),
-        None,
-        local_node_id(),
-        local_host.clone(),
-    )
-    .await;
+    let plan = build_plan(local_command(action), Arc::clone(&providers_data), local_node_id(), local_host.clone()).await;
 
     match plan {
         Err(refusal) => refusal.into_command_value(),
@@ -2245,72 +1261,14 @@ async fn run_build_plan_to_completion_with(
                 vcs_resolver,
                 env: Arc::new(TestEnvVars::default()),
                 config_base,
-                attachable_store,
                 daemon_socket_path: None,
-                local_node_id: local_node_id(),
+
                 local_host: local_host.clone(),
                 environment_manager: empty_environment_manager().await,
             };
             run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await
         }
     }
-}
-
-#[tokio::test]
-async fn remove_checkout_cascades_attachable_set_deletion() {
-    let config_base = config_base();
-    let attachable_store = crate::attachable::shared_in_memory_attachable_store();
-    let host = local_host();
-
-    // Pre-populate the store with a set and members
-    {
-        let mut store = attachable_store.lock().expect("lock store");
-        let checkout_path = HostPath::new(host.clone(), "/repo/wt-feat-x");
-        let set_id = store.ensure_terminal_set(Some(host.clone()), Some(checkout_path.into()));
-        store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "cleat",
-            "flotilla/feat-x/shell/0",
-            crate::attachable::TerminalPurpose { checkout: "feat-x".into(), role: "shell".into(), index: 0 },
-            "bash",
-            crate::path_context::ExecutionEnvironmentPath::new("/repo/wt-feat-x"),
-            TerminalStatus::Running,
-        );
-    }
-
-    let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.terminal_pools.insert("cleat", desc("cleat"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
-
-    let runner = runner_ok();
-    let result = run_build_plan_to_completion_with(
-        remove_checkout_action("feat-x"),
-        registry,
-        data,
-        runner,
-        repo_root(),
-        config_base,
-        attachable_store.clone(),
-    )
-    .await;
-
-    assert_checkout_removed_branch(result, "feat-x");
-
-    // Verify set and members were removed from store
-    {
-        let store = attachable_store.lock().expect("lock store");
-        assert!(store.registry().sets.is_empty(), "set should be removed");
-        assert!(store.registry().attachables.is_empty(), "attachables should be removed");
-        assert!(store.registry().bindings.is_empty(), "bindings should be removed");
-    }
-
-    // Verify terminal was killed via cascade (session name is the AttachableId, not the old flotilla/... format)
-    let killed = mock_pool.killed.lock().await;
-    assert_eq!(killed.len(), 1, "cascade should kill the terminal");
 }
 
 // -----------------------------------------------------------------------
@@ -2329,134 +1287,21 @@ async fn build_plan_create_checkout_returns_steps() {
 
     match plan {
         Ok(step_plan) => {
-            assert_eq!(step_plan.steps.len(), 3, "checkout + prepare + attach steps");
+            assert_eq!(step_plan.steps.len(), 1, "checkout needs no personal workspace");
             assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-            assert_eq!(step_plan.steps[1].description, "Prepare workspace for feat-x");
-            assert_eq!(step_plan.steps[2].description, "Attach workspace");
         }
         Err(_) => panic!("expected Ok, got Err"),
     }
 }
 
 #[tokio::test]
-async fn checkout_command_fails_loudly_without_workspace_manager() {
+async fn checkout_command_succeeds_without_workspace_manager() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
 
     let result = run_build_plan_to_completion(existing_branch_checkout_action("feat-x"), registry, empty_data(), runner_ok()).await;
 
-    assert_error_contains(result, "no workspace manager is active");
-}
-
-#[tokio::test]
-async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let data = empty_data();
-
-    let plan = build_plan(
-        command_with_host("feta", fresh_checkout_action("feat-x")),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await
-    .expect("build plan");
-
-    assert_eq!(plan.steps.len(), 3);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(node_id("feta")));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(node_id("feta")));
-    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(local_node_id()));
-}
-
-#[tokio::test]
-async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_and_attaches_locally() {
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let local = node_id("laptop-node");
-
-    let plan = build_plan(
-        Command::builder()
-            .action(CommandAction::Checkout {
-                repo: repo_selector(),
-                target: CheckoutTarget::FreshBranch("feat-x".to_string()),
-                issue_ids: vec![("github".into(), "123".into())],
-            })
-            .node_id(node_id("feta-node"))
-            .provisioning_target(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("Build Box") })
-            .build(),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(empty_data()),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local.clone(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build plan");
-
-    assert_eq!(plan.steps.len(), 4);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(node_id("feta-node")));
-    assert!(matches!(
-        plan.steps[1].action,
-        StepAction::LinkIssuesToBranch { ref branch, ref issue_ids }
-            if branch == "feat-x" && issue_ids == &vec![(String::from("github"), String::from("123"))]
-    ));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(node_id("feta-node")));
-    assert!(matches!(
-        plan.steps[2].action,
-        StepAction::PrepareWorkspace { ref checkout_path, ref label, .. }
-            if checkout_path.is_none() && label == "feat-x@Build Box"
-    ));
-    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(node_id("feta-node")));
-    assert_eq!(plan.steps[3].description, "Attach workspace");
-    assert_eq!(plan.steps[3].host, StepExecutionContext::Host(local));
-}
-
-#[tokio::test]
-async fn build_plan_create_checkout_treats_local_host_as_local() {
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let data = empty_data();
-    let local = local_node_id();
-
-    let plan = build_plan(
-        Command::builder().action(fresh_checkout_action("feat-x")).node_id(local.clone()).build(),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local.clone(),
-        local_host(),
-    )
-    .await
-    .expect("build plan");
-
-    assert_eq!(plan.steps.len(), 3);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(local_node_id()));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local_node_id()));
-    assert_eq!(plan.steps[2].host, StepExecutionContext::Host(local_node_id()));
-}
-
-#[tokio::test]
-async fn workspace_label_for_host_suffixes_only_for_remote_hosts() {
-    let local = node_id("laptop-node");
-    let remote = node_id("feta-node");
-
-    assert_eq!(workspace_label_for_host("feat", &remote, &local, Some(&HostName::new("feta"))), "feat@feta");
-    assert_eq!(workspace_label_for_host("feat", &local, &local, Some(&HostName::new("laptop"))), "feat");
+    assert_checkout_created_branch(result, "feat-x");
 }
 
 #[tokio::test]
@@ -2473,17 +1318,15 @@ async fn build_plan_create_checkout_skips_existing() {
 
     match plan {
         Ok(step_plan) => {
-            assert_eq!(step_plan.steps.len(), 3, "checkout + prepare + attach steps");
+            assert_eq!(step_plan.steps.len(), 1, "checkout needs no personal workspace");
             assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-            assert_eq!(step_plan.steps[1].description, "Prepare workspace for feat-x");
-            assert_eq!(step_plan.steps[2].description, "Attach workspace");
         }
         Err(_) => panic!("expected Ok, got Err"),
     }
 }
 
 #[tokio::test]
-async fn checkout_plan_includes_workspace_step() {
+async fn checkout_plan_ends_after_checkout() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
@@ -2492,335 +1335,10 @@ async fn checkout_plan_includes_workspace_step() {
 
     match plan {
         Ok(step_plan) => {
-            assert_eq!(step_plan.steps.len(), 3, "expected checkout + prepare + attach steps");
+            assert_eq!(step_plan.steps.len(), 1, "checkout ends after creating the checkout");
             assert_eq!(step_plan.steps[0].description, "Create checkout for branch feat-x");
-            assert_eq!(step_plan.steps[1].description, "Prepare workspace for feat-x");
-            assert_eq!(step_plan.steps[2].description, "Attach workspace");
         }
         Err(_) => panic!("expected Ok"),
-    }
-}
-
-#[tokio::test]
-async fn build_plan_prepare_terminal_uses_command_host_for_terminal_step() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-
-    let plan = build_plan(
-        command_with_host("feta", CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] }),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await
-    .expect("build plan");
-
-    assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(node_id("feta")));
-}
-
-#[tokio::test]
-async fn build_plan_create_workspace_for_checkout_uses_prepare_and_attach_steps_locally() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-
-    let plan = build_plan(
-        local_command(CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        local_host(),
-    )
-    .await
-    .expect("build plan");
-
-    assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(local_node_id()));
-    assert!(matches!(
-        plan.steps[0].action,
-        StepAction::PrepareWorkspace { ref checkout_path, ref label, .. }
-            if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat"
-    ));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local_node_id()));
-    assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
-}
-
-#[tokio::test]
-async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_attach() {
-    let registry = empty_registry();
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(HostPath::new(HostName::new("feta"), path.clone()).into(), TestCheckout::new("feat").build());
-    let local = node_id("laptop-node");
-
-    let plan = build_plan(
-        command_with_host("feta", CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local.clone(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build plan");
-
-    assert_eq!(plan.steps.len(), 2);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(node_id("feta")));
-    assert!(matches!(
-        plan.steps[0].action,
-            StepAction::PrepareWorkspace { ref checkout_path, ref label, .. }
-            if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat@feta"
-    ));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local));
-    assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
-}
-
-#[tokio::test]
-async fn checkout_plan_end_to_end_creates_workspace() {
-    use tokio_util::sync::CancellationToken;
-
-    use crate::step::run_step_plan;
-
-    let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = ProviderRegistry::new();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
-    registry.terminal_pools.insert("cleat", desc("cleat"), Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) }));
-    let registry = Arc::new(registry);
-    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
-    let providers_data = Arc::new(empty_data());
-    let temp = tempfile::tempdir().expect("tempdir");
-    let cb = DaemonHostPath::new(temp.path());
-    let attachable = test_attachable_store(&cb);
-    let lh = local_host();
-    let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
-
-    let plan = build_plan(
-        local_command(fresh_checkout_action("feat-x")),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::clone(&registry),
-        Arc::clone(&providers_data),
-        cb.clone(),
-        attachable.clone(),
-        None,
-        local_node_id(),
-        lh.clone(),
-    )
-    .await;
-
-    let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
-    let resolver = ExecutorStepResolver {
-        repo,
-        vcs_resolver: Arc::new(crate::vcs::FixedVcsResolver(registry.vcs.preferred().expect("fixture vcs").clone())),
-        registry,
-        providers_data,
-        runner: runner.clone(),
-        env: Arc::new(TestEnvVars::default()),
-        config_base: cb,
-        attachable_store: attachable.clone(),
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: lh.clone(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
-        _ => panic!("expected steps"),
-    };
-
-    assert!(matches!(result, CommandValue::CheckoutCreated { .. }));
-
-    let calls = ws_mgr.calls.lock().await;
-    assert!(
-        calls.iter().any(|c| c.starts_with("create_workspace") || c.starts_with("select_workspace")),
-        "should create or select workspace from prior outcome: {calls:?}"
-    );
-
-    let expected_checkout = QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat-x");
-    let store = attachable.lock().expect("attachable store lock");
-    let matching_sets = store.sets_for_checkout(&expected_checkout);
-    assert_eq!(matching_sets.len(), 1, "new checkout should create one attachable set with its stable qualified path");
-    assert_eq!(store.registry().sets.len(), 1, "workspace terminals must not create a second set for the same checkout");
-    let set = store.registry().sets.get(&matching_sets[0]).expect("canonical attachable set");
-    assert!(!set.members.is_empty(), "workspace terminals should belong to the canonical attachable set");
-    assert_eq!(
-        store.lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref"),
-        Some(set.id.as_str()),
-        "workspace binding should point at the terminal-holding set"
-    );
-}
-
-#[tokio::test]
-async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
-    use tokio_util::sync::CancellationToken;
-
-    use crate::step::run_step_plan;
-
-    let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
-    let mut registry = ProviderRegistry::new();
-    // No checkout manager needed — checkout already exists
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
-    let registry = Arc::new(registry);
-    // validate_checkout_target needs 2 responses: local ref check (Ok), remote ref check
-    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Ok("".into()), Err("missing".into())]));
-    let mut data = empty_data();
-    data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
-    let providers_data = Arc::new(data);
-    let temp = tempfile::tempdir().expect("tempdir");
-    let cb = DaemonHostPath::new(temp.path());
-    let attachable = test_attachable_store(&cb);
-    let lh = local_host();
-    let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
-
-    let plan = build_plan(
-        local_command(existing_branch_checkout_action("feat-x")),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::clone(&registry),
-        Arc::clone(&providers_data),
-        cb.clone(),
-        attachable.clone(),
-        None,
-        local_node_id(),
-        lh.clone(),
-    )
-    .await;
-
-    let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
-    let resolver = ExecutorStepResolver {
-        repo,
-        registry,
-        providers_data,
-        runner: runner.clone(),
-        vcs_resolver: test_vcs_resolver(runner),
-        env: Arc::new(TestEnvVars::default()),
-        config_base: cb,
-        attachable_store: attachable,
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: lh.clone(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
-        _ => panic!("expected steps"),
-    };
-
-    assert!(
-        matches!(result, CommandValue::CheckoutCreated { ref branch, .. } if branch == "feat-x"),
-        "should return CheckoutCreated for pre-existing checkout, got: {result:?}"
-    );
-    let calls = ws_mgr.calls.lock().await;
-    assert!(
-        calls.iter().any(|c| c.starts_with("select_workspace") || c.starts_with("create_workspace")),
-        "should select or create workspace for pre-existing checkout: {calls:?}"
-    );
-}
-
-#[tokio::test]
-async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
-    use tokio_util::sync::CancellationToken;
-
-    use crate::step::run_step_plan;
-
-    let ws_mgr = Arc::new(MockWorkspaceManager::failing("ws failed"));
-    let mut registry = ProviderRegistry::new();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
-    let registry = Arc::new(registry);
-    let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
-    let providers_data = Arc::new(empty_data());
-    let temp = tempfile::tempdir().expect("tempdir");
-    let cb = DaemonHostPath::new(temp.path());
-    let attachable = test_attachable_store(&cb);
-    let lh = local_host();
-    let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
-
-    let plan = build_plan(
-        local_command(fresh_checkout_action("feat-x")),
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::clone(&registry),
-        Arc::clone(&providers_data),
-        cb.clone(),
-        attachable.clone(),
-        None,
-        local_node_id(),
-        lh.clone(),
-    )
-    .await;
-
-    let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
-    let resolver = ExecutorStepResolver {
-        repo,
-        vcs_resolver: Arc::new(crate::vcs::FixedVcsResolver(registry.vcs.preferred().expect("fixture vcs").clone())),
-        registry,
-        providers_data,
-        runner: runner.clone(),
-        env: Arc::new(TestEnvVars::default()),
-        config_base: cb,
-        attachable_store: attachable,
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: lh.clone(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
-        _ => panic!("expected steps"),
-    };
-
-    assert_eq!(
-        result,
-        CommandValue::CheckoutCreated {
-            branch: "feat-x".into(),
-            path: QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat-x"),
-        }
-    );
-}
-
-#[tokio::test]
-async fn build_plan_teleport_session_returns_steps() {
-    let mut registry = empty_registry();
-    registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    let mut data = empty_data();
-    let path = PathBuf::from("/repo/wt-feat");
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
-    data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    let runner = runner_ok();
-
-    let plan = run_build_plan(
-        CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: Some(path) },
-        registry,
-        data,
-        runner,
-    )
-    .await;
-
-    match plan {
-        Ok(step_plan) => {
-            // 3 steps: resolve attach, ensure checkout, create workspace
-            assert_eq!(step_plan.steps.len(), 3, "expected 3 steps, got {}", step_plan.steps.len());
-        }
-        Err(_) => panic!("expected Ok, got Err"),
     }
 }
 
@@ -2923,249 +1441,6 @@ async fn build_plan_simple_command_returns_ok() {
 // -----------------------------------------------------------------------
 // Tests: environment checkout plan
 // -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn build_plan_with_environment_prepends_lifecycle_steps() {
-    let registry = empty_registry();
-    let data = empty_data();
-
-    let cmd = Command::builder()
-        .action(CommandAction::Checkout {
-            repo: repo_selector(),
-            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
-            issue_ids: vec![],
-        })
-        .node_id(node_id("feta-node"))
-        .provisioning_target(flotilla_protocol::ProvisioningTarget::NewEnvironment {
-            host: HostName::new("feta"),
-            provider: "docker".to_string(),
-        })
-        .context_repo(repo_selector())
-        .build();
-
-    let plan = build_plan(
-        cmd,
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build_plan should succeed");
-
-    // Verify 5 steps (create resolves the image and initializes the environment).
-    assert_eq!(plan.steps.len(), 5);
-
-    // Verify step actions in order
-    assert!(matches!(plan.steps[0].action, StepAction::ReadEnvironmentSpec));
-    assert!(matches!(plan.steps[1].action, StepAction::CreateEnvironment { .. }));
-    assert!(matches!(plan.steps[2].action, StepAction::CreateCheckout { .. }));
-    assert!(matches!(plan.steps[3].action, StepAction::PrepareWorkspace { .. }));
-    assert!(matches!(plan.steps[4].action, StepAction::AttachWorkspace));
-
-    // Verify host assignments — steps 0-1: Host(feta)
-    assert_eq!(plan.steps[0].host.node_id(), &node_id("feta-node"));
-    assert_eq!(plan.steps[1].host.node_id(), &node_id("feta-node"));
-    assert!(matches!(&plan.steps[0].host, StepExecutionContext::Host(_)));
-    assert!(matches!(&plan.steps[1].host, StepExecutionContext::Host(_)));
-
-    // Steps 2-3: Environment(feta, env_id)
-    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
-    assert!(matches!(&plan.steps[3].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
-
-    // Step 4: Host(laptop) — attach on local
-    assert_eq!(plan.steps[4].host.node_id(), &local_node_id());
-    assert!(matches!(&plan.steps[4].host, StepExecutionContext::Host(_)));
-
-    // Verify workspace label includes remote host suffix
-    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[3].action {
-        assert_eq!(label, "feature-x@feta");
-    } else {
-        panic!("step 3 should be PrepareWorkspace");
-    }
-}
-
-#[tokio::test]
-async fn build_plan_with_environment_local_host_omits_suffix() {
-    let registry = empty_registry();
-    let data = empty_data();
-
-    let cmd = Command::builder()
-        .action(CommandAction::Checkout { repo: repo_selector(), target: CheckoutTarget::Branch("main".to_string()), issue_ids: vec![] })
-        .node_id(local_node_id())
-        .provisioning_target(flotilla_protocol::ProvisioningTarget::NewEnvironment {
-            host: HostName::new("laptop"),
-            provider: "docker".to_string(),
-        })
-        .context_repo(repo_selector())
-        .build();
-
-    let plan = build_plan(
-        cmd,
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build_plan should succeed");
-
-    assert_eq!(plan.steps.len(), 5);
-
-    // When target_host == local_host, workspace label should be just the branch
-    if let StepAction::PrepareWorkspace { ref label, .. } = plan.steps[3].action {
-        assert_eq!(label, "main");
-    } else {
-        panic!("step 3 should be PrepareWorkspace");
-    }
-
-    // Checkout step should use ExistingBranch intent
-    if let StepAction::CreateCheckout { ref branch, create_branch, intent, .. } = plan.steps[2].action {
-        assert_eq!(branch, "main");
-        assert!(!create_branch);
-        assert_eq!(intent, CheckoutIntent::ExistingBranch);
-    } else {
-        panic!("step 2 should be CreateCheckout");
-    }
-}
-
-#[tokio::test]
-async fn build_plan_with_existing_environment_returns_3_steps() {
-    let registry = empty_registry();
-    let data = empty_data();
-
-    let cmd = Command::builder()
-        .action(CommandAction::Checkout {
-            repo: repo_selector(),
-            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
-            issue_ids: vec![],
-        })
-        .node_id(node_id("feta-node"))
-        .provisioning_target(flotilla_protocol::ProvisioningTarget::ExistingEnvironment {
-            host: HostName::new("feta"),
-            env_id: flotilla_protocol::EnvironmentId::new("env-abc"),
-        })
-        .context_repo(repo_selector())
-        .build();
-
-    let plan = build_plan(
-        cmd,
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build_plan should succeed");
-
-    assert_eq!(plan.steps.len(), 3, "existing-environment checkout should have 3 steps");
-
-    assert!(matches!(plan.steps[0].action, StepAction::CreateCheckout { .. }));
-    assert!(matches!(plan.steps[1].action, StepAction::PrepareWorkspace { .. }));
-    assert!(matches!(plan.steps[2].action, StepAction::AttachWorkspace));
-
-    // Steps 0-1 execute in Environment(feta, env_id)
-    assert!(matches!(&plan.steps[0].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
-    assert!(matches!(&plan.steps[1].host, StepExecutionContext::Environment(h, _) if *h == node_id("feta-node")));
-
-    // Step 2 attaches on the local host
-    assert_eq!(plan.steps[2].host.node_id(), &local_node_id());
-    assert!(matches!(&plan.steps[2].host, StepExecutionContext::Host(_)));
-}
-
-#[tokio::test]
-async fn build_plan_with_host_target_returns_standard_checkout_plan() {
-    let registry = empty_registry();
-    let data = empty_data();
-
-    // ProvisioningTarget::Host should fall through to the standard checkout plan
-    let cmd = Command::builder()
-        .action(CommandAction::Checkout {
-            repo: repo_selector(),
-            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
-            issue_ids: vec![],
-        })
-        .node_id(node_id("feta-node"))
-        .provisioning_target(flotilla_protocol::ProvisioningTarget::Host { host: HostName::new("feta") })
-        .context_repo(repo_selector())
-        .build();
-
-    let plan = build_plan(
-        cmd,
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build_plan should succeed");
-
-    // Standard checkout plan: CreateCheckout + PrepareWorkspace + AttachWorkspace
-    assert_eq!(plan.steps.len(), 3, "host-target checkout should have 3 steps");
-
-    assert!(matches!(plan.steps[0].action, StepAction::CreateCheckout { .. }));
-    assert!(matches!(plan.steps[1].action, StepAction::PrepareWorkspace { .. }));
-    assert!(matches!(plan.steps[2].action, StepAction::AttachWorkspace));
-
-    // CreateCheckout and PrepareWorkspace run on the target host
-    assert_eq!(plan.steps[0].host.node_id(), &node_id("feta-node"));
-    assert_eq!(plan.steps[1].host.node_id(), &node_id("feta-node"));
-    // AttachWorkspace runs on the local host
-    assert_eq!(plan.steps[2].host.node_id(), &local_node_id());
-}
-
-#[tokio::test]
-async fn build_plan_with_no_provisioning_target_returns_standard_checkout_plan() {
-    let registry = empty_registry();
-    let data = empty_data();
-
-    // No provisioning_target should also produce the standard checkout plan
-    let cmd = Command::builder()
-        .action(CommandAction::Checkout {
-            repo: repo_selector(),
-            target: CheckoutTarget::FreshBranch("feature-x".to_string()),
-            issue_ids: vec![],
-        })
-        .node_id(node_id("feta-node"))
-        .context_repo(repo_selector())
-        .build();
-
-    let plan = build_plan(
-        cmd,
-        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        Arc::new(registry),
-        Arc::new(data),
-        config_base(),
-        test_attachable_store(&config_base()),
-        None,
-        local_node_id(),
-        HostName::new("laptop"),
-    )
-    .await
-    .expect("build_plan should succeed");
-
-    assert_eq!(plan.steps.len(), 3, "no-target checkout should have 3 steps");
-
-    assert!(matches!(plan.steps[0].action, StepAction::CreateCheckout { .. }));
-    assert!(matches!(plan.steps[1].action, StepAction::PrepareWorkspace { .. }));
-    assert!(matches!(plan.steps[2].action, StepAction::AttachWorkspace));
-}
 
 // -----------------------------------------------------------------------
 // Tests: resolve_checkout_branch
@@ -3293,128 +1568,6 @@ fn resolve_checkout_branch_host_scope_matches_remote_host_name() {
 }
 
 // -----------------------------------------------------------------------
-// Tests: resolve_workspace_commands via TerminalPreparationService
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn resolve_workspace_commands_no_template_uses_default() {
-    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
-    let mut config = WorkspaceConfig {
-        name: "test-branch".to_string(),
-        working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
-        template_vars: [("main_command".to_string(), "claude".to_string())].into_iter().collect(),
-        template_yaml: None,
-        resolved_commands: None,
-    };
-
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
-    service.resolve_workspace_commands_in_set(&mut config, &set_id).await;
-
-    // Default template has one "main" terminal entry
-    assert!(config.resolved_commands.is_some());
-    let commands = config.resolved_commands.expect("default template should produce resolved commands");
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0, "main");
-}
-
-#[tokio::test]
-async fn resolve_workspace_commands_skips_non_terminal_content() {
-    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
-    let yaml = r#"
-content:
-  - role: docs
-    type: webview
-    command: "http://localhost:3000"
-"#;
-    let mut config = WorkspaceConfig {
-        name: "test-branch".to_string(),
-        working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
-        template_vars: std::collections::HashMap::new(),
-        template_yaml: Some(yaml.to_string()),
-        resolved_commands: None,
-    };
-
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
-    service.resolve_workspace_commands_in_set(&mut config, &set_id).await;
-
-    // All content entries were non-terminal, so resolved_commands stays None
-    assert!(config.resolved_commands.is_none());
-}
-
-#[tokio::test]
-async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager() {
-    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
-    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
-
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let requested = vec![
-        PreparedTerminalCommand { role: "main".into(), command: "claude".into() },
-        PreparedTerminalCommand { role: "main".into(), command: "bash".into() },
-    ];
-
-    let result = service
-        .prepare_terminal_commands(&set_id, "feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
-        .await
-        .expect("prepare requested terminal commands");
-
-    // Both commands should be resolved through the terminal manager
-    assert_eq!(result.len(), 2);
-    assert_eq!(result[0].role, "main");
-    assert_eq!(result[1].role, "main");
-    // Args should contain structured Arg from attach_args(), not Literal-wrapped strings
-    let flat = flotilla_protocol::arg::flatten(&result[0].args, 0);
-    assert!(flat.starts_with("attach:"), "expected attach: prefix, got: {flat}");
-}
-
-#[tokio::test]
-async fn prepare_terminal_commands_skips_terminal_when_ensure_running_fails() {
-    let mock_pool: Arc<dyn TerminalPool> = Arc::new(FailingEnsureTerminalPool);
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
-    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
-
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }];
-
-    let result = service
-        .prepare_terminal_commands(&set_id, "feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
-        .await
-        .expect("prepare requested terminal commands");
-
-    assert!(result.is_empty());
-}
-
-#[tokio::test]
-async fn resolve_workspace_commands_invalid_template_uses_default() {
-    let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
-    let store = crate::attachable::shared_in_memory_attachable_store();
-    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
-    let mut config = WorkspaceConfig {
-        name: "test-branch".to_string(),
-        working_directory: ExecutionEnvironmentPath::new("/repo/wt"),
-        template_vars: [("main_command".to_string(), "claude".to_string())].into_iter().collect(),
-        template_yaml: Some("content: [".to_string()),
-        resolved_commands: None,
-    };
-
-    let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
-    service.resolve_workspace_commands_in_set(&mut config, &set_id).await;
-
-    let commands = config.resolved_commands.expect("invalid template should fall back to default template");
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0, "main");
-}
-
-// -----------------------------------------------------------------------
 // Tests: write_branch_issue_links
 // -----------------------------------------------------------------------
 
@@ -3487,68 +1640,6 @@ async fn checkout_service_validate_target_propagates_checkout_manager_error() {
 // -----------------------------------------------------------------------
 // Tests: ExecutorStepResolver
 // -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() {
-    let config_base = config_base();
-    let resolver = ExecutorStepResolver {
-        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(empty_registry()),
-        providers_data: Arc::new(empty_data()),
-        runner: Arc::new(runner_ok()),
-        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(TestEnvVars::default()),
-        config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    let prior = vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
-        branch: "feat".into(),
-        path: QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat"),
-    })];
-    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: None };
-    let context = StepExecutionContext::Host(local_node_id());
-    let outcome = resolver.resolve("create workspace", &context, action, &prior).await;
-    match outcome {
-        Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
-            assert_eq!(prepared.label, "feat");
-            assert_eq!(prepared.target_node_id, local_node_id());
-            assert_eq!(prepared.display_host, None);
-            assert_eq!(prepared.checkout_path, PathBuf::from("/repo/wt-feat"));
-            assert_eq!(prepared.checkout_key, Some(QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat")));
-            assert!(!prepared.prepared_commands.is_empty(), "default workspace template should produce commands");
-        }
-        other => panic!("expected PreparedWorkspace outcome, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() {
-    let config_base = config_base();
-    let resolver = ExecutorStepResolver {
-        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(empty_registry()),
-        providers_data: Arc::new(empty_data()),
-        runner: Arc::new(runner_ok()),
-        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(TestEnvVars::default()),
-        config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: local_host(),
-        environment_manager: empty_environment_manager().await,
-    };
-
-    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: None };
-    let context = StepExecutionContext::Host(local_node_id());
-    let outcome = resolver.resolve("create workspace", &context, action, &[]).await;
-    assert!(matches!(outcome, Ok(StepOutcome::Skipped)), "should skip when no prior CheckoutCreated outcome: {outcome:?}");
-}
 
 // -----------------------------------------------------------------------
 // Tests: Environment lifecycle actions
@@ -3640,6 +1731,101 @@ async fn manager_with_provisioned_environment(
 }
 
 #[tokio::test]
+async fn remove_checkout_resolves_for_remote_host() {
+    let remote = HostName::new("remote-box");
+    let remote_hp = HostPath::new(remote.clone(), PathBuf::from("/repo/wt-feat"));
+    let mut data = empty_data();
+    data.checkouts.insert(remote_hp.into(), TestCheckout::new("feat").build());
+
+    let _config_base = config_base();
+    let plan =
+        build_plan(command_with_host("remote-box", remove_checkout_action("feat")), Arc::new(data), local_node_id(), local_host()).await;
+
+    let plan = plan.expect("remote host target should resolve remote-owned checkout");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+}
+
+#[tokio::test]
+async fn remove_checkout_disambiguates_by_target_host() {
+    // Same branch on two hosts — command.host should disambiguate
+    let local = hp("/repo/wt-feat");
+    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat"));
+    let mut data = empty_data();
+    data.checkouts.insert(local.into(), TestCheckout::new("feat").build());
+    data.checkouts.insert(remote.into(), TestCheckout::new("feat").build());
+
+    let _config_base = config_base();
+    let plan =
+        build_plan(command_with_host("remote-box", remove_checkout_action("feat")), Arc::new(data), local_node_id(), local_host()).await;
+
+    let plan = plan.expect("build_plan should resolve the targeted checkout");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+    match &plan.steps[0].action {
+        StepAction::RemoveCheckout { branch } => assert_eq!(branch, "feat"),
+        other => panic!("expected RemoveCheckout step, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remove_checkout_remote_node_ignores_local_duplicate_branch() {
+    let local = hp("/repo/wt-feat-local");
+    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat-remote"));
+    let mut data = empty_data();
+    data.checkouts.insert(local.into(), TestCheckout::new("feat").build());
+    let mut remote_checkout = TestCheckout::new("feat").build();
+    remote_checkout.host_name = Some(HostName::new("remote-box"));
+    data.checkouts.insert(remote.into(), remote_checkout);
+
+    let _config_base = config_base();
+    let plan = build_plan(
+        Command::builder()
+            .action(remove_checkout_action("feat"))
+            .node_id(NodeId::new("remote-box"))
+            .context_repo(RepoSelector::Identity(repo_identity()))
+            .build(),
+        Arc::new(data),
+        local_node_id(),
+        local_host(),
+    )
+    .await
+    .expect("build_plan should resolve remote checkout without considering local duplicate");
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+    match &plan.steps[0].action {
+        StepAction::RemoveCheckout { branch } => assert_eq!(branch, "feat"),
+        other => panic!("expected RemoveCheckout step, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fetch_checkout_status_targets_remote_node_when_command_is_remote() {
+    let _registry = empty_registry();
+    let _config_base = config_base();
+    let plan = build_plan(
+        Command::builder()
+            .action(CommandAction::FetchCheckoutStatus {
+                branch: "feat".to_string(),
+                checkout_path: Some(PathBuf::from("/repo/wt")),
+                change_request_id: None,
+            })
+            .node_id(NodeId::new("remote-box"))
+            .context_repo(RepoSelector::Identity(repo_identity()))
+            .build(),
+        Arc::new(empty_data()),
+        local_node_id(),
+        local_host(),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+}
+
+#[tokio::test]
 async fn executor_step_resolver_create_environment() {
     let config_base = config_base();
     let env_id = EnvironmentId::new("env-test-1");
@@ -3666,9 +1852,7 @@ async fn executor_step_resolver_create_environment() {
         vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(TestEnvVars::new([("GITHUB_TOKEN", "gh-test-token")])),
         config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-        local_node_id: local_node_id(),
         local_host: local_host(),
         environment_manager: empty_environment_manager().await,
     };
@@ -3704,9 +1888,7 @@ async fn executor_step_resolver_create_environment_errors_without_spec_outcome()
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-        local_node_id: local_node_id(),
         local_host: local_host(),
         environment_manager: empty_environment_manager().await,
     };
@@ -3738,9 +1920,7 @@ async fn executor_step_resolver_destroy_environment() {
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
-        local_node_id: local_node_id(),
         local_host: local_host(),
         environment_manager,
     };
@@ -3767,9 +1947,7 @@ async fn executor_step_resolver_destroy_environment_not_found() {
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
-        local_node_id: local_node_id(),
         local_host: local_host(),
         environment_manager: empty_environment_manager().await,
     };
@@ -3781,46 +1959,64 @@ async fn executor_step_resolver_destroy_environment_not_found() {
     assert!(outcome.unwrap_err().contains("environment handle not found"));
 }
 
-#[tokio::test]
-async fn executor_step_resolver_prepare_workspace_uses_manager_container_name_for_environment_context() {
-    let config_base = config_base();
-    let env_id = EnvironmentId::new("env-prepare-1");
-    let image_id = ImageId::new("flotilla:test");
-    let handle: EnvironmentHandle =
-        Arc::new(MockProvisionedEnvironment { id: env_id.clone(), image: image_id, runner: Arc::new(runner_ok()) });
-    let mut env_registry = empty_registry();
-    env_registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-
-    let resolver = ExecutorStepResolver {
-        repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
-        registry: Arc::new(empty_registry()),
-        providers_data: Arc::new(empty_data()),
-        runner: Arc::new(runner_ok()),
-        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(TestEnvVars::default()),
-        config_base: config_base.clone(),
-        attachable_store: test_attachable_store(&config_base),
-        daemon_socket_path: None,
-        local_node_id: local_node_id(),
-        local_host: local_host(),
-        environment_manager: manager_with_provisioned_environment(&env_id, handle, Some(Arc::new(env_registry))).await,
+// #2918: checkout creates code and optional issue links, never a personal workspace.
+// Generate host, new-environment and existing-environment destinations, fresh/existing
+// branches, and empty/nonempty issue lists; routing and returned checkout intent survive.
+#[hegel::test]
+fn checkout_plans_are_headless_for_every_destination(tc: hegel::TestCase) {
+    use flotilla_protocol::ProvisioningTarget;
+    use hegel::generators as gs;
+    let destination = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let fresh = tc.draw(gs::booleans());
+    let linked = tc.draw(gs::booleans());
+    let target_host = HostName::new("checkout-host");
+    let target_node = NodeId::new("checkout-node");
+    let env_id = EnvironmentId::new("existing-environment");
+    let target = match destination {
+        0 => ProvisioningTarget::Host { host: target_host },
+        1 => ProvisioningTarget::NewEnvironment { host: target_host, provider: "docker".into() },
+        _ => ProvisioningTarget::ExistingEnvironment { host: target_host, env_id: env_id.clone() },
     };
-
-    let prior = vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
-        branch: "feat".into(),
-        path: QualifiedPath::environment(env_id.clone(), "/workspace/wt-feat"),
-    })];
-    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: Some(HostName::new("feta")) };
-    let context = StepExecutionContext::Environment(local_node_id(), env_id.clone());
-    let outcome = resolver.resolve("prepare workspace", &context, action, &prior).await;
-
-    match outcome {
-        Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
-            assert_eq!(prepared.display_host, Some(HostName::new("feta")));
-            assert_eq!(prepared.checkout_key, Some(QualifiedPath::environment(env_id.clone(), "/workspace/wt-feat")));
-            assert_eq!(prepared.environment_id, Some(env_id));
-            assert_eq!(prepared.container_name.as_deref(), Some("mock-container"));
+    let branch = "headless-checkout";
+    let issue_ids = if linked { vec![("github".into(), "42".into())] } else { vec![] };
+    let cmd = Command::builder()
+        .action(CommandAction::Checkout {
+            repo: repo_selector(),
+            target: if fresh { CheckoutTarget::FreshBranch(branch.into()) } else { CheckoutTarget::Branch(branch.into()) },
+            issue_ids: issue_ids.clone(),
+        })
+        .node_id(target_node.clone())
+        .provisioning_target(target)
+        .build();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    let plan = runtime.block_on(build_plan(cmd, Arc::new(empty_data()), local_node_id(), local_host())).expect("checkout plan");
+    let checkout = plan.steps.iter().find(|step| matches!(step.action, StepAction::CreateCheckout { .. })).expect("checkout step");
+    match &checkout.action {
+        StepAction::CreateCheckout { branch: actual, create_branch, intent, issue_ids: actual_issues } => {
+            assert_eq!(actual, branch);
+            assert_eq!(*create_branch, fresh);
+            assert_eq!(*intent, if fresh { CheckoutIntent::FreshBranch } else { CheckoutIntent::ExistingBranch });
+            assert_eq!(actual_issues, &issue_ids);
         }
-        other => panic!("expected PreparedWorkspace outcome, got {other:?}"),
+        _ => unreachable!(),
     }
+    match (&checkout.host, destination) {
+        (StepExecutionContext::Host(node), 0) => assert_eq!(node, &target_node),
+        (StepExecutionContext::Environment(node, actual_env), 1 | 2) => {
+            assert_eq!(node, &target_node);
+            if destination == 2 {
+                assert_eq!(actual_env, &env_id);
+            }
+        }
+        other => panic!("wrong checkout destination: {other:?}"),
+    }
+    assert_eq!(plan.steps.len(), 1 + usize::from(linked) + if destination == 1 { 2 } else { 0 });
+    assert_eq!(plan.steps.iter().filter(|step| matches!(step.action, StepAction::LinkIssuesToBranch { .. })).count(), usize::from(linked));
+    assert!(plan.steps.iter().all(|step| matches!(
+        step.action,
+        StepAction::ReadEnvironmentSpec
+            | StepAction::CreateEnvironment { .. }
+            | StepAction::CreateCheckout { .. }
+            | StepAction::LinkIssuesToBranch { .. }
+    )));
 }

@@ -24,8 +24,9 @@ Three distinct concepts replace the current `CloudAgentSession`:
 - `status`: idle / active / waiting-for-input / waiting-for-permission / errored
 - `model`: Option<String>
 - `context`: `AgentContext` enum:
-  - `Local { attachable_id: AttachableId }` — correlates to checkout via the terminal's
-    AttachableSet. Branch/repo derived through correlation, not duplicated here.
+  - `Local { attachable_id: AttachableId }` — hook identity retained until AgentSession.
+    TerminalSession references identify managed crew terminals; the retired AttachableSet
+    registry no longer supplies checkout correlation.
   - `Cloud { provider_name, session_id, branch: Option<String>, repo: Option<String> }` —
     carries its own refs from the API. Branch/repo available for some harnesses (Claude,
     Cursor) but not all (Codex has repo but not branch until PR).
@@ -42,14 +43,12 @@ BYOC).
 
 ### Environment Variable Injection
 
-When flotilla launches a managed terminal, it injects:
+Hooks accept `FLOTILLA_ATTACHABLE_ID` as an optional existing identity; otherwise the
+CLI allocates a UUID and the daemon reuses the persisted session-to-identity mapping.
+The AttachableStore and personal-terminal injection path have been retired.
 
-- `FLOTILLA_ATTACHABLE_ID` — the terminal's stable UUID identity from the AttachableStore
-- `FLOTILLA_DAEMON_SOCKET` — path to the running daemon's socket
-
-Set in `TerminalPool::ensure_running()` / `attach_command()`. Cleat passes these
-variables when launching a session; passthrough sets them in the command
-environment directly.
+Managed crew sessions supply `FLOTILLA_NAMESPACE` and `FLOTILLA_TERMINAL_SESSION`
+to identify their TerminalSession. `FLOTILLA_DAEMON_SOCKET` identifies the daemon socket.
 
 ### Hook Command and Event Flow
 
@@ -79,10 +78,10 @@ trait HarnessHookParser {
 ```
 
 **Unmanaged terminal handling:** When `FLOTILLA_ATTACHABLE_ID` is absent (agent running in
-a terminal flotilla didn't launch — common when hooks are installed globally), the hook:
-1. Allocates a new attachable ID
-2. Stores a `session_id → attachable_id` mapping in the AgentStateStore
-3. Subsequent hooks for the same session look up by `session_id` from stdin JSON
+a terminal flotilla didn't launch — common when hooks are installed globally):
+1. The CLI allocates a candidate attachable ID.
+2. The daemon stores a `session_id → attachable_id` mapping in AgentStateStore.
+3. For subsequent hooks the daemon reuses the mapped identity for the stdin `session_id`.
 
 Claude Code provides `session_id` in every hook event's stdin, plus `cwd`,
 `transcript_path`, `model` (on SessionStart), and `permission_mode`.
@@ -99,7 +98,7 @@ Claude Code provides `session_id` in every hook event's stdin, plus `cwd`,
 
 ### Persistent AgentStateStore
 
-File-backed persistent store (same pattern as `AttachableStore`):
+File-backed persistent store at `agents/state.json` beneath the daemon config directory:
 - Keyed by `AttachableId`
 - Holds: harness, current status, model, session title, claude session_id, last event timestamp
 - `InMemoryAgentStateStore` for tests
@@ -110,8 +109,8 @@ File-backed persistent store (same pattern as `AttachableStore`):
 
 New provider reads from `AgentStateStore`:
 - Returns `Agent` items with `AgentContext::Local { attachable_id }`
-- Emits `CorrelationKey::AttachableSet(set_id)` — transitively links to checkout, workspace,
-  other terminals
+- The former `CorrelationKey::AttachableSet(set_id)` path is retired. Managed crew hooks
+  identify TerminalSessions directly; AttachableId remains only for hook-state identity.
 - New `ItemKind::Agent` in correlation engine (not singleton — multiple agents per work item ok)
 - New `agents: IndexMap<String, Agent>` field in `ProviderData`
 

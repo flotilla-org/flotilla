@@ -31,7 +31,6 @@ use crate::{
         environment::DockerEnvironmentHopResolver,
         remote::{ssh_resolver_from_config, NoopRemoteHopResolver},
         resolver::HopResolver,
-        terminal::NoopTerminalHopResolver,
         Hop, HopPlan, ResolutionContext,
     },
     path_context::ExecutionEnvironmentPath,
@@ -635,8 +634,7 @@ impl<'a> AttachResolver<'a> {
                 container_name.ok_or_else(|| format!("environment {} has no docker container id", session.spec.env_ref))?;
             let environment_resolver =
                 DockerEnvironmentHopResolver::new(HashMap::from([(environment_id.clone(), container_name.to_string())]));
-            let hop_resolver =
-                HopResolver::new(Arc::new(NoopRemoteHopResolver), Arc::new(environment_resolver), Arc::new(NoopTerminalHopResolver));
+            let hop_resolver = HopResolver::new(Arc::new(NoopRemoteHopResolver), Arc::new(environment_resolver));
             let plan = HopPlan(vec![
                 Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() },
                 Hop::RunCommand { command: attach_args },

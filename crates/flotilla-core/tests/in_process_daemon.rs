@@ -13,7 +13,6 @@ use std::{
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::{
-    attachable::{shared_in_memory_attachable_store, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose},
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,

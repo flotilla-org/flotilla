@@ -4,14 +4,13 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    arg::Arg,
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
     query::{
         CrewCommandContext, CrewListResponse, CrewStallsResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse,
         FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
-    AttachableSetId, IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
+    IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,12 +83,6 @@ pub enum CheckoutSelector {
 pub enum CheckoutTarget {
     Branch(String),
     FreshBranch(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedTerminalCommand {
-    pub role: String,
-    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -516,39 +509,6 @@ pub struct DaemonLogQuery {
     pub target: Option<String>,
 }
 
-/// Structured resolved attach command for a workspace pane.
-/// Produced on the target host, consumed on the presentation host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedPaneCommand {
-    pub role: String,
-    pub args: Vec<Arg>,
-}
-
-/// Execution-side workspace preparation artifact.
-/// Produced on the checkout host and consumed by the presentation-host attach step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedWorkspace {
-    pub label: String,
-    pub target_node_id: crate::NodeId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub display_host: Option<crate::HostName>,
-    pub checkout_path: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout_key: Option<QualifiedPath>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attachable_set_id: Option<AttachableSetId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment_id: Option<crate::EnvironmentId>,
-    /// Provider-specific transport handle (e.g. Docker container name).
-    /// Set by PrepareWorkspace on the remote daemon, consumed by AttachWorkspace
-    /// on the presentation host for hop chain construction.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_yaml: Option<String>,
-    pub prepared_commands: Vec<ResolvedPaneCommand>,
-}
-
 /// Routed command envelope shared by all frontends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct Command {
@@ -788,22 +748,6 @@ pub struct ResourceDigest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {
-    CreateWorkspaceForCheckout {
-        checkout_path: PathBuf,
-        label: String,
-    },
-    CreateWorkspaceFromPreparedTerminal {
-        target_node_id: crate::NodeId,
-        branch: String,
-        checkout_path: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attachable_set_id: Option<AttachableSetId>,
-        commands: Vec<ResolvedPaneCommand>,
-    },
-    // Retired with the executor internals in step 2 (#2915).
-    SelectWorkspace {
-        ws_ref: String,
-    },
     Attach {
         reference: String,
         /// Restrict resolution to the host that advertised the recipe.
@@ -821,15 +765,7 @@ pub enum CommandAction {
         #[serde(default)]
         mode: AttachMode,
     },
-    // Retired with the executor internals in step 2 (#2915).
-    PrepareTerminalForCheckout {
-        checkout_path: PathBuf,
-        /// Role→command mappings from the requesting host's template.
-        /// When non-empty, the remote side wraps these through its terminal pool
-        /// instead of reading its own template.
-        #[serde(default)]
-        commands: Vec<PreparedTerminalCommand>,
-    },
+
     Checkout {
         repo: RepoSelector,
         target: CheckoutTarget,
@@ -997,12 +933,7 @@ pub enum CommandAction {
     ProjectRefresh {
         name: String,
     },
-    // Retired with the executor internals in step 2 (#2915).
-    TeleportSession {
-        session_id: String,
-        branch: Option<String>,
-        checkout_key: Option<PathBuf>,
-    },
+
     TrackRepoPath {
         path: PathBuf,
     },
@@ -1206,12 +1137,9 @@ impl CommandAction {
 impl Command {
     pub fn description(&self) -> &'static str {
         match &self.action {
-            CommandAction::CreateWorkspaceForCheckout { .. } => "Creating workspace...",
-            CommandAction::CreateWorkspaceFromPreparedTerminal { .. } => "Creating workspace...",
-            CommandAction::SelectWorkspace { .. } => "Switching workspace...",
             CommandAction::Attach { .. } => "Resolving attach target...",
             CommandAction::AttachTransient { .. } => "Resolving temporary attach target...",
-            CommandAction::PrepareTerminalForCheckout { .. } => "Preparing terminal...",
+
             CommandAction::Checkout { target, .. } => match target {
                 CheckoutTarget::Branch(_) => "Checking out branch...",
                 CheckoutTarget::FreshBranch(_) => "Creating checkout...",
@@ -1244,7 +1172,7 @@ impl Command {
             CommandAction::ProjectApply { .. } => "Applying project...",
             CommandAction::ProjectRegister { .. } => "Registering project declaration...",
             CommandAction::ProjectRefresh { .. } => "Refreshing project declaration...",
-            CommandAction::TeleportSession { .. } => "Teleporting session...",
+
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
             CommandAction::UntrackRepo { .. } => "Untracking repository...",
             CommandAction::RepositoryRemoteRemove { .. } => "Removing repository remote...",
@@ -1385,16 +1313,7 @@ pub enum CommandValue {
     CheckoutRemoved {
         branch: String,
     },
-    TerminalPrepared {
-        repo_identity: RepoIdentity,
-        target_node_id: crate::NodeId,
-        branch: String,
-        checkout_path: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attachable_set_id: Option<AttachableSetId>,
-        commands: Vec<ResolvedPaneCommand>,
-    },
-    PreparedWorkspace(Box<PreparedWorkspace>),
+
     BranchNameGenerated {
         name: String,
         issue_ids: Vec<(String, String)>,
@@ -1411,9 +1330,7 @@ pub enum CommandValue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binding: Option<AttachBinding>,
     },
-    CheckoutPathResolved {
-        path: PathBuf,
-    },
+
     RepositoryResolved {
         /// No match is distinct from a refused or failed lookup.
         key: Option<crate::RepositoryKey>,
@@ -1560,14 +1477,12 @@ mod tests {
     }
 
     use crate::{
-        arg::Arg,
         query::{
             CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostListEntry,
             HostListResponse, HostProvidersResponse, HostStatusResponse, RepoProvidersResponse,
         },
         test_helpers::assert_json_roundtrip,
-        AttachableSetId, HostEnvironment, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity, SystemInfo,
-        ToolInventory,
+        HostEnvironment, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity, SystemInfo, ToolInventory,
     };
 
     fn repo_identity() -> RepoIdentity {
@@ -1582,16 +1497,6 @@ mod tests {
                 .node_id(NodeId::new("feta"))
                 .build(),
             Command::builder().action(CommandAction::TrackRepoPath { path: PathBuf::from("/repo") }).build(),
-            Command::builder()
-                .action(CommandAction::CreateWorkspaceFromPreparedTerminal {
-                    target_node_id: NodeId::new("desktop"),
-                    branch: "feat-x".into(),
-                    checkout_path: PathBuf::from("/remote/repo/feat-x"),
-                    attachable_set_id: Some(AttachableSetId::new("set-1")),
-                    commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-                })
-                .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
-                .build(),
             Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Query("owner/repo".into()) }).build(),
             Command::builder()
                 .action(CommandAction::Checkout {
@@ -1599,11 +1504,6 @@ mod tests {
                     target: CheckoutTarget::FreshBranch("feat-x".into()),
                     issue_ids: vec![("github".into(), "42".into())],
                 })
-                .build(),
-            Command::builder()
-                .action(CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x"), commands: vec![] })
-                .node_id(NodeId::new("desktop"))
-                .context_repo(RepoSelector::Identity(repo_identity()))
                 .build(),
             Command::builder().action(CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-x".into()) }).build(),
             Command::builder()
@@ -1614,11 +1514,6 @@ mod tests {
                 })
                 .context_repo(RepoSelector::Path(PathBuf::from("/repo")))
                 .build(),
-            Command::builder()
-                .action(CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/repo/wt"), label: "feat-x".into() })
-                .context_repo(RepoSelector::Identity(repo_identity()))
-                .build(),
-            Command::builder().action(CommandAction::SelectWorkspace { ws_ref: "ws://1".into() }).build(),
             Command::builder()
                 .action(CommandAction::Attach { reference: "convoy-a".into(), host: None, mode: AttachMode::Default })
                 .build(),
@@ -1732,15 +1627,6 @@ mod tests {
             Command::builder()
                 .action(CommandAction::ProjectApply { name: "my-project".into(), spec_yaml: "repositories: []\n".into() })
                 .build(),
-            Command::builder()
-                .action(CommandAction::TeleportSession {
-                    session_id: "session-1".into(),
-                    branch: Some("feat-x".into()),
-                    checkout_key: Some(PathBuf::from("/repo/wt")),
-                })
-                .node_id(NodeId::new("feta"))
-                .context_repo(RepoSelector::Identity(repo_identity()))
-                .build(),
             // Repository keys remain independent of checkout paths on the wire.
             Command::builder()
                 .action(CommandAction::QueryResolveRepository { repo: RepoSelector::Repository(crate::RepositoryKey("widgets".into())) })
@@ -1832,13 +1718,6 @@ mod tests {
     }
 
     #[test]
-    fn command_uses_snake_case_tag() {
-        let cmd = Command::builder().action(CommandAction::SelectWorkspace { ws_ref: "x".into() }).build();
-        let json = serde_json::to_value(&cmd).expect("serialize");
-        assert_eq!(json.get("action").and_then(|v| v.as_str()), Some("select_workspace"));
-    }
-
-    #[test]
     fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
             CommandValue::Ok,
@@ -1869,26 +1748,6 @@ mod tests {
                 path: QualifiedPath::host(HostId::new("host-a"), "/repos/project/wt-1"),
             },
             CommandValue::CheckoutRemoved { branch: "feat-old".into() },
-            CommandValue::TerminalPrepared {
-                repo_identity: repo_identity(),
-                target_node_id: NodeId::new("desktop"),
-                branch: "feat-x".into(),
-                checkout_path: PathBuf::from("/remote/repo/feat-x"),
-                attachable_set_id: Some(AttachableSetId::new("set-1")),
-                commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-            },
-            CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
-                label: "feat-x".into(),
-                target_node_id: NodeId::new("desktop"),
-                display_host: Some(crate::HostName::new("desktop")),
-                checkout_path: PathBuf::from("/remote/repo/feat-x"),
-                checkout_key: None,
-                attachable_set_id: Some(AttachableSetId::new("set-1")),
-                environment_id: None,
-                container_name: None,
-                template_yaml: Some("layout: []\ncontent: []\n".into()),
-                prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-            })),
             CommandValue::BranchNameGenerated { name: "feat/cool-thing".into(), issue_ids: vec![("gh".into(), "1".into())] },
             CommandValue::CheckoutStatus(Box::new(CheckoutStatus {
                 branch: "old".into(),
@@ -1902,7 +1761,6 @@ mod tests {
             CommandValue::Error { message: "something failed".into() },
             CommandValue::Cancelled,
             CommandValue::AttachCommandResolved { plan: crate::ResolvedAttachPlan::shell_command("bash --login"), binding: None },
-            CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
             CommandValue::RepositoryResolved { key: Some(crate::RepositoryKey("widgets".into())) },
             CommandValue::RepositoryResolved { key: None },
             CommandValue::RepoProviders(Box::new(RepoProvidersResponse {
@@ -2092,24 +1950,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_workspace_roundtrip_preserves_fields() {
-        let prepared = PreparedWorkspace {
-            label: "feat-x".into(),
-            target_node_id: NodeId::new("desktop"),
-            display_host: Some(crate::HostName::new("desktop")),
-            checkout_path: PathBuf::from("/remote/repo/feat-x"),
-            checkout_key: None,
-            attachable_set_id: Some(AttachableSetId::new("set-1")),
-            environment_id: None,
-            container_name: None,
-            template_yaml: Some("layout: []\ncontent: []\n".into()),
-            prepared_commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-        };
-
-        assert_json_roundtrip(&prepared);
-    }
-
-    #[test]
     fn command_result_uses_snake_case_tag() {
         let result = CommandValue::CheckoutCreated { branch: "x".into(), path: QualifiedPath::host(HostId::new("host-a"), "/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
@@ -2196,25 +2036,6 @@ mod tests {
     fn command_description_covers_all_variants() {
         let cases: Vec<Command> = vec![
             Command::builder()
-                .action(CommandAction::CreateWorkspaceForCheckout { checkout_path: PathBuf::from("/tmp"), label: "ws".into() })
-                .build(),
-            Command::builder()
-                .action(CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/remote/repo/feat-x"), commands: vec![] })
-                .node_id(NodeId::new("desktop"))
-                .context_repo(RepoSelector::Identity(repo_identity()))
-                .build(),
-            Command::builder()
-                .action(CommandAction::CreateWorkspaceFromPreparedTerminal {
-                    target_node_id: NodeId::new("desktop"),
-                    branch: "feat-x".into(),
-                    checkout_path: PathBuf::from("/remote/repo/feat-x"),
-                    attachable_set_id: None,
-                    commands: vec![ResolvedPaneCommand { role: "main".into(), args: vec![Arg::Literal("bash".into())] }],
-                })
-                .context_repo(RepoSelector::Identity(repo_identity()))
-                .build(),
-            Command::builder().action(CommandAction::SelectWorkspace { ws_ref: "x".into() }).build(),
-            Command::builder()
                 .action(CommandAction::Checkout {
                     repo: RepoSelector::Query("repo".into()),
                     target: CheckoutTarget::Branch("b".into()),
@@ -2255,10 +2076,6 @@ mod tests {
                 .build(),
             Command::builder()
                 .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false })
-                .build(),
-            Command::builder()
-                .action(CommandAction::TeleportSession { session_id: "s".into(), branch: None, checkout_key: None })
-                .context_repo(RepoSelector::Path(PathBuf::from("/tmp")))
                 .build(),
             Command::builder().action(CommandAction::TrackRepoPath { path: PathBuf::from("/tmp") }).build(),
             Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(PathBuf::from("/tmp")) }).build(),

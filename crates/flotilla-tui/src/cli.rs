@@ -1289,7 +1289,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         }
         CommandValue::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
         CommandValue::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
-        CommandValue::TerminalPrepared { branch, target_node_id, .. } => format!("terminal prepared: {branch} on {target_node_id}"),
+
         CommandValue::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
         CommandValue::CheckoutStatus(status) => {
             let mut parts = vec![format!("checkout status: {}", status.branch)];
@@ -1312,9 +1312,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         }
         CommandValue::Error { message } => format!("error: {message}"),
         CommandValue::Cancelled => "cancelled".to_string(),
-        CommandValue::PreparedWorkspace(_) | CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
-            "internal step result".to_string()
-        }
+        CommandValue::AttachCommandResolved { .. } => "internal step result".to_string(),
         CommandValue::RepositoryResolved { key: Some(key) } => format!("Repository/{key}"),
         CommandValue::RepositoryResolved { key: None } => "no matching Repository".into(),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),

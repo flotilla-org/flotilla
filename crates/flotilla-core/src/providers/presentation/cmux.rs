@@ -58,7 +58,7 @@ impl CmuxPresentationManager {
                 let ws_ref = ws["id"].as_str()?.to_string();
                 let name = ws["title"].as_str().unwrap_or("").to_string();
 
-                Some((ws_ref, Workspace { name, attachable_set_id: None }))
+                Some((ws_ref, Workspace { name }))
             })
             .collect())
     }
@@ -224,7 +224,7 @@ impl super::PresentationManager for CmuxPresentationManager {
         };
 
         info!(workspace = %config.name, %ws_uuid, "cmux: workspace ready");
-        Ok((ws_uuid, Workspace { name: config.name.clone(), attachable_set_id: None }))
+        Ok((ws_uuid, Workspace { name: config.name.clone() }))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {

@@ -33,7 +33,9 @@ only a focus Regard for the convoy or vessel; the connected PM owns realization
 from its catalog recipe. It does not create or select a workspace directly.
 
 The personal `workspace [select]`, `repo prepare-terminal`, and `agent teleport`
-CLI commands have been retired.
+CLI commands have been retired. Checkout, including `repo checkout --env`,
+creates the checkout without opening a personal workspace. Existing
+`flotilla-v2:` sessions remain orphaned; checkout removal no longer deletes them.
 
 ## Multi-select (issues)
 

@@ -104,7 +104,7 @@ impl InProcessDaemon {
             | A::ResourceDelete { .. }
             | A::RepositoryRemoteRemove { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
             A::QueryCrewCapabilities { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Command),
-            A::ArchiveSession { .. } | A::TeleportSession { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Steps),
+            A::ArchiveSession { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Steps),
             A::QueryHostList { .. }
             | A::QueryExplainProject { .. }
             | A::QueryProjectList { .. }
@@ -132,11 +132,7 @@ impl InProcessDaemon {
             | A::Attach { .. }
             | A::AttachTransient { .. }
             | A::ResourceWatch { .. } => (TargetReason::LocalRead, RemoteDelivery::Command),
-            A::CreateWorkspaceForCheckout { .. }
-            | A::CreateWorkspaceFromPreparedTerminal { .. }
-            | A::SelectWorkspace { .. }
-            | A::PrepareTerminalForCheckout { .. }
-            | A::Checkout { .. }
+            A::Checkout { .. }
             | A::RemoveCheckout { .. }
             | A::FetchCheckoutStatus { .. }
             | A::OpenChangeRequest { .. }
@@ -184,7 +180,7 @@ impl InProcessDaemon {
                     .map_err(TargetError::CrewSessionHome)?
                     .map_or(TargetHost::Local, TargetHost::Node)
             }
-            A::ArchiveSession { session_id } | A::TeleportSession { session_id, .. } => {
+            A::ArchiveSession { session_id } => {
                 let session_action = A::ResourceReconcileNow {
                     namespace: self.provisioning_namespace().await,
                     kind: "TerminalSession".into(),

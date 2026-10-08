@@ -1,11 +1,9 @@
 pub use flotilla_protocol::CheckoutIntent;
 use flotilla_protocol::{provider_data::Checkout, qualified_path::QualifiedPath, CheckoutSelector, HostName};
-use tracing::warn;
 
 use crate::{
     path_context::{canonical_or_original, ExecutionEnvironmentPath},
     provider_data::ProviderData,
-    terminal_manager::TerminalManager,
     vcs::Vcs,
 };
 
@@ -79,21 +77,8 @@ impl<'a> CheckoutService<'a> {
         Ok(path)
     }
 
-    pub(super) async fn remove_checkout(
-        &self,
-        _repo_root: &ExecutionEnvironmentPath,
-        branch: &str,
-        deleted_checkout_paths: &[QualifiedPath],
-        terminal_manager: Option<&TerminalManager>,
-    ) -> Result<(), String> {
+    pub(super) async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
         self.vcs.remove_checkout(branch).await?;
-
-        // Cascade: remove attachable sets and kill terminal sessions for deleted checkouts
-        if let Some(tm) = terminal_manager {
-            if let Err(err) = tm.cascade_delete(deleted_checkout_paths).await {
-                warn!(err = %err, "failed to cascade delete terminal sessions (best-effort)");
-            }
-        }
 
         Ok(())
     }
