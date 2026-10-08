@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     AheadBehind, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
-    RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
+    RepoIdentity, TerminalStatus, WorkingTreeStatus,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -28,9 +28,8 @@ use crate::{
         change_request::ChangeRequestTracker,
         discovery::EnvVars,
         issue_tracker::IssueProvider,
-        presentation::PresentationManager,
         terminal::{TerminalPool, TerminalSessionLiveness},
-        types::{BranchInfo, WorkspaceAttachRequest},
+        types::BranchInfo,
         vcs::{git_worktree::GitWorktreeStrategy, VcsInspection},
         ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     },
@@ -176,7 +175,6 @@ pub struct FakeDiscoveryProviders {
     pub checkout_manager: Option<Arc<dyn Vcs>>,
     pub change_request: Option<Arc<dyn ChangeRequestTracker>>,
     pub issue_tracker: Option<Arc<dyn IssueProvider>>,
-    pub presentation_manager: Option<Arc<dyn PresentationManager>>,
     pub terminal_pool: Option<Arc<dyn TerminalPool>>,
 }
 
@@ -197,11 +195,6 @@ impl FakeDiscoveryProviders {
 
     pub fn with_issue_tracker(mut self, provider: Arc<dyn IssueProvider>) -> Self {
         self.issue_tracker = Some(provider);
-        self
-    }
-
-    pub fn with_presentation_manager(mut self, provider: Arc<dyn PresentationManager>) -> Self {
-        self.presentation_manager = Some(provider);
         self
     }
 
@@ -818,62 +811,6 @@ pub struct FakeChangeRequest {
     pub admission_base_ref: String,
 }
 
-pub struct FakePresentationManager {
-    pub workspaces: Arc<TokioMutex<Vec<(String, Workspace)>>>,
-    pub selected: Arc<TokioMutex<Vec<String>>>,
-    pub list_error: Arc<TokioMutex<Option<String>>>,
-}
-
-impl Default for FakePresentationManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FakePresentationManager {
-    pub fn new() -> Self {
-        Self {
-            workspaces: Arc::new(TokioMutex::new(Vec::new())),
-            selected: Arc::new(TokioMutex::new(Vec::new())),
-            list_error: Arc::new(TokioMutex::new(None)),
-        }
-    }
-
-    pub async fn add_workspaces(&self, workspaces: Vec<(String, Workspace)>) {
-        self.workspaces.lock().await.extend(workspaces);
-    }
-}
-
-#[async_trait::async_trait]
-impl PresentationManager for FakePresentationManager {
-    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-        if let Some(error) = self.list_error.lock().await.clone() {
-            return Err(error);
-        }
-        Ok(self.workspaces.lock().await.clone())
-    }
-
-    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-        let mut store = self.workspaces.lock().await;
-        let ws_ref = format!("workspace:{}", store.len() + 1);
-        let workspace = Workspace { name: config.name.clone() };
-        store.push((ws_ref.clone(), workspace.clone()));
-        Ok((ws_ref, workspace))
-    }
-
-    async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        self.selected.lock().await.push(ws_ref.to_string());
-        Ok(())
-    }
-    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        self.selected.lock().await.push(format!("delete:{ws_ref}"));
-        Ok(())
-    }
-    fn binding_scope_prefix(&self) -> String {
-        String::new()
-    }
-}
-
 pub struct FakeTerminalPool {
     pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
     liveness_override: Arc<TokioMutex<Option<Result<TerminalSessionLiveness, String>>>>,
@@ -1217,35 +1154,6 @@ impl Factory for FakeChangeRequestFactory {
     }
 }
 
-pub struct FakePresentationManagerFactory(pub Arc<dyn PresentationManager>);
-
-#[async_trait::async_trait]
-impl Factory for FakePresentationManagerFactory {
-    type Descriptor = ProviderDescriptor;
-    type Output = dyn PresentationManager;
-
-    fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor::labeled_simple(
-            ProviderCategory::WorkspaceManager,
-            "fake-workspaces",
-            "Fake Workspaces",
-            "WS",
-            "Workspaces",
-            "workspace",
-        )
-    }
-
-    async fn probe(
-        &self,
-        _env: &EnvironmentBag,
-        _config: &ConfigStore,
-        _repo_root: &ExecutionEnvironmentPath,
-        _runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
-        Ok(Arc::clone(&self.0))
-    }
-}
-
 pub struct FakeTerminalPoolFactory(pub Arc<dyn TerminalPool>);
 
 #[async_trait::async_trait]
@@ -1355,11 +1263,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         issue_tracker_factories.push(Box::new(FakeIssueProviderFactory(it)));
     }
 
-    let mut presentation_manager_factories: Vec<Box<super::PresentationManagerFactory>> = Vec::new();
-    if let Some(ws) = providers.presentation_manager {
-        presentation_manager_factories.push(Box::new(FakePresentationManagerFactory(ws)));
-    }
-
     let mut terminal_pool_factories: Vec<Box<super::TerminalPoolFactory>> = Vec::new();
     if let Some(pool) = providers.terminal_pool {
         terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
@@ -1377,7 +1280,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             issue_trackers: issue_tracker_factories,
             cloud_agents: vec![],
             ai_utilities: vec![],
-            presentation_managers: presentation_manager_factories,
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![Box::new(super::factories::host_direct::HostDirectEnvironmentFactory)],
         },

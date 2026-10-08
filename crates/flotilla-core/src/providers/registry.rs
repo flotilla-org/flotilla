@@ -12,7 +12,6 @@ use crate::{
         discovery::ProviderDescriptor,
         environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
-        presentation::PresentationManager,
         terminal::TerminalPool,
         vcs::CloneProvisioner,
     },
@@ -157,7 +156,6 @@ pub struct ProviderRegistry {
     pub issue_trackers: ProviderSet<dyn IssueProvider>,
     pub cloud_agents: ProviderSet<dyn CloudAgentService>,
     pub ai_utilities: ProviderSet<dyn AiUtility>,
-    pub presentation_managers: ProviderSet<dyn PresentationManager>,
     pub terminal_pools: ProviderSet<dyn TerminalPool>,
     pub environment_providers: ProviderSet<dyn EnvironmentProvider>,
 }
@@ -172,7 +170,6 @@ impl ProviderRegistry {
             issue_trackers: ProviderSet::new(),
             cloud_agents: ProviderSet::new(),
             ai_utilities: ProviderSet::new(),
-            presentation_managers: ProviderSet::new(),
             terminal_pools: ProviderSet::new(),
             environment_providers: ProviderSet::new(),
         }
@@ -205,7 +202,6 @@ impl ProviderRegistry {
         collect(&mut infos, &self.issue_trackers);
         collect(&mut infos, &self.cloud_agents);
         collect(&mut infos, &self.ai_utilities);
-        collect(&mut infos, &self.presentation_managers);
         collect(&mut infos, &self.terminal_pools);
         collect(&mut infos, &self.environment_providers);
         infos

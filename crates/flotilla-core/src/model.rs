@@ -46,7 +46,6 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
     collect(&mut names, &registry.issue_trackers);
     collect(&mut names, &registry.cloud_agents);
     collect(&mut names, &registry.ai_utilities);
-    collect(&mut names, &registry.presentation_managers);
     collect(&mut names, &registry.terminal_pools);
     collect(&mut names, &registry.environment_providers);
     names

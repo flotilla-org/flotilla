@@ -1,6 +1,5 @@
 pub mod claude;
 pub mod cleat;
-pub mod cmux;
 pub mod codex;
 pub mod cursor;
 pub mod docker;
@@ -8,13 +7,8 @@ pub mod git;
 pub mod github;
 pub mod host_direct;
 pub mod passthrough;
-pub mod zellij;
 
 use super::FactoryRegistry;
-
-fn presentation_factories() -> Vec<Box<super::PresentationManagerFactory>> {
-    vec![Box::new(cmux::CmuxInsideFactory), Box::new(zellij::ZellijPresentationManagerFactory), Box::new(cmux::CmuxBinaryFallbackFactory)]
-}
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
     vec![Box::new(cleat::CleatTerminalPoolFactory), Box::new(passthrough::PassthroughTerminalPoolFactory)]
@@ -36,8 +30,6 @@ impl FactoryRegistry {
                 Box::new(codex::CodexCodingAgentFactory),
             ],
             ai_utilities: vec![Box::new(claude::ClaudeApiAiUtilityFactory), Box::new(claude::ClaudeCliAiUtilityFactory)],
-            // Priority: inside-cmux > inside-zellij > cmux-binary-fallback
-            presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory), Box::new(host_direct::HostDirectEnvironmentFactory)],
         }
@@ -56,7 +48,6 @@ mod tests {
         assert!(!reg.issue_trackers.is_empty());
         assert!(!reg.cloud_agents.is_empty());
         assert!(!reg.ai_utilities.is_empty());
-        assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
     }
 
@@ -69,7 +60,6 @@ mod tests {
         assert!(!reg.issue_trackers.is_empty());
         assert!(!reg.cloud_agents.is_empty());
         assert!(!reg.ai_utilities.is_empty());
-        assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
     }
 }

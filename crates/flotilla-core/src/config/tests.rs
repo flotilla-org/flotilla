@@ -557,7 +557,6 @@ checkout_path = "/tmp/{{ branch }}"
     let config: FlotillaConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.ai_utility.preference.backend.as_deref(), Some("claude"));
     assert_eq!(config.ai_utility.claude.unwrap().implementation.as_deref(), Some("api"));
-    assert_eq!(config.presentation_manager.preference.backend.as_deref(), Some("zellij"));
     assert_eq!(config.vcs.git.checkout_path, "/tmp/{{ branch }}");
 }
 
@@ -584,11 +583,22 @@ async fn probe_config_errors_use_cached_defaults() {
 #[test]
 fn provider_preferences_preserve_backend_strings() {
     for backend in ["", "cleat", "passthrough", "cmux", "zellij", "unknown", "shpool", "tmux"] {
-        for section in ["terminal_pool", "presentation_manager"] {
-            let config: FlotillaConfig = toml::from_str(&format!("[{section}]\nbackend = '{backend}'\n")).expect("config loads");
-            let preference =
-                if section == "terminal_pool" { &config.terminal_pool.preference } else { &config.presentation_manager.preference };
-            assert_eq!(preference.backend.as_deref(), Some(backend));
-        }
+        let config: FlotillaConfig = toml::from_str(&format!("[terminal_pool]\nbackend = '{backend}'\n")).expect("config loads");
+        assert_eq!(config.terminal_pool.preference.backend.as_deref(), Some(backend));
     }
+}
+
+// The retired key must load without changing active config or being written back.
+#[hegel::test]
+fn retired_presentation_manager_config_is_accepted_and_dropped(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let legacy = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let value = ["backend = 'cmux'", "backend = 'zellij'", "backend = 'unknown'\nnested = { extra = [1, 2] }", ""][legacy];
+    let source = format!("[terminal_pool]\nbackend = 'cleat'\n[presentation_manager]\n{value}\n");
+    let config: FlotillaConfig = toml::from_str(&source).expect("retired config loads");
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(!serialized.contains("presentation_manager"), "retired key must be dropped");
+    assert_eq!(config.terminal_pool.preference.backend.as_deref(), Some("cleat"));
+    let active: FlotillaConfig = toml::from_str("[terminal_pool]\nbackend = 'cleat'\n").expect("active config");
+    assert_eq!(serialized, toml::to_string(&active).expect("active serialization"));
 }

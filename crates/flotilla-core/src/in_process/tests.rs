@@ -6450,7 +6450,7 @@ async fn observation_cache_deadline_crosses_both_clocks() {
 fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use crate::providers::discovery::test_support::FakePresentationManager;
+    use crate::providers::discovery::test_support::FakeTerminalPool;
 
     // Cover no roots, multiple roots, both discovery outcomes, repeated removals,
     // and either root removal order. Factories stand in for process providers.
@@ -6467,7 +6467,7 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
         }
         let mut providers = FakeDiscoveryProviders::new().with_change_request(Arc::new(FakeChangeRequest::new()));
         if available {
-            providers = providers.with_presentation_manager(Arc::new(FakePresentationManager::new()));
+            providers = providers.with_terminal_pool(Arc::new(FakeTerminalPool::new()));
         }
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
@@ -6479,7 +6479,7 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
         )
         .await;
         let environment = daemon.local_host_identity().environment_id;
-        // Host-direct adoption is always available; presentation discovery
+        // Host-direct adoption is always available; terminal discovery
         // remains optional, and neither depends on repository membership.
         let mut expected = vec![HostProviderStatus {
             category: "environment_provider".into(),
@@ -6490,9 +6490,9 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
         }];
         if available {
             expected.push(HostProviderStatus {
-                category: "workspace_manager".into(),
-                name: "Fake Workspaces".into(),
-                implementation: "fake-workspaces".into(),
+                category: "terminal_pool".into(),
+                name: "Fake Terminals".into(),
+                implementation: "fake-terminals".into(),
                 healthy: true,
                 disabled_reason: None,
             });
@@ -6503,7 +6503,7 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
 
         // A stored health observation can differ from this process's discovery;
         // queries must present that status even while roots are removed.
-        let published = vec![HostProviderStatus::disabled("workspace_manager", "published", "offline probe")];
+        let published = vec![HostProviderStatus::disabled("environment_provider", "published", "offline probe")];
         description.providers = published.clone();
         let hosts = backend.using::<ResourceHost>("flotilla");
         let name = daemon.local_host_id().expect("host id").to_string();

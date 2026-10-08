@@ -4128,15 +4128,12 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
 
     let path = Path::new("/checkouts/router-main");
     let leader = if observed {
-        use flotilla_core::providers::discovery::test_support::{FakePresentationManagerFactory, FakeVcsFactory, FakeVcsState};
+        use flotilla_core::providers::discovery::test_support::{FakeVcsFactory, FakeVcsState};
         let tmp = tempfile::tempdir().expect("config");
         let mut discovery = fake_discovery(false);
         discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(
             FakeVcsState::builder(path).branch("main", true).checkout("main").is_main(true).path(path).build().build(),
         ))];
-        discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(Arc::new(
-            flotilla_core::providers::discovery::test_support::FakePresentationManager::new(),
-        )))];
         InProcessDaemon::new(Vec::new(), test_config_store_with_floor(tmp.keep(), None), discovery, HostName::new("leader")).await
     } else {
         empty_daemon_named("leader").await

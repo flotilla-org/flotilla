@@ -14,9 +14,7 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    providers::discovery::test_support::{
-        fake_discovery, git_process_discovery, init_git_repo_with_remote, FakePresentationManager, FakePresentationManagerFactory,
-    },
+    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
 };
 use flotilla_protocol::{
     commands::DaemonLogQuery,
@@ -761,12 +759,6 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
-}
-
-fn git_process_discovery_with_workspace_manager() -> flotilla_core::providers::discovery::DiscoveryRuntime {
-    let mut discovery = git_process_discovery(false);
-    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(Arc::new(FakePresentationManager::new())))];
-    discovery
 }
 
 type RoutingState = (
@@ -2799,9 +2791,7 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let workspace_manager = Arc::new(FakePresentationManager::new());
-    let mut discovery = git_process_discovery(false);
-    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(workspace_manager.clone()))];
+    let discovery = git_process_discovery(false);
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
@@ -2893,7 +2883,6 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
 
     assert!(!workspace_started, "local workspace step should not run after remote checkout failure");
     assert_eq!(finished_result, CommandValue::Error { message: "checkout failed".into() });
-    assert!(workspace_manager.workspaces.lock().await.is_empty(), "workspace manager should remain unused");
 }
 
 #[tokio::test]
@@ -3492,9 +3481,7 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     init_git_repo_with_remote(&requester_repo, "git@github.com:owner/repo.git");
 
     let config = test_config_store(tmp.path().join("config"));
-    let daemon =
-        InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery_with_workspace_manager(), HostName::new("local"))
-            .await;
+    let daemon = InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.add_repo(&remote_repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
@@ -5257,9 +5244,7 @@ async fn remote_checkout_completion_is_headless() {
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let workspace_manager = Arc::new(FakePresentationManager::new());
-    let mut discovery = git_process_discovery(false);
-    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(workspace_manager.clone()))];
+    let discovery = git_process_discovery(false);
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
 
@@ -5345,6 +5330,4 @@ async fn remote_checkout_completion_is_headless() {
             path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
         }
     );
-
-    assert!(workspace_manager.workspaces.lock().await.is_empty(), "remote checkout must not create a local workspace");
 }

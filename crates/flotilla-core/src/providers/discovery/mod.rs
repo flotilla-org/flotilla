@@ -37,9 +37,8 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         issue_tracker::IssueProvider,
-        presentation::PresentationManager,
         registry::{ProviderRegistry, ProviderSet},
-        scan_cache::{SharedPresentationManager, SharedTerminalPool},
+        scan_cache::SharedTerminalPool,
         terminal::TerminalPool,
         CommandRunner,
     },
@@ -446,7 +445,6 @@ pub type ChangeRequestFactory = ProviderFactory<dyn ChangeRequestTracker>;
 pub type IssueProviderFactory = ProviderFactory<dyn IssueProvider>;
 pub type CloudAgentFactory = ProviderFactory<dyn CloudAgentService>;
 pub type AiUtilityFactory = ProviderFactory<dyn AiUtility>;
-pub type PresentationManagerFactory = ProviderFactory<dyn PresentationManager>;
 pub type TerminalPoolFactory = ProviderFactory<dyn TerminalPool>;
 pub type EnvironmentProviderFactory = ProviderFactory<dyn EnvironmentProvider>;
 
@@ -460,7 +458,6 @@ pub struct FactoryRegistry {
     pub issue_trackers: Vec<Box<IssueProviderFactory>>,
     pub cloud_agents: Vec<Box<CloudAgentFactory>>,
     pub ai_utilities: Vec<Box<AiUtilityFactory>>,
-    pub presentation_managers: Vec<Box<PresentationManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
 }
@@ -510,9 +507,7 @@ impl FactoryRegistry {
         for (desc, p) in probe_category(&self.ai_utilities, env, config, repo_root, &runner).await {
             registry.ai_utilities.insert(desc.implementation.clone(), desc, p);
         }
-        for (desc, p) in probe_category(&self.presentation_managers, env, config, repo_root, &runner).await {
-            registry.presentation_managers.insert(desc.implementation.clone(), desc, p);
-        }
+
         for (desc, p) in probe_category(&self.terminal_pools, env, config, repo_root, &runner).await {
             registry.terminal_pools.insert(desc.implementation.clone(), desc, p);
         }
@@ -551,7 +546,6 @@ pub(crate) struct HostRegistry {
     pub(crate) agent_adapters: AgentAdapterRegistry,
     pub(crate) cloud_agents: Vec<(ProviderDescriptor, Arc<dyn CloudAgentService>)>,
     pub(crate) ai_utilities: Vec<(ProviderDescriptor, Arc<dyn AiUtility>)>,
-    pub(crate) presentation_managers: Vec<(ProviderDescriptor, Arc<dyn PresentationManager>)>,
     pub(crate) terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
     pub(crate) environment_providers: Vec<(ProviderDescriptor, Arc<dyn EnvironmentProvider>)>,
 }
@@ -579,9 +573,7 @@ impl HostScopedDiscovery {
         for (descriptor, provider) in &self.registry.ai_utilities {
             registry.ai_utilities.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
-        for (descriptor, provider) in &self.registry.presentation_managers {
-            registry.presentation_managers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
-        }
+
         for (descriptor, provider) in &self.registry.terminal_pools {
             registry.terminal_pools.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
@@ -647,12 +639,6 @@ impl HostScopedProviderCache {
             let (ai_utilities, ai_utility_unmet) =
                 probe_host_category(&factories.ai_utilities, host_bag, config, probe_root, &runner, |provider| provider).await;
             unmet.extend(ai_utility_unmet);
-            let (presentation_managers, presentation_unmet) =
-                probe_host_category(&factories.presentation_managers, host_bag, config, probe_root, &runner, |provider| {
-                    Arc::new(SharedPresentationManager::new(provider, HOST_SCAN_CACHE_TTL))
-                })
-                .await;
-            unmet.extend(presentation_unmet);
             let (terminal_pools, terminal_unmet) =
                 probe_host_category(&factories.terminal_pools, host_bag, config, probe_root, &runner, |provider| {
                     Arc::new(SharedTerminalPool::new(provider, HOST_SCAN_CACHE_TTL))
@@ -668,7 +654,6 @@ impl HostScopedProviderCache {
                     .agent_adapters(AgentAdapterRegistry::discover(host_bag, Arc::clone(&runner)))
                     .cloud_agents(cloud_agents)
                     .ai_utilities(ai_utilities)
-                    .presentation_managers(presentation_managers)
                     .terminal_pools(terminal_pools)
                     .environment_providers(environment_providers)
                     .build(),
@@ -903,10 +888,6 @@ async fn discover_providers_inner(
         .await;
     }
     if host_scoped.is_none() {
-        probe_all(&factories.presentation_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-            registry.presentation_managers.insert(desc.implementation.clone(), desc, provider);
-        })
-        .await;
         probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
             registry.terminal_pools.insert(desc.implementation.clone(), desc, provider);
         })
@@ -979,12 +960,6 @@ async fn discover_providers_inner(
             ));
         }
     }
-    apply_backend_pref(
-        &mut registry.presentation_managers,
-        ProviderCategory::WorkspaceManager,
-        flotilla_config.presentation_manager.preference.backend.as_deref(),
-        &mut unmet,
-    );
     apply_backend_pref(
         &mut registry.terminal_pools,
         ProviderCategory::TerminalPool,
@@ -1140,7 +1115,6 @@ mod orchestrator_tests {
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
-            presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
         };
@@ -1168,7 +1142,6 @@ mod orchestrator_tests {
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
-            presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
         };
@@ -1180,7 +1153,6 @@ mod orchestrator_tests {
         assert!(result.registry.issue_trackers.is_empty());
         assert!(result.registry.cloud_agents.is_empty());
         assert!(result.registry.ai_utilities.is_empty());
-        assert!(result.registry.presentation_managers.is_empty());
         assert!(result.registry.terminal_pools.is_empty());
         assert!(result.unmet.is_empty());
         assert!(result.repo_slug.is_none());
