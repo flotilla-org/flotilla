@@ -397,11 +397,7 @@ where
             }
             Err(err) => return Err(err),
         };
-        if environment
-            .status
-            .as_ref()
-            .is_some_and(|status| matches!(status.phase, EnvironmentPhase::Terminating | EnvironmentPhase::Failed))
-        {
+        if environment.status.as_ref().is_some_and(|status| matches!(status.phase, EnvironmentPhase::Failed | EnvironmentPhase::Lost)) {
             return Ok(TerminalPrepared::OwnerTerminal);
         }
         match self.session_owner_state(obj).await? {

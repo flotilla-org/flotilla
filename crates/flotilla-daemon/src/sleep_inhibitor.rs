@@ -336,7 +336,7 @@ fn convoy_key(convoy: &ReadResourceObject<Convoy>) -> (Option<flotilla_protocol:
 fn convoy_requires_inhibitor(convoy: &ResourceObject<Convoy>, host_id: &flotilla_protocol::CanonicalHostId) -> bool {
     let non_terminal = !matches!(
         convoy.status.as_ref().map(|status| status.phase),
-        Some(ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
+        Some(ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned)
     );
     non_terminal
         && convoy

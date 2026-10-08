@@ -280,3 +280,55 @@ async fn host_direct_provider_failure_prevents_readiness() {
     let result = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
     assert!(matches!(result.patch, Some(EnvironmentStatusPatch::MarkFailed { .. })));
 }
+
+// A lost Environment retains its durable container identity and never calls
+// provision again. RecordingDockerRuntime stands in for the Docker process;
+// its provisioning method panics if automatic rehydration is attempted.
+#[tokio::test]
+async fn lost_environment_is_not_reprovisioned() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let environments = backend.using::<Environment>("flotilla");
+    let environment = environments
+        .create(
+            &InputMeta::builder().name("lost-environment".into()).build(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    host_ref: "host-a".into(),
+                    image: "crew-image".into(),
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect("environment");
+    let environment = environments
+        .update_status(
+            "lost-environment",
+            &environment.metadata.resource_version,
+            &EnvironmentStatus {
+                phase: EnvironmentPhase::Lost,
+                docker_container_id: Some("retained-container".into()),
+                message: Some("host reboot".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("lost backing");
+    let reconciler = EnvironmentReconciler::new(Arc::new(RecordingDockerRuntime::default()), backend.clone(), "flotilla");
+    for _ in 0..2 {
+        let prepared = reconciler.prepare(&environment).await.expect("lost prepare");
+        let outcome = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
+        assert!(outcome.patch.is_none() && outcome.actuations.is_empty());
+    }
+    let after = environments.get("lost-environment").await.expect("retained environment");
+    assert_eq!(after.status, environment.status);
+    assert_eq!(after.metadata.resource_version, environment.metadata.resource_version);
+}

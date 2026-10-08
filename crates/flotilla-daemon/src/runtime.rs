@@ -2088,10 +2088,24 @@ async fn reconcile_provisioned_environment(
 ) -> Result<(), String> {
     let spec = environment.spec.docker.as_ref().expect("candidate filtering requires a local Docker spec");
     let Some(container_id) = container_id else {
-        return fail_unavailable_environment(state, namespace, &env_id, "ready Docker environment has no container identity").await;
+        return mark_unavailable_environment(
+            state,
+            namespace,
+            &env_id,
+            BackingDisposition::Failed,
+            "ready Docker environment has no container identity",
+        )
+        .await;
     };
     let Some(handle) = handle else {
-        return fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} is not running")).await;
+        return mark_unavailable_environment(
+            state,
+            namespace,
+            &env_id,
+            BackingDisposition::Lost,
+            &format!("Docker container {container_id} is not running"),
+        )
+        .await;
     };
     let status = handle.status().await;
     let observation = match handle.runtime_observation().await {
@@ -2100,7 +2114,7 @@ async fn reconcile_provisioned_environment(
             if matches!(status, Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) =>
         {
             // Richer evidence is best effort once liveness establishes death.
-            // Keep existing samples and fail backing rather than retry forever.
+            // Keep existing samples and mark backing lost rather than retry forever.
             warn!(container = %container_id, %error, "terminal backing observation unavailable");
             None
         }
@@ -2110,15 +2124,23 @@ async fn reconcile_provisioned_environment(
         record_environment_observation(state, namespace, &env_id, observation).await?;
     }
     if let Some(termination) = observation.as_ref().and_then(|observation| observation.termination.as_ref()) {
-        return fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} {termination}")).await;
+        return mark_unavailable_environment(
+            state,
+            namespace,
+            &env_id,
+            BackingDisposition::Lost,
+            &format!("Docker container {container_id} {termination}"),
+        )
+        .await;
     }
     match status {
         Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
         Ok(status @ (flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) => {
-            return fail_unavailable_environment(
+            return mark_unavailable_environment(
                 state,
                 namespace,
                 &env_id,
+                BackingDisposition::Lost,
                 &format!("Docker container {container_id} is not running (status: {status:?})"),
             )
             .await;
@@ -2143,7 +2165,14 @@ async fn reconcile_provisioned_environment(
         }
         .await;
         if let Err(error) = adoption {
-            return fail_unavailable_environment(state, namespace, &env_id, &format!("environment adoption failed: {error}")).await;
+            return mark_unavailable_environment(
+                state,
+                namespace,
+                &env_id,
+                BackingDisposition::Failed,
+                &format!("environment adoption failed: {error}"),
+            )
+            .await;
         }
         info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }
@@ -2531,7 +2560,7 @@ fn github_app_scope_from_grants(
     scope
 }
 
-/// Persist diagnostics before marking backing failed: dependency watchers may
+/// Persist diagnostics before marking backing lost: dependency watchers may
 /// immediately start teardown, and neither inspect nor cgroup evidence survives it.
 async fn record_environment_observation(
     state: &ControllerRuntimeState,
@@ -2589,10 +2618,16 @@ fn changed_runtime_observation(
     Some(merged)
 }
 
-async fn fail_unavailable_environment(
+enum BackingDisposition {
+    Lost,
+    Failed,
+}
+
+async fn mark_unavailable_environment(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
     env_id: &EnvironmentId,
+    disposition: BackingDisposition,
     message: &str,
 ) -> Result<(), String> {
     let registered_container = state.daemon.environment_container_name(env_id);
@@ -2620,18 +2655,25 @@ async fn fail_unavailable_environment(
     }
     retained_paths.sort();
     retained_paths.dedup();
+    let message = match disposition {
+        BackingDisposition::Lost => format!("lost, recoverable: {message}; rehydration is not available yet (#2872)"),
+        BackingDisposition::Failed => message.to_string(),
+    };
     let message = if retained_paths.is_empty() {
-        message.to_string()
+        message.clone()
     } else {
         format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
     };
     flotilla_resources::apply_status_patch(
         &state.daemon.resource_backend().using::<Environment>(namespace),
         env_id.as_str(),
-        &EnvironmentStatusPatch::MarkFailed { message: message.to_string() },
+        &match disposition {
+            BackingDisposition::Lost => EnvironmentStatusPatch::MarkLost { message: message.clone() },
+            BackingDisposition::Failed => EnvironmentStatusPatch::MarkFailed { message: message.clone() },
+        },
     )
     .await
-    .map_err(|error| format!("mark unavailable environment {env_id} failed: {error}"))?;
+    .map_err(|error| format!("mark unavailable environment {env_id}: {error}"))?;
     warn!(environment = %env_id, %message, "provisioned environment backing is unavailable");
     Ok(())
 }
@@ -13826,7 +13868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_readoption_marks_missing_container_failed() {
+    async fn environment_readoption_marks_missing_container_lost() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -13855,8 +13897,11 @@ mod tests {
 
         let environment = daemon.resource_backend().using::<Environment>(NAMESPACE).get(env_id.as_str()).await.expect("environment record");
         let status = environment.status.expect("environment status");
-        assert_eq!(status.phase, EnvironmentPhase::Failed);
-        assert_eq!(status.message.as_deref(), Some("Docker container missing-container is not running"));
+        assert_eq!(status.phase, EnvironmentPhase::Lost);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("lost, recoverable: Docker container missing-container is not running; rehydration is not available yet (#2872)")
+        );
         assert!(daemon.environment_registry_for_environment(&env_id).is_none());
     }
 

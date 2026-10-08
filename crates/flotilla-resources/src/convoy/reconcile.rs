@@ -28,7 +28,7 @@ use crate::{
     resource::ResourceObject,
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
-    vessel::{Vessel, VesselPhase},
+    vessel::{vessel_resource_name, Vessel, VesselPhase},
     workflow_template::{
         validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ExitDeclaration,
         ValidationError, WorkflowTemplate,
@@ -1774,6 +1774,29 @@ fn vessel_outcome(
             continue;
         };
         let vessel = vessels.get(&vessel_resource_name(&convoy.metadata.name, &requirement.name));
+        if let Some(vessel) = vessel.filter(|vessel| vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Lost)) {
+            if state.phase.is_terminal() {
+                continue;
+            }
+            let message = vessel
+                .status
+                .as_ref()
+                .and_then(|status| status.message.clone())
+                .unwrap_or_else(|| "lost, recoverable: environment disappeared; rehydration is not available yet (#2872)".into());
+            if state.phase == WorkPhase::Interrupted && state.message.as_ref() == Some(&message) {
+                continue;
+            }
+            let roles = status.crew_work.get(&requirement.name).into_iter().flat_map(|crew| crew.keys().cloned()).collect();
+            return InternalReconcileOutcome {
+                patch: Some(provisioning_patches::work_interrupted(requirement.name.clone(), roles, message)),
+                actuations,
+                events: vec![ConvoyEvent::WorkPhaseChanged {
+                    work: requirement.name.clone(),
+                    from: state.phase,
+                    to: WorkPhase::Interrupted,
+                }],
+            };
+        }
         // A deleting child still occupies the requirement until finalization.
         // Record a failed child's cause and retry even if teardown won the race.
         if vessel.is_some_and(|vessel| {
@@ -2185,12 +2208,4 @@ fn insert_optional_field(fields: &mut BTreeMap<String, serde_json::Value>, key: 
     if let Some(value) = value {
         fields.insert(key.to_string(), json!(value));
     }
-}
-
-/// Per-vessel convoy resources (`Vessel`, `Presentation`) share the name
-/// shape `<convoy>-<vessel>`. Resource kinds have separate namespaces, so the
-/// shared shape causes no collision and keeps both resources discoverable
-/// together by name.
-fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
-    format!("{convoy_name}-{vessel}")
 }

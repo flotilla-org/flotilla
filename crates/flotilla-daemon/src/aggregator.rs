@@ -2800,7 +2800,7 @@ impl Aggregator {
                 })
                 .unwrap_or_default()
         };
-        let mut readiness = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host);
+        let (mut readiness, loss_reason) = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host);
         if readiness.state == ReadinessState::Provisioning {
             if let Some(stalled) = stalled.filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
             {
@@ -2812,6 +2812,9 @@ impl Aggregator {
                 });
             }
         }
+        // Frozen backing loss takes precedence over credential refresh: credentials
+        // cannot make this vessel usable until rehydration exists.
+        let surface_state = if loss_reason.is_some() { SurfaceState::NeedsYou } else { surface_state };
         VesselRow::builder()
             .readiness(readiness)
             .resource(convoy_ref.subresource(format!("vessels/{}", definition.name)))
@@ -2830,16 +2833,18 @@ impl Aggregator {
             .maybe_ready_at(state.and_then(|state| state.ready_at))
             .maybe_started_at(state.and_then(|state| state.started_at))
             .maybe_finished_at(state.and_then(|state| state.finished_at))
-            .maybe_message(
+            .maybe_message(loss_reason.or_else(|| {
                 credential_attention
                     .and_then(|demand| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned())
                     .or_else(|| {
-                        completion_pending
-                            .map(|pending| format!("completion pending: {}", pending.last_error))
+                        state
+                            .filter(|state| state.phase == ResourceWorkPhase::Interrupted)
+                            .and_then(|state| state.message.clone())
+                            .or_else(|| completion_pending.map(|pending| format!("completion pending: {}", pending.last_error)))
                             .or_else(|| terminal_condition.clone())
                             .or_else(|| state.and_then(|state| state.message.clone()))
-                    }),
-            )
+                    })
+            }))
             .maybe_requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
             .maybe_image_ref(image_ref)
@@ -3010,20 +3015,15 @@ fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
         ResourceConvoyPhase::Active => ConvoyPhase::Active,
         ResourceConvoyPhase::Interrupted => ConvoyPhase::Interrupted,
-        ResourceConvoyPhase::Anchored => ConvoyPhase::Anchored,
         ResourceConvoyPhase::Landing => ConvoyPhase::Landing,
+        ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
         ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
         ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
-        ResourceConvoyPhase::Cancelled => ConvoyPhase::Cancelled,
-        ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
     }
 }
 
 fn convoy_phase_is_terminal(phase: ResourceConvoyPhase) -> bool {
-    matches!(
-        phase,
-        ResourceConvoyPhase::Landed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Cancelled | ResourceConvoyPhase::Abandoned
-    )
+    matches!(phase, ResourceConvoyPhase::Landed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Abandoned)
 }
 
 fn convoy_is_initializing(status: Option<&ConvoyStatus>) -> bool {
@@ -6037,6 +6037,65 @@ mod tests {
         convoy.vessels.first().expect("vessel row").clone()
     }
 
+    // Environment loss is recoverable and blocked, never provisioning or failed.
+    // Both local and replicated vessel evidence must show the cause before the
+    // convoy's asynchronous work roll-up has caught up.
+    #[tokio::test]
+    async fn lost_vessel_readiness_is_recoverable_and_explains_the_cause() {
+        use flotilla_protocol::result_set::ReadinessState;
+        use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
+        for remote in [false, true] {
+            for phase in [ResourceWorkPhase::Running, ResourceWorkPhase::Interrupted] {
+                let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+                let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call();
+                let (events, _) = broadcast::channel(128);
+                let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
+                let provenance = if remote {
+                    let origin = flotilla_protocol::NodeId::new("remote-origin");
+                    aggregator.origin_hosts.insert(origin.clone(), HostName::new("kiwi"));
+                    ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() }
+                } else {
+                    ResourceProvenance::Local
+                };
+                let mut vessel = backend
+                    .using::<Vessel>("flotilla")
+                    .create(
+                        &InputMeta::builder().name("lost-vessel".into()).build(),
+                        &VesselSpec {
+                            convoy_ref: convoy.metadata.name.clone(),
+                            vessel_name: "implement".into(),
+                            placement_policy_ref: "local".into(),
+                            adopted_checkout_refs: Default::default(),
+                        },
+                    )
+                    .await
+                    .expect("vessel");
+                let reason = "lost, recoverable: container gone; rehydration is not available yet (#2872)";
+                vessel.status = Some(VesselStatus { phase: VesselPhase::Lost, message: Some(reason.into()), ..Default::default() });
+                apply_readiness_event(
+                    &mut aggregator.readiness_vessels,
+                    ReadWatchEvent::Added(ReadResourceObject { object: vessel, provenance }),
+                );
+                let status = convoy.status.as_ref().expect("status");
+                let definition = &status.workflow_snapshot.as_ref().expect("snapshot").vessels[0];
+                let reference =
+                    ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
+                let row = aggregator.summarize_vessel(
+                    &reference,
+                    definition,
+                    status.work.get("implement"),
+                    None,
+                    status.crew_work.get("implement"),
+                );
+                assert_eq!(row.readiness.state, ReadinessState::Blocked);
+                assert_eq!(row.readiness.blockers[0].phase, "Lost");
+                assert_eq!(row.readiness.blockers[0].reason, reason);
+                assert_eq!(row.surface_state, SurfaceState::NeedsYou);
+                assert_eq!(row.message.as_deref(), Some(reason));
+            }
+        }
+    }
+
     // #1961: live checkout evidence distinguishes waiting, blocked retries and
     // confirmed failure. Recovery and replayed updates must clear old reasons.
     #[hegel::test]
@@ -6134,7 +6193,7 @@ mod tests {
                     phase: match op {
                         2 => CheckoutPhase::Failed,
                         3 | 6 => CheckoutPhase::Ready,
-                        _ => CheckoutPhase::Preparing,
+                        _ => CheckoutPhase::Pending,
                     },
                     message: (op != 3).then(|| "Forgejo authentication refused".into()),
                     clone_retry: (op == 1 || op == 6).then(|| ControllerRetry {

@@ -997,11 +997,9 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
         (ConvoyPhase::Pending, true),
         (ConvoyPhase::Active, true),
         (ConvoyPhase::Interrupted, true),
-        (ConvoyPhase::Anchored, true),
         (ConvoyPhase::Landing, true),
         (ConvoyPhase::Landed, true),
         (ConvoyPhase::Failed, true),
-        (ConvoyPhase::Cancelled, true),
         (ConvoyPhase::Abandoned, false),
     ] {
         let authority_root = NodeId::new("convoy-authority");
@@ -1440,11 +1438,9 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
         ConvoyPhase::Pending,
         ConvoyPhase::Active,
         ConvoyPhase::Interrupted,
-        ConvoyPhase::Anchored,
         ConvoyPhase::Landing,
         ConvoyPhase::Landed,
         ConvoyPhase::Failed,
-        ConvoyPhase::Cancelled,
         ConvoyPhase::Abandoned,
     ];
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));

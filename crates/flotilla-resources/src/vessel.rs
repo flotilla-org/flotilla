@@ -29,8 +29,11 @@ pub enum VesselPhase {
     Pending,
     Provisioning,
     Ready,
+    // Retired unwritten TearingDown decodes as Interrupted, the nearest live
+    // recoverable state, not a semantic rename. ADR 0047: remove one roll after #2917.
+    #[serde(alias = "TearingDown")]
     Interrupted,
-    TearingDown,
+    Lost,
     Failed,
 }
 
@@ -127,7 +130,9 @@ pub enum VesselStatusPatch {
     StageLandingCredentials {
         credentials: BTreeMap<String, LandingCredentialScope>,
     },
-    MarkTearingDown,
+    MarkLost {
+        message: String,
+    },
     MarkFailed {
         message: String,
     },
@@ -188,8 +193,9 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             Self::StageLandingCredentials { credentials } => {
                 status.held_credentials.extend(credentials.clone());
             }
-            Self::MarkTearingDown => {
-                status.phase = VesselPhase::TearingDown;
+            Self::MarkLost { message } => {
+                status.phase = VesselPhase::Lost;
+                status.message = Some(message.clone());
             }
             Self::MarkFailed { message } => {
                 status.phase = VesselPhase::Failed;
@@ -197,4 +203,12 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             }
         }
     }
+}
+
+/// Per-vessel convoy resources (`Vessel`, `Presentation`) share the name
+/// shape `<convoy>-<vessel>`. Resource kinds have separate namespaces, so the
+/// shared shape causes no collision and keeps both resources discoverable
+/// together by name.
+pub fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
+    format!("{convoy_name}-{vessel}")
 }

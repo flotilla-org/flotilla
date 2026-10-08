@@ -980,7 +980,7 @@ fn crew_roles_remain_a_flat_fact() {
 
 #[test]
 fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
-    for phase in [ConvoyPhase::Active, ConvoyPhase::Landed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned, ConvoyPhase::Failed] {
+    for phase in [ConvoyPhase::Active, ConvoyPhase::Landed, ConvoyPhase::Abandoned, ConvoyPhase::Failed] {
         let reference = convoy_ref("dev", "governor-old");
         let convoy = ConvoyRow::builder()
             .resource(reference.clone())

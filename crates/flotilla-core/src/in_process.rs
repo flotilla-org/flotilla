@@ -1295,11 +1295,9 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
             Some(message) => format!("convoy {identity} failed while starting: {message}"),
             None => format!("convoy {identity} failed while starting"),
         }),
-        flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {identity} was cancelled while starting")),
         flotilla_resources::ConvoyPhase::Pending
         | flotilla_resources::ConvoyPhase::Active
         | flotilla_resources::ConvoyPhase::Interrupted
-        | flotilla_resources::ConvoyPhase::Anchored
         | flotilla_resources::ConvoyPhase::Landing
         | flotilla_resources::ConvoyPhase::Landed
         | flotilla_resources::ConvoyPhase::Abandoned => None,
@@ -5228,11 +5226,7 @@ impl InProcessDaemon {
                 let observed =
                     self.observed_resource_backend.using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
                 for checkout in durable.items.into_iter().map(|source| source.object).chain(observed.items) {
-                    if checkout
-                        .status
-                        .as_ref()
-                        .is_some_and(|status| matches!(status.phase, ResourceCheckoutPhase::Terminating | ResourceCheckoutPhase::Gone))
-                    {
+                    if checkout.status.as_ref().is_some_and(|status| matches!(status.phase, ResourceCheckoutPhase::Gone)) {
                         continue;
                     }
                     let reference = checkout.metadata.name;
@@ -5245,9 +5239,7 @@ impl InProcessDaemon {
                             |status| {
                                 match status.phase {
                                     ResourceCheckoutPhase::Pending => "pending",
-                                    ResourceCheckoutPhase::Preparing => "preparing",
                                     ResourceCheckoutPhase::Ready => "ready",
-                                    ResourceCheckoutPhase::Terminating => "terminating",
                                     ResourceCheckoutPhase::Failed => "failed",
                                     ResourceCheckoutPhase::Gone => "gone",
                                 }

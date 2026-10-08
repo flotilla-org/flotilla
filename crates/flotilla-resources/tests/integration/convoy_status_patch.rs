@@ -343,7 +343,7 @@ fn abandoned_status_is_immutable_against_stale_and_duplicate_patches() {
 
 #[test]
 fn terminal_convoy_outcomes_survive_stale_status_patches() {
-    for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned] {
+    for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned] {
         let settled = ConvoyStatus {
             phase,
             finished_at: Some(ts(50)),

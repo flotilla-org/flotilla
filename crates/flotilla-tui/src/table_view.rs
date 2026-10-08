@@ -1130,9 +1130,8 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
         ConvoyPhase::Active => CellTone::Plain,
         ConvoyPhase::Interrupted => CellTone::Warning,
         ConvoyPhase::Landed => CellTone::Success,
-        ConvoyPhase::Anchored | ConvoyPhase::Landing => CellTone::Plain,
+        ConvoyPhase::Landing => CellTone::Plain,
         ConvoyPhase::Failed => CellTone::Error,
-        ConvoyPhase::Cancelled => CellTone::Muted,
         ConvoyPhase::Abandoned => CellTone::Muted,
     };
     let label = match (row.phase, row.disposition.as_deref()) {

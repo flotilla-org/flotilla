@@ -395,7 +395,7 @@ where
                 other.metadata.name != obj.metadata.name
                     && other.metadata.deletion_timestamp.is_none()
                     && match other.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) {
-                        CheckoutPhase::Ready | CheckoutPhase::Preparing | CheckoutPhase::Terminating => true,
+                        CheckoutPhase::Ready => true,
                         // Pending siblings reserve in creation order; names break timestamp ties.
                         // A refused loser remains terminally Failed even if the winner later fails.
                         CheckoutPhase::Pending => {

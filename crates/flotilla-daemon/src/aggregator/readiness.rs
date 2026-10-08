@@ -34,13 +34,16 @@ impl Aggregator {
         work: Option<&WorkState>,
         crew: Option<&BTreeMap<String, CrewWorkState>>,
         host: &HostName,
-    ) -> Readiness {
+    ) -> (Readiness, Option<String>) {
         let phase = work.map(|work| work.phase).unwrap_or(ResourceWorkPhase::Pending);
         if phase.is_terminal() {
-            return Readiness {
-                state: if phase == ResourceWorkPhase::Failed { ReadinessState::Failed } else { ReadinessState::Ready },
-                blockers: Vec::new(),
-            };
+            return (
+                Readiness {
+                    state: if phase == ResourceWorkPhase::Failed { ReadinessState::Failed } else { ReadinessState::Ready },
+                    blockers: Vec::new(),
+                },
+                None,
+            );
         }
         let mut result = Readiness {
             state: if matches!(phase, ResourceWorkPhase::Running | ResourceWorkPhase::Stalled) {
@@ -62,7 +65,11 @@ impl Aggregator {
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
-                result.state = if vessel_phase == VesselPhase::Failed { ReadinessState::Failed } else { ReadinessState::Provisioning };
+                result.state = match vessel_phase {
+                    VesselPhase::Failed => ReadinessState::Failed,
+                    VesselPhase::Lost => ReadinessState::Blocked,
+                    _ => ReadinessState::Provisioning,
+                };
                 result.blockers.push(ReadinessBlocker {
                     resource: ResourceRef::new(
                         api_version(Vessel::API_PATHS),
@@ -72,8 +79,22 @@ impl Aggregator {
                     )
                     .on_host(host.clone()),
                     phase: format!("{vessel_phase:?}"),
-                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| "vessel is not ready".into()),
+                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| {
+                        if vessel_phase == VesselPhase::Lost {
+                            // TODO(#2872): remove unavailable-rehydration guidance when recovery ships.
+                            "lost, recoverable; rehydration is not available yet (#2872)".into()
+                        } else {
+                            "vessel is not ready".into()
+                        }
+                    }),
                 });
+            }
+            // Lost backing is frozen. Missing child evidence cannot turn it
+            // back into provisioning or replace the recovery explanation.
+            if vessel_phase == VesselPhase::Lost {
+                // This same Lost phase always pushed a blocker above, before any child traversal.
+                let loss_reason = result.blockers.last().expect("lost vessel blocker").reason.clone();
+                return (result, Some(loss_reason));
             }
             let mut checkout_refs =
                 status.map(|status| status.checkout_refs.values().cloned().collect::<BTreeSet<_>>()).unwrap_or_default();
@@ -186,7 +207,7 @@ impl Aggregator {
                 }),
             });
         }
-        result
+        (result, None)
     }
 }
 

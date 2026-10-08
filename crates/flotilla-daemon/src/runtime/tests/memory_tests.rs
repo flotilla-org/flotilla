@@ -77,6 +77,13 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
                         .build()],
                 }),
                 work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "shell".into(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                )]),
                 ..Default::default()
             },
         )
@@ -179,7 +186,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let environments = backend.using::<Environment>(NAMESPACE);
     let environment = environments.get(env_id.as_str()).await.expect("environment");
     let status = environment.status.expect("status");
-    assert_eq!(status.phase, EnvironmentPhase::Failed);
+    assert_eq!(status.phase, EnvironmentPhase::Lost);
     let message = status.message.expect("failure message");
     assert!(message.contains("host oomd") && message.contains("exit code 137") && message.contains("/hulls/work/flotilla"), "{message}");
     let observation = status.runtime_observation.expect("persisted evidence");
@@ -192,14 +199,26 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     );
     let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let vessel = vessels.get("memory-incident-work").await.expect("vessel");
+    // A restart can encounter an already-interrupted vessel whose backing
+    // loss was persisted separately. Reconstruct its stored status before
+    // preparing with the new reconciler; loss must still propagate.
+    let mut vessel_status = vessel.status.expect("status");
+    vessel_status.phase = flotilla_resources::VesselPhase::Interrupted;
+    let vessel_status: VesselStatus =
+        serde_json::from_value(serde_json::to_value(vessel_status).expect("persist vessel")).expect("restart decode");
+    let vessel = vessels.update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &vessel_status).await.expect("restart");
     let prepared = vessel_reconciler.prepare(&vessel).await.expect("prepare vessel");
     let outcome = vessel_reconciler.reconcile(&vessel, &prepared, chrono::Utc::now());
-    flotilla_resources::apply_status_patch(&vessels, &vessel.metadata.name, &outcome.patch.expect("fail vessel"))
+    flotilla_resources::apply_status_patch(&vessels, &vessel.metadata.name, &outcome.patch.expect("mark vessel lost"))
         .await
-        .expect("persist vessel failure");
-    let failed = vessels.get(&vessel.metadata.name).await.expect("vessel").status.expect("status");
-    assert_eq!(failed.phase, flotilla_resources::VesselPhase::Failed);
-    assert_eq!(failed.message.as_deref(), Some(message.as_str()));
+        .expect("persist vessel loss");
+    let lost_status = vessels.get(&vessel.metadata.name).await.expect("vessel").status.expect("status");
+    assert_eq!(lost_status.phase, flotilla_resources::VesselPhase::Lost);
+    assert_eq!(lost_status.message.as_deref(), Some(message.as_str()));
+    let lost = vessels.get(&vessel.metadata.name).await.expect("lost vessel");
+    let prepared = vessel_reconciler.prepare(&lost).await.expect("lost vessel prepare");
+    let frozen = vessel_reconciler.reconcile(&lost, &prepared, chrono::Utc::now());
+    assert!(frozen.patch.is_none() && frozen.actuations.is_empty(), "lost backing must not reprovision");
     let convoys = backend.using::<Convoy>(NAMESPACE);
     let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
     let convoy = convoys.get("memory-incident").await.expect("convoy");
@@ -213,19 +232,21 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
             ["work"],
         observation
     );
-    // The following reconciliations roll the recorded vessel failure into the
-    // convoy message; the diagnostic copy must not swallow phase progression.
+    // Following reconciliations interrupt work and crew; copying diagnostic
+    // evidence must not swallow the recoverable phase transition.
     for _ in 0..2 {
         let convoy = convoys.get("memory-incident").await.expect("convoy");
         let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
         let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-        flotilla_resources::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("roll up failure"))
+        flotilla_resources::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("roll up loss"))
             .await
-            .expect("persist convoy failure");
+            .expect("persist convoy interruption");
     }
-    let failed = convoys.get("memory-incident").await.expect("convoy").status.expect("status");
-    assert_eq!(failed.phase, ConvoyPhase::Failed);
-    assert_eq!(failed.message.as_deref(), Some(message.as_str()));
+    let interrupted = convoys.get("memory-incident").await.expect("convoy").status.expect("status");
+    assert_eq!(interrupted.phase, ConvoyPhase::Interrupted);
+    assert_eq!(interrupted.work["work"].message.as_deref(), Some(message.as_str()));
+    assert_eq!(interrupted.crew_work["work"]["shell"].phase, flotilla_resources::CrewWorkPhase::Interrupted);
+    assert!(interrupted.crew_work["work"]["shell"].message.as_ref().expect("loss reason").contains("lost, recoverable"));
     environments.delete(env_id.as_str()).await.expect("remove backing resource");
     let result = daemon
         .execute_query(
@@ -243,7 +264,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     assert!(checkouts.get("recoverable-work").await.is_ok(), "failure must retain work");
 }
 
-// Terminal liveness must still fail backing when richer inspection is unavailable;
+// Terminal liveness must still mark backing lost when richer inspection is unavailable;
 // running backing remains Ready for retry. The runner is the subprocess boundary.
 #[tokio::test]
 async fn observation_error_preserves_terminal_liveness_and_retries_running_backing() {
@@ -280,8 +301,8 @@ async fn observation_error_preserves_terminal_liveness_and_retries_running_backi
             .status
             .expect("status");
         if terminal {
-            result.expect("terminal backing must fail even without inspect");
-            assert_eq!(status.phase, EnvironmentPhase::Failed);
+            result.expect("terminal backing is lost even without inspect");
+            assert_eq!(status.phase, EnvironmentPhase::Lost);
             assert!(status.message.expect("message").contains("Stopped"));
         } else {
             assert!(result.expect_err("running inspection failure retries").contains("will retry"));

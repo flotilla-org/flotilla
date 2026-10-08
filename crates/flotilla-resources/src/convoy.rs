@@ -1312,17 +1312,19 @@ pub enum ConvoyPhase {
     Pending,
     Active,
     Interrupted,
-    Anchored,
+    // ADR 0047: remove Anchored alias one fleet roll after #2917.
+    #[serde(alias = "Anchored")]
     Landing,
     Landed,
     Failed,
-    Cancelled,
+    // ADR 0047: remove Cancelled alias one fleet roll after #2917.
+    #[serde(alias = "Cancelled")]
     Abandoned,
 }
 
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Landed | Self::Failed | Self::Cancelled | Self::Abandoned)
+        matches!(self, Self::Landed | Self::Failed | Self::Abandoned)
     }
 }
 
@@ -2009,10 +2011,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 if let Some(crew) = status.crew_work.get_mut(work) {
                     for (role, state) in crew.iter_mut().filter(|(role, state)| {
-                        roles.contains(*role) && matches!(state.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted)
+                        roles.contains(*role)
+                            && matches!(state.phase, CrewWorkPhase::Working | CrewWorkPhase::Interrupted | CrewWorkPhase::Stalled)
                     }) {
                         state.phase = CrewWorkPhase::Interrupted;
-                        state.message = Some(format!("crew session for `{role}` was interrupted"));
+                        state.message = Some(format!("crew session for `{role}` was interrupted: {message}"));
                         state.finished_at = None;
                     }
                 }
@@ -2714,7 +2717,7 @@ mod subject_tests {
         }
         // Terminal convoys must not retain queued-turn NeedsYou attention. Clearing
         // the advisory must still preserve unrelated attention, for every terminal phase.
-        for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned] {
+        for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned] {
             let mut terminal = status.clone();
             terminal.phase = phase;
             terminal.turn_deliveries.get_mut("first").unwrap().episodes[0].outcome = TurnDeliveryOutcome::Queued {

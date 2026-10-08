@@ -892,17 +892,15 @@ pub enum ConvoyPhase {
     Pending,
     Active,
     Interrupted,
-    Anchored,
     Landing,
     Landed,
     Failed,
-    Cancelled,
     Abandoned,
 }
 
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Landed | Self::Failed | Self::Cancelled | Self::Abandoned)
+        matches!(self, Self::Landed | Self::Failed | Self::Abandoned)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -910,11 +908,9 @@ impl ConvoyPhase {
             Self::Pending => "pending",
             Self::Active => "active",
             Self::Interrupted => "interrupted",
-            Self::Anchored => "anchored",
             Self::Landing => "landing",
             Self::Landed => "landed",
             Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
             Self::Abandoned => "abandoned",
         }
     }

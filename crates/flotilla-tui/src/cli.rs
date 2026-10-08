@@ -808,7 +808,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
 fn format_crew_list_human(response: &CrewListResponse) -> String {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Role", "Kind", "State", "Attention", "Adapter", "Model", "Stance"]);
+    table.set_header(vec!["Role", "Kind", "State", "Attention", "Adapter", "Model", "Stance", "Reason"]);
     for member in &response.members {
         table.add_row(vec![
             Cell::new(&member.role),
@@ -818,6 +818,7 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
             Cell::new(member.adapter.as_deref().unwrap_or("-")),
             Cell::new(member.model.as_deref().unwrap_or("-")),
             Cell::new(member.stance.as_deref().unwrap_or("-")),
+            Cell::new(member.reason.as_deref().unwrap_or("-")),
         ]);
     }
     let mut inbox = String::new();

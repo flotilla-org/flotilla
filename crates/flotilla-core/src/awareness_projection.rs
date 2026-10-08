@@ -380,9 +380,9 @@ fn convoy_state(phase: ConvoyPhase, initializing: bool) -> AwarenessState {
         ConvoyPhase::Active => AwarenessState::Active,
         ConvoyPhase::Interrupted => AwarenessState::Waiting,
         ConvoyPhase::Landed => AwarenessState::Done,
-        ConvoyPhase::Anchored | ConvoyPhase::Landing => AwarenessState::Active,
+        ConvoyPhase::Landing => AwarenessState::Active,
         ConvoyPhase::Failed => AwarenessState::Failed,
-        ConvoyPhase::Cancelled | ConvoyPhase::Abandoned => AwarenessState::Cancelled,
+        ConvoyPhase::Abandoned => AwarenessState::Cancelled,
     }
 }
 
@@ -444,7 +444,7 @@ fn entry_rank(entry: &AwarenessEntry) -> (bool, std::cmp::Reverse<u8>, u8) {
 fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
     match entry.phase {
         Some(AwarenessPhase::Convoy(phase)) => {
-            matches!(phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
+            matches!(phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Abandoned)
         }
         Some(AwarenessPhase::Work(phase)) => {
             matches!(phase, WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned)

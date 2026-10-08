@@ -809,3 +809,24 @@ fn fleet_root_is_visible_in_project_and_fleet_lists() {
     assert!(output.lines().any(|line| line.contains("flotilla/project-map") && line.contains("fleet")), "{output}");
     assert!(output.lines().any(|line| line.contains("flotilla/product") && line.contains("project-map")), "{output}");
 }
+
+// Lost backing is shown as recoverable, with its cause in human and JSON output.
+#[test]
+fn crew_list_explains_recoverable_environment_loss() {
+    let response = flotilla_protocol::CrewListResponse::builder()
+        .convoy("work".into())
+        .vessel("work".into())
+        .vessel_ref("work-work".into())
+        .members(vec![flotilla_protocol::CrewListMember::builder()
+            .role("coder".into())
+            .kind("agent".into())
+            .state("lost".into())
+            .reason("lost, recoverable: host reboot".into())
+            .build()])
+        .build();
+    let human = super::format_crew_list_human(&response);
+    assert!(human.contains("lost, recoverable") && human.contains("host reboot"));
+    let json = serde_json::to_value(response).expect("JSON");
+    assert_eq!(json["members"][0]["state"], "lost");
+    assert_eq!(json["members"][0]["reason"], "lost, recoverable: host reboot");
+}
