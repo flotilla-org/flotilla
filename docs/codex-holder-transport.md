@@ -46,7 +46,8 @@ private homes use a two-second graceful shutdown period; existing saved
 settings are preserved. First installation uses bootstrap under a private installation lock; later
 crews use idempotent daemon start. Bootstrap itself restarts a running daemon
 and must not run for every crew. A complete installed Codex CLI package and
-Linux flock are required. The daemon
+Linux flock and GNU ln are required; non-following `ln -sT` prevents a
+concurrent seeder from following a newly published directory symlink. The daemon
 starts without crew identity variables; each thread receives its own
 `FLOTILLA_CREW_ID`, `FLOTILLA_CREW_ROLE`, and `FLOTILLA_TERMINAL_SESSION` through
 `shell_environment_policy.set`. Existing configured shell variables and

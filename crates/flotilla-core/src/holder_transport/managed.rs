@@ -168,6 +168,15 @@ fn home(environment: &TerminalEnvVars, vessel: &str) -> Result<(PathBuf, PathBuf
         source.parent().filter(|parent| parent.file_name().is_some_and(|name| name == "crews")).and_then(Path::parent).unwrap_or(&source);
     Ok((base.join("flotilla-vessels").join(vessel), source))
 }
+fn link_if_absent(from: &Path, to: &Path, directory_source: bool) -> String {
+    // Native Codex launch is Linux-only. GNU -T is intentional: a concurrent
+    // seeder can publish a directory symlink after the absence check, and plain
+    // ln -s would follow it and create a link inside the source directory.
+    let source_test = if directory_source { "-d" } else { "-e" };
+    let from = shell_quote(&from.to_string_lossy());
+    let to = shell_quote(&to.to_string_lossy());
+    format!("if [ {source_test} {from} ] && [ ! -e {to} ]; then ln -sT {from} {to} 2>/dev/null || test -L {to}; fi\n")
+}
 async fn lifecycle(
     runner: &dyn CommandRunner,
     binary: &str,
@@ -221,36 +230,21 @@ async fn lifecycle(
         for (name, from) in
             [("material-home", base.to_path_buf()), ("plugins", base.join("plugins")), ("AGENTS.md", base.join("AGENTS.md"))]
         {
-            let to = home.join(name);
-            script.push_str(&format!(
-                "if [ -e {} ] && [ ! -e {} ]; then ln -sT {} {} 2>/dev/null || test -L {}; fi\n",
-                shell_quote(&from.to_string_lossy()),
-                shell_quote(&to.to_string_lossy()),
-                shell_quote(&from.to_string_lossy()),
-                shell_quote(&to.to_string_lossy()),
-                shell_quote(&to.to_string_lossy())
-            ));
+            script.push_str(&link_if_absent(&from, &home.join(name), false));
         }
         let skills = if seed.parent().and_then(Path::file_name).is_some_and(|name| name == "crews") {
             base.join("crews")
         } else {
             seed.join("skills")
         };
-        let to = home.join("skills");
-        script.push_str(&format!(
-            "if [ -d {} ] && [ ! -e {} ]; then ln -sT {} {} 2>/dev/null || test -L {}; fi\n",
-            shell_quote(&skills.to_string_lossy()),
-            shell_quote(&to.to_string_lossy()),
-            shell_quote(&skills.to_string_lossy()),
-            shell_quote(&to.to_string_lossy()),
-            shell_quote(&to.to_string_lossy())
-        ));
-        let settings = home.join("app-server-daemon/settings.json");
+        script.push_str(&link_if_absent(&skills, &home.join("skills"), true));
+        let settings_dir = home.join("app-server-daemon");
+        let settings = settings_dir.join("settings.json");
         script.push_str(&format!(
             "mkdir -p {}\nif [ ! -e {} ]; then settings_tmp=$(mktemp {})\nprintf '%s' {} > \"$settings_tmp\"\nln \"$settings_tmp\" {} 2>/dev/null || test -f {}\nrm -f \"$settings_tmp\"\nfi\n",
-            shell_quote(&settings.parent().expect("settings parent").to_string_lossy()),
+            shell_quote(&settings_dir.to_string_lossy()),
             shell_quote(&settings.to_string_lossy()),
-            shell_quote(&settings.parent().expect("settings parent").join("settings.XXXXXX").to_string_lossy()),
+            shell_quote(&settings_dir.join("settings.XXXXXX").to_string_lossy()),
             shell_quote(r#"{"updater":{"autoUpdateEnabled":false},"shutdownGraceSeconds":2}"#),
             shell_quote(&settings.to_string_lossy()),
             shell_quote(&settings.to_string_lossy())
