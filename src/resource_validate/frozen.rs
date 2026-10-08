@@ -140,6 +140,7 @@ pub(super) struct Report {
     grants: CategoryCount,
     pub failures: Vec<String>,
     pub waivers: Vec<String>,
+    validated_elsewhere: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -350,6 +351,22 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                     waiver,
                 );
             }
+            // Environment records are host-local. A present Environment remains
+            // subject to every existing check, even if a stale placement disagrees.
+            let environment_is_local = status.environment_ref.as_ref().is_some_and(|reference| {
+                inventory
+                    .iter()
+                    .any(|document| document["kind"] == "Environment" && namespace(document) == ns && name(document) == reference)
+            });
+            if !environment_is_local {
+                if let Some(host) = remote_placement_host(inventory, &convoy, &vessel) {
+                    report.validated_elsewhere.push(format!(
+                        "Convoy/{identity} images Vessel/{ns}/{}: validated on the host that holds it ({host})",
+                        vessel.metadata.name
+                    ));
+                    continue;
+                }
+            }
             if let Some(environment_ref) = &status.environment_ref {
                 let environment = inventory
                     .iter()
@@ -429,6 +446,35 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
         }
     }
     Ok(report)
+}
+
+// Placement, not the Vessel's authoring root, identifies the execution host:
+// an admitting daemon may author an intent projected into a remote actuator.
+// flotilla-resources' registry::read_object_value owns the merged read-view
+// invariant: it strips authored origin annotations and supplies replica provenance
+// itself (the key is defined by replica::ORIGIN_ROOT_ANNOTATION in that crate).
+// Missing evidence never turns a refusal into a skip.
+fn remote_placement_host(inventory: &[Value], convoy: &ResourceObject<Convoy>, vessel: &ResourceObject<Vessel>) -> Option<String> {
+    let host = vessel
+        .status
+        .as_ref()
+        .and_then(|status| status.placement_decision.as_ref())
+        .map(|decision| decision.target_host.reference.clone())
+        .or_else(|| {
+            flotilla_resources::vessel_placement_pin(convoy, &vessel.spec.vessel_name).map(|pin| pin.decision.target_host.reference)
+        })
+        .or_else(|| {
+            convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.placement_decision.as_ref())
+                .map(|decision| decision.target_host.reference.clone())
+        })?;
+    inventory
+        .iter()
+        .find(|document| document["kind"] == "Host" && namespace(document) == convoy.metadata.namespace && name(document) == host.as_str())
+        .filter(|document| document["metadata"]["annotations"]["flotilla.work/origin-root"].as_str().is_some_and(|root| !root.is_empty()))
+        .map(|_| host.to_string())
 }
 
 async fn check_identity(probes: &impl Probes, local: &str, registry: Option<&str>) -> Result<(), String> {
@@ -732,6 +778,189 @@ mod tests {
         let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert_eq!(report.images.unsatisfied, 1);
         assert!(report.failures.iter().any(|failure| failure.contains("composition") && failure.contains("missing")));
+    }
+
+    async fn placed_image_inventory() -> (ResourceBackend, Vec<Value>) {
+        use flotilla_resources::{Host, HostSpec, VesselSpec, VesselStatus};
+        let (backend, mut inventory) = frozen_store().await;
+        let host = backend
+            .clone()
+            .using::<Host>("fleet")
+            .create(&InputMeta::builder().name("host-b".into()).build(), &HostSpec::default())
+            .await
+            .expect("host B");
+        inventory.push(serde_json::to_value(host.to_k8s_object()).expect("host document"));
+        let vessels = backend.clone().using::<Vessel>("fleet");
+        let vessel = vessels
+            .create(
+                &InputMeta::builder().name("vessel".into()).build(),
+                &VesselSpec {
+                    convoy_ref: "governor".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "contained".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+        let decision = serde_json::from_value(serde_json::json!({
+            "policy_name":"contained", "target_host":{"ref":"host-b","display_name":"B"}
+        }))
+        .expect("placement");
+        let vessel = vessels
+            .update_status(
+                "vessel",
+                &vessel.metadata.resource_version,
+                &VesselStatus {
+                    placement_decision: Some(decision),
+                    environment_ref: Some("environment".into()),
+                    ..VesselStatus::default()
+                },
+            )
+            .await
+            .expect("placed vessel");
+        inventory.push(serde_json::to_value(vessel.to_k8s_object()).expect("vessel document"));
+        (backend, inventory)
+    }
+
+    // #2933: a merged convoy placed on B passes on A without B's Environment;
+    // B still checks its image and refuses a genuinely missing local Environment.
+    #[tokio::test]
+    async fn frozen_images_follow_placement_across_two_host_inventories() {
+        use flotilla_protocol::NodeId;
+        use flotilla_resources::{list_resource_kind_including_replicas, DockerEnvironmentSpec, EnvironmentSpec, Host};
+        let (backend, mut inventory) = placed_image_inventory().await;
+        let supply = Supply { revision: "1".repeat(40), image_available: true };
+        let replica_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let origin = NodeId::new("root-b");
+        replica_backend
+            .replica_writer::<Convoy>(origin.clone(), "fleet")
+            .replace(&backend.using::<Convoy>("fleet").list().await.expect("convoys"), chrono::Utc::now())
+            .await
+            .expect("replicate convoy to A");
+        replica_backend
+            .replica_writer::<Host>(origin.clone(), "fleet")
+            .replace(&backend.using::<Host>("fleet").list().await.expect("hosts"), chrono::Utc::now())
+            .await
+            .expect("replicate host to A");
+        replica_backend
+            .replica_writer::<Vessel>(origin, "fleet")
+            .replace(&backend.using::<Vessel>("fleet").list().await.expect("vessels"), chrono::Utc::now())
+            .await
+            .expect("replicate vessel to A");
+        let mut host_a = Vec::new();
+        for kind in ["convoys", "hosts", "vessels"] {
+            let merged = list_resource_kind_including_replicas(&replica_backend, "fleet", kind).await.expect("merged inventory");
+            host_a.extend(merged.value["items"].as_array().expect("items").iter().cloned());
+        }
+        let report = check(&host_a, &BTreeSet::new(), &supply).await.expect("A checks merged inventory");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.images.checked, 0);
+        assert_eq!(report.validated_elsewhere.len(), 1);
+        assert!(report.validated_elsewhere[0].contains("validated on the host that holds it (host-b)"));
+        // Delegated references must be visible in the CLI's JSON report.
+        let json_report = serde_json::to_value(&report).expect("serialized report");
+        assert_eq!(json_report["validated_elsewhere"][0], report.validated_elsewhere[0]);
+        assert_eq!(report.skills.checked, 1);
+        assert_eq!(report.workflow.checked, 1);
+        // Portable references still use candidate supply and merged definitions.
+        let mut invalid_portable = host_a.clone();
+        invalid_portable[0]["status"]["workflow_snapshot"]["vessels"][0]["credential_refs"] = serde_json::json!(["missing"]);
+        let report = check(
+            &invalid_portable,
+            &BTreeSet::from([("fleet".into(), "single-agent".into())]),
+            &Supply { revision: "2".repeat(40), image_available: false },
+        )
+        .await
+        .expect("portable checks on A");
+        assert_eq!(report.images.unsatisfied, 0);
+        assert_eq!(report.skills.unsatisfied, 1);
+        assert_eq!(report.workflow.unsatisfied, 1);
+        assert_eq!(report.grants.unsatisfied, 1);
+        let report = check(&inventory, &BTreeSet::new(), &supply).await.expect("B checks missing Environment");
+        assert_eq!(report.images.unsatisfied, 1);
+        assert!(report.failures[0].contains("frozen Environment"));
+        let environment = backend
+            .using::<Environment>("fleet")
+            .create(
+                &InputMeta::builder().name("environment".into()).build(),
+                &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(
+                        serde_json::from_value::<DockerEnvironmentSpec>(serde_json::json!({"host_ref":"host-b", "image":"frozen-tag"}))
+                            .expect("docker"),
+                    ),
+                },
+            )
+            .await
+            .expect("environment");
+        inventory.push(serde_json::to_value(environment.to_k8s_object()).expect("environment document"));
+        let report = check(&inventory, &BTreeSet::new(), &supply).await.expect("B checks image");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.images.checked, 1);
+        // A locally inventoried Environment is checked even with a stale remote pin.
+        host_a.push(inventory.last().expect("environment document").clone());
+        let report = check(&host_a, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: false })
+            .await
+            .expect("present local Environment");
+        assert_eq!(report.images.unsatisfied, 1);
+        assert!(report.validated_elsewhere.is_empty());
+        let report =
+            check(&inventory, &BTreeSet::new(), &Supply { image_available: false, ..supply }).await.expect("B refuses unavailable image");
+        assert_eq!(report.images.unsatisfied, 1);
+    }
+
+    // Placement/provenance property: only a known remote placement defers
+    // host-local images; local and unknown ownership still refuse missing state.
+    // Generators cover all three placement sources plus no pin, local/replica/
+    // absent Host records, namespace mismatch, retained images, and waivers.
+    #[hegel::test]
+    fn image_scope_requires_positive_remote_placement(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let pin_source = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let host_source = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let other_namespace = tc.draw(gs::booleans());
+        let retained = tc.draw(gs::booleans());
+        let waiver = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let (_, mut inventory) = placed_image_inventory().await;
+            let decision = inventory[2]["status"]["placement_decision"].take();
+            match pin_source {
+                0 => inventory[2]["status"]["placement_decision"] = decision,
+                1 => {
+                    inventory[0]["metadata"]["annotations"][flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION] =
+                        serde_json::json!(serde_json::json!({"work":{"policy_ref":"contained", "decision":decision}}).to_string())
+                }
+                2 => inventory[0]["status"]["placement_decision"] = decision,
+                _ => {}
+            }
+            if host_source == 1 {
+                inventory[1]["metadata"]["annotations"]["flotilla.work/origin-root"] = serde_json::json!("root-b");
+            } else if host_source == 2 {
+                inventory[1]["metadata"]["name"] = serde_json::json!("unrelated-host");
+            }
+            if other_namespace {
+                inventory[1]["metadata"]["namespace"] = serde_json::json!("other");
+            }
+            if retained {
+                inventory[2]["status"]["environment_ref"] = Value::Null;
+                inventory[2]["status"]["local_image_id"] = serde_json::json!("frozen-id");
+            }
+            if waiver {
+                inventory[0]["metadata"]["annotations"][READMISSION_ANNOTATION] = serde_json::json!("re-admit");
+            }
+            let report =
+                check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: false }).await.expect("check");
+            let remote = pin_source < 3 && host_source == 1 && !other_namespace;
+            assert_eq!(report.validated_elsewhere.len(), usize::from(remote));
+            assert_eq!(report.images.checked, usize::from(!remote));
+            assert_eq!(report.images.unsatisfied, usize::from(!remote));
+            assert_eq!(report.images.waived, usize::from(!remote && waiver));
+            assert_eq!(report.failures.len(), usize::from(!remote && !waiver));
+            assert_eq!(report.skills.checked, 1);
+            assert_eq!(report.workflow.checked, 1);
+        });
     }
 
     // The process-boundary stand-in accepts only Docker's exact manifest

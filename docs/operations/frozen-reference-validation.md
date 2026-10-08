@@ -13,6 +13,17 @@ builtin references; images count frozen compositions, build references and place
 identities; grants count frozen vessel and retained landing credential references. Empty stores pass.
 Terminal convoys are excluded. Inventory/decoding failures always refuse.
 
+Placed vessel images are checked on the daemon that owns their placement Host.
+The frozen vessel decision (then the per-vessel convoy pin, then the convoy
+placement decision) identifies that Host; store-authored Host replica provenance
+identifies a remote owner. A remote vessel without a local Environment is
+reported in `validated_elsewhere` as `validated on the host that holds it`.
+This is a delegation to that host's pre-roll gate, not evidence that its gate
+has already passed. A present local Environment keeps all existing checks;
+missing placement or Host evidence never excuses a missing Environment.
+Skills, workflows, frozen layer definitions and grants still use candidate supply
+or merged replicated definitions and are checked on every host.
+
 Skills use provisioning's source/repository/path authorization and Git staging
 implementation, fetching the exact frozen SHA and verifying selected SKILL.md
 files. The candidate supply can pin a newer SHA: this does not substitute for a
