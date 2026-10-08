@@ -1,3 +1,4 @@
+use crate::holder_transport::managed;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -581,20 +582,67 @@ pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
     }
 }
 
-/// First-party app-server launch data from the adapter's existing grant policy.
-#[derive(Debug, Clone, bon::Builder)]
-pub struct AppServerLaunch {
-    pub binary: String,
-    pub prompt: String,
-    pub approval_policy: Option<String>,
-    pub sandbox: Option<String>,
+/// Identity belongs to the crew thread, while service lifetime belongs to its vessel.
+#[derive(Debug, Clone)]
+pub struct CrewIdentity {
+    pub crew: String,
+    pub role: String,
+    pub terminal: String,
+    pub vessel: String,
+}
+impl CrewIdentity {
+    pub fn environment(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            ("FLOTILLA_CREW_ID".into(), self.crew.clone()),
+            ("FLOTILLA_CREW_ROLE".into(), self.role.clone()),
+            ("FLOTILLA_TERMINAL_SESSION".into(), self.terminal.clone()),
+        ])
+    }
+}
+#[async_trait]
+pub trait AgentSession: flotilla_resources::MessageTransport {
+    fn available(&self) -> bool;
+    fn events(&self) -> Vec<crate::holder_transport::HolderEvent> {
+        Vec::new()
+    }
+    async fn attention(&self) -> Result<flotilla_resources::TerminalAttentionState, String>;
+    async fn stop(&self, retiring_vessel: bool) -> Result<(), String>;
+}
+pub struct AgentSessionLaunch {
+    pub attach_command: String,
+    pub binding: flotilla_resources::HolderTransport,
+    pub session: Arc<dyn AgentSession>,
 }
 
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    fn app_server_launch(&self, _request: &AgentLaunchRequest) -> Option<AppServerLaunch> {
-        None
+    fn has_native_input(&self) -> bool {
+        false
+    }
+    fn supports_native_steering(&self) -> bool {
+        false
+    }
+    async fn start_session(
+        &self,
+        _cwd: &ExecutionEnvironmentPath,
+        _request: &AgentLaunchRequest,
+        _environment: &TerminalEnvVars,
+        _identity: &CrewIdentity,
+    ) -> Result<Option<AgentSessionLaunch>, String> {
+        Ok(None)
+    }
+    async fn connect_session(
+        &self,
+        _binding: &flotilla_resources::HolderTransport,
+        _identity: &CrewIdentity,
+        _grants: Option<&BTreeSet<flotilla_resources::FulfilmentGrant>>,
+    ) -> Result<Arc<dyn AgentSession>, String> {
+        Err("agent has no native input transport".into())
+    }
+    /// Retire harness services without starting or reconnecting a crew thread.
+    async fn stop_vessel(&self, _binding: &flotilla_resources::HolderTransport) -> Result<(), String> {
+        Ok(())
     }
     /// Return a fatal launch diagnostic; ambiguous exits remain resumable.
     fn classify_exit_failure(&self, _exit_code: i32, _screen: &str) -> Option<String> {
@@ -760,19 +808,42 @@ impl CliAgentAdapter {
 
 #[async_trait]
 impl AgentAdapter for CliAgentAdapter {
-    fn app_server_launch(&self, request: &AgentLaunchRequest) -> Option<AppServerLaunch> {
-        if !cfg!(target_os = "linux") || !matches!(self.flavor, AdapterFlavor::Codex { .. }) {
-            return None;
+    fn has_native_input(&self) -> bool {
+        cfg!(target_os = "linux") && matches!(self.flavor, AdapterFlavor::Codex { .. })
+    }
+    fn supports_native_steering(&self) -> bool {
+        self.has_native_input()
+    }
+    async fn start_session(
+        &self,
+        cwd: &ExecutionEnvironmentPath,
+        request: &AgentLaunchRequest,
+        environment: &TerminalEnvVars,
+        identity: &CrewIdentity,
+    ) -> Result<Option<AgentSessionLaunch>, String> {
+        if !self.has_native_input() {
+            return Ok(None);
         }
         let unattended = !self.flavor.autonomy_args(request.fulfilment_grants.as_ref()).is_empty();
-        Some(
-            AppServerLaunch::builder()
-                .binary(self.binary.clone())
-                .prompt(self.deliver_brief(&request.brief))
-                .maybe_approval_policy(unattended.then(|| "never".into()))
-                .maybe_sandbox(unattended.then(|| "danger-full-access".into()))
-                .build(),
-        )
+        managed::start(&self.binary, Arc::clone(&self.runner), cwd, request, environment, identity, unattended).await.map(Some)
+    }
+    async fn connect_session(
+        &self,
+        binding: &flotilla_resources::HolderTransport,
+        identity: &CrewIdentity,
+        grants: Option<&BTreeSet<flotilla_resources::FulfilmentGrant>>,
+    ) -> Result<Arc<dyn AgentSession>, String> {
+        if !self.has_native_input() {
+            return Err("agent has no native input transport".into());
+        }
+        let unattended = !self.flavor.autonomy_args(grants).is_empty();
+        managed::connect(&self.binary, Arc::clone(&self.runner), binding, identity, unattended).await
+    }
+    async fn stop_vessel(&self, binding: &flotilla_resources::HolderTransport) -> Result<(), String> {
+        if self.has_native_input() {
+            managed::stop_vessel(&self.binary, &*self.runner, binding).await?;
+        }
+        Ok(())
     }
     fn id(&self) -> &'static str {
         self.flavor.id()
@@ -1255,6 +1326,7 @@ mod tests {
             CrewBriefTemplateOverride, CrewBriefTemplateResolver, CLAUDE_MANAGED_SETTINGS_PATH,
         },
         crew_capabilities::CAPABILITIES_HEADING,
+        holder_transport::managed,
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{factories::git::GitVcsFactory, EnvironmentAssertion, EnvironmentBag, Factory},
@@ -2047,13 +2119,13 @@ mod tests {
         let codex = registry.get("codex").expect("adapter");
         let plan = codex.launch(&request).expect("embedded launch");
         if cfg!(target_os = "linux") {
-            let native = codex.app_server_launch(&request).expect("native launch");
             let unattended = plan.command.contains("--dangerously-bypass-approvals-and-sandbox");
-            assert_eq!(native.approval_policy.as_deref(), unattended.then_some("never"));
-            assert_eq!(native.sandbox.as_deref(), unattended.then_some("danger-full-access"));
-            assert_eq!(native.prompt, codex.deliver_brief(&request.brief));
+            let (approval, sandbox) = managed::policy(unattended);
+            assert_eq!(approval.as_deref(), unattended.then_some("never"));
+            assert_eq!(sandbox.as_deref(), unattended.then_some("danger-full-access"));
+            assert!(codex.has_native_input());
         } else {
-            assert!(codex.app_server_launch(&request).is_none());
+            assert!(!codex.has_native_input());
         }
     }
 

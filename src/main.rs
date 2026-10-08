@@ -93,19 +93,6 @@ fn binary_version() -> &'static str {
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 enum SubCommand {
-    #[command(hide = true)]
-    CodexAppServerStop {
-        #[arg(long)]
-        socket: String,
-    },
-    /// Supervise a first-party Codex app-server and reap orphaned tool commands.
-    #[command(hide = true)]
-    CodexAppServer {
-        #[arg(long)]
-        binary: String,
-        #[arg(long)]
-        socket: String,
-    },
     /// Run the daemon server
     Daemon(DaemonArgs),
     /// Open the TUI scoped to one View (e.g. `flotilla view convoys/flotilla`).
@@ -999,12 +986,6 @@ fn main() -> Result<()> {
 
 async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat) -> Result<()> {
     match command {
-        Some(SubCommand::CodexAppServerStop { socket }) => {
-            flotilla_core::holder_transport::supervisor::stop(&socket).await.map_err(|error| color_eyre::eyre::eyre!(error))
-        }
-        Some(SubCommand::CodexAppServer { binary, socket }) => {
-            flotilla_core::holder_transport::supervisor::supervise(&binary, &socket).await.map_err(|error| color_eyre::eyre::eyre!(error))
-        }
         Some(SubCommand::View(ViewArgs { address })) => {
             // Parse before touching the terminal so a bad address in a
             // recipe fails loudly at the shell (ADR 0013).

@@ -32,9 +32,7 @@ use flotilla_core::{
     crew_capabilities::{CredentialCapability, SessionCapabilitySource},
     daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
-    holder_transport::{
-        select_transport, supervisor::STOP_COMMAND_TIMEOUT, AppServer, AppServerClient, CodexTransport, TransportCapability,
-    },
+    holder_transport::{select_transport, TransportCapability},
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -48,8 +46,7 @@ use flotilla_core::{
     vcs::{CheckoutMaterialisationError, CheckoutRegistration, WorktreeMetadata, REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT},
 };
 use flotilla_protocol::{
-    arg::shell_quote, CanonicalHostId, ConfiguredResourceLimits, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows,
-    TerminalStatus,
+    CanonicalHostId, ConfiguredResourceLimits, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus,
 };
 use flotilla_resources::{
     canonical_host_id, canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
@@ -1619,7 +1616,7 @@ struct ControllerRuntimeState {
     local_backing_observed: AtomicBool,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
-    codex_transports: Mutex<HashMap<String, Arc<CodexTransport>>>,
+    agent_sessions: Mutex<HashMap<String, Arc<dyn flotilla_core::agent_adapter::AgentSession>>>,
     exit_receipts: ExitReceiptObserver,
     archive_catalog_lock: Mutex<()>,
     checkout_removal_concurrency: NonZeroUsize,
@@ -1756,7 +1753,7 @@ impl ControllerRuntimeState {
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
-            codex_transports: Mutex::new(HashMap::new()),
+            agent_sessions: Mutex::new(HashMap::new()),
             exit_receipts: ExitReceiptObserver::default(),
             archive_catalog_lock: Mutex::new(()),
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
@@ -6328,10 +6325,14 @@ impl flotilla_resources::controller::Reconciler for MessageController {
 #[async_trait]
 impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
     fn binding(&self, holder: &ResourceObject<TerminalSession>) -> Option<flotilla_resources::HolderTransport> {
-        select_transport(holder, &[TransportCapability::AgentApi("codex")]).ok().flatten().cloned()
+        self.selected_transport(holder).ok().flatten()
     }
     fn supports_steering(&self, holder: &ResourceObject<TerminalSession>) -> bool {
-        Self::is_native_holder(holder)
+        let Ok(Some(flotilla_resources::HolderTransport::AgentApi { adapter, .. })) = self.selected_transport(holder) else { return false };
+        self.registry_for_env(&holder.spec.env_ref)
+            .ok()
+            .and_then(|registry| registry.agent_adapters.get(&adapter).map(|adapter| adapter.supports_native_steering()))
+            .unwrap_or(false)
     }
     fn uses_structured_evidence(&self, holder: &ResourceObject<TerminalSession>) -> bool {
         Self::is_native_holder(holder)
@@ -6345,7 +6346,7 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
         if submission.is_some_and(|submission| submission.transport != self.binding(holder)) {
             return Err("holder transport changed while input acceptance was held".into());
         }
-        if let Some(transport) = self.codex_transport(holder).await? {
+        if let Some(transport) = self.native_transport(holder).await? {
             return transport.observe(holder, submission).await;
         }
         let status = holder.status.as_ref().ok_or("holder status is absent")?;
@@ -6452,7 +6453,7 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
                 reason: "recorded transport no longer matches this holder".into(),
             };
         }
-        match self.codex_transport(&batch.holder).await {
+        match self.native_transport(&batch.holder).await {
             Ok(Some(transport)) => return transport.submit(batch).await,
             Ok(None) => {}
             Err(reason) => return flotilla_resources::MessageTransportOutcome::NotSubmitted { reason },
@@ -6514,7 +6515,7 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
                 reason: "recorded transport no longer matches this holder".into(),
             };
         }
-        match self.codex_transport(&batch.holder).await {
+        match self.native_transport(&batch.holder).await {
             Ok(Some(transport)) => return transport.poll(batch).await,
             Ok(None) => {}
             Err(reason) => return flotilla_resources::MessageTransportOutcome::Unconfirmed { reason },
@@ -6561,61 +6562,11 @@ fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, String>) ->
     }
 }
 
-// Both cleanup operations must run after a failed launch. Neither may erase
-// the diagnostic that explains why the holder could not be published.
-async fn cleanup_failed_native_launch(
-    runner: &dyn CommandRunner,
-    pool: &dyn TerminalPool,
-    server_name: &str,
-    endpoint: &str,
-    original: String,
-) -> String {
-    if let Err(error) = runner
-        .run_with_timeout(
-            "flotilla",
-            &["codex-app-server-stop", "--socket", endpoint],
-            Path::new("/"),
-            &ChannelLabel::Default,
-            STOP_COMMAND_TIMEOUT,
-        )
-        .await
-    {
-        warn!(%server_name, %error, "failed launch supervisor cleanup failed; still removing terminal session");
-    }
-    if let Err(error) = pool.kill_session(server_name).await {
-        warn!(%server_name, %error, "failed launch terminal cleanup failed");
-    }
-    original
-}
-
 struct TerminalControllerRuntime {
     state: Arc<ControllerRuntimeState>,
 }
 
 impl TerminalControllerRuntime {
-    async fn cleanup_native_servers(&self, name: &str, spec: &TerminalSessionSpec, pool: &dyn TerminalPool) -> Result<(), String> {
-        let prefix = format!("{name}-app-server-");
-        for server in pool.list_sessions().await?.into_iter().filter(|server| server.session_name.starts_with(&prefix)) {
-            let id = server.session_name.strip_prefix(&prefix).expect("filtered prefix");
-            if let Err(error) = uuid::Uuid::parse_str(id) {
-                warn!(session = %server.session_name, %error, "skipping unrelated retained session with invalid Codex incarnation");
-                continue;
-            }
-            let endpoint = format!("/tmp/flotilla-codex-{id}/control.sock");
-            self.runner_for_env(&spec.env_ref)?
-                .run_with_timeout(
-                    "flotilla",
-                    &["codex-app-server-stop", "--socket", &endpoint],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                    STOP_COMMAND_TIMEOUT,
-                )
-                .await?;
-            pool.kill_session(&server.session_name).await?;
-            self.state.codex_transports.lock().await.remove(id);
-        }
-        Ok(())
-    }
     async fn holder_for_session(
         &self,
         session_id: &str,
@@ -6641,29 +6592,55 @@ impl TerminalControllerRuntime {
         }
         Ok(None)
     }
-    fn is_native_holder(holder: &ResourceObject<TerminalSession>) -> bool {
-        matches!(
-            select_transport(holder, &[TransportCapability::AgentApi("codex")]),
-            Ok(Some(flotilla_resources::HolderTransport::AgentApi { .. }))
-        )
+    fn selected_transport(&self, holder: &ResourceObject<TerminalSession>) -> Result<Option<flotilla_resources::HolderTransport>, String> {
+        let registry = self.registry_for_env(&holder.spec.env_ref)?;
+        let supported = registry
+            .agent_adapters
+            .ids()
+            .filter_map(|id| {
+                let adapter = registry.agent_adapters.get(id)?;
+                adapter.has_native_input().then(|| TransportCapability::AgentApi(adapter.id()))
+            })
+            .collect::<Vec<_>>();
+        select_transport(holder, &supported).map(|selected| selected.cloned())
     }
-    async fn codex_transport(&self, holder: &ResourceObject<TerminalSession>) -> Result<Option<Arc<CodexTransport>>, String> {
-        let selected = select_transport(holder, &[TransportCapability::AgentApi("codex")])?;
-        let Some(flotilla_resources::HolderTransport::AgentApi { endpoint, session, .. }) = selected else { return Ok(None) };
-        let key = holder.status.as_ref().and_then(|status| status.crew.as_ref()).ok_or("holder crew absent")?.id.clone();
+    fn is_native_holder(holder: &ResourceObject<TerminalSession>) -> bool {
+        holder.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| {
+            crew.input_transports.iter().any(|binding| matches!(binding, flotilla_resources::HolderTransport::AgentApi { .. }))
+        })
+    }
+    async fn native_transport(
+        &self,
+        holder: &ResourceObject<TerminalSession>,
+    ) -> Result<Option<Arc<dyn flotilla_core::agent_adapter::AgentSession>>, String> {
+        let Some(binding @ flotilla_resources::HolderTransport::AgentApi { .. }) = self.selected_transport(holder)? else {
+            return Ok(None);
+        };
+        let flotilla_resources::HolderTransport::AgentApi { adapter, .. } = &binding else { unreachable!() };
+        let crew = holder.status.as_ref().and_then(|status| status.crew.as_ref()).ok_or("holder crew absent")?;
+        let key = crew.id.clone();
         {
-            let mut transports = self.state.codex_transports.lock().await;
+            let mut transports = self.state.agent_sessions.lock().await;
             if let Some(transport) = transports.get(&key).filter(|transport| transport.available()) {
                 return Ok(Some(Arc::clone(transport)));
             }
             transports.remove(&key);
         }
-        let runner = self.runner_for_env(&holder.spec.env_ref)?;
-        let client = AppServerClient::connect(&*runner, endpoint).await?;
-        let transport = CodexTransport::resume(client, session.clone()).await?;
-        let mut transports = self.state.codex_transports.lock().await;
-        let selected = transports.entry(key).or_insert_with(|| Arc::clone(&transport));
-        Ok(Some(Arc::clone(selected)))
+        let TerminalSessionSource::Agent { context, .. } = &holder.spec.source else {
+            return Err("native session lacks crew context".into());
+        };
+        let identity = flotilla_core::agent_adapter::CrewIdentity {
+            crew: key.clone(),
+            role: holder.spec.role.clone(),
+            terminal: holder.metadata.name.clone(),
+            vessel: context.vessel_ref.clone(),
+        };
+        let registry = self.registry_for_env(&holder.spec.env_ref)?;
+        let adapter = registry.agent_adapters.get(adapter).ok_or("native session adapter unavailable")?;
+        let grants = fulfilment_grants_for_terminal(&self.state.daemon.resource_backend(), context).await;
+        let transport = adapter.connect_session(&binding, &identity, grants.as_ref()).await?;
+        let mut transports = self.state.agent_sessions.lock().await;
+        Ok(Some(Arc::clone(transports.entry(key).or_insert(transport))))
     }
 }
 
@@ -7020,7 +6997,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     environment: credential_env.clone(),
                     fulfilment_grants,
                 };
-                native_launch = adapter.app_server_launch(&launch_request);
+                native_launch = Some((Arc::clone(adapter), launch_request.clone()));
                 let plan = adapter.launch(&launch_request)?;
                 let crew_id = uuid::Uuid::new_v4().to_string();
                 let crew = flotilla_resources::CrewSessionStatus::builder()
@@ -7069,76 +7046,19 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
             ]);
         }
-        if let (Some(native), Some(crew)) = (native_launch, crew.as_mut()) {
-            let binary = native.binary;
-            self.cleanup_native_servers(name, spec, &*pool).await?;
-            // A separate cleat-owned foreground process reuses the installed CLI.
-            // Its socket stays inside the vessel; no cross-container symlink.
-            let endpoint = format!("/tmp/flotilla-codex-{}/control.sock", crew.id);
-            let server_name = format!("{name}-app-server-{}", crew.id);
-            let server_dir = Path::new(&endpoint).parent().expect("control socket parent").to_string_lossy();
-            let server_command = format!(
-                "umask 077; mkdir -p {}; exec flotilla codex-app-server --binary {} --socket {}",
-                shell_quote(&server_dir),
-                shell_quote(&binary),
-                shell_quote(&endpoint)
-            );
-            let runner = self.runner_for_env(&spec.env_ref)?;
-            if let Err(error) = pool.ensure_session(&server_name, &server_command, &cwd, &env, &pool_tags).await {
-                return Err(cleanup_failed_native_launch(&*runner, &*pool, &server_name, &endpoint, error).await);
-            }
-            let client = tokio::time::timeout(Duration::from_secs(20), async {
-                loop {
-                    if let Ok(connected) = AppServerClient::connect(&*runner, &endpoint).await {
-                        break connected;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
-            .await;
-            let setup = async {
-                let client = client.map_err(|_| "Codex app-server did not become ready within twenty seconds")?;
-                let response = client
-                    .request(
-                        "thread/start",
-                        json!({"cwd":spec.cwd,"model":crew.model,
-                            "approvalPolicy":native.approval_policy,
-                            "sandbox":native.sandbox}),
-                    )
-                    .await
-                    .map_err(|error| error.reason())?;
-                let thread = response["thread"]["id"].as_str().ok_or("Codex thread/start omitted thread id")?.to_string();
-                client
-                    .request(
-                        "turn/start",
-                        json!({"threadId":thread,"clientUserMessageId":format!("launch-{}",crew.id),
-                            "input":[{"type":"text","text":native.prompt,"text_elements":[]}]}),
-                    )
-                    .await
-                    .map_err(|error| error.reason())?;
-                let transport = CodexTransport::started(client, thread.clone());
-                transport.wait_for_launch_receipt(&format!("launch-{}", crew.id)).await?;
-                self.state.codex_transports.lock().await.insert(crew.id.clone(), transport);
-                crew.input_transports = vec![flotilla_resources::HolderTransport::AgentApi {
-                    adapter: "codex".into(),
-                    endpoint: endpoint.clone(),
-                    session: thread.clone(),
-                }];
-                Ok::<_, String>(format!(
-                    "{} --remote {} resume {}",
-                    shell_quote(&binary),
-                    shell_quote(&format!("unix://{endpoint}")),
-                    shell_quote(&thread)
-                ))
-            }
-            .await;
-            let attach_command = match setup {
-                Ok(command) => command,
-                Err(error) => {
-                    return Err(cleanup_failed_native_launch(&*runner, &*pool, &server_name, &endpoint, error).await);
-                }
+        if let (Some((adapter, request)), Some(crew)) = (native_launch, crew.as_mut()) {
+            let TerminalSessionSource::Agent { context, .. } = &spec.source else { unreachable!() };
+            let identity = flotilla_core::agent_adapter::CrewIdentity {
+                crew: crew.id.clone(),
+                role: spec.role.clone(),
+                terminal: name.into(),
+                vessel: context.vessel_ref.clone(),
             };
-            command = flotilla_core::agent_process::monitored_command(&attach_command, &crew.id);
+            if let Some(native) = adapter.start_session(&cwd, &request, &env, &identity).await? {
+                command = flotilla_core::agent_process::monitored_command(&native.attach_command, &crew.id);
+                crew.input_transports = vec![native.binding];
+                self.state.agent_sessions.lock().await.insert(crew.id.clone(), native.session);
+            }
         }
         // A dead generation may retain a recording with the old ID. Launch
         // under a fresh ID so cleat cannot resolve the name ambiguously, then
@@ -7151,17 +7071,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
         if let Err(error) = pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await {
             if let Some(crew) = &crew {
-                if let Some(flotilla_resources::HolderTransport::AgentApi { endpoint, .. }) = crew.input_transports.first() {
-                    self.state.codex_transports.lock().await.remove(&crew.id);
-                    let server = format!("{name}-app-server-{}", crew.id);
-                    match self.runner_for_env(&spec.env_ref) {
-                        Ok(runner) => return Err(cleanup_failed_native_launch(&*runner, &*pool, &server, endpoint, error).await),
-                        Err(cleanup_error) => {
-                            warn!(%cleanup_error, "failed launch runner unavailable during cleanup");
-                            if let Err(cleanup_error) = pool.kill_session(&server).await {
-                                warn!(%cleanup_error, "failed launch terminal cleanup failed");
-                            }
-                        }
+                if let Some(session) = self.state.agent_sessions.lock().await.remove(&crew.id) {
+                    if let Err(cleanup) = session.stop(false).await {
+                        warn!(%cleanup, "failed launch native thread cleanup failed");
                     }
                 }
             }
@@ -7189,12 +7101,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
             Err(message) => return Ok(TerminalLiveness::Unavailable(message)),
         };
         if let Some(holder) = self.holder_for_session(session_id, spec).await?.filter(Self::is_native_holder) {
-            let crew = holder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("native holder crew");
-            let server = format!("{}-app-server-{}", holder.metadata.name, crew.id);
-            return Ok(match pool.session_liveness(&server).await {
-                Ok(TerminalSessionLiveness::Running) => TerminalLiveness::Running,
-                Ok(TerminalSessionLiveness::Lost(reason)) => TerminalLiveness::Lost(reason),
-                Ok(_) => TerminalLiveness::Stopped,
+            return Ok(match self.native_transport(&holder).await {
+                Ok(Some(session)) => match session.attention().await {
+                    Ok(_) => TerminalLiveness::Running,
+                    Err(error) => TerminalLiveness::Unavailable(error),
+                },
+                Ok(None) => TerminalLiveness::Stopped,
                 Err(error) => TerminalLiveness::Unavailable(error),
             });
         }
@@ -7250,7 +7162,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
         let holder = self.holder_for_session(session_id, spec).await?;
         if let Some(holder) = holder {
-            if let Some(transport) = self.codex_transport(&holder).await? {
+            if let Some(transport) = self.native_transport(&holder).await? {
                 return Ok(Some(TerminalObservation {
                     output_digest: None,
                     attention: Some(TerminalAttention {
@@ -7385,21 +7297,28 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let pool = self.pool_for_spec(spec)?;
         if let Some(holder) = self.holder_for_session(session_id, spec).await?.filter(Self::is_native_holder) {
             let crew = holder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("native holder has crew");
-            if let Some(flotilla_resources::HolderTransport::AgentApi { endpoint, .. }) =
-                select_transport(&holder, &[TransportCapability::AgentApi("codex")])?
-            {
-                self.runner_for_env(&spec.env_ref)?
-                    .run_with_timeout(
-                        "flotilla",
-                        &["codex-app-server-stop", "--socket", endpoint],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                        STOP_COMMAND_TIMEOUT,
-                    )
-                    .await?;
+            let retiring_vessel = if let TerminalSessionSource::Agent { context, .. } = &spec.source {
+                self.state
+                    .daemon
+                    .resource_backend()
+                    .using::<Vessel>(&context.namespace)
+                    .get(&context.vessel_ref)
+                    .await
+                    .ok()
+                    .is_some_and(|vessel| vessel.metadata.deletion_timestamp.is_some())
+            } else {
+                false
+            };
+            if retiring_vessel {
+                if let Some(binding @ flotilla_resources::HolderTransport::AgentApi { .. }) = self.selected_transport(&holder)? {
+                    let flotilla_resources::HolderTransport::AgentApi { adapter, .. } = &binding else { unreachable!() };
+                    let registry = self.registry_for_env(&holder.spec.env_ref)?;
+                    registry.agent_adapters.get(adapter).ok_or("native session adapter unavailable")?.stop_vessel(&binding).await?;
+                }
+            } else if let Some(session) = self.native_transport(&holder).await? {
+                session.stop(false).await?;
             }
-            self.state.codex_transports.lock().await.remove(&crew.id);
-            pool.kill_session(&format!("{}-app-server-{}", holder.metadata.name, crew.id)).await?;
+            self.state.agent_sessions.lock().await.remove(&crew.id);
         }
         if pool.tracks_session_liveness() {
             match pool.list_sessions().await {
@@ -7424,7 +7343,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn cleanup_failed_session(&self, spec: &TerminalSessionSpec) -> Result<(), String> {
         let TerminalSessionSource::Agent { context, .. } = &spec.source else { return Ok(()) };
         let name = format!("terminal-{}-{}", context.vessel_ref, spec.role);
-        self.cleanup_native_servers(&name, spec, &*self.pool_for_spec(spec)?).await
+        if let Some(holder) = self.holder_for_session(&name, spec).await? {
+            if let Some(session) = self.native_transport(&holder).await? {
+                session.stop(false).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn cleanup_session_artifacts(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
@@ -15249,65 +15173,6 @@ mod tests {
         assert!(host.status.expect("local Host status").ready, "historical abnormal exits must not block placement after recovery");
 
         runtime.shutdown();
-    }
-
-    // A failed supervisor stop must not leave the recorded terminal alive or
-    // replace the original protocol launch failure. The runner/pool stand in
-    // for the two process boundaries; the cleanup orchestration is real.
-    #[tokio::test]
-    async fn failed_native_launch_attempts_both_cleanup_steps_and_keeps_original_error() {
-        use flotilla_protocol::arg::Arg;
-        struct Pool {
-            inner: FakeTerminalPool,
-            fail: bool,
-        }
-        #[async_trait]
-        impl TerminalPool for Pool {
-            async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
-                self.inner.list_sessions().await
-            }
-            async fn ensure_session(
-                &self,
-                name: &str,
-                command: &str,
-                cwd: &ExecutionEnvironmentPath,
-                env: &TerminalEnvVars,
-                tags: &[TerminalSessionTag],
-            ) -> Result<(), String> {
-                self.inner.ensure_session(name, command, cwd, env, tags).await
-            }
-            fn attach_args(
-                &self,
-                name: &str,
-                command: &str,
-                cwd: &ExecutionEnvironmentPath,
-                env: &TerminalEnvVars,
-            ) -> Result<Vec<Arg>, String> {
-                self.inner.attach_args(name, command, cwd, env)
-            }
-            async fn kill_session(&self, name: &str) -> Result<(), String> {
-                self.inner.kill_session(name).await?;
-                if self.fail {
-                    Err("pool kill failed".into())
-                } else {
-                    Ok(())
-                }
-            }
-        }
-        for (stop_failed, kill_failed) in [(false, false), (false, true), (true, false), (true, true)] {
-            let runner = DiscoveryMockRunner::builder()
-                .on_run(
-                    "flotilla",
-                    &["codex-app-server-stop", "--socket", "/private/socket"],
-                    if stop_failed { Err("supervisor stop failed".into()) } else { Ok(String::new()) },
-                )
-                .build();
-            let pool = Pool { inner: FakeTerminalPool::new(), fail: kill_failed };
-            let error =
-                cleanup_failed_native_launch(&runner, &pool, "server", "/private/socket", "original thread/start failed".into()).await;
-            assert_eq!(error, "original thread/start failed");
-            assert_eq!(pool.inner.killed.lock().await.as_slice(), ["server"]);
-        }
     }
 
     // These provisioning scenarios exercise a screen-only holder and a pool

@@ -1,7 +1,10 @@
 //! Holder input selection and the first-party Codex app-server adapter.
 //! Durable queueing and acknowledgements remain in MessageInbox. A protocol
 //! response acknowledges a request; a correlated userMessage item proves input.
-pub mod supervisor;
+pub mod managed;
+mod protocol;
+pub use protocol::RequestId;
+use protocol::{Thread, ThreadResponse, ThreadStatus};
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -74,10 +77,6 @@ pub trait AppServer: Send + Sync {
     fn events(&self) -> Vec<Value> {
         Vec::new()
     }
-    /// A bounded diagnostic snapshot for the fixture recorder, not an event cursor.
-    fn event_snapshot(&self) -> Vec<Value> {
-        Vec::new()
-    }
     async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError>;
 }
 
@@ -102,8 +101,11 @@ impl Drop for AppServerClient {
 
 impl AppServerClient {
     pub async fn connect(runner: &dyn CommandRunner, endpoint: &str) -> Result<Arc<Self>, String> {
+        Self::connect_with_binary(runner, "codex", endpoint).await
+    }
+    pub async fn connect_with_binary(runner: &dyn CommandRunner, binary: &str, endpoint: &str) -> Result<Arc<Self>, String> {
         let stream =
-            runner.open_stream("codex", &["app-server", "proxy", "--sock", endpoint], Path::new("/"), &ChannelLabel::Default).await?;
+            runner.open_stream(binary, &["app-server", "proxy", "--sock", endpoint], Path::new("/"), &ChannelLabel::Default).await?;
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), client_async("ws://localhost/", stream.io))
             .await
             .map_err(|_| "app-server handshake timed out")?
@@ -114,40 +116,42 @@ impl AppServerClient {
         let task = tokio::spawn(async move {
             let _process = stream.process;
             let mut pending = BTreeMap::new();
-            let mut sequence = 0u64;
+            let mut sequence = 0i64;
             loop {
                 tokio::select! {
                     call = receiver.recv() => {
                         let Some(call) = call else { break };
                         sequence += 1;
-                        let mut message = json!({"method":call.method,"params":call.params});
-                        if let Some(reply) = call.reply {
-                            message["id"] = json!(sequence);
-                            pending.insert(sequence, reply);
-                        }
-                        if socket.send(WsMessage::Text(message.to_string().into())).await.is_err() {
-                            break;
-                        }
+                        let id = call.reply.map(|reply| { pending.insert(sequence, reply); sequence });
+                        let message = protocol::Outgoing { id, method: &call.method, params: &call.params };
+                        let Ok(encoded) = serde_json::to_string(&message) else { break };
+                        if socket.send(WsMessage::Text(encoded.into())).await.is_err() { break; }
                     }
                     event = socket.next() => {
                         match event {
                             Some(Ok(WsMessage::Text(text))) => {
-                                let Ok(value) = serde_json::from_str::<Value>(&text) else { break };
-                                if value.get("method").is_some() {
-                                    let mut events = observed.lock().expect("app-server events lock");
-                                    if events.len() == 256 {
-                                        events.pop_front();
+                                let message = match serde_json::from_str::<protocol::Incoming>(&text) {
+                                    Ok(message) => message,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "invalid Codex RPC envelope");
+                                        break;
                                     }
-                                    events.push_back(value);
-                                    continue;
-                                }
-                                if let Some(reply) = value["id"].as_u64().and_then(|id| pending.remove(&id)) {
-                                    let result = if let Some(error) = value.get("error") {
-                                        Err(RpcError::Rejected(error.to_string()))
-                                    } else {
-                                        Ok(value["result"].clone())
-                                    };
-                                    let _ = reply.send(result);
+                                };
+                                match message {
+                                    protocol::Incoming::Event { method, id, params } => {
+                                        let mut events = observed.lock().expect("app-server events lock");
+                                        if events.len() == 256 { events.pop_front(); }
+                                        events.push_back(json!({"method": method, "id": id, "params": params}));
+                                    }
+                                    protocol::Incoming::Success { id: protocol::RequestId::Number(id), result } => {
+                                        if let Some(reply) = pending.remove(&id) { let _ = reply.send(Ok(result)); }
+                                    }
+                                    protocol::Incoming::Failure { id: protocol::RequestId::Number(id), error } => {
+                                        if let Some(reply) = pending.remove(&id) {
+                                            let _ = reply.send(Err(RpcError::Rejected(format!("{}: {} ({:?})", error.code, error.message, error.data))));
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             Some(Ok(WsMessage::Ping(bytes))) => {
@@ -193,9 +197,6 @@ impl AppServer for AppServerClient {
     fn available(&self) -> bool {
         !self.calls.is_closed()
     }
-    fn event_snapshot(&self) -> Vec<Value> {
-        self.events.lock().expect("app-server events lock").iter().cloned().collect()
-    }
     fn events(&self) -> Vec<Value> {
         self.events.lock().expect("app-server events lock").drain(..).collect()
     }
@@ -233,39 +234,44 @@ impl CodexTransport {
         self.rpc.available()
     }
     pub async fn resume(rpc: Arc<dyn AppServer>, thread: String) -> Result<Arc<Self>, String> {
-        rpc.request("thread/resume", json!({"threadId":thread,"excludeTurns":false})).await.map_err(|error| error.reason())?;
+        rpc.request(
+            "thread/resume",
+            serde_json::to_value(protocol::ThreadResume { thread_id: &thread, exclude_turns: false }).map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| error.reason())?;
         Ok(Arc::new(Self { rpc, thread }))
     }
-    async fn read(&self) -> Result<Value, String> {
-        let response =
-            self.rpc.request("thread/read", json!({"threadId":self.thread,"includeTurns":true})).await.map_err(|error| error.reason())?;
-        if response["thread"]["id"].as_str() != Some(self.thread.as_str()) {
+    async fn read(&self, include_turns: bool) -> Result<Thread, String> {
+        let params =
+            serde_json::to_value(protocol::ThreadRead { thread_id: &self.thread, include_turns }).map_err(|error| error.to_string())?;
+        let response = self.rpc.request("thread/read", params).await.map_err(|error| error.reason())?;
+        let response: ThreadResponse =
+            serde_json::from_value(response).map_err(|error| format!("invalid Codex thread response: {error}"))?;
+        if response.thread.id != self.thread {
             return Err("app-server returned a different thread".into());
         }
-        Ok(response["thread"].clone())
+        Ok(response.thread)
     }
-    fn evidence(thread: &Value, id: &str) -> Option<String> {
+    fn receipt(thread: &Thread, id: &str) -> Option<String> {
         let marker = format!("[flotilla batch: {id}]\n");
-        thread["turns"].as_array()?.iter().find_map(|turn| {
-            turn["items"]
-                .as_array()?
+        thread.turns.iter().find_map(|turn| {
+            turn.items
                 .iter()
-                .find(|item| {
-                    item["type"] == "userMessage"
-                        && (item["clientId"].as_str() == Some(id)
-                            || item["content"].as_array().is_some_and(|content| {
-                                content.iter().any(|part| {
-                                    part["type"] == "text" && part["text"].as_str().is_some_and(|text| text.starts_with(&marker))
-                                })
-                            }))
+                .any(|item| match item {
+                    protocol::Item::UserMessage { client_id, content } => {
+                        client_id.as_deref() == Some(id)
+                            || content.iter().any(|part| matches!(part, protocol::Content::Text { text, .. } if text.starts_with(&marker)))
+                    }
+                    protocol::Item::Other => false,
                 })
-                .map(|_| format!("codex userMessage {id} in turn {}", turn["id"]))
+                .then(|| format!("codex userMessage {id} in turn {}", turn.id))
         })
     }
     pub async fn wait_for_launch_receipt(&self, id: &str) -> Result<(), String> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if Self::evidence(&self.read().await?, id).is_some() {
+                if Self::receipt(&self.read(true).await?, id).is_some() {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -276,18 +282,14 @@ impl CodexTransport {
     }
     pub async fn attention(&self) -> Result<flotilla_resources::TerminalAttentionState, String> {
         use flotilla_resources::TerminalAttentionState as Attention;
-        let thread = self.read().await?;
-        match thread["status"]["type"].as_str() {
-            Some("idle") => Ok(Attention::Idle),
-            Some("active")
-                if thread["status"]["activeFlags"]
-                    .as_array()
-                    .is_some_and(|flags| flags.iter().any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput")) =>
-            {
+        let thread = self.read(false).await?;
+        match thread.status {
+            ThreadStatus::Idle => Ok(Attention::Idle),
+            ThreadStatus::Active { flags } if flags.iter().any(|flag| flag == "waitingOnApproval" || flag == "waitingOnUserInput") => {
                 Ok(Attention::NeedsInput)
             }
-            Some("active") => Ok(Attention::Working),
-            _ => Err("app-server thread is unavailable".into()),
+            ThreadStatus::Active { .. } => Ok(Attention::Working),
+            ThreadStatus::Unavailable => Err("app-server thread is unavailable".into()),
         }
     }
 }
@@ -304,39 +306,49 @@ impl MessageTransport for CodexTransport {
         _: &ResourceObject<TerminalSession>,
         submission: Option<&MessageSubmission>,
     ) -> Result<MessageObservation, String> {
-        let thread = self.read().await?;
-        let state = thread["status"]["type"].as_str();
+        let thread = self.read(submission.is_some()).await?;
+        let state = &thread.status;
         Ok(MessageObservation {
-            ready: state == Some("idle"),
-            working: state == Some("active"),
-            evidence: submission.and_then(|submission| Self::evidence(&thread, &submission.batch_id)),
+            ready: matches!(state, ThreadStatus::Idle),
+            working: matches!(state, ThreadStatus::Active { .. }),
+            evidence: submission.and_then(|submission| Self::receipt(&thread, &submission.batch_id)),
             waiting_reason: Some("waiting for structured Codex turn boundary".into()),
             ..Default::default()
         })
     }
     async fn submit(&self, batch: &MessageBatch) -> MessageTransportOutcome {
-        let thread = match self.read().await {
+        let thread = match self.read(true).await {
             Ok(thread) => thread,
             Err(reason) => return MessageTransportOutcome::NotSubmitted { reason },
         };
-        if let Some(evidence) = Self::evidence(&thread, &batch.id) {
+        if let Some(evidence) = Self::receipt(&thread, &batch.id) {
             return MessageTransportOutcome::Accepted { evidence };
         }
-        let active = thread["turns"].as_array().and_then(|turns| turns.iter().rev().find(|turn| turn["status"] == "inProgress"));
-        let input = json!([{"type":"text","text":format!("[flotilla batch: {}]\n{}", batch.id, batch.text),"text_elements":[]}]);
-        let (method, params) = if thread["status"]["type"] == "active" {
-            if !batch.interrupting {
-                return MessageTransportOutcome::NotSubmitted { reason: "Codex turn became active before delivery".into() };
+        let active = thread.turns.iter().rev().find(|turn| turn.status == "inProgress");
+        let expected_turn_id = match thread.status {
+            ThreadStatus::Active { .. } => {
+                if !batch.interrupting {
+                    return MessageTransportOutcome::NotSubmitted { reason: "Codex turn became active before delivery".into() };
+                }
+                let Some(turn) = active else {
+                    return MessageTransportOutcome::NotSubmitted { reason: "active Codex turn id unavailable".into() };
+                };
+                Some(turn.id.as_str())
             }
-            let Some(turn) = active else {
-                return MessageTransportOutcome::NotSubmitted { reason: "active Codex turn id unavailable".into() };
-            };
-            ("turn/steer", json!({"threadId":self.thread,"expectedTurnId":turn["id"],"clientUserMessageId":batch.id,"input":input}))
-        } else if thread["status"]["type"] == "idle" {
-            ("turn/start", json!({"threadId":self.thread,"clientUserMessageId":batch.id,"input":input}))
-        } else {
-            return MessageTransportOutcome::NotSubmitted { reason: "Codex thread is not ready".into() };
+            ThreadStatus::Idle => None,
+            ThreadStatus::Unavailable => return MessageTransportOutcome::NotSubmitted { reason: "Codex thread is not ready".into() },
         };
+        let method = if expected_turn_id.is_some() { "turn/steer" } else { "turn/start" };
+        let params = serde_json::to_value(protocol::Input {
+            thread_id: &self.thread,
+            client_user_message_id: &batch.id,
+            expected_turn_id,
+            input: vec![protocol::Content::Text {
+                text: format!("[flotilla batch: {}]\n{}", batch.id, batch.text),
+                text_elements: Vec::new(),
+            }],
+        })
+        .expect("serializable Codex input");
         match self.rpc.request(method, params).await {
             Ok(_) => MessageTransportOutcome::Pending,
             Err(RpcError::Rejected(reason)) => MessageTransportOutcome::NotSubmitted { reason },
@@ -344,8 +356,8 @@ impl MessageTransport for CodexTransport {
         }
     }
     async fn poll(&self, batch: &MessageBatch) -> MessageTransportOutcome {
-        match self.read().await {
-            Ok(thread) => Self::evidence(&thread, &batch.id)
+        match self.read(true).await {
+            Ok(thread) => Self::receipt(&thread, &batch.id)
                 .map(|evidence| MessageTransportOutcome::Accepted { evidence })
                 .unwrap_or(MessageTransportOutcome::Pending),
             Err(reason) => MessageTransportOutcome::Unconfirmed { reason },
@@ -358,8 +370,8 @@ impl MessageTransport for CodexTransport {
 pub enum HolderEvent {
     TurnStarted { turn: String },
     TurnCompleted { turn: String, status: String },
-    ApprovalRequested { request: Value, method: String, item: String },
-    ApprovalResolved { request: Value },
+    ApprovalRequested { request: RequestId, method: String, item: String },
+    ApprovalResolved { request: RequestId },
 }
 impl CodexTransport {
     pub fn events(&self) -> Vec<HolderEvent> {
@@ -367,24 +379,33 @@ impl CodexTransport {
             .events()
             .into_iter()
             .filter_map(|event| {
-                let params = &event["params"];
-                if params["threadId"].as_str() != Some(self.thread.as_str()) {
-                    return None;
-                }
-                match event["method"].as_str()? {
-                    "turn/started" => Some(HolderEvent::TurnStarted { turn: params["turn"]["id"].as_str()?.into() }),
-                    "turn/completed" => Some(HolderEvent::TurnCompleted {
-                        turn: params["turn"]["id"].as_str()?.into(),
-                        status: params["turn"]["status"].as_str()?.into(),
+                let notification = serde_json::from_value::<protocol::Notification>(event).ok()?;
+                let request = notification.id;
+                match notification.event {
+                    protocol::Event::TurnStarted(event) if event.thread_id == self.thread => {
+                        Some(HolderEvent::TurnStarted { turn: event.turn.id })
+                    }
+                    protocol::Event::TurnCompleted(event) if event.thread_id == self.thread => {
+                        Some(HolderEvent::TurnCompleted { turn: event.turn.id, status: event.turn.status })
+                    }
+                    protocol::Event::CommandApproval(event) if event.thread_id == self.thread => Some(HolderEvent::ApprovalRequested {
+                        request: request?,
+                        method: "item/commandExecution/requestApproval".into(),
+                        item: event.item_id,
                     }),
-                    method @ ("item/commandExecution/requestApproval"
-                    | "item/fileChange/requestApproval"
-                    | "item/permissions/requestApproval") => Some(HolderEvent::ApprovalRequested {
-                        request: event["id"].clone(),
-                        method: method.into(),
-                        item: params["itemId"].as_str()?.into(),
+                    protocol::Event::FileApproval(event) if event.thread_id == self.thread => Some(HolderEvent::ApprovalRequested {
+                        request: request?,
+                        method: "item/fileChange/requestApproval".into(),
+                        item: event.item_id,
                     }),
-                    "serverRequest/resolved" => Some(HolderEvent::ApprovalResolved { request: params["requestId"].clone() }),
+                    protocol::Event::PermissionsApproval(event) if event.thread_id == self.thread => Some(HolderEvent::ApprovalRequested {
+                        request: request?,
+                        method: "item/permissions/requestApproval".into(),
+                        item: event.item_id,
+                    }),
+                    protocol::Event::Resolved(event) if event.thread_id == self.thread => {
+                        Some(HolderEvent::ApprovalResolved { request: event.request_id })
+                    }
                     _ => None,
                 }
             })

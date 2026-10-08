@@ -27,24 +27,48 @@ the legacy Working debounce as acceptance evidence.
 
 ## Codex
 
-On Linux, managed Codex crews launch a foreground app-server in a separate
-cleat session. Its command runs through `flotilla codex-app-server`, a dedicated
-child-subreaper supervisor. The existing installed CLI is reused: there is no
-per-`CODEX_HOME` daemon package installation or updater. Homes and credentials
-remain per crew. A private `/tmp/flotilla-codex-<crew-id>/control.sock` stays in
-the execution environment; no host/container socket symlink crosses namespaces.
-Other platforms currently retain guarded screen transport.
+On Linux, the Codex adapter bootstraps Codex's own managed daemon with
+`codex app-server daemon bootstrap`. Crews in a vessel share a private
+`CODEX_HOME` under `flotilla-vessels/<vessel>` and have separate Codex threads.
+The daemon is a harness implementation detail, not a second cleat session or
+pane. Each crew has one terminal running the first-party
+`codex --remote unix://... resume <thread>` client. Other platforms currently
+retain guarded screen transport.
 
-A binary duplex method on the injected `CommandRunner` runs the first-party
-`codex app-server proxy --sock ...` in that same environment. Local, Docker and
-SSH runners forward this method. The client performs the WebSocket handshake,
-`initialize`, and the `initialized` notification. Thread creation inherits the
-adapter's existing fulfilment-grant policy, model, working directory, credential
-environment and rendered brief. Restricted grants preserve the home's configured sandbox
-and approval defaults. The holder is published only after a native receipt for
-the launch brief; the app-server receives the complete composed crew environment,
-including build concurrency limits. The terminal runs a first-party
-`codex --remote unix://... resume <thread>` client.
+The private home seeds the source configuration and links its authentication,
+plugin material, and global instructions. Staged role skill directories remain
+visible through the common material root. Per-thread `skills.config` excludes
+other roles' canonical skill paths while preserving configured exclusions;
+shared skill files selected by both roles stay enabled. Start, TUI attach, and
+reconnect apply the same shell identity and skill selection.
+Daemon auto-update is disabled for the private managed installation. New
+private homes use a two-second graceful shutdown period; existing saved
+settings are preserved. First installation uses bootstrap under a private installation lock; later
+crews use idempotent daemon start. Bootstrap itself restarts a running daemon
+and must not run for every crew. A complete installed Codex CLI package and
+Linux flock are required. The daemon
+starts without crew identity variables; each thread receives its own
+`FLOTILLA_CREW_ID`, `FLOTILLA_CREW_ROLE`, and `FLOTILLA_TERMINAL_SESSION` through
+`shell_environment_policy.set`. Existing configured shell variables and
+inclusion filters are preserved. The TUI and reconnect paths apply the same
+identity and grant policy. These variables identify tool calls; they do not
+isolate authentication or other shared daemon services. The vessel is the
+isolation boundary.
+
+The generic runtime asks the selected `AgentAdapter` to start or reconnect an
+`AgentSession`. The adapter owns bootstrap, connection details, attach command,
+and teardown; generic runtime code does not branch on Codex. A binary duplex
+method on the injected `CommandRunner` runs the first-party
+`codex app-server proxy --sock ...` in the execution environment. Local, Docker,
+and SSH runners forward this method. The client performs the WebSocket
+handshake, `initialize`, and the `initialized` notification. Thread creation
+uses the adapter's existing fulfilment-grant policy, model, working directory,
+and rendered brief. Restricted grants preserve configured sandbox and approval
+defaults. A native receipt for the launch brief precedes holder publication.
+Threads explicitly select legacy rollout history because the pinned managed
+daemon rejects paginated turn listing needed for receipt recovery.
+Failed launch archives its thread. Retiring a crew archives that crew's thread;
+retiring the vessel stops the shared daemon.
 
 The runtime uses app-server liveness, not TUI exit receipts, for the holder.
 A TUI can detach without terminating the thread. The persisted endpoint and
@@ -73,54 +97,25 @@ limitation; ordinary queued input must not be intentionally submitted while
 active. `turn/steer` has a matching-turn precondition and fails safely when the
 observed turn changes.
 
-Graceful teardown signals the supervisor after validating its incarnation PID
-and endpoint. It sends SIGTERM to the app-server, allows two seconds to flush,
-then force-stops an unresponsive server, reaps descendants, and removes the cleat
-session. Child signal/wait failures still run orphan cleanup. On app-server
-exit or crash, the supervisor kills and reaps reparented descendants, including
-tools that started a new process group. Cleanup is bounded and refuses to claim
-success when children remain. An external SIGKILL of the supervisor itself
-cannot run cleanup. Stop polls process liveness as well as the receipt; an absent
-or zombie supervisor immediately falls through to stale receipt recovery. The
-stop wait allows ten seconds (child grace, orphan sweeps, and scheduling margin),
-and callers allow fifteen seconds for helper startup and completion. Stop warns and removes the stale
-PID/socket receipt so relaunch and teardown can proceed. A reused live PID is
-never signalled. Vessel teardown remains the enclosing cleanup mechanism. Before replacing a failed launch, retained server sessions must be
-stopped through their supervisor.
+## Verification
 
-## Evidence and operator acceptance
+Protocol and inbox behaviour are tested with injected collaborators and small
+structured inputs. Large session recordings are removed: model output is not a
+stable protocol contract. Typed Serde envelopes and the subset of events we
+consume validate correlation fields while tolerating unknown harness fields.
 
-The tests use real in-memory resource storage and injected protocol/process
-collaborators. The three JSON recordings were captured against codex-cli
-0.160.0 with `codex_transport_probe`: ordinary delivery/completion, active-turn
-steering, and a real command-execution approval request. Never edit those
-recordings; rerun the recorder against the first-party CLI.
-
-In a Linux execution environment with Codex >= 0.160, a logged-in `CODEX_HOME`,
-and the candidate binary on PATH:
-
-```bash
-cargo build --locked --bin flotilla
-FLOTILLA_BIN="$PWD/target/debug/flotilla" scripts/accept-codex-transport.sh
-```
-
-The script creates a private scratch home, copies the supplied authentication
-file without printing it, starts a supervised app-server, checks delivery,
-steering and approvals, verifies graceful shutdown, and uses a process-boundary fixture to prove that a
-crashing app-server cannot leave a detached tool running. It uses model inference
-but does not accept the approval request. It removes the scratch credentials on
-exit. Set `CODEX_TRANSPORT_MODEL` for an available model. To re-record fixtures,
-pass the fixture directory as its argument (the delivery recording is named
-`codex_0_160_delivery.json`).
-
-Full fleet acceptance additionally requires a candidate crew image containing
-the new supervisor command. Dispatch a Codex crew, inspect the declared endpoint
-and structured attention, send three ordinary Messages during a running turn,
-and an interrupting supervisor Message. Verify that only the urgent Message is
-steered, the others arrive as one batch at the boundary, a detached TUI does not
-stop the holder, Flotilla restart recovers the held batch without typing again,
-and vessel teardown removes the app-server and its commands. This requires the
-operator's Docker-capable provisioner and is not a contained-CI test.
-
-Protocol references: [official app-server documentation](https://developers.openai.com/codex/app-server)
-and the schema generated by `codex app-server generate-json-schema --out ...`.
+`scripts/accept-codex-transport.sh` runs the live Rust adapter probe and then
+`scripts/prove-codex-vessel-identity.py`. It requires a logged-in full Codex
+package, cleat, and uv. The Rust probe starts two crews through the candidate
+adapter, checks actual tool identity files, reconnects through the native
+proxy, checks staged role skills, submits ordinary and urgent native input,
+observes an approval held for user input, and retires one crew while the other
+remains available. The Python proof checks actual tool executions
+from two threads before and after TUI attachment, resume, client reconnect,
+and daemon restart. It uses a private temporary home, stops its daemon and
+terminals, and removes copied authentication. See
+[the research and proof](research/2026-10-07-codex-vessel-daemon.md).
+The Python proof exercises the first-party protocol directly; the Rust probe
+exercises the candidate adapter. These scripts use a real model and are
+operator acceptance checks, not deterministic CI tests. Run with
+`CODEX_HOME=/path/to/logged-in/home scripts/accept-codex-transport.sh`.
