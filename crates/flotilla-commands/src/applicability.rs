@@ -54,12 +54,8 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ResourceWatch { .. } => false,
 
         // Controller transport commands are unavailable to interactive surfaces.
-        CommandAction::CreateWorkspaceForCheckout { .. }
-        | CommandAction::CreateWorkspaceFromPreparedTerminal { .. }
-        | CommandAction::SelectWorkspace { .. }
-        | CommandAction::Attach { .. }
+        CommandAction::Attach { .. }
         | CommandAction::AttachTransient { .. }
-        | CommandAction::PrepareTerminalForCheckout { .. }
         | CommandAction::Checkout { .. }
         | CommandAction::RemoveCheckout { .. }
         | CommandAction::OpenChangeRequest { .. }
@@ -87,7 +83,6 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ProjectApply { .. }
         | CommandAction::ProjectRegister { .. }
         | CommandAction::ProjectRefresh { .. }
-        | CommandAction::TeleportSession { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
         | CommandAction::RepositoryRemoteRemove { .. }

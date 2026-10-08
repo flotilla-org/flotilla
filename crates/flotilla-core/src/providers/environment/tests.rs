@@ -1289,7 +1289,7 @@ async fn environment_runner_transforms_commands_for_container() {
 
 /// Integration test: three-hop composition — SSH → docker exec → terminal attach.
 ///
-/// Builds a HopPlan with RemoteToHost + EnterEnvironment + AttachTerminal and resolves
+/// Builds a HopPlan with RemoteToHost + EnterEnvironment + RunCommand and resolves
 /// it end-to-end using mock resolvers. Asserts that the output is correctly nested:
 /// SSH wrapping docker exec wrapping the terminal attach command.
 #[test]
@@ -1298,12 +1298,9 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
 
     use flotilla_protocol::arg::{flatten, Arg};
 
-    use crate::{
-        attachable::AttachableId,
-        hop_chain::{
-            environment::DockerEnvironmentHopResolver, remote::RemoteHopResolver, resolver::HopResolver, terminal::TerminalHopResolver,
-            Hop, HopPlan, ResolutionContext, ResolvedAction,
-        },
+    use crate::hop_chain::{
+        environment::DockerEnvironmentHopResolver, remote::RemoteHopResolver, resolver::HopResolver, Hop, HopPlan, ResolutionContext,
+        ResolvedAction,
     };
 
     // ── Mock resolvers ───────────────────────────────────────────────
@@ -1322,34 +1319,20 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
         }
     }
 
-    /// A minimal mock TerminalHopResolver that pushes a simple attach command.
-    struct MockTerminal;
-    impl TerminalHopResolver for MockTerminal {
-        fn resolve(&self, attachable_id: &AttachableId, context: &mut ResolutionContext) -> Result<(), String> {
-            context.actions.push(ResolvedAction::Command(vec![
-                Arg::Literal("cleat".into()),
-                Arg::Literal("attach".into()),
-                Arg::Literal(attachable_id.to_string()),
-            ]));
-            Ok(())
-        }
-    }
-
     // ── Build the HopResolver ────────────────────────────────────────
 
     let mut containers = HashMap::new();
     containers.insert(EnvironmentId::new("env1"), "container-abc".to_string());
     let docker_env = Arc::new(DockerEnvironmentHopResolver::new(containers));
 
-    let resolver = HopResolver::new(Arc::new(MockRemote), docker_env, Arc::new(MockTerminal));
+    let resolver = HopResolver::new(Arc::new(MockRemote), docker_env);
 
-    // ── Build the HopPlan: RemoteToHost → EnterEnvironment → AttachTerminal ──
+    // ── Build the HopPlan: RemoteToHost → EnterEnvironment → RunCommand ──
 
-    let att_id = AttachableId::new("sess-123");
     let plan = HopPlan(vec![
         Hop::RemoteToHost { host: HostName::new("feta") },
         Hop::EnterEnvironment { env_id: EnvironmentId::new("env1"), provider: "docker".into() },
-        Hop::AttachTerminal { attachable_id: att_id.clone() },
+        Hop::RunCommand { command: vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Literal("sess-123".into())] },
     ]);
 
     // ── Resolve from a different host ────────────────────────────────
@@ -1391,7 +1374,7 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     // Innermost args are flattened directly into the docker exec invocation
     assert_eq!(docker_nested[7], Arg::Literal("cleat".into()), "innermost command should be cleat");
     assert_eq!(docker_nested[8], Arg::Literal("attach".into()), "cleat subcommand should be attach");
-    assert_eq!(docker_nested[9], Arg::Literal(att_id.to_string()), "cleat should attach to correct session");
+    assert_eq!(docker_nested[9], Arg::Literal("sess-123".to_string()), "cleat should attach to correct session");
     assert_eq!(docker_nested.len(), 10, "docker nested should have exactly 10 args");
 
     // Verify flatten produces the expected structure
@@ -1400,7 +1383,7 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     assert!(flat.contains("docker exec"), "should contain supervised docker exec: {flat}");
     assert!(flat.contains("container-abc"), "should contain the quoted container target: {flat}");
     assert!(flat.contains("cleat attach"), "should contain cleat attach: {flat}");
-    assert!(flat.contains(att_id.as_str()), "should contain session id: {flat}");
+    assert!(flat.contains("sess-123"), "should contain session id: {flat}");
 
     // Verify nesting depth updated for both remote and environment hops
     assert_eq!(context.nesting_depth, 2, "nesting_depth should be 2 after remote + environment hops");

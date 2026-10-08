@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use async_trait::async_trait;
@@ -22,7 +22,6 @@ use tokio::sync::Mutex as TokioMutex;
 
 use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 use crate::{
-    attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     path_context::ExecutionEnvironmentPath,
     providers::{
@@ -172,10 +171,6 @@ pub fn init_git_repo_with_remote(path: &Path, remote: &str) -> RepoIdentity {
     RepoIdentity::from_remote_url(remote).expect("remote should produce repo identity")
 }
 
-pub fn test_attachable_store(config: &ConfigStore) -> SharedAttachableStore {
-    shared_file_backed_attachable_store(config.base_path())
-}
-
 #[derive(Default)]
 pub struct FakeDiscoveryProviders {
     pub checkout_manager: Option<Arc<dyn Vcs>>,
@@ -183,7 +178,6 @@ pub struct FakeDiscoveryProviders {
     pub issue_tracker: Option<Arc<dyn IssueProvider>>,
     pub presentation_manager: Option<Arc<dyn PresentationManager>>,
     pub terminal_pool: Option<Arc<dyn TerminalPool>>,
-    pub attachable_store: Option<SharedAttachableStore>,
 }
 
 impl FakeDiscoveryProviders {
@@ -213,11 +207,6 @@ impl FakeDiscoveryProviders {
 
     pub fn with_terminal_pool(mut self, provider: Arc<dyn TerminalPool>) -> Self {
         self.terminal_pool = Some(provider);
-        self
-    }
-
-    pub fn with_attachable_store(mut self, store: SharedAttachableStore) -> Self {
-        self.attachable_store = Some(store);
         self
     }
 }
@@ -414,7 +403,6 @@ fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> super
         ))]),
         repo_detectors: super::detectors::default_repo_detectors(),
         factories: super::FactoryRegistry::default_all(),
-        attachable_store: OnceLock::new(),
         host_scoped_providers: Default::default(),
     }
 }
@@ -868,7 +856,7 @@ impl PresentationManager for FakePresentationManager {
     async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         let mut store = self.workspaces.lock().await;
         let ws_ref = format!("workspace:{}", store.len() + 1);
-        let workspace = Workspace { name: config.name.clone(), attachable_set_id: None };
+        let workspace = Workspace { name: config.name.clone() };
         store.push((ws_ref.clone(), workspace.clone()));
         Ok((ws_ref, workspace))
     }
@@ -1377,11 +1365,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
     }
 
-    let attachable_store = std::sync::OnceLock::new();
-    if let Some(store) = providers.attachable_store {
-        let _ = attachable_store.set(store);
-    }
-
     DiscoveryRuntime {
         runner,
         env: Arc::new(TestEnvVars::default()),
@@ -1398,7 +1381,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![Box::new(super::factories::host_direct::HostDirectEnvironmentFactory)],
         },
-        attachable_store,
         host_scoped_providers: Default::default(),
     }
 }

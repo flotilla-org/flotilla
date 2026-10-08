@@ -288,16 +288,16 @@ pub use commands::{
     ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, CrewSupervisionAction, EvidenceFreshness, ExplainedArtifact,
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
     ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition,
-    ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace,
-    RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceDigest, ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope,
-    ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,
+    ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, RepoSelector, ResourceCursor, ResourceDigest,
+    ResourceDigestQuery, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType,
+    StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRung,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AgentStatus, AheadBehind, AttachableId,
-    AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, DispatchIssueFacts, Issue,
-    IssueChangeset, IssueRef, IssueSource, IssueState, ManagedTerminal, PaneExitAttention, ProviderData, RemoteAccessPoint,
-    RemoteAccessType, SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
+    ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, DispatchIssueFacts, Issue, IssueChangeset, IssueRef,
+    IssueSource, IssueState, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus, WorkingTreeStatus,
+    Workspace,
 };
 pub use query::{
     BlobSyncStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse,

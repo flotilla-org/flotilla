@@ -130,7 +130,7 @@ impl super::PresentationManager for ZellijPresentationManager {
                 let tab_id = tab["tab_id"].as_u64()?;
                 let name = tab["name"].as_str()?.to_string();
                 let ws_ref = format!("{session}:{tab_id}");
-                Some((ws_ref, Workspace { name, attachable_set_id: None }))
+                Some((ws_ref, Workspace { name }))
             })
             .collect();
 
@@ -205,7 +205,7 @@ impl super::PresentationManager for ZellijPresentationManager {
         let session = self.session_name()?;
         let ws_ref = format!("{session}:{tab_id}");
         info!(workspace = %config.name, "zellij: workspace ready");
-        Ok((ws_ref, Workspace { name: config.name.clone(), attachable_set_id: None }))
+        Ok((ws_ref, Workspace { name: config.name.clone() }))
     }
 
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {

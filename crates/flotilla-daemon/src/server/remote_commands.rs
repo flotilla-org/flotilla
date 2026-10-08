@@ -723,13 +723,7 @@ impl RemoteCommandRouter {
         self.daemon.send_event(DaemonEvent::CommandFinished {
             command_id: entry.command_id,
             node_id: responder_node_id,
-            repo_identity: entry
-                .repo_identity
-                .or_else(|| match &result {
-                    CommandValue::TerminalPrepared { repo_identity, .. } => Some(repo_identity.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(fallback_repo_identity),
+            repo_identity: entry.repo_identity.unwrap_or_else(fallback_repo_identity),
             repo: entry.repo,
             result,
         });
@@ -1510,7 +1504,7 @@ pub(super) fn extract_command_repo_identity(command: &Command) -> Option<RepoIde
     }
     match &command.action {
         CommandAction::Checkout { repo: RepoSelector::Identity(identity), .. } => Some(identity.clone()),
-        CommandAction::PrepareTerminalForCheckout { .. } => None,
+
         CommandAction::UntrackRepo { repo: RepoSelector::Identity(identity) } => Some(identity.clone()),
         CommandAction::Refresh { repo: Some(RepoSelector::Identity(identity)) } => Some(identity.clone()),
         _ => None,

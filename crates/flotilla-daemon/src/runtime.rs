@@ -779,7 +779,6 @@ impl DaemonRuntime {
             ),
             spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
-            spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
             spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
@@ -3784,13 +3783,6 @@ where
         }
     });
     (task, ready_rx)
-}
-
-fn spawn_managed_terminal_attention_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let daemon = Arc::clone(&daemon);
-        async move { daemon.refresh_managed_terminal_attention().await }
-    })
 }
 
 fn spawn_demand_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {

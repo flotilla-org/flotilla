@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, ChangeRequest, Checkout, CloudAgentSession, Issue,
-    ManagedTerminal, Workspace,
-};
+use crate::{qualified_path::QualifiedPath, ChangeRequest, Checkout, CloudAgentSession, Issue, Workspace};
 
 /// Operation on a keyed collection entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -41,9 +38,9 @@ pub enum Change {
     Issue { key: String, op: EntryOp<Issue> },
     Session { key: String, op: EntryOp<CloudAgentSession> },
     Workspace { key: String, op: EntryOp<Workspace> },
-    AttachableSet { key: AttachableSetId, op: EntryOp<AttachableSet> },
+
     Branch { key: String, op: EntryOp<Branch> },
-    ManagedTerminal { key: AttachableId, op: EntryOp<ManagedTerminal> },
+
     ProviderHealth { category: String, provider: String, op: EntryOp<bool> },
 }
 

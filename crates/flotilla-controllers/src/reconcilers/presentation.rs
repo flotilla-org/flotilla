@@ -12,7 +12,6 @@ use flotilla_core::{
         environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
         remote::ssh_resolver_from_config,
         resolver::HopResolver,
-        terminal::NoopTerminalHopResolver,
         Hop, ResolutionContext, ResolvedAction,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -309,7 +308,7 @@ impl<R> PresentationReconciler<R> {
             } else {
                 Arc::new(NoopEnvironmentHopResolver)
             };
-        let hop_resolver = HopResolver::new(Arc::new(ssh_resolver), env_resolver, Arc::new(NoopTerminalHopResolver));
+        let hop_resolver = HopResolver::new(Arc::new(ssh_resolver), env_resolver);
         let target_host = self.hop_chain.target_host(host_ref);
         let mut plan = HopPlanBuilder::new(self.hop_chain.local_host()).build_for_prepared_command(&target_host, &attach_args);
         if environment.spec.docker.is_some() {

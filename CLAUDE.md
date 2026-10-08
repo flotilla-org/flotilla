@@ -117,7 +117,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 
 | Crate | Role |
 |-------|------|
-| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, attachables, step plans, `DaemonHandle` trait, `InProcessDaemon` composition root |
+| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `DaemonHandle` trait, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
@@ -147,7 +147,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-core/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
 | `crates/flotilla-core/src/step.rs` | Step planning and execution system |
 | `crates/flotilla-core/src/agents/` | Agent hook handling and state management |
-| `crates/flotilla-core/src/attachable/` | Attachable session set management |
+| `crates/flotilla-core/src/attachable/` | Agent-hook identity shim pending AgentSession |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
 | `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, and replay support |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |

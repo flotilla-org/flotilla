@@ -1,3 +1,5 @@
+mod template;
+use self::template::{PaneLayout, PaneTemplate, SurfaceTemplate, WorkspaceTemplate};
 pub mod cmux;
 pub mod zellij;
 
@@ -5,10 +7,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::{
-    providers::types::{Workspace, WorkspaceAttachRequest},
-    template::{self, PaneLayout, PaneTemplate, SurfaceTemplate, WorkspaceTemplate},
-};
+use crate::providers::types::{Workspace, WorkspaceAttachRequest};
 
 #[async_trait]
 pub trait PresentationManager: Send + Sync {
@@ -82,8 +81,8 @@ fn build_pane_layout(tmpl: &WorkspaceTemplate, resolved: &[(String, String)]) ->
 
 #[cfg(test)]
 mod tests {
+    use super::template::{ContentEntry, LayoutSlot, WorkspaceTemplate};
     use super::*;
-    use crate::template::{ContentEntry, LayoutSlot, WorkspaceTemplate};
 
     #[test]
     fn build_pane_layout_maps_layout_to_panes() {

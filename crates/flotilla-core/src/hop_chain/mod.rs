@@ -10,21 +10,19 @@ pub mod environment;
 pub mod flatten;
 pub mod remote;
 pub mod resolver;
-pub mod terminal;
 #[cfg(test)]
 mod tests;
 
 pub use flotilla_protocol::{arg::Arg, ResolvedAttachAction as ResolvedAction};
 use flotilla_protocol::{EnvironmentId, HostName};
 
-use crate::{attachable::AttachableId, path_context::ExecutionEnvironmentPath};
+use crate::path_context::ExecutionEnvironmentPath;
 
 /// Declarative — what needs to happen, not how.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hop {
     RemoteToHost { host: HostName },
     EnterEnvironment { env_id: EnvironmentId, provider: String },
-    AttachTerminal { attachable_id: AttachableId },
     RunCommand { command: Vec<Arg> },
 }
 

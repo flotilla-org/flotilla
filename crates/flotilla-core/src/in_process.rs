@@ -50,15 +50,14 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::QualifiedPath,
     result_set::{ConvoyChangeRequest, Rows},
-    AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CliListKind, CliListResponse, CliListRow, Command, CommandAction,
-    CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListResponse, DaemonEvent, DispatchQueueResponse,
-    EntryOp, EnvironmentId, FleetHealthResponse, FleetListResponse, FulfilmentAllocation, FulfilmentAllocationCandidate,
-    FulfilmentListResponse, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary,
-    LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
-    PlacementViableCandidate, PrincipalRef, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity,
-    RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceRecordType,
-    ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    AttachBinding, CanonicalHostId, CheckoutArchiveOutcome, CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue,
+    ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListResponse, DaemonEvent, DispatchQueueResponse, EnvironmentId,
+    FleetHealthResponse, FleetListResponse, FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentListResponse, HostListResponse,
+    HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, NodeId, NodeInfo,
+    PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
+    ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceRecordType, ResourceRef, StatusResponse, StreamKey,
+    SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
@@ -1337,27 +1336,6 @@ fn convoy_home_unreachable_message(
     )
 }
 
-fn managed_terminal_changes(
-    previous: Option<&HashMap<flotilla_protocol::AttachableId, ManagedTerminal>>,
-    current: &HashMap<flotilla_protocol::AttachableId, ManagedTerminal>,
-) -> Vec<Change> {
-    let mut changes = Vec::new();
-    for (key, terminal) in current {
-        let op = match previous.and_then(|terminals| terminals.get(key)) {
-            Some(previous) if previous == terminal => continue,
-            Some(_) => EntryOp::Updated(terminal.clone()),
-            None => EntryOp::Added(terminal.clone()),
-        };
-        changes.push(Change::ManagedTerminal { key: key.clone(), op });
-    }
-    if let Some(previous) = previous {
-        for key in previous.keys().filter(|key| !current.contains_key(*key)) {
-            changes.push(Change::ManagedTerminal { key: key.clone(), op: EntryOp::Removed });
-        }
-    }
-    changes
-}
-
 #[async_trait::async_trait]
 impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
     async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
@@ -1431,9 +1409,6 @@ pub struct InProcessDaemon {
     /// Heartbeats publish these observations into Host status.
     local_provider_statuses: Vec<HostProviderStatus>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
-    /// Last terminal state published per repository, used to emit field-scoped
-    /// deltas without disturbing unrelated provider snapshot state.
-    managed_terminals_by_repo: RwLock<HashMap<RepoIdentity, HashMap<flotilla_protocol::AttachableId, ManagedTerminal>>>,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
@@ -1944,7 +1919,6 @@ impl InProcessDaemon {
             operator_reconciler: RwLock::new(None),
             local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
-            managed_terminals_by_repo: RwLock::new(HashMap::new()),
         });
         crew_ops.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew_ops) })).await;
 
@@ -3426,14 +3400,7 @@ impl InProcessDaemon {
                 }
             }
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
-            CommandAction::FetchCheckoutStatus { .. }
-            | CommandAction::ArchiveSession { .. }
-            | CommandAction::GenerateBranchName { .. }
-            | CommandAction::TeleportSession { .. }
-            | CommandAction::CreateWorkspaceForCheckout { .. }
-            | CommandAction::CreateWorkspaceFromPreparedTerminal { .. }
-            | CommandAction::PrepareTerminalForCheckout { .. }
-            | CommandAction::SelectWorkspace { .. } => {
+            CommandAction::FetchCheckoutStatus { .. } | CommandAction::ArchiveSession { .. } | CommandAction::GenerateBranchName { .. } => {
                 let selector = command.context_repo.as_ref().ok_or_else(|| "command requires repo context".to_string())?;
                 self.resolve_repo_selector(selector).await
             }
@@ -4581,88 +4548,6 @@ impl InProcessDaemon {
             Err(error) => {
                 warn!(repo = %path.display(), %error, "repository identity is unavailable during refresh");
                 Ok(None)
-            }
-        }
-    }
-
-    /// Refresh host-local bare pane state and publish field-scoped deltas.
-    /// Pools are scanned once even when several tracked repositories share the
-    /// same host-scoped provider.
-    pub async fn refresh_managed_terminal_attention(&self) {
-        struct RepoTerminals {
-            identity: RepoIdentity,
-            roots: Vec<PathBuf>,
-            pool_key: usize,
-        }
-
-        let (repos, pools) = {
-            let tracked = self.repos.read().await;
-            let mut repos = Vec::new();
-            let mut pools = HashMap::new();
-            for state in tracked.values() {
-                let registry = state.registry();
-                let Some(pool) = registry.terminal_pools.preferred().cloned() else { continue };
-                let pool_key = Arc::as_ptr(&pool) as *const () as usize;
-                pools.entry(pool_key).or_insert(pool);
-                let roots = state.local_paths().into_iter().map(|root| canonical_or_original(&root)).collect();
-                repos.push(RepoTerminals { identity: state.identity().clone(), roots, pool_key });
-            }
-            (repos, pools)
-        };
-
-        let store = self.discovery.shared_attachable_store(&self.config);
-        for (pool_key, pool) in pools {
-            let manager = crate::terminal_manager::TerminalManager::new(pool, store.clone(), self.host_name.clone());
-            let terminals = match manager.refresh().await {
-                Ok(terminals) => terminals,
-                Err(error) => {
-                    warn!(%error, "failed to refresh managed terminal attention");
-                    continue;
-                }
-            };
-            let pool_repos = repos.iter().filter(|repo| repo.pool_key == pool_key).collect::<Vec<_>>();
-            let mut current = pool_repos.iter().map(|repo| (repo.identity.clone(), HashMap::new())).collect::<HashMap<_, HashMap<_, _>>>();
-            for terminal in &terminals {
-                let working_directory = canonical_or_original(terminal.working_directory.as_path());
-                // A nested checkout can share a path prefix with another
-                // tracked repository. Attribute the pane to the most-specific
-                // root only so one exit cannot surface on multiple checkouts.
-                let owner = pool_repos
-                    .iter()
-                    .flat_map(|repo| repo.roots.iter().map(move |root| (*repo, root)))
-                    .filter(|(_, root)| working_directory.starts_with(root))
-                    .max_by_key(|(_, root)| root.components().count())
-                    .map(|(repo, _)| repo);
-                if let Some(repo) = owner {
-                    current.get_mut(&repo.identity).expect("pool repository is initialized").insert(
-                        terminal.attachable_id.clone(),
-                        ManagedTerminal {
-                            set_id: terminal.attachable_set_id.clone(),
-                            role: terminal.role.clone(),
-                            command: terminal.command.clone(),
-                            working_directory: terminal.working_directory.as_path().to_path_buf(),
-                            status: terminal.status.clone(),
-                            attention: terminal.attention.clone(),
-                        },
-                    );
-                }
-            }
-
-            let mut previous = self.managed_terminals_by_repo.write().await;
-            for repo in pool_repos {
-                let next = current.remove(&repo.identity).expect("pool repository is initialized");
-                let changes = managed_terminal_changes(previous.get(&repo.identity), &next);
-                previous.insert(repo.identity.clone(), next);
-                if changes.is_empty() {
-                    continue;
-                }
-                self.event_sink.emit(DaemonEvent::RepoDelta(Box::new(RepoDelta {
-                    seq: 0,
-                    prev_seq: 0,
-                    repo_identity: repo.identity.clone(),
-                    repo: repo.roots.first().cloned(),
-                    changes,
-                })));
             }
         }
     }
@@ -5916,7 +5801,6 @@ impl InProcessDaemon {
         let providers_data = Arc::new(self.executor_provider_data(&request.repo_identity, &local_repo_path, &registry).await);
 
         let config_base = DaemonHostPath::new(self.config.base_path().as_path());
-        let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone().map(DaemonHostPath::new);
         let resolver = executor::ExecutorStepResolver {
             repo: executor::RepoExecutionContext {
@@ -5928,9 +5812,8 @@ impl InProcessDaemon {
             runner: Arc::clone(&self.discovery.runner),
             env: Arc::clone(&self.discovery.env),
             config_base,
-            attachable_store,
             daemon_socket_path,
-            local_node_id: self.node_id.clone(),
+
             local_host: self.host_name.clone(),
             environment_manager: Arc::clone(&self.environment_manager),
             vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
@@ -7532,7 +7415,6 @@ impl InProcessDaemon {
 
         let local_host = self.host_name.clone();
         let local_node_id = self.node_id.clone();
-        let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         let environment_manager = Arc::clone(&self.environment_manager);
         let vcs_resolver = self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>;
@@ -7542,25 +7424,14 @@ impl InProcessDaemon {
             let resolver_runner = Arc::clone(&runner);
             let resolver_env = Arc::clone(&env);
             let resolver_config_base = config_base.clone();
-            let resolver_attachable_store = attachable_store.clone();
             let resolver_local_host = local_host.clone();
             let ee_repo_path = ExecutionEnvironmentPath::new(&repo_path);
             let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path.clone() };
             let daemon_socket_dhp = daemon_socket_path.map(DaemonHostPath::new);
 
-            let plan = executor::build_plan(
-                command,
-                executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
-                registry,
-                providers_data,
-                config_base,
-                attachable_store,
-                daemon_socket_dhp.clone(),
-                local_node_id.clone(),
-                local_host,
-            )
-            .await
-            .map_err(executor::PlannerRefusal::into_command_value);
+            let plan = executor::build_plan(command, providers_data, local_node_id.clone(), local_host)
+                .await
+                .map_err(executor::PlannerRefusal::into_command_value);
 
             match plan {
                 Err(result) => {
@@ -7584,9 +7455,8 @@ impl InProcessDaemon {
                         runner: resolver_runner,
                         env: resolver_env,
                         config_base: resolver_config_base,
-                        attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_dhp.clone(),
-                        local_node_id: local_node_id.clone(),
+
                         local_host: resolver_local_host.clone(),
                         environment_manager: Arc::clone(&environment_manager),
                         vcs_resolver: Arc::clone(&vcs_resolver),

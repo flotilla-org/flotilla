@@ -189,11 +189,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::Cancelled => {
             app.set_status_message(Some("Command cancelled".into()));
         }
-        CommandValue::TerminalPrepared { .. }
-        | CommandValue::PreparedWorkspace(_)
-        | CommandValue::AttachCommandResolved { .. }
-        | CommandValue::CheckoutPathResolved { .. }
-        | CommandValue::CheckoutStatus(_) => {
+        CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutStatus(_) => {
             tracing::warn!("unexpected internal step result reached UI handler");
         }
         CommandValue::RepositoryResolved { .. }

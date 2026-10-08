@@ -12,7 +12,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         presentation::PresentationManager,
-        terminal::{ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize},
+        terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize},
         types::{Workspace, WorkspaceAttachRequest},
     },
 };
@@ -136,10 +136,6 @@ impl TerminalPool for SharedTerminalPool {
     async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
         // Attach needs the endpoint's current state, not the shared discovery snapshot.
         self.inner.session_liveness(session_id).await
-    }
-
-    fn managed_session_name(&self, metadata: &ManagedSessionMetadata) -> Option<String> {
-        self.inner.managed_session_name(metadata)
     }
 
     fn tracks_session_liveness(&self) -> bool {
@@ -306,7 +302,7 @@ mod tests {
         }
 
         async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-            let workspace = Workspace { name: config.name.clone(), attachable_set_id: None };
+            let workspace = Workspace { name: config.name.clone() };
             let entry = (format!("workspace:{}", config.name), workspace);
             self.workspaces.lock().await.push(entry.clone());
             Ok(entry)

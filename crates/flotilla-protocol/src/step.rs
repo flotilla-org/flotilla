@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    path_context::ExecutionEnvironmentPath, qualified_path::QualifiedPath, AttachableSetId, CommandValue, NodeId, PreparedTerminalCommand,
-    ResolvedPaneCommand,
-};
+use crate::{path_context::ExecutionEnvironmentPath, CommandValue, NodeId};
 
 /// Whether a checkout command targets an existing branch or creates a fresh one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,21 +55,6 @@ pub enum StepAction {
     },
     RemoveCheckout {
         branch: String,
-        deleted_checkout_paths: Vec<QualifiedPath>,
-    },
-
-    // Teleport
-    ResolveAttachCommand {
-        session_id: String,
-    },
-    EnsureCheckoutForTeleport {
-        branch: Option<String>,
-        checkout_key: Option<ExecutionEnvironmentPath>,
-        initial_path: Option<ExecutionEnvironmentPath>,
-    },
-    CreateTeleportWorkspace {
-        session_id: String,
-        branch: Option<String>,
     },
 
     // Session
@@ -81,29 +63,6 @@ pub enum StepAction {
     },
     GenerateBranchName {
         issue_keys: Vec<String>,
-    },
-
-    // Workspace lifecycle (new)
-    CreateWorkspaceFromPreparedTerminal {
-        target_node_id: NodeId,
-        branch: String,
-        checkout_path: ExecutionEnvironmentPath,
-        attachable_set_id: Option<AttachableSetId>,
-        commands: Vec<ResolvedPaneCommand>,
-    },
-    PrepareWorkspace {
-        checkout_path: Option<ExecutionEnvironmentPath>,
-        label: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        display_host: Option<crate::HostName>,
-    },
-    AttachWorkspace,
-    SelectWorkspace {
-        ws_ref: String,
-    },
-    PrepareTerminalForCheckout {
-        checkout_path: ExecutionEnvironmentPath,
-        commands: Vec<PreparedTerminalCommand>,
     },
 
     // Query

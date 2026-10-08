@@ -17,7 +17,7 @@ pub mod test_support;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -30,7 +30,6 @@ use tokio::sync::OnceCell as AsyncOnceCell;
 use crate::{
     admission::{system_available_space_probe, AvailableSpaceProbe},
     agent_adapter::AgentAdapterRegistry,
-    attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
@@ -535,7 +534,6 @@ pub struct DiscoveryRuntime {
     pub host_detectors: Arc<Vec<Box<dyn HostDetector>>>,
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
-    pub(crate) attachable_store: OnceLock<SharedAttachableStore>,
     pub(crate) host_scoped_providers: HostScopedProviderCache,
 }
 
@@ -691,13 +689,8 @@ impl DiscoveryRuntime {
             host_detectors: Arc::new(detectors::default_host_detectors()),
             repo_detectors: detectors::default_repo_detectors(),
             factories: FactoryRegistry::default_all(),
-            attachable_store: OnceLock::new(),
             host_scoped_providers: HostScopedProviderCache::default(),
         }
-    }
-
-    pub fn shared_attachable_store(&self, config: &ConfigStore) -> SharedAttachableStore {
-        Arc::clone(self.attachable_store.get_or_init(|| shared_file_backed_attachable_store(config.base_path())))
     }
 }
 

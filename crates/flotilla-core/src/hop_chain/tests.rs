@@ -12,11 +12,9 @@ use super::{
     environment::{DockerEnvironmentHopResolver, EnvironmentHopResolver, NoopEnvironmentHopResolver},
     remote::{RemoteHopResolver, SshRemoteHopResolver},
     resolver::HopResolver,
-    terminal::{NoopTerminalHopResolver, TerminalHopResolver},
     Hop, HopPlan, ResolutionContext, ResolvedAction,
 };
 use crate::{
-    attachable::AttachableId,
     config::{HostsConfig, RemoteHostConfig, SshConfig},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
 };
@@ -352,38 +350,18 @@ impl RemoteHopResolver for RecordingRemote {
     }
 }
 
-#[derive(Default)]
-struct RecordingTerminal {
-    calls: Mutex<Vec<AttachableId>>,
-}
-
-impl TerminalHopResolver for RecordingTerminal {
-    fn resolve(&self, attachable_id: &AttachableId, context: &mut ResolutionContext) -> Result<(), String> {
-        self.calls.lock().expect("calls lock").push(attachable_id.clone());
-        context.actions.push(ResolvedAction::Command(vec![
-            Arg::Literal("cleat".into()),
-            Arg::Literal("attach".into()),
-            Arg::Quoted(attachable_id.to_string()),
-        ]));
-        Ok(())
-    }
-}
-
 #[test]
 fn resolver_composes_command_execution_inside_out() {
     let environment = EnvironmentId::new("crew-box");
-    let attachable = AttachableId::new("session");
     let remote = Arc::new(RecordingRemote::default());
-    let terminal = Arc::new(RecordingTerminal::default());
     let resolver = HopResolver::new(
         remote.clone(),
         Arc::new(DockerEnvironmentHopResolver::new(HashMap::from([(environment.clone(), "crew-container".to_string())]))),
-        terminal.clone(),
     );
     let plan = HopPlan(vec![
         Hop::RemoteToHost { host: HostName::new("udder") },
         Hop::EnterEnvironment { env_id: environment.clone(), provider: "docker".into() },
-        Hop::AttachTerminal { attachable_id: attachable.clone() },
+        Hop::RunCommand { command: vec![Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Quoted("session".into())] },
     ]);
     let mut context = context();
 
@@ -398,18 +376,13 @@ fn resolver_composes_command_execution_inside_out() {
     assert_eq!(docker[4], Arg::Quoted("crew-container".into()));
     assert_eq!(docker[7..], [Arg::Literal("cleat".into()), Arg::Literal("attach".into()), Arg::Quoted("session".into())]);
     assert_eq!(*remote.calls.lock().expect("calls lock"), [HostName::new("udder")]);
-    assert_eq!(*terminal.calls.lock().expect("calls lock"), [attachable]);
     assert_eq!(context.nesting_depth, 2);
 }
 
 #[test]
 fn resolver_collapses_local_host_and_current_environment() {
     let environment = EnvironmentId::new("crew-box");
-    let resolver = HopResolver::new(
-        Arc::new(super::remote::NoopRemoteHopResolver),
-        Arc::new(NoopEnvironmentHopResolver),
-        Arc::new(NoopTerminalHopResolver),
-    );
+    let resolver = HopResolver::new(Arc::new(super::remote::NoopRemoteHopResolver), Arc::new(NoopEnvironmentHopResolver));
     let plan = HopPlan(vec![
         Hop::RemoteToHost { host: HostName::new("kiwi") },
         Hop::EnterEnvironment { env_id: environment.clone(), provider: "docker".into() },
@@ -426,11 +399,7 @@ fn resolver_collapses_local_host_and_current_environment() {
 
 #[test]
 fn missing_environment_adapter_names_the_environment() {
-    let resolver = HopResolver::new(
-        Arc::new(super::remote::NoopRemoteHopResolver),
-        Arc::new(NoopEnvironmentHopResolver),
-        Arc::new(NoopTerminalHopResolver),
-    );
+    let resolver = HopResolver::new(Arc::new(super::remote::NoopRemoteHopResolver), Arc::new(NoopEnvironmentHopResolver));
     let plan = HopPlan(vec![
         Hop::EnterEnvironment { env_id: EnvironmentId::new("missing"), provider: "docker".into() },
         Hop::RunCommand { command: vec![Arg::Literal("true".into())] },

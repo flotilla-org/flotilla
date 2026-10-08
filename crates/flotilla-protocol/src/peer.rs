@@ -388,12 +388,9 @@ mod tests {
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             step_offset: 2,
             steps: vec![Step {
-                description: "Prepare terminal".into(),
+                description: "Remove checkout".into(),
                 host: StepExecutionContext::Host(NodeId::new("feta")),
-                action: StepAction::PrepareTerminalForCheckout {
-                    checkout_path: crate::ExecutionEnvironmentPath::new("/repo"),
-                    commands: vec![],
-                },
+                action: StepAction::RemoveCheckout { branch: "feature".into() },
             }],
         };
         let json_value = serde_json::to_value(&msg).expect("serialize");

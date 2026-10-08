@@ -1,36 +1,17 @@
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
-use flotilla_protocol::{provider_data::Issue, qualified_path::QualifiedPath, CommandValue, HostName, IssueSource};
+use flotilla_protocol::{provider_data::Issue, CommandValue, IssueSource};
 use tracing::{info, warn};
 
-use super::{known_local_checkout_key, WorkspaceOrchestrator};
 use crate::{
-    attachable::SharedAttachableStore,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, types::CloudAgentSession},
-    terminal_manager::TerminalManager,
 };
 
 pub(super) struct ReadOnlySessionActionService<'a> {
     issue_source: IssueSource,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
-}
-
-pub(super) struct TeleportSessionActionService<'a> {
-    read_only: ReadOnlySessionActionService<'a>,
-    repo_root: &'a ExecutionEnvironmentPath,
-    config_base: &'a DaemonHostPath,
-    attachable_store: &'a SharedAttachableStore,
-    daemon_socket_path: Option<&'a Path>,
-    local_host: &'a HostName,
-    terminal_manager: Option<&'a TerminalManager>,
-}
-
-pub(super) struct TeleportFlow<'a> {
-    service: TeleportSessionActionService<'a>,
-    checkout_key: Option<&'a ExecutionEnvironmentPath>,
 }
 
 impl<'a> ReadOnlySessionActionService<'a> {
@@ -156,127 +137,6 @@ impl<'a> ReadOnlySessionActionService<'a> {
     }
 }
 
-impl<'a> TeleportSessionActionService<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        repo_root: &'a ExecutionEnvironmentPath,
-        issue_source: IssueSource,
-        registry: &'a ProviderRegistry,
-        providers_data: &'a ProviderData,
-        config_base: &'a DaemonHostPath,
-        attachable_store: &'a SharedAttachableStore,
-        daemon_socket_path: Option<&'a Path>,
-        local_host: &'a HostName,
-        terminal_manager: Option<&'a TerminalManager>,
-    ) -> Self {
-        Self {
-            read_only: ReadOnlySessionActionService::new(issue_source, registry, providers_data),
-            repo_root,
-            config_base,
-            attachable_store,
-            daemon_socket_path,
-            local_host,
-            terminal_manager,
-        }
-    }
-
-    pub(super) async fn resolve_teleport_checkout_path(
-        &self,
-        checkout_key: Option<&ExecutionEnvironmentPath>,
-        branch: Option<&str>,
-    ) -> Result<Option<ExecutionEnvironmentPath>, String> {
-        if let Some(path) = self.checkout_path_from_key(checkout_key) {
-            return Ok(Some(path));
-        }
-
-        match branch {
-            Some(branch_name) => {
-                let vcs = self.read_only.registry.vcs.preferred().cloned().ok_or_else(|| "No VCS provider available".to_string())?;
-                let (path, _checkout) = vcs.create_checkout(branch_name, false).await?;
-                Ok(Some(path))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub(super) async fn create_workspace_for_teleport(
-        &self,
-        checkout_path: &Path,
-        checkout_key: &QualifiedPath,
-        branch: Option<&str>,
-        teleport_cmd: &str,
-    ) -> Result<(), String> {
-        let workspace_orchestrator = WorkspaceOrchestrator::new(
-            self.repo_root.as_path(),
-            self.read_only.registry,
-            self.config_base.as_path(),
-            self.attachable_store,
-            self.daemon_socket_path,
-            self.local_host,
-            self.terminal_manager,
-        );
-        let name = branch.unwrap_or("session");
-        workspace_orchestrator.create_workspace_for_teleport(checkout_path, Some(checkout_key), name, teleport_cmd).await
-    }
-
-    fn checkout_path_from_key(&self, checkout_key: Option<&ExecutionEnvironmentPath>) -> Option<ExecutionEnvironmentPath> {
-        checkout_key
-            .and_then(|key| known_local_checkout_key(self.read_only.providers_data, key.as_path(), self.local_host).map(|_| key.clone()))
-    }
-}
-
-impl<'a> TeleportFlow<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        repo_root: &'a ExecutionEnvironmentPath,
-        issue_source: IssueSource,
-        registry: &'a ProviderRegistry,
-        providers_data: &'a ProviderData,
-        config_base: &'a DaemonHostPath,
-        attachable_store: &'a SharedAttachableStore,
-        daemon_socket_path: Option<&'a Path>,
-        local_host: &'a HostName,
-        _session_id: &'a str,
-        _branch: Option<&'a str>,
-        checkout_key: Option<&'a ExecutionEnvironmentPath>,
-    ) -> Self {
-        Self {
-            service: TeleportSessionActionService::new(
-                repo_root,
-                issue_source,
-                registry,
-                providers_data,
-                config_base,
-                attachable_store,
-                daemon_socket_path,
-                local_host,
-                None,
-            ),
-            checkout_key,
-        }
-    }
-
-    pub(super) async fn initial_checkout_path(&self) -> Result<Option<ExecutionEnvironmentPath>, String> {
-        self.service.resolve_teleport_checkout_path(self.checkout_key, None).await
-    }
-}
-
 fn session_provider_key<'a>(session: &'a CloudAgentSession, _session_id: &str) -> Option<&'a str> {
     (!session.provider_name.is_empty()).then_some(session.provider_name.as_str())
-}
-
-pub(super) async fn resolve_attach_command(
-    session_id: &str,
-    registry: &ProviderRegistry,
-    providers_data: &ProviderData,
-) -> Result<String, String> {
-    let provider_key = providers_data
-        .sessions
-        .get(session_id)
-        .and_then(|session| session_provider_key(session, session_id))
-        .ok_or_else(|| format!("Cannot determine provider for session {session_id}"))?;
-
-    let (_, coding_agent) = registry.cloud_agents.get(provider_key).ok_or_else(|| format!("No coding agent provider: {provider_key}"))?;
-
-    coding_agent.attach_command(session_id).await
 }
