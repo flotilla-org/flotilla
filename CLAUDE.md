@@ -95,6 +95,12 @@ This fork exists for Claude Code Web sessions. Two things to be aware of:
 
 ## Architecture
 
+### Environment provider lifecycle
+
+See [ADR 0058](docs/adr/0058-environment-providers-own-lifecycle-and-runtime-capabilities.md)
+for provider selection, preparation ownership, host adoption and image capability boundaries.
+
+
 Provider observations and control-plane resources meet at the Aggregator:
 
 ```

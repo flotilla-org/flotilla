@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        environment::{CreateOpts, EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
+        environment::{EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
         terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
     },
 };
-use flotilla_protocol::{EnvironmentId, ImageId};
+use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
     DockerEnvironmentSpec, DockerImagePullPolicy, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSpec,
 };
@@ -18,11 +18,23 @@ struct FakeEnvironmentProvider;
 
 #[async_trait]
 impl EnvironmentProvider for FakeEnvironmentProvider {
-    async fn ensure_image(&self, _spec: &flotilla_protocol::EnvironmentSpec, _repo_root: &std::path::Path) -> Result<ImageId, String> {
-        Ok(ImageId::new("image-1"))
+    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
+        flotilla_core::providers::environment::EnvironmentKind::Docker
+    }
+    async fn prepare(
+        &self,
+        _spec: &flotilla_resources::EnvironmentSpec,
+        _opts: &flotilla_core::providers::environment::PrepareOpts,
+    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
+        Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
-    async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<Arc<dyn ProvisionedEnvironment>, String> {
+    async fn provision(
+        &self,
+        _id: EnvironmentId,
+        _image: &flotilla_core::providers::environment::PreparedEnvironment,
+        _opts: flotilla_core::providers::environment::ProvisionOpts,
+    ) -> Result<Arc<dyn ProvisionedEnvironment>, String> {
         unimplemented!("test double")
     }
 

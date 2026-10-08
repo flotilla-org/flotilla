@@ -175,11 +175,11 @@ impl EnvironmentOrphanSweep {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Mutex};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use flotilla_core::providers::environment::{CreateOpts, EnvironmentHandle};
-    use flotilla_protocol::{EnvironmentId, ImageId};
+    use flotilla_core::providers::environment::{EnvironmentHandle, ProvisionOpts};
+    use flotilla_protocol::EnvironmentId;
     use flotilla_resources::{EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta};
     use hegel::generators as gs;
 
@@ -198,10 +198,23 @@ mod tests {
     }
     #[async_trait]
     impl EnvironmentProvider for DockerBoundary {
-        async fn ensure_image(&self, _: &flotilla_protocol::EnvironmentSpec, _: &Path) -> Result<ImageId, String> {
-            unreachable!()
+        fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
+            flotilla_core::providers::environment::EnvironmentKind::Docker
         }
-        async fn create(&self, _: EnvironmentId, _: &ImageId, _: CreateOpts) -> Result<EnvironmentHandle, String> {
+        async fn prepare(
+            &self,
+            _spec: &flotilla_resources::EnvironmentSpec,
+            _opts: &flotilla_core::providers::environment::PrepareOpts,
+        ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
+            Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+        }
+
+        async fn provision(
+            &self,
+            _: EnvironmentId,
+            _: &flotilla_core::providers::environment::PreparedEnvironment,
+            _: ProvisionOpts,
+        ) -> Result<EnvironmentHandle, String> {
             unreachable!()
         }
         async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {

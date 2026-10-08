@@ -21,11 +21,11 @@ use flotilla_resources::{
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
     DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
     ExitDeclaration, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
-    InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
-    ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
-    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
-    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
+    ResourceBackend, ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement,
+    VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
@@ -1568,6 +1568,22 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
             .build(),
     )
     .await;
+    // Placement freezes the exact runtime instance into the created environment
+    // so later provisioning and recovery cannot switch to a different endpoint.
+    let instance_key = flotilla_core::providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+    let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+    let policy = policies.get("policy-local-image").await.expect("placement policy");
+    policies
+        .update(
+            &InputMeta::builder()
+                .name("policy-local-image".into())
+                .labels(BTreeMap::from([(instance_key.into(), "rootless".into())]))
+                .build(),
+            &policy.metadata.resource_version,
+            &policy.spec,
+        )
+        .await
+        .expect("bind runtime instance");
     let vessel =
         create_workspace(&backend, NAMESPACE, "workspace-local-image", "convoy-local-image", "implement", "policy-local-image", REPO_URL)
             .await;
@@ -1579,8 +1595,8 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
     assert!(outcome.actuations.iter().any(|actuation| {
         matches!(
             actuation,
-            Actuation::CreateEnvironment { spec, .. }
-                if matches!(
+            Actuation::CreateEnvironment { spec, meta }
+                if meta.labels.get(instance_key).map(String::as_str) == Some("rootless") && matches!(
                     spec.docker.as_ref(),
                     Some(docker)
                         if docker.image == "flotilla-dev-env:latest"
@@ -3389,7 +3405,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
             let outcome = reconciler.reconcile(vessel, &prepared, Utc::now());
             assert!(
                 outcome.actuations.iter().any(|actuation| matches!(actuation,
-                    Actuation::CreateEnvironment { spec, .. } if spec.docker.as_ref().is_some_and(|docker| docker.image == image)
+                    Actuation::CreateEnvironment { spec, meta } if spec.docker.as_ref().is_some_and(|docker| docker.image == image && docker.image_build_ref.is_none()) && meta.labels.get("flotilla.work/legacy-image-baseline").map(String::as_str) == Some("fleet-crew")
                 )),
                 "each host must provision the new image: {:?}",
                 outcome.actuations

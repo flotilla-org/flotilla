@@ -13,6 +13,7 @@ use flotilla_core::{
         CrewBriefTemplateResolver,
     },
     in_process::BRIEF_ARTIFACTS_ANNOTATION,
+    providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL,
 };
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
@@ -604,7 +605,7 @@ impl Reconciler for VesselReconciler {
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
                         actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, BTreeMap::new()),
+                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
@@ -1042,7 +1043,7 @@ impl Reconciler for VesselReconciler {
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
                         actuations.push(Actuation::CreateEnvironment {
-                            meta: owned_child_meta(&env_name, obj, BTreeMap::new()),
+                            meta: owned_child_meta(&env_name, obj, environment_provider_labels(&placement_policy)),
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
@@ -1634,6 +1635,22 @@ pub fn checkout_path_component(branch: &str) -> String {
 
 fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {
     format!("{}/{}/{}.{}", repo_default_dir.trim_end_matches('/'), convoy_slug, repo_slug, branch_slug)
+}
+
+fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<String, String> = policy
+        .metadata
+        .labels
+        .get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL)
+        .map(|instance| (ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.clone()))
+        .into_iter()
+        .collect();
+    if let Some(docker) = &policy.spec.docker_per_vessel {
+        if let DockerImageSource::Baseline { image_baseline_ref } = &docker.image {
+            labels.insert("flotilla.work/legacy-image-baseline".into(), image_baseline_ref.clone());
+        }
+    }
+    labels
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {

@@ -10,6 +10,17 @@ use flotilla_resources::{
 
 #[async_trait]
 pub trait DockerEnvironmentRuntime: Send + Sync {
+    /// Adopt or provision through the selected environment provider.
+    async fn provision_environment(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::EnvironmentSpec,
+    ) -> Result<EnvironmentProvisioning, String> {
+        if let Some(docker) = &spec.docker {
+            return self.provision(name, docker).await.map(EnvironmentProvisioning::Docker);
+        }
+        Err("host-direct provider unavailable".into())
+    }
     async fn ensure_image(
         &self,
         _build: &ResourceObject<flotilla_resources::ImageBuild>,
@@ -99,10 +110,15 @@ impl<R> EnvironmentReconciler<R> {
     }
 }
 
+pub enum EnvironmentProvisioning {
+    HostDirect,
+    Docker(DockerProvisioning),
+}
+
 pub enum EnvironmentPrepared {
     Foreign,
     None,
-    Ready(DockerProvisioning),
+    Ready(EnvironmentProvisioning),
     Failed(String),
     Waiting(String, Vec<String>),
 }
@@ -221,20 +237,34 @@ where
                         resolved_identity = Some(delivered);
                         spec.pull_policy = DockerImagePullPolicy::Never;
                     }
-                    match self.docker.provision(&obj.metadata.name, &spec).await {
+                    match self
+                        .docker
+                        .provision_environment(
+                            &obj.metadata.name,
+                            &flotilla_resources::EnvironmentSpec { host_direct: None, docker: Some(spec) },
+                        )
+                        .await
+                    {
                         Ok(mut provisioning) => {
                             if let Some(identity) = resolved_identity {
-                                if provisioning.local_image_id != identity.local_image_id {
+                                if !matches!(&provisioning, EnvironmentProvisioning::Docker(value) if value.local_image_id == identity.local_image_id)
+                                {
                                     return Ok(EnvironmentPrepared::Failed("provisioned image differs from delivered digest".into()));
                                 }
-                                provisioning.registry_digest = identity.registry_digest;
+                                if let EnvironmentProvisioning::Docker(value) = &mut provisioning {
+                                    value.registry_digest = identity.registry_digest;
+                                }
                             }
                             Ok(EnvironmentPrepared::Ready(provisioning))
                         }
+                        Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message, progress)),
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
-                    Ok(EnvironmentPrepared::None)
+                    match self.docker.provision_environment(&obj.metadata.name, &obj.spec).await {
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Err(message) => Ok(EnvironmentPrepared::Failed(message)),
+                    }
                 }
             }
             _ => Ok(EnvironmentPrepared::None),
@@ -251,15 +281,15 @@ where
             return ReconcileOutcome::new(None);
         }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
-            EnvironmentPhase::Pending if obj.spec.host_direct.is_some() => Some(EnvironmentStatusPatch::MarkReady {
-                configured_limits: None,
-                docker_container_id: None,
-                image_ref: None,
-                local_image_id: None,
-                registry_digest: None,
-            }),
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => match prepared {
-                EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
+                EnvironmentPrepared::Ready(EnvironmentProvisioning::HostDirect) => Some(EnvironmentStatusPatch::MarkReady {
+                    configured_limits: None,
+                    docker_container_id: None,
+                    image_ref: None,
+                    local_image_id: None,
+                    registry_digest: None,
+                }),
+                EnvironmentPrepared::Ready(EnvironmentProvisioning::Docker(provisioning)) => Some(EnvironmentStatusPatch::MarkReady {
                     configured_limits: provisioning.configured_limits.clone(),
                     docker_container_id: Some(provisioning.container_id.clone()),
                     image_ref: Some(provisioning.image_ref.clone()),

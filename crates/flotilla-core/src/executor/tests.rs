@@ -9,6 +9,7 @@ use super::{
     session_actions::resolve_attach_command,
     workspace_config, workspace_label_for_host, ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
+use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, ProviderBinding, SharedAttachableStore},
     environment_manager::EnvironmentManager,
@@ -3555,20 +3556,23 @@ async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() 
 
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
 
-use crate::providers::environment::{CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
+use crate::providers::environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
 
 struct MockEnvironmentProvider {
-    ensure_image_results: tokio::sync::Mutex<Vec<Result<ImageId, String>>>,
     create_results: tokio::sync::Mutex<Vec<Result<EnvironmentHandle, String>>>,
-    seen_create_opts: tokio::sync::Mutex<Vec<CreateOpts>>,
+    seen_create_opts: tokio::sync::Mutex<Vec<ProvisionOpts>>,
 }
 
 #[async_trait]
 impl EnvironmentProvider for MockEnvironmentProvider {
-    async fn ensure_image(&self, _spec: &EnvironmentSpec, _repo_root: &std::path::Path) -> Result<ImageId, String> {
-        self.ensure_image_results.lock().await.remove(0)
+    fn kind(&self) -> EnvironmentKind {
+        EnvironmentKind::Docker
     }
-    async fn create(&self, _id: EnvironmentId, _image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+    async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
+        Ok(PreparedEnvironment::new(&Arc::new(()), ()))
+    }
+
+    async fn provision(&self, _id: EnvironmentId, _image: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
         self.seen_create_opts.lock().await.push(opts);
         self.create_results.lock().await.remove(0)
     }
@@ -3648,7 +3652,6 @@ async fn executor_step_resolver_create_environment() {
     });
 
     let provider = Arc::new(MockEnvironmentProvider {
-        ensure_image_results: tokio::sync::Mutex::new(vec![Ok(image_id.clone())]),
         create_results: tokio::sync::Mutex::new(vec![Ok(mock_env)]),
         seen_create_opts: tokio::sync::Mutex::new(vec![]),
     });

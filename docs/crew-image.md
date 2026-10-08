@@ -367,10 +367,11 @@ baselines fail admission/provisioning with the reference named in an
 `image-baseline ... missing/unresolved` error before Docker can pull. Resolve
 concurrent Definition edits explicitly; there is no image fallback.
 
-Independent placements may still use a literal `docker_per_vessel.image`
-string. `pull_policy` remains per placement: `always` (default),
+Independent placements may use a pinned digest in `docker_per_vessel.image`.
+Mutable tags are refused by environment preparation. `pull_policy` remains per placement: `always` (default),
 `if_not_present`, or `never`. This does not resolve or build the recipe in
-`.flotilla/environment.yaml`.
+the retired `.flotilla/environment.yaml.legacy` recipe. For checkout environments,
+declare ImageBuild and use its resulting pinned digest; providers do not build the recipe.
 
 ## Composed spine and display acceptance
 

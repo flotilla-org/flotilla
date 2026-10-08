@@ -968,3 +968,14 @@ base and harness; newly needed capabilities extend the frozen selection.
 The identity of resolved build inputs and their parent chain for one target
 architecture. Equal pinned inputs share a key across hosts; the key is distinct
 from the actual built image identity.
+
+**Environment Provider**:
+Makes one **Environment** spec kind real through preparation, provisioning,
+inspection and destruction. A **Provider Instance** identifies one host-local
+runtime endpoint or namespace. Host-direct is an adoption provider; cloud-agent
+vessels follow a separate creation route.
+
+**Local Image Cache**:
+The image inventory owned by one **Provider Instance** on one **Host**.
+A digest held in one cache does not imply it is available in another cache on
+that Host.

@@ -6,6 +6,7 @@ pub mod cursor;
 pub mod docker;
 pub mod git;
 pub mod github;
+pub mod host_direct;
 pub mod passthrough;
 pub mod zellij;
 
@@ -38,7 +39,7 @@ impl FactoryRegistry {
             // Priority: inside-cmux > inside-zellij > cmux-binary-fallback
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
-            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
+            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory), Box::new(host_direct::HostDirectEnvironmentFactory)],
         }
     }
 }

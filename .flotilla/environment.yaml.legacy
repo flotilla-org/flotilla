@@ -1,3 +1,5 @@
+# Retired checkout config: providers no longer build Dockerfiles.
+# Declare ImageBuild, then use its pinned digest in a checkout environment config.
 image:
   dockerfile: .flotilla/Dockerfile.dev-env
 token_env_vars:
