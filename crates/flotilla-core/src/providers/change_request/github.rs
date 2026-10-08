@@ -1,13 +1,12 @@
 use crate::providers::github_poll::PollCache;
-mod observation;
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
 
-use self::observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape};
 use super::ObservationError;
+use crate::providers::github_observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape};
 use crate::{
     change_request_observer::{parse_gh_observation_value_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
@@ -238,11 +237,10 @@ impl GitHubChangeRequest {
         telemetry: &mut ObservationTelemetry<'_>,
     ) -> Result<ParsedObservationResponse, ObservationError> {
         let argument = format!("query={query}");
-        let started = Instant::now();
+        let call = telemetry.call(shape, subjects);
         let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root());
-        let elapsed = started.elapsed();
         let parsed = output.map(ParsedObservationResponse::from_output);
-        telemetry.record(shape, subjects, parsed.as_ref().ok(), elapsed);
+        call.finish(parsed.as_ref().ok());
         let parsed = parsed?;
         if let Some(limit) = &parsed.limit {
             return Err(ObservationError::RateLimited { budget: "GraphQL".into(), limit: limit.clone() });

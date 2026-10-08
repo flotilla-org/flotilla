@@ -46,7 +46,10 @@ mod field_ownership;
 mod fleet_designation;
 mod forge;
 mod forge_read;
-pub use forge_read::{forge_read_name, ForgeRead, ForgeReadRequest, ForgeReadSpec, ForgeReadStatus};
+pub use forge_read::{
+    forge_read_name, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec,
+    ForgeReadStatus,
+};
 mod fulfilment_kind;
 mod host;
 mod http;

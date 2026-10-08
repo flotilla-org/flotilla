@@ -306,6 +306,22 @@ fn rate_limit_error_from_response_at(raw: &str, budget: &str, received_at: DateT
     ))
 }
 
+/// Reserve the last 100 GraphQL points for other users of the host identity.
+/// Use headers when present, with the requested rateLimit fields as fallback.
+pub(crate) fn low_graphql_budget(raw: &str, document: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let remaining = response_header(raw, "x-ratelimit-remaining")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| document["data"]["rateLimit"]["remaining"].as_u64())?;
+    if remaining >= u64::from(MIN_REMAINING_BUDGET) {
+        return None;
+    }
+    response_header(raw, "x-ratelimit-reset")
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+        .or_else(|| document["data"]["rateLimit"]["resetAt"].as_str()?.parse().ok())
+        .or_else(|| Some(Utc::now() + chrono::Duration::minutes(1)))
+}
+
 fn low_budget_from_response(raw: &str) -> Option<(DateTime<Utc>, String)> {
     let remaining = response_header(raw, "x-ratelimit-remaining")?.parse::<u32>().ok()?;
     if response_header(raw, "x-ratelimit-resource")? != "core" {

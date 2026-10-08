@@ -8151,7 +8151,7 @@ impl ChangeRequestTracker for CountingForgeRequests {
 
 #[tokio::test]
 async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
-    use flotilla_resources::{ForgeRead, Resource};
+    use flotilla_resources::{ForgeRead, ForgeReadHeartbeat, Resource};
     let mut temps = Vec::new();
     let mut daemons = Vec::new();
     let mut providers = Vec::new();
@@ -8295,6 +8295,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     }
     assert_eq!(providers.iter().map(|p| p.calls.load(Ordering::SeqCst)).collect::<Vec<_>>(), vec![1, 0, 0]);
     replicate::<ForgeRead>(&daemons).await;
+    replicate::<ForgeReadHeartbeat>(&daemons).await;
     // Cached nonowner reads get the same hundreds of facts without forge I/O.
     for daemon in &daemons {
         let provider = daemon.issue_provider_for_source(&source).await.unwrap();
@@ -8312,6 +8313,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     }
     assert_eq!(providers.iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).collect::<Vec<_>>(), vec![3, 0, 0]);
     replicate::<ForgeRead>(&daemons).await;
+    replicate::<ForgeReadHeartbeat>(&daemons).await;
     for daemon in &daemons {
         let provider = daemon.issue_provider_for_source(&source).await.unwrap();
         assert_eq!(provider.query(&source, &Default::default(), 1, 50).await.unwrap().items.len(), 1);
@@ -8338,9 +8340,14 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         );
     }
     // Expire every observation without sleeping; replicas preserve this age.
+    // Legacy demand is older than retention: the companion renewal must keep
+    // requests active through fallback and recovery without whole-value writes.
     for daemon in &daemons {
         let reads = daemon.resource_backend().using::<ForgeRead>("flotilla");
         for record in reads.list().await.unwrap().items {
+            let mut spec = record.spec;
+            spec.demanded_at = Utc::now() - chrono::Duration::seconds(3601);
+            let record = reads.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.unwrap();
             if let Some(mut status) = record.status {
                 status.attempted_at -= chrono::Duration::seconds(61);
                 reads.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.unwrap();
@@ -8348,6 +8355,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         }
     }
     replicate::<ForgeRead>(&daemons).await;
+    replicate::<ForgeReadHeartbeat>(&daemons).await;
     for daemon in &daemons {
         let _ = daemon.refresh_forge_read_demands().await;
     }
@@ -8357,6 +8365,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     assert_eq!(providers[0].issue_calls.load(Ordering::SeqCst), 3);
     assert_eq!(providers[1..].iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 3);
     replicate::<ForgeRead>(&daemons).await;
+    replicate::<ForgeReadHeartbeat>(&daemons).await;
     for daemon in &daemons {
         assert_eq!(daemon.issue_provider_for_source(&source).await.unwrap().dispatch_board(&source).await.unwrap().issues.len(), 400);
     }
@@ -8392,6 +8401,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         }
     }
     replicate::<ForgeRead>(&daemons).await;
+    replicate::<ForgeReadHeartbeat>(&daemons).await;
     for daemon in &daemons {
         daemon.refresh_forge_read_demands().await.unwrap();
     }

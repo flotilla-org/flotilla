@@ -4,6 +4,7 @@ pub mod coding_agent;
 pub mod discovery;
 pub mod environment;
 pub mod github_api;
+pub(crate) mod github_observation;
 pub(crate) mod github_poll;
 pub mod issue_tracker;
 pub mod presentation;

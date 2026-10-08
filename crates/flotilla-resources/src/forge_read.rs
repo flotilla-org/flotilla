@@ -14,6 +14,36 @@ impl Resource for ForgeRead {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "forgereads", kind: "ForgeRead" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
 }
+/// Small companion to one whole ForgeRead, sharing its name. Demand renewals
+/// and unchanged-result heartbeats must not replicate its opaque value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeReadHeartbeat;
+impl Resource for ForgeReadHeartbeat {
+    type Spec = ForgeReadHeartbeatSpec;
+    type Status = ForgeReadHeartbeatStatus;
+    type StatusPatch = ForgeReadHeartbeatStatus;
+    const API_PATHS: ApiPaths =
+        ApiPaths { group: "flotilla.work", version: "v1", plural: "forgereadheartbeats", kind: "ForgeReadHeartbeat" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeReadHeartbeatSpec {
+    pub demanded_at: DateTime<Utc>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ForgeReadHeartbeatStatus {
+    pub authority: String,
+    /// Identifies the whole-result status this heartbeat renews. A heartbeat
+    /// for an older result or a former owner cannot freshen another value.
+    pub content_at: DateTime<Utc>,
+    pub attempted_at: DateTime<Utc>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+impl StatusPatch<ForgeReadHeartbeatStatus> for ForgeReadHeartbeatStatus {
+    fn apply(&self, status: &mut ForgeReadHeartbeatStatus) {
+        *status = self.clone();
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum ForgeReadRequest {
