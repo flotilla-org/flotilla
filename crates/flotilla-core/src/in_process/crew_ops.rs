@@ -20,12 +20,12 @@ use flotilla_resources::{
     external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
     CrewCompletionPending, CrewCompletionRefusalCause, CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge,
-    HoldAct, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Presentation as ResourcePresentation,
-    Project, Repository, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung,
-    UnmetSettlementExpectation, Vessel, WorkCompletionAuthority, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    HoldAct, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WorkCompletionAuthority,
+    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
@@ -1365,9 +1365,6 @@ impl CrewService {
 
     async fn cascade_convoy_children(&self, namespace: &str, name: &str) -> Result<(), String> {
         let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]);
-        delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<ResourcePresentation>(namespace), &selector)
-            .await
-            .map_err(|error| error.to_string())?;
         delete_lifecycle_owned_matching(&self.resource_backend.clone().using::<Vessel>(namespace), &selector)
             .await
             .map_err(|error| error.to_string())?;

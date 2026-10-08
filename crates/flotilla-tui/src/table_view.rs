@@ -1485,7 +1485,6 @@ mod tests {
             phase,
             crew: vec![ProcessSummary { role: "coder".into(), command_preview: "codex".into() }],
             host: Some(HostName::new("kiwi")),
-            workspace_ref: None,
             materialize_ref: None,
             completion_target: None,
             ready_at: None,

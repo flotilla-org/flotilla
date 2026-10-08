@@ -464,7 +464,7 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
     assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
 }
 
-pub async fn convoy_teardown_removes_its_managed_presentations(factory: &dyn EnsureScenarioController) {
+pub async fn convoy_teardown_removes_its_managed_children(factory: &dyn EnsureScenarioController) {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
     let convoy_ref = backend
@@ -475,29 +475,48 @@ pub async fn convoy_teardown_removes_its_managed_presentations(factory: &dyn Ens
         .status
         .and_then(|status| status.convoy_ref)
         .expect("convoy ref");
-    let presentations = backend.using::<ResourcePresentation>("flotilla");
-    presentations
+    // Step 3 removes only the retired Presentation cascade. Managed Vessel
+    // and TerminalSession children must still be cascaded by convoy teardown.
+    let meta = InputMeta::builder()
+        .name("quartermaster-work".to_string())
+        .labels(BTreeMap::from([
+            (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+            (CONVOY_LABEL.to_string(), convoy_ref.clone()),
+        ]))
+        .build();
+    let vessels = backend.using::<flotilla_resources::Vessel>("flotilla");
+    vessels
         .create(
-            &InputMeta::builder()
-                .name("quartermaster-work".to_string())
-                .labels(BTreeMap::from([
-                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
-                    (CONVOY_LABEL.to_string(), convoy_ref.clone()),
-                ]))
-                .build(),
-            &flotilla_resources::PresentationSpec {
+            &meta,
+            &flotilla_resources::VesselSpec {
                 convoy_ref: convoy_ref.clone(),
-                presentation_policy_ref: "default".to_string(),
-                name: "quartermaster".to_string(),
-                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_ref.clone())]),
+                vessel_name: "work".into(),
+                placement_policy_ref: "default".into(),
+                adopted_checkout_refs: Default::default(),
             },
         )
         .await
-        .expect("presentation");
+        .expect("vessel");
+    let sessions = backend.using::<flotilla_resources::TerminalSession>("flotilla");
+    sessions
+        .create(
+            &meta,
+            &flotilla_resources::TerminalSessionSpec {
+                env_ref: "old-environment".into(),
+                role: "tool".into(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "true".into() },
+                cwd: "/tmp".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("session");
 
     daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("convoy teardown");
 
-    assert!(matches!(presentations.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(vessels.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(sessions.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await, Err(ResourceError::NotFound { .. })));
 }
 

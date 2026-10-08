@@ -322,7 +322,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
 }
 
 #[tokio::test]
-async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
+async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
@@ -518,7 +518,6 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
             secondaries: ConvoyReconciler::secondary_watches(),
             reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                 .with_vessels(workspaces.clone())
-                .with_presentations(presentations.clone())
                 .with_checkouts(checkouts.clone())
                 .with_prepared_snapshot_gc(PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla")),
             resync_interval: Duration::from_millis(50),
@@ -545,7 +544,6 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
         loop {
             if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
-                && matches!(presentations.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
                 && matches!(checkouts.get("checkout-convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(
                     backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
@@ -562,7 +560,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
         }
     })
     .await
-    .expect("convoy finalizer should delete managed presentation and task workspace");
+    .expect("convoy finalizer should delete managed vessels and checkouts");
 
     assert_eq!(
         workspaces
@@ -604,63 +602,6 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
             .expect("authority label should parse"),
         Some(LifecycleAuthority::Observed)
     );
-
-    loop_task.abort();
-}
-
-#[tokio::test]
-async fn controller_loop_creates_one_presentation_per_active_task() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let workspaces = backend.clone().using::<Vessel>("flotilla");
-    let presentations = backend.clone().using::<Presentation>("flotilla");
-    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
-
-    let created =
-        convoys.create(&convoy_meta("convoy-multi"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").phase = flotilla_resources::WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    status.work.get_mut("review").expect("review task").phase = flotilla_resources::WorkPhase::Ready;
-    status.work.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
-    convoys.update_status("convoy-multi", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
-
-    let loop_task = tokio::spawn(
-        ControllerLoop {
-            primary: convoys.clone(),
-            secondaries: ConvoyReconciler::secondary_watches(),
-            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(workspaces.clone()).with_presentations(presentations.clone()),
-            resync_interval: Duration::from_millis(50),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if let (Ok(implement), Ok(review)) =
-                (presentations.get("convoy-multi-implement").await, presentations.get("convoy-multi-review").await)
-            {
-                break (implement, review);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .map(|(implement, review)| {
-        assert_eq!(implement.spec.name, "convoy-multi:implement");
-        assert_eq!(implement.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
-        assert_eq!(implement.spec.process_selector.get(VESSEL_LABEL).map(String::as_str), Some("implement"));
-        assert_eq!(implement.metadata.labels.get(VESSEL_LABEL).map(String::as_str), Some("implement"));
-
-        assert_eq!(review.spec.name, "convoy-multi:review");
-        assert_eq!(review.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
-        assert_eq!(review.spec.process_selector.get(VESSEL_LABEL).map(String::as_str), Some("review"));
-        assert_eq!(review.metadata.labels.get(VESSEL_LABEL).map(String::as_str), Some("review"));
-    })
-    .expect("controller loop should create one presentation per active task");
 
     loop_task.abort();
 }

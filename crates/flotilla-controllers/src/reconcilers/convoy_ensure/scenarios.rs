@@ -113,8 +113,8 @@ async fn convoy_routing_prefers_an_exact_terminal_pre_identity_record() {
 }
 
 #[tokio::test]
-async fn convoy_teardown_removes_its_managed_presentations() {
-    ensure_scenarios::convoy_teardown_removes_its_managed_presentations(&Controller).await;
+async fn convoy_teardown_removes_its_managed_children() {
+    ensure_scenarios::convoy_teardown_removes_its_managed_children(&Controller).await;
 }
 
 #[tokio::test]

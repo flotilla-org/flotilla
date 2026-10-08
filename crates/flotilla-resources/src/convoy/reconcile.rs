@@ -24,7 +24,6 @@ use crate::{
     },
     labels::{LifecycleAuthority, CONVOY_LABEL, VESSEL_LABEL},
     pinned_placement_ref, pinned_workflow_ref,
-    presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
@@ -34,9 +33,9 @@ use crate::{
         ValidationError, WorkflowTemplate,
     },
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
-    InputMeta, InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource,
-    ResourceError, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue,
-    TypedResolver, ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
+    InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError,
+    RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue, TypedResolver,
+    ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
 };
 
 fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
@@ -84,7 +83,6 @@ pub struct ConvoyReconciler {
     vessels: Option<TypedResolver<Vessel>>,
     federated_vessels: Option<ReplicaReadResolver<Vessel>>,
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
-    presentations: Option<TypedResolver<Presentation>>,
     checkouts: Option<TypedResolver<Checkout>>,
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
@@ -101,7 +99,6 @@ pub struct ConvoyReconciler {
 pub struct ConvoyPrepared {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
-    presentations: BTreeMap<String, ResourceObject<Presentation>>,
     terminal_sessions: Vec<ResourceObject<TerminalSession>>,
     checkouts: BTreeMap<String, ResourceObject<Checkout>>,
     observed_subjects: Vec<Subject>,
@@ -118,7 +115,6 @@ impl ConvoyReconciler {
             vessels: None,
             federated_vessels: None,
             terminal_sessions: None,
-            presentations: None,
             checkouts: None,
             federated_checkouts: None,
             change_requests: None,
@@ -149,11 +145,6 @@ impl ConvoyReconciler {
 
     pub fn with_terminal_sessions(mut self, terminal_sessions: TypedResolver<TerminalSession>) -> Self {
         self.terminal_sessions = Some(terminal_sessions);
-        self
-    }
-
-    pub fn with_presentations(mut self, presentations: TypedResolver<Presentation>) -> Self {
-        self.presentations = Some(presentations);
         self
     }
 
@@ -201,7 +192,6 @@ impl ConvoyReconciler {
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
         vec![
             Box::new(LabelMappedWatch::<Vessel, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Checkout, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
         ]
@@ -217,7 +207,6 @@ impl ConvoyReconciler {
                 resolver: backend.including_replicas::<Vessel>(namespace),
                 _marker: PhantomData,
             }),
-            Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(ReplicaLabelMappedWatch::<Checkout, Convoy> {
                 label_key: CONVOY_LABEL,
@@ -919,16 +908,7 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
-        let presentations = match &self.presentations {
-            Some(presentations) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => presentations
-                .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
-                .await?
-                .items
-                .into_iter()
-                .map(|presentation| (presentation.metadata.name.clone(), presentation))
-                .collect(),
-            _ => BTreeMap::new(),
-        };
+
         let checkouts = match (&self.federated_checkouts, &self.checkouts) {
             (Some(checkouts), _) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
                 federated_children(checkouts, obj).await?
@@ -1020,7 +1000,6 @@ impl Reconciler for ConvoyReconciler {
         Ok(ConvoyPrepared {
             template,
             vessels,
-            presentations,
             terminal_sessions,
             checkouts,
             observed_subjects,
@@ -1106,7 +1085,6 @@ impl Reconciler for ConvoyReconciler {
             obj,
             prepared.template.as_ref(),
             &prepared.vessels,
-            &prepared.presentations,
             &prepared.checkouts,
             LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
             now,
@@ -1171,9 +1149,7 @@ impl Reconciler for ConvoyReconciler {
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]);
-        if let Some(presentations) = &self.presentations {
-            delete_lifecycle_owned_matching(presentations, &selector).await?;
-        }
+
         if let Some(vessels) = &self.vessels {
             delete_lifecycle_owned_matching(vessels, &selector).await?;
         }
@@ -1242,7 +1218,7 @@ fn convoy_object_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) -> crat
     event
 }
 
-/// Test-support reconcile entry that carries no vessel, presentation, checkout,
+/// Test-support reconcile entry that carries no vessel, checkout,
 /// or change-request state. Claim exits can settle here; instantiated leaf
 /// tables require the production [`ConvoyReconciler`] and its observed records.
 pub fn reconcile(
@@ -1256,7 +1232,6 @@ pub fn reconcile(
         template,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        &BTreeMap::new(),
         LifecycleConditions { exit_disposition, reclaim_eligible: false },
         now,
     );
@@ -1267,7 +1242,6 @@ fn reconcile_internal(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    presentations: &BTreeMap<String, ResourceObject<Presentation>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     conditions: LifecycleConditions,
     now: DateTime<Utc>,
@@ -1297,7 +1271,6 @@ fn reconcile_internal(
             convoy,
             &status,
             vessels,
-            presentations,
             checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() },
@@ -1310,7 +1283,6 @@ fn reconcile_internal(
                 convoy,
                 &status,
                 vessels,
-                presentations,
                 checkouts,
                 conditions.reclaim_eligible,
                 InternalReconcileOutcome {
@@ -1331,16 +1303,16 @@ fn reconcile_internal(
     }
 
     if let Some(outcome) = backfill_crew_work_outcome(&status) {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, outcome);
+        return with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, outcome);
     }
 
     if let Some(outcome) = fail_fast_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, outcome);
+        return with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, outcome);
     }
 
     let provisioning = vessel_outcome(convoy, &status, vessels, now);
     if provisioning.patch.is_some() {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, provisioning);
+        return with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, provisioning);
     }
 
     if let Some(outcome) = roll_up_crew_work_outcome(convoy, &status, vessels, now) {
@@ -1348,7 +1320,6 @@ fn reconcile_internal(
             convoy,
             &status,
             vessels,
-            presentations,
             checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
@@ -1360,7 +1331,6 @@ fn reconcile_internal(
             convoy,
             &status,
             vessels,
-            presentations,
             checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
@@ -1372,14 +1342,13 @@ fn reconcile_internal(
             convoy,
             &status,
             vessels,
-            presentations,
             checkouts,
             conditions.reclaim_eligible,
             InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
         );
     }
 
-    with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, provisioning)
+    with_cleanup(convoy, &status, vessels, checkouts, conditions.reclaim_eligible, provisioning)
 }
 
 fn bootstrap_outcome(
@@ -1953,12 +1922,11 @@ fn with_cleanup(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    presentations: &BTreeMap<String, ResourceObject<Presentation>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     reclaim_eligible: bool,
     mut outcome: InternalReconcileOutcome,
 ) -> InternalReconcileOutcome {
-    let (patch, actuations) = cleanup_plan(convoy, status, vessels, presentations, checkouts, reclaim_eligible, outcome.patch.as_ref());
+    let (patch, actuations) = cleanup_plan(convoy, status, vessels, checkouts, reclaim_eligible, outcome.patch.as_ref());
     if outcome.patch.is_none() {
         outcome.patch = patch;
     }
@@ -1970,7 +1938,6 @@ fn cleanup_plan(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
-    presentations: &BTreeMap<String, ResourceObject<Presentation>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     reclaim_eligible: bool,
     patch: Option<&ConvoyStatusPatch>,
@@ -1981,16 +1948,7 @@ fn cleanup_plan(
     }
 
     if !predicted_status.phase.is_terminal() {
-        let mut actuations = Vec::new();
-        for (work, state) in &predicted_status.work {
-            let resource_name = vessel_resource_name(&convoy.metadata.name, work);
-            if matches!(state.phase, WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled)
-                && !presentations.contains_key(&resource_name)
-            {
-                actuations.push(create_presentation_actuation(convoy, work));
-            }
-        }
-        return (None, actuations);
+        return (None, Vec::new());
     }
 
     if !reclaim_eligible {
@@ -1999,16 +1957,10 @@ fn cleanup_plan(
 
     let mut actuations = extract_actuations(convoy);
     actuations.extend(
-        presentations
-            .keys()
-            .cloned()
-            .map(|name| Actuation::DeletePresentation { name })
-            .chain(
-                vessels
-                    .values()
-                    .filter(|vessel| vessel.metadata.deletion_timestamp.is_none())
-                    .map(|vessel| Actuation::DeleteVessel { name: vessel.metadata.name.clone() }),
-            )
+        vessels
+            .values()
+            .filter(|vessel| vessel.metadata.deletion_timestamp.is_none())
+            .map(|vessel| Actuation::DeleteVessel { name: vessel.metadata.name.clone() })
             .chain(
                 checkouts
                     .values()
@@ -2023,7 +1975,6 @@ fn cleanup_plan(
             ),
     );
     actuations.sort_by_key(|actuation| match actuation {
-        Actuation::DeletePresentation { name } => (0, name.clone()),
         Actuation::DeleteVessel { name } => (1, name.clone()),
         Actuation::DeleteCheckout { name } => (2, name.clone()),
         _ => (3, String::new()),
@@ -2080,46 +2031,6 @@ fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: Da
         }],
         events: Vec::new(),
     })
-}
-
-fn create_presentation_actuation(convoy: &ResourceObject<Convoy>, vessel: &str) -> Actuation {
-    let presentation_name = if convoy
-        .status
-        .as_ref()
-        .and_then(|status| status.workflow_snapshot.as_ref())
-        .is_some_and(|snapshot| snapshot.vessels.len() == 1)
-    {
-        convoy.metadata.name.clone()
-    } else {
-        format!("{}:{vessel}", convoy.metadata.name)
-    };
-
-    Actuation::CreatePresentation {
-        meta: InputMeta::builder()
-            .name(vessel_resource_name(&convoy.metadata.name, vessel))
-            .labels(BTreeMap::from([
-                (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
-                (VESSEL_LABEL.to_string(), vessel.to_string()),
-            ]))
-            .owner_references(vec![OwnerReference {
-                api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
-                kind: Convoy::API_PATHS.kind.to_string(),
-                name: convoy.metadata.name.clone(),
-                controller: true,
-            }])
-            .build(),
-        spec: PresentationSpec {
-            convoy_ref: convoy.metadata.name.clone(),
-            // Stage 4a always uses the built-in default policy. Threading a policy ref through
-            // ConvoySpec remains follow-up work once convoys can choose among multiple layouts.
-            presentation_policy_ref: "default".to_string(),
-            name: presentation_name,
-            process_selector: BTreeMap::from([
-                (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
-                (VESSEL_LABEL.to_string(), vessel.to_string()),
-            ]),
-        },
-    }
 }
 
 fn work_failed_outcome(

@@ -8,7 +8,6 @@ mod common;
 mod environment_reconciler;
 mod image_build;
 mod liveness_contract;
-mod presentation_reconciler;
 mod provisioning_in_memory;
 mod repository_reconciler;
 mod terminal_session_reconciler;

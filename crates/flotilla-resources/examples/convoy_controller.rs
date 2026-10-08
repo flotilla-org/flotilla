@@ -1,12 +1,9 @@
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
 
-use flotilla_controllers::reconcilers::{
-    HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, VesselReconciler,
-};
-use flotilla_core::{path_context::DaemonHostPath, providers::registry::ProviderRegistry, HostName};
+use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
-    controller::ControllerLoop, ensure_crd, ensure_namespace, Checkout, Convoy, ConvoyReconciler, HttpBackend, Presentation,
-    ResourceBackend, Vessel, WorkflowTemplate,
+    controller::ControllerLoop, ensure_crd, ensure_namespace, Checkout, Convoy, ConvoyReconciler, HttpBackend, ResourceBackend, Vessel,
+    WorkflowTemplate,
 };
 use tracing::info;
 
@@ -45,15 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crd(&backend, include_str!("../src/crds/presentation.crd.yaml")).await?;
 
     let backend = ResourceBackend::Http(backend);
+    // ADR 0047: remove this cleanup one fleet roll after #2915 step 3.
+    flotilla_resources::purge_retired_presentations(&backend, &namespace).await?;
     let convoys = backend.clone().using::<Convoy>(&namespace);
     let templates = backend.definitions::<WorkflowTemplate>(&namespace);
     let vessels = backend.clone().using::<Vessel>(&namespace);
-    let presentations = backend.clone().using::<Presentation>(&namespace);
-    let empty_registry = Arc::new(ProviderRegistry::new());
-    let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
-    let config_base = DaemonHostPath::new(env::current_dir()?);
 
-    info!("starting task-workspace, presentation, and convoy controller loops");
+    info!("starting vessel and convoy controller loops");
     tokio::try_join!(
         async {
             ControllerLoop {
@@ -67,38 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         },
         async {
-            ControllerLoop {
-                primary: presentations,
-                secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
-                reconciler: PresentationReconciler::new(
-                    Arc::new(ProviderPresentationRuntime::new(Arc::clone(&empty_registry), Arc::clone(&policies))),
-                    backend.clone(),
-                    &namespace,
-                    {
-                        let empty_registry = Arc::clone(&empty_registry);
-                        HopChainContext::new(
-                            flotilla_protocol::CanonicalHostId::resolved("local"),
-                            HostName::local(),
-                            config_base,
-                            move |_env_ref| Ok(Arc::clone(&empty_registry)),
-                        )
-                    },
-                    policies,
-                ),
-                resync_interval: Duration::from_secs(60),
-                backend: backend.clone(),
-            }
-            .run()
-            .await
-        },
-        async {
             let convoy_backend = backend.clone();
             ControllerLoop {
                 primary: convoys,
                 secondaries: ConvoyReconciler::secondary_watches(),
                 reconciler: ConvoyReconciler::new(templates)
                     .with_vessels(convoy_backend.clone().using::<Vessel>(&namespace))
-                    .with_presentations(convoy_backend.clone().using::<Presentation>(&namespace))
                     .with_checkouts(convoy_backend.clone().using::<Checkout>(&namespace)),
                 resync_interval: Duration::from_secs(60),
                 backend: convoy_backend,

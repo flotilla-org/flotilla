@@ -781,7 +781,6 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     .expect("timed out waiting for convoy materialization capability");
     let vessel = convoy.vessels.iter().find(|vessel| vessel.name == "coder").expect("convoy-bound session vessel row");
     assert_eq!(vessel.materialize.as_deref(), Some("terminal-convoy-coder"));
-    assert_eq!(vessel.attach, None, "materialization must not pretend an observed PM workspace already exists");
 
     let row = rows.iter().find(|row| row.name == "terminal-yeoman").expect("attachable session row");
     assert_eq!(row.repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));

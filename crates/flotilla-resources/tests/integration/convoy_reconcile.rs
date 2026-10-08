@@ -517,10 +517,7 @@ async fn reconcile_once_with_resources(
     }
 
     let current = convoys.get(&convoy.metadata.name).await.expect("convoy get should succeed");
-    let reconciler = ConvoyReconciler::new(templates.clone())
-        .with_vessels(vessels.clone())
-        .with_presentations(presentations_resolver.clone())
-        .with_teardown_runtime(Arc::new(AlwaysEligible));
+    let reconciler = ConvoyReconciler::new(templates.clone()).with_vessels(vessels.clone()).with_teardown_runtime(Arc::new(AlwaysEligible));
     let deps = reconciler.prepare(&current).await.expect("dependency fetch should succeed");
     reconciler.reconcile(&current, &deps, now)
 }
@@ -2432,7 +2429,8 @@ async fn ready_task_emits_vessel_creation_actuation() {
         Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(started_at), finished_at: None })
             if started_at == timestamp(20)
     ));
-    assert_eq!(outcome.actuations.len(), 2);
+    // Step 3 leaves only Vessel creation; no Presentation accompanies it.
+    assert_eq!(outcome.actuations.len(), 1);
     match outcome
         .actuations
         .iter()
@@ -2453,7 +2451,7 @@ async fn ready_task_emits_vessel_creation_actuation() {
         }
         other => panic!("expected task workspace actuation, got {other:?}"),
     }
-    assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
+    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
 }
 
 #[tokio::test]
@@ -2870,41 +2868,6 @@ async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_read
 }
 
 #[tokio::test]
-async fn active_convoy_creates_presentation_when_missing() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
-
-    assert!(matches!(
-        outcome.patch,
-        Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(started_at), finished_at: None })
-            if started_at == timestamp(20)
-    ));
-    assert!(outcome.actuations.iter().any(|actuation| {
-        matches!(
-            actuation,
-            Actuation::CreatePresentation { meta, spec }
-                if meta.name == "convoy-a-implement"
-                    && meta.labels.get(CONVOY_LABEL).map(String::as_str) == Some("convoy-a")
-                    && meta.labels.get(VESSEL_LABEL).map(String::as_str) == Some("implement")
-                    && meta.owner_references.len() == 1
-                    && meta.owner_references[0].kind == "Convoy"
-                    && meta.owner_references[0].name == "convoy-a"
-                    && spec.convoy_ref == "convoy-a"
-                    && spec.presentation_policy_ref == "default"
-                    && spec.name == "convoy-a:implement"
-                    && spec.process_selector == BTreeMap::from([
-                        (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-                        (VESSEL_LABEL.to_string(), "implement".to_string()),
-                    ])
-        )
-    }));
-}
-
-#[tokio::test]
 async fn active_convoy_does_not_recreate_existing_presentation() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
@@ -3000,11 +2963,11 @@ async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
     .await;
 
     assert_eq!(outcome.patch, None);
-    assert!(outcome
+    assert!(!outcome
         .actuations
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-implement")));
-    assert!(outcome
+    assert!(!outcome
         .actuations
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-review")));
@@ -3119,7 +3082,7 @@ async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_re
 }
 
 #[tokio::test]
-async fn terminal_completed_convoy_without_observed_presentation_does_not_emit_speculative_delete() {
+async fn terminal_completed_convoy_reclaims_vessel_without_presentation_dependency() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Landed;
     status.finished_at = Some(timestamp(20));
@@ -3147,117 +3110,7 @@ async fn terminal_completed_convoy_without_observed_presentation_does_not_emit_s
 }
 
 #[tokio::test]
-async fn multi_task_convoy_creates_presentations_only_for_active_tasks() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    // `review` intentionally stays in Pending — covers the `WorkPhase::Pending => {}` arm.
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
-
-    let creates: Vec<_> = outcome
-        .actuations
-        .iter()
-        .filter_map(|actuation| match actuation {
-            Actuation::CreatePresentation { meta, spec } => Some((meta.name.clone(), spec.name.clone())),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(creates, vec![("convoy-a-implement".to_string(), "convoy-a:implement".to_string())]);
-    assert!(!outcome
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::CreatePresentation { meta, .. } if meta.name == "convoy-a-review")));
-}
-
-#[tokio::test]
-async fn single_vessel_convoys_name_presentations_after_the_convoy() {
-    let mut presentation_names = Vec::new();
-
-    for convoy_name in ["convoy-a", "convoy-b"] {
-        let mut status = bootstrapped_tool_only_convoy_status();
-        status.phase = ConvoyPhase::Active;
-        status.started_at = Some(timestamp(18));
-        status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.retain(|vessel| vessel.name == "implement");
-        status.work.retain(|vessel, _| vessel == "implement");
-        status.crew_work.retain(|vessel, _| vessel == "implement");
-        status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
-        status.work.get_mut("implement").expect("implement work").started_at = Some(timestamp(18));
-        let convoy = convoy_object(convoy_name, task_provisioning_convoy_spec(), Some(status));
-
-        let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
-        let presentation_name = outcome
-            .actuations
-            .iter()
-            .find_map(|actuation| match actuation {
-                Actuation::CreatePresentation { spec, .. } => Some(spec.name.clone()),
-                _ => None,
-            })
-            .expect("presentation creation");
-        presentation_names.push(presentation_name);
-    }
-
-    assert_eq!(presentation_names, vec!["convoy-a".to_string(), "convoy-b".to_string()]);
-}
-
-#[tokio::test]
-async fn ready_and_running_tasks_both_create_presentations_when_missing() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    status.work.get_mut("review").expect("review task").phase = WorkPhase::Ready;
-    status.work.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
-
-    let mut create_names: Vec<_> = outcome
-        .actuations
-        .iter()
-        .filter_map(|actuation| match actuation {
-            Actuation::CreatePresentation { meta, .. } => Some(meta.name.clone()),
-            _ => None,
-        })
-        .collect();
-    create_names.sort();
-    assert_eq!(create_names, vec!["convoy-a-implement".to_string(), "convoy-a-review".to_string()]);
-}
-
-#[tokio::test]
-async fn launching_task_creates_presentation_when_missing() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Launching;
-    status.work.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        Vec::new(),
-        timestamp(20),
-    )
-    .await;
-
-    assert!(outcome.actuations.iter().any(|actuation| matches!(
-        actuation,
-        Actuation::CreatePresentation { meta, spec }
-            if meta.name == "convoy-a-implement"
-                && spec.name == "convoy-a:implement"
-                && spec.process_selector.get(VESSEL_LABEL).map(String::as_str) == Some("implement")
-    )));
-}
-
-#[tokio::test]
-async fn one_task_completed_deletes_only_that_presentation() {
+async fn completing_one_task_keeps_active_convoy_resources_warm() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
@@ -3502,4 +3355,28 @@ async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() 
         assert!(!again.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
     }
+}
+
+// Step 3 retires Presentation creation for every active work phase, with or
+// without a leftover row. Real in-memory resource collaborators exercise prepare.
+#[hegel::test]
+fn convoy_never_creates_presentations(tc: hegel::TestCase) {
+    let phase = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+    let leftover = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let mut status = bootstrapped_tool_only_convoy_status();
+        status.phase = ConvoyPhase::Active;
+        let work = status.work.get_mut("implement").expect("work");
+        work.phase = [WorkPhase::Ready, WorkPhase::Launching, WorkPhase::Running, WorkPhase::Stalled][phase as usize];
+        work.ready_at = Some(timestamp(12));
+        work.started_at = Some(timestamp(18));
+        let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+        let leftovers = if leftover { vec![presentation_object("convoy-a", "implement")] } else { Vec::new() };
+        let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), leftovers, timestamp(20)).await;
+        assert!(!outcome
+            .actuations
+            .iter()
+            .any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. } | Actuation::DeletePresentation { .. })));
+    });
 }
