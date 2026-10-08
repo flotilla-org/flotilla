@@ -109,12 +109,27 @@ grep -Eq "size-cap cargo prune root=.*desk reclaimed_bytes=[1-9][0-9]*" "$sweep_
 
 mkdir -p "$empty_home/.cargo/bin"
 cp "$test_home/.cargo/bin/cargo-sweep" "$empty_home/.cargo/bin/"
+# Session retention removes expired homes only, using the configured age.
+archive_root=$empty_home/.local/share/flotilla/session-archive
+mkdir -p "$archive_root/convoy/expired" "$archive_root/convoy/recent" "$empty_home/.local/share/flotilla/agent-homes/live"
+touch -t 200001010000 "$archive_root/convoy/expired"
 HOME="$empty_home" XDG_STATE_HOME="$empty_home/.local/state" \
   FLOTILLA_SWEEP_LOG="$empty_log" \
   FLOTILLA_SWEEP_TEST_INVOCATIONS="$stub_log" \
   "$repo_root/scripts/cargo-sweep-mtime.sh"
 
 [[ $(wc -l < "$stub_log") == 4 ]]
+[[ ! -e $archive_root/convoy/expired ]]
+[[ -d $archive_root/convoy/recent ]]
+[[ -d $empty_home/.local/share/flotilla/agent-homes/live ]]
+# A longer configured retention preserves the same old archive.
+mkdir -p "$archive_root/convoy/expired"
+touch -t 200001010000 "$archive_root/convoy/expired"
+HOME="$empty_home" XDG_STATE_HOME="$empty_home/.local/state" \
+  FLOTILLA_SWEEP_LOG="$empty_log" FLOTILLA_SESSION_ARCHIVE_RETENTION_DAYS=99999 \
+  FLOTILLA_SWEEP_TEST_INVOCATIONS="$stub_log" "$repo_root/scripts/cargo-sweep-mtime.sh"
+[[ -d $archive_root/convoy/expired ]]
+
 grep -Fq "mtime-based cargo sweep started: retention_days=3 roots=0" "$empty_log"
 grep -Fq "mtime-based cargo sweep completed: reclaimed_bytes=0 failed_roots=0" "$empty_log"
 

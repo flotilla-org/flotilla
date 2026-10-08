@@ -5477,7 +5477,40 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let mut cleanup_errors =
             forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
         if let Some(registry) = self.state.agent_material.as_deref() {
-            if let Err(error) = registry.remove_environment_home(environment_ref).await {
+            let namespace = self.state.daemon.provisioning_namespace().await;
+            let backend = self.state.daemon.resource_backend();
+            let environment = backend.using::<Environment>(&namespace).get(environment_ref).await;
+            // Forced deletion may already have removed the resource owners.
+            // Admission names environments env-convoy-<32 hex UUID>-<vessel>.
+            let mut convoy_ref = environment_ref
+                .strip_prefix("env-")
+                .filter(|name| {
+                    name.starts_with("convoy-")
+                        && name.as_bytes().get(39) == Some(&b'-')
+                        && name[7..39].bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .map(|name| name[..39].to_string())
+                .unwrap_or_else(|| "unowned".to_string());
+            // A failed owner lookup may archive under this fallback rather than
+            // the later-resolved convoy. Preserve the logs and continue cleanup.
+            match environment {
+                Ok(environment) => {
+                    if let Some(owner) = environment.metadata.owner_references.iter().find(|owner| owner.kind == "Vessel") {
+                        match backend.using::<Vessel>(&namespace).get(&owner.name).await {
+                            Ok(vessel) => convoy_ref = vessel.spec.convoy_ref,
+                            Err(ResourceError::NotFound { .. }) => {}
+                            Err(error) => cleanup_errors.push(error.to_string()),
+                        }
+                    }
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => cleanup_errors.push(error.to_string()),
+            }
+            if !matches!(Path::new(&convoy_ref).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
+                cleanup_errors.push("archive convoy identity must name one directory".to_string());
+                convoy_ref = "unowned".into();
+            }
+            if let Err(error) = registry.archive_environment_home(&convoy_ref, environment_ref).await {
                 cleanup_errors.push(error);
             }
         }
@@ -10689,7 +10722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_teardown_after_restart_removes_persistent_agent_home() {
+    async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -10749,7 +10782,24 @@ mod tests {
             .expect("restart teardown should rediscover and destroy the container");
 
         assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
-        assert!(!environment_home.exists(), "durable environment teardown must remove its persistent agent home");
+        assert!(!environment_home.exists(), "durable environment teardown must move its persistent agent home");
+        assert_eq!(
+            fs::read_to_string(home.join(".local/share/flotilla/session-archive/unowned/contained-restarted/codex/sessions/rollout.jsonl"))
+                .unwrap(),
+            "session state"
+        );
+        // Forced teardown can leave no resource records; the admission name still identifies the convoy.
+        let convoy = "convoy-0123456789abcdef0123456789abcdef";
+        let environment = format!("env-{convoy}-work");
+        let forced_home = home.join(".local/share/flotilla/agent-homes").join(&environment);
+        fs::create_dir_all(&forced_home).unwrap();
+        fs::write(forced_home.join("session.jsonl"), "forced session").unwrap();
+        runtime.cleanup(&environment).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(home.join(".local/share/flotilla/session-archive").join(convoy).join(&environment).join("session.jsonl"))
+                .unwrap(),
+            "forced session"
+        );
         assert!(!cleat_state.exists(), "durable teardown must remove contained-cleat state too");
     }
 
