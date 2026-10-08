@@ -450,8 +450,10 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
 
 // Placement, not the Vessel's authoring root, identifies the execution host:
 // an admitting daemon may author an intent projected into a remote actuator.
-// The merged Host read view strips authored origin annotations and supplies
-// replica provenance itself. Missing evidence never turns a refusal into a skip.
+// flotilla-resources' registry::read_object_value owns the merged read-view
+// invariant: it strips authored origin annotations and supplies replica provenance
+// itself (the key is defined by replica::ORIGIN_ROOT_ANNOTATION in that crate).
+// Missing evidence never turns a refusal into a skip.
 fn remote_placement_host(inventory: &[Value], convoy: &ResourceObject<Convoy>, vessel: &ResourceObject<Vessel>) -> Option<String> {
     let host = vessel
         .status
@@ -856,6 +858,9 @@ mod tests {
         assert_eq!(report.images.checked, 0);
         assert_eq!(report.validated_elsewhere.len(), 1);
         assert!(report.validated_elsewhere[0].contains("validated on the host that holds it (host-b)"));
+        // Delegated references must be visible in the CLI's JSON report.
+        let json_report = serde_json::to_value(&report).expect("serialized report");
+        assert_eq!(json_report["validated_elsewhere"][0], report.validated_elsewhere[0]);
         assert_eq!(report.skills.checked, 1);
         assert_eq!(report.workflow.checked, 1);
         // Portable references still use candidate supply and merged definitions.
