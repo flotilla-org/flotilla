@@ -89,7 +89,7 @@ pub struct FlotillaConfig {
     #[serde(default)]
     pub ai_utility: AiUtilityConfig,
     // ADR 0047 / #2915: accept and drop the retired key for one generation.
-    // Remove after the first roll containing PresentationManager retirement.
+    // Remove in #2915 step 5, after the first roll containing steps 3 and 4.
     #[serde(default, rename = "presentation_manager", deserialize_with = "drop_retired_presentation_manager", skip_serializing)]
     _retired_presentation_manager: Option<()>,
     #[serde(default)]
