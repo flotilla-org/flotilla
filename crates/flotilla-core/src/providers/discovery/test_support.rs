@@ -1396,7 +1396,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             ai_utilities: vec![],
             presentation_managers: presentation_manager_factories,
             terminal_pools: terminal_pool_factories,
-            environment_providers: vec![Box::new(super::factories::docker::HostDirectEnvironmentFactory)],
+            environment_providers: vec![Box::new(super::factories::host_direct::HostDirectEnvironmentFactory)],
         },
         attachable_store,
         host_scoped_providers: Default::default(),

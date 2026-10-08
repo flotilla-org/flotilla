@@ -54,7 +54,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let spec = spec.docker.as_ref().expect("kind checked");
         let registry_digest = spec.image.rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest));
         if !flotilla_resources::is_image_digest(&spec.image) && !registry_digest {
-            return Err("waiting on build: Docker environments require an existing pinned digest".into());
+            return Err("Docker environments require a pinned digest; mutable tags are unsupported".into());
         }
         if !self.inner.image_exists(&spec.image, Path::new("/")).await? {
             if !registry_digest {
@@ -73,9 +73,9 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                 .runner
                 .run("docker", &args, Path::new("/"), &ChannelLabel::Default)
                 .await
-                .map_err(|error| format!("waiting on build: pinned image unavailable: {error}"))?;
+                .map_err(|error| format!("pinned image pull failed: {error}"))?;
             if !self.inner.image_exists(&spec.image, Path::new("/")).await? {
-                return Err("waiting on build: pulled digest is not present".into());
+                return Err("pinned image pull succeeded but digest is not present".into());
             }
         }
         Ok(super::PreparedEnvironment::new(&self.preparation_owner, ImageId::new(spec.image.clone())))
@@ -88,6 +88,8 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         opts: ProvisionOpts,
     ) -> Result<EnvironmentHandle, String> {
         let image = prepared.get::<ImageId>(&self.preparation_owner)?;
+        // Preparation already resolved and verified the digest; provisioning must
+        // never pull again or use registry credentials, regardless of pull policy.
         self.create(
             id,
             image,

@@ -263,6 +263,18 @@ async fn host_adoption_is_idempotent_and_preparation_is_instance_scoped() {
         docker: None,
     };
     let prepared = provider.prepare(&spec, &Default::default()).await.expect("prepare host");
+    for opts in [
+        super::ProvisionOpts { tokens: vec![("TOKEN".into(), "secret".into())], ..Default::default() },
+        super::ProvisionOpts { tools: vec![test_daemon_tool("/socket")], ..Default::default() },
+        super::ProvisionOpts {
+            provisioned_mounts: vec![ProvisionedMount::new("/host", "/guest", ProvisionedMountMode::Ro)],
+            ..Default::default()
+        },
+        super::ProvisionOpts { cpu_limit: Some(1), ..Default::default() },
+    ] {
+        assert!(provider.provision(EnvironmentId::new("unsupported"), &prepared, opts).await.is_err());
+        assert!(provider.list().await.expect("no adoption on rejected opts").is_empty());
+    }
     let id = EnvironmentId::new("adopted");
     assert!(other.provision(id.clone(), &prepared, Default::default()).await.is_err());
     let first = provider.provision(id.clone(), &prepared, Default::default()).await.expect("adopt");
@@ -1694,7 +1706,7 @@ async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
 }
 
 // Missing pinned registry digests can be pulled with admitted credentials;
-// preparation reports waiting when the existing digest cannot be obtained.
+// preparation reports pull/verification failures without classifying them as build demand.
 // The queued runner stands in for Docker's subprocess interface.
 #[tokio::test]
 async fn preparation_pulls_only_pinned_registry_content() {
@@ -1710,8 +1722,17 @@ async fn preparation_pulls_only_pinned_registry_content() {
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[1].1, ["--config", "/private/operation-auth", "pull", spec.docker.as_ref().expect("docker").image.as_str()]);
     let absent = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
-    let error = absent.prepare(&spec, &opts).await.err().expect("must wait");
-    assert!(error.starts_with("waiting on build:"));
+    let error = absent.prepare(&spec, &opts).await.err().expect("pull failed");
+    assert!(error.starts_with("pinned image pull failed:"));
+    let absent_after_pull = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([
+        Err("not held".into()),
+        Ok("pulled".into()),
+        Err("still absent".into()),
+    ])));
+    assert_eq!(
+        absent_after_pull.prepare(&spec, &opts).await.err().expect("verify failed"),
+        "pinned image pull succeeded but digest is not present"
+    );
 }
 
 // Tags and malformed digests cannot make preparation succeed, even if a

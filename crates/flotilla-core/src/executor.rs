@@ -1208,6 +1208,8 @@ impl StepResolver for ExecutorStepResolver {
                     .select(EnvironmentKind::Docker, Some(&provider))
                     .ok_or_else(|| format!("environment provider not available: {provider}"))?;
                 let resource_spec = legacy_environment_spec(spec)?;
+                // TODO(#2862 Part B): mint an operation-scoped RegistryAuth here;
+                // anonymous preparation must use an empty adapter configuration.
                 let prepared = env_provider.prepare(&resource_spec, &Default::default()).await?;
                 let tokens = spec
                     .token_env_vars

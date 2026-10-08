@@ -11,6 +11,9 @@ use super::{EnvironmentHandle, EnvironmentKind, EnvironmentProvider, PreparedEnv
 use crate::providers::environment::{PrepareOpts, ProvisionOpts};
 use crate::providers::CommandRunner;
 
+/// Legacy handles require an image id even for image-free adoption.
+const HOST_DIRECT_IMAGE_SENTINEL: &str = "host-direct:no-image";
+
 pub struct HostDirectEnvironmentProvider {
     runner: Arc<dyn CommandRunner>,
     environment: HashMap<String, String>,
@@ -37,16 +40,24 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
         Ok(PreparedEnvironment::new(&self.owner, ()))
     }
 
-    async fn provision(
-        &self,
-        id: EnvironmentId,
-        prepared: &PreparedEnvironment,
-        _opts: ProvisionOpts,
-    ) -> Result<EnvironmentHandle, String> {
+    async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String> {
         prepared.get::<()>(&self.owner)?;
+        if !opts.tokens.is_empty()
+            || !opts.provisioned_mounts.is_empty()
+            || !opts.tools.is_empty()
+            || opts.cpu_limit.is_some()
+            || opts.memory_policy != Default::default()
+        {
+            return Err("host-direct adoption cannot install tokens, mounts, tools, or resource limits".into());
+        }
         let mut handles = self.handles.lock().expect("host adoption lock");
         Ok(Arc::clone(handles.entry(id.clone()).or_insert_with(|| {
-            Arc::new(HostHandle { id, runner: Arc::clone(&self.runner), environment: self.environment.clone(), image: ImageId::new("") })
+            Arc::new(HostHandle {
+                id,
+                runner: Arc::clone(&self.runner),
+                environment: self.environment.clone(),
+                image: ImageId::new(HOST_DIRECT_IMAGE_SENTINEL),
+            })
         })))
     }
 
