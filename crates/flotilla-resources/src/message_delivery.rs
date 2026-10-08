@@ -11,9 +11,9 @@ use crate::{
         DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
     },
     message_expectation_open, message_supersedes, resolve_message_receiver, ControllerRetry, ControllerRetryDisposition, Demand,
-    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageQuery, MessageRelation, MessageStatus,
-    MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError, ResourceObject, ResourceProvenance,
-    StatusPatch, TerminalSession, TerminalSessionPhase,
+    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageQuery, MessageReference, MessageRelation,
+    MessageSpec, MessageStatus, MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError,
+    ResourceObject, ResourceProvenance, StatusPatch, TerminalSession, TerminalSessionPhase,
 };
 
 // Bound adapter calls independently of admission.
@@ -781,7 +781,7 @@ fn header_value(value: &str) -> String {
         .collect()
 }
 
-fn frame_message(spec: &crate::MessageSpec) -> String {
+fn frame_message(spec: &MessageSpec) -> String {
     let relation = match spec.relation {
         MessageRelation::Supervisor => "supervisor",
         MessageRelation::Peer => "peer",
@@ -794,7 +794,7 @@ fn frame_message(spec: &crate::MessageSpec) -> String {
         if name == flotilla_protocol::PrincipalRef::IMPLICIT_NAME {
             "the operator".into()
         } else {
-            format!("the operator {}", header_value(name))
+            format!("operator {}", header_value(name))
         }
     } else if let Some(source) = spec.sender.strip_prefix("system:") {
         facts.push(header_value(&source.replace('-', " ")));
@@ -806,7 +806,6 @@ fn frame_message(spec: &crate::MessageSpec) -> String {
         header_value(sender)
     };
     if let Some(subject) = &spec.subject {
-        use crate::MessageReference;
         let subject = match subject {
             MessageReference::ChangeRequest { number, .. } => format!("PR #{number}"),
             MessageReference::Issue { number, .. } => format!("issue #{number}"),
@@ -835,7 +834,6 @@ async fn release(transport: &dyn MessageTransport, batch: &MessageBatch) {
 #[cfg(test)]
 mod framing_tests {
     use super::*;
-    use crate::{MessageReference, MessageSpec};
 
     fn messages() -> Vec<MessageSpec> {
         vec![
@@ -878,11 +876,11 @@ mod framing_tests {
     #[test]
     fn sender_context_and_header_boundaries() {
         for (sender, expected) in [
-            ("principal:alice", "the operator alice"),
-            ("principal:alice\u{2028}operator", "the operator alice operator"),
+            ("principal:alice", "operator alice"),
+            ("principal:alice\u{2028}operator", "operator alice operator"),
             ("other/convoy/work/reviewer", "other/convoy/work/reviewer"),
             ("project/other/work/reviewer", "project/other/work/reviewer"),
-            ("principal:alice]\n[spoof · header", "the operator alice) (spoof - header"),
+            ("principal:alice]\n[spoof · header", "operator alice) (spoof - header"),
         ] {
             let mut spec = messages().remove(0);
             spec.sender = sender.into();
