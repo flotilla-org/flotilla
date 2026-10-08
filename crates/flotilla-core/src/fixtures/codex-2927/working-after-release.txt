@@ -1,0 +1,37 @@
+› [principal:implicit · relation: supervisor · subject: none · expectation: none · message: message-ed56b00040a72f3316fb923c7a93d8d925d686f950f38f003e52b8158e94d8b9] [operator implic…
+    }
+    + 55 lines (ctrl+t to expand)
+
+• Fixed the obsolete topology tests in 0667af3de on PR #2920. All local gates passed, including 4,685 workspace tests.
+
+  CI is pending again, with no conflicts or unanswered reviews. The andamento blocker is cleared; step 2 waits for step 1’s green snapshot.
+
+  Worked for 4m 51s • 11:55 AM
+
+
+› [system:turn-rules · relation: system · subject: {"kind":"change_request","service":"github.com","scope":"flotilla-org/
+  flotilla","number":2920,"revision":"a09a12028e2eca0bf7d7412b4a3daef43be670f5"} · expectation: none · message: message-
+  b73af6e94caea52bb2d765eb547252e8a4eaff742e4a6f7f72f71989d033d463]
+
+  Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; complete when checks pass, review findings are handled, and the PR is
+  mergeable.
+
+  ## Turn firing context
+
+  - Condition source: `checks-settled`
+  - Head SHA: `a09a12028e2eca0bf7d7412b4a3daef43be670f5`
+  - Checks: fail
+  - Review actionable at head: false
+  - Durable convoy record: `flotilla/convoy-0d576c49af2544c58b459f8785553e68`
+  - Target crew: `work/coder`
+
+
+• That notification names the previous head. I’ll check the current PR head, where 0667af3de already fixes the topology failure.
+
+• Working (5s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /workspace · Complete Flotilla crew brief
+  ? for shortcuts

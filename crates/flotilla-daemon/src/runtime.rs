@@ -6558,12 +6558,14 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
             }
         });
         let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
+        let evidence = if other_delivery { None } else { evidence };
         Ok(flotilla_resources::MessageObservation {
             ready: !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
-            working: attention.is_some_and(|attention| {
-                attention.state == TerminalAttentionState::Working
-                    && submission.is_some_and(|submission| attention.as_of > submission.started_at)
-            }),
+            working: !other_delivery
+                && attention.is_some_and(|attention| {
+                    attention.state == TerminalAttentionState::Working
+                        && submission.is_some_and(|submission| attention.as_of > submission.started_at)
+                }),
             evidence,
             output_digest: status.last_output_digest.clone(),
             waiting_reason: Some("waiting for a fresh idle holder observation".into()),
@@ -6648,8 +6650,12 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
         }
         let session = batch.submission.session.clone();
         let text = batch.text.clone();
+        let daemon = Arc::clone(&self.state.daemon);
+        let namespace = batch.holder.metadata.namespace.clone();
+        let members = batch.submission.members.clone();
         let task = tokio::spawn(async move {
-            deliver_and_confirm(&*pool, adapter.as_deref(), &session, &text, TerminalDeliveryReadiness::TurnBoundary, false).await
+            let inbox = daemon.message_inbox(&namespace).await;
+            deliver_guarded_and_confirm(&*pool, adapter.as_deref(), &session, &text, &inbox, &members).await
         });
         deliveries.insert(
             batch.submission.session.clone(),
@@ -6849,6 +6855,54 @@ async fn deliver_and_confirm(
             return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
         }
     }
+    submit_and_confirm(pool, adapter, session_id, message, clear_before_delivery).await
+}
+
+/// Readiness and freshness are both pre-write steps under one hold deadline.
+async fn deliver_guarded_and_confirm(
+    pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
+    session: &str,
+    text: &str,
+    inbox: &flotilla_resources::MessageInbox,
+    members: &[String],
+) -> Result<TerminalDeliveryOutcome, String> {
+    let deadline =
+        tokio::time::Instant::now() + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR.to_std().expect("positive hold bound");
+    let ready =
+        tokio::time::timeout_at(deadline, wait_for_delivery_ready(pool, adapter, session, TerminalDeliveryReadiness::TurnBoundary)).await;
+    if ready.is_err() {
+        // Stop waiting; the durable intent remains for the operator gate.
+        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+    }
+    if !matches!(ready, Ok(Ok(true))) {
+        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+    }
+    match tokio::time::timeout_at(deadline, inbox.validate_delivery_members(members, Utc::now())).await {
+        Ok(Ok(true)) => {}
+        Err(_) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)),
+        Ok(Err(error)) => {
+            warn!(%session, %error, "message freshness is unavailable before input; holding the unsent batch");
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+        }
+        Ok(Ok(false)) => return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)),
+    }
+    // timeout_at polls an immediately-ready future before its timer; enforce
+    // the bound even if readiness and validation complete at the deadline.
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+    }
+    // No second readiness wait may separate validation from terminal input.
+    submit_and_confirm(pool, adapter, session, text, false).await
+}
+
+async fn submit_and_confirm(
+    pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
+    session_id: &str,
+    message: &str,
+    clear_before_delivery: bool,
+) -> Result<TerminalDeliveryOutcome, String> {
     let submission =
         if clear_before_delivery { pool.retry_delivery(session_id, message).await } else { pool.deliver(session_id, message).await };
     // A transport error may occur after a partial write, or after acceptance
@@ -15603,6 +15657,143 @@ mod tests {
         .expect("terminal controller attention projection");
     }
 
+    // #2927: a captured scrollback composer permits input, while an unknown
+    // screen is held for at most five minutes and cannot paste on late release.
+    #[tokio::test(start_paused = true)]
+    async fn captured_scrollback_delivery_and_bounded_hold() {
+        let adapters = AgentAdapterRegistry::discover(
+            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+        );
+        for idle in [true, false] {
+            let pool = Arc::new(HooklessComposerPool {
+                inner: FakeTerminalPool::new(),
+                submitted_screen: include_str!("../../flotilla-core/src/fixtures/codex-2927/working-after-release.txt"),
+            });
+            pool.inner
+                .add_sessions(vec![ProviderTerminalSession::builder()
+                    .session_name("agent".into())
+                    .status(TerminalStatus::Running)
+                    .screen_activity(ScreenActivity::Stable)
+                    .build()])
+                .await;
+            pool.inner
+                .set_captured_screen(
+                    "agent",
+                    if idle {
+                        include_str!("../../flotilla-core/src/fixtures/codex-2927/scrolled-back.txt")
+                    } else {
+                        "unobservable screen"
+                    },
+                )
+                .await;
+            let backend = ResourceBackend::InMemory(Default::default());
+            let inbox = flotilla_resources::MessageInbox::new(backend, NAMESPACE);
+            inbox
+                .accept(
+                    &empty_meta("turn"),
+                    &flotilla_resources::MessageSpec::builder()
+                        .sender("system:test".into())
+                        .receiver("flotilla/coder".into())
+                        .relation(flotilla_resources::MessageRelation::System)
+                        .body("wake".into())
+                        .build(),
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let task_pool = pool.clone();
+            let adapter = adapters.get("codex").unwrap().clone();
+            let started = tokio::time::Instant::now();
+            let task = tokio::spawn(async move {
+                deliver_guarded_and_confirm(&*task_pool, Some(&*adapter), "agent", "wake", &inbox, &["turn".into()]).await
+            });
+            tokio::task::yield_now().await;
+            if !idle {
+                tokio::time::advance(Duration::from_secs(299)).await;
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished());
+                assert!(pool.inner.delivered.lock().await.is_empty());
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            let outcome = task.await.unwrap().unwrap();
+            if !idle {
+                assert!(started.elapsed() <= Duration::from_secs(300), "held task must stop at the bound");
+            }
+            assert_eq!(
+                outcome,
+                if idle {
+                    TerminalDeliveryOutcome::Confirmed
+                } else {
+                    TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
+                }
+            );
+            pool.inner.set_captured_screen("agent", include_str!("../../flotilla-core/src/fixtures/codex-2927/scrolled-back.txt")).await;
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            assert_eq!(pool.inner.delivered.lock().await.len(), usize::from(idle));
+        }
+    }
+
+    // Release must reject a firing condition that changed during a screen wait,
+    // even when the holder now has a genuine captured idle composer.
+    #[tokio::test(start_paused = true)]
+    async fn held_turn_is_revalidated_at_actual_input_boundary() {
+        let adapters = AgentAdapterRegistry::discover(
+            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+        );
+        let pool =
+            Arc::new(HooklessComposerPool { inner: FakeTerminalPool::new(), submitted_screen: "• Working (1s • esc to interrupt)" });
+        pool.inner
+            .add_sessions(vec![ProviderTerminalSession::builder()
+                .session_name("agent".into())
+                .status(TerminalStatus::Running)
+                .screen_activity(ScreenActivity::Stable)
+                .build()])
+            .await;
+        pool.inner.set_captured_screen("agent", "unobservable screen").await;
+        let backend = ResourceBackend::InMemory(Default::default());
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let convoy = convoys.create(&empty_meta("subject"), &ConvoySpec::builder().workflow_ref("workflow".into()).build()).await.unwrap();
+        convoys
+            .update_status("subject", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
+            .await
+            .unwrap();
+        let inbox = flotilla_resources::MessageInbox::new(backend.clone(), NAMESPACE);
+        inbox
+            .accept(
+                &empty_meta("turn"),
+                &flotilla_resources::MessageSpec::builder()
+                    .sender("system:turn-rules".into())
+                    .receiver("flotilla/coder".into())
+                    .relation(flotilla_resources::MessageRelation::System)
+                    .body("wake".into())
+                    .delivery_condition("convoy/subject .status.phase == Active".parse().unwrap())
+                    .build(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let task_pool = pool.clone();
+        let adapter = adapters.get("codex").unwrap().clone();
+        let task = tokio::spawn(async move {
+            deliver_guarded_and_confirm(&*task_pool, Some(&*adapter), "agent", "wake", &inbox, &["turn".into()]).await
+        });
+        tokio::task::yield_now().await;
+        let convoy = convoys.get("subject").await.unwrap();
+        convoys
+            .update_status("subject", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() })
+            .await
+            .unwrap();
+        pool.inner.set_captured_screen("agent", include_str!("../../flotilla-core/src/fixtures/codex-2927/scrolled-back.txt")).await;
+        assert_eq!(task.await.unwrap().unwrap(), TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+        assert!(pool.inner.delivered.lock().await.is_empty());
+        assert_eq!(
+            backend.using::<flotilla_resources::Message>(NAMESPACE).get("turn").await.unwrap().status.unwrap().phase,
+            flotilla_resources::MessagePhase::Superseded
+        );
+    }
+
     // A fresh idle composer accepts one batch; stable Working supplies evidence.
     // Once its task is gone, polling the durable intent never types it again.
     #[tokio::test(start_paused = true)]
@@ -15665,7 +15856,39 @@ mod tests {
             )
             .text("first\nsecond\nthird".into())
             .build();
+        for name in &batch.submission.members {
+            backend
+                .using::<flotilla_resources::Message>(NAMESPACE)
+                .create(
+                    &empty_meta(name),
+                    &flotilla_resources::MessageSpec::builder()
+                        .sender("system:test".into())
+                        .receiver("flotilla/coder".into())
+                        .relation(flotilla_resources::MessageRelation::System)
+                        .body("transport test".into())
+                        .build(),
+                )
+                .await
+                .expect("record batch member");
+        }
         assert_eq!(MessageTransport::submit(&runtime, &batch).await, MessageTransportOutcome::Pending);
+        // Unrelated hook/tool activity while the task owns input cannot invent
+        // receipt, even with fresh Working evidence after submission began.
+        let holder = sessions.get(ID).await.expect("pending holder");
+        let original = holder.status.clone().expect("pending status");
+        let mut status = original.clone();
+        let activity_at = batch.submission.started_at + chrono::Duration::seconds(1);
+        status.session_id = Some(ID.into());
+        status.attention = Some(flotilla_resources::TerminalAttention {
+            state: TerminalAttentionState::Working,
+            as_of: activity_at,
+            source: TerminalAttentionSource::Hook,
+        });
+        status.last_tool_activity_at = Some(activity_at);
+        let holder = sessions.update_status(ID, &holder.metadata.resource_version, &status).await.expect("unrelated activity");
+        let observation = MessageTransport::observe(&runtime, &holder, Some(&batch.submission)).await.expect("pending observation");
+        assert!(!observation.ready && !observation.working && observation.evidence.is_none());
+        sessions.update_status(ID, &holder.metadata.resource_version, &original).await.expect("restore holder observation");
         let mut accepted = false;
         for _ in 0..30 {
             tokio::time::advance(Duration::from_millis(200)).await;
@@ -15680,6 +15903,9 @@ mod tests {
         // With no retained task, a restart can observe evidence but never submit.
         assert!(matches!(MessageTransport::poll(&runtime, &batch).await, MessageTransportOutcome::Unconfirmed { .. }));
         assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+        for name in &batch.submission.members {
+            backend.using::<flotilla_resources::Message>(NAMESPACE).delete(name).await.expect("retire direct transport fixtures");
+        }
         // Cross-host delivery waits until the sender authority's convoy is
         // replicated. The receiver's real inbox then submits all three records
         // through the same terminal-pool boundary exactly once.
