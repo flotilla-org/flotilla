@@ -25,7 +25,7 @@ jobs:
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
       - id: check
@@ -46,7 +46,7 @@ jobs:
     env:
       HEGEL_DEFAULT_PROFILE: nightly
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action

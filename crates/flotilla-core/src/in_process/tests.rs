@@ -38,6 +38,19 @@ use crate::{
     vcs::GitCheckoutStrategy,
 };
 
+#[cfg(unix)]
+use crate::providers::{
+    discovery::test_support::FakeTerminalPool,
+    terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
+};
+use crate::providers::{
+    discovery::test_support::{
+        fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeChangeRequest, FakeDiscoveryProviders,
+        FakeVcsFactory, FakeVcsState,
+    },
+    testing::MockRunner,
+};
+
 // #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
 // successful reads never emit fallback diagnostics. Glue: exhaust the three read outcomes.
 #[tokio::test]
@@ -843,14 +856,6 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
         assert!(!PlacementTieBreak { needs: &named, now }.reserved(&candidate));
     }
 }
-use crate::providers::{
-    discovery::test_support::{
-        fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeChangeRequest, FakeDiscoveryProviders,
-        FakeTerminalPool, FakeVcsFactory, FakeVcsState,
-    },
-    terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
-    testing::MockRunner,
-};
 
 #[test]
 fn standalone_issue_source_lookup_round_trips_installation_identity() {
@@ -3836,6 +3841,7 @@ fn managed_terminal_changes_are_field_scoped_and_deduplicated() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
     let temp = tempfile::tempdir().expect("tempdir");

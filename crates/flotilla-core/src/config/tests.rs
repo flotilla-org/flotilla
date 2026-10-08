@@ -5,6 +5,7 @@ use std::{
 
 use flotilla_protocol::NodeId;
 use flotilla_resources::{RepositoryGitSpec, RepositoryProviderPreference, RepositorySpec, RepositoryVcsSpec};
+#[cfg(unix)]
 use hegel::generators as gs;
 use tempfile::tempdir;
 
@@ -40,6 +41,7 @@ fn observation_roots_roundtrip_and_reject_configuration() {
 // #2570: adding equivalent filesystem roots is idempotent and preserves the
 // first configured spelling, including a suffix that does not exist yet.
 // Generate insertion order, zero to three missing components, and repeated adds.
+#[cfg(unix)]
 #[hegel::test]
 fn observation_root_alias_add_is_idempotent(tc: hegel::TestCase) {
     let alias_first = tc.draw(gs::booleans());

@@ -23,7 +23,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
@@ -48,7 +48,7 @@ jobs:
     name: Script contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Decide whether script inputs changed
@@ -107,7 +107,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Decide whether launch inputs changed
@@ -133,8 +133,20 @@ jobs:
         if: steps.filter.outputs.run == 'true'
         with:
           shared-key: cleat-environment
-      - name: Build pinned old and new cleat
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Key pinned cleat binaries
         if: steps.filter.outputs.run == 'true'
+        id: cleat-key
+        run: echo "key=$(ci/cleat-environment/cache-key.sh)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        if: steps.filter.outputs.run == 'true'
+        id: cleat-binaries
+        with:
+          path: ${{ runner.temp }}/cleat-environment
+          key: ${{ steps.cleat-key.outputs.key }}
+      - name: Build pinned old and new cleat
+        if: steps.filter.outputs.run == 'true' && steps.cleat-binaries.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/flotilla-org/cleat.git "$RUNNER_TEMP/cleat-source"
           ci/cleat-environment/build.sh "$RUNNER_TEMP/cleat-source" "$RUNNER_TEMP/cleat-environment"
@@ -156,7 +168,7 @@ jobs:
     name: DAG scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           python3 -m unittest scripts.tests.test_dag_fetch
           python3 -m unittest scripts.tests.test_dag_compose
@@ -165,7 +177,7 @@ jobs:
     name: codex-token-refresh script
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: python3 -m unittest scripts.tests.test_codex_token_refresh
 
   clippy:
@@ -173,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
@@ -182,14 +194,23 @@ jobs:
       # and thrashed the repo's 10GB cache pool against compose's blobs.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "clippy"
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check Windows cfg paths on Linux
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+          cargo --config 'profile.dev.package."*".debug=0' check --target x86_64-pc-windows-gnu -p flotilla -p flotilla-client -p flotilla-tui -p flotilla-manifest -p flotilla-transport --all-targets --locked
 
   relay-wasm:
     name: Relay Workers target
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
@@ -197,6 +218,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "relay-wasm"
       - run: cargo --config 'profile.dev.package."*".debug=0' build -p flotilla-relay --target wasm32-unknown-unknown --locked
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-relay --target wasm32-unknown-unknown --locked -- -D warnings
@@ -206,7 +228,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
@@ -215,6 +237,7 @@ jobs:
       # and thrashed the repo's 10GB cache pool against compose's blobs.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: "test"
       - run: cargo --config 'profile.dev.package."*".debug=0' test --workspace --locked
 
@@ -228,7 +251,7 @@ jobs:
       windows: ${{ steps.classify.outputs.windows }}
       macos: ${{ steps.classify.outputs.macos }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: classify
@@ -261,17 +284,20 @@ jobs:
 
   windows-client:
     name: Windows client
+    env:
+      RUSTFLAGS: "-D warnings"
     runs-on: windows-latest
     needs: changes
     if: needs.changes.outputs.windows == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-client"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked -- -D warnings
       - run: cargo --config 'profile.dev.package."*".debug=0' build --bin flotilla --locked
       - name: Run the client on Windows' default 1 MiB main-thread stack
@@ -298,13 +324,14 @@ jobs:
     needs: [fmt, changes]
     if: needs.changes.outputs.macos == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up pinned Rust
         id: rust-pin
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-peer-identity"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run selected macOS tests
         shell: bash
         run: |
