@@ -59,7 +59,10 @@ fn message_stored_shape_round_trips(tc: hegel::TestCase) {
         MessagePhase::DeadLettered,
     ];
     let phase = phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
-    let spec = spec(reference, expectation);
+    let mut spec = spec(reference, expectation);
+    if tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1 {
+        spec.delivery_condition = Some("convoy/work .status.phase == Landed".parse().expect("delivery leaf"));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
         let resolver = ResourceBackend::InMemory(InMemoryBackend::default()).using::<Message>("flotilla");
@@ -2075,4 +2078,182 @@ async fn unknown_project_contact_query_reports_configuration_error() {
     assert_eq!(book.routing_issue.as_deref(), Some("unknown Project `missing`"));
     assert!(book.render().contains("unknown Project `missing`"));
     assert!(!book.render().contains("No current subscriber"));
+}
+
+// #2927: release uses today's subject revision and firing condition, including
+// changes after submission began. Generate each state transition and replay
+// validation twice to cover duplicate release and persistent closure.
+#[hegel::test]
+fn held_turn_release_checks_revision_and_condition(tc: hegel::TestCase) {
+    use flotilla_resources::*;
+    let change = tc.draw(gs::integers::<u8>().min_value(0).max_value(6));
+    let legacy = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (backend, inbox) = delivery_inbox().await;
+        let crs = backend.using::<ChangeRequest>("flotilla");
+        let name = change_request_record_name("github.com", "org/repo", 2920);
+        let record = crs
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("org/repo".into())
+                    .number(2920)
+                    .observing_authority("test".into())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let observation = |head: &str, checks| ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            state: Observation { value: Some(ObservedChangeRequestState::Open), observed_at: at(30) },
+            head_sha: Observation { value: Some(head.into()), observed_at: at(30) },
+            checks: Observation { value: checks, observed_at: at(30) },
+            review: ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+            mergeable: Default::default(),
+        };
+        crs.update_status(&name, &record.metadata.resource_version, &observation("old", Some(ObservedChecks::Fail))).await.unwrap();
+        let reference = MessageReference::ChangeRequest {
+            service: "github.com".into(),
+            scope: "org/repo".into(),
+            number: 2920,
+            revision: "old".into(),
+        };
+        let mut intent = spec(Some(reference), MessageExpectation::None);
+        intent.sender = "system:turn-rules".into();
+        intent.delivery_condition = Some("cr/github.com/org/repo/2920 .checks == fail".parse().unwrap());
+        if legacy {
+            intent.delivery_condition = None;
+        }
+        inbox.accept(&InputMeta::builder().name("turn".into()).build(), &intent, at(10)).await.unwrap();
+        if legacy {
+            // The receiver may see an old Message before its admission receipt
+            // replicates. Missing condition proof must hold the turn.
+            assert!(inbox.validate_delivery_members(&["turn".into()], at(31)).await.is_err());
+            let convoys = backend.using::<Convoy>("flotilla");
+            let convoy = convoys.get("convoy").await.unwrap();
+            let rule = TurnDeliveryRule::builder()
+                .on("$cr.checks == fail".parse().unwrap())
+                .to(TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+                .brief("checks settled".into())
+                .hold(HoldAct::State)
+                .build();
+            let snapshot = WorkflowSnapshot {
+                cascade: None,
+                exit: None,
+                turn_delivery: [("checks-settled".into(), rule)].into_iter().collect(),
+                stall_nudges: Default::default(),
+                supervision: None,
+                vessels: vec![],
+            };
+            let episode = TurnDeliveryEpisode::builder()
+                .subject_revision("old".into())
+                .evidence_at(at(10))
+                .judged_claim_at(at(9))
+                .outcome(TurnDeliveryOutcome::MessageAccepted {
+                    new_turn: true,
+                    message: ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "turn"),
+                    rung: TurnDeliveryRung::WarmSession,
+                    accepted_at: at(10),
+                })
+                .build();
+            convoys
+                .update_status(
+                    "convoy",
+                    &convoy.metadata.resource_version,
+                    &ConvoyStatus {
+                        phase: ConvoyPhase::Active,
+                        workflow_snapshot: Some(snapshot),
+                        turn_deliveries: [("checks-settled".into(), TurnDeliveryStatus { episodes: vec![episode], ..Default::default() })]
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Pending,
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+        let record = crs.get(&name).await.unwrap();
+        let status = match change {
+            0 => observation("old", Some(ObservedChecks::Fail)),
+            1 => observation("new", Some(ObservedChecks::Fail)),
+            2 => observation("old", Some(ObservedChecks::Pass)),
+            _ => observation("old", None),
+        };
+        let mut status = status;
+        if change == 4 {
+            status.state.value = Some(ObservedChangeRequestState::Merged);
+            status.checks.value = Some(ObservedChecks::Fail);
+        }
+        if change == 5 {
+            status.checks = Observation { value: Some(ObservedChecks::Fail), observed_at: at(-300) };
+        }
+        if change == 6 {
+            status.checks = Observation::known(ObservedChecks::Fail, at(30));
+            status.head_sha.observed_at = at(-300);
+        }
+        crs.update_status(&name, &record.metadata.resource_version, &status).await.unwrap();
+        for _ in 0..2 {
+            let result = inbox.validate_delivery_members(&["turn".into()], at(31)).await;
+            if matches!(change, 3 | 5 | 6) {
+                assert!(result.is_err(), "unknown is held, never mistaken for false");
+            } else {
+                assert_eq!(result.unwrap(), change == 0);
+            }
+            let status = backend.using::<Message>("flotilla").get("turn").await.unwrap().status.unwrap();
+            assert_eq!(status.phase == MessagePhase::Superseded, matches!(change, 1 | 2 | 4));
+            assert!(status.resolved_receiver.is_none(), "stale closure never fabricates receipt");
+        }
+    });
+}
+
+// A pending submission becomes an operator HumanGate exactly at five minutes;
+// repeated overdue passes preserve one gate and never claim input receipt.
+#[tokio::test]
+async fn pending_submission_surfaces_at_hold_boundary() {
+    use flotilla_resources::{Demand, MessageTransportOutcome};
+    let (backend, inbox) = delivery_inbox().await;
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: MessageTransportOutcome::Pending,
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+    inbox.reconcile_delivery(&transport, at(319)).await.unwrap();
+    assert!(backend.using::<Demand>("flotilla").list().await.unwrap().items.is_empty());
+    for second in [320, 321, 10000] {
+        inbox.reconcile_delivery(&transport, at(second)).await.unwrap();
+        assert_eq!(backend.using::<Demand>("flotilla").list().await.unwrap().items.len(), 1);
+        assert_eq!(transport.submissions.lock().unwrap().len(), 1);
+        assert!(backend.using::<Message>("flotilla").get("message-0").await.unwrap().status.unwrap().resolved_receiver.is_none());
+    }
+}
+
+// Previous-generation admission retries reuse immutable Messages; new guarded
+// intents with different firing conditions remain distinct.
+#[test]
+fn delivery_guard_admission_compatibility() {
+    let legacy = spec(None, MessageExpectation::None);
+    let mut current = legacy.clone();
+    current.delivery_condition = Some("convoy/work .status.phase == Active".parse().unwrap());
+    assert!(legacy.same_intent(&current));
+    assert!(current.same_intent(&legacy));
+    let mut other = current.clone();
+    other.delivery_condition = Some("convoy/work .status.phase == Landed".parse().unwrap());
+    assert!(!current.same_intent(&other));
 }

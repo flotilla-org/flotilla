@@ -603,6 +603,9 @@ impl MessageInbox {
     ) -> Result<(), ResourceError> {
         for member in members {
             let current = self.messages.get(&member.metadata.name).await?;
+            if current.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                continue;
+            }
             let mut status = status_for(&current);
             if status.retry.as_ref().is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. })) {
                 if ambiguous

@@ -2456,6 +2456,7 @@ impl CrewService {
             .references(request.references.clone())
             .maybe_subject(request.message_subject.clone())
             .expectation(request.expectation.clone())
+            .maybe_delivery_condition(request.delivery_condition.clone())
             .build();
         let name = flotilla_resources::message_record_name(
             receiver,
@@ -2581,6 +2582,7 @@ impl CrewService {
             .references(request.references.clone())
             .maybe_subject(request.message_subject.clone())
             .expectation(request.expectation.clone())
+            .maybe_delivery_condition(request.delivery_condition.clone())
             .build();
         let name = flotilla_resources::message_record_name(
             &receiver,
@@ -3123,6 +3125,7 @@ impl CrewService {
             ))
             .references(references)
             .maybe_subject(request.message_subject.clone())
+            .maybe_delivery_condition(request.delivery_condition.clone())
             .build();
         self.publish_message_intent(&request.namespace, &name, &intent).await.map(|_| ())
     }

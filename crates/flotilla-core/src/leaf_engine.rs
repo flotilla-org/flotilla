@@ -84,6 +84,7 @@ pub struct CrewTurnIntent {
     #[builder(default)]
     pub references: Vec<flotilla_resources::MessageReference>,
     pub message_subject: Option<flotilla_resources::MessageReference>,
+    pub delivery_condition: Option<Leaf>,
     #[builder(default)]
     pub expectation: flotilla_resources::MessageExpectation,
 }
@@ -1223,6 +1224,7 @@ impl LeafSubscriptionTable {
             .sender("system:turn-rules".into())
             .references(message_subject.clone().into_iter().collect())
             .maybe_message_subject(message_subject)
+            .delivery_condition(leaf.clone())
             .build();
         let prior_episodes = status.turn_deliveries.get(source).map_or(0, |delivery| delivery.episodes.len()) as u32;
         let now = Utc::now();

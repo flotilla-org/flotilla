@@ -956,7 +956,7 @@ fn codex_composer_visible(screen: &str) -> bool {
 fn codex_footer_chrome(line: &str) -> bool {
     // rust-v0.160.0 rows beneath the model footer: the shortcuts hint, which may
     // share its row with a right-aligned warning, and wrapped warning rows.
-    line.starts_with("? for shortcuts") || line.starts_with('⚠')
+    line.starts_with("? for shortcuts") || line.starts_with('⚠') || line == "New activity · enter/esc latest · ? shortcuts"
 }
 
 fn codex_background_terminal_footer(line: &str) -> bool {
@@ -2531,6 +2531,24 @@ mod tests {
         assert_eq!(codex.classify_screen_attention(wrapped), Some(TerminalAttentionState::Idle), "{wrapped}");
         let host_draft = format!("› i think{host_footer}");
         assert_ne!(codex.classify_screen_attention(&host_draft), Some(TerminalAttentionState::Idle), "{host_draft}");
+    }
+
+    // #2927: scrolling an attached transcript must not hide the idle composer
+    // or block delivery. These screens were captured from the real cleat cast.
+    #[test]
+    fn codex_captured_scrollback_remains_deliverable() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        assert_eq!(
+            codex.classify_screen_attention(include_str!("fixtures/codex-2927/scrolled-back.txt")),
+            Some(TerminalAttentionState::Idle)
+        );
+        let draft = include_str!("fixtures/codex-2927/scrolled-back.txt").replace("› Ask Codex to do anything", "› operator draft");
+        assert_eq!(codex.classify_screen_attention(&draft), Some(TerminalAttentionState::Unobservable));
+        assert_eq!(
+            codex.classify_screen_attention(include_str!("fixtures/codex-2927/working-after-release.txt")),
+            Some(TerminalAttentionState::Working)
+        );
     }
 
     #[test]

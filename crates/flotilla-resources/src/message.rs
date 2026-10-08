@@ -22,6 +22,9 @@ impl Resource for Message {
         if spec.interrupting && spec.relation != MessageRelation::Supervisor {
             return Err(ResourceError::invalid("only supervisor messages may interrupt an active turn"));
         }
+        if let Some(condition) = &spec.delivery_condition {
+            crate::admit_leaf(condition).map_err(ResourceError::invalid)?;
+        }
         if let MessageExpectation::Outcome { condition } = &spec.expectation {
             crate::admit_leaf(condition).map_err(ResourceError::invalid)?;
         }
@@ -108,6 +111,10 @@ pub struct MessageSpec {
     #[serde(default)]
     #[builder(default)]
     pub interrupting: bool,
+    /// Original firing condition, checked again before keystroke delivery.
+    /// Decode pre-#2927 Messages without it; remove default after one fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_condition: Option<Leaf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +305,13 @@ impl MessageSpec {
         }
         let mut left = self.clone();
         let mut right = other.clone();
+        // Retry an admission stored before #2927 without changing its immutable
+        // spec. Delivery recovers the old guard from the workflow receipt.
+        // Remove this compatibility comparison after one fleet roll.
+        if left.delivery_condition.is_none() || right.delivery_condition.is_none() {
+            left.delivery_condition = None;
+            right.delivery_condition = None;
+        }
         let digest = |spec: &Self| spec.body_digest.clone().unwrap_or_else(|| message_body_digest(&spec.body));
         let same_body = digest(&left) == digest(&right);
         left.body.clear();
