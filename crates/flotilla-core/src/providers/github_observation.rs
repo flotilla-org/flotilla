@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use super::super::ObservationError;
+use super::change_request::ObservationError;
 use crate::providers::{
     github_api::{github_rate_limit_from_document, parse_gh_api_response, response_header, GhApiResponse, GithubRateLimit},
     CommandOutput,
@@ -10,7 +10,7 @@ use crate::providers::{
 
 /// Every observer call derives accounting and decoding from this one JSON parse.
 #[derive(bon::Builder)]
-pub(super) struct ParsedObservationResponse {
+pub(crate) struct ParsedObservationResponse {
     pub response: GhApiResponse,
     pub success: bool,
     pub stderr: String,
@@ -35,14 +35,18 @@ impl ParsedObservationResponse {
             .headers(headers)
             .build()
     }
+    pub(crate) fn low_budget(&self) -> Option<chrono::DateTime<Utc>> {
+        super::github_api::low_graphql_budget(&self.headers, self.document.as_ref().unwrap_or(&serde_json::Value::Null))
+    }
     pub fn into_document(self) -> Result<serde_json::Value, ObservationError> {
         self.document.map_err(|error| format!("decode GitHub GraphQL observation: {error}").into())
     }
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum QueryShape {
+pub(crate) enum QueryShape {
     BoundBatch,
+    BoardBatch,
     HistoryComments,
     HistoryReviews,
     HistoryThreads,
@@ -52,6 +56,7 @@ impl QueryShape {
     fn as_str(self) -> &'static str {
         match self {
             Self::BoundBatch => "bound-batch",
+            Self::BoardBatch => "board-batch",
             Self::HistoryComments => "history-comments",
             Self::HistoryReviews => "history-reviews",
             Self::HistoryThreads => "history-threads",
@@ -59,15 +64,17 @@ impl QueryShape {
         }
     }
     fn is_history(self) -> bool {
-        !matches!(self, Self::BoundBatch)
+        !matches!(self, Self::BoundBatch | Self::BoardBatch)
     }
 }
 
 /// One repository observation, including all history follow-ups. Logs contain
 /// budget headers and forge errors, never credentials, query text, or PR bodies.
 #[derive(bon::Builder)]
-pub(super) struct ObservationTelemetry<'a> {
+pub(crate) struct ObservationTelemetry<'a> {
     scope: &'a str,
+    #[builder(default = "change request")]
+    observer: &'static str,
     subjects: usize,
     #[builder(default = Instant::now())]
     started: Instant,
@@ -82,11 +89,19 @@ pub(super) struct ObservationTelemetry<'a> {
 }
 
 impl<'a> ObservationTelemetry<'a> {
-    pub(super) fn new(scope: &'a str, subjects: usize) -> Self {
+    pub(crate) fn new(scope: &'a str, subjects: usize) -> Self {
         Self::builder().scope(scope).subjects(subjects).build()
     }
 
-    pub(super) fn record(
+    pub(crate) fn board(scope: &'a str, subjects: usize) -> Self {
+        Self::builder().scope(scope).subjects(subjects).observer("dispatch board").build()
+    }
+
+    pub(crate) fn call(&mut self, shape: QueryShape, subjects: usize) -> ObservationCall<'_, 'a> {
+        ObservationCall { telemetry: self, pending: Some((shape, subjects, Instant::now())) }
+    }
+
+    pub(crate) fn record(
         &mut self,
         shape: QueryShape,
         subjects: usize,
@@ -108,7 +123,7 @@ impl<'a> ObservationTelemetry<'a> {
         let error_messages = errors.into_iter().flatten().filter_map(|error| error["message"].as_str()).collect::<Vec<_>>();
         let limit = parsed.and_then(|parsed| parsed.limit.as_ref());
         tracing::info!(
-            scope = %self.scope, query_shape = shape.as_str(), subject_count = subjects,
+            observer = self.observer, scope = %self.scope, query_shape = shape.as_str(), subject_count = subjects,
             status = ?parsed.map(|parsed| parsed.response.status).filter(|status| *status != 0), transport_failure = parsed.is_none(),
             x_ratelimit_limit = ?response_header(headers, "x-ratelimit-limit"),
             x_ratelimit_remaining = ?response_header(headers, "x-ratelimit-remaining"),
@@ -118,6 +133,7 @@ impl<'a> ObservationTelemetry<'a> {
             retry_after = ?response_header(headers, "retry-after"),
             graphql_error_types = ?error_types, graphql_error_messages = ?error_messages,
             rest_error_message = ?document["message"].as_str(),
+            reserve_retry_at = ?parsed.and_then(ParsedObservationResponse::low_budget),
             rate_limit_kind = ?limit.as_ref().map(|limit| limit.kind.as_str()),
             response_class = if let Some(limit) = &limit { limit.kind.as_str() } else if parsed.is_none() || parsed.is_some_and(|parsed| !parsed.success || parsed.response.status >= 400 || parsed.document.is_err()) || errors.is_some_and(|errors| !errors.is_empty()) { "other-error" } else { "success" },
             retry_source = ?limit.as_ref().map(|limit| limit.retry_source.as_str()),
@@ -128,10 +144,30 @@ impl<'a> ObservationTelemetry<'a> {
     }
 }
 
+/// Dropping an in-flight query records unknown cost before its cycle aggregate.
+pub(crate) struct ObservationCall<'call, 'scope> {
+    telemetry: &'call mut ObservationTelemetry<'scope>,
+    pending: Option<(QueryShape, usize, Instant)>,
+}
+impl ObservationCall<'_, '_> {
+    pub(crate) fn finish(mut self, parsed: Option<&ParsedObservationResponse>) {
+        if let Some((shape, subjects, started)) = self.pending.take() {
+            self.telemetry.record(shape, subjects, parsed, started.elapsed());
+        }
+    }
+}
+impl Drop for ObservationCall<'_, '_> {
+    fn drop(&mut self) {
+        if let Some((shape, subjects, started)) = self.pending.take() {
+            self.telemetry.record(shape, subjects, None, started.elapsed());
+        }
+    }
+}
+
 impl Drop for ObservationTelemetry<'_> {
     fn drop(&mut self) {
         tracing::info!(
-            scope = %self.scope, subject_count = self.subjects,
+            observer = self.observer, scope = %self.scope, subject_count = self.subjects,
             calls = self.calls, history_calls = self.history_calls,
             cost = self.cost, unknown_cost_calls = self.unknown_cost_calls,
             elapsed_ms = self.started.elapsed().as_millis() as u64,
@@ -259,5 +295,50 @@ mod tests {
         let transport = text.lines().find(|line| line.contains("transport_failure=true")).expect("transport failure event");
         assert!(transport.contains("status=None"), "a failed transport has no HTTP response status: {transport}");
         assert!(!text.contains("secret-token") && !text.contains("private-review-body"), "logs must omit credentials and review content");
+    }
+    // #2928: board batches share observation telemetry, including quota headers,
+    // bounded subject count, exact cost and aggregate unknown-cost accounting.
+    #[test]
+    fn board_budget_telemetry_uses_shared_fields() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut telemetry = ObservationTelemetry::board("team/repo", 20);
+            record(&mut telemetry, QueryShape::BoardBatch, 20,
+                Some("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 4998\r\nX-RateLimit-Used: 2\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"data\":{\"rateLimit\":{\"cost\":2}}}"), std::time::Duration::ZERO);
+        });
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        for field in [
+            "observer=\"dispatch board\"",
+            "query_shape=\"board-batch\"",
+            "subject_count=20",
+            "calls=1",
+            "cost=2",
+            "x_ratelimit_remaining=Some(\"4998\")",
+            "x_ratelimit_used=Some(\"2\")",
+            "x_ratelimit_reset=Some(\"1893456000\")",
+            "unknown_cost_calls=0",
+        ] {
+            assert!(text.contains(field), "missing {field}: {text}");
+        }
+    }
+    // A cancelled query may have spent points without returning headers/cost.
+    // Its call and cycle must report one attempt with unknown cost, not zero.
+    #[test]
+    fn cancelled_board_call_is_visible_with_unknown_cost() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut telemetry = ObservationTelemetry::board("team/repo", 20);
+            let call = telemetry.call(QueryShape::BoardBatch, 20);
+            drop(call);
+        });
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        assert_eq!(text.lines().count(), 2);
+        for field in ["status=None", "cost=None", "calls=1", "unknown_cost_calls=1", "history_calls=0"] {
+            assert!(text.contains(field), "missing {field}: {text}");
+        }
     }
 }

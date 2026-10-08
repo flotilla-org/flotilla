@@ -58,10 +58,26 @@ pub(super) struct Collection {
 /// not support `since`, so their durable cursor bounds updated-order paging.
 impl Collection {
     pub async fn changes(&self, api: &dyn GhApi, root: &Path, scope: &str, kind: &str) -> Result<Vec<Value>, String> {
+        self.changes_with_initial_state(api, root, scope, kind, "all").await
+    }
+
+    pub async fn board_changes(&self, api: &dyn GhApi, root: &Path, scope: &str, kind: &str) -> Result<Vec<Value>, String> {
+        self.changes_with_initial_state(api, root, scope, kind, "open").await
+    }
+
+    async fn changes_with_initial_state(
+        &self,
+        api: &dyn GhApi,
+        root: &Path,
+        scope: &str,
+        kind: &str,
+        initial: &str,
+    ) -> Result<Vec<Value>, String> {
+        let state = if self.cursor.is_none() { initial } else { "all" };
         let mut changed = Vec::new();
         let mut since = None;
         for page in 1..=100 {
-            let endpoint = format!("repos/{scope}/{kind}?state=all&sort=updated&direction=desc&per_page=100&page={page}");
+            let endpoint = format!("repos/{scope}/{kind}?state={state}&sort=updated&direction=desc&per_page=100&page={page}");
             let endpoint = since.as_ref().map_or_else(|| endpoint.clone(), |since| format!("{endpoint}&since={since}"));
             let mut response = api.get_with_headers(&endpoint, root, &gh_api_channel_label("GET", &endpoint)).await?;
             if page == 1 && kind == "issues" && response.status != 304 {
@@ -112,10 +128,26 @@ impl Collection {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize, bon::Builder)]
 pub(super) struct BoardState {
+    // Added for #2928. Previous-generation forge-cache records lack these fields.
+    // Defaults may be retired one roll after #2928, once caches are rewritten (ADR 0047).
+    #[serde(default)]
+    pub pending: Option<PendingBoard>,
+    #[serde(default)]
+    pub retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[builder(default)]
     pub issues: Collection,
+    #[builder(default)]
     pub pulls: Collection,
+}
+
+/// An inventory is durable before detail work begins. Cursors may advance as
+/// batches commit because the remaining revisions are retained here atomically.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(super) struct PendingBoard {
+    pub issues: Vec<Value>,
+    pub pulls: Vec<Value>,
 }
 
 pub(super) struct PollCache {

@@ -8,8 +8,9 @@ use flotilla_protocol::{
     Issue, IssueChangeset, IssueRef, IssueSource, NodeId,
 };
 use flotilla_resources::{
-    forge_read_name, normalize_issue_source, resolve_project_issue_sources, ForgeRead, ForgeReadRequest, ForgeReadSpec, ForgeReadStatus,
-    Host, InputMeta, IssueSourceResolution, Project, Repository, ResourceBackend, ResourceError, ResourceProvenance,
+    forge_read_name, normalize_issue_source, resolve_project_issue_sources, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec,
+    ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project,
+    Repository, ResourceBackend, ResourceError, ResourceProvenance, SystemClock,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
@@ -24,10 +25,82 @@ use crate::providers::{
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
-const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const DEMAND_MAX_AGE: Duration = Duration::seconds(180);
 const DEMAND_RETENTION: Duration = Duration::seconds(3600);
 const STATUS_WRITE_ATTEMPTS: usize = 8;
+const READ_HEARTBEAT_INTERVAL: Duration = Duration::seconds(300);
+const READ_HEARTBEAT_MAX_AGE: Duration = Duration::seconds(900);
+
+type ReadLock = Arc<Mutex<Option<LocalRead>>>;
+
+struct LocalRead {
+    status: ForgeReadStatus,
+    content_at: DateTime<Utc>,
+}
+
+// Visit only known observation fields, never arbitrary user field maps.
+// Domain timestamps (as_of, updated_at, closed_at, merged_at) remain facts.
+fn observation_objects(
+    request: &ForgeReadRequest,
+    value: &mut serde_json::Value,
+    mut visit: impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let items = match request {
+        ForgeReadRequest::Query { .. } => value.get_mut("items"),
+        ForgeReadRequest::Changes { .. } => value.get_mut("updated"),
+        ForgeReadRequest::Board | ForgeReadRequest::Issue { .. } => {
+            if let Some(object) = value.as_object_mut() {
+                visit(object);
+            }
+            return;
+        }
+        _ => return,
+    };
+    if let Some(items) = items.and_then(serde_json::Value::as_array_mut) {
+        for item in items {
+            if let Some(object) = item.as_object_mut() {
+                visit(object);
+            }
+        }
+    }
+}
+fn comparable_value(request: &ForgeReadRequest, value: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    let mut value = value.clone();
+    if let Some(value) = value.as_mut() {
+        observation_objects(request, value, |object| {
+            object.remove("observed_at");
+            if matches!(request, ForgeReadRequest::Board) {
+                object.remove("age_seconds");
+            }
+        });
+    }
+    value
+}
+fn content_changed(request: &ForgeReadRequest, previous: Option<&ForgeReadStatus>, status: &ForgeReadStatus) -> bool {
+    previous.is_none_or(|previous| {
+        previous.authority != status.authority
+            || previous.error != status.error
+            || previous.retry_at != status.retry_at
+            || comparable_value(request, &previous.value) != comparable_value(request, &status.value)
+    })
+}
+fn expire_status(mut status: Option<ForgeReadStatus>, now: DateTime<Utc>) -> Option<ForgeReadStatus> {
+    if let Some(status) = status.as_mut() {
+        if now.signed_duration_since(status.attempted_at) >= READ_HEARTBEAT_MAX_AGE && status.error.is_none() {
+            status.error = Some("forge observation heartbeat stale".into());
+        }
+    }
+    status
+}
+fn local_status(previous: Option<ForgeReadStatus>, local: Option<&LocalRead>) -> Option<ForgeReadStatus> {
+    match (previous, local) {
+        (Some(previous), Some(local)) if previous.authority == local.status.authority && previous.attempted_at == local.content_at => {
+            Some(local.status.clone())
+        }
+        (previous, _) => previous,
+    }
+}
 
 fn latest_status(statuses: impl IntoIterator<Item = ForgeReadStatus>) -> Option<ForgeReadStatus> {
     statuses.into_iter().max_by_key(|status| (status.attempted_at, status.authority.clone()))
@@ -175,11 +248,17 @@ pub struct ForgeReads {
     pub namespace: String,
     pub touch_demand: bool,
     pub allow_stale: bool,
-    locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    locks: Arc<Mutex<BTreeMap<String, ReadLock>>>,
+    clock: Arc<dyn Clock>,
 }
 impl ForgeReads {
     pub fn new(backend: ResourceBackend, namespace: String) -> Self {
-        Self { backend, namespace, touch_demand: true, allow_stale: false, locks: Default::default() }
+        Self { backend, namespace, touch_demand: true, allow_stale: false, locks: Default::default(), clock: Arc::new(SystemClock) }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
     pub async fn read<T, F, Fut>(&self, source: &IssueSource, request: ForgeReadRequest, load: F) -> Result<T, String>
     where
@@ -190,36 +269,38 @@ impl ForgeReads {
         let source = canonical_source(source);
         let name = forge_read_name(&source, &request);
         let lock = self.locks.lock().await.entry(name.clone()).or_default().clone();
-        let _guard = lock.lock().await;
+        let mut local = lock.lock().await;
         let records = self.backend.using::<ForgeRead>(&self.namespace);
-        let now = Utc::now();
-        let spec = ForgeReadSpec { source: source.clone(), request, demanded_at: now };
+        let now = self.clock.now();
+        let spec = ForgeReadSpec { source: source.clone(), request: request.clone(), demanded_at: now };
+        // This spec remains a migration fallback. Renewals live in the small
+        // companion so touching demand never rewrites a completed board.
         let current = match records.get(&name).await {
-            Ok(current) => {
-                if self.touch_demand && now.signed_duration_since(current.spec.demanded_at) >= READ_FRESHNESS {
-                    records
-                        .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
-                        .await
-                        .map_err(|e| e.to_string())?
-                } else {
-                    current
-                }
-            }
+            Ok(current) => current,
             Err(ResourceError::NotFound { .. }) => {
                 records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.map_err(|e| e.to_string())?
             }
             Err(e) => return Err(e.to_string()),
         };
-        let statuses = self.backend.including_replicas::<ForgeRead>(&self.namespace).get_all(&name).await.map_err(|e| e.to_string())?;
-        let previous = latest_status(statuses.items.into_iter().filter_map(|record| record.object.status));
+        self.touch_heartbeat(&name, current.spec.demanded_at, now).await?;
+        let published = self.published_status(&name).await?;
+        let previous = local_status(published.clone(), local.as_ref());
+        let previous = if local.as_ref().is_some_and(|local| {
+            published.as_ref().is_some_and(|status| status.attempted_at == local.content_at && status.authority == local.status.authority)
+        }) {
+            previous
+        } else {
+            self.with_heartbeat(&name, previous).await?
+        };
         let owner = owns_source(&self.backend, &self.namespace, &source).await?;
         let fresh = previous.as_ref().is_some_and(|status| {
             now.signed_duration_since(status.attempted_at) < READ_FRESHNESS || status.retry_at.is_some_and(|at| at > now)
         });
         if !owner || fresh {
+            let previous = if owner { previous } else { expire_status(previous, now) };
             return previous
                 .ok_or_else(|| "forge observation pending at source owner".to_string())
-                .and_then(|status| decode(status, self.allow_stale));
+                .and_then(|status| decode(status, self.allow_stale, &request));
         }
         // The shared per-request lock coalesces local work. Do not persist a
         // transient pending claim: cancellation or handoff must leave the last
@@ -229,7 +310,7 @@ impl ForgeReads {
         if !owns_source(&self.backend, &self.namespace, &source).await? {
             return Err("forge observer changed during read".into());
         }
-        let completed_at = Utc::now();
+        let completed_at = self.clock.now();
         let (value, observed_at, error, retry_at) = match result {
             Ok(value) => (Some(serde_json::to_value(value).map_err(|e| e.to_string())?), Some(completed_at), None, None),
             Err(error) => (
@@ -247,8 +328,99 @@ impl ForgeReads {
             error,
             retry_at,
         };
-        self.publish_status(&name, current.metadata.resource_version, &status).await?;
-        decode(status, self.allow_stale)
+        let changed = content_changed(&request, published.as_ref(), &status);
+        let content_at = if changed {
+            self.publish_status(&name, current.metadata.resource_version, &status).await?;
+            status.attempted_at
+        } else {
+            published.expect("unchanged content has a published status").attempted_at
+        };
+        self.publish_heartbeat(&name, content_at, &status, changed).await?;
+        *local = Some(LocalRead { status: status.clone(), content_at });
+        decode(status, self.allow_stale, &request)
+    }
+    async fn published_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
+        let statuses = self.backend.including_replicas::<ForgeRead>(&self.namespace).get_all(name).await.map_err(|e| e.to_string())?;
+        Ok(latest_status(statuses.items.into_iter().filter_map(|record| record.object.status)))
+    }
+    async fn with_heartbeat(&self, name: &str, status: Option<ForgeReadStatus>) -> Result<Option<ForgeReadStatus>, String> {
+        let Some(mut status) = status else { return Ok(None) };
+        let pulses =
+            self.backend.including_replicas::<ForgeReadHeartbeat>(&self.namespace).get_all(name).await.map_err(|e| e.to_string())?;
+        let pulse = pulses
+            .items
+            .into_iter()
+            .filter_map(|record| record.object.status)
+            .filter(|pulse| pulse.authority == status.authority && pulse.content_at == status.attempted_at)
+            .max_by_key(|pulse| pulse.attempted_at);
+        if let Some(pulse) = pulse {
+            status.attempted_at = pulse.attempted_at;
+            status.observed_at = pulse.observed_at;
+        }
+        Ok(expire_status(Some(status), self.clock.now()))
+    }
+    pub(crate) async fn status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
+        let lock = self.locks.lock().await.entry(name.to_owned()).or_default().clone();
+        let local = lock.lock().await;
+        let published = self.published_status(name).await?;
+        if local.as_ref().is_some_and(|local| {
+            published.as_ref().is_some_and(|status| status.attempted_at == local.content_at && status.authority == local.status.authority)
+        }) {
+            Ok(expire_status(local_status(published, local.as_ref()), self.clock.now()))
+        } else {
+            self.with_heartbeat(name, published).await
+        }
+    }
+    async fn touch_heartbeat(&self, name: &str, legacy_demand: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), String> {
+        let records = self.backend.using::<ForgeReadHeartbeat>(&self.namespace);
+        let spec = ForgeReadHeartbeatSpec { demanded_at: if self.touch_demand { now } else { legacy_demand } };
+        match records.get(name).await {
+            Ok(current) if self.touch_demand && now.signed_duration_since(current.spec.demanded_at) >= READ_FRESHNESS => {
+                records
+                    .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(_) => {}
+            Err(ResourceError::NotFound { .. }) => {
+                records.create(&InputMeta::builder().name(name.to_owned()).build(), &spec).await.map_err(|e| e.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        Ok(())
+    }
+    async fn publish_heartbeat(
+        &self,
+        name: &str,
+        content_at: DateTime<Utc>,
+        status: &ForgeReadStatus,
+        changed: bool,
+    ) -> Result<(), String> {
+        let records = self.backend.using::<ForgeReadHeartbeat>(&self.namespace);
+        for attempt in 0..STATUS_WRITE_ATTEMPTS {
+            let current = records.get(name).await.map_err(|e| e.to_string())?;
+            if !changed
+                && current.status.as_ref().is_some_and(|pulse| {
+                    pulse.authority == status.authority
+                        && pulse.content_at == content_at
+                        && status.attempted_at.signed_duration_since(pulse.attempted_at) < READ_HEARTBEAT_INTERVAL
+                })
+            {
+                return Ok(());
+            }
+            let pulse = ForgeReadHeartbeatStatus::builder()
+                .authority(status.authority.clone())
+                .content_at(content_at)
+                .attempted_at(status.attempted_at)
+                .maybe_observed_at(status.observed_at)
+                .build();
+            match records.update_status(name, &current.metadata.resource_version, &pulse).await {
+                Ok(_) => return Ok(()),
+                Err(ResourceError::Conflict { .. }) if attempt + 1 < STATUS_WRITE_ATTEMPTS => tokio::task::yield_now().await,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        unreachable!("heartbeat writes have a bounded nonempty retry loop")
     }
     async fn publish_status(&self, name: &str, mut version: String, status: &ForgeReadStatus) -> Result<(), String> {
         let records = self.backend.using::<ForgeRead>(&self.namespace);
@@ -265,13 +437,18 @@ impl ForgeReads {
         unreachable!("status writes have a bounded nonempty retry loop")
     }
 }
-fn decode<T: DeserializeOwned>(status: ForgeReadStatus, allow_stale: bool) -> Result<T, String> {
+fn decode<T: DeserializeOwned>(status: ForgeReadStatus, allow_stale: bool, request: &ForgeReadRequest) -> Result<T, String> {
     if !allow_stale {
         if let Some(error) = &status.error {
             return Err(error.clone());
         }
     }
-    if let Some(value) = status.value {
+    if let Some(mut value) = status.value {
+        if let Some(observed_at) = status.observed_at {
+            observation_objects(request, &mut value, |object| {
+                object.insert("observed_at".into(), serde_json::json!(observed_at));
+            });
+        }
         serde_json::from_value(value).map_err(|e| e.to_string())
     } else {
         Err(status.error.unwrap_or_else(|| "forge observation pending".into()))
@@ -305,14 +482,7 @@ impl IssueProvider for ObservedIssueProvider {
         reads.allow_stale = true;
         let mut board: flotilla_protocol::DispatchBoardRepository =
             reads.read(source, ForgeReadRequest::Board, || self.inner.dispatch_board(source)).await?;
-        let statuses = self
-            .reads
-            .backend
-            .including_replicas::<ForgeRead>(&self.reads.namespace)
-            .get_all(&forge_read_name(&canonical_source(source), &ForgeReadRequest::Board))
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(status) = latest_status(statuses.items.into_iter().filter_map(|record| record.object.status)) {
+        if let Some(status) = self.reads.status(&forge_read_name(&canonical_source(source), &ForgeReadRequest::Board)).await? {
             if let Some(at) = status.observed_at {
                 board.observed_at = at;
             }
@@ -347,8 +517,18 @@ impl crate::in_process::InProcessDaemon {
         let backend = self.resource_backend();
         let namespace = self.provisioning_namespace_for_forge().await;
         let mut requests = BTreeMap::new();
+        let mut demands = BTreeMap::new();
+        for record in backend.including_replicas::<ForgeReadHeartbeat>(&namespace).list().await.map_err(|e| e.to_string())?.items {
+            let demanded_at = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
+            *demanded_at = (*demanded_at).max(record.object.spec.demanded_at);
+        }
         for record in backend.including_replicas::<ForgeRead>(&namespace).list().await.map_err(|e| e.to_string())?.items {
-            if Utc::now().signed_duration_since(record.object.spec.demanded_at) < DEMAND_MAX_AGE {
+            let demanded_at = demands
+                .get(&record.object.metadata.name)
+                .copied()
+                .unwrap_or(record.object.spec.demanded_at)
+                .max(record.object.spec.demanded_at);
+            if Utc::now().signed_duration_since(demanded_at) < DEMAND_MAX_AGE {
                 requests.insert(record.object.metadata.name, record.object.spec);
             }
         }
@@ -402,17 +582,43 @@ impl crate::in_process::InProcessDaemon {
                 }
             })
             .await;
-        // Retire only this root's idle requests; replicas follow tombstones.
-        let local = backend.using::<ForgeRead>(&namespace);
-        for record in local.list().await.map_err(|e| e.to_string())?.items {
-            if Utc::now().signed_duration_since(record.spec.demanded_at) >= DEMAND_RETENTION {
-                if let Err(error) = local.delete(&record.metadata.name).await {
-                    tracing::debug!(name = %record.metadata.name, %error, "idle forge demand cleanup failed");
-                }
-            }
-        }
+        retire_idle_reads(&backend, &namespace, Utc::now()).await?;
         Ok(())
     }
+}
+
+// Take a fresh lease snapshot after servicing potentially slow reads. Retire
+// each local kind independently: deleting a whole read must not orphan its
+// companion forever, and renewal at any origin keeps both kinds alive.
+async fn retire_idle_reads(backend: &ResourceBackend, namespace: &str, now: DateTime<Utc>) -> Result<(), String> {
+    let mut demands = BTreeMap::new();
+    for record in backend.including_replicas::<ForgeRead>(namespace).list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
+        *demand = (*demand).max(record.object.spec.demanded_at);
+    }
+    for record in backend.including_replicas::<ForgeReadHeartbeat>(namespace).list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
+        *demand = (*demand).max(record.object.spec.demanded_at);
+    }
+    let reads = backend.using::<ForgeRead>(namespace);
+    for record in reads.list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at);
+        if now.signed_duration_since(demand) >= DEMAND_RETENTION {
+            if let Err(error) = reads.delete(&record.metadata.name).await {
+                tracing::debug!(name = %record.metadata.name, %error, "idle forge demand cleanup failed");
+            }
+        }
+    }
+    let pulses = backend.using::<ForgeReadHeartbeat>(namespace);
+    for record in pulses.list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at);
+        if now.signed_duration_since(demand) >= DEMAND_RETENTION {
+            if let Err(error) = pulses.delete(&record.metadata.name).await {
+                tracing::debug!(name = %record.metadata.name, %error, "idle forge heartbeat cleanup failed");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct ObservedChangeRequestTracker {
@@ -488,6 +694,238 @@ mod tests {
     async fn replicate<T: Resource>(from: &ResourceBackend, to: &ResourceBackend) {
         let list = from.using::<T>("flotilla").list().await.unwrap();
         to.replica_writer::<T>(from.local_root().unwrap(), "flotilla").replace(&list, Utc::now()).await.unwrap();
+    }
+
+    fn clocked_reads(root: &str) -> (ForgeReads, Arc<flotilla_resources::VirtualClock>) {
+        let clock = Arc::new(flotilla_resources::VirtualClock::new(Utc::now()));
+        let mut reads = ForgeReads::new(backend(root), "flotilla".into());
+        reads.clock = clock.clone();
+        (reads, clock)
+    }
+
+    // An externally removed parent leaves a live demand companion until its
+    // lease expires; at the retention boundary even an orphan is tombstoned.
+    // A new read afterwards recreates the pair and resumes normally.
+    #[tokio::test]
+    async fn orphan_heartbeat_retires_at_retention_and_can_be_recreated() {
+        let (reads, clock) = clocked_reads("owner");
+        let source = source();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        reads.backend.using::<ForgeRead>("flotilla").delete(&name).await.unwrap();
+        clock.advance(DEMAND_RETENTION - Duration::seconds(1));
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
+        clock.advance(Duration::seconds(1));
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(matches!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+        assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Ok(43_u64) }).await.unwrap(), 43);
+    }
+
+    // Fresh demand arriving from another origin protects an old local pair.
+    // Expiration deletes only local records, never the replicated demand.
+    #[tokio::test]
+    async fn replicated_demand_renews_retention_for_both_kinds() {
+        let (reads, clock) = clocked_reads("owner");
+        let source = source();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        clock.advance(DEMAND_RETENTION);
+        let peer = backend("peer");
+        peer.using::<ForgeReadHeartbeat>("flotilla")
+            .create(&meta(&name), &ForgeReadHeartbeatSpec { demanded_at: clock.now() })
+            .await
+            .unwrap();
+        replicate::<ForgeReadHeartbeat>(&peer, &reads.backend).await;
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(reads.backend.using::<ForgeRead>("flotilla").get(&name).await.is_ok());
+        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
+        clock.advance(DEMAND_RETENTION);
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(matches!(reads.backend.using::<ForgeRead>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+        assert!(matches!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+        assert!(peer.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
+    }
+
+    // Minute refreshes retain one whole-board publication, while demand renews
+    // in its small companion and observation heartbeats publish every 5 minutes.
+    // Generate elapsed poll counts across heartbeat edges and domain changes.
+    #[hegel::test]
+    fn unchanged_boards_publish_only_low_rate_heartbeats(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let polls = tc.draw(gs::integers::<u32>().min_value(1).max_value(12));
+        let changed_field = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (reads, clock) = clocked_reads("owner");
+            let source = source();
+            let name = forge_read_name(&source, &ForgeReadRequest::Board);
+            let initial = clock.now();
+            let mut value = serde_json::json!({"observed_at": initial, "age_seconds": 0,
+                "issues": (0..400).map(|id| serde_json::json!({"id":id,"title":"open","updated_at":initial})).collect::<Vec<_>>()});
+            reads.read(&source, ForgeReadRequest::Board, || async { Ok(value.clone()) }).await.unwrap();
+            let records = reads.backend.using::<ForgeRead>("flotilla");
+            let first = records.get(&name).await.unwrap();
+            let pulses = reads.backend.using::<ForgeReadHeartbeat>("flotilla");
+            let mut pulse = pulses.get(&name).await.unwrap().status.unwrap();
+            for poll in 1..=polls {
+                let now = clock.advance(READ_FRESHNESS);
+                value["observed_at"] = serde_json::json!(now);
+                value["age_seconds"] = serde_json::json!(poll);
+                let returned = reads.read(&source, ForgeReadRequest::Board, || async { Ok(value.clone()) }).await.unwrap();
+                assert_eq!(returned, value);
+                let current = records.get(&name).await.unwrap();
+                assert_eq!(
+                    current.metadata.resource_version, first.metadata.resource_version,
+                    "unchanged board must not replicate in full"
+                );
+                assert_eq!(current.status, first.status);
+                let heartbeat = pulses.get(&name).await.unwrap();
+                assert_eq!(heartbeat.spec.demanded_at, now);
+                let next = heartbeat.status.unwrap();
+                if poll % 5 == 0 {
+                    assert_eq!(next.attempted_at, now);
+                    assert_eq!(next.observed_at, Some(now));
+                } else {
+                    assert_eq!(next, pulse);
+                }
+                pulse = next;
+                assert_eq!(reads.status(&name).await.unwrap().unwrap().observed_at, Some(now));
+                // Coalescing uses completed local observations, rather than
+                // the old whole-board publication timestamp.
+                let _: serde_json::Value =
+                    reads.read(&source, ForgeReadRequest::Board, || async { panic!("fresh local read must coalesce") }).await.unwrap();
+            }
+            clock.advance(READ_FRESHNESS);
+            match changed_field {
+                0 => value["issues"][0]["title"] = serde_json::json!("changed"),
+                1 => value["issues"][0]["updated_at"] = serde_json::json!(clock.now()),
+                _ => value["issues"] = serde_json::json!([]),
+            }
+            reads.read(&source, ForgeReadRequest::Board, || async { Ok(value) }).await.unwrap();
+            assert_ne!(records.get(&name).await.unwrap().metadata.resource_version, first.metadata.resource_version);
+        });
+    }
+
+    // Other whole reads carry Issue observation timestamps too. Their freshness
+    // must not republish unchanged facts, and similarly named user fields and
+    // as_of revision timestamps must remain semantic. Generate all issue shapes.
+    #[hegel::test]
+    fn issue_read_publication_preserves_user_fields_and_revision_time(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let shape = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (reads, clock) = clocked_reads("owner");
+            let request = match shape {
+                0 => ForgeReadRequest::Issue { id: "7".into() },
+                1 => ForgeReadRequest::Query { params: IssueQuery::default(), page: 1, count: 1 },
+                _ => ForgeReadRequest::Changes { since: "cursor".into(), count: 1 },
+            };
+            let wrap = |item: serde_json::Value| match shape {
+                0 => item,
+                1 => serde_json::json!({"items":[item]}),
+                _ => serde_json::json!({"updated":[item]}),
+            };
+            let source = source();
+            let name = forge_read_name(&source, &request);
+            let mut item = serde_json::json!({"observed_at":clock.now(),"as_of":clock.now(),"fields":{"observed_at":"user fact"}});
+            reads.read(&source, request.clone(), || async { Ok(wrap(item.clone())) }).await.unwrap();
+            let records = reads.backend.using::<ForgeRead>("flotilla");
+            let first = records.get(&name).await.unwrap();
+            clock.advance(READ_FRESHNESS);
+            item["observed_at"] = serde_json::json!(clock.now());
+            let expected = wrap(item.clone());
+            assert_eq!(reads.read(&source, request.clone(), || async { Ok(expected.clone()) }).await.unwrap(), expected);
+            assert_eq!(records.get(&name).await.unwrap().metadata.resource_version, first.metadata.resource_version);
+            clock.advance(READ_FRESHNESS);
+            item["fields"]["observed_at"] = serde_json::json!("changed user fact");
+            reads.read(&source, request.clone(), || async { Ok(wrap(item.clone())) }).await.unwrap();
+            let changed = records.get(&name).await.unwrap();
+            assert_ne!(changed.metadata.resource_version, first.metadata.resource_version);
+            clock.advance(READ_FRESHNESS);
+            item["as_of"] = serde_json::json!(clock.now());
+            reads.read(&source, request, || async { Ok(wrap(item)) }).await.unwrap();
+            assert_ne!(records.get(&name).await.unwrap().metadata.resource_version, changed.metadata.resource_version);
+        });
+    }
+
+    // Repeated identical errors do not resend the last good board. Error
+    // transitions and recovery publish immediately even with identical facts.
+    #[tokio::test]
+    async fn error_transitions_publish_once_and_background_does_not_renew_demand() {
+        let (mut reads, clock) = clocked_reads("owner");
+        let source = source();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        reads.allow_stale = true;
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        let records = reads.backend.using::<ForgeRead>("flotilla");
+        let first = records.get(&name).await.unwrap();
+        reads.touch_demand = false;
+        clock.advance(READ_FRESHNESS);
+        assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Err::<u64, _>("outage".into()) }).await.unwrap(), 42);
+        let failed = records.get(&name).await.unwrap();
+        assert_ne!(first.metadata.resource_version, failed.metadata.resource_version);
+        assert_eq!(failed.status.as_ref().unwrap().error.as_deref(), Some("outage"));
+        clock.advance(READ_FRESHNESS);
+        reads.read(&source, ForgeReadRequest::Board, || async { Err::<u64, _>("outage".into()) }).await.unwrap();
+        assert_eq!(failed.metadata.resource_version, records.get(&name).await.unwrap().metadata.resource_version);
+        let demand = reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.unwrap();
+        assert_eq!(demand.spec.demanded_at, first.spec.demanded_at);
+        clock.advance(READ_FRESHNESS);
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        let recovered = records.get(&name).await.unwrap();
+        assert_ne!(recovered.metadata.resource_version, failed.metadata.resource_version);
+        assert!(recovered.status.unwrap().error.is_none());
+    }
+
+    // Replicated peers use the small owner's heartbeat, never call the forge,
+    // and reject expired or mismatched-content heartbeats. A new owner can
+    // publish equal facts immediately with its new authority (handoff test).
+    #[tokio::test]
+    async fn peer_freshness_comes_from_matching_heartbeat_and_expires() {
+        let (owner, clock) = clocked_reads("owner");
+        let source = source();
+        let spec = ProjectSpec::builder()
+            .display_name("Shared".into())
+            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source.clone()).alias("shared".into()).build()])
+            .build();
+        owner.backend.using::<Project>("flotilla").create(&meta("shared"), &spec).await.unwrap();
+        let mut peer = ForgeReads::new(backend("peer"), "flotilla".into());
+        peer.clock = clock.clone();
+        replicate::<Project>(&owner.backend, &peer.backend).await;
+        owner.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        let first = owner.backend.using::<ForgeRead>("flotilla").get(&name).await.unwrap();
+        replicate::<ForgeRead>(&owner.backend, &peer.backend).await;
+        replicate::<ForgeReadHeartbeat>(&owner.backend, &peer.backend).await;
+        clock.advance(READ_HEARTBEAT_INTERVAL);
+        owner.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        assert_eq!(
+            first.metadata.resource_version,
+            owner.backend.using::<ForgeRead>("flotilla").get(&name).await.unwrap().metadata.resource_version
+        );
+        replicate::<ForgeReadHeartbeat>(&owner.backend, &peer.backend).await;
+        assert_eq!(
+            peer.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer must never load") }).await.unwrap(),
+            42_u64
+        );
+        assert_eq!(peer.status(&name).await.unwrap().unwrap().observed_at, Some(clock.now()));
+        clock.advance(READ_HEARTBEAT_MAX_AGE);
+        let error =
+            peer.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer must never load") }).await.unwrap_err();
+        assert_eq!(error, "forge observation heartbeat stale");
+        peer.allow_stale = true;
+        assert_eq!(
+            peer.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer must never load") }).await.unwrap(),
+            42_u64
+        );
+        let pulses = owner.backend.using::<ForgeReadHeartbeat>("flotilla");
+        let record = pulses.get(&name).await.unwrap();
+        let mut wrong = record.status.unwrap();
+        wrong.attempted_at = clock.now();
+        wrong.content_at = clock.now();
+        pulses.update_status(&name, &record.metadata.resource_version, &wrong).await.unwrap();
+        replicate::<ForgeReadHeartbeat>(&owner.backend, &peer.backend).await;
+        assert_eq!(peer.status(&name).await.unwrap().unwrap().error.as_deref(), Some("forge observation heartbeat stale"));
     }
 
     // Cancellation must release local coalescing and leave no replicated claim

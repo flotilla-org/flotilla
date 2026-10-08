@@ -1,19 +1,22 @@
-# GitHub change-request observer diagnostics
+# GitHub observer diagnostics
 
 Each production observer GraphQL request emits an INFO event named
 `GitHub change request observation call` beneath
-`flotilla_core::providers::change_request::github::observation`. It includes:
+`flotilla_core::providers::github_observation`. It includes:
 
-- Repository scope, query shape, subject count, HTTP status, and elapsed time.
+- Observer (`change request` or `dispatch board`), repository scope, query shape,
+  subject count, HTTP status, and elapsed time.
 - `x_ratelimit_limit`, `x_ratelimit_remaining`, `x_ratelimit_used`,
   `x_ratelimit_reset`, `x_ratelimit_resource`, and `retry_after` response headers.
 - GraphQL error types and messages, response classification, retry source and
   deadline, and the `rateLimit.cost` returned by that same query.
 
 Shapes are `bound-batch`, `history-comments`, `history-reviews`,
-`history-threads`, and `history-thread-comments`. No extra quota probe is made.
+`history-threads`, `history-thread-comments`, and `board-batch`. No extra quota probe is made.
 Request text, authentication headers, and PR/review bodies are omitted.
-Transport failures retain a call event with unavailable HTTP/cost data.
+Transport failures and cancelled in-flight calls retain a call event with
+unavailable HTTP/cost data. Shared budget rows also count cancelled attempts
+without inventing a GraphQL cost.
 
 A `GitHub change request observation cycle` event aggregates each repository
 batch and its follow-ups: subjects, calls, history calls, known cost, elapsed
@@ -106,3 +109,95 @@ Use comparable successful cycles separately from backoff/error cycles and
 record host load; this comparison estimates local overhead, it does not isolate
 JSON parsing CPU time. Judge material improvement from that post-deployment
 trace rather than claiming a CPU regression or gain from static code changes.
+
+## Dispatch board refresh (#2928)
+
+The board uses the same call/cycle events and budget rows with
+`observer="dispatch board"` and `query_shape="board-batch"`. The initial REST
+inventory lists open issues and PRs only. Subsequent inventories use the
+inclusive `since` cursor and ETag probe, fetching detail only for changed open
+revisions. Closed revisions drop their board entries without GraphQL detail.
+An inventory is saved before fetching details; batches of at most 20 subjects
+validate native windows and atomically save their details, revisions, cursor,
+and remaining jobs. A cancelled refresh or daemon restart resumes those jobs.
+The forge-cache poll state is stored data: previous-generation records remain
+decodable with defaults for pending jobs and retry deadlines (ADR 0047).
+
+A successful GraphQL response below 100 remaining points sets a reserve
+cooldown until reset, visible as `reserve_retry_at` and in the shared budget
+row. Successful batches remain durable during this wait. The board also saves
+primary/secondary retry deadlines so restart does not bypass backoff.
+
+Same-repository blockers resolve against the completed board's current open
+set, even when closing a blocker leaves its dependent's revision unchanged.
+Cross-repository blockers use one deduplicated conditional REST issue read per
+URL per refresh. Off-board PRs referenced by open issues use conditional REST
+state reads; unrelated closed history is never fetched. A failed relation read
+leaves the board unavailable instead of inventing a closed blocker or merged PR.
+
+After deployment, operator acceptance should compare board call/cycle costs
+and completion against the shared identity's remaining/used/reset headers.
+Confirm that retries resume committed batches, quiet inventories fetch no
+GraphQL detail, and closing a blocker changes eligibility without re-reading
+its dependent. Live-host verification is operator acceptance, not a crew gate.
+
+Empty initial collections persist the inventory-start UTC second as their
+first cursor. Subsequent polls remain incremental even when no open item was
+available to establish a revision; the existing one-second issue overlap covers
+same-second additions.
+
+## Board publication and freshness
+
+`ForgeReads` publishes a whole `ForgeRead` status only when its facts, error,
+retry deadline, or elected authority change. Board `observed_at` and
+`age_seconds` are observation metadata; Issue/query/changeset `observed_at`
+fields are excluded as well and stamped from the effective observation on
+reads. Arbitrary user field maps are preserved. Issue `as_of`, `updated_at`, `closed_at`, and
+PR `merged_at` remain domain facts. Successful unchanged reads update the
+owner's local completion cache, preserving one-minute read coalescing without
+rewriting the opaque board.
+
+A small `ForgeReadHeartbeat` companion shares the whole read's resource name.
+Its spec carries one-minute demand renewals (180-second demand lease); its
+status carries the owner's last attempt and successful observation every five
+minutes, or immediately when the whole result changes. It contains no issue
+records or opaque result. Peers accept only a heartbeat with the same authority
+and whole-result `attempted_at` token. After fifteen minutes without a matching
+attempt, strict reads refuse with `forge observation heartbeat stale`; board
+reads retain the last good board with that error and its observation age.
+Background servicing does not renew demand. Idle requests and their companion
+are retired after an hour, respecting demand from every replicated origin.
+
+The observation layer owns the 300-second load deadline and publishes its
+failure while retaining the last good value. The dispatch cache's outer
+watchdog is derived from that deadline plus thirty seconds, so it cannot race
+the load deadline; it still bounds providers used without the observation
+adapter. Durable batch progress survives either cancellation.
+
+Existing `ForgeRead` specs/statuses and forge-cache poll JSON stay decodable
+(ADR 0047). Existing demanded/attempted timestamps provide migration fallbacks
+until a companion is created. `ForgeReadHeartbeat` is a newly registered
+observation resource; no existing stored shape was replaced. Older binaries do not understand the new companion kind or its freshness and
+demand renewals; fleet rollout must upgrade source owners and readers together
+before relying on change-only publication.
+
+## User-visible freshness and cooldown
+
+The board intentionally refreshes an open PR's CI rollup only when that PR's
+`updated_at` moves. Check completion alone may not move that revision, so the
+board's CI can remain pending until a subsequent PR update. This follows
+#2928's updated-at-only board-detail contract and avoids timed PR-only rollup
+batches. Dedicated change-request observation still validates commit statuses
+and check runs independently; use that observation for current PR CI.
+
+The 100-point low-budget cooldown is shared by every GraphQL consumer of the
+host credential, including interactive reads and dedicated PR observation.
+Those calls refuse until the reported reset deadline instead of spending the
+remaining quota. Board reads retain their last good facts with the refresh
+error; REST reads use their separate budget. `fleet health` exposes the retry
+deadline and remaining quota.
+
+Retention scans local reads and heartbeats independently. An externally deleted
+whole-read record cannot leave its heartbeat forever: idle companions retire
+at the one-hour boundary. A fresh lease from any origin protects both kinds,
+and cleanup re-reads leases after servicing slow observations.
