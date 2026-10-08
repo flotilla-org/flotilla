@@ -490,7 +490,7 @@ fn assert_ok(result: CommandValue) {
 }
 
 // -----------------------------------------------------------------------
-// Tests: CreateWorkspaceForCheckout
+// Tests: ArchiveSession
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -1198,10 +1198,6 @@ async fn generate_branch_name_unknown_issue_key_still_uses_ai_context() {
 
     assert_branch_name_generated(result, "feat/from-placeholder", &[("issues", "nonexistent")]);
 }
-
-// -----------------------------------------------------------------------
-// Tests: TeleportSession
-// -----------------------------------------------------------------------
 
 // -----------------------------------------------------------------------
 // Tests: Daemon-level commands rejected
