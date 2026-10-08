@@ -32,6 +32,7 @@ use flotilla_core::{
     crew_capabilities::{CredentialCapability, SessionCapabilitySource},
     daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
+    holder_transport::{select_transport, TransportCapability},
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
@@ -57,9 +58,9 @@ use flotilla_resources::{
     Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     HostSpec, HostStatus, HostStatusPatch, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec, Platform,
     Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch, WorkflowTemplate,
-    AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
+    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch,
+    WorkflowTemplate, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
@@ -1615,6 +1616,7 @@ struct ControllerRuntimeState {
     local_backing_observed: AtomicBool,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    agent_sessions: Mutex<HashMap<String, Arc<dyn flotilla_core::agent_adapter::AgentSession>>>,
     exit_receipts: ExitReceiptObserver,
     archive_catalog_lock: Mutex<()>,
     checkout_removal_concurrency: NonZeroUsize,
@@ -1751,6 +1753,7 @@ impl ControllerRuntimeState {
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
+            agent_sessions: Mutex::new(HashMap::new()),
             exit_receipts: ExitReceiptObserver::default(),
             archive_catalog_lock: Mutex::new(()),
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
@@ -6321,11 +6324,31 @@ impl flotilla_resources::controller::Reconciler for MessageController {
 
 #[async_trait]
 impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
+    fn binding(&self, holder: &ResourceObject<TerminalSession>) -> Option<flotilla_resources::HolderTransport> {
+        self.selected_transport(holder).ok().flatten()
+    }
+    fn supports_steering(&self, holder: &ResourceObject<TerminalSession>) -> bool {
+        let Ok(Some(flotilla_resources::HolderTransport::AgentApi { adapter, .. })) = self.selected_transport(holder) else { return false };
+        self.registry_for_env(&holder.spec.env_ref)
+            .ok()
+            .and_then(|registry| registry.agent_adapters.get(&adapter).map(|adapter| adapter.supports_native_steering()))
+            .unwrap_or(false)
+    }
+    fn uses_structured_evidence(&self, holder: &ResourceObject<TerminalSession>) -> bool {
+        Self::is_native_holder(holder)
+    }
+
     async fn observe(
         &self,
         holder: &ResourceObject<TerminalSession>,
         submission: Option<&flotilla_resources::MessageSubmission>,
     ) -> Result<flotilla_resources::MessageObservation, String> {
+        if submission.is_some_and(|submission| submission.transport != self.binding(holder)) {
+            return Err("holder transport changed while input acceptance was held".into());
+        }
+        if let Some(transport) = self.native_transport(holder).await? {
+            return transport.observe(holder, submission).await;
+        }
         let status = holder.status.as_ref().ok_or("holder status is absent")?;
         let session = status.session_id.as_deref().ok_or("holder session is absent")?;
         let now = Utc::now();
@@ -6425,6 +6448,16 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
         }
     }
     async fn submit(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        if batch.submission.transport != self.binding(&batch.holder) {
+            return flotilla_resources::MessageTransportOutcome::Unconfirmed {
+                reason: "recorded transport no longer matches this holder".into(),
+            };
+        }
+        match self.native_transport(&batch.holder).await {
+            Ok(Some(transport)) => return transport.submit(batch).await,
+            Ok(None) => {}
+            Err(reason) => return flotilla_resources::MessageTransportOutcome::NotSubmitted { reason },
+        }
         match self.adapter_for_spec(&batch.holder.spec) {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -6477,6 +6510,16 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
     }
 
     async fn poll(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        if batch.submission.transport != self.binding(&batch.holder) {
+            return flotilla_resources::MessageTransportOutcome::Unconfirmed {
+                reason: "recorded transport no longer matches this holder".into(),
+            };
+        }
+        match self.native_transport(&batch.holder).await {
+            Ok(Some(transport)) => return transport.poll(batch).await,
+            Ok(None) => {}
+            Err(reason) => return flotilla_resources::MessageTransportOutcome::Unconfirmed { reason },
+        }
         let delivery = {
             let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
             match deliveries.get(&batch.submission.session) {
@@ -6521,6 +6564,84 @@ fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, String>) ->
 
 struct TerminalControllerRuntime {
     state: Arc<ControllerRuntimeState>,
+}
+
+impl TerminalControllerRuntime {
+    async fn holder_for_session(
+        &self,
+        session_id: &str,
+        spec: &TerminalSessionSpec,
+    ) -> Result<Option<ResourceObject<TerminalSession>>, String> {
+        let TerminalSessionSource::Agent { context, .. } = &spec.source else { return Ok(None) };
+        // Managed pool IDs use the resource name; a replacement after a lost
+        // recording appends one UUID. Try the exact name first so resources
+        // whose own names end in a UUID are still resolved correctly.
+        let terminals = self.state.daemon.resource_backend().using::<TerminalSession>(&context.namespace);
+        let recovered_name = session_id
+            .get(session_id.len().saturating_sub(37)..)
+            .filter(|suffix| suffix.starts_with('-') && uuid::Uuid::parse_str(&suffix[1..]).is_ok())
+            .map(|_| &session_id[..session_id.len() - 37]);
+        for name in std::iter::once(session_id).chain(recovered_name) {
+            match terminals.get(name).await {
+                Ok(holder) if holder.status.as_ref().and_then(|status| status.session_id.as_deref()) == Some(session_id) => {
+                    return Ok(Some(holder))
+                }
+                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(None)
+    }
+    fn selected_transport(&self, holder: &ResourceObject<TerminalSession>) -> Result<Option<flotilla_resources::HolderTransport>, String> {
+        let registry = self.registry_for_env(&holder.spec.env_ref)?;
+        let supported = registry
+            .agent_adapters
+            .ids()
+            .filter_map(|id| {
+                let adapter = registry.agent_adapters.get(id)?;
+                adapter.has_native_input().then(|| TransportCapability::AgentApi(adapter.id()))
+            })
+            .collect::<Vec<_>>();
+        select_transport(holder, &supported).map(|selected| selected.cloned())
+    }
+    fn is_native_holder(holder: &ResourceObject<TerminalSession>) -> bool {
+        holder.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| {
+            crew.input_transports.iter().any(|binding| matches!(binding, flotilla_resources::HolderTransport::AgentApi { .. }))
+        })
+    }
+    async fn native_transport(
+        &self,
+        holder: &ResourceObject<TerminalSession>,
+    ) -> Result<Option<Arc<dyn flotilla_core::agent_adapter::AgentSession>>, String> {
+        let Some(binding @ flotilla_resources::HolderTransport::AgentApi { .. }) = self.selected_transport(holder)? else {
+            return Ok(None);
+        };
+        let flotilla_resources::HolderTransport::AgentApi { adapter, .. } = &binding else { unreachable!() };
+        let crew = holder.status.as_ref().and_then(|status| status.crew.as_ref()).ok_or("holder crew absent")?;
+        let key = crew.id.clone();
+        {
+            let mut transports = self.state.agent_sessions.lock().await;
+            if let Some(transport) = transports.get(&key).filter(|transport| transport.available()) {
+                return Ok(Some(Arc::clone(transport)));
+            }
+            transports.remove(&key);
+        }
+        let TerminalSessionSource::Agent { context, .. } = &holder.spec.source else {
+            return Err("native session lacks crew context".into());
+        };
+        let identity = flotilla_core::agent_adapter::CrewIdentity {
+            crew: key.clone(),
+            role: holder.spec.role.clone(),
+            terminal: holder.metadata.name.clone(),
+            vessel: context.vessel_ref.clone(),
+        };
+        let registry = self.registry_for_env(&holder.spec.env_ref)?;
+        let adapter = registry.agent_adapters.get(adapter).ok_or("native session adapter unavailable")?;
+        let grants = fulfilment_grants_for_terminal(&self.state.daemon.resource_backend(), context).await;
+        let transport = adapter.connect_session(&binding, &identity, grants.as_ref()).await?;
+        let mut transports = self.state.agent_sessions.lock().await;
+        Ok(Some(Arc::clone(transports.entry(key).or_insert(transport))))
+    }
 }
 
 const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
@@ -6782,7 +6903,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
         }
         credential_env = declared_env.into_iter().collect();
-        let (command, mut env, crew) = match &spec.source {
+        let mut native_launch = None;
+        let (mut command, mut env, mut crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
             TerminalSessionSource::Agent { selector, brief, context, .. } => {
                 let mut materialized_brief = brief.clone();
@@ -6868,13 +6990,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 }
                 let backend = self.state.daemon.resource_backend();
                 let fulfilment_grants = fulfilment_grants_for_terminal(&backend, context).await;
-                let plan = adapter.launch(&AgentLaunchRequest {
+                let launch_request = AgentLaunchRequest {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
                     brief: materialized_brief,
                     environment: credential_env.clone(),
                     fulfilment_grants,
-                })?;
+                };
+                native_launch = Some((Arc::clone(adapter), launch_request.clone()));
+                let plan = adapter.launch(&launch_request)?;
                 let crew_id = uuid::Uuid::new_v4().to_string();
                 let crew = flotilla_resources::CrewSessionStatus::builder()
                     .id(crew_id.clone())
@@ -6922,6 +7046,20 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
             ]);
         }
+        if let (Some((adapter, request)), Some(crew)) = (native_launch, crew.as_mut()) {
+            let TerminalSessionSource::Agent { context, .. } = &spec.source else { unreachable!() };
+            let identity = flotilla_core::agent_adapter::CrewIdentity {
+                crew: crew.id.clone(),
+                role: spec.role.clone(),
+                terminal: name.into(),
+                vessel: context.vessel_ref.clone(),
+            };
+            if let Some(native) = adapter.start_session(&cwd, &request, &env, &identity).await? {
+                command = flotilla_core::agent_process::monitored_command(&native.attach_command, &crew.id);
+                crew.input_transports = vec![native.binding];
+                self.state.agent_sessions.lock().await.insert(crew.id.clone(), native.session);
+            }
+        }
         // A dead generation may retain a recording with the old ID. Launch
         // under a fresh ID so cleat cannot resolve the name ambiguously, then
         // mark the old recording for retention after the launch succeeds.
@@ -6931,7 +7069,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
             pool.kill_session(&session_id).await?;
         }
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
-        pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
+        if let Err(error) = pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await {
+            if let Some(crew) = &crew {
+                if let Some(session) = self.state.agent_sessions.lock().await.remove(&crew.id) {
+                    if let Err(cleanup) = session.stop(false).await {
+                        warn!(%cleanup, "failed launch native thread cleanup failed");
+                    }
+                }
+            }
+            return Err(error);
+        }
         if recovered_from_lost {
             if let Err(error) = pool.retain_recovered_recording(name).await {
                 tracing::warn!(%error, session = name, "retain old cleat recording after recovery failed");
@@ -6953,6 +7100,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
             Ok(pool) => pool,
             Err(message) => return Ok(TerminalLiveness::Unavailable(message)),
         };
+        if let Some(holder) = self.holder_for_session(session_id, spec).await?.filter(Self::is_native_holder) {
+            return Ok(match self.native_transport(&holder).await {
+                Ok(Some(session)) => match session.attention().await {
+                    Ok(_) => TerminalLiveness::Running,
+                    Err(error) => TerminalLiveness::Unavailable(error),
+                },
+                Ok(None) => TerminalLiveness::Stopped,
+                Err(error) => TerminalLiveness::Unavailable(error),
+            });
+        }
         Ok(match pool.session_liveness(session_id).await {
             Ok(liveness) => terminal_liveness_for_source(&spec.source, liveness),
             Err(message) => TerminalLiveness::Unavailable(message),
@@ -6964,6 +7121,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &TerminalSessionSpec,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
+        if !crew.input_transports.is_empty() {
+            return Ok(None);
+        }
         let runner = self.runner_for_env(&spec.env_ref)?;
         self.state
             .exit_receipts
@@ -7000,6 +7160,20 @@ impl TerminalRuntime for TerminalControllerRuntime {
     }
 
     async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
+        let holder = self.holder_for_session(session_id, spec).await?;
+        if let Some(holder) = holder {
+            if let Some(transport) = self.native_transport(&holder).await? {
+                return Ok(Some(TerminalObservation {
+                    output_digest: None,
+                    attention: Some(TerminalAttention {
+                        state: transport.attention().await?,
+                        as_of: Utc::now(),
+                        source: TerminalAttentionSource::Protocol,
+                    }),
+                    occupancy: Default::default(),
+                }));
+            }
+        }
         let pool = self.pool_for_spec(spec)?;
         let adapter = self.adapter_for_spec(spec)?;
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
@@ -7121,6 +7295,31 @@ impl TerminalRuntime for TerminalControllerRuntime {
             delivery.task.abort();
         }
         let pool = self.pool_for_spec(spec)?;
+        if let Some(holder) = self.holder_for_session(session_id, spec).await?.filter(Self::is_native_holder) {
+            let crew = holder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("native holder has crew");
+            let retiring_vessel = if let TerminalSessionSource::Agent { context, .. } = &spec.source {
+                self.state
+                    .daemon
+                    .resource_backend()
+                    .using::<Vessel>(&context.namespace)
+                    .get(&context.vessel_ref)
+                    .await
+                    .ok()
+                    .is_some_and(|vessel| vessel.metadata.deletion_timestamp.is_some())
+            } else {
+                false
+            };
+            if retiring_vessel {
+                if let Some(binding @ flotilla_resources::HolderTransport::AgentApi { .. }) = self.selected_transport(&holder)? {
+                    let flotilla_resources::HolderTransport::AgentApi { adapter, .. } = &binding else { unreachable!() };
+                    let registry = self.registry_for_env(&holder.spec.env_ref)?;
+                    registry.agent_adapters.get(adapter).ok_or("native session adapter unavailable")?.stop_vessel(&binding).await?;
+                }
+            } else if let Some(session) = self.native_transport(&holder).await? {
+                session.stop(false).await?;
+            }
+            self.state.agent_sessions.lock().await.remove(&crew.id);
+        }
         if pool.tracks_session_liveness() {
             match pool.list_sessions().await {
                 Ok(sessions) => {
@@ -7139,6 +7338,17 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
         }
         pool.kill_session(session_id).await
+    }
+
+    async fn cleanup_failed_session(&self, spec: &TerminalSessionSpec) -> Result<(), String> {
+        let TerminalSessionSource::Agent { context, .. } = &spec.source else { return Ok(()) };
+        let name = format!("terminal-{}-{}", context.vessel_ref, spec.role);
+        if let Some(holder) = self.holder_for_session(&name, spec).await? {
+            if let Some(session) = self.native_transport(&holder).await? {
+                session.stop(false).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn cleanup_session_artifacts(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
@@ -14965,6 +15175,42 @@ mod tests {
         runtime.shutdown();
     }
 
+    // These provisioning scenarios exercise a screen-only holder and a pool
+    // that records commands without starting processes. Native protocol coverage
+    // uses the injected app-server peer and the operator acceptance script.
+    struct ScreenOnlyAdapter(Arc<dyn AgentAdapter>);
+    #[async_trait]
+    impl AgentAdapter for ScreenOnlyAdapter {
+        fn id(&self) -> &'static str {
+            self.0.id()
+        }
+        async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &flotilla_resources::TerminalBrief) -> Result<(), String> {
+            self.0.prepare(cwd, brief).await
+        }
+        async fn prepare_with_vcs(
+            &self,
+            cwd: &ExecutionEnvironmentPath,
+            brief: &flotilla_resources::TerminalBrief,
+            env: &TerminalEnvVars,
+            vcs: &dyn flotilla_core::vcs::Vcs,
+        ) -> Result<(), String> {
+            self.0.prepare_with_vcs(cwd, brief, env, vcs).await
+        }
+        async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &flotilla_resources::TerminalBrief) -> Result<(), String> {
+            self.0.cleanup(cwd, brief).await
+        }
+        fn launch(&self, request: &AgentLaunchRequest) -> Result<flotilla_core::agent_adapter::AgentLaunchPlan, String> {
+            self.0.launch(request)
+        }
+        fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
+            self.0.classify_screen_attention(screen)
+        }
+    }
+    fn screen_only_codex(registry: &mut ProviderRegistry) {
+        let adapter = Arc::clone(registry.agent_adapters.get("codex").expect("Codex adapter"));
+        registry.agent_adapters.insert(Arc::new(ScreenOnlyAdapter(adapter)));
+    }
+
     async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
         crew_daemon_with_backend(config, ResourceBackend::InMemory(Default::default())).await
     }
@@ -15299,8 +15545,13 @@ mod tests {
         let current = sessions.update(&meta, &current.metadata.resource_version, &current.spec).await.expect("holder address");
         let mut status = current.status.clone().expect("holder status");
         status.session_id = Some(ID.into());
-        status.crew =
-            Some(flotilla_resources::CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() });
+        status.crew = Some(flotilla_resources::CrewSessionStatus {
+            input_transports: Vec::new(),
+            id: "crew".into(),
+            adapter: "codex".into(),
+            model: None,
+            stance: "work".into(),
+        });
         sessions.update_status(ID, &current.metadata.resource_version, &status).await.expect("holder identity");
         pool.inner.set_captured_screen(ID, "› Ask Codex to do anything").await;
         let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
@@ -15423,6 +15674,7 @@ mod tests {
                 session = sessions.update(&meta, &session.metadata.resource_version, &stored_spec).await.expect("new-only holder");
                 let mut status = session.status.clone().expect("status");
                 status.crew = Some(flotilla_resources::CrewSessionStatus {
+                    input_transports: Vec::new(),
                     id: "crew-id".into(),
                     adapter: "codex".into(),
                     model: None,
@@ -15616,6 +15868,7 @@ mod tests {
         let mut status = session.status.clone().expect("status");
         status.session_id = Some("agent".into());
         status.crew = Some(flotilla_resources::CrewSessionStatus {
+            input_transports: Vec::new(),
             id: "held-crew".into(),
             adapter: "codex".into(),
             model: None,
@@ -15847,6 +16100,7 @@ mod tests {
         let mut status = terminal.status.clone().expect("cross-host Message fixture operation succeeds");
         status.session_id = Some("agent".into());
         status.crew = Some(flotilla_resources::CrewSessionStatus {
+            input_transports: Vec::new(),
             id: "original-crew".into(),
             adapter: "codex".into(),
             model: None,
@@ -18016,7 +18270,8 @@ mod tests {
         let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
         let current_socket = temp.path().join("current-daemon.sock");
         daemon.set_daemon_socket_path(current_socket.clone()).await;
-        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let mut local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        screen_only_codex(Arc::get_mut(&mut local_registry).expect("unshared test registry"));
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
         let state = Arc::new(ControllerRuntimeState::new(
             Arc::clone(&daemon),
@@ -18091,6 +18346,31 @@ mod tests {
             std::fs::read_to_string(durable_checkout.join(".flotilla/briefs/coder.md")).expect("durable brief copy"),
             "Implement the issue."
         );
+
+        // Point lookups also support explicit resource names and recovered
+        // pool IDs. A name ending in a UUID must be tried before stripping it.
+        let terminals = runtime.state.daemon.resource_backend().using::<TerminalSession>(NAMESPACE);
+        for (name, recovered) in [
+            ("explicit-agent".to_string(), false),
+            (format!("explicit-{}", uuid::Uuid::new_v4()), false),
+            ("recovered-agent".to_string(), true),
+        ] {
+            let id = if recovered { format!("{name}-{}", uuid::Uuid::new_v4()) } else { name.clone() };
+            let holder = terminals.create(&empty_meta(&name), &spec).await.expect("explicit holder");
+            terminals
+                .update_status(
+                    &name,
+                    &holder.metadata.resource_version,
+                    &TerminalSessionStatus { session_id: Some(id.clone()), ..Default::default() },
+                )
+                .await
+                .expect("holder incarnation");
+            let resolved = runtime.holder_for_session(&id, &spec).await.expect("lookup").expect("matching holder");
+            assert_eq!(resolved.metadata.name, name);
+            if recovered {
+                assert!(runtime.holder_for_session(&name, &spec).await.expect("old incarnation lookup").is_none());
+            }
+        }
 
         runtime.cleanup_session_artifacts(&spec).await.expect("cleanup generated briefs");
         assert!(!session_cwd.join(".flotilla/briefs/coder.md").exists(), "session brief should be removed");
@@ -18318,9 +18598,10 @@ mod tests {
         std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_path));
         let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
-        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let mut local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         assert!(local_registry.agent_adapters.get("codex").is_some());
         assert!(local_registry.agent_adapters.get("claude-code").is_some());
+        screen_only_codex(Arc::get_mut(&mut local_registry).expect("unshared test registry"));
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
         let backend = daemon.resource_backend();
 
@@ -18708,7 +18989,8 @@ mod tests {
         let mut convoy_watch =
             convoys.watch(flotilla_resources::WatchStart::resuming_from(&listed_before_restart)).await.expect("watch convoy recovery");
         let (daemon, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
-        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
+        let mut local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry after restart");
+        screen_only_codex(Arc::get_mut(&mut local_registry).expect("unshared test registry"));
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile after restart");
         let surviving_sessions = terminals
             .list()

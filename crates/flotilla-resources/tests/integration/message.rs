@@ -623,7 +623,13 @@ async fn delivery_inbox() -> (ResourceBackend, flotilla_resources::MessageInbox)
             &TerminalSessionStatus {
                 phase: TerminalSessionPhase::Running,
                 session_id: Some("session".into()),
-                crew: Some(CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                crew: Some(CrewSessionStatus {
+                    input_transports: Vec::new(),
+                    id: "crew".into(),
+                    adapter: "codex".into(),
+                    model: None,
+                    stance: "work".into(),
+                }),
                 ..Default::default()
             },
         )
@@ -1859,7 +1865,13 @@ async fn topic_receipt_and_reply_use_the_ancestor_holders_address() {
                 &TerminalSessionStatus {
                     phase: TerminalSessionPhase::Running,
                     session_id: Some("root-session".into()),
-                    crew: Some(CrewSessionStatus { id: "root-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                    crew: Some(CrewSessionStatus {
+                        id: "root-crew".into(),
+                        adapter: "codex".into(),
+                        model: None,
+                        stance: "work".into(),
+                        input_transports: Vec::new(),
+                    }),
                     ..Default::default()
                 },
             )
@@ -2075,4 +2087,81 @@ async fn unknown_project_contact_query_reports_configuration_error() {
     assert_eq!(book.routing_issue.as_deref(), Some("unknown Project `missing`"));
     assert!(book.render().contains("unknown Project `missing`"));
     assert!(!book.render().contains("No current subscriber"));
+}
+
+// #2714: only interrupting supervisor messages cross an active-turn boundary.
+// Ordinary inputs retain FIFO, and unrelated structured work cannot acknowledge
+// a held batch, even after the legacy Working debounce elapses.
+#[tokio::test]
+async fn urgent_native_delivery_leaves_ordinary_messages_queued_and_requires_a_correlated_receipt() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+
+    use flotilla_resources::{
+        MessageBatch, MessageObservation, MessageSubmission, MessageTransport, MessageTransportOutcome, ResourceObject, TerminalSession,
+    };
+    // Process/protocol seam; real MessageInbox and resource storage own intent.
+    struct Native {
+        active: AtomicBool,
+        receipt: AtomicBool,
+        submissions: Mutex<Vec<(bool, Vec<String>, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl MessageTransport for Native {
+        fn supports_steering(&self, _: &ResourceObject<TerminalSession>) -> bool {
+            true
+        }
+        fn uses_structured_evidence(&self, _: &ResourceObject<TerminalSession>) -> bool {
+            true
+        }
+        async fn observe(
+            &self,
+            _: &ResourceObject<TerminalSession>,
+            submission: Option<&MessageSubmission>,
+        ) -> Result<MessageObservation, String> {
+            Ok(MessageObservation {
+                ready: !self.active.load(Ordering::SeqCst),
+                working: self.active.load(Ordering::SeqCst),
+                evidence: (submission.is_some() && self.receipt.load(Ordering::SeqCst)).then(|| "correlated userMessage".into()),
+                ..Default::default()
+            })
+        }
+        async fn submit(&self, batch: &MessageBatch) -> MessageTransportOutcome {
+            self.submissions.lock().expect("submissions").push((batch.interrupting, batch.submission.members.clone(), batch.text.clone()));
+            MessageTransportOutcome::Pending
+        }
+        async fn poll(&self, _: &MessageBatch) -> MessageTransportOutcome {
+            MessageTransportOutcome::Pending
+        }
+    }
+    let (backend, inbox) = delivery_inbox().await;
+    let native = Native { active: AtomicBool::new(true), receipt: AtomicBool::new(false), submissions: Mutex::new(Vec::new()) };
+    let mut urgent = spec(None, MessageExpectation::None);
+    urgent.relation = MessageRelation::Supervisor;
+    urgent.interrupting = true;
+    urgent.body = "urgent steering".into();
+    inbox.accept(&InputMeta::builder().name("urgent".into()).build(), &urgent, at(11)).await.expect("urgent intent");
+    inbox.reconcile_delivery(&native, at(12)).await.expect("steer active turn");
+    {
+        let submissions = native.submissions.lock().expect("submissions");
+        assert_eq!(submissions.len(), 1);
+        assert!(submissions[0].0);
+        assert_eq!(submissions[0].1, vec!["urgent"]);
+        assert!(!submissions[0].2.contains("body-"));
+    }
+    inbox.reconcile_delivery(&native, at(15)).await.expect("unrelated working");
+    inbox.reconcile_delivery(&native, at(20)).await.expect("working exceeds debounce");
+    let messages = backend.using::<Message>("flotilla");
+    assert!(messages.get("urgent").await.expect("urgent").status.expect("status").resolved_receiver.is_none());
+    native.receipt.store(true, Ordering::SeqCst);
+    inbox.reconcile_delivery(&native, at(21)).await.expect("receipt");
+    native.active.store(false, Ordering::SeqCst);
+    native.receipt.store(false, Ordering::SeqCst);
+    inbox.reconcile_delivery(&native, at(22)).await.expect("ordinary turn boundary");
+    let submissions = native.submissions.lock().expect("submissions");
+    assert_eq!(submissions.len(), 2);
+    assert!(!submissions[1].0);
+    assert_eq!(submissions[1].1, vec!["message-0", "message-1", "message-2"]);
 }

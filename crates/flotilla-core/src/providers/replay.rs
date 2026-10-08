@@ -906,6 +906,12 @@ impl CommandRunner for RecordingRunner {
         result
     }
 
+    async fn open_stream(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<super::CommandStream, String> {
+        // Bidirectional protocols are recorded at their protocol seam (see the
+        // Codex transport probe), rather than pretending they are one command.
+        self.inner.open_stream(cmd, args, cwd, label).await
+    }
+
     async fn spawn_long_lived(
         &self,
         cmd: &str,

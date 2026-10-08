@@ -189,6 +189,15 @@ impl CommandRunner for BudgetedRunner {
         self.budgets.after(cmd, args, result.as_ref().map(|value| value.as_str()).unwrap_or_else(|error| error.as_str()));
         result
     }
+    async fn open_stream(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<crate::providers::CommandStream, String> {
+        self.inner.open_stream(cmd, args, cwd, label).await
+    }
     async fn spawn_long_lived(
         &self,
         cmd: &str,

@@ -100,6 +100,12 @@ impl CommandRunner for DockerEnvironmentRunner {
         self.inner.run_output("docker", &arg_refs, Path::new("/"), label).await
     }
 
+    async fn open_stream(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<super::super::CommandStream, String> {
+        let owned = self.docker_exec_args(cmd, args, cwd, true);
+        let refs = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner.open_stream("docker", &refs, Path::new("/"), label).await
+    }
+
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let docker_args = self.docker_exec_args(cmd, args, cwd, true);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -166,17 +172,25 @@ impl CommandRunner for DockerEnvironmentRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::{future, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{future, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
+    #[cfg(unix)]
     use uuid::Uuid;
 
-    use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
+    use super::DockerEnvironmentRunner;
+    #[cfg(unix)]
+    use super::CONTAINED_CODEX_HOME;
     use crate::providers::{
         command_timeout_message,
         testing::{MockRunner, TimeoutOnlyRunner},
-        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+        ChannelLabel, CommandOutput, CommandRunner,
     };
+
+    #[cfg(unix)]
+    use crate::providers::ProcessCommandRunner;
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_docker_exec() {
@@ -205,8 +219,10 @@ mod tests {
         assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
     }
 
+    #[cfg(unix)]
     struct DockerContainer(String);
 
+    #[cfg(unix)]
     impl Drop for DockerContainer {
         fn drop(&mut self) {
             let _ = std::process::Command::new("docker").args(["rm", "-f", &self.0]).output();
@@ -290,6 +306,7 @@ mod tests {
         assert!(calls[0].1.iter().all(|arg| arg != "/run/user/1000" && arg != "/host/state"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires Docker and the busybox:latest image"]
     async fn persistent_delivery_paths_work_in_a_real_non_root_container() {

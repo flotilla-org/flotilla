@@ -216,6 +216,10 @@ impl Default for MessageStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageSubmission {
+    /// Pin the selected method before sending. Previous-generation submissions
+    /// retain guarded screen delivery; remove this default after one fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<crate::HolderTransport>,
     pub batch_id: String,
     pub crew_id: String,
     pub session: String,

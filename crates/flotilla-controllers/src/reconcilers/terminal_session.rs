@@ -911,6 +911,9 @@ where
             let retry = RECEIPT_RETIREMENT_RETRY_AFTER;
             outcome.requeue_after = Some(outcome.requeue_after.map_or(retry, |delay| delay.min(retry)));
         }
+        if obj.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| !crew.input_transports.is_empty()) {
+            outcome.requeue_after = Some(outcome.requeue_after.map_or(Duration::from_secs(2), |delay| delay.min(Duration::from_secs(2))));
+        }
         outcome
     }
 

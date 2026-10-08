@@ -288,6 +288,7 @@ mod tests {
 
     // #2570: local checkout facts and selectors agree through directory symlinks,
     // including an absent suffix. Generate both stored spellings and suffix depths.
+    #[cfg(unix)]
     #[hegel::test]
     fn symlinked_cwd_resolves_physical_checkout(tc: hegel::TestCase) {
         let stored_alias = tc.draw(gs::booleans());

@@ -42,12 +42,24 @@ pub struct MessageBatch {
     pub holder: ResourceObject<TerminalSession>,
     pub submission: MessageSubmission,
     pub text: String,
+    #[builder(default)]
+    pub interrupting: bool,
 }
 
 /// The transport owns readiness and evidence. Polling an existing submission
 /// must never type its text again, even after adapter or daemon restart.
 #[async_trait]
 pub trait MessageTransport: Send + Sync {
+    fn binding(&self, _holder: &ResourceObject<TerminalSession>) -> Option<crate::HolderTransport> {
+        None
+    }
+    fn supports_steering(&self, _holder: &ResourceObject<TerminalSession>) -> bool {
+        false
+    }
+    /// Structured adapters must never infer acceptance from unrelated work.
+    fn uses_structured_evidence(&self, _holder: &ResourceObject<TerminalSession>) -> bool {
+        false
+    }
     async fn observe(
         &self,
         holder: &ResourceObject<TerminalSession>,
@@ -409,7 +421,7 @@ impl MessageInbox {
             let same_holder = holder.status.as_ref().and_then(|status| status.session_id.as_deref()) == Some(submission.session.as_str())
                 && receiver == Some(submission.crew_id.as_str());
             let evidence = observation.evidence.clone().or_else(|| {
-                if same_holder && observation.working {
+                if same_holder && observation.working && !transport.uses_structured_evidence(holder) {
                     // Use the same Working debounce as legacy held inputs.
                     let since = submission.working_since.get_or_insert(now);
                     delivery_acceptance_evidence(
@@ -490,7 +502,18 @@ impl MessageInbox {
         }) {
             return Ok(());
         }
-        if running_holder.is_none() || !observation.ready {
+        // Urgent supervisor input may bypass ordinary queued messages only on a
+        // transport that explicitly supports steering. Never pull peers along.
+        let urgent: Vec<_> = pending
+            .iter()
+            .filter(|message| message.spec.interrupting && message.spec.relation == MessageRelation::Supervisor)
+            .cloned()
+            .collect();
+        let pending =
+            if observation.working && transport.supports_steering(holder) && !urgent.is_empty() { urgent.as_slice() } else { pending };
+        if running_holder.is_none()
+            || !(observation.ready || (observation.working && transport.supports_steering(holder) && !urgent.is_empty()))
+        {
             let reason = observation.waiting_reason.as_deref().unwrap_or("waiting for holder terminal readiness and a turn boundary");
             for message in pending {
                 self.wait(message, MessagePhase::Deliverable, reason, now).await?;
@@ -503,6 +526,7 @@ impl MessageInbox {
         // The key is stable for every possibly submitted attempt. Membership
         // can change only after definitely-unsent evidence clears that attempt.
         let submission = MessageSubmission::builder()
+            .maybe_transport(transport.binding(holder))
             .batch_id(format!(
                 "batch-{}-{}",
                 pending[0].metadata.name,
@@ -792,7 +816,13 @@ fn batch(holder: &ResourceObject<TerminalSession>, members: &[ResourceObject<Mes
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    MessageBatch::builder().id(submission.batch_id.clone()).holder(holder.clone()).submission(submission).text(text).build()
+    MessageBatch::builder()
+        .id(submission.batch_id.clone())
+        .holder(holder.clone())
+        .submission(submission)
+        .text(text)
+        .interrupting(members.iter().all(|message| message.spec.interrupting && message.spec.relation == MessageRelation::Supervisor))
+        .build()
 }
 
 async fn release(transport: &dyn MessageTransport, batch: &MessageBatch) {

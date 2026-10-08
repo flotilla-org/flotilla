@@ -224,7 +224,13 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
             &TerminalSessionStatus {
                 phase: TerminalSessionPhase::Running,
                 session_id: Some("receiver-session".into()),
-                crew: Some(CrewSessionStatus { id: "receiver-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                crew: Some(CrewSessionStatus {
+                    input_transports: Vec::new(),
+                    id: "receiver-crew".into(),
+                    adapter: "codex".into(),
+                    model: None,
+                    stance: "work".into(),
+                }),
                 ..Default::default()
             },
         )

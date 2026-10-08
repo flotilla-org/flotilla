@@ -1275,6 +1275,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
             &ResourceTerminalSessionStatus {
                 phase: ResourceTerminalSessionPhase::Running,
                 crew: Some(flotilla_resources::CrewSessionStatus {
+                    input_transports: Vec::new(),
                     id: "governor-crew".to_string(),
                     adapter: "codex".to_string(),
                     model: None,
@@ -3836,6 +3837,7 @@ fn managed_terminal_changes_are_field_scoped_and_deduplicated() {
     ));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -5018,6 +5020,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
                         phase: ResourceTerminalSessionPhase::Running,
                         session_id: Some("session-one".to_string()),
                         crew: Some(flotilla_resources::CrewSessionStatus {
+                            input_transports: Vec::new(),
                             id: "crew-one".to_string(),
                             adapter: "codex".to_string(),
                             model: None,
