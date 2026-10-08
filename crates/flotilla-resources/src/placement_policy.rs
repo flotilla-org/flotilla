@@ -88,6 +88,9 @@ pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     pub image: DockerImageSource,
     /// Admission freezes baseline provenance alongside the resolved image.
+    /// Operator-authored policies normally omit this field. Explicit values are
+    /// accepted as asserted provenance, like the legacy Environment label; use
+    /// them only when preserving an image previously resolved from that baseline.
     /// One-generation bridge until #2731; retire after its last writing roll
     /// and the following compatibility generation (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]

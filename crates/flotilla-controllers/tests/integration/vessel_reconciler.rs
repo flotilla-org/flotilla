@@ -1980,8 +1980,8 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-legacy_image_baseline_ref: None,
-memory_policy: Default::default(),
+            legacy_image_baseline_ref: None,
+            memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: Default::default(),
@@ -1993,8 +1993,10 @@ memory_policy: Default::default(),
         .build(),
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree",
     "/workspace",
-    Some(DockerEnvironmentSpec { image_composition: None, image_build_ref: None,
-memory_policy: Default::default(),
+    Some(DockerEnvironmentSpec {
+        image_composition: None,
+        image_build_ref: None,
+        memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -2040,8 +2042,8 @@ memory_policy: Default::default(),
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-legacy_image_baseline_ref: None,
-memory_policy: Default::default(),
+            legacy_image_baseline_ref: None,
+            memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: Default::default(),
@@ -2053,8 +2055,10 @@ memory_policy: Default::default(),
         .build(),
     "/workspace",
     "/app",
-    Some(DockerEnvironmentSpec { image_composition: None, image_build_ref: None,
-memory_policy: Default::default(),
+    Some(DockerEnvironmentSpec {
+        image_composition: None,
+        image_build_ref: None,
+        memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
