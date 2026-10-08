@@ -424,8 +424,6 @@ pub(crate) struct ExecutorStepResolver {
     pub vcs_resolver: Arc<dyn crate::vcs::CheckoutVcsResolver>,
 }
 
-impl ExecutorStepResolver {}
-
 #[async_trait::async_trait]
 impl StepResolver for ExecutorStepResolver {
     async fn resolve(

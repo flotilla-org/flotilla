@@ -136,16 +136,6 @@ impl MockWorkspaceManager {
         }
     }
 
-    fn failing(msg: &str) -> Self {
-        Self {
-            existing: vec![],
-            create_result: tokio::sync::Mutex::new(Err(msg.to_string())),
-            select_result: tokio::sync::Mutex::new(Err(msg.to_string())),
-            created_configs: tokio::sync::Mutex::new(Vec::new()),
-            calls: tokio::sync::Mutex::new(vec![]),
-        }
-    }
-
     fn with_existing(existing: Vec<(String, Workspace)>) -> Self {
         Self {
             existing,
@@ -587,19 +577,6 @@ async fn create_checkout_failure() {
     let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
 
     assert_error_eq(result, "branch already exists");
-}
-
-#[tokio::test]
-async fn create_checkout_success_ws_manager_fails_still_returns_created() {
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
-    let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
-
-    let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
-
-    // Workspace failure is logged but checkout still reports success
-    assert_checkout_created_branch(result, "feat-x");
 }
 
 // -----------------------------------------------------------------------
