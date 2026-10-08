@@ -36,8 +36,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           repository: flotilla-org/cleat
           ref: 00c072b207dc943f6c93fe3b6b09abaa257695a6
@@ -48,6 +48,7 @@ jobs:
         uses: ./ci/toolchain/action
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: tender-ssh-cleat
       - name: Provision OpenSSH and functional pinned cleat
         run: |
