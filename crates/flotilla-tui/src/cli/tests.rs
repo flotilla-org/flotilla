@@ -88,9 +88,6 @@ fn provider_lists_show_active_sessions_and_workspaces() {
     assert_eq!(serde_json::from_value::<CommandValue>(json).expect("decode list"), value);
     let output = format_command_result(&CommandValue::CliList(Box::new(agents)));
     assert!(output.contains("session-42") && output.contains("Implement feature") && output.contains("running"), "{output}");
-
-    let workspaces = CliListResponse { list_kind: CliListKind::Workspace, items: vec![] };
-    assert_eq!(format_command_result(&CommandValue::CliList(Box::new(workspaces))), "No active workspaces found.\n");
 }
 
 #[test]

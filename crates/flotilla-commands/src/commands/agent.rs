@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
@@ -20,13 +18,6 @@ pub struct AgentNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum AgentVerb {
-    /// Connect to a remote agent session
-    Teleport {
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        checkout: Option<PathBuf>,
-    },
     /// Archive an agent session
     Archive,
 }
@@ -40,16 +31,6 @@ impl AgentNoun {
                 context_repo: None,
                 action: CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Agent },
             })),
-            (Some(subject), Some(AgentVerb::Teleport { branch, checkout })) => Ok(Resolved::NeedsContext {
-                command: Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::TeleportSession { session_id: subject, branch, checkout_key: checkout },
-                },
-                repo: RepoContext::Inferred,
-                host: HostResolution::Local,
-            }),
             (Some(subject), Some(AgentVerb::Archive)) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
@@ -73,15 +54,6 @@ impl std::fmt::Display for AgentNoun {
             write!(f, " {subject}")?;
         }
         match &self.verb {
-            Some(AgentVerb::Teleport { branch, checkout }) => {
-                write!(f, " teleport")?;
-                if let Some(b) = branch {
-                    write!(f, " --branch {b}")?;
-                }
-                if let Some(c) = checkout {
-                    write!(f, " --checkout {}", c.display())?;
-                }
-            }
             Some(AgentVerb::Archive) => write!(f, " archive")?,
             None => {}
         }
@@ -91,7 +63,6 @@ impl std::fmt::Display for AgentNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use clap::Parser;
     use flotilla_protocol::CommandAction;
@@ -113,43 +84,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_teleport_no_flags() {
-        let resolved = parse(&["agent", "claude-1", "teleport"]).resolve().unwrap();
-        crate::test_utils::assert_needs_context(
-            resolved,
-            CommandAction::TeleportSession { session_id: "claude-1".into(), branch: None, checkout_key: None },
-            RepoContext::Inferred,
-            HostResolution::Local,
-        );
-    }
-
-    #[test]
-    fn agent_teleport_with_branch() {
-        let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat"]).resolve().unwrap();
-        crate::test_utils::assert_needs_context(
-            resolved,
-            CommandAction::TeleportSession { session_id: "claude-1".into(), branch: Some("feat".into()), checkout_key: None },
-            RepoContext::Inferred,
-            HostResolution::Local,
-        );
-    }
-
-    #[test]
-    fn agent_teleport_with_branch_and_checkout() {
-        let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat", "--checkout", "/tmp/wt"]).resolve().unwrap();
-        crate::test_utils::assert_needs_context(
-            resolved,
-            CommandAction::TeleportSession {
-                session_id: "claude-1".into(),
-                branch: Some("feat".into()),
-                checkout_key: Some(PathBuf::from("/tmp/wt")),
-            },
-            RepoContext::Inferred,
-            HostResolution::Local,
-        );
-    }
-
-    #[test]
     fn agent_archive() {
         let resolved = parse(&["agent", "claude-1", "archive"]).resolve().unwrap();
         crate::test_utils::assert_needs_context(
@@ -158,16 +92,6 @@ mod tests {
             RepoContext::Inferred,
             HostResolution::ProviderHost,
         );
-    }
-
-    #[test]
-    fn round_trip_teleport() {
-        assert_round_trip::<AgentNoun>(&["agent", "claude-1", "teleport"]);
-    }
-
-    #[test]
-    fn round_trip_teleport_with_branch() {
-        assert_round_trip::<AgentNoun>(&["agent", "claude-1", "teleport", "--branch", "feat"]);
     }
 
     #[test]

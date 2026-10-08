@@ -33,8 +33,6 @@ pub enum RepoVerb {
         #[arg(long)]
         fresh: bool,
     },
-    /// Prepare terminal for a checkout
-    PrepareTerminal { path: PathBuf },
     /// Show providers for a repository
     Providers,
 }
@@ -75,13 +73,6 @@ impl RepoNoun {
                 }))
             }
             (None, Some(RepoVerb::Checkout { .. })) => Err("checkout requires a repository subject".into()),
-            (Some(subject), Some(RepoVerb::PrepareTerminal { path })) => Ok(Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(RepoSelector::Query(subject)),
-                action: CommandAction::PrepareTerminalForCheckout { checkout_path: path, commands: vec![] },
-            })),
-            (None, Some(RepoVerb::PrepareTerminal { .. })) => Err("prepare-terminal requires a repository subject".into()),
             (Some(subject), Some(RepoVerb::Providers)) => Ok(Resolved::Ready(Command {
                 node_id: None,
                 provisioning_target: None,
@@ -116,7 +107,6 @@ impl fmt::Display for RepoNoun {
                     }
                     write!(f, " {branch}")?;
                 }
-                RepoVerb::PrepareTerminal { path } => write!(f, " prepare-terminal {}", path.display())?,
                 RepoVerb::Providers => write!(f, " providers")?,
             }
         }
@@ -221,17 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_prepare_terminal() {
-        let resolved = parse(&["repo", "myslug", "prepare-terminal", "/tmp/path"]).resolve().unwrap();
-        let Resolved::Ready(command) = resolved else { panic!("expected a ready command") };
-        assert_eq!(
-            command.action,
-            CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/path"), commands: vec![] }
-        );
-        assert_eq!(command.context_repo, Some(RepoSelector::Query("myslug".into())));
-    }
-
-    #[test]
     fn repo_subject_form_refresh() {
         // `repo myslug refresh` — subject used as repo (noun-subject-verb canonical form)
         let resolved = parse(&["repo", "myslug", "refresh"]).resolve().unwrap();
@@ -290,10 +269,5 @@ mod tests {
     #[test]
     fn round_trip_all_refresh() {
         assert_round_trip::<RepoNoun>(&["repo", "all", "refresh"]);
-    }
-
-    #[test]
-    fn round_trip_prepare_terminal() {
-        assert_round_trip::<RepoNoun>(&["repo", "myslug", "prepare-terminal", "/tmp/path"]);
     }
 }

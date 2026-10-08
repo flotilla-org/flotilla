@@ -268,10 +268,10 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
 }
 
 #[tokio::test]
-async fn cli_lists_include_active_provider_sessions_and_workspaces() {
+async fn cli_lists_include_active_provider_sessions() {
     use crate::providers::{
         coding_agent::CloudAgentService,
-        discovery::{test_support::FakePresentationManager, ProviderCategory, ProviderDescriptor},
+        discovery::{ProviderCategory, ProviderDescriptor},
         types::RepoCriteria,
     };
 
@@ -331,25 +331,9 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
         ResourceBackend::InMemory(InMemoryBackend::default()),
     )
     .await;
-    let workspace_provider = Arc::new(FakePresentationManager::new());
-    workspace_provider
-        .add_workspaces(vec![("workspace:1".into(), flotilla_protocol::Workspace { name: "Current work".into(), attachable_set_id: None })])
-        .await;
     let mut registry = ProviderRegistry::new();
     registry.cloud_agents.insert("broken", ProviderDescriptor::named(ProviderCategory::CloudAgent, "broken"), Arc::new(BrokenSessions));
     registry.cloud_agents.insert("fake", ProviderDescriptor::named(ProviderCategory::CloudAgent, "fake"), Arc::new(Sessions));
-    let broken_workspace_provider = Arc::new(FakePresentationManager::new());
-    *broken_workspace_provider.list_error.lock().await = Some("provider unavailable".into());
-    registry.presentation_managers.insert(
-        "broken",
-        ProviderDescriptor::named(ProviderCategory::WorkspaceManager, "broken"),
-        broken_workspace_provider,
-    );
-    registry.presentation_managers.insert(
-        "fake",
-        ProviderDescriptor::named(ProviderCategory::WorkspaceManager, "fake"),
-        workspace_provider,
-    );
     let identity = RepoIdentity { authority: "github.com".into(), path: "team/repo".into() };
     daemon.repos.write().await.insert(
         identity.clone(),
@@ -371,14 +355,6 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
     };
     assert_eq!(agents.items.len(), 1);
     assert_eq!(agents.items[0].reference, "active");
-    let CommandValue::CliList(workspaces) =
-        daemon.execute_query(list(CliListKind::Workspace), uuid::Uuid::new_v4()).await.expect("workspaces")
-    else {
-        panic!("expected workspace list");
-    };
-    assert_eq!(workspaces.items.len(), 1);
-    assert_eq!(workspaces.items[0].name, "Current work");
-    assert_eq!(workspaces.items[0].repo, None);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey};
+use flotilla_protocol::{CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId};
 
 use super::{ui_state::PendingActionContext, App};
 use crate::{
@@ -146,39 +146,8 @@ impl App {
     pub(super) fn execute_table_intent(&mut self, intent: TableIntent) {
         let (mut command, host) = match intent {
             TableIntent::OpenInPm(target) => {
-                let locally_homed = target
-                    .host
-                    .as_ref()
-                    .is_some_and(|home| home == &HostName::local() || self.model.my_host().is_some_and(|local| home == local));
-                if !locally_homed {
-                    let home = target.host.as_ref().map_or_else(|| "unknown host".to_string(), ToString::to_string);
-                    self.set_error_message(format!("{} is not reachable from this PM yet (homed on {home})", target.label));
-                    return;
-                }
-                let Some(connector) = self.pm_connector.clone() else {
-                    self.set_error_message("No presentation manager is connected".to_string());
-                    return;
-                };
-                let working_directory = self
-                    .table_action_repo(target.repo_hint.as_ref())
-                    .and_then(|identity| self.model.repos.get(&identity).map(|repo| repo.path.clone()))
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let tx = self.pm_update_tx.clone();
-                let label = target.label.clone();
                 self.report_focus(vec![target.resource_ref()]);
-                tokio::spawn(async move {
-                    let result = connector.open(&target, &working_directory).await;
-                    let _ = tx.send(super::PmOpenUpdate { label, result });
-                });
                 return;
-            }
-            TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
-                let Some(repo_identity) = self.table_action_repo(repo_hint.as_ref()) else {
-                    self.set_error_message("Cannot attach workspace: the convoy does not identify a tracked repository".to_string());
-                    return;
-                };
-                (self.repo_command_for_identity(repo_identity, CommandAction::SelectWorkspace { ws_ref: workspace_ref }), host)
             }
             TableIntent::AttachPane { reference, host } => {
                 self.proto_commands.push(self.command(CommandAction::AttachTransient {
@@ -342,28 +311,12 @@ impl App {
         }
     }
 
-    fn table_action_repo(&self, hint: Option<&RepoKey>) -> Option<RepoIdentity> {
-        hint.and_then(|hint| self.model.repo_order.iter().find(|identity| repo_identity_matches_hint(identity, hint)).cloned())
-            .or_else(|| (self.model.repo_order.len() == 1).then(|| self.model.repo_order[0].clone()))
-    }
-
     fn panel_target_node(&self, host: &HostName) -> Result<Option<NodeId>, String> {
         if host == &HostName::local() {
             return Ok(None);
         }
         self.model.node_id_for_host(host).cloned().map(Some).ok_or_else(|| format!("host '{}' is not connected", host.as_str()))
     }
-}
-
-pub(super) fn repo_identity_matches_hint(identity: &RepoIdentity, hint: &RepoKey) -> bool {
-    if hint.0 == identity.path || hint.0 == format!("{}/{}", identity.authority, identity.path.trim_start_matches('/')) {
-        return true;
-    }
-    if matches!(identity.authority.as_str(), "local" | "unknown") {
-        return false;
-    }
-    let url = format!("https://{}/{}", identity.authority, identity.path.trim_start_matches('/'));
-    flotilla_resources::canonicalize_repo_url(&url).is_ok_and(|canonical| flotilla_resources::descriptive_repo_slug(&canonical) == hint.0)
 }
 
 #[cfg(test)]

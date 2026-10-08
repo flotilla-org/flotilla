@@ -32,7 +32,6 @@ pub enum CliListKind {
     Checkout,
     Cr,
     Agent,
-    Workspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

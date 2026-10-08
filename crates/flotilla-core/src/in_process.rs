@@ -5287,7 +5287,7 @@ impl InProcessDaemon {
                     );
                 }
             }
-            CliListKind::Agent | CliListKind::Workspace => return self.list_provider_cli_items(kind).await,
+            CliListKind::Agent => return self.list_provider_cli_items(kind).await,
         }
 
         Ok(CliListResponse { list_kind: kind, items: items.into_values().collect() })
@@ -5298,7 +5298,6 @@ impl InProcessDaemon {
         let mut repositories =
             self.repos.read().await.values().map(|state| (state.identity().path.clone(), state.registry())).collect::<Vec<_>>();
         repositories.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut seen_workspace_providers = BTreeSet::new();
         for (repo, registry) in repositories {
             if kind == CliListKind::Agent {
                 let criteria = RepoCriteria { repo_slug: Some(repo.clone()) };
@@ -5322,31 +5321,6 @@ impl InProcessDaemon {
                             reference,
                             name: session.title,
                             status: status.to_string(),
-                            provider: Some(provider_name),
-                        });
-                    }
-                }
-            } else {
-                for (descriptor, provider) in registry.presentation_managers.iter() {
-                    let provider_name = descriptor.display_name.clone();
-                    if seen_workspace_providers.contains(&provider_name) {
-                        continue;
-                    }
-                    let workspaces = match provider.list_workspaces().await {
-                        Ok(workspaces) => workspaces,
-                        Err(error) => {
-                            warn!(provider = %provider_name, %error, "failed to list workspaces");
-                            continue;
-                        }
-                    };
-                    seen_workspace_providers.insert(provider_name.clone());
-                    for (reference, workspace) in workspaces {
-                        let provider_name = descriptor.display_name.clone();
-                        items.entry((provider_name.clone(), reference.clone())).or_insert(CliListRow {
-                            repo: None,
-                            reference,
-                            name: workspace.name,
-                            status: "active".to_string(),
                             provider: Some(provider_name),
                         });
                     }
