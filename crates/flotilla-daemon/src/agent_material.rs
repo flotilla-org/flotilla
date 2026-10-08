@@ -374,11 +374,17 @@ done"#,
     }
 
     pub(crate) async fn archive_environment_home(&self, convoy_ref: &str, environment_ref: &str) -> Result<(), String> {
+        for identity in [convoy_ref, environment_ref] {
+            if !matches!(Path::new(identity).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
+                return Err("archive identity must name one directory".into());
+            }
+        }
+        self.discard_delivered_credentials(environment_ref).await?;
         let home = self.homes_dir.join(environment_ref);
         if !fs::try_exists(&home).await.map_err(|error| error.to_string())? {
             return Ok(());
         }
-        let archive = self.homes_dir.parent().expect("agent homes parent").join("session-archive").join(convoy_ref);
+        let archive = self.homes_dir.parent().ok_or("agent homes parent missing")?.join("session-archive").join(convoy_ref);
         fs::create_dir_all(&archive).await.map_err(|error| format!("create session archive: {error}"))?;
         let mut destination = archive.join(environment_ref);
         loop {
@@ -397,6 +403,8 @@ done"#,
         let result = async {
             let directory = fs::File::open(&home).await?;
             directory.into_std().await.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+            // Both roots must be on the same filesystem: do not fall back to
+            // copying on EXDEV, since teardown promises an atomic move.
             fs::rename(&home, &destination).await
         }
         .await;
@@ -2342,8 +2350,10 @@ esac
         std::fs::create_dir_all(session.parent().expect("session has parent")).expect("session directory");
         std::fs::write(&session, "{\"type\":\"session_meta\"}\n").expect("session state");
 
-        registry.archive_environment_home("convoy-a", "env-a").await.expect("remove environment home");
-        assert!(!environment_home.exists(), "environment deletion must remove persistent agent state");
+        // Delivered login material is stripped while session contents survive.
+        std::fs::write(environment_home.join("codex/auth.json"), "credential").unwrap();
+        registry.archive_environment_home("convoy-a", "env-a").await.expect("archive environment home");
+        assert!(!environment_home.exists(), "teardown must move the persistent agent home");
 
         // Teardown preserves session contents; repeated environments never overwrite an archive.
         let archive = temp.path().join(".local/share/flotilla/session-archive/convoy-a");
@@ -2355,6 +2365,17 @@ esac
         std::fs::write(environment_home.join("second-session"), "second").unwrap();
         registry.archive_environment_home("convoy-a", "env-a").await.unwrap();
         assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 2);
+        let suffixed = std::fs::read_dir(&archive)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap() != "env-a")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(suffixed.join("second-session")).unwrap(), "second");
+        assert!(!archive.join("env-a/codex/auth.json").exists());
+        for invalid in ["../escape", "..", "/", ""] {
+            assert!(registry.archive_environment_home("convoy-a", invalid).await.is_err());
+            assert!(registry.archive_environment_home(invalid, "env-a").await.is_err());
+        }
         assert!(archive.join("env-a/codex/sessions/2026/09/16/rollout.jsonl").exists());
         registry.archive_environment_home("convoy-a", "env-a").await.expect("idempotent cleanup");
     }

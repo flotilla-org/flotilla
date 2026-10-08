@@ -79,7 +79,7 @@ fi
   # Archive homes are exactly two directories below the archive root.
   archive_root=$HOME/.local/share/flotilla/session-archive
   if [[ -d $archive_root ]]; then
-    find "$archive_root" -mindepth 2 -maxdepth 2 -type d -mmin +"$((10#$archive_retention_days * 1440))" -exec rm -rf -- {} +
+    find "$archive_root" -mindepth 2 -maxdepth 2 -type d -mmin +"$((10#$archive_retention_days * 1440))" -exec rm -rf -- {} + || echo "session archive sweep failed; continuing Cargo maintenance" >&2
   fi
   started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
   total_reclaimed_bytes=0

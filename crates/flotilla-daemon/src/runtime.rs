@@ -5366,15 +5366,16 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                         match backend.using::<Vessel>(&namespace).get(&owner.name).await {
                             Ok(vessel) => convoy_ref = vessel.spec.convoy_ref,
                             Err(ResourceError::NotFound { .. }) => {}
-                            Err(error) => return Err(error.to_string()),
+                            Err(error) => cleanup_errors.push(error.to_string()),
                         }
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error) => cleanup_errors.push(error.to_string()),
             }
             if !matches!(Path::new(&convoy_ref).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
-                return Err("archive convoy identity must name one directory".to_string());
+                cleanup_errors.push("archive convoy identity must name one directory".to_string());
+                convoy_ref = "unowned".into();
             }
             if let Err(error) = registry.archive_environment_home(&convoy_ref, environment_ref).await {
                 cleanup_errors.push(error);
