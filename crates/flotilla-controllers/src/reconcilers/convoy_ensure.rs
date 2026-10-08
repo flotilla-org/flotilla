@@ -768,7 +768,7 @@ impl EnsurePass<'_> {
         let terminal = convoy
             .as_ref()
             .and_then(|convoy| convoy.status.as_ref())
-            .is_some_and(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned));
+            .is_some_and(|status| matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Abandoned));
 
         if let Some(convoy) = convoy.as_ref().filter(|_| !terminal) {
             self.observe_ensure_config_drift(namespace, ensure, convoy).await?;

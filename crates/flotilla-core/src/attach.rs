@@ -759,12 +759,10 @@ fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
         ResourceConvoyPhase::Active => ConvoyPhase::Active,
         ResourceConvoyPhase::Interrupted => ConvoyPhase::Interrupted,
-        ResourceConvoyPhase::Anchored => ConvoyPhase::Anchored,
         ResourceConvoyPhase::Landing => ConvoyPhase::Landing,
+        ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
         ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
         ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
-        ResourceConvoyPhase::Cancelled => ConvoyPhase::Cancelled,
-        ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
     }
 }
 

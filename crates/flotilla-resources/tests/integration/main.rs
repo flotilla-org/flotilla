@@ -15,6 +15,7 @@ mod http_wire;
 mod in_memory;
 mod k8s_integration;
 mod landing_gate;
+mod lifecycle_hygiene;
 mod lifecycle_status_patch;
 mod manifest_root;
 mod message;

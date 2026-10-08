@@ -337,6 +337,9 @@ enum PlannedPatch {
         roles: BTreeSet<String>,
         message: String,
     },
+    Lost {
+        message: String,
+    },
     Failed {
         message: String,
     },
@@ -400,6 +403,25 @@ impl VesselPrepared {
         Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
     }
 
+    fn unavailable_environment(environment: &ResourceObject<Environment>) -> Option<Self> {
+        let status = environment.status.as_ref()?;
+        let patch = match status.phase {
+            EnvironmentPhase::Lost => PlannedPatch::Lost {
+                message: status.message.clone().unwrap_or_else(|| {
+                    format!(
+                        "lost, recoverable: environment {} disappeared; rehydration is not available yet (#2872)",
+                        environment.metadata.name
+                    )
+                }),
+            },
+            EnvironmentPhase::Failed => PlannedPatch::Failed {
+                message: status.message.clone().unwrap_or_else(|| format!("environment {} failed", environment.metadata.name)),
+            },
+            _ => return None,
+        };
+        Some(Self { patch, actuations: Vec::new() })
+    }
+
     fn failed(message: impl Into<String>) -> Self {
         Self { patch: PlannedPatch::Failed { message: message.into() }, actuations: Vec::new() }
     }
@@ -423,7 +445,7 @@ impl Reconciler for VesselReconciler {
     type Prepared = VesselPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
-        if obj.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Failed) {
+        if obj.status.as_ref().is_some_and(|status| matches!(status.phase, VesselPhase::Failed | VesselPhase::Lost)) {
             return Ok(VesselPrepared::none());
         }
 
@@ -450,18 +472,16 @@ impl Reconciler for VesselReconciler {
         // dependencies: retain the recorded death cause and recovery paths.
         if let Some(environment_ref) = obj.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
             match self.environments.get(environment_ref).await {
-                Ok(environment) if environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed) => {
-                    let message = environment
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.message.clone())
-                        .unwrap_or_else(|| format!("environment {environment_ref} failed"));
-                    return Ok(VesselPrepared::failed(message));
+                Ok(environment) => {
+                    if let Some(prepared) = VesselPrepared::unavailable_environment(&environment) {
+                        return Ok(prepared);
+                    }
                 }
-                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
+
         let placement_policy = match self.placement_dependency(obj, &obj.spec.placement_policy_ref).await {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
@@ -568,13 +588,8 @@ impl Reconciler for VesselReconciler {
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
-                        if existing.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
-                            let message = existing
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("environment {env_name} failed"));
-                            return Ok(VesselPrepared::failed(message));
+                        if let Some(prepared) = VesselPrepared::unavailable_environment(&existing) {
+                            return Ok(prepared);
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             let waiting_for = existing
@@ -944,8 +959,8 @@ impl Reconciler for VesselReconciler {
                     }
                     Err(err) => return Err(err),
                 };
-                if environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
-                    return Ok(VesselPrepared::failed(format!("environment {env_name} failed")));
+                if let Some(prepared) = VesselPrepared::unavailable_environment(&environment) {
+                    return Ok(prepared);
                 }
                 if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                     return Ok(VesselPrepared::provisioning(
@@ -991,13 +1006,8 @@ impl Reconciler for VesselReconciler {
                             });
                         }
 
-                        if existing.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
-                            let message = existing
-                                .status
-                                .as_ref()
-                                .and_then(|status| status.message.clone())
-                                .unwrap_or_else(|| format!("environment {env_name} failed"));
-                            return Ok(VesselPrepared::failed(message));
+                        if let Some(prepared) = VesselPrepared::unavailable_environment(&existing) {
+                            return Ok(prepared);
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             let waiting_for = existing
@@ -1449,6 +1459,7 @@ impl Reconciler for VesselReconciler {
                 Some(VesselStatusPatch::MarkInterrupted { roles: roles.clone(), message: message.clone() })
             }
             PlannedPatch::Interrupted { .. } => None,
+            PlannedPatch::Lost { message } => Some(VesselStatusPatch::MarkLost { message: message.clone() }),
             PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
         };
 

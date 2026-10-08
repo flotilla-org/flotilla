@@ -2929,8 +2929,7 @@ impl std::io::Write for ReclaimLogBuffer {
 #[rstest::rstest]
 #[tokio::test(start_paused = true)]
 async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
-    #[values(ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned, ConvoyPhase::Landing)]
-    phase: ConvoyPhase,
+    #[values(ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned, ConvoyPhase::Landing)] phase: ConvoyPhase,
     #[values(false, true)] replicated: bool,
     #[values(false, true)] initially_refused: bool,
     #[values(LifecycleAuthority::Managed, LifecycleAuthority::Adopted, LifecycleAuthority::Observed)] authority_kind: LifecycleAuthority,

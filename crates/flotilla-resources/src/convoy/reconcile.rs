@@ -1774,6 +1774,29 @@ fn vessel_outcome(
             continue;
         };
         let vessel = vessels.get(&vessel_resource_name(&convoy.metadata.name, &requirement.name));
+        if let Some(vessel) = vessel.filter(|vessel| vessel.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Lost)) {
+            if state.phase.is_terminal() {
+                continue;
+            }
+            let message = vessel
+                .status
+                .as_ref()
+                .and_then(|status| status.message.clone())
+                .unwrap_or_else(|| "lost, recoverable: environment disappeared; rehydration is not available yet (#2872)".into());
+            if state.phase == WorkPhase::Interrupted && state.message.as_ref() == Some(&message) {
+                continue;
+            }
+            let roles = status.crew_work.get(&requirement.name).into_iter().flat_map(|crew| crew.keys().cloned()).collect();
+            return InternalReconcileOutcome {
+                patch: Some(provisioning_patches::work_interrupted(requirement.name.clone(), roles, message)),
+                actuations,
+                events: vec![ConvoyEvent::WorkPhaseChanged {
+                    work: requirement.name.clone(),
+                    from: state.phase,
+                    to: WorkPhase::Interrupted,
+                }],
+            };
+        }
         // A deleting child still occupies the requirement until finalization.
         // Record a failed child's cause and retry even if teardown won the race.
         if vessel.is_some_and(|vessel| {

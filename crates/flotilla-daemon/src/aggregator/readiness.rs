@@ -62,7 +62,11 @@ impl Aggregator {
             if vessel_phase == VesselPhase::Ready {
                 result.state = ReadinessState::Ready;
             } else {
-                result.state = if vessel_phase == VesselPhase::Failed { ReadinessState::Failed } else { ReadinessState::Provisioning };
+                result.state = match vessel_phase {
+                    VesselPhase::Failed => ReadinessState::Failed,
+                    VesselPhase::Lost => ReadinessState::Blocked,
+                    _ => ReadinessState::Provisioning,
+                };
                 result.blockers.push(ReadinessBlocker {
                     resource: ResourceRef::new(
                         api_version(Vessel::API_PATHS),
@@ -72,8 +76,19 @@ impl Aggregator {
                     )
                     .on_host(host.clone()),
                     phase: format!("{vessel_phase:?}"),
-                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| "vessel is not ready".into()),
+                    reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| {
+                        if vessel_phase == VesselPhase::Lost {
+                            "lost, recoverable; rehydration is not available yet (#2872)".into()
+                        } else {
+                            "vessel is not ready".into()
+                        }
+                    }),
                 });
+            }
+            // Lost backing is frozen. Missing child evidence cannot turn it
+            // back into provisioning or replace the recovery explanation.
+            if vessel_phase == VesselPhase::Lost {
+                return result;
             }
             let mut checkout_refs =
                 status.map(|status| status.checkout_refs.values().cloned().collect::<BTreeSet<_>>()).unwrap_or_default();

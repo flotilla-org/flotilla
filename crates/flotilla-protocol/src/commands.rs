@@ -2011,6 +2011,7 @@ mod tests {
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),
+                    reason: None,
                     attention: None,
                     adapter: Some("codex".into()),
                     model: None,

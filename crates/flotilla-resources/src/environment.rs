@@ -74,7 +74,9 @@ pub enum EnvironmentPhase {
     Pending,
     Provisioning,
     Ready,
-    Terminating,
+    // ADR 0047: remove Terminating alias one fleet roll after #2917.
+    #[serde(alias = "Terminating")]
+    Lost,
     Failed,
 }
 
@@ -127,10 +129,12 @@ pub enum EnvironmentStatusPatch {
         message: String,
         build_refs: Vec<String>,
     },
+    MarkLost {
+        message: String,
+    },
     MarkFailed {
         message: String,
     },
-    MarkTerminating,
     CredentialDelivery {
         retry: Option<ControllerRetry>,
     },
@@ -161,14 +165,15 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.ready = false;
                 status.message = Some(message.clone());
             }
+            Self::MarkLost { message } => {
+                status.phase = EnvironmentPhase::Lost;
+                status.ready = false;
+                status.message = Some(message.clone());
+            }
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;
                 status.ready = false;
                 status.message = Some(message.clone());
-            }
-            Self::MarkTerminating => {
-                status.phase = EnvironmentPhase::Terminating;
-                status.ready = false;
             }
         }
     }

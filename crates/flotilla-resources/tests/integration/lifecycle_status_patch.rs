@@ -135,7 +135,7 @@ define_patch_kinds! {
     VesselMarkReady => DUPLICATE,
     VesselStageLandingCredentials => DUPLICATE,
     VesselMarkInterrupted => NONE,
-    VesselMarkTearingDown => NONE,
+    VesselMarkLost => NONE,
     VesselMarkFailed => NONE,
     PresentationMarkActive => DUPLICATE_NEW_ATTEMPT,
     PresentationMarkTornDown => NONE,
@@ -230,7 +230,7 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
         VesselStatusPatch::StageLandingCredentials { .. } => PatchKind::VesselStageLandingCredentials,
-        VesselStatusPatch::MarkTearingDown => PatchKind::VesselMarkTearingDown,
+        VesselStatusPatch::MarkLost { .. } => PatchKind::VesselMarkLost,
         VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
     }
 }

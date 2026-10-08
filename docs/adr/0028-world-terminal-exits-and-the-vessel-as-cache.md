@@ -10,6 +10,15 @@ ruled everything here), #1321 (Bosun run 1 — the evidence source), #1322
 (`flotilla wait`, re-scoped by this ADR into the leaf engine), #1341/#1342/
 #1343 (the machinery defects the same grill traced).
 
+**Lifecycle amendment (2026-10-08, #2917):** `Anchored` and convoy `Cancelled`
+are retired because they have no production writers. Landed, Failed and
+Abandoned are terminal: resume and turn delivery require an explicit
+continuation (#2873) or a new generation. Environment backing loss is `Lost`
+on Environment and Vessel, with recoverable interrupted work and crew; it
+never authorizes reprovisioning. Rehydration is deferred to #2872. Retired
+stored phases decode for one fleet roll under ADR 0047. The historical phase
+and delivery descriptions below are subject to this amendment.
+
 ## Context
 
 On 2026-08-02 two convoys reached `Landed` and vessel teardown at the moment

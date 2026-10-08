@@ -10,6 +10,15 @@ crews never reach Done — resolved by this model), #1071 (event-driven
 shepherding — given a home state here), #1111/#1114 (the disk-exhaustion
 consequences of the old shape).
 
+**Lifecycle amendment (2026-10-08, #2917):** `Anchored` and convoy `Cancelled`
+are retired because they have no production writers. Landed, Failed and
+Abandoned are terminal: resume and turn delivery require an explicit
+continuation (#2873) or a new generation. Environment backing loss is `Lost`
+on Environment and Vessel, with recoverable interrupted work and crew; it
+never authorizes reprovisioning. Rehydration is deferred to #2872. Retired
+stored phases decode for one fleet roll under ADR 0047. The historical phase
+and delivery descriptions below are subject to this amendment.
+
 Six convoys ran concurrently on one host (2026-07-26); their merged work
 left six warm vessels that nothing ever reclaimed, the boot volume filled,
 and the daemon wedged. The proximate framing — "nothing reaps settled

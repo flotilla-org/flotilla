@@ -1537,7 +1537,7 @@ impl ReconcilerWake {
             let selected_vessels = select_convoy_children(convoy, &vessels);
             let selected_checkouts = select_convoy_children(convoy, &checkouts);
             let mut obligations = status.nudge_obligations.clone();
-            let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored);
+            let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
             if holding {
                 let mut missing_hooks =
                     selected_sessions.values().filter_map(|session| missing_turn_hook(session, &obligations, now)).collect::<Vec<_>>();
@@ -2707,7 +2707,7 @@ impl ReconcilerWake {
                     Ok(convoy) => sender.send(convoy).await.map_err(|_| "convoy controller queue closed".to_string())?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         for convoy in convoy_objects.values().filter(|convoy| {
-                            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
+                            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing))
                         }) {
                             sender.send(convoy.metadata.name.clone()).await.map_err(|_| "convoy controller queue closed".to_string())?;
                         }
@@ -2753,10 +2753,7 @@ impl ReconcilerWake {
             self.subscriptions.inner.backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let mut desired = Vec::<LeafSubscriptionRow>::new();
         for convoy in convoys.values().filter(|convoy| {
-            convoy
-                .status
-                .as_ref()
-                .is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored))
+            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing))
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");
             let mut controller_rows = HashSet::<(String, String)>::new();
@@ -3457,7 +3454,7 @@ mod tests {
                 // strand the episode nor retain its queued-turn advisory.
                 let convoy = convoys.get("stalled-work").await.unwrap();
                 let mut status = convoy.status.unwrap();
-                let terminal_phase = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned][state];
+                let terminal_phase = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned][state % 3];
                 status.phase = terminal_phase;
                 convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
                 let session = sessions.get("resumed-coder").await.unwrap();
@@ -6535,7 +6532,7 @@ mod tests {
             .expect("cached merge row");
         let LeafWatcher::TurnDelivery { source, rule, .. } = &stale_row.watcher else { unreachable!() };
         // A cached firing must recheck both active and parked settlement claims.
-        for phase in [ConvoyPhase::Active, ConvoyPhase::Landing, ConvoyPhase::Anchored] {
+        for phase in [ConvoyPhase::Active, ConvoyPhase::Landing] {
             let current = convoys.get("checks-wake").await.expect("convoy");
             status.phase = phase;
             // Clear the episode to prove eligibility, rather than deduplication,

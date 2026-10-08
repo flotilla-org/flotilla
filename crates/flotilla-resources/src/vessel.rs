@@ -29,8 +29,10 @@ pub enum VesselPhase {
     Pending,
     Provisioning,
     Ready,
+    // ADR 0047: remove TearingDown alias one fleet roll after #2917.
+    #[serde(alias = "TearingDown")]
     Interrupted,
-    TearingDown,
+    Lost,
     Failed,
 }
 
@@ -127,7 +129,9 @@ pub enum VesselStatusPatch {
     StageLandingCredentials {
         credentials: BTreeMap<String, LandingCredentialScope>,
     },
-    MarkTearingDown,
+    MarkLost {
+        message: String,
+    },
     MarkFailed {
         message: String,
     },
@@ -188,8 +192,9 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             Self::StageLandingCredentials { credentials } => {
                 status.held_credentials.extend(credentials.clone());
             }
-            Self::MarkTearingDown => {
-                status.phase = VesselPhase::TearingDown;
+            Self::MarkLost { message } => {
+                status.phase = VesselPhase::Lost;
+                status.message = Some(message.clone());
             }
             Self::MarkFailed { message } => {
                 status.phase = VesselPhase::Failed;

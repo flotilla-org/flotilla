@@ -250,9 +250,9 @@ pub fn convoy_badge(phase: ConvoyPhase, initializing: bool) -> Badge {
         ConvoyPhase::Active => Badge { state: BadgeState::Active, attention: false },
         ConvoyPhase::Interrupted => Badge { state: BadgeState::Waiting, attention: true },
         ConvoyPhase::Landed => Badge { state: BadgeState::Done, attention: false },
-        ConvoyPhase::Anchored | ConvoyPhase::Landing => Badge { state: BadgeState::Active, attention: false },
+        ConvoyPhase::Landing => Badge { state: BadgeState::Active, attention: false },
         ConvoyPhase::Failed => Badge { state: BadgeState::Failed, attention: true },
-        ConvoyPhase::Cancelled | ConvoyPhase::Abandoned => Badge { state: BadgeState::Idle, attention: false },
+        ConvoyPhase::Abandoned => Badge { state: BadgeState::Idle, attention: false },
     }
 }
 

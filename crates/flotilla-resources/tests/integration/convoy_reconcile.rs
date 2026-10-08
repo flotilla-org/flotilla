@@ -3415,10 +3415,10 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
 // and must not repeatedly request deletion while a session finalizer runs.
 #[hegel::test]
 fn terminal_session_cleanup_respects_reclaim_and_authority(tc: hegel::TestCase) {
-    let phases = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned];
+    let phases = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned];
     let authorities = [LifecycleAuthority::Managed, LifecycleAuthority::Adopted, LifecycleAuthority::Observed];
     // Cover every terminal phase and authority on both sides of the gate.
-    let phase = phases[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3))];
+    let phase = phases[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
     let authority = authorities[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
     let eligible = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -3467,4 +3467,35 @@ fn terminal_session_cleanup_respects_reclaim_and_authority(tc: hegel::TestCase) 
             "in-flight deletion must not be requested again"
         );
     });
+}
+
+// Environment loss is recoverable interruption at every live work phase. It
+// carries the reason to work and crew, preserves retry budget, and never creates
+// replacement backing. Existing in-memory reconciliation is the collaborator.
+#[tokio::test]
+async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() {
+    for phase in [WorkPhase::Ready, WorkPhase::Launching, WorkPhase::Running, WorkPhase::Stalled, WorkPhase::Interrupted] {
+        let mut status = bootstrapped_convoy_status();
+        status.phase = ConvoyPhase::Active;
+        status.work.get_mut("implement").expect("work").phase = phase;
+        status.crew_work.get_mut("implement").expect("crew").get_mut("coder").expect("coder").phase =
+            if phase == WorkPhase::Stalled { CrewWorkPhase::Stalled } else { CrewWorkPhase::Working };
+        let message = "lost, recoverable: container gone; rehydration is not available yet (#2872)";
+        let vessel = vessel_object("convoy-a", "implement", VesselPhase::Lost, Some(message));
+        let mut convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+        let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel.clone()], Vec::new(), timestamp(21)).await;
+        let patch = outcome.patch.expect("loss interrupts work");
+        assert!(matches!(&patch, ConvoyStatusPatch::WorkInterrupted { message: reason, .. } if reason == message), "{patch:?}");
+        patch.apply(convoy.status.as_mut().expect("status"));
+        let status = convoy.status.as_ref().expect("status");
+        assert_eq!(status.work["implement"].phase, WorkPhase::Interrupted);
+        assert_eq!(status.work["implement"].message.as_deref(), Some(message));
+        assert!(status.work["implement"].provisioning_retry.is_none());
+        assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Interrupted);
+        assert!(status.crew_work["implement"]["coder"].message.as_ref().expect("reason").contains(message));
+        assert!(!outcome.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
+        let again = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(22)).await;
+        assert!(!again.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
+        assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
+    }
 }

@@ -100,11 +100,13 @@ pub struct ObservedCheckoutSpec {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckoutPhase {
     #[default]
+    // ADR 0047: remove Preparing alias one fleet roll after #2917.
+    #[serde(alias = "Preparing")]
     Pending,
-    Preparing,
     Ready,
-    Terminating,
     Failed,
+    // ADR 0047: remove Terminating alias one fleet roll after #2917.
+    #[serde(alias = "Terminating")]
     Gone,
 }
 
@@ -244,9 +246,7 @@ pub enum ChangeRequestMergeability {
 pub enum CheckoutStatusPatch {
     ObserveCloneRetry { retry: Option<crate::ControllerRetry> },
     ObserveValidation { message: Option<String> },
-    MarkPreparing,
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
-    MarkTerminating,
     MarkFailed { message: String },
     MarkGone,
     UpdateIntegration { integration: Box<CheckoutIntegrationStatus> },
@@ -273,10 +273,6 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
         match self {
             Self::ObserveCloneRetry { retry } => status.clone_retry = retry.clone(),
             Self::ObserveValidation { message } => status.message = message.clone(),
-            Self::MarkPreparing => {
-                status.phase = CheckoutPhase::Preparing;
-                status.message = None;
-            }
             Self::MarkReady { path, commit, branch_provenance } => {
                 status.phase = CheckoutPhase::Ready;
                 status.path = Some(path.clone());
@@ -284,9 +280,6 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.branch_provenance = *branch_provenance;
                 status.message = None;
                 status.clone_retry = None;
-            }
-            Self::MarkTerminating => {
-                status.phase = CheckoutPhase::Terminating;
             }
             Self::MarkFailed { message } => {
                 status.phase = CheckoutPhase::Failed;

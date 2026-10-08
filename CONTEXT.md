@@ -641,6 +641,18 @@ A **Host** is/has a direct environment and may contain nested ones; the precise
 host/environment relationship is still being pinned down.
 _Avoid_: Sandbox (reserve for the future restricted-execution feature), VM.
 
+**Lost**:
+An **Environment** or **Vessel** whose previously provisioned execution backing
+has disappeared. Its work is recoverable, distinct from failed provisioning;
+reviving it requires rehydration, which is not available yet (#2872).
+_Avoid_: Failed, reprovisioning.
+
+**Terminal convoy outcome**:
+A **Convoy** settled as Landed, Failed or Abandoned. Further work belongs to an
+explicit continuation or a new generation; resume and turn delivery preserve
+the terminal outcome.
+_Avoid_: Parked, idle.
+
 **Presentation**:
 How running work is surfaced to a person — which panes/surfaces show which
 **Processes**, across multiplexers and external windows. Dual to placement.
@@ -849,7 +861,7 @@ _Avoid_: Retry, failover.
 **Leaf Engine**:
 The single daemon-side event-delivery mechanism evaluating **Condition
 Leaves** for all watcher kinds — hanging `wait` callers and parked convoys
-(the `Landing`/`Anchored` reconcilers) alike (ADR 0028; built by #1322). Its
+(the `Landing` reconciler) alike (ADR 0028; built by #1322). Its
 leaf enumeration is the shared legal vocabulary for **Exit Tables**, wakeups,
 and waits. Since ADR 0045, every holding phase arms rows, each row declares
 its **Maker**, and the engine judges **Stalls** over them.

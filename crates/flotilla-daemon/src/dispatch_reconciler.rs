@@ -1388,11 +1388,9 @@ mod tests {
             ConvoyPhase::Pending,
             ConvoyPhase::Active,
             ConvoyPhase::Interrupted,
-            ConvoyPhase::Anchored,
             ConvoyPhase::Landing,
             ConvoyPhase::Landed,
             ConvoyPhase::Failed,
-            ConvoyPhase::Cancelled,
             ConvoyPhase::Abandoned,
         ] {
             let current = convoys.get("human-dispatch").await.expect("convoy");

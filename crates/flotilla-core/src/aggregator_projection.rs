@@ -540,7 +540,7 @@ fn sorted_project_scopes(projects: &HashMap<QueryScope, Vec<RepositoryKey>>) -> 
 }
 
 fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
-    matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active | ConvoyPhase::Interrupted | ConvoyPhase::Anchored | ConvoyPhase::Landing)
+    matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active | ConvoyPhase::Interrupted | ConvoyPhase::Landing)
 }
 
 fn convoy_scopes(row: &ConvoyRow) -> Vec<QueryScope> {

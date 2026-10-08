@@ -162,8 +162,6 @@ fn clone_status_patch_marks_cloning_and_ready() {
 #[test]
 fn checkout_status_patch_marks_ready_and_failed() {
     let mut status = CheckoutStatus::default();
-    CheckoutStatusPatch::MarkPreparing.apply(&mut status);
-    assert_eq!(status.phase, CheckoutPhase::Preparing);
 
     CheckoutStatusPatch::MarkReady {
         path: "/workspace".to_string(),
