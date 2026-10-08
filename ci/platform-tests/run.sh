@@ -29,9 +29,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < "$repo_root/ci/platform-tests/selectors.txt"
 # Validate the entire file before launching any tests; failures stop the job.
 # Bash 3.2 treats an empty array as unset under nounset.
-# GitHub Windows images expose `python`; Unix runners provide `python3`.
-case "${OSTYPE-}" in
-  msys*|cygwin*) python_command=python ;;
-  *) python_command=python3 ;;
-esac
-"$python_command" "$repo_root/ci/platform-tests/execute.py" ${commands[@]+"${commands[@]}"}
+for command in ${commands[@]+"${commands[@]}"}; do
+  read -r -a args <<< "$command"
+  cargo --config 'profile.dev.package."*".debug=0' test "${args[@]}"
+done
