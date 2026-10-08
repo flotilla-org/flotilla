@@ -5169,18 +5169,21 @@ struct GatedStartupEnvironmentProvider {
 
 #[async_trait::async_trait]
 impl flotilla_core::providers::environment::EnvironmentProvider for GatedStartupEnvironmentProvider {
-    async fn ensure_image(
+    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
+        flotilla_core::providers::environment::EnvironmentKind::Docker
+    }
+    async fn prepare(
         &self,
-        _spec: &flotilla_protocol::EnvironmentSpec,
-        _root: &std::path::Path,
-    ) -> Result<flotilla_protocol::ImageId, String> {
+        _spec: &flotilla_resources::EnvironmentSpec,
+        _opts: &flotilla_core::providers::environment::PrepareOpts,
+    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
         Err("unused".into())
     }
-    async fn create(
+    async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_protocol::ImageId,
-        _opts: flotilla_core::providers::environment::CreateOpts,
+        _image: &flotilla_core::providers::environment::PreparedEnvironment,
+        _opts: flotilla_core::providers::environment::ProvisionOpts,
     ) -> Result<flotilla_core::providers::environment::EnvironmentHandle, String> {
         Err("unused".into())
     }

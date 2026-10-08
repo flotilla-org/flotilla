@@ -27,6 +27,7 @@ use self::{
     terminals::TerminalPreparationService,
     workspace::WorkspaceOrchestrator,
 };
+use crate::providers::environment::{legacy_environment_spec, EnvironmentKind};
 use crate::{
     attachable::SharedAttachableStore,
     data,
@@ -1204,9 +1205,10 @@ impl StepResolver for ExecutorStepResolver {
                 let (_, env_provider) = self
                     .registry
                     .environment_providers
-                    .get(&provider)
+                    .select(EnvironmentKind::Docker, Some(&provider))
                     .ok_or_else(|| format!("environment provider not available: {provider}"))?;
-                let image = env_provider.ensure_image(spec, self.repo.root.as_path()).await?;
+                let resource_spec = legacy_environment_spec(spec)?;
+                let prepared = env_provider.prepare(&resource_spec, &Default::default()).await?;
                 let tokens = spec
                     .token_env_vars
                     .iter()
@@ -1226,7 +1228,7 @@ impl StepResolver for ExecutorStepResolver {
                         env_id: env_id.clone(),
                         provider: &provider,
                         registry: self.registry.as_ref(),
-                        image,
+                        prepared,
                         tokens,
                         config_base: &self.config_base,
                         daemon_socket_path: &daemon_socket,

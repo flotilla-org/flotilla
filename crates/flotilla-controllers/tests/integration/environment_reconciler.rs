@@ -258,3 +258,25 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
     assert!(reconciler.reconcile(&environment, &prepared, chrono::Utc::now()).patch.is_none());
     reconciler.run_finalizer(&environment).await.expect("orphaned environment finalizer should converge");
 }
+
+// Host-direct readiness requires a successful runtime adoption. The reconciler
+// must not mark the resource ready merely because its spec names host-direct.
+#[tokio::test]
+async fn host_direct_provider_failure_prevents_readiness() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let environment = backend
+        .using::<Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("direct-adoption".into()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
+                docker: None,
+            },
+        )
+        .await
+        .expect("create direct environment");
+    let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend, "flotilla");
+    let prepared = reconciler.prepare(&environment).await.expect("prepare direct adoption");
+    let result = reconciler.reconcile(&environment, &prepared, chrono::Utc::now());
+    assert!(matches!(result.patch, Some(EnvironmentStatusPatch::MarkFailed { .. })));
+}

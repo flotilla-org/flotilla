@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
+use crate::providers::environment::EnvironmentKind;
 use crate::{
     agent_adapter::AgentAdapterRegistry,
     providers::{
@@ -208,6 +209,27 @@ impl ProviderRegistry {
         collect(&mut infos, &self.terminal_pools);
         collect(&mut infos, &self.environment_providers);
         infos
+    }
+}
+
+impl ProviderSet<dyn EnvironmentProvider> {
+    /// Resolve a kind and optional exact instance. An omitted instance is valid
+    /// only when exactly one provider supports the kind; priority never picks a
+    /// different runtime endpoint accidentally.
+    pub fn select(&self, kind: EnvironmentKind, instance: Option<&str>) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
+        if let Some(instance) = instance {
+            return self.get(instance).filter(|(_, provider)| provider.kind() == kind);
+        }
+        let mut matches = self.iter().filter(|(_, provider)| provider.kind() == kind);
+        let selected = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(selected)
+    }
+
+    pub fn for_kind(&self, kind: EnvironmentKind) -> Option<(&ProviderDescriptor, &Arc<dyn EnvironmentProvider>)> {
+        self.select(kind, None)
     }
 }
 

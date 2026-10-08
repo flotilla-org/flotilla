@@ -1,4 +1,5 @@
 pub mod docker;
+pub mod host_direct;
 pub mod runner;
 
 #[cfg(test)]
@@ -11,7 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
+use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
 use super::CommandRunner;
@@ -19,7 +20,7 @@ use super::CommandRunner;
 /// Options for creating a new provisioned environment.
 ///
 /// Runtime-only — not serializable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateOpts {
     pub tokens: Vec<(String, String)>,
     pub working_directory: Option<ExecutionEnvironmentPath>,
@@ -35,6 +36,37 @@ pub struct CreateOpts {
     /// CPU quota for this vessel. None leaves the provider's default.
     pub cpu_limit: Option<usize>,
     pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
+}
+
+/// Inputs shared by environment provisioning, without image concepts.
+#[derive(Debug, Clone, Default)]
+pub struct ProvisionOpts {
+    pub tokens: Vec<(String, String)>,
+    pub working_directory: Option<ExecutionEnvironmentPath>,
+    pub provisioned_mounts: Vec<ProvisionedMount>,
+    pub tools: Vec<EnvironmentTool>,
+    pub cpu_limit: Option<usize>,
+    pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
+}
+
+/// Admitted operation credentials. Part B replaces the artifact with an opaque
+/// RegistryAuth handle; callers never select an image through these options.
+#[derive(Debug, Clone, Default)]
+pub struct PrepareOpts {
+    pub prepared_auth: PreparedEnvironmentAuth,
+}
+
+impl From<CreateOpts> for ProvisionOpts {
+    fn from(opts: CreateOpts) -> Self {
+        Self {
+            tokens: opts.tokens,
+            working_directory: opts.working_directory,
+            provisioned_mounts: opts.provisioned_mounts,
+            tools: opts.tools,
+            cpu_limit: opts.cpu_limit,
+            memory_policy: opts.memory_policy,
+        }
+    }
 }
 
 /// Auth admitted by credential preflight for this environment's image pull.
@@ -212,11 +244,52 @@ pub struct EnvironmentBacking {
     pub container_id: String,
 }
 
-/// Manages lifecycle of sandbox environments: image building, creation, and listing.
+/// One kind of environment supported by a provider instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentKind {
+    HostDirect,
+    Docker,
+}
+
+impl EnvironmentKind {
+    pub fn of(spec: &flotilla_resources::EnvironmentSpec) -> Result<Self, String> {
+        match (spec.host_direct.is_some(), spec.docker.is_some()) {
+            (true, false) => Ok(Self::HostDirect),
+            (false, true) => Ok(Self::Docker),
+            _ => Err("environment spec must select exactly one kind".into()),
+        }
+    }
+}
+
+/// A provider's private preparation result. Only the creating instance may
+/// consume it; callers never need to know the backing runtime's inputs.
+pub struct PreparedEnvironment {
+    owner: Arc<()>,
+    value: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl PreparedEnvironment {
+    pub fn new<T: Send + Sync + 'static>(owner: &Arc<()>, value: T) -> Self {
+        Self { owner: Arc::clone(owner), value: Box::new(value) }
+    }
+
+    pub(crate) fn get<T: 'static>(&self, owner: &Arc<()>) -> Result<&T, String> {
+        if !Arc::ptr_eq(&self.owner, owner) {
+            return Err("preparation belongs to a different provider instance".into());
+        }
+        self.value.downcast_ref().ok_or_else(|| "preparation has a different provider kind".into())
+    }
+}
+
+/// Makes an environment spec real, without exposing runtime-specific inputs.
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
-    async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String>;
-    async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
+    fn kind(&self) -> EnvironmentKind;
+    async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String>;
+    async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String>;
+    async fn inspect(&self, id: &EnvironmentId) -> Result<Option<EnvironmentHandle>, String> {
+        Ok(self.list().await?.into_iter().find(|handle| handle.id() == id))
+    }
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
     async fn list_backings(&self) -> Result<Vec<EnvironmentBacking>, String> {
         self.list()
@@ -265,3 +338,30 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn destroy(&self) -> Result<(), String>;
 }
+
+/// Decode the preceding checkout configuration at its admission seam. Building
+/// Dockerfiles is demand-driven through ImageBuild, never a provider operation.
+pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Result<flotilla_resources::EnvironmentSpec, String> {
+    let flotilla_protocol::ImageSource::Registry(image) = &spec.image else {
+        return Err("waiting on build: declare an ImageBuild and pin its resulting digest".into());
+    };
+    Ok(flotilla_resources::EnvironmentSpec {
+        host_direct: None,
+        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+            host_ref: String::new(),
+            image: image.clone(),
+            image_build_ref: None,
+            image_composition: None,
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
+            memory_policy: Default::default(),
+            mounts: Vec::new(),
+            env: Default::default(),
+        }),
+    })
+}
+
+/// Frozen provider instance identity carried from placement policy to its
+/// environment. Metadata is extensible, so this adds no stored spec shape.
+pub const ENVIRONMENT_PROVIDER_INSTANCE_LABEL: &str = "flotilla.work/environment-provider-instance";

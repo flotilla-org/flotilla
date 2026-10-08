@@ -6,10 +6,11 @@ use std::{
 
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    EnvironmentId, EnvironmentInfo, EnvironmentStatus, ImageId,
+    EnvironmentId, EnvironmentInfo, EnvironmentStatus,
 };
 use flotilla_resources::host_direct_environment_name;
 
+use crate::providers::environment::{EnvironmentKind, PreparedEnvironment};
 use crate::{
     config::ConfigStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -68,7 +69,7 @@ pub struct CreateProvisionedEnvironmentRequest<'a> {
     pub env_id: EnvironmentId,
     pub provider: &'a str,
     pub registry: &'a ProviderRegistry,
-    pub image: ImageId,
+    pub prepared: PreparedEnvironment,
     pub tokens: Vec<(String, String)>,
     pub config_base: &'a DaemonHostPath,
     pub daemon_socket_path: &'a DaemonHostPath,
@@ -325,14 +326,16 @@ impl EnvironmentManager {
             env_id,
             provider,
             registry,
-            image,
+            prepared,
             tokens,
             config_base,
             daemon_socket_path,
             reference_repo,
         } = request;
-        let (_, env_provider) =
-            registry.environment_providers.get(provider).ok_or_else(|| format!("environment provider not available: {provider}"))?;
+        let (_, env_provider) = registry
+            .environment_providers
+            .select(EnvironmentKind::Docker, Some(provider))
+            .ok_or_else(|| format!("environment provider not available: {provider}"))?;
 
         let provisioned_mounts = reference_repo
             .as_ref()
@@ -366,7 +369,7 @@ impl EnvironmentManager {
             cpu_limit: None,
             memory_policy: Default::default(),
         };
-        let handle = env_provider.create(env_id.clone(), &image, opts).await?;
+        let handle = env_provider.provision(env_id.clone(), &prepared, opts.into()).await?;
         let (env_bag, provider_registry) = self.probe_provisioned_environment(&env_id, &handle, config_base).await?;
         self.register_provisioned_environment(env_id, handle, env_bag, Some(Arc::new(provider_registry)))
     }
@@ -580,8 +583,9 @@ mod tests {
         },
     };
 
+    use crate::providers::environment::{PrepareOpts, ProvisionOpts};
     use async_trait::async_trait;
-    use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
+    use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
     use super::*;
     use crate::providers::{
@@ -590,7 +594,7 @@ mod tests {
             test_support::{fake_discovery, DiscoveryMockRunner},
             EnvironmentAssertion, ProviderCategory, ProviderDescriptor,
         },
-        environment::{CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
+        environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
         registry::ProviderRegistry,
         CommandRunner,
     };
@@ -650,11 +654,19 @@ mod tests {
 
     #[async_trait]
     impl EnvironmentProvider for MockEnvironmentProvider {
-        async fn ensure_image(&self, _spec: &EnvironmentSpec, _repo_root: &std::path::Path) -> Result<ImageId, String> {
-            Err("unused in test".to_string())
+        fn kind(&self) -> EnvironmentKind {
+            EnvironmentKind::Docker
+        }
+        async fn prepare(&self, _spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
+            Ok(PreparedEnvironment::new(&Arc::new(()), ()))
         }
 
-        async fn create(&self, _id: EnvironmentId, _image: &ImageId, _opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+        async fn provision(
+            &self,
+            _id: EnvironmentId,
+            _image: &PreparedEnvironment,
+            _opts: ProvisionOpts,
+        ) -> Result<EnvironmentHandle, String> {
             self.create_result.lock().await.take().expect("create called more than expected")
         }
 
@@ -1059,7 +1071,7 @@ mod tests {
                 env_id: env_id.clone(),
                 provider: "docker",
                 registry: &registry,
-                image: ImageId::new("mock:image"),
+                prepared: PreparedEnvironment::new(&Arc::new(()), ()),
                 tokens: vec![],
                 config_base: &DaemonHostPath::new("/tmp/test-config"),
                 daemon_socket_path: &DaemonHostPath::new("/tmp/flotilla.sock"),
@@ -1122,7 +1134,7 @@ mod tests {
                 env_id: env_id.clone(),
                 provider: "mock",
                 registry: &registry,
-                image: ImageId::new("mock:image"),
+                prepared: PreparedEnvironment::new(&Arc::new(()), ()),
                 tokens: vec![],
                 config_base: &DaemonHostPath::new("/tmp/test-config"),
                 daemon_socket_path: &DaemonHostPath::new("/tmp/flotilla.sock"),

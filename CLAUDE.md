@@ -414,3 +414,15 @@ let session = replay::test_session(&fixture("my.yaml"), masks);
 ```
 
 **Important:** Register longer (more specific) values first. Shorter values can partially match longer ones.
+
+### Environment provider lifecycle
+
+Environment providers accept resource specs through `prepare`, returning an opaque
+instance-owned preparation consumed by `provision`. Select by `EnvironmentKind`
+and provider-instance identity; an omitted instance must resolve uniquely. Placement
+policies bind an explicit instance through the `flotilla.work/environment-provider-instance`
+metadata label, frozen into their created Environment.
+Host-direct adopts its injected runner through the same lifecycle. Docker never
+builds: preparation requires a held digest or an existing registry digest, otherwise
+it reports waiting on ImageBuild. Concrete providers belong in discovery factories
+and composition roots. See [ADR 0058](docs/adr/0058-environment-providers-own-lifecycle-and-runtime-capabilities.md).

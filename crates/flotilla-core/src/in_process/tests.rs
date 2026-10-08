@@ -9087,17 +9087,24 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
         )
         .await;
         let environment = daemon.local_host_identity().environment_id;
-        let expected = if available {
-            vec![HostProviderStatus {
+        // Host-direct adoption is always available; presentation discovery
+        // remains optional, and neither depends on repository membership.
+        let mut expected = vec![HostProviderStatus {
+            category: "environment_provider".into(),
+            name: "host-direct".into(),
+            implementation: "host-direct".into(),
+            healthy: true,
+            disabled_reason: None,
+        }];
+        if available {
+            expected.push(HostProviderStatus {
                 category: "workspace_manager".into(),
                 name: "Fake Workspaces".into(),
                 implementation: "fake-workspaces".into(),
                 healthy: true,
                 disabled_reason: None,
-            }]
-        } else {
-            vec![]
-        };
+            });
+        }
         let mut description = daemon.local_host_description().await;
         assert_eq!(description.providers, expected, "host discovery cannot depend on a tracked repository");
         assert_eq!(daemon.get_host_providers_internal(&environment).await.expect("bootstrap providers").summary.providers, expected,);

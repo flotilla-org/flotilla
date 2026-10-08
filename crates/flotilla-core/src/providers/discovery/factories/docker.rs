@@ -8,8 +8,8 @@ use crate::{
     config::ConfigStore,
     path_context::ExecutionEnvironmentPath,
     providers::{
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        environment::{docker::DockerEnvironmentProvider, EnvironmentProvider},
+        discovery::{EnvironmentAssertion, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        environment::{docker::DockerEnvironmentProvider, host_direct::HostDirectEnvironmentProvider, EnvironmentProvider},
         ChannelLabel, CommandRunner,
     },
 };
@@ -41,6 +41,36 @@ impl Factory for DockerEnvironmentFactory {
             Ok(_) => Ok(Arc::new(DockerEnvironmentProvider::new(runner))),
             Err(_) => Err(vec![UnmetRequirement::MissingBinary("docker".into())]),
         }
+    }
+}
+
+pub struct HostDirectEnvironmentFactory;
+
+#[async_trait]
+impl Factory for HostDirectEnvironmentFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn EnvironmentProvider;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "host-direct")
+    }
+
+    async fn probe(
+        &self,
+        env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {
+        let environment = env
+            .assertions()
+            .iter()
+            .filter_map(|assertion| match assertion {
+                EnvironmentAssertion::EnvVarSet { key, value } => Some((key.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        Ok(Arc::new(HostDirectEnvironmentProvider::new(runner, environment)))
     }
 }
 

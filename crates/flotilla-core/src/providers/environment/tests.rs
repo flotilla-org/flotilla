@@ -210,93 +210,70 @@ impl CommandRunner for QueuedRunner {
 // DockerEnvironmentProvider tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn ensure_image_builds_dockerfile() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let dockerfile_path = temp.path().join("Dockerfile");
-    std::fs::write(&dockerfile_path, "FROM ubuntu:24.04\n").expect("write Dockerfile");
-    let runner = Arc::new(QueuedRunner::new([Err("missing".into()), Ok(String::new())]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    let spec = EnvironmentSpec { image: ImageSource::Dockerfile(dockerfile_path.clone()), token_env_vars: vec![] };
-    let repo_root = temp.path();
-
-    let result = provider.ensure_image(&spec, repo_root).await;
-
-    assert!(result.is_ok(), "ensure_image should succeed for Dockerfile source");
-    let image_id = result.unwrap();
-    assert!(image_id.as_str().starts_with("flotilla-env-"));
-    let calls = runner.calls();
-    assert_eq!(calls.len(), 2);
-    let (inspect_cmd, inspect_args, inspect_cwd) = &calls[0];
-    assert_eq!(inspect_cmd, "docker");
-    assert_eq!(inspect_args, &["image", "inspect", image_id.as_str()]);
-    assert_eq!(inspect_cwd, repo_root);
-    let (build_cmd, build_args, build_cwd) = &calls[1];
-    assert_eq!(build_cmd, "docker");
-    assert_eq!(build_args[0], "build");
-    assert_eq!(build_cwd, repo_root);
-    assert!(build_args.contains(&"-t".to_string()), "should pass -t flag");
-    assert!(build_args.contains(&"-f".to_string()), "should pass -f flag");
-    let tag_idx = build_args.iter().position(|a| a == "-t").expect("-t flag present");
-    assert_eq!(build_args[tag_idx + 1], image_id.as_str());
-    let f_idx = build_args.iter().position(|a| a == "-f").expect("-f flag present");
-    assert_eq!(build_args[f_idx + 1], dockerfile_path.to_string_lossy());
+// Providers never build. Generate both kinds and duplicate/ambiguous specs;
+// preparation either validates the selected kind or refuses before execution.
+#[hegel::test]
+fn environment_specs_select_exactly_one_kind(tc: hegel::TestCase) {
+    use super::EnvironmentKind;
+    use hegel::generators as gs;
+    let host = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
+    let docker = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
+    let mut spec = pinned_spec();
+    if !docker {
+        spec.docker = None;
+    }
+    spec.host_direct =
+        host.then(|| flotilla_resources::HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() });
+    assert_eq!(EnvironmentKind::of(&spec).is_ok(), host != docker);
 }
 
-#[tokio::test]
-async fn ensure_image_reuses_tag_for_same_dockerfile_contents() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let dockerfile_path = temp.path().join("Dockerfile");
-    std::fs::write(&dockerfile_path, "FROM ubuntu:24.04\nRUN echo hi\n").expect("write Dockerfile");
-    let spec = EnvironmentSpec { image: ImageSource::Dockerfile(dockerfile_path.clone()), token_env_vars: vec![] };
-
-    let first_runner = Arc::new(RecordingRunner::new_ok(""));
-    let first_provider = DockerEnvironmentProvider::new(first_runner);
-    let second_runner = Arc::new(RecordingRunner::new_ok(""));
-    let second_provider = DockerEnvironmentProvider::new(second_runner);
-
-    let first = first_provider.ensure_image(&spec, temp.path()).await.expect("first ensure_image");
-    let second = second_provider.ensure_image(&spec, temp.path()).await.expect("second ensure_image");
-
-    assert_eq!(first, second, "same Dockerfile contents should produce the same image tag");
+fn pinned_spec() -> flotilla_resources::EnvironmentSpec {
+    super::legacy_environment_spec(&EnvironmentSpec {
+        image: ImageSource::Registry(format!("sha256:{}", "a".repeat(64))),
+        token_env_vars: Vec::new(),
+    })
+    .expect("registry spec")
 }
 
+// The subprocess double represents the Docker CLI. A held digest prepares
+// without building or pulling; absent local-only digests wait on ImageBuild.
 #[tokio::test]
-async fn ensure_image_skips_build_when_tag_exists_locally() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let dockerfile_path = temp.path().join("Dockerfile");
-    std::fs::write(&dockerfile_path, "FROM ubuntu:24.04\nRUN echo hi\n").expect("write Dockerfile");
-    let runner = Arc::new(RecordingRunner::new_ok("already-present"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    let spec = EnvironmentSpec { image: ImageSource::Dockerfile(dockerfile_path), token_env_vars: vec![] };
-
-    let image_id = provider.ensure_image(&spec, temp.path()).await.expect("ensure_image");
-
-    let calls = runner.calls();
-    assert_eq!(calls.len(), 1);
-    let (cmd, args, cwd) = &calls[0];
-    assert_eq!(cmd, "docker");
-    assert_eq!(args, &["image", "inspect", image_id.as_str()]);
-    assert_eq!(cwd, temp.path());
+async fn preparation_uses_existing_digest_and_never_builds() {
+    for present in [true, false] {
+        let runner = Arc::new(RecordingRunner::new_ok("present"));
+        let missing = Arc::new(RecordingRunner::new_err("absent"));
+        let selected = if present { runner } else { missing };
+        let provider = DockerEnvironmentProvider::new(selected.clone());
+        assert_eq!(provider.prepare(&pinned_spec(), &Default::default()).await.is_ok(), present);
+        assert_eq!(selected.calls().len(), 1);
+        assert_eq!(selected.calls()[0].1[0..2], ["image", "inspect"]);
+    }
 }
 
+// Host adoption returns the injected runner and never starts or stops the host.
+// A preparation cannot cross instances, even when they implement the same kind.
 #[tokio::test]
-async fn ensure_image_pulls_registry() {
+async fn host_adoption_is_idempotent_and_preparation_is_instance_scoped() {
+    use super::host_direct::HostDirectEnvironmentProvider;
     let runner = Arc::new(RecordingRunner::new_ok(""));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    let spec = EnvironmentSpec { image: ImageSource::Registry("ubuntu:22.04".into()), token_env_vars: vec![] };
-    let repo_root = std::path::Path::new("/repo");
-
-    let result = provider.ensure_image(&spec, repo_root).await;
-
-    assert!(result.is_ok(), "ensure_image should succeed for Registry source");
-    let image_id = result.unwrap();
-    assert_eq!(image_id.as_str(), "ubuntu:22.04");
-    let calls = runner.calls();
-    assert_eq!(calls.len(), 1);
-    let (cmd, args, _) = &calls[0];
-    assert_eq!(cmd, "docker");
-    assert_eq!(args, &["pull", "ubuntu:22.04"]);
+    let provider = HostDirectEnvironmentProvider::new(runner.clone(), Default::default());
+    let other = HostDirectEnvironmentProvider::new(runner.clone(), Default::default());
+    let spec = flotilla_resources::EnvironmentSpec {
+        host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/".into() }),
+        docker: None,
+    };
+    let prepared = provider.prepare(&spec, &Default::default()).await.expect("prepare host");
+    let id = EnvironmentId::new("adopted");
+    assert!(other.provision(id.clone(), &prepared, Default::default()).await.is_err());
+    let first = provider.provision(id.clone(), &prepared, Default::default()).await.expect("adopt");
+    let second = provider.provision(id.clone(), &prepared, Default::default()).await.expect("adopt twice");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(provider.inspect(&id).await.expect("inspect").is_some());
+    assert_eq!(provider.list().await.expect("list").len(), 1);
+    provider.destroy(id.as_str()).await.expect("detach");
+    provider.destroy(id.as_str()).await.expect("detach twice");
+    assert!(provider.list().await.expect("list").is_empty());
+    assert!(runner.calls().is_empty());
 }
 
 #[tokio::test]
@@ -1662,4 +1639,91 @@ async fn list_backings_rejects_incomplete_identity() {
     }
     let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
     assert!(provider.list_backings().await.expect("empty listing").is_empty());
+}
+
+// Explicit instance selection never crosses kinds. Generate zero through three
+// same-kind instances, including ambiguity, exact hits and an absent identity.
+#[hegel::test]
+fn provider_selection_is_kind_and_instance_scoped(tc: hegel::TestCase) {
+    use super::{host_direct::HostDirectEnvironmentProvider, EnvironmentKind};
+    use crate::providers::{
+        discovery::{ProviderCategory, ProviderDescriptor},
+        registry::ProviderRegistry,
+    };
+    use hegel::generators as gs;
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let mut registry = ProviderRegistry::new();
+    let runner = Arc::new(RecordingRunner::new_ok(""));
+    registry.environment_providers.insert(
+        "direct",
+        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "direct"),
+        Arc::new(HostDirectEnvironmentProvider::new(runner.clone(), Default::default())),
+    );
+    for index in 0..count {
+        let identity = format!("endpoint-{index}");
+        registry.environment_providers.insert(
+            &identity,
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, &identity),
+            Arc::new(DockerEnvironmentProvider::new(runner.clone())),
+        );
+    }
+    assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, None).is_some(), count == 1);
+    assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, Some("endpoint-0")).is_some(), count > 0);
+    assert!(registry.environment_providers.select(EnvironmentKind::Docker, Some("direct")).is_none());
+    assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, Some("absent")).is_none());
+    assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, None).is_some());
+}
+
+// Docker provisioning consumes only its own preparation, uses the prepared
+// image without an implicit pull, and exposes the environment runner and mounts.
+#[tokio::test]
+async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
+    let runner = Arc::new(QueuedRunner::new([Ok("held".into()), Ok("container-id".into()), Ok(format!("sha256:{}", "a".repeat(64)))]));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let other = DockerEnvironmentProvider::new(runner.clone());
+    let prepared = provider.prepare(&pinned_spec(), &Default::default()).await.expect("prepare held digest");
+    let id = EnvironmentId::new("prepared-docker");
+    assert!(other.provision(id.clone(), &prepared, Default::default()).await.is_err());
+    let handle = provider.provision(id.clone(), &prepared, Default::default()).await.expect("provision");
+    assert_eq!(handle.id(), &id);
+    assert_eq!(handle.image().as_str(), pinned_spec().docker.expect("docker").image);
+    assert!(handle.provisioned_mounts().is_empty());
+    let calls = runner.calls();
+    let run = calls.iter().find(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")).expect("container run");
+    assert!(run.1.windows(2).any(|args| args == ["--pull", "never"]));
+}
+
+// Missing pinned registry digests can be pulled with admitted credentials;
+// preparation reports waiting when the existing digest cannot be obtained.
+// The queued runner stands in for Docker's subprocess interface.
+#[tokio::test]
+async fn preparation_pulls_only_pinned_registry_content() {
+    let mut spec = pinned_spec();
+    spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
+    let opts = super::PrepareOpts {
+        prepared_auth: super::PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new("/private/operation-auth") },
+    };
+    let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    provider.prepare(&spec, &opts).await.expect("pull existing digest");
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[1].1, ["--config", "/private/operation-auth", "pull", spec.docker.as_ref().expect("docker").image.as_str()]);
+    let absent = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
+    let error = absent.prepare(&spec, &opts).await.err().expect("must wait");
+    assert!(error.starts_with("waiting on build:"));
+}
+
+// Tags and malformed digests cannot make preparation succeed, even if a
+// subprocess would claim they are present. No subprocess runs for invalid pins.
+#[tokio::test]
+async fn preparation_refuses_mutable_or_malformed_image_identity() {
+    for image in ["crew:latest", "registry.example/crew@sha256:invalid", "sha256:invalid", ""] {
+        let runner = Arc::new(RecordingRunner::new_ok("held"));
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let mut spec = pinned_spec();
+        spec.docker.as_mut().expect("docker").image = image.into();
+        assert!(provider.prepare(&spec, &Default::default()).await.is_err());
+        assert!(runner.calls().is_empty());
+    }
 }

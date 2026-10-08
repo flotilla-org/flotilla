@@ -38,7 +38,7 @@ impl FactoryRegistry {
             // Priority: inside-cmux > inside-zellij > cmux-binary-fallback
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
-            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
+            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory), Box::new(docker::HostDirectEnvironmentFactory)],
         }
     }
 }
