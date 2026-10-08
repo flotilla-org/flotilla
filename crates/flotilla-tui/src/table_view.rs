@@ -1465,10 +1465,9 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 mod tests {
     use flotilla_protocol::{
         test_support::TestIssue, AwarenessCounts, AwarenessFamilySummary, AwarenessKind, AwarenessNode, AwarenessState,
-        DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef, ResultSetCondition, ResultSetState,
+        DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepoKey, RepositoryKey, ResourceRef, ResultSetCondition,
+        ResultSetState,
     };
-
-    use flotilla_protocol::RepoKey;
 
     use super::*;
     use crate::convoy_model::{ConvoyId, ProcessSummary, WorkCompletionTarget};

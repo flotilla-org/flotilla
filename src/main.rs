@@ -321,7 +321,6 @@ enum DomainCommand {
     Issue(flotilla_commands::commands::issue::IssueNoun),
     /// Cloud agents
     Agent(flotilla_commands::commands::agent::AgentNoun),
-    /// Workspaces
     /// Manage and route to hosts
     Host(flotilla_commands::commands::host::HostNounPartial),
     /// Inspect fulfilment kinds and live facts

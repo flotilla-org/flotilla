@@ -509,8 +509,6 @@ pub struct App {
     /// ephemeral searches beyond the window.
     pub query_tables: QueryTableCache,
     pub pending_fetch_more: HashSet<flotilla_protocol::QueryId>,
-    /// Connected presentation-manager realization path, when this TUI is
-    /// running inside a supported PM.
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
     /// Drop guard that gives in-process subscribers the same teardown

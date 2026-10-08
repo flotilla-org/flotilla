@@ -800,6 +800,7 @@ pub enum CommandAction {
         attachable_set_id: Option<AttachableSetId>,
         commands: Vec<ResolvedPaneCommand>,
     },
+    // Retired with the executor internals in step 2 (#2915).
     SelectWorkspace {
         ws_ref: String,
     },
@@ -820,6 +821,7 @@ pub enum CommandAction {
         #[serde(default)]
         mode: AttachMode,
     },
+    // Retired with the executor internals in step 2 (#2915).
     PrepareTerminalForCheckout {
         checkout_path: PathBuf,
         /// Role→command mappings from the requesting host's template.
@@ -995,6 +997,7 @@ pub enum CommandAction {
     ProjectRefresh {
         name: String,
     },
+    // Retired with the executor internals in step 2 (#2915).
     TeleportSession {
         session_id: String,
         branch: Option<String>,
