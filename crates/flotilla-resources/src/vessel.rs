@@ -29,7 +29,8 @@ pub enum VesselPhase {
     Pending,
     Provisioning,
     Ready,
-    // ADR 0047: remove TearingDown alias one fleet roll after #2917.
+    // Retired unwritten TearingDown decodes as Interrupted, the nearest live
+    // recoverable state, not a semantic rename. ADR 0047: remove one roll after #2917.
     #[serde(alias = "TearingDown")]
     Interrupted,
     Lost,
@@ -202,4 +203,12 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             }
         }
     }
+}
+
+/// Per-vessel convoy resources (`Vessel`, `Presentation`) share the name
+/// shape `<convoy>-<vessel>`. Resource kinds have separate namespaces, so the
+/// shared shape causes no collision and keeps both resources discoverable
+/// together by name.
+pub fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
+    format!("{convoy_name}-{vessel}")
 }

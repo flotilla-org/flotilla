@@ -74,7 +74,8 @@ pub enum EnvironmentPhase {
     Pending,
     Provisioning,
     Ready,
-    // ADR 0047: remove Terminating alias one fleet roll after #2917.
+    // Retired unwritten Terminating decodes as Lost, the nearest unavailable
+    // backing state, not a semantic rename. ADR 0047: remove one roll after #2917.
     #[serde(alias = "Terminating")]
     Lost,
     Failed,

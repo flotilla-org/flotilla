@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_resources::{
-    ChangeRequestStatus, ConvoySpec, ConvoyStatus, CrewWorkState, InMemoryBackend, Selector, SystemClock, TerminalSessionSpec, WorkState,
-    WorkflowSnapshot,
+    ChangeRequestStatus, ConvoySpec, ConvoyStatus, CrewWorkState, InMemoryBackend, Selector, SystemClock, TerminalSessionPhase,
+    TerminalSessionSpec, TerminalSessionStatus, WorkState, WorkflowSnapshot,
 };
 
 use super::*;
@@ -1888,10 +1888,32 @@ async fn lost_vessel_resume_explains_rehydration() {
         )
         .await
         .expect("crew state");
-    assert_eq!(view.members[0].state, "lost, recoverable");
-    assert_eq!(view.members[0].reason.as_deref(), Some("host reboot"));
-    let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
-    let error = crew.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("no rehydration");
+    assert_eq!(view.members[0].state, "lost");
+    assert_eq!(view.members[0].reason.as_deref(), Some("lost, recoverable: host reboot"));
+    // A new daemon service has no remembered interruption. It must refuse
+    // resume from the persisted Lost record after Work has already rolled up.
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let mut status = convoy.status.expect("status");
+    status.phase = ConvoyPhase::Interrupted;
+    status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Interrupted;
+    status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Interrupted;
+    let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).expect("persist")).expect("restart decode");
+    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("interruption roll-up");
+    let restarted = CrewService::builder()
+        .resource_backend(backend.clone())
+        .leaf_subscriptions(crew.leaf_subscriptions.clone())
+        .work_credential_reconciler(RwLock::new(Some(probe.clone() as Arc<dyn WorkCredentialReconciler>)))
+        .clock(crew.clock.clone())
+        .provisioning_namespace(crew.provisioning_namespace.clone())
+        .config(crew.config.clone())
+        .host_name(crew.host_name.clone())
+        .brief_artifact_writer(crew.brief_artifact_writer.clone())
+        .checkout_providers(crew.checkout_providers.clone())
+        .local_environment_id(crew.local_environment_id.clone())
+        .build();
+    drop(crew);
+    let before = convoys.get("crew").await.expect("convoy");
+    let error = restarted.resume("flotilla", "crew", "resume", Some("work"), Some("coder")).await.expect_err("no rehydration");
     assert!(error.contains("lost, recoverable") && error.contains("host reboot") && error.contains("#2872"), "{error}");
     assert!(!error.contains("failed provisioning"), "{error}");
     let after = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
@@ -1899,4 +1921,51 @@ async fn lost_vessel_resume_explains_rehydration() {
     assert_eq!(after.metadata.resource_version, before.metadata.resource_version);
     assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.is_empty());
     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let original = sessions.get("session").await.expect("session");
+    let mut session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("mapped-session".into())
+                .labels(BTreeMap::from([(VESSEL_REF_LABEL.into(), "crew-work".into())]))
+                .build(),
+            &original.spec,
+        )
+        .await
+        .expect("mapped session");
+    let context = ResolvedCrewContext {
+        namespace: "flotilla".into(),
+        convoy: "crew".into(),
+        vessel_ref: "crew-work".into(),
+        vessel: "work".into(),
+        caller_role: "coder".into(),
+        caller_session: None,
+    };
+    // Settled sessions retain their outcome, and completed crew work does not
+    // become lost merely because its vessel later loses backing.
+    for (session_phase, crew_phase, expected) in [
+        (TerminalSessionPhase::Stopped, CrewWorkPhase::Interrupted, "stopped"),
+        (TerminalSessionPhase::Failed, CrewWorkPhase::Interrupted, "failed"),
+        (TerminalSessionPhase::Running, CrewWorkPhase::Done, "active"),
+        (TerminalSessionPhase::Running, CrewWorkPhase::Failed, "active"),
+        (TerminalSessionPhase::Running, CrewWorkPhase::HandedBack, "active"),
+        (TerminalSessionPhase::Running, CrewWorkPhase::Interrupted, "lost"),
+    ] {
+        session = sessions
+            .update_status(
+                "mapped-session",
+                &session.metadata.resource_version,
+                &TerminalSessionStatus { phase: session_phase, ..Default::default() },
+            )
+            .await
+            .expect("session outcome");
+        let convoy = convoys.get("crew").await.expect("convoy");
+        let mut status = convoy.status.expect("status");
+        status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = crew_phase;
+        let convoy = convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("crew outcome");
+        let view = restarted.crew_state(&context, &convoy).await.expect("view");
+        assert_eq!(view.members[0].state, expected, "{session_phase:?}, {crew_phase:?}");
+        assert_eq!(view.members[0].reason.is_some(), expected == "lost");
+    }
 }

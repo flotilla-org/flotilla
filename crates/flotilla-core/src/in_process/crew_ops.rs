@@ -745,6 +745,7 @@ impl CrewService {
             inbox_messages.entry(message.current_receiver.as_ref().unwrap_or(&message.receiver).clone()).or_default().push(message);
         }
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
+        let crew_work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&context.vessel));
         let loss_reason =
             match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(&context.namespace).get(&context.vessel_ref).await
             {
@@ -761,10 +762,16 @@ impl CrewService {
             .iter()
             .map(|process| {
                 let session = by_role.get(&process.role);
-                let state = if loss_reason.is_some() {
-                    "lost, recoverable"
+                let session_phase = session.and_then(|session| session.status.as_ref().map(|status| status.phase));
+                let settled = crew_work
+                    .and_then(|crew| crew.get(&process.role))
+                    .is_some_and(|crew| matches!(crew.phase, CrewWorkPhase::Done | CrewWorkPhase::Failed | CrewWorkPhase::HandedBack))
+                    || matches!(session_phase, Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Failed));
+                let member_loss = loss_reason.as_ref().filter(|_| !settled);
+                let state = if member_loss.is_some() {
+                    "lost"
                 } else {
-                    match session.and_then(|session| session.status.as_ref().map(|status| status.phase)) {
+                    match session_phase {
                         Some(ResourceTerminalSessionPhase::Starting) => "starting",
                         Some(ResourceTerminalSessionPhase::Running) => "active",
                         Some(ResourceTerminalSessionPhase::Lost) => "lost",
@@ -785,7 +792,13 @@ impl CrewService {
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
-                    .maybe_reason(loss_reason.clone())
+                    .maybe_reason(member_loss.map(|reason| {
+                        if reason.starts_with("lost, recoverable") {
+                            reason.clone()
+                        } else {
+                            format!("lost, recoverable: {reason}")
+                        }
+                    }))
                     .maybe_attention(crew_attention(session.and_then(|session| session.status.as_ref()), Utc::now()))
                     .maybe_adapter(crew.map(|crew| crew.adapter.clone()))
                     .maybe_model(crew.and_then(|crew| crew.model.clone()))
@@ -2083,7 +2096,7 @@ impl CrewService {
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
         if status.phase.is_terminal() {
-            return Err(format!("convoy `{name}` is in terminal phase `{:?}` and cannot accept a brief; dispatch a new generation, or use explicit --continue-pr continuation once #2873 is available", status.phase));
+            return Err(terminal_convoy_refusal(name, &format!("is in terminal phase `{:?}` and cannot accept a brief", status.phase)));
         }
         let candidates = status
             .crew_work
@@ -2267,9 +2280,7 @@ impl CrewService {
         .await
         .map_err(|err| err.to_string())?;
         if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            return Err(format!(
-                "convoy `{name}` became terminal; dispatch a new generation, or use explicit --continue-pr continuation once #2873 is available"
-            ));
+            return Err(terminal_convoy_refusal(name, "became terminal"));
         }
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
             if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
@@ -2502,7 +2513,7 @@ impl CrewService {
     }
 
     async fn ensure_vessel_backing_available(&self, namespace: &str, convoy: &str, vessel: &str) -> Result<(), String> {
-        let vessel_ref = format!("{convoy}-{vessel}");
+        let vessel_ref = flotilla_resources::vessel_resource_name(convoy, vessel);
         match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(namespace).get(&vessel_ref).await {
             Ok(resource) if resource.object.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::VesselPhase::Lost) => {
                 let reason =
@@ -2551,10 +2562,7 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         let convoy = &target.object;
         if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            return Err(format!(
-                "convoy `{}` is terminal; dispatch a new generation, or use explicit --continue-pr continuation once #2873 is available",
-                request.convoy
-            ));
+            return Err(terminal_convoy_refusal(&request.convoy, "is terminal"));
         }
         self.ensure_vessel_backing_available(&request.namespace, &request.convoy, &request.vessel).await?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
@@ -3283,3 +3291,10 @@ fn associated_change_request_name_without_checkout_status(
 
 #[cfg(test)]
 mod tests;
+
+fn terminal_convoy_refusal(name: &str, cause: &str) -> String {
+    format!(
+        "convoy `{name}` {cause}; dispatch a new generation, \
+         or use explicit --continue-pr continuation once #2873 is available"
+    )
+}

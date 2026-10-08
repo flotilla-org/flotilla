@@ -820,12 +820,13 @@ fn crew_list_explains_recoverable_environment_loss() {
         .members(vec![flotilla_protocol::CrewListMember::builder()
             .role("coder".into())
             .kind("agent".into())
-            .state("lost, recoverable".into())
-            .reason("host reboot".into())
+            .state("lost".into())
+            .reason("lost, recoverable: host reboot".into())
             .build()])
         .build();
     let human = super::format_crew_list_human(&response);
     assert!(human.contains("lost, recoverable") && human.contains("host reboot"));
     let json = serde_json::to_value(response).expect("JSON");
-    assert_eq!(json["members"][0]["reason"], "host reboot");
+    assert_eq!(json["members"][0]["state"], "lost");
+    assert_eq!(json["members"][0]["reason"], "lost, recoverable: host reboot");
 }

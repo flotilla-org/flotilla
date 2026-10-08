@@ -199,6 +199,14 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     );
     let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let vessel = vessels.get("memory-incident-work").await.expect("vessel");
+    // A restart can encounter an already-interrupted vessel whose backing
+    // loss was persisted separately. Reconstruct its stored status before
+    // preparing with the new reconciler; loss must still propagate.
+    let mut vessel_status = vessel.status.expect("status");
+    vessel_status.phase = flotilla_resources::VesselPhase::Interrupted;
+    let vessel_status: VesselStatus =
+        serde_json::from_value(serde_json::to_value(vessel_status).expect("persist vessel")).expect("restart decode");
+    let vessel = vessels.update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &vessel_status).await.expect("restart");
     let prepared = vessel_reconciler.prepare(&vessel).await.expect("prepare vessel");
     let outcome = vessel_reconciler.reconcile(&vessel, &prepared, chrono::Utc::now());
     flotilla_resources::apply_status_patch(&vessels, &vessel.metadata.name, &outcome.patch.expect("mark vessel lost"))

@@ -34,13 +34,16 @@ impl Aggregator {
         work: Option<&WorkState>,
         crew: Option<&BTreeMap<String, CrewWorkState>>,
         host: &HostName,
-    ) -> Readiness {
+    ) -> (Readiness, Option<String>) {
         let phase = work.map(|work| work.phase).unwrap_or(ResourceWorkPhase::Pending);
         if phase.is_terminal() {
-            return Readiness {
-                state: if phase == ResourceWorkPhase::Failed { ReadinessState::Failed } else { ReadinessState::Ready },
-                blockers: Vec::new(),
-            };
+            return (
+                Readiness {
+                    state: if phase == ResourceWorkPhase::Failed { ReadinessState::Failed } else { ReadinessState::Ready },
+                    blockers: Vec::new(),
+                },
+                None,
+            );
         }
         let mut result = Readiness {
             state: if matches!(phase, ResourceWorkPhase::Running | ResourceWorkPhase::Stalled) {
@@ -88,7 +91,8 @@ impl Aggregator {
             // Lost backing is frozen. Missing child evidence cannot turn it
             // back into provisioning or replace the recovery explanation.
             if vessel_phase == VesselPhase::Lost {
-                return result;
+                let loss_reason = result.blockers.last().expect("lost vessel blocker").reason.clone();
+                return (result, Some(loss_reason));
             }
             let mut checkout_refs =
                 status.map(|status| status.checkout_refs.values().cloned().collect::<BTreeSet<_>>()).unwrap_or_default();
@@ -201,7 +205,7 @@ impl Aggregator {
                 }),
             });
         }
-        result
+        (result, None)
     }
 }
 

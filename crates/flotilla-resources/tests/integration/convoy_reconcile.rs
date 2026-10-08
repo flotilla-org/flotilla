@@ -3494,7 +3494,11 @@ async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() 
         assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Interrupted);
         assert!(status.crew_work["implement"]["coder"].message.as_ref().expect("reason").contains(message));
         assert!(!outcome.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
+        // Reconstruct persisted evidence into a fresh backend, as on restart.
+        let convoy = serde_json::from_value(serde_json::to_value(convoy).expect("persist convoy")).expect("restore convoy");
+        let vessel = serde_json::from_value(serde_json::to_value(vessel).expect("persist vessel")).expect("restore vessel");
         let again = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(22)).await;
+        assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkInterrupted { .. })), "restart must not repeat loss roll-up");
         assert!(!again.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
     }

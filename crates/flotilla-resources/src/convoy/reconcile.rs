@@ -28,7 +28,7 @@ use crate::{
     resource::ResourceObject,
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
-    vessel::{Vessel, VesselPhase},
+    vessel::{vessel_resource_name, Vessel, VesselPhase},
     workflow_template::{
         validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ExitDeclaration,
         ValidationError, WorkflowTemplate,
@@ -2208,12 +2208,4 @@ fn insert_optional_field(fields: &mut BTreeMap<String, serde_json::Value>, key: 
     if let Some(value) = value {
         fields.insert(key.to_string(), json!(value));
     }
-}
-
-/// Per-vessel convoy resources (`Vessel`, `Presentation`) share the name
-/// shape `<convoy>-<vessel>`. Resource kinds have separate namespaces, so the
-/// shared shape causes no collision and keeps both resources discoverable
-/// together by name.
-fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
-    format!("{convoy_name}-{vessel}")
 }

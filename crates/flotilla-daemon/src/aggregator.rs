@@ -2800,7 +2800,7 @@ impl Aggregator {
                 })
                 .unwrap_or_default()
         };
-        let mut readiness = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host);
+        let (mut readiness, loss_reason) = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host);
         if readiness.state == ReadinessState::Provisioning {
             if let Some(stalled) = stalled.filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
             {
@@ -2812,7 +2812,8 @@ impl Aggregator {
                 });
             }
         }
-        let loss_reason = readiness.blockers.iter().find(|blocker| blocker.phase == "Lost").map(|blocker| blocker.reason.clone());
+        // Frozen backing loss takes precedence over credential refresh: credentials
+        // cannot make this vessel usable until rehydration exists.
         let surface_state = if loss_reason.is_some() { SurfaceState::NeedsYou } else { surface_state };
         VesselRow::builder()
             .readiness(readiness)
