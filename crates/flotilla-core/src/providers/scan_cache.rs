@@ -10,11 +10,7 @@ use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{
-        presentation::PresentationManager,
-        terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize},
-        types::{Workspace, WorkspaceAttachRequest},
-    },
+    providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize},
 };
 
 pub(crate) struct SharedScan<T> {
@@ -75,48 +71,6 @@ impl<T: Clone> SharedScan<T> {
             .as_ref()
             .filter(|cached| cached.scanned_at.elapsed() < self.ttl)
             .map(|cached| cached.result.clone())
-    }
-}
-
-pub(crate) struct SharedPresentationManager {
-    inner: Arc<dyn PresentationManager>,
-    workspaces: SharedScan<Vec<(String, Workspace)>>,
-}
-
-impl SharedPresentationManager {
-    pub(crate) fn new(inner: Arc<dyn PresentationManager>, ttl: Duration) -> Self {
-        Self { inner, workspaces: SharedScan::new(ttl) }
-    }
-}
-
-#[async_trait]
-impl PresentationManager for SharedPresentationManager {
-    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-        self.workspaces.get_or_scan(|| self.inner.list_workspaces()).await
-    }
-
-    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-        let result = self.inner.create_workspace(config).await;
-        if result.is_ok() {
-            self.workspaces.invalidate();
-        }
-        result
-    }
-
-    async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        self.inner.select_workspace(ws_ref).await
-    }
-
-    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        let result = self.inner.delete_workspace(ws_ref).await;
-        if result.is_ok() {
-            self.workspaces.invalidate();
-        }
-        result
-    }
-
-    fn binding_scope_prefix(&self) -> String {
-        self.inner.binding_scope_prefix()
     }
 }
 
@@ -229,8 +183,6 @@ impl TerminalPool for SharedTerminalPool {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tokio::sync::Mutex;
-
     use super::*;
 
     #[tokio::test]
@@ -280,67 +232,5 @@ mod tests {
         release.notify_one();
         assert_eq!(in_flight.await.expect("scan task"), Ok(1));
         assert_eq!(scan.get_or_scan(|| async { Ok(2) }).await, Ok(2));
-    }
-
-    struct CountingPresentationManager {
-        calls: AtomicUsize,
-        workspaces: Mutex<Vec<(String, Workspace)>>,
-    }
-
-    impl CountingPresentationManager {
-        fn new() -> Self {
-            Self { calls: AtomicUsize::new(0), workspaces: Mutex::new(vec![]) }
-        }
-    }
-
-    #[async_trait]
-    impl PresentationManager for CountingPresentationManager {
-        async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            Ok(self.workspaces.lock().await.clone())
-        }
-
-        async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-            let workspace = Workspace { name: config.name.clone() };
-            let entry = (format!("workspace:{}", config.name), workspace);
-            self.workspaces.lock().await.push(entry.clone());
-            Ok(entry)
-        }
-
-        async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
-            self.workspaces.lock().await.retain(|(candidate, _)| candidate != ws_ref);
-            Ok(())
-        }
-
-        fn binding_scope_prefix(&self) -> String {
-            String::new()
-        }
-    }
-
-    #[tokio::test]
-    async fn concurrent_workspace_reads_share_one_scan_and_mutations_invalidate_it() {
-        let inner = Arc::new(CountingPresentationManager::new());
-        let manager = SharedPresentationManager::new(inner.clone(), Duration::from_secs(10));
-
-        let (first, second) = tokio::join!(manager.list_workspaces(), manager.list_workspaces());
-        assert!(first.expect("first workspace scan").is_empty());
-        assert!(second.expect("second workspace scan").is_empty());
-        assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "concurrent readers should share the underlying scan");
-
-        let request = WorkspaceAttachRequest::builder()
-            .name("new")
-            .working_directory(ExecutionEnvironmentPath::new("/repo"))
-            .template_vars(Default::default())
-            .build();
-        manager.create_workspace(&request).await.expect("create workspace");
-        let workspaces = manager.list_workspaces().await.expect("scan after mutation");
-
-        assert_eq!(workspaces.len(), 1);
-        assert_eq!(inner.calls.load(Ordering::SeqCst), 2, "a successful mutation should invalidate the shared result");
     }
 }

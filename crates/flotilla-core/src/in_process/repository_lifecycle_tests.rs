@@ -9,10 +9,7 @@ use crate::providers::{
     discovery::{
         detectors::generic::{parse_first_dotted_version, CommandDetector},
         factories::github::GitHubIssueProviderFactory,
-        test_support::{
-            fake_discovery, fake_discovery_with_runner, FakeIssueProvider, FakePresentationManager, FakePresentationManagerFactory,
-            FakeVcsFactory, FakeVcsState,
-        },
+        test_support::{fake_discovery, fake_discovery_with_runner, FakeIssueProvider, FakeVcsFactory, FakeVcsState},
         Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
     },
     testing::MockRunner,
@@ -154,7 +151,6 @@ async fn generic_checkout_executes_without_presentation_roots() {
     let state = FakeVcsState::builder(path).checkout("main").path(path).is_main(true).build().build();
     let mut discovery = fake_discovery(false);
     discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(state.clone()))];
-    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(Arc::new(FakePresentationManager::new())))];
     let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
     let spec = RepositorySpec::remote("https://github.com/acme/commands").expect("repository");
     let key = spec.key();

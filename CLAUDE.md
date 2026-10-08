@@ -183,7 +183,6 @@ Each trait lives under `crates/flotilla-core/src/providers/` with implementation
 - **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
 - **CloudAgentService** (`crates/flotilla-core/src/providers/coding_agent/claude.rs`, `crates/flotilla-core/src/providers/coding_agent/codex.rs`, `crates/flotilla-core/src/providers/coding_agent/cursor.rs`)
 - **AiUtility** (`crates/flotilla-core/src/providers/ai_utility/claude_api.rs`, `crates/flotilla-core/src/providers/ai_utility/claude_cli.rs`)
-- **PresentationManager** (`crates/flotilla-core/src/providers/presentation/cmux.rs`, `crates/flotilla-core/src/providers/presentation/zellij.rs`)
 - **TerminalPool** (`crates/flotilla-core/src/providers/terminal/cleat.rs`, `crates/flotilla-core/src/providers/terminal/passthrough.rs`)
 
 Provider labels and implementation names live in the `ProviderDescriptor` registered alongside each implementation: `section_label`, `item_noun`, `abbreviation`, and `display_name`.

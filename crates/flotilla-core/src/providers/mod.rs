@@ -7,7 +7,6 @@ pub mod github_api;
 pub(crate) mod github_observation;
 pub(crate) mod github_poll;
 pub mod issue_tracker;
-pub mod presentation;
 pub mod registry;
 pub(crate) mod scan_cache;
 pub mod ssh_runner;

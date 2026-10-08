@@ -21,7 +21,6 @@ use crate::{
         },
         environment::ProvisionedMount,
         issue_tracker::IssueProvider,
-        presentation::PresentationManager,
         registry::ProviderRegistry,
         terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag},
         testing::MockRunner,
@@ -113,66 +112,6 @@ impl Vcs for MockCheckoutManager {
     }
     async fn remove_checkout(&self, _branch: &str) -> Result<(), String> {
         self.remove_result.lock().await.take().expect("remove_checkout called more than expected")
-    }
-}
-
-/// A mock WorkspaceManager that records calls and returns configurable results.
-struct MockWorkspaceManager {
-    existing: Vec<(String, Workspace)>,
-    create_result: tokio::sync::Mutex<Result<(), String>>,
-    select_result: tokio::sync::Mutex<Result<(), String>>,
-    created_configs: tokio::sync::Mutex<Vec<WorkspaceAttachRequest>>,
-    calls: tokio::sync::Mutex<Vec<String>>,
-}
-
-impl MockWorkspaceManager {
-    fn succeeding() -> Self {
-        Self {
-            existing: vec![],
-            create_result: tokio::sync::Mutex::new(Ok(())),
-            select_result: tokio::sync::Mutex::new(Ok(())),
-            created_configs: tokio::sync::Mutex::new(Vec::new()),
-            calls: tokio::sync::Mutex::new(vec![]),
-        }
-    }
-
-    fn with_existing(existing: Vec<(String, Workspace)>) -> Self {
-        Self {
-            existing,
-            create_result: tokio::sync::Mutex::new(Ok(())),
-            select_result: tokio::sync::Mutex::new(Ok(())),
-            created_configs: tokio::sync::Mutex::new(Vec::new()),
-            calls: tokio::sync::Mutex::new(vec![]),
-        }
-    }
-}
-
-#[async_trait]
-impl PresentationManager for MockWorkspaceManager {
-    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-        self.calls.lock().await.push("list_workspaces".to_string());
-        Ok(self.existing.clone())
-    }
-    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-        self.created_configs.lock().await.push(config.clone());
-        self.calls.lock().await.push(format!("create_workspace:{}", config.name));
-        let result = self.create_result.lock().await;
-        match &*result {
-            Ok(()) => Ok(("mock-ref".to_string(), Workspace { name: config.name.clone() })),
-            Err(e) => Err(e.clone()),
-        }
-    }
-    async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        self.calls.lock().await.push(format!("select_workspace:{ws_ref}"));
-        let result = self.select_result.lock().await;
-        result.clone()
-    }
-    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        self.calls.lock().await.push(format!("delete_workspace:{ws_ref}"));
-        Ok(())
-    }
-    fn binding_scope_prefix(&self) -> String {
-        String::new()
     }
 }
 
@@ -498,31 +437,9 @@ async fn archive_session_uses_provider_from_session_ref() {
     assert_ok(result);
 }
 
-#[tokio::test]
-async fn checkout_action_does_not_create_workspace() {
-    // #2918: a personal checkout neither selects an existing PM workspace
-    // nor creates a new one, even when a PM provider is available.
-    let ws_mgr =
-        Arc::new(MockWorkspaceManager::with_existing(vec![("workspace:99".to_string(), Workspace { name: "feat-x".to_string() })]));
-
-    let mut registry = empty_registry();
-    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
-    let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
-
-    let result =
-        run_build_plan_to_completion_with(fresh_checkout_action("feat-x"), registry, empty_data(), runner, repo_root(), config_base())
-            .await;
-
-    assert_checkout_created_branch(result, "feat-x");
-    let calls = ws_mgr.calls.lock().await;
-    assert!(calls.is_empty(), "checkout must not call the presentation manager, got: {calls:?}");
-}
-
 // -----------------------------------------------------------------------
 // Tests: CreateCheckout
 // -----------------------------------------------------------------------
-
 #[tokio::test]
 async fn create_checkout_no_manager() {
     let registry = empty_registry();
@@ -537,7 +454,6 @@ async fn create_checkout_no_manager() {
 async fn create_checkout_success() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
     let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
@@ -549,7 +465,6 @@ async fn create_checkout_success() {
 async fn create_checkout_with_issue_ids_writes_git_config() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     // Two validation probes (branch absent locally/remotely), then the git config write.
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string()), Ok(String::new())]);
 
@@ -1279,7 +1194,6 @@ async fn run_build_plan_to_completion_with(
 async fn build_plan_create_checkout_returns_steps() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let data = empty_data();
     let runner = runner_ok();
 
@@ -1308,7 +1222,6 @@ async fn checkout_command_succeeds_without_workspace_manager() {
 async fn build_plan_create_checkout_skips_existing() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     // Pre-populate with an existing checkout for the branch
     data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
@@ -1329,7 +1242,6 @@ async fn build_plan_create_checkout_skips_existing() {
 async fn checkout_plan_ends_after_checkout() {
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
 
     let plan = run_build_plan(fresh_checkout_action("feat-x"), registry, empty_data(), runner_ok()).await;
 

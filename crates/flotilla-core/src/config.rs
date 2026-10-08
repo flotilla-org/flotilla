@@ -68,12 +68,6 @@ pub struct ClaudeAiUtilityConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct PresentationManagerConfig {
-    #[serde(flatten)]
-    pub preference: ProviderPreference,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TerminalPoolConfig {
     #[serde(flatten)]
     pub preference: ProviderPreference,
@@ -94,8 +88,10 @@ pub struct FlotillaConfig {
     pub cloud_agent: CloudAgentConfig,
     #[serde(default)]
     pub ai_utility: AiUtilityConfig,
-    #[serde(default)]
-    pub presentation_manager: PresentationManagerConfig,
+    // ADR 0047 / #2915: accept and drop the retired key for one generation.
+    // Remove in #2915 step 5, after the first roll containing steps 3 and 4.
+    #[serde(default, rename = "presentation_manager", deserialize_with = "drop_retired_presentation_manager", skip_serializing)]
+    _retired_presentation_manager: Option<()>,
     #[serde(default)]
     pub terminal_pool: TerminalPoolConfig,
     #[serde(default)]
@@ -846,3 +842,8 @@ impl ConfigStore {
 
 #[cfg(test)]
 mod tests;
+
+fn drop_retired_presentation_manager<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<()>, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(None)
+}
