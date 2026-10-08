@@ -81,6 +81,7 @@ impl Aggregator {
                     phase: format!("{vessel_phase:?}"),
                     reason: status.and_then(|status| status.message.clone()).unwrap_or_else(|| {
                         if vessel_phase == VesselPhase::Lost {
+                            // TODO(#2872): remove unavailable-rehydration guidance when recovery ships.
                             "lost, recoverable; rehydration is not available yet (#2872)".into()
                         } else {
                             "vessel is not ready".into()
@@ -91,6 +92,7 @@ impl Aggregator {
             // Lost backing is frozen. Missing child evidence cannot turn it
             // back into provisioning or replace the recovery explanation.
             if vessel_phase == VesselPhase::Lost {
+                // This same Lost phase always pushed a blocker above, before any child traversal.
                 let loss_reason = result.blockers.last().expect("lost vessel blocker").reason.clone();
                 return (result, Some(loss_reason));
             }
