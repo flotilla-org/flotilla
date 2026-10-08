@@ -1657,8 +1657,8 @@ fn environment_provider_labels(policy: &ResourceObject<PlacementPolicy>) -> BTre
         .into_iter()
         .collect();
     if let Some(docker) = &policy.spec.docker_per_vessel {
-        if let DockerImageSource::Baseline { image_baseline_ref } = &docker.image {
-            labels.insert("flotilla.work/legacy-image-baseline".into(), image_baseline_ref.clone());
+        if let Some(image_baseline_ref) = docker.legacy_image_baseline_ref() {
+            labels.insert("flotilla.work/legacy-image-baseline".into(), image_baseline_ref.to_string());
         }
     }
     labels

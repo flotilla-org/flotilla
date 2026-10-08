@@ -1927,6 +1927,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
     let policy = PlacementPolicySpec::builder()
         .pool("passthrough".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".into(),
             image: image.into(),

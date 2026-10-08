@@ -1193,6 +1193,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string().into(),
@@ -1460,6 +1461,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string().into(),
@@ -1552,6 +1554,7 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
                     host_memory_percent: 30,
                     expected_concurrent_crews: 3,
@@ -1977,6 +1980,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+legacy_image_baseline_ref: None,
 memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
@@ -2036,6 +2040,7 @@ memory_policy: Default::default(),
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+legacy_image_baseline_ref: None,
 memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
@@ -3359,6 +3364,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
             PlacementPolicySpec::builder()
                 .pool("cleat".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: name.to_string(),
                     image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
@@ -3454,6 +3460,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },

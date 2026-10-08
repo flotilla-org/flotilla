@@ -2150,6 +2150,11 @@ impl ConvoyAdmission {
                     .filter(|need| need.is_image_need())
                     .map(CapabilityNeed::capability_string)
                     .collect();
+                // The image is frozen below, but its baseline source must also
+                // survive into the prepared snapshot for the #2731 bridge.
+                if let flotilla_resources::DockerImageSource::Baseline { image_baseline_ref } = &docker.image {
+                    docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
+                }
                 docker.image = freeze_admission_image(&self.backend, namespace, &docker.image, &needs).await?;
             }
             validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;

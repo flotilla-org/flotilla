@@ -87,6 +87,11 @@ pub enum HostDirectPlacementPolicyCheckout {
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     pub image: DockerImageSource,
+    /// Admission freezes baseline provenance alongside the resolved image.
+    /// One-generation bridge until #2731; retire after its last writing roll
+    /// and the following compatibility generation (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_image_baseline_ref: Option<String>,
     /// Controls registry access for the resolved image tag. Image build recipes
     /// are intentionally outside placement policy and are tracked separately.
     #[serde(default)]
@@ -102,6 +107,17 @@ pub struct DockerPerVesselPlacementPolicySpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub checkout: DockerCheckoutStrategy,
+}
+
+impl DockerPerVesselPlacementPolicySpec {
+    /// Frozen snapshots retain provenance after their image becomes a literal
+    /// or composition. Old live policies still carry the baseline source itself.
+    pub fn legacy_image_baseline_ref(&self) -> Option<&str> {
+        self.legacy_image_baseline_ref.as_deref().or(match &self.image {
+            DockerImageSource::Baseline { image_baseline_ref } => Some(image_baseline_ref.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

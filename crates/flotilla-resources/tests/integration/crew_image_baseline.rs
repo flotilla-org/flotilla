@@ -63,3 +63,42 @@ async fn crew_image_baseline_merged_resolution_contract(#[case] backend: Resourc
     assert!(reference.resolve(&definitions).await.expect_err("deleted").contains("missing/unresolved"));
     assert_eq!(DockerImageSource::from("independent:v1").resolve(&definitions).await.expect("literal image"), "independent:v1");
 }
+
+// ADR 0047/#2941: previous-generation policies decode without provenance;
+// frozen snapshots retain it through serialization, and literal tags never
+// acquire baseline provenance merely from their spelling.
+#[hegel::test]
+fn placement_baseline_provenance_round_trips_and_never_infers_literal_tags(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Cross all four live/frozen provenance combinations, and empty through
+    // long literal image values. Frozen provenance takes precedence over live.
+    let live = tc.draw(gs::booleans());
+    let frozen = tc.draw(gs::booleans());
+    let image_len = tc.draw(gs::integers::<usize>().min_value(0).max_value(70));
+    let image = if live {
+        json!({ "image_baseline_ref": "live-baseline" })
+    } else {
+        json!(if image_len == 0 { String::new() } else { format!("crew:{}", "a".repeat(image_len)) })
+    };
+    let mut value = json!({
+        "host_ref": "host-a", "image": image,
+        "checkout": { "fresh_clone_in_container": { "clone_path": "/workspace" } }
+    });
+    if frozen {
+        value["legacy_image_baseline_ref"] = json!("frozen-baseline");
+    }
+    let policy: flotilla_resources::DockerPerVesselPlacementPolicySpec = serde_json::from_value(value).expect("stored policy");
+    let expected = if frozen {
+        Some("frozen-baseline")
+    } else if live {
+        Some("live-baseline")
+    } else {
+        None
+    };
+    assert_eq!(policy.legacy_image_baseline_ref(), expected);
+    let encoded = serde_json::to_value(&policy).expect("write policy");
+    assert_eq!(encoded.get("legacy_image_baseline_ref"), frozen.then_some(&json!("frozen-baseline")));
+    let decoded: flotilla_resources::DockerPerVesselPlacementPolicySpec = serde_json::from_value(encoded).expect("read snapshot");
+    assert_eq!(decoded, policy);
+    assert_eq!(decoded.legacy_image_baseline_ref(), expected);
+}
