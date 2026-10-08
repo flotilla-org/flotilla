@@ -377,8 +377,10 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
     // Issue #2484: only portable provenance may be replicated.
     assert!(!flotilla.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
     // The host-local observation root survives restart even when the bootstrap
-    // repository is not itself a Project member.
-    assert!(config.load_observation_roots().expect("local roots").iter().any(|root| root.as_ref() == tmp.path()));
+    // repository is not itself a Project member. Roots are stored canonical
+    // (macOS temp dirs resolve /var to /private/var).
+    let canonical_tmp = tmp.path().canonicalize().expect("canonical tmp");
+    assert!(config.load_observation_roots().expect("local roots").iter().any(|root| root.as_ref() == canonical_tmp));
     // #2719: an omitted default inherits; admission supplies the builtin fallback.
     assert!(flotilla.spec.default_workflow_ref.is_empty());
     assert_eq!(flotilla.spec.repositories[0].alias.as_deref(), Some("flotilla"));
