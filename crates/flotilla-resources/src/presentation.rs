@@ -1,3 +1,5 @@
+// ADR 0047: retained only to decode and purge previous-generation rows.
+// Remove this kind and cleanup one fleet roll after removal step 3 (#2915).
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -87,4 +89,26 @@ impl StatusPatch<PresentationStatus> for PresentationStatusPatch {
             }
         }
     }
+}
+
+/// ADR 0047 one-generation cleanup. Remove one fleet roll after #2915 step 3.
+/// Presentation creation has stopped; release its retired finalizer even when
+/// deletion already began, then delete each local row without provider teardown.
+pub async fn purge_retired_presentations(backend: &crate::ResourceBackend, namespace: &str) -> Result<(), crate::ResourceError> {
+    let resolver = backend.clone().using::<Presentation>(namespace);
+    for object in resolver.list().await?.items {
+        if object.metadata.finalizers.iter().any(|name| name == "flotilla.work/presentation-teardown") {
+            let meta = crate::InputMeta::from(&object.metadata).without_finalizer("flotilla.work/presentation-teardown");
+            match resolver.update(&meta, &object.metadata.resource_version, &object.spec).await {
+                Ok(_) => {}
+                Err(crate::ResourceError::NotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        match resolver.delete(&object.metadata.name).await {
+            Ok(()) | Err(crate::ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }

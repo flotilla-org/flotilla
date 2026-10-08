@@ -154,7 +154,6 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         adoption_registry(handles),
         None,
         daemon.local_host_id().expect("local host").to_string(),
-        None,
         "host-direct-test".into(),
     ));
     let sample = EnvironmentRuntimeObservation {
@@ -288,7 +287,6 @@ async fn observation_error_preserves_terminal_liveness_and_retries_running_backi
             adoption_registry(handles),
             None,
             daemon.local_host_id().expect("local host").to_string(),
-            None,
             "host-direct-test".into(),
         ));
         let result = reconcile_provisioned_environments(&state, NAMESPACE).await;

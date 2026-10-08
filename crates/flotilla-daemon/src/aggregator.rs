@@ -29,7 +29,7 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
+    Demand, DemandAddressee, DemandState, Environment, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
     RegardExpiryPolicy, ReplicaReadResolver, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
     StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
     VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
@@ -49,7 +49,6 @@ use readiness::{apply_readiness_event, readiness_resources};
 
 type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
 
-type PresentationKey = (String, String, String);
 type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
 type EnsureKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
@@ -65,7 +64,6 @@ pub struct AggregatorResolvers {
     durable_convoy_ensures: ReplicaReadResolver<ConvoyEnsure>,
     durable_demands: TypedResolver<Demand>,
     durable_environments: TypedResolver<Environment>,
-    durable_presentations: TypedResolver<Presentation>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
     durable_fleet_designation: Option<ReplicaReadResolver<flotilla_resources::FleetDesignation>>,
@@ -75,7 +73,6 @@ pub struct AggregatorResolvers {
     durable_checkouts: ReplicaReadResolver<Checkout>,
     durable_clones: TypedResolver<CloneResource>,
     observed_convoys: TypedResolver<Convoy>,
-    observed_presentations: TypedResolver<Presentation>,
     observed_sessions: ReplicaReadResolver<TerminalSession>,
     observed_checkouts: TypedResolver<Checkout>,
     observed_checkout_replicas: ReplicaReadResolver<Checkout>,
@@ -87,7 +84,6 @@ struct AggregatorSourceRefs<'a> {
     durable_convoy_ensures: &'a dyn AggregatorReplicaWatchSource<ConvoyEnsure>,
     durable_demands: &'a dyn AggregatorWatchSource<Demand>,
     durable_environments: &'a dyn AggregatorWatchSource<Environment>,
-    durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
     durable_fleet_designation: Option<&'a dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>>,
@@ -97,7 +93,6 @@ struct AggregatorSourceRefs<'a> {
     durable_checkouts: &'a dyn AggregatorReplicaWatchSource<Checkout>,
     durable_clones: &'a dyn AggregatorWatchSource<CloneResource>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
-    observed_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     observed_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     observed_checkouts: &'a dyn AggregatorWatchSource<Checkout>,
     observed_checkout_replicas: &'a dyn AggregatorReplicaWatchSource<Checkout>,
@@ -231,10 +226,7 @@ pub struct Aggregator {
     #[builder(skip)]
     demands: HashMap<ResourceRef, ResourceObject<Demand>>,
     #[builder(skip)]
-    presentations_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Presentation>>>,
-    #[builder(skip)]
     sessions_by_source: HashMap<LocalSource, HashMap<SessionKey, ReadResourceObject<TerminalSession>>>,
-    presentation_workspaces: HashMap<PresentationKey, String>,
     terminal_sessions: HashMap<SessionKey, ReadResourceObject<TerminalSession>>,
     attachable_sessions: HashSet<SessionKey>,
     origin_hosts: HashMap<flotilla_protocol::NodeId, HostName>,
@@ -347,9 +339,7 @@ impl Aggregator {
             local_host,
             convoys_by_source: HashMap::new(),
             demands: HashMap::new(),
-            presentations_by_source: HashMap::new(),
             sessions_by_source: HashMap::new(),
-            presentation_workspaces: HashMap::new(),
             terminal_sessions: HashMap::new(),
             attachable_sessions: HashSet::new(),
             origin_hosts: HashMap::new(),
@@ -421,7 +411,6 @@ impl Aggregator {
             durable_convoy_ensures,
             durable_demands,
             durable_environments,
-            durable_presentations,
             durable_sessions,
             durable_projects,
             durable_fleet_designation,
@@ -431,7 +420,6 @@ impl Aggregator {
             durable_checkouts,
             durable_clones,
             observed_convoys,
-            observed_presentations,
             observed_sessions,
             observed_checkouts,
             observed_checkout_replicas,
@@ -441,7 +429,6 @@ impl Aggregator {
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_demands(&durable_demands)
             .durable_environments(&durable_environments)
-            .durable_presentations(&durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .maybe_durable_fleet_designation(
@@ -455,7 +442,6 @@ impl Aggregator {
             .durable_checkouts(&durable_checkouts)
             .durable_clones(&durable_clones)
             .observed_convoys(&observed_convoys)
-            .observed_presentations(&observed_presentations)
             .observed_sessions(&observed_sessions)
             .observed_checkouts(&observed_checkouts)
             .observed_checkout_replicas(&observed_checkout_replicas)
@@ -469,7 +455,6 @@ impl Aggregator {
             durable_convoy_ensures,
             durable_demands,
             durable_environments,
-            durable_presentations,
             durable_sessions,
             durable_projects,
             durable_fleet_designation,
@@ -479,7 +464,6 @@ impl Aggregator {
             durable_checkouts,
             durable_clones,
             observed_convoys,
-            observed_presentations,
             observed_sessions,
             observed_checkouts,
             observed_checkout_replicas,
@@ -507,7 +491,6 @@ impl Aggregator {
         let mut durable_convoy_stream = self.recover_replica_convoy_watch(durable_convoys).await?;
         let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
         let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
-        let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
         let mut durable_fleet_stream = match durable_fleet_designation {
             Some(source) => self.recover_fleet_designation_watch(source).await?,
@@ -519,7 +502,6 @@ impl Aggregator {
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
         let mut durable_regard_stream = self.recover_regard_watch(durable_regards).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
-        let mut observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
         let mut observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
         let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
         let mut checkout_replica_stream = self.recover_checkout_replica_watch(observed_checkout_replicas).await?;
@@ -715,14 +697,7 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable environment watch ended")),
                 },
-                event = durable_presentation_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_presentation_event_from(LocalSource::Durable, event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator durable presentation watch ended")),
-                },
+
                 event = durable_session_stream.next() => match event {
                     Some(Ok(event)) => self.apply_replica_session_event(event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -799,14 +774,7 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator observed convoy watch ended")),
                 },
-                event = observed_presentation_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_presentation_event_from(LocalSource::Observed, event).await,
-                    Some(Err(ResourceError::WatchExpired { .. })) => {
-                        observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
-                    }
-                    Some(Err(err)) => return Err(err),
-                    None => return Err(ResourceError::other("aggregator observed presentation watch ended")),
-                },
+
                 event = observed_session_stream.next() => match event {
                     Some(Ok(event)) => self.apply_session_read_event_from(LocalSource::Observed, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -856,19 +824,6 @@ impl Aggregator {
         let (items, watch) = Self::recover_replica_watch(resolver).await?;
         self.replace_replica_convoys(items).await;
         Ok(watch)
-    }
-
-    async fn recover_presentation_watch(
-        &mut self,
-        source: LocalSource,
-        resolver: &dyn AggregatorWatchSource<Presentation>,
-    ) -> Result<WatchStream<Presentation>, ResourceError> {
-        loop {
-            match self.list_and_watch_presentations(source, resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
     }
 
     async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
@@ -1053,18 +1008,6 @@ impl Aggregator {
         Ok(watch)
     }
 
-    async fn list_and_watch_presentations(
-        &mut self,
-        source: LocalSource,
-        resolver: &dyn AggregatorWatchSource<Presentation>,
-    ) -> Result<WatchStream<Presentation>, ResourceError> {
-        let listed = resolver.list().await?;
-        let start = WatchStart::resuming_from(&listed);
-        let watch = resolver.watch(start).await?;
-        self.replace_presentation_source(source, listed.items).await;
-        Ok(watch)
-    }
-
     async fn list_and_watch_demands(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
         let listed = resolver.list().await?;
         let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
@@ -1142,33 +1085,6 @@ impl Aggregator {
             .collect();
         self.rebuild_checkout_rows().await?;
         Ok(watch)
-    }
-
-    async fn replace_presentation_source(&mut self, source: LocalSource, presentations: Vec<ResourceObject<Presentation>>) {
-        let replacement = presentations
-            .into_iter()
-            .map(|presentation| (self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name), presentation))
-            .collect();
-        self.presentations_by_source.insert(source, replacement);
-        self.rebuild_local_projection().await;
-    }
-
-    async fn apply_presentation_event_from(&mut self, source: LocalSource, event: WatchEvent<Presentation>) {
-        match event {
-            WatchEvent::Added(presentation) | WatchEvent::Modified(presentation) => {
-                let reference = self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name);
-                self.presentations_by_source.entry(source).or_default().insert(reference, presentation);
-            }
-            WatchEvent::Deleted(presentation) => {
-                let reference = self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name);
-                self.presentations_by_source.entry(source).or_default().remove(&reference);
-            }
-            WatchEvent::DeletedByName(tombstone) => {
-                let reference = self.presentation_ref(&tombstone.namespace, &tombstone.name);
-                self.presentations_by_source.entry(source).or_default().remove(&reference);
-            }
-        }
-        self.rebuild_local_projection().await;
     }
 
     async fn apply_demand_event(&mut self, event: WatchEvent<Demand>) {
@@ -1534,38 +1450,6 @@ impl Aggregator {
         // teardown.
         let effective_convoys = self.effective_convoy_reads_including_deleted();
         let salience_changed = self.rebuild_salience_projection().await;
-        let presentation_keys = effective_convoys
-            .values()
-            .flat_map(|convoy| {
-                let convoy = &convoy.object;
-                convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).into_iter().flat_map(|snapshot| {
-                    snapshot
-                        .vessels
-                        .iter()
-                        .map(|vessel| (convoy.metadata.namespace.clone(), convoy.metadata.name.clone(), vessel.name.clone()))
-                })
-            })
-            .collect::<HashSet<_>>();
-
-        let mut presentation_workspaces = HashMap::new();
-        for source in LOCAL_SOURCE_PRECEDENCE {
-            let Some(presentations) = self.presentations_by_source.get(&source) else { continue };
-            for presentation in presentations.values() {
-                let Some(key) = presentation_key(presentation) else { continue };
-                if !presentation_keys.contains(&key) {
-                    continue;
-                }
-                if let Some(workspace_ref) = presentation.status.as_ref().and_then(|status| status.observed_workspace_ref.clone()) {
-                    presentation_workspaces.insert(key, workspace_ref);
-                } else {
-                    // A higher-precedence source with no active workspace still
-                    // masks an attach target from a lower-precedence source.
-                    presentation_workspaces.remove(&key);
-                }
-            }
-        }
-        self.presentation_workspaces = presentation_workspaces;
-
         let mut local_replacement = HashMap::new();
         let mut replica_replacements: HashMap<HostName, HashMap<ResourceRef, ConvoyRow>> = HashMap::new();
         for (reference, convoy) in effective_convoys {
@@ -2278,11 +2162,6 @@ impl Aggregator {
         )
     }
 
-    fn presentation_ref(&self, namespace: &str, name: &str) -> ResourceRef {
-        ResourceRef::new(api_version(Presentation::API_PATHS), Presentation::API_PATHS.kind, namespace, name)
-            .on_host(self.local_host.clone())
-    }
-
     fn demand_ref(&self, namespace: &str, name: &str) -> ResourceRef {
         ResourceRef::new(api_version(Demand::API_PATHS), Demand::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
     }
@@ -2333,9 +2212,6 @@ impl Aggregator {
                 .phase(SessionPhase::Running)
                 .build(),
         )
-    }
-    fn vessel_attach(&self, namespace: &str, convoy: &str, vessel: &str) -> Option<String> {
-        self.presentation_workspaces.get(&(namespace.to_string(), convoy.to_string(), vessel.to_string())).cloned()
     }
 
     fn vessel_host(&self, convoy_ref: &ResourceRef, state: Option<&WorkState>) -> HostName {
@@ -2756,7 +2632,6 @@ impl Aggregator {
             )
             .depends_on(definition.depends_on.clone())
             .host(vessel_host.clone())
-            .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .maybe_materialize(self.vessel_materialize(&convoy_ref.namespace, &convoy_ref.name, &definition.name, &vessel_host))
             .maybe_cleat_endpoint(self.vessel_cleat_endpoint(&convoy_ref.namespace, &convoy_ref.name, &definition.name, &vessel_host))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
@@ -2896,14 +2771,6 @@ fn convoy_references_repo(convoy: &ResourceObject<Convoy>, repo_identity: &RepoI
         .any(|identity| identity == *repo_identity)
 }
 
-fn presentation_key(presentation: &ResourceObject<Presentation>) -> Option<PresentationKey> {
-    Some((
-        presentation.metadata.namespace.clone(),
-        presentation.metadata.labels.get(CONVOY_LABEL)?.clone(),
-        presentation.metadata.labels.get(VESSEL_LABEL)?.clone(),
-    ))
-}
-
 fn is_independent_session(session: &ResourceObject<TerminalSession>) -> bool {
     !session.metadata.labels.contains_key(CONVOY_LABEL)
         && session.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Running)
@@ -2960,9 +2827,9 @@ mod tests {
     use flotilla_resources::{
         BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, DemandKind, DemandSpec, DemandStatus,
         DemandTransition, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec,
-        PlacementStatus, PresentationPhase, PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec,
-        RegardSource, RegardSpec, RegardStatus, RepositorySpec, ResourceBackend, TerminalAttention, TerminalAttentionSource,
-        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        PlacementStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus, RepositorySpec,
+        ResourceBackend, TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+        VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -3781,7 +3648,6 @@ mod tests {
                         .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
                         .durable_demands(durable.clone().using::<Demand>("flotilla"))
                         .durable_environments(durable.clone().using::<Environment>("flotilla"))
-                        .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                         .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                         .durable_projects(durable.including_replicas::<Project>("flotilla"))
                         .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
@@ -3790,7 +3656,6 @@ mod tests {
                         .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
                         .durable_clones(durable.using::<CloneResource>("flotilla"))
                         .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
-                        .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
                         .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
                         .observed_checkouts(observed.using::<Checkout>("flotilla"))
                         .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
@@ -4288,9 +4153,7 @@ mod tests {
     async fn run_with_test_sources(
         aggregator: Aggregator,
         durable_convoys: &dyn AggregatorReplicaWatchSource<Convoy>,
-        durable_presentations: &dyn AggregatorWatchSource<Presentation>,
         observed_convoys: &dyn AggregatorWatchSource<Convoy>,
-        observed_presentations: &dyn AggregatorWatchSource<Presentation>,
     ) -> Result<(), ResourceError> {
         let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4309,7 +4172,6 @@ mod tests {
             .durable_convoys(durable_convoys)
             .durable_demands(&durable_demands)
             .durable_environments(&durable_environments)
-            .durable_presentations(durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
@@ -4319,7 +4181,6 @@ mod tests {
             .durable_checkouts(&durable_checkouts)
             .durable_clones(&durable_clones)
             .observed_convoys(observed_convoys)
-            .observed_presentations(observed_presentations)
             .observed_sessions(&observed_sessions)
             .observed_checkouts(&observed_checkouts)
             .observed_checkout_replicas(&observed_checkout_replicas)
@@ -4402,40 +4263,6 @@ mod tests {
             ..Default::default()
         };
         resolver.update_status(name, &created.metadata.resource_version, &status).await.expect("set convoy vessel status")
-    }
-
-    async fn presentation_object(name: &str, convoy: &str, vessel: &str, workspace: Option<&str>) -> ResourceObject<Presentation> {
-        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
-        let resolver = backend.using::<Presentation>("flotilla");
-        let created = resolver
-            .create(
-                &InputMeta::builder()
-                    .name(name.to_string())
-                    .labels(BTreeMap::from([
-                        (CONVOY_LABEL.to_string(), convoy.to_string()),
-                        (VESSEL_LABEL.to_string(), vessel.to_string()),
-                    ]))
-                    .build(),
-                &PresentationSpec::builder()
-                    .convoy_ref(convoy.to_string())
-                    .presentation_policy_ref("default".to_string())
-                    .name(name.to_string())
-                    .build(),
-            )
-            .await
-            .expect("create scripted presentation");
-        resolver
-            .update_status(
-                name,
-                &created.metadata.resource_version,
-                &PresentationStatus {
-                    phase: PresentationPhase::Active,
-                    observed_workspace_ref: workspace.map(str::to_string),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("set scripted presentation status")
     }
 
     async fn session_object(name: &str) -> ResourceObject<TerminalSession> {
@@ -4860,17 +4687,9 @@ mod tests {
             vec![ResourceList { items: initial, resource_version: "1".into(), generation: None }],
             vec![Ok(watch_events(events))],
         );
-        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let (tx, mut rx) = broadcast::channel(1024);
-        let run = run_with_test_sources(
-            Aggregator::new(state.clone(), HostName::new("local"), tx),
-            &durable_convoys,
-            &durable_presentations,
-            &observed_convoys,
-            &observed_presentations,
-        );
+        let run = run_with_test_sources(Aggregator::new(state.clone(), HostName::new("local"), tx), &durable_convoys, &observed_convoys);
         tokio::pin!(run);
         tokio::select! {
             result = &mut run => panic!("aggregator stopped: {result:?}"),
@@ -4924,15 +4743,11 @@ mod tests {
                 ),
             ))],
         );
-        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::new(BlockingChangeRequestResolver)),
             &durable_convoys,
-            &durable_presentations,
             &observed_convoys,
-            &observed_presentations,
         );
         tokio::pin!(run);
 
@@ -5097,7 +4912,6 @@ mod tests {
         );
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::new(
             vec![ResourceList { items: vec![session], resource_version: "1".to_string(), generation: None }],
             vec![Ok(pending_watch())],
@@ -5107,7 +4921,6 @@ mod tests {
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -5118,7 +4931,6 @@ mod tests {
             .durable_convoys(&durable_convoys)
             .durable_demands(&durable_demands)
             .durable_environments(&durable_environments)
-            .durable_presentations(&durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_convoy_ensures(&durable_convoy_ensures)
@@ -5128,7 +4940,6 @@ mod tests {
             .durable_checkouts(&durable_checkouts)
             .durable_clones(&durable_clones)
             .observed_convoys(&observed_convoys)
-            .observed_presentations(&observed_presentations)
             .observed_sessions(&observed_sessions)
             .observed_checkouts(&observed_checkouts)
             .observed_checkout_replicas(&observed_checkout_replicas)
@@ -5355,15 +5166,11 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
-            &durable_presentations,
             &observed_convoys,
-            &observed_presentations,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5412,15 +5219,11 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
-            &durable_presentations,
             &observed_convoys,
-            &observed_presentations,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5645,15 +5448,11 @@ mod tests {
             vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
             vec![Ok(pending_watch())],
         );
-        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
-            &durable_presentations,
             &observed_convoys,
-            &observed_presentations,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5991,7 +5790,6 @@ mod tests {
                 assert_eq!(row.readiness().state, expected, "operation {op}");
                 if op == 1 || op == 2 {
                     assert!(row.readiness().explanation().contains("Forgejo authentication refused"));
-                    assert!(row.vessels[0].attach.is_none());
                     assert!(row.vessels[0].materialize.is_none());
                 }
                 if op == 3 || op == 6 {
@@ -6256,7 +6054,6 @@ mod tests {
                     .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
                     .durable_demands(durable.clone().using::<Demand>("flotilla"))
                     .durable_environments(durable.clone().using::<Environment>("flotilla"))
-                    .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
@@ -6265,7 +6062,6 @@ mod tests {
                     .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
                     .durable_clones(durable.using::<CloneResource>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
-                    .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
                     .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
                     .observed_checkouts(observed.using::<Checkout>("flotilla"))
                     .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
@@ -6292,24 +6088,18 @@ mod tests {
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![Ok(expiring_watch()), Ok(pending_watch())],
         ));
-        let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
-        let run_durable_presentations = Arc::clone(&durable_presentations);
         let run_observed_convoys = Arc::clone(&observed_convoys);
-        let run_observed_presentations = Arc::clone(&observed_presentations);
         let run_state = state.clone();
         let task = tokio::spawn(async move {
             run_with_test_sources(
                 Aggregator::new(run_state, HostName::new("local"), event_tx),
                 run_durable_convoys.as_ref(),
-                run_durable_presentations.as_ref(),
                 run_observed_convoys.as_ref(),
-                run_observed_presentations.as_ref(),
             )
             .await
         });
@@ -6339,7 +6129,6 @@ mod tests {
         let durable_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_environments = Arc::new(ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_demands = Arc::new(ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_sessions = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![Ok(expiring_watch()), Ok(pending_watch())],
@@ -6349,7 +6138,6 @@ mod tests {
         let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_regards = Arc::new(ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -6366,7 +6154,6 @@ mod tests {
                 .durable_convoys(durable_convoys.as_ref())
                 .durable_demands(durable_demands.as_ref())
                 .durable_environments(durable_environments.as_ref())
-                .durable_presentations(durable_presentations.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
                 .durable_projects(durable_projects.as_ref())
                 .durable_convoy_ensures(durable_convoy_ensures.as_ref())
@@ -6376,7 +6163,6 @@ mod tests {
                 .durable_checkouts(&durable_checkouts)
                 .durable_clones(&durable_clones)
                 .observed_convoys(observed_convoys.as_ref())
-                .observed_presentations(observed_presentations.as_ref())
                 .observed_sessions(observed_sessions.as_ref())
                 .observed_checkouts(observed_checkouts.as_ref())
                 .observed_checkout_replicas(&observed_checkout_replicas)
@@ -6413,9 +6199,7 @@ mod tests {
                 Ok(pending_watch()),
             ],
         ));
-        let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
 
@@ -6425,9 +6209,7 @@ mod tests {
             run_with_test_sources(
                 Aggregator::new(run_state, HostName::new("local"), event_tx),
                 run_durable_convoys.as_ref(),
-                durable_presentations.as_ref(),
                 observed_convoys.as_ref(),
-                observed_presentations.as_ref(),
             )
             .await
         });
@@ -6445,136 +6227,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_presentation_watch_relists_its_source_and_removes_stale_attach() {
-        let convoy = convoy_with_vessel("convoy-a").await;
-        let presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", Some("workspace-1")).await;
-        let durable_convoys = Arc::new(ScriptedSource::new(
-            vec![ResourceList { items: vec![convoy], resource_version: "1".to_string(), generation: None }],
-            vec![Ok(pending_watch())],
-        ));
-        let durable_presentations = Arc::new(ScriptedSource::new(
-            vec![ResourceList { items: vec![presentation], resource_version: "1".to_string(), generation: None }, empty_list()],
-            vec![Ok(expiring_watch()), Ok(pending_watch())],
-        ));
-        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let state = AggregatorProjectionState::new();
-        let (event_tx, mut event_rx) = broadcast::channel(8);
-
-        let run_durable_convoys = Arc::clone(&durable_convoys);
-        let run_durable_presentations = Arc::clone(&durable_presentations);
-        let run_observed_convoys = Arc::clone(&observed_convoys);
-        let run_observed_presentations = Arc::clone(&observed_presentations);
-        let run_state = state.clone();
-        let task = tokio::spawn(async move {
-            run_with_test_sources(
-                Aggregator::new(run_state, HostName::new("local"), event_tx),
-                run_durable_convoys.as_ref(),
-                run_durable_presentations.as_ref(),
-                run_observed_convoys.as_ref(),
-                run_observed_presentations.as_ref(),
-            )
-            .await
-        });
-
-        let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
-        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
-        let initial_row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
-        assert_eq!(initial_row.vessels.first().expect("vessel row").attach.as_deref(), Some("workspace-1"));
-
-        let update = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "relist delta timeout").await;
-        let DaemonEvent::ResultDelta(update) = update else { panic!("expected relist delta") };
-        let changed = update.changes.as_convoys().expect("changed convoy rows").first().expect("changed convoy row");
-        assert_eq!(changed.vessels.first().expect("changed vessel row").attach, None);
-        assert!(update.changes.removed_resources().expect("convoy removals").is_empty());
-        assert_eq!(durable_presentations.list_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(durable_presentations.watch_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 1, "healthy watch must not restart");
-        assert!(!task.is_finished(), "aggregator should remain alive after presentation relist");
-
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn convoy_deletion_removes_its_presentation_workspace_from_the_join() {
-        let convoy = convoy_with_vessel("convoy-a").await;
-        let presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", Some("workspace-1")).await;
-        let (event_tx, _event_rx) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx);
-        let key = ("flotilla".to_string(), "convoy-a".to_string(), "implement".to_string());
-
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
-        aggregator.apply_presentation_event_from(LocalSource::Durable, WatchEvent::Added(presentation)).await;
-        assert_eq!(aggregator.presentation_workspaces.get(&key).map(String::as_str), Some("workspace-1"));
-
-        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Deleted(convoy)).await;
-
-        assert!(!aggregator.presentation_workspaces.contains_key(&key));
-    }
-
-    #[tokio::test]
-    async fn observed_presentation_without_workspace_masks_durable_attach() {
-        let convoy = convoy_with_vessel("convoy-a").await;
-        let durable_presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", Some("stale-workspace")).await;
-        let observed_presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", None).await;
-        let durable_convoys = Arc::new(ScriptedSource::new(
-            vec![ResourceList { items: vec![convoy], resource_version: "1".to_string(), generation: None }],
-            vec![Ok(pending_watch())],
-        ));
-        let durable_presentations = Arc::new(ScriptedSource::new(
-            vec![ResourceList { items: vec![durable_presentation], resource_version: "1".to_string(), generation: None }],
-            vec![Ok(pending_watch())],
-        ));
-        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
-        let observed_presentations = Arc::new(ScriptedSource::new(
-            vec![ResourceList { items: vec![observed_presentation], resource_version: "1".to_string(), generation: None }],
-            vec![Ok(pending_watch())],
-        ));
-        let state = AggregatorProjectionState::new();
-        let (event_tx, mut event_rx) = broadcast::channel(8);
-
-        let run_state = state.clone();
-        let task = tokio::spawn(async move {
-            run_with_test_sources(
-                Aggregator::new(run_state, HostName::new("local"), event_tx),
-                durable_convoys.as_ref(),
-                durable_presentations.as_ref(),
-                observed_convoys.as_ref(),
-                observed_presentations.as_ref(),
-            )
-            .await
-        });
-
-        let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial result set timeout").await;
-        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
-        let row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
-        assert_eq!(row.vessels.first().expect("vessel row").attach, None);
-        assert!(state.result_set().await.rows.as_convoys().expect("convoy rows")[0].vessels[0].attach.is_none());
-        assert!(!task.is_finished(), "aggregator should remain alive");
-
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
     async fn non_expiry_watch_error_still_exits_aggregator() {
         let durable_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(failing_watch("convoy watch failed"))]);
-        let durable_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let observed_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let state = AggregatorProjectionState::new();
         let (event_tx, _event_rx) = broadcast::channel(8);
 
         let result = timeout(
             Duration::from_secs(1),
-            run_with_test_sources(
-                Aggregator::new(state, HostName::new("local"), event_tx),
-                &durable_convoys,
-                &durable_presentations,
-                &observed_convoys,
-                &observed_presentations,
-            ),
+            run_with_test_sources(Aggregator::new(state, HostName::new("local"), event_tx), &durable_convoys, &observed_convoys),
         )
         .await
         .expect("aggregator should return the watch error")
@@ -6691,7 +6352,6 @@ mod tests {
             .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
             .durable_demands(d.using::<Demand>("flotilla"))
             .durable_environments(d.using::<Environment>("flotilla"))
-            .durable_presentations(d.using::<Presentation>("flotilla"))
             .durable_sessions(d.including_replicas::<TerminalSession>("flotilla"))
             .durable_projects(d.including_replicas::<Project>("flotilla"))
             .durable_repositories(d.including_replicas::<Repository>("flotilla"))
@@ -6700,7 +6360,6 @@ mod tests {
             .durable_checkouts(d.including_replicas::<Checkout>("flotilla"))
             .durable_clones(d.using::<CloneResource>("flotilla"))
             .observed_convoys(observed.using::<Convoy>("flotilla"))
-            .observed_presentations(observed.using::<Presentation>("flotilla"))
             .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
             .observed_checkouts(observed.using::<Checkout>("flotilla"))
             .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))

@@ -15,20 +15,8 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
-    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, HopChainContext, PreparedCheckout,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselReconciler,
-};
-use flotilla_core::{
-    path_context::DaemonHostPath,
-    providers::{
-        discovery::{ProviderCategory, ProviderDescriptor},
-        presentation::PresentationManager,
-        registry::ProviderRegistry,
-        terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolTerminalSession},
-        types::{Workspace, WorkspaceAttachRequest},
-    },
-    HostName,
+    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, PreparedCheckout, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
@@ -36,10 +24,9 @@ use flotilla_resources::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
     Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus,
     Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation,
-    PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, StatusPatch,
-    TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
-    VESSEL_REF_LABEL,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Repository,
+    RepositorySpec, ResourceBackend, ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
+    VesselRequirement, VESSEL_REF_LABEL,
 };
 
 use crate::common;
@@ -216,71 +203,6 @@ impl TerminalRuntime for FakeTerminalRuntime {
     }
 
     async fn kill_session(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct FakePresentationManager {
-    created: Mutex<Vec<WorkspaceAttachRequest>>,
-    deleted: Mutex<Vec<String>>,
-}
-
-#[async_trait]
-impl PresentationManager for FakePresentationManager {
-    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
-        Ok(Vec::new())
-    }
-
-    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
-        self.created.lock().expect("created lock").push(config.clone());
-        Ok((format!("workspace:{}", self.created.lock().expect("created lock").len()), Workspace { name: config.name.clone() }))
-    }
-
-    async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        self.deleted.lock().expect("deleted lock").push(ws_ref.to_string());
-        Ok(())
-    }
-
-    fn binding_scope_prefix(&self) -> String {
-        String::new()
-    }
-}
-
-struct FakePresentationTerminalPool;
-
-#[async_trait]
-impl TerminalPool for FakePresentationTerminalPool {
-    async fn list_sessions(&self) -> Result<Vec<PoolTerminalSession>, String> {
-        Ok(Vec::new())
-    }
-
-    async fn ensure_session(
-        &self,
-        _session_name: &str,
-        _command: &str,
-        _cwd: &flotilla_core::path_context::ExecutionEnvironmentPath,
-        _env_vars: &TerminalEnvVars,
-        _tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn attach_args(
-        &self,
-        session_name: &str,
-        _command: &str,
-        _cwd: &flotilla_core::path_context::ExecutionEnvironmentPath,
-        _env_vars: &TerminalEnvVars,
-    ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
-        Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
-    }
-
-    async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
         Ok(())
     }
 }
@@ -810,141 +732,6 @@ async fn terminal_session_controller_marks_session_running() {
             }
         })
         .await;
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn presentation_controller_marks_presentation_active_for_live_convoy_session() {
-    let backend = ResourceBackend::InMemory(Default::default());
-    create_ready_host(&backend, "01HXYZ").await;
-    create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
-    create_convoy_with_single_task(
-        &backend,
-        NAMESPACE,
-        "convoy-a",
-        "implement",
-        "git@github.com:flotilla-org/flotilla.git",
-        "feat/presentation",
-    )
-    .await;
-
-    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
-    let session = sessions
-        .create(
-            &controller_meta()
-                .name("term-a")
-                .labels(
-                    [
-                        (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-                        (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
-                        (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
-                .call(),
-            &flotilla_resources::TerminalSessionSpec {
-                env_ref: "host-direct-01HXYZ".to_string(),
-                role: "coder".to_string(),
-                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/Users/alice/dev/flotilla-repos/convoy-a".to_string(),
-                env: Default::default(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("session create should succeed");
-    sessions
-        .update_status("term-a", &session.metadata.resource_version, &{
-            let mut status = flotilla_resources::TerminalSessionStatus::default();
-            flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
-                configured_limits: None,
-                session_id: "term-a".to_string(),
-                pid: Some(42),
-                started_at: Utc::now(),
-                crew: None,
-                launch_command: "cargo test".to_string(),
-                delivered_message_id: None,
-            }
-            .apply(&mut status);
-            status
-        })
-        .await
-        .expect("session status update should succeed");
-
-    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
-    presentations
-        .create(
-            &controller_meta().name("presentation-a").call(),
-            &PresentationSpec {
-                convoy_ref: "convoy-a".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "convoy-a".to_string(),
-                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-            },
-        )
-        .await
-        .expect("presentation create should succeed");
-
-    let mut registry = ProviderRegistry::new();
-    let manager = Arc::new(FakePresentationManager::default());
-    registry.presentation_managers.insert(
-        "fake".to_string(),
-        ProviderDescriptor::labeled_simple(ProviderCategory::WorkspaceManager, "fake", "Fake", "", "", ""),
-        Arc::clone(&manager) as Arc<dyn PresentationManager>,
-    );
-    registry.terminal_pools.insert(
-        "cleat".to_string(),
-        ProviderDescriptor::labeled_simple(ProviderCategory::TerminalPool, "cleat", "Cleat", "", "", ""),
-        Arc::new(FakePresentationTerminalPool),
-    );
-    let registry = Arc::new(registry);
-    let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
-
-    let mut harness = ControllerLoopHarness::new(backend.clone());
-    harness.spawn(
-        ControllerLoop {
-            primary: presentations.clone(),
-            secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
-            reconciler: PresentationReconciler::new(
-                Arc::new(ProviderPresentationRuntime::new(Arc::clone(&registry), Arc::clone(&policies))),
-                backend.clone(),
-                NAMESPACE,
-                HopChainContext::new(
-                    flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
-                    HostName::new("local"),
-                    {
-                        let path = std::env::temp_dir().join("flotilla-presentation-provisioning-in-memory");
-                        std::fs::create_dir_all(&path).expect("temp config dir should exist");
-                        DaemonHostPath::new(path)
-                    },
-                    move |_env_ref| Ok(Arc::clone(&registry)),
-                ),
-                policies,
-            ),
-            resync_interval: Duration::from_millis(50),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    harness
-        .wait_until(Duration::from_secs(1), || {
-            let presentations = presentations.clone();
-            async move {
-                matches!(
-                    presentations.get("presentation-a").await.ok().and_then(|presentation| presentation.status),
-                    Some(status)
-                        if status.phase == PresentationPhase::Active
-                            && status.observed_presentation_manager.as_deref() == Some("fake")
-                            && status.observed_workspace_ref.as_deref() == Some("workspace:1")
-                )
-            }
-        })
-        .await;
-
-    assert_eq!(manager.created.lock().expect("created lock").len(), 1);
 
     harness.shutdown().await;
 }

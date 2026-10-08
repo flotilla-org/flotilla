@@ -23,6 +23,7 @@ mod owner_gc;
 mod placement_tiebreak_capacity_wait;
 mod platform_vocabulary;
 mod prepared_snapshot_gc;
+mod presentation_retirement;
 mod principal_attention_status_patch;
 mod provisioning_http_wire;
 mod provisioning_resources_in_memory;

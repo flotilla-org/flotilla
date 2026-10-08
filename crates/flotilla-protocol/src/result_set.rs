@@ -2,7 +2,7 @@
 //!
 //! The Aggregator maintains incrementally-updated result sets for a small set
 //! of named queries (e.g. [`QueryId::Convoys`]: Convoys, durable ∪
-//! observed, fleet-merged, joined with Presentation attach state). Clients
+//! observed, fleet-merged, joined with TerminalSession materialization state). Clients
 //! subscribe per query and receive a full [`ResultSet`] followed by
 //! [`ResultDelta`]s. Rows are typed per query; presentation concerns
 //! (columns, labels, tab composition) are consumer config and never appear
@@ -27,7 +27,7 @@ pub type Timestamp = DateTime<Utc>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryId {
-    /// Convoys — durable ∪ observed, fleet-merged, joined with Presentation
+    /// Convoys — durable ∪ observed, fleet-merged, joined with TerminalSession
     /// attach state — fleet-wide (`None`) or in one Project.
     /// Rows are [`ConvoyRow`].
     Convoys { scope: Option<QueryScope> },
@@ -1261,14 +1261,8 @@ pub struct VesselRow {
     pub depends_on: Vec<String>,
     /// Host whose daemon can act on this vessel.
     pub host: HostName,
-    /// Presentation join: the observed workspace reference for this vessel's
-    /// running session. `Some` is a capability fact — the daemon will accept
-    /// an attach on this row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attach: Option<String>,
     /// Terminal-session reference from which a presentation manager can
-    /// materialize this vessel's workspace. This is deliberately distinct
-    /// from `attach`, which names an already-observed PM workspace.
+    /// materialize this vessel's workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialize: Option<String>,
     /// Endpoint of the terminal selected by `materialize`.

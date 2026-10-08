@@ -13,10 +13,10 @@ use flotilla_resources::{
     CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Demand as ResourceDemand, DemandKind, DemandSpec, DemandStatusPatch,
     Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
     EnvironmentStatus as ResourceEnvironmentStatus, Event, FulfilmentKindSpec, HarnessFacts, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation,
-    ProjectRepositoryRole, ProjectRepositorySpec, RepositoryStatus, Selector, TerminalSession as ResourceTerminalSession,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, VirtualClock,
-    WorkflowTemplateSpec, AUTHORITY_LABEL, CONVOY_LABEL, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
+    ProjectRepositorySpec, RepositoryStatus, Selector, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, VirtualClock, WorkflowTemplateSpec,
+    AUTHORITY_LABEL, CONVOY_LABEL, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 
 mod admission;

@@ -748,7 +748,6 @@ mod tests {
                     phase: WorkPhase::Pending,
                     crew: vec![],
                     host: None,
-                    workspace_ref: None,
                     materialize_ref: None,
                     completion_target: None,
                     ready_at: None,

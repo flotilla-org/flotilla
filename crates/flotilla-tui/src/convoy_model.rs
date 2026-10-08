@@ -149,7 +149,6 @@ pub struct VesselSummary {
     pub placement_decision: Option<PlacementDecision>,
     pub crew: Vec<ProcessSummary>,
     pub host: Option<HostName>,
-    pub workspace_ref: Option<String>,
     pub materialize_ref: Option<String>,
     pub completion_target: Option<WorkCompletionTarget>,
     pub ready_at: Option<Timestamp>,
@@ -251,7 +250,6 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         placement_decision: vessel.placement_decision.clone(),
         crew,
         host: Some(vessel.host.clone()),
-        workspace_ref: vessel.attach.clone(),
         materialize_ref: vessel.materialize.clone(),
         completion_target: vessel.complete_work.then(|| WorkCompletionTarget {
             convoy: wire_convoy_address(row),

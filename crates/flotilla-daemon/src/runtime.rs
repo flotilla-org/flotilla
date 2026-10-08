@@ -15,10 +15,9 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     checkout::managed_checkout_reason, checkout_path_component, convoy_ensure::EnsureReconciler, vessel::WorktreeMetadataResolver,
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure,
-    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
+    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, PreparedCheckout,
+    RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness,
+    TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
@@ -56,13 +55,13 @@ use flotilla_resources::{
     EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
     Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     HostSpec, HostStatus, HostStatusPatch, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec, Platform,
-    Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch, WorkflowTemplate,
-    AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
-    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
+    Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError,
+    ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch, WorkflowTemplate, AGENTLESS_CAPABILITY,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS,
+    TRANSPORT_CAPABILITY,
 };
 use futures::{
     stream::{BoxStream, SelectAll},
@@ -714,6 +713,12 @@ impl DaemonRuntime {
         )
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
+        phase(
+            "purge_retired_presentations",
+            flotilla_resources::purge_retired_presentations(&daemon.resource_backend(), &options.namespace),
+        )
+        .await
+        .map_err(|error| format!("purge retired Presentations: {error}"))?;
         phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
@@ -874,8 +879,6 @@ impl DaemonRuntime {
             ))
             .await;
         if options.start_controllers {
-            let local_repo_root =
-                phase("tracked_repo_paths", daemon.tracked_repo_paths()).await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let image_build_runner = {
                 use flotilla_core::{
                     providers::vcs::git_worktree::GitWorktreeStrategy,
@@ -920,7 +923,6 @@ impl DaemonRuntime {
                     Arc::clone(&local_registry),
                     daemon_socket_path.map(DaemonHostPath::new),
                     profile.host_id.clone(),
-                    local_repo_root,
                     profile.host_direct_environment_name(),
                 )
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
@@ -1601,7 +1603,6 @@ struct ControllerRuntimeState {
     local_registry: Arc<ProviderRegistry>,
     local_host_ref: String,
     namespace: String,
-    local_repo_root: Option<ExecutionEnvironmentPath>,
     host_direct_environment_name: String,
     agentless_ssh: HashMap<String, AgentlessSshProfile>,
     environment_tools: EnvironmentToolProvisioner,
@@ -1729,7 +1730,6 @@ impl ControllerRuntimeState {
         local_registry: Arc<ProviderRegistry>,
         daemon_socket_path: Option<DaemonHostPath>,
         local_host_ref: String,
-        local_repo_root: Option<ExecutionEnvironmentPath>,
         host_direct_environment_name: String,
     ) -> Self {
         let environment_tools = EnvironmentToolProvisioner::for_local_host(&daemon, &config, daemon_socket_path.clone());
@@ -1739,7 +1739,6 @@ impl ControllerRuntimeState {
             local_registry,
             local_host_ref,
             namespace: flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE.to_string(),
-            local_repo_root,
             host_direct_environment_name,
             agentless_ssh: HashMap::new(),
             environment_tools,
@@ -4726,38 +4725,6 @@ fn spawn_controller_loops(
                 )
             }
         }),
-        controller!(Presentation, {
-            let state = Arc::clone(&state);
-            move |backend: ResourceBackend, namespace_string: String| {
-                let state = Arc::clone(&state);
-                let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
-                let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
-                let mut hop_chain = HopChainContext::new(
-                    CanonicalHostId::resolved(state.local_host_ref.clone()),
-                    state.daemon.host_name().clone(),
-                    state.config.base_path().clone(),
-                    {
-                        let state = Arc::clone(&state);
-                        move |env_ref| {
-                            if env_ref == state.host_direct_environment_name {
-                                return Ok(Arc::clone(&state.local_registry));
-                            }
-                            state
-                                .daemon
-                                .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
-                                .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
-                        }
-                    },
-                );
-                if let Some(repo_root) = state.local_repo_root.clone() {
-                    hop_chain = hop_chain.with_repo_root(repo_root);
-                }
-                (
-                    PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
-                    PresentationReconciler::new(runtime, backend, &namespace_string, hop_chain, policies),
-                )
-            }
-        }),
         controller!(Convoy, {
             let daemon = Arc::clone(&state.daemon);
             move |backend: ResourceBackend, namespace_string: String| {
@@ -4771,7 +4738,6 @@ fn spawn_controller_loops(
                         .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                         .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
-                        .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                         .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
                         .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
                         .with_forges(backend.definitions::<Forge>(&namespace_string))
@@ -4891,7 +4857,6 @@ fn spawn_aggregator_task(
                             .durable_convoy_ensures(durable.including_replicas::<flotilla_resources::ConvoyEnsure>(&namespace))
                             .durable_demands(durable.clone().using::<Demand>(&namespace))
                             .durable_environments(durable.clone().using::<Environment>(&namespace))
-                            .durable_presentations(durable.using::<Presentation>(&namespace))
                             .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
                             .durable_projects(durable.including_replicas::<Project>(&namespace))
                             .durable_fleet_designation(durable.including_replicas::<flotilla_resources::FleetDesignation>(&namespace))
@@ -4902,7 +4867,6 @@ fn spawn_aggregator_task(
                             // Clone has no replication contract; remote failures arrive through Checkout status.
                             .durable_clones(durable.using::<flotilla_resources::Clone>(&namespace))
                             .observed_convoys(observed.clone().using::<Convoy>(&namespace))
-                            .observed_presentations(observed.using::<Presentation>(&namespace))
                             .observed_sessions(observed.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
                             .observed_checkouts(observed.using::<Checkout>(&namespace))
                             .observed_checkout_replicas(observed.including_replicas::<Checkout>(&namespace))
@@ -8801,7 +8765,7 @@ mod tests {
                     )
                     .expect("register environment");
             }
-            let state = ControllerRuntimeState::new(daemon, config, passthrough_registry(), None, "local".into(), None, "local-env".into());
+            let state = ControllerRuntimeState::new(daemon, config, passthrough_registry(), None, "local".into(), "local-env".into());
             let state = Arc::new(if concurrency == 2 {
                 state
             } else {
@@ -9054,7 +9018,6 @@ mod tests {
                 passthrough_registry(),
                 None,
                 local_host_id.clone(),
-                None,
                 format!("host-direct-{local_host_id}"),
             )
             .with_agentless_ssh(vec![profile]),
@@ -9958,7 +9921,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))),
@@ -10059,7 +10021,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(EnvironmentToolProvisioner::with_unavailable_cleat(
@@ -10203,7 +10164,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
@@ -10291,7 +10251,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
@@ -10376,7 +10335,6 @@ mod tests {
             Arc::new(ProviderRegistry::new()),
             None,
             "host-test".to_string(),
-            None,
             "host-direct-host-test".to_string(),
         )
         .with_agent_material(Arc::clone(&material));
@@ -10498,7 +10456,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
@@ -10588,7 +10545,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
@@ -10694,7 +10650,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
@@ -10793,7 +10748,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_agent_material(agent_material),
@@ -10876,7 +10830,6 @@ mod tests {
             Arc::new(registry),
             None,
             "host-test".into(),
-            None,
             "host-direct-host-test".into(),
         ));
         // Restart discarded both status identity and the in-process handle cache.
@@ -10950,7 +10903,6 @@ mod tests {
             Arc::new(ProviderRegistry::new()),
             Some(DaemonHostPath::new("/tmp/flotilla.sock")),
             "host-test".to_string(),
-            None,
             "host-direct-host-test".to_string(),
         );
 
@@ -11023,7 +10975,6 @@ mod tests {
             Arc::new(registry),
             Some(DaemonHostPath::new("/tmp/flotilla.sock")),
             "host-test".to_string(),
-            None,
             "host-direct-host-test".to_string(),
         ));
 
@@ -11112,7 +11063,6 @@ mod tests {
             Arc::new(registry),
             Some(DaemonHostPath::new("/tmp/flotilla.sock")),
             "host-test".to_string(),
-            None,
             "host-direct-host-test".to_string(),
         );
 
@@ -11148,7 +11098,6 @@ mod tests {
             Arc::new(ProviderRegistry::new()),
             Some(DaemonHostPath::new("/tmp/flotilla.sock")),
             "host-test".to_string(),
-            None,
             "host-direct-host-test".to_string(),
         ));
         let spec = flotilla_resources::DockerEnvironmentSpec {
@@ -11199,7 +11148,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
@@ -12025,7 +11973,6 @@ mod tests {
             passthrough_registry(),
             None,
             "test-host".to_string(),
-            None,
             "host-direct-test-host".to_string(),
         );
         let custom_root = temp.path().join("custom/.flotilla-archives");
@@ -12699,7 +12646,6 @@ mod tests {
             passthrough_registry(),
             None,
             kiwi_host_ref.clone(),
-            None,
             kiwi_profile.host_direct_environment_name(),
         ));
         let feta_registry = if docker {
@@ -12721,7 +12667,6 @@ mod tests {
                 feta_registry,
                 docker.then(|| DaemonHostPath::new(temp.path().join("flotilla.sock"))),
                 feta_host_ref.clone(),
-                None,
                 feta_profile.host_direct_environment_name(),
             )
             .with_environment_tools(fixed_environment_tools(temp.path())),
@@ -12942,7 +12887,6 @@ mod tests {
             passthrough_registry(),
             None,
             "host-test".to_string(),
-            None,
             "host-direct-host-test".to_string(),
         );
         let env_id = EnvironmentId::new("contained-work");
@@ -13209,7 +13153,6 @@ mod tests {
             passthrough_registry(),
             None,
             "test-host".into(),
-            None,
             "host-direct-test".into(),
         )
         .with_credential_store(store.clone());
@@ -13369,7 +13312,6 @@ mod tests {
             passthrough_registry(),
             None,
             "test-host".to_string(),
-            None,
             "host-direct-test".to_string(),
         )
         .with_credential_store(store);
@@ -13752,7 +13694,6 @@ mod tests {
             passthrough_registry(),
             None,
             daemon.local_host_id().expect("host").to_string(),
-            None,
             "host-direct-test".into(),
         ));
         let runtime = DockerControllerRuntime { state };
@@ -13838,7 +13779,6 @@ mod tests {
                 registry,
                 None,
                 restarted.local_host_id().expect("local host identity").to_string(),
-                None,
                 "host-direct-test".to_string(),
             ));
 
@@ -13881,7 +13821,6 @@ mod tests {
             adoption_registry(Vec::new()),
             None,
             daemon.local_host_id().expect("local host identity").to_string(),
-            None,
             "host-direct-test".to_string(),
         ));
 
@@ -13921,7 +13860,6 @@ mod tests {
             adoption_registry(vec![handle]),
             None,
             daemon.local_host_id().expect("local host identity").to_string(),
-            None,
             "host-direct-test".to_string(),
         ));
 
@@ -14002,7 +13940,6 @@ mod tests {
             adoption_registry(vec![handle(bad_id.clone()), handle(good_id.clone())]),
             None,
             daemon.local_host_id().expect("local host identity").to_string(),
-            None,
             "host-direct-test".to_string(),
         ));
 
@@ -14042,7 +13979,6 @@ mod tests {
                 passthrough_registry(),
                 None,
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )),
         };
@@ -14097,7 +14033,6 @@ mod tests {
                 Arc::new(local_registry),
                 Some(DaemonHostPath::new("/tmp/flotilla.sock")),
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
@@ -15647,7 +15582,6 @@ mod tests {
                 registry,
                 None,
                 profile.host_id.clone(),
-                None,
                 profile.host_direct_environment_name(),
             )),
         };
@@ -15841,7 +15775,6 @@ mod tests {
                         registry,
                         None,
                         profile.host_id.clone(),
-                        None,
                         profile.host_direct_environment_name(),
                     )),
                 });
@@ -16032,7 +15965,6 @@ mod tests {
                 registry,
                 None,
                 profile.host_id.clone(),
-                None,
                 profile.host_direct_environment_name(),
             )),
         });
@@ -16266,7 +16198,6 @@ mod tests {
                 registry,
                 None,
                 profile.host_id.clone(),
-                None,
                 profile.host_direct_environment_name(),
             )),
         };
@@ -16773,7 +16704,6 @@ mod tests {
             restarted_registry,
             None,
             profile.host_id.clone(),
-            None,
             profile.host_direct_environment_name(),
         ));
         let loop_task = tokio::spawn(
@@ -16832,7 +16762,6 @@ mod tests {
         daemon: Arc<InProcessDaemon>,
         config: Arc<ConfigStore>,
         repo_default_dir: PathBuf,
-        repo: PathBuf,
         completion_action: CompletionAction,
     ) {
         std::fs::create_dir_all(&repo_default_dir).expect("repo default dir");
@@ -16850,7 +16779,6 @@ mod tests {
             passthrough_registry(),
             None,
             profile.host_id.clone(),
-            Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
         let controller_handles = spawn_controller_loops(
@@ -18087,7 +18015,7 @@ mod tests {
             Some(Arc::new(FakeChangeRequest::new())),
         )
         .await;
-        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Retain).await;
     }
 
     #[tokio::test]
@@ -18112,7 +18040,7 @@ mod tests {
             Some(Arc::new(FakeChangeRequest::new())),
         )
         .await;
-        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Retain).await;
     }
 
     #[tokio::test]
@@ -18150,7 +18078,7 @@ mod tests {
         )
         .await;
 
-        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Delete).await;
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, CompletionAction::Delete).await;
     }
 
     #[tokio::test]
@@ -18293,7 +18221,6 @@ mod tests {
                 Arc::new(ProviderRegistry::new()),
                 None,
                 "host-test".to_string(),
-                None,
                 "host-direct-host-test".to_string(),
             )
             .with_credential_store(credential_store)
@@ -18427,7 +18354,6 @@ mod tests {
             local_registry,
             None,
             profile.host_id.clone(),
-            None,
             profile.host_direct_environment_name(),
         ));
         let session_name = "terminal-demo-implement-coder";
@@ -18518,7 +18444,6 @@ mod tests {
                 local_registry,
                 None,
                 profile.host_id.clone(),
-                None,
                 profile.host_direct_environment_name(),
             )),
         };
@@ -18576,7 +18501,6 @@ mod tests {
                     local_registry,
                     None,
                     profile.host_id.clone(),
-                    None,
                     profile.host_direct_environment_name(),
                 )
                 .with_agent_material(Arc::clone(&material)),
@@ -18673,7 +18597,6 @@ mod tests {
                 local_registry,
                 None,
                 profile.host_id.clone(),
-                None,
                 profile.host_direct_environment_name(),
             )),
         };
@@ -18735,7 +18658,6 @@ mod tests {
             local_registry,
             None,
             profile.host_id.clone(),
-            Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
         let controller_handles = spawn_controller_loops(
@@ -19136,7 +19058,6 @@ mod tests {
             local_registry,
             None,
             profile.host_id.clone(),
-            Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
         let controller_handles = spawn_controller_loops(
@@ -19386,7 +19307,6 @@ mod tests {
             passthrough_registry(),
             None,
             profile.host_id.clone(),
-            Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
         let controller_handles = spawn_controller_loops(
