@@ -180,3 +180,24 @@ until a companion is created. `ForgeReadHeartbeat` is a newly registered
 observation resource; no existing stored shape was replaced. Older binaries do not understand the new companion kind or its freshness and
 demand renewals; fleet rollout must upgrade source owners and readers together
 before relying on change-only publication.
+
+## User-visible freshness and cooldown
+
+The board intentionally refreshes an open PR's CI rollup only when that PR's
+`updated_at` moves. Check completion alone may not move that revision, so the
+board's CI can remain pending until a subsequent PR update. This follows
+#2928's updated-at-only board-detail contract and avoids timed PR-only rollup
+batches. Dedicated change-request observation still validates commit statuses
+and check runs independently; use that observation for current PR CI.
+
+The 100-point low-budget cooldown is shared by every GraphQL consumer of the
+host credential, including interactive reads and dedicated PR observation.
+Those calls refuse until the reported reset deadline instead of spending the
+remaining quota. Board reads retain their last good facts with the refresh
+error; REST reads use their separate budget. `fleet health` exposes the retry
+deadline and remaining quota.
+
+Retention scans local reads and heartbeats independently. An externally deleted
+whole-read record cannot leave its heartbeat forever: idle companions retire
+at the one-hour boundary. A fresh lease from any origin protects both kinds,
+and cleanup re-reads leases after servicing slow observations.

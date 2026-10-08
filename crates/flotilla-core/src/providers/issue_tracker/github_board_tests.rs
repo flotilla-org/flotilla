@@ -459,3 +459,56 @@ async fn board_empty_inventory_enters_incremental_state_across_restart() {
     assert_eq!(forge.graphql_calls.load(Ordering::SeqCst), 1);
     assert!(forge.requests.lock().unwrap().is_empty());
 }
+
+// The contract's updated_at-only detail invalidation deliberately caches board
+// CI, even when the forge's checks finish without a PR revision change. Quiet
+// polls must not request check endpoints or GraphQL rollups; a PR revision bump
+// fetches the latest rollup. Dedicated PR observation remains independently fresh.
+#[tokio::test]
+async fn board_ci_rollup_waits_for_pr_revision_change() {
+    let listing = |kind: &str, state: &str| format!("repos/team/repo/{kind}?state={state}&sort=updated&direction=desc&per_page=100&page=1");
+    let pr = json!({"number":10,"state":"open","updated_at":"2026-10-08T00:00:00Z"});
+    let graph = |state: &str| {
+        rest(
+            "rollup",
+            json!({"data":{"rateLimit":{"cost":1,"remaining":4000},"repository":{
+                "pr10":{"number":10,"state":"OPEN","url":"https://github.com/team/repo/pull/10","mergedAt":null,"mergeStateStatus":"CLEAN",
+                    "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"nodes":[{"state":state}],"pageInfo":{"hasNextPage":false}}}}}]}}
+            }}}),
+        )
+    };
+    let forge = Arc::new(ScriptForge {
+        requests: Mutex::new(std::collections::VecDeque::from([
+            (listing("issues", "open"), rest("empty-issues", json!([]))),
+            (listing("pulls", "open"), rest("pr-open", json!([pr.clone()]))),
+            ("pullRequest(number:10)".into(), graph("PENDING")),
+        ])),
+        graphql_calls: AtomicUsize::new(0),
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let first = provider(forge.clone(), directory.path());
+    assert_eq!(first.dispatch_board(&source()).await.unwrap().pull_requests[0].ci, "pending");
+    let state = first.poll.load("team/repo").unwrap();
+    let cursor: chrono::DateTime<chrono::Utc> = state.issues.cursor.unwrap().parse().unwrap();
+    let since =
+        urlencoding::encode(&(cursor - chrono::Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).into_owned();
+    // The forge now has a successful rollup, but the PR listing revision is
+    // unchanged. Any attempt to request fresh detail here fails this script.
+    forge.requests.lock().unwrap().extend([
+        (listing("issues", "all"), rest("empty-all", json!([]))),
+        (format!("{}&since={since}", listing("issues", "all")), rest("empty-delta", json!([]))),
+        (listing("pulls", "all"), rest("same-pr", json!([pr.clone()]))),
+    ]);
+    assert_eq!(provider(forge.clone(), directory.path()).dispatch_board(&source()).await.unwrap().pull_requests[0].ci, "pending");
+    assert_eq!(forge.graphql_calls.load(Ordering::SeqCst), 1);
+    let mut changed_pr = pr;
+    changed_pr["updated_at"] = json!("2026-10-08T00:01:00Z");
+    forge.requests.lock().unwrap().extend([
+        (listing("issues", "all"), "HTTP/2 304 Not Modified\r\n\r\n".into()),
+        (listing("pulls", "all"), rest("changed-pr", json!([changed_pr]))),
+        ("pullRequest(number:10)".into(), graph("SUCCESS")),
+    ]);
+    assert_eq!(provider(forge.clone(), directory.path()).dispatch_board(&source()).await.unwrap().pull_requests[0].ci, "success");
+    assert_eq!(forge.graphql_calls.load(Ordering::SeqCst), 2);
+    assert!(forge.requests.lock().unwrap().is_empty());
+}

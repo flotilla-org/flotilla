@@ -322,6 +322,26 @@ mod tests {
         }
     }
 
+    // Cancellation accounting must survive an already poisoned diagnostics
+    // mutex during unwinding, count the attempt, and leave cost unknown.
+    #[tokio::test]
+    async fn cancelled_attempt_survives_poisoned_budget_lock() {
+        let budgets = ForgeBudgets::default();
+        let state = budgets.state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison diagnostics lock");
+        })
+        .join()
+        .is_err());
+        let attempt = BudgetAttempt { budgets: &budgets, key: Some(("host gh login", "GraphQL")) };
+        drop(attempt);
+        let row = budgets.rows("host").pop().expect("cancelled attempt row");
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.unreported_calls, 1);
+        assert_eq!(row.reported_cost, 0);
+    }
+
     // REST diagnostics conservatively count attempts, including HTTP failures
     // and failures whose transport result cannot prove that no request arrived.
     #[hegel::test]

@@ -582,23 +582,43 @@ impl crate::in_process::InProcessDaemon {
                 }
             })
             .await;
-        // Retire only this root's idle requests; replicas follow tombstones.
-        let local = backend.using::<ForgeRead>(&namespace);
-        for record in local.list().await.map_err(|e| e.to_string())?.items {
-            let demanded_at = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at).max(record.spec.demanded_at);
-            if Utc::now().signed_duration_since(demanded_at) >= DEMAND_RETENTION {
-                if let Err(error) = backend.using::<ForgeReadHeartbeat>(&namespace).delete(&record.metadata.name).await {
-                    if !matches!(error, ResourceError::NotFound { .. }) {
-                        tracing::debug!(name = %record.metadata.name, %error, "idle forge heartbeat cleanup failed");
-                    }
-                }
-                if let Err(error) = local.delete(&record.metadata.name).await {
-                    tracing::debug!(name = %record.metadata.name, %error, "idle forge demand cleanup failed");
-                }
-            }
-        }
+        retire_idle_reads(&backend, &namespace, Utc::now()).await?;
         Ok(())
     }
+}
+
+// Take a fresh lease snapshot after servicing potentially slow reads. Retire
+// each local kind independently: deleting a whole read must not orphan its
+// companion forever, and renewal at any origin keeps both kinds alive.
+async fn retire_idle_reads(backend: &ResourceBackend, namespace: &str, now: DateTime<Utc>) -> Result<(), String> {
+    let mut demands = BTreeMap::new();
+    for record in backend.including_replicas::<ForgeRead>(namespace).list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
+        *demand = (*demand).max(record.object.spec.demanded_at);
+    }
+    for record in backend.including_replicas::<ForgeReadHeartbeat>(namespace).list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.entry(record.object.metadata.name).or_insert(record.object.spec.demanded_at);
+        *demand = (*demand).max(record.object.spec.demanded_at);
+    }
+    let reads = backend.using::<ForgeRead>(namespace);
+    for record in reads.list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at);
+        if now.signed_duration_since(demand) >= DEMAND_RETENTION {
+            if let Err(error) = reads.delete(&record.metadata.name).await {
+                tracing::debug!(name = %record.metadata.name, %error, "idle forge demand cleanup failed");
+            }
+        }
+    }
+    let pulses = backend.using::<ForgeReadHeartbeat>(namespace);
+    for record in pulses.list().await.map_err(|e| e.to_string())?.items {
+        let demand = demands.get(&record.metadata.name).copied().unwrap_or(record.spec.demanded_at);
+        if now.signed_duration_since(demand) >= DEMAND_RETENTION {
+            if let Err(error) = pulses.delete(&record.metadata.name).await {
+                tracing::debug!(name = %record.metadata.name, %error, "idle forge heartbeat cleanup failed");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub struct ObservedChangeRequestTracker {
@@ -681,6 +701,50 @@ mod tests {
         let mut reads = ForgeReads::new(backend(root), "flotilla".into());
         reads.clock = clock.clone();
         (reads, clock)
+    }
+
+    // An externally removed parent leaves a live demand companion until its
+    // lease expires; at the retention boundary even an orphan is tombstoned.
+    // A new read afterwards recreates the pair and resumes normally.
+    #[tokio::test]
+    async fn orphan_heartbeat_retires_at_retention_and_can_be_recreated() {
+        let (reads, clock) = clocked_reads("owner");
+        let source = source();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        reads.backend.using::<ForgeRead>("flotilla").delete(&name).await.unwrap();
+        clock.advance(DEMAND_RETENTION - Duration::seconds(1));
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
+        clock.advance(Duration::seconds(1));
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(matches!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+        assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Ok(43_u64) }).await.unwrap(), 43);
+    }
+
+    // Fresh demand arriving from another origin protects an old local pair.
+    // Expiration deletes only local records, never the replicated demand.
+    #[tokio::test]
+    async fn replicated_demand_renews_retention_for_both_kinds() {
+        let (reads, clock) = clocked_reads("owner");
+        let source = source();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap();
+        clock.advance(DEMAND_RETENTION);
+        let peer = backend("peer");
+        peer.using::<ForgeReadHeartbeat>("flotilla")
+            .create(&meta(&name), &ForgeReadHeartbeatSpec { demanded_at: clock.now() })
+            .await
+            .unwrap();
+        replicate::<ForgeReadHeartbeat>(&peer, &reads.backend).await;
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(reads.backend.using::<ForgeRead>("flotilla").get(&name).await.is_ok());
+        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
+        clock.advance(DEMAND_RETENTION);
+        retire_idle_reads(&reads.backend, "flotilla", clock.now()).await.unwrap();
+        assert!(matches!(reads.backend.using::<ForgeRead>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+        assert!(matches!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+        assert!(peer.using::<ForgeReadHeartbeat>("flotilla").get(&name).await.is_ok());
     }
 
     // Minute refreshes retain one whole-board publication, while demand renews
