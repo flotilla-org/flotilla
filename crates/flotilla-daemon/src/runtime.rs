@@ -5360,6 +5360,8 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 })
                 .map(|name| name[..39].to_string())
                 .unwrap_or_else(|| "unowned".to_string());
+            // A failed owner lookup may archive under this fallback rather than
+            // the later-resolved convoy. Preserve the logs and continue cleanup.
             match environment {
                 Ok(environment) => {
                     if let Some(owner) = environment.metadata.owner_references.iter().find(|owner| owner.kind == "Vessel") {
