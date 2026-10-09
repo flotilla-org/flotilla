@@ -16,11 +16,10 @@ use flotilla_resources::{
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase,
     ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource, CrewWorkPhase,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
-    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec,
-    RepositoryKey, ResourceBackend, ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError,
-    Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, RepositoryKey, ResourceBackend,
+    ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 use crate::common;
@@ -465,14 +464,12 @@ async fn reconcile_once_with_resources(
     convoy: &flotilla_resources::ResourceObject<Convoy>,
     template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
     workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
-    presentations: Vec<flotilla_resources::ResourceObject<Presentation>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
-    let presentations_resolver = backend.clone().using::<Presentation>("flotilla");
 
     if let Some(template) = template {
         templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
@@ -497,22 +494,6 @@ async fn reconcile_once_with_resources(
                 .update_status(&workspace.metadata.name, &created.metadata.resource_version, status)
                 .await
                 .expect("workspace status update should succeed");
-        }
-    }
-
-    for presentation in presentations {
-        let created = presentations_resolver
-            .create(
-                &presentation_meta(&presentation.metadata.name, &presentation.spec.convoy_ref, &presentation.spec.name),
-                &presentation.spec,
-            )
-            .await
-            .expect("presentation create should succeed");
-        if let Some(status) = presentation.status.as_ref() {
-            presentations_resolver
-                .update_status(&presentation.metadata.name, &created.metadata.resource_version, status)
-                .await
-                .expect("presentation status update should succeed");
         }
     }
 
@@ -943,35 +924,6 @@ fn vessel_object_with_local_image_id(
             credential_delivery_retry: None,
             credential_refresh_retry: None,
         }),
-    }
-}
-
-fn presentation_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
-    InputMeta::builder()
-        .name(name.to_string())
-        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string()), (VESSEL_LABEL.to_string(), task.to_string())]))
-        .owner_references(vec![OwnerReference {
-            api_version: "flotilla.work/v1".to_string(),
-            kind: "Convoy".to_string(),
-            name: convoy_name.to_string(),
-            controller: true,
-        }])
-        .build()
-}
-
-fn presentation_object(convoy_name: &str, task: &str) -> flotilla_resources::ResourceObject<Presentation> {
-    flotilla_resources::ResourceObject {
-        metadata: common::object_meta(&format!("{convoy_name}-{task}"), "flotilla", "23"),
-        spec: PresentationSpec {
-            convoy_ref: convoy_name.to_string(),
-            presentation_policy_ref: "default".to_string(),
-            name: task.to_string(),
-            process_selector: BTreeMap::from([
-                (CONVOY_LABEL.to_string(), convoy_name.to_string()),
-                (VESSEL_LABEL.to_string(), task.to_string()),
-            ]),
-        },
-        status: None,
     }
 }
 
@@ -2422,14 +2374,14 @@ async fn ready_task_emits_vessel_creation_actuation() {
     status.work.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(20)).await;
 
     assert!(matches!(
         outcome.patch,
         Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(started_at), finished_at: None })
             if started_at == timestamp(20)
     ));
-    // Step 3 leaves only Vessel creation; no Presentation accompanies it.
+    // Ready work creates its Vessel.
     assert_eq!(outcome.actuations.len(), 1);
     match outcome
         .actuations
@@ -2451,7 +2403,6 @@ async fn ready_task_emits_vessel_creation_actuation() {
         }
         other => panic!("expected task workspace actuation, got {other:?}"),
     }
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
 }
 
 #[tokio::test]
@@ -2461,14 +2412,9 @@ async fn ready_task_with_ready_workspace_moves_to_launching() {
     status.work.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        Vec::new(),
-        timestamp(20),
-    )
-    .await;
+    let outcome =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(20))
+            .await;
     let expected_checkout_refs = serde_json::to_value(BTreeMap::from([(
         flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key(),
         "checkout-implement".to_string(),
@@ -2499,7 +2445,6 @@ async fn same_image_tag_moving_between_convoys_produces_distinct_settlement_test
             &convoy,
             None,
             vec![vessel_object_with_local_image_id(convoy_name, "implement", VesselPhase::Ready, None, digest)],
-            Vec::new(),
             timestamp(20),
         )
         .await;
@@ -2526,14 +2471,9 @@ async fn launching_task_with_ready_workspace_moves_to_running() {
     status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        Vec::new(),
-        timestamp(20),
-    )
-    .await;
+    let outcome =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(20))
+            .await;
 
     assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::WorkRunning { ref work, .. }) if work == "implement"));
 }
@@ -2549,7 +2489,6 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
         &convoy,
         None,
         vec![vessel_object("convoy-a", "implement", VesselPhase::Failed, Some("terminal session crashed"))],
-        Vec::new(),
         timestamp(21),
     )
     .await;
@@ -2626,11 +2565,11 @@ async fn governor_deleting_failed_vessel_records_retry_before_it_disappears() {
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
     let mut vessel = vessel_object("standing", "implement", VesselPhase::Failed, Some("skill staging failed during reboot"));
     vessel.metadata.deletion_timestamp = Some(timestamp(20));
-    let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(21)).await;
+    let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], timestamp(21)).await;
     assert!(!outcome.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. } | Actuation::DeleteVessel { .. })));
     outcome.patch.expect("persist failure during finalization").apply(convoy.status.as_mut().expect("status"));
     assert_eq!(convoy.status.as_ref().expect("status").work["implement"].message.as_deref(), Some("skill staging failed during reboot"));
-    let missing = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(22)).await;
+    let missing = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(22)).await;
     assert!(!missing.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. })));
 }
 
@@ -2647,7 +2586,7 @@ async fn governor_does_not_recreate_an_existing_or_deleting_vessel() {
             convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
             let mut vessel = vessel_object("standing", "implement", phase, None);
             vessel.metadata.deletion_timestamp = deleting.then_some(timestamp(20));
-            let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(21)).await;
+            let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel], timestamp(21)).await;
             assert!(!outcome.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. })));
             if deleting {
                 assert!(!matches!(outcome.patch, Some(ConvoyStatusPatch::WorkRunning { .. })), "finalizing child cannot recover work");
@@ -2680,18 +2619,18 @@ fn governor_failure_create_rate_is_bounded(tc: hegel::TestCase) {
         let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
         convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
         let failed = vessel_object("standing", "implement", VesselPhase::Failed, Some("skill staging failed: source unavailable"));
-        let first = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], Vec::new(), timestamp(0)).await;
+        let first = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], timestamp(0)).await;
         first.patch.expect("retry").apply(convoy.status.as_mut().expect("status"));
         let mut creates = 0;
         let mut deadline = 30;
         for attempt in 1..=8 {
             for second in [deadline - 1, deadline + late_tick] {
                 for _ in 0..bursts {
-                    let outcome = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], Vec::new(), timestamp(second)).await;
+                    let outcome = reconcile_once_with_resources(&convoy, None, vec![failed.clone()], timestamp(second)).await;
                     let deleted = outcome.actuations.iter().any(|act| matches!(act, Actuation::DeleteVessel { .. }));
                     assert_eq!(deleted, second >= deadline);
                     if deleted {
-                        let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(second)).await;
+                        let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(second)).await;
                         creates += absent.actuations.iter().filter(|act| matches!(act, Actuation::CreateVessel { .. })).count();
                         absent.patch.expect("reserve next retry").apply(convoy.status.as_mut().expect("status"));
                         let retry =
@@ -2718,13 +2657,13 @@ async fn governor_provisioning_failure_backs_off_across_watch_ticks() {
     let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".into(), "governor".into());
     let failed_vessel = skill_failure_vessel(&convoy).await;
-    let failed = reconcile_once_with_resources(&convoy, None, vec![failed_vessel.clone()], Vec::new(), timestamp(21)).await;
+    let failed = reconcile_once_with_resources(&convoy, None, vec![failed_vessel.clone()], timestamp(21)).await;
     failed.patch.expect("visible failure and retry").apply(convoy.status.as_mut().expect("status"));
     assert!(convoy.status.as_ref().expect("status").work["implement"].message.as_ref().expect("cause").contains("skill staging"));
     // Every call constructs a new reconciler; the retry must be stored, not local.
     for second in 22..51 {
         for vessels in [vec![failed_vessel.clone()], Vec::new()] {
-            let outcome = reconcile_once_with_resources(&convoy, None, vessels, Vec::new(), timestamp(second)).await;
+            let outcome = reconcile_once_with_resources(&convoy, None, vessels, timestamp(second)).await;
             assert!(
                 !outcome.actuations.iter().any(|act| matches!(act, Actuation::CreateVessel { .. } | Actuation::DeleteVessel { .. })),
                 "no churn before backoff expires"
@@ -2745,7 +2684,6 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
         &convoy,
         None,
         vec![vessel_object("standing", "implement", VesselPhase::Failed, Some("container stopped after reboot"))],
-        Vec::new(),
         timestamp(21),
     )
     .await;
@@ -2757,7 +2695,7 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
 
     failed.patch.expect("interrupted work").apply(convoy.status.as_mut().expect("status"));
     assert_ne!(convoy.status.as_ref().expect("status").phase, ConvoyPhase::Failed);
-    let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(51)).await;
+    let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(51)).await;
     assert_eq!(absent.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 1);
     assert!(!matches!(absent.patch, Some(ConvoyStatusPatch::MarkWorkFailed { .. })));
 
@@ -2765,19 +2703,13 @@ async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failin
         &convoy,
         None,
         vec![vessel_object("standing", "implement", VesselPhase::Pending, None)],
-        Vec::new(),
         timestamp(52),
     )
     .await;
     assert_eq!(provisioning.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 0);
-    let recovered = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("standing", "implement", VesselPhase::Ready, None)],
-        Vec::new(),
-        timestamp(53),
-    )
-    .await;
+    let recovered =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("standing", "implement", VesselPhase::Ready, None)], timestamp(53))
+            .await;
     assert!(matches!(recovered.patch, Some(ConvoyStatusPatch::WorkRunning { .. })));
     assert_eq!(recovered.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 0);
 }
@@ -2790,11 +2722,11 @@ async fn ensured_work_with_missing_vessel_observation_stalls_without_admitting_a
     let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
     convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
 
-    let first = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(21)).await;
+    let first = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(21)).await;
     assert!(matches!(first.patch, Some(ConvoyStatusPatch::RollUpWork { phase: WorkPhase::Stalled, .. })));
     assert!(!first.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
     first.patch.expect("stall patch").apply(convoy.status.as_mut().expect("status"));
-    let second = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(22)).await;
+    let second = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(22)).await;
     assert!(second.patch.is_none(), "missing observation stays stalled");
     assert!(!second.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
 }
@@ -2806,7 +2738,7 @@ async fn interrupted_non_ensured_work_without_a_vessel_does_not_create_one() {
     status.work.get_mut("implement").expect("work").phase = WorkPhase::Interrupted;
     let convoy = convoy_object("manual", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(21)).await;
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(21)).await;
     assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
 }
 
@@ -2823,7 +2755,6 @@ async fn running_agent_work_with_an_interrupted_vessel_becomes_recoverable() {
         &convoy,
         None,
         vec![vessel_object("convoy-a", "implement", VesselPhase::Interrupted, Some("crew terminal session disappeared; relaunching"))],
-        Vec::new(),
         timestamp(21),
     )
     .await;
@@ -2848,14 +2779,9 @@ async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_read
         Some("crew session for `coder` was interrupted".to_string());
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        Vec::new(),
-        timestamp(22),
-    )
-    .await;
+    let outcome =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(22))
+            .await;
 
     let patch = outcome.patch.expect("running work patch");
     assert!(matches!(patch, ConvoyStatusPatch::WorkRunning { ref work, .. } if work == "implement"));
@@ -2865,21 +2791,6 @@ async fn interrupted_agent_work_returns_to_running_only_after_its_vessel_is_read
     assert_eq!(recovered.work["implement"].message, None);
     assert_eq!(recovered.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(recovered.crew_work["implement"]["coder"].message, None);
-}
-
-#[tokio::test]
-async fn active_convoy_does_not_recreate_existing_presentation() {
-    let mut status = bootstrapped_tool_only_convoy_status();
-    status.phase = ConvoyPhase::Active;
-    status.started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
-    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-
-    let outcome =
-        reconcile_once_with_resources(&convoy, None, Vec::new(), vec![presentation_object("convoy-a", "implement")], timestamp(20)).await;
-
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
 }
 
 #[tokio::test]
@@ -2900,16 +2811,15 @@ async fn completed_work_without_a_landing_claim_keeps_resources_warm() {
             vessel_object("convoy-a", "implement", VesselPhase::Ready, None),
             vessel_object("convoy-a", "review", VesselPhase::Ready, None),
         ],
-        vec![presentation_object("convoy-a", "implement"), presentation_object("convoy-a", "review")],
         timestamp(20),
     )
     .await;
 
     assert_eq!(outcome.patch, None);
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(
-        actuation,
-        Actuation::DeletePresentation { .. } | Actuation::DeleteVessel { .. } | Actuation::DeleteCheckout { .. }
-    )));
+    assert!(!outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. } | Actuation::DeleteCheckout { .. })));
 }
 
 #[tokio::test]
@@ -2932,13 +2842,11 @@ async fn completed_agent_work_without_a_landing_claim_keeps_vessel_available_for
             vessel_object("convoy-a", "implement", VesselPhase::Ready, None),
             vessel_object("convoy-a", "review", VesselPhase::Ready, None),
         ],
-        vec![presentation_object("convoy-a", "implement"), presentation_object("convoy-a", "review")],
         timestamp(20),
     )
     .await;
 
     assert_eq!(outcome.patch, None);
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeletePresentation { .. })));
     assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. })));
 }
 
@@ -2953,24 +2861,11 @@ async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
     }
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        vec![presentation_object("convoy-a", "implement"), presentation_object("convoy-a", "review")],
-        timestamp(21),
-    )
-    .await;
+    let outcome =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(21))
+            .await;
 
     assert_eq!(outcome.patch, None);
-    assert!(!outcome
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-implement")));
-    assert!(!outcome
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-review")));
     assert!(outcome
         .actuations
         .iter()
@@ -3082,7 +2977,7 @@ async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_re
 }
 
 #[tokio::test]
-async fn terminal_completed_convoy_reclaims_vessel_without_presentation_dependency() {
+async fn terminal_completed_convoy_reclaims_vessel() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Landed;
     status.finished_at = Some(timestamp(20));
@@ -3092,17 +2987,11 @@ async fn terminal_completed_convoy_reclaims_vessel_without_presentation_dependen
     }
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        Vec::new(),
-        timestamp(21),
-    )
-    .await;
+    let outcome =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(21))
+            .await;
 
     assert_eq!(outcome.patch, None);
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeletePresentation { .. })));
     assert!(outcome
         .actuations
         .iter()
@@ -3120,20 +3009,15 @@ async fn completing_one_task_keeps_active_convoy_resources_warm() {
     status.work.get_mut("review").expect("review task").started_at = Some(timestamp(18));
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)],
-        vec![presentation_object("convoy-a", "implement"), presentation_object("convoy-a", "review")],
-        timestamp(20),
-    )
-    .await;
+    let outcome =
+        reconcile_once_with_resources(&convoy, None, vec![vessel_object("convoy-a", "implement", VesselPhase::Ready, None)], timestamp(20))
+            .await;
 
     let deletes: Vec<_> = outcome
         .actuations
         .iter()
         .filter_map(|actuation| match actuation {
-            Actuation::DeletePresentation { name } => Some(name.clone()),
+            Actuation::DeleteVessel { name } => Some(name.clone()),
             _ => None,
         })
         .collect();
@@ -3336,7 +3220,7 @@ async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() 
         let message = "lost, recoverable: container gone; rehydration is not available yet (#2872)";
         let vessel = vessel_object("convoy-a", "implement", VesselPhase::Lost, Some(message));
         let mut convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-        let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel.clone()], Vec::new(), timestamp(21)).await;
+        let outcome = reconcile_once_with_resources(&convoy, None, vec![vessel.clone()], timestamp(21)).await;
         let patch = outcome.patch.expect("loss interrupts work");
         assert!(matches!(&patch, ConvoyStatusPatch::WorkInterrupted { message: reason, .. } if reason == message), "{patch:?}");
         patch.apply(convoy.status.as_mut().expect("status"));
@@ -3350,33 +3234,9 @@ async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() 
         // Reconstruct persisted evidence into a fresh backend, as on restart.
         let convoy = serde_json::from_value(serde_json::to_value(convoy).expect("persist convoy")).expect("restore convoy");
         let vessel = serde_json::from_value(serde_json::to_value(vessel).expect("persist vessel")).expect("restore vessel");
-        let again = reconcile_once_with_resources(&convoy, None, vec![vessel], Vec::new(), timestamp(22)).await;
+        let again = reconcile_once_with_resources(&convoy, None, vec![vessel], timestamp(22)).await;
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkInterrupted { .. })), "restart must not repeat loss roll-up");
         assert!(!again.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
     }
-}
-
-// Step 3 retires Presentation creation for every active work phase, with or
-// without a leftover row. Real in-memory resource collaborators exercise prepare.
-#[hegel::test]
-fn convoy_never_creates_presentations(tc: hegel::TestCase) {
-    let phase = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
-    let leftover = tc.draw(hegel::generators::booleans());
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(async {
-        let mut status = bootstrapped_tool_only_convoy_status();
-        status.phase = ConvoyPhase::Active;
-        let work = status.work.get_mut("implement").expect("work");
-        work.phase = [WorkPhase::Ready, WorkPhase::Launching, WorkPhase::Running, WorkPhase::Stalled][phase as usize];
-        work.ready_at = Some(timestamp(12));
-        work.started_at = Some(timestamp(18));
-        let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
-        let leftovers = if leftover { vec![presentation_object("convoy-a", "implement")] } else { Vec::new() };
-        let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), leftovers, timestamp(20)).await;
-        assert!(!outcome
-            .actuations
-            .iter()
-            .any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. } | Actuation::DeletePresentation { .. })));
-    });
 }

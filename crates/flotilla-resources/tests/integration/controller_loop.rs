@@ -12,9 +12,8 @@ use flotilla_resources::{
         Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
         ReconcileOutcome, Reconciler, ResolverLabelMappedWatch,
     },
-    ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation,
-    PresentationSpec, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel,
-    VesselSpec,
+    ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, RepositoryKey,
+    Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel, VesselSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, time::timeout};
@@ -1738,71 +1737,11 @@ async fn non_expiry_secondary_watch_error_still_exits_controller_loop() {
 }
 
 #[tokio::test]
-async fn controller_loop_applies_create_presentation_actuation() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
-    let presentations = backend.clone().using::<Presentation>("flotilla");
-    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
-
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: primaries,
-            secondaries: Vec::new(),
-            reconciler: ActuatingReconciler {
-                reconciled: None,
-                actuation: Actuation::CreatePresentation {
-                    meta: resource_meta().name("alpha-presentation").call(),
-                    spec: PresentationSpec {
-                        convoy_ref: "alpha".to_string(),
-                        presentation_policy_ref: "default".to_string(),
-                        name: "alpha".to_string(),
-                        process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
-                    },
-                },
-            },
-            resync_interval: Duration::from_secs(60),
-            backend,
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if presentations.get("alpha-presentation").await.is_ok() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("create presentation actuation should create the resource");
-
-    let created = presentations.get("alpha-presentation").await.expect("created presentation should be readable");
-    assert_eq!(created.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Managed));
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
 async fn controller_loop_applies_delete_actuations_idempotently() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let primaries = backend.clone().using::<PrimaryResource>("flotilla");
-    let presentations = backend.clone().using::<Presentation>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
-    presentations
-        .create(
-            &resource_meta().name("alpha-presentation").call(),
-            &PresentationSpec {
-                convoy_ref: "alpha".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "alpha".to_string(),
-                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
-            },
-        )
-        .await
-        .expect("presentation create should succeed");
     vessels
         .create(
             &resource_meta().name("alpha-task").call(),
@@ -1815,34 +1754,6 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         )
         .await
         .expect("task workspace create should succeed");
-
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: primaries.clone(),
-            secondaries: Vec::new(),
-            reconciler: ActuatingReconciler {
-                actuation: Actuation::DeletePresentation { name: "alpha-presentation".to_string() },
-                reconciled: None,
-            },
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if matches!(presentations.get("alpha-presentation").await, Err(ResourceError::NotFound { .. })) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delete presentation actuation should remove the resource");
-
-    harness.shutdown().await;
 
     let mut harness = TestLoopHarness::new();
     harness.spawn(
@@ -1876,22 +1787,9 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
 async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resources() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let primaries = backend.clone().using::<PrimaryResource>("flotilla");
-    let presentations = backend.clone().using::<Presentation>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
-    presentations
-        .create(
-            &resource_meta().name("adopted-presentation").call().with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &PresentationSpec {
-                convoy_ref: "alpha".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "alpha".to_string(),
-                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
-            },
-        )
-        .await
-        .expect("presentation create should succeed");
     vessels
         .create(
             &resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed),
@@ -1918,37 +1816,6 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
         )
         .await
         .expect("adopted checkout create should succeed");
-
-    let reconciled = Arc::new(Mutex::new(Vec::new()));
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: primaries.clone(),
-            secondaries: Vec::new(),
-            reconciler: ActuatingReconciler {
-                actuation: Actuation::DeletePresentation { name: "adopted-presentation".to_string() },
-                reconciled: Some(Arc::clone(&reconciled)),
-            },
-            resync_interval: Duration::from_secs(60),
-            backend: backend.clone(),
-        }
-        .run(),
-    );
-
-    timeout(Duration::from_secs(1), async {
-        loop {
-            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delete presentation actuation should run");
-    let presentation = presentations.get("adopted-presentation").await.expect("adopted presentation should remain");
-    assert_eq!(presentation.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Adopted));
-
-    harness.shutdown().await;
 
     let reconciled = Arc::new(Mutex::new(Vec::new()));
     let mut harness = TestLoopHarness::new();

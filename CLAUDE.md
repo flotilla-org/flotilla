@@ -198,7 +198,7 @@ Providers are constructed via **factories** (`discovery/factories/`) that receiv
 
 **Why injected collaborators?** The daemon may run discovery for remote hosts or container environments where the host process's own env vars and binaries are wrong. The `EnvVars` trait and `CommandRunner` trait abstract this so tests can inject values and environments can provide their own. Never use `std::env` or `std::process::Command` directly in providers — always go through the injected `EnvVars` and `CommandRunner`.
 
-Checkout VCS providers are demand-discovered through `vcs_for_checkout` and cached for the observed Checkout instance. Removing a Checkout retires its cached provider; active operations may retain a lease. Presentation rows retain provider descriptors only.
+Checkout VCS providers are demand-discovered through `vcs_for_checkout` and cached for the observed Checkout instance. Removing a Checkout retires its cached provider; active operations may retain a lease.
 
 ### VCS operation boundary
 

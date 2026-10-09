@@ -70,7 +70,6 @@ mod owner_gc;
 mod placement_policy;
 mod platform;
 mod prepared_snapshot;
-mod presentation;
 mod principal_attention;
 mod project;
 mod project_hierarchy;
@@ -193,9 +192,6 @@ pub use prepared_snapshot::{
     content_hash, is_prepared_snapshot, PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PLACEMENT_SNAPSHOT_KIND,
     PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,
 };
-pub use presentation::{
-    purge_retired_presentations, Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch,
-};
 pub use principal_attention::{
     resolve_demand, Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandPoolRef, DemandResponseOption,
     DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, DemandVerdict, DemandVerdictDisposition, HumanGateContext,
@@ -287,7 +283,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
         $callback::<$crate::PlacementPolicy>($($argument),*);
-        $callback::<$crate::Presentation>($($argument),*);
         $callback::<$crate::Project>($($argument),*);
         $callback::<$crate::Regard>($($argument),*);
         $callback::<$crate::Repository>($($argument),*);
