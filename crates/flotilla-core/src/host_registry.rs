@@ -447,7 +447,6 @@ impl HostRegistry {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn publish_peer_summary(&self, summary: HostSummary, emit: &impl Fn(DaemonEvent)) {
         if summary_is_overlay_placeholder(&summary)
             && self
@@ -498,7 +497,6 @@ impl HostRegistry {
         self.sync_host_membership(counts, emit).await;
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn set_peer_host_summaries(
         &self,
         summaries: HashMap<EnvironmentId, HostSummary>,
@@ -747,7 +745,6 @@ fn update_host_summary(
     Some(build_host_snapshot(local_node, configured, node_connectivity, &state.environment_id, state))
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn summary_is_overlay_placeholder(summary: &HostSummary) -> bool {
     summary.system == SystemInfo::default()
         && summary.inventory == ToolInventory::default()

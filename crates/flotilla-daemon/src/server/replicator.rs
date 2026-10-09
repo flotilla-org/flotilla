@@ -2,16 +2,13 @@ use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::
 
 use chrono::Utc;
 use flotilla_core::in_process::InProcessDaemon;
-#[cfg(any(test, feature = "test-support"))]
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::NodeId;
-#[cfg(any(test, feature = "test-support"))]
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
 use flotilla_resources::{
     DigestQuery, HttpBackend, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent,
     WatchStart,
 };
-#[cfg(any(test, feature = "test-support"))]
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
 use futures::StreamExt;
 use tokio::sync::watch;
@@ -42,7 +39,6 @@ impl ReplicationStore {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn kind<T: Resource>(self) -> String {
         match self {
             Self::Durable => T::API_PATHS.plural.to_string(),
@@ -78,29 +74,24 @@ struct RetryBackoff {
 enum MissingSocketTransport {
     #[default]
     WaitForSocket,
-    #[cfg(any(test, feature = "test-support"))]
     Routed,
 }
 
 /// Test harnesses can select authored kinds and drive digest rounds explicitly.
 /// Production keeps full-fleet replication and periodic digest scheduling.
 #[derive(Clone, Default)]
-pub(super) struct ReplicationTestOptions {
+pub(super) struct ReplicationOptions {
     missing_socket_transport: MissingSocketTransport,
-    #[cfg(any(test, feature = "test-support"))]
     kinds: Option<&'static [&'static str]>,
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) digest_driver: Option<super::test_support::DigestDriver>,
+    pub(super) digest_driver: Option<Arc<dyn DigestScheduler>>,
 }
 
-impl ReplicationTestOptions {
-    #[cfg(any(test, feature = "test-support"))]
+impl ReplicationOptions {
     pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
         Self { kinds, digest_driver: None, missing_socket_transport: MissingSocketTransport::Routed }
     }
 
     fn includes<T: Resource>(&self) -> bool {
-        #[cfg(any(test, feature = "test-support"))]
         if self.kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
             return false;
         }
@@ -111,7 +102,7 @@ impl ReplicationTestOptions {
 #[derive(Default)]
 pub(super) struct PeerReplicatorSupervisors {
     generations: HashMap<NodeId, ActiveGeneration>,
-    test_options: ReplicationTestOptions,
+    options: ReplicationOptions,
 }
 
 impl Drop for PeerReplicatorSupervisors {
@@ -164,8 +155,8 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
-    pub(super) fn new(test_options: ReplicationTestOptions) -> Self {
-        Self { generations: HashMap::new(), test_options }
+    pub(super) fn new(options: ReplicationOptions) -> Self {
+        Self { generations: HashMap::new(), options }
     }
 
     pub(super) async fn peer_connected(
@@ -182,8 +173,7 @@ impl PeerReplicatorSupervisors {
         daemon.begin_peer_resource_replication(&peer).await;
         let transport = match resource_socket_path {
             Some(_) => ReplicationTransport::Http(socket_path_source),
-            #[cfg(any(test, feature = "test-support"))]
-            None if self.test_options.missing_socket_transport == MissingSocketTransport::Routed => ReplicationTransport::Routed(_router),
+            None if self.options.missing_socket_transport == MissingSocketTransport::Routed => ReplicationTransport::Routed(_router),
             None => {
                 debug!(%peer, generation, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
                 ReplicationTransport::Http(socket_path_source)
@@ -197,7 +187,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Durable,
-            self.test_options.clone()
+            self.options.clone()
         );
         spawn_kind::<flotilla_resources::Checkout>(
             &daemon,
@@ -206,7 +196,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Observed,
-            self.test_options.clone(),
+            self.options.clone(),
         );
         spawn_kind::<flotilla_resources::TerminalSession>(
             &daemon,
@@ -215,7 +205,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Observed,
-            self.test_options.clone(),
+            self.options.clone(),
         )
     }
 
@@ -277,7 +267,6 @@ impl PeerReplicatorSupervisors {
 #[derive(Clone)]
 enum ReplicationTransport {
     Http(SocketPathSource),
-    #[cfg(any(test, feature = "test-support"))]
     Routed(RemoteCommandRouter),
 }
 
@@ -288,9 +277,9 @@ fn spawn_kind<T: Resource>(
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
     store: ReplicationStore,
-    test_options: ReplicationTestOptions,
+    options: ReplicationOptions,
 ) {
-    if !test_options.includes::<T>() {
+    if !options.includes::<T>() {
         return;
     }
     if T::REPLICATION_CLASS == ReplicationClass::None {
@@ -326,7 +315,6 @@ fn spawn_kind<T: Resource>(
                 .await;
             });
         }
-        #[cfg(any(test, feature = "test-support"))]
         ReplicationTransport::Routed(router) => {
             let relay_daemon = Arc::clone(daemon);
             let relay_peer = peer.clone();
@@ -355,8 +343,7 @@ fn spawn_kind<T: Resource>(
     let daemon = Arc::clone(daemon);
     let peer = peer.clone();
     let transport = transport.clone();
-    #[cfg(any(test, feature = "test-support"))]
-    let digest_control = test_options.digest_driver.map(|driver| driver.control(daemon.node_id(), &peer, &store.kind::<T>()));
+    let digest_control = options.digest_driver.map(|driver| driver.control(daemon.node_id(), &peer, &store.kind::<T>()));
     let cancellation = cancellation.clone();
     tokio::spawn(async move {
         match transport {
@@ -388,7 +375,6 @@ fn spawn_kind<T: Resource>(
                 )
                 .await;
             }
-            #[cfg(any(test, feature = "test-support"))]
             ReplicationTransport::Routed(router) => {
                 let run_daemon = Arc::clone(&daemon);
                 let run_peer = peer.clone();
@@ -717,7 +703,6 @@ where
     Ok(true)
 }
 
-#[cfg(any(test, feature = "test-support"))]
 async fn fetch_routed_digest<T: Resource>(
     router: &RemoteCommandRouter,
     peer: &NodeId,
@@ -762,13 +747,12 @@ fn check_sequence<T: Resource>(version: &mut Option<String>, event: &WatchEvent<
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
 async fn replicate_kind_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
     store: ReplicationStore,
-    digest_control: Option<Arc<super::test_support::DigestControl>>,
+    digest_control: Option<Arc<DigestControl>>,
 ) -> Result<(), String> {
     store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
     let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
@@ -795,14 +779,13 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 async fn run_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
     store: ReplicationStore,
     prefix: Option<flotilla_resources::ReplicaCursor>,
-    digest_control: Option<Arc<super::test_support::DigestControl>>,
+    digest_control: Option<Arc<DigestControl>>,
 ) -> Result<(), String> {
     if let Some(control) = &digest_control {
         control.ready.send_replace(false);
@@ -936,7 +919,6 @@ async fn run_routed_watch<T: Resource>(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 async fn replicate_relay_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
@@ -993,7 +975,6 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 async fn apply_relay_response<T: Resource>(
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
@@ -1071,7 +1052,6 @@ async fn apply_relay_response<T: Resource>(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
 async fn apply_response<T: Resource>(
     writer: &flotilla_resources::ReplicaWriter<T>,
     initial: &mut Vec<ResourceObject<T>>,
@@ -1110,7 +1090,6 @@ async fn apply_response<T: Resource>(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<WatchEvent<T>>, String> {
     let event_type = match record.record_type {
         ResourceRecordType::Current | ResourceRecordType::Added => "ADDED",
@@ -1151,8 +1130,8 @@ mod tests {
     fn routed_replication_requires_explicit_harness_options() {
         // Glue: the production constructor waits for a forwarded socket even
         // when helpers are compiled; only the in-memory harness opts into routing.
-        assert_eq!(super::ReplicationTestOptions::default().missing_socket_transport, super::MissingSocketTransport::WaitForSocket);
-        assert_eq!(super::ReplicationTestOptions::new(None).missing_socket_transport, super::MissingSocketTransport::Routed);
+        assert_eq!(super::ReplicationOptions::default().missing_socket_transport, super::MissingSocketTransport::WaitForSocket);
+        assert_eq!(super::ReplicationOptions::new(None).missing_socket_transport, super::MissingSocketTransport::Routed);
     }
 
     #[test]
@@ -1560,4 +1539,15 @@ mod digest_tests {
             authority.digest(&DigestQuery::Root).await.expect("authority root").root
         );
     }
+}
+
+/// Injects explicit digest scheduling into a routed replication session.
+pub trait DigestScheduler: Send + Sync {
+    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DigestControl>;
+}
+
+/// Channels for readiness and requested digest completion, supplied by a scheduler.
+pub struct DigestControl {
+    pub requests: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<bool, String>>>>,
+    pub ready: watch::Sender<bool>,
 }

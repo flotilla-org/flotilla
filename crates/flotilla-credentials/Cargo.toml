@@ -5,8 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = ["test-support"]
-test-support = ["flotilla-core/test-support", "flotilla-protocol/test-support", "flotilla-resources/test-support"]
+default = []
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests"]
 
@@ -30,6 +29,11 @@ tempfile = "3"
 futures = "0.3"
 
 [dev-dependencies]
+flotilla-credentials-testkit = { path = "../flotilla-credentials-testkit" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 bytes = "1"

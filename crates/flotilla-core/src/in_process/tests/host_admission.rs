@@ -15,7 +15,7 @@ use super::support::{create_identity_convoy, placement_policy, test_meta};
 use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{allocate_convoy_generation, convoy_record_name, parse_role_address, RoleAddress};
 use crate::in_process::{placement_target_host, resolve_local_convoy_name, InProcessDaemon};
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 #[test]
 fn convoy_role_addresses_reject_malformed_values() {

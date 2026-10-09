@@ -15,8 +15,11 @@ VCS = "crates/flotilla-core/src/"
 
 
 def integration_test_path(path):
+    # All dev-only testkits may construct real Git fixtures. The build-graph
+    # guard forbids production dependencies on them; production source inclusions
+    # are traversed separately below and remain subject to this Git boundary.
     parts = Path(path).parts
-    return bool(parts) and (parts[0] == "tests" or (len(parts) >= 4 and parts[0] == "crates" and parts[2] == "tests"))
+    return bool(parts) and (parts[0] == "tests" or (len(parts) >= 4 and parts[0] == "crates" and (parts[2] == "tests" or parts[1].endswith("-testkit"))))
 
 
 def exempt(path, production=False):
@@ -26,7 +29,6 @@ def exempt(path, production=False):
         or path == "crates/build_identity.rs"
         or path == VCS + "vcs.rs"
         or path.startswith(VCS + "providers/vcs/")
-        or path == VCS + "providers/discovery/test_support.rs"
     )
 
 

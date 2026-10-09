@@ -27,3 +27,10 @@ pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path"
 mod image_distribution;
 
 pub use flotilla_credentials::validate_frozen_vessel_skills;
+
+#[cfg(test)]
+extern crate self as flotilla_daemon;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../flotilla-daemon-testkit/src/lib.rs"]
+mod testkits;

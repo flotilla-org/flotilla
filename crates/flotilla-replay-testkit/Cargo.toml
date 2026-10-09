@@ -1,0 +1,34 @@
+[package]
+name = "flotilla-replay-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+toml = "0.8"
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
+http = "1"
+bytes = "1"
+serde_yml = "0.0.12"
+url = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flotilla-core = { path = "../flotilla-core" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+hegeltest = "=0.48.1"
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

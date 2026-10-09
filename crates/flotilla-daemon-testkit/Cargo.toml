@@ -1,0 +1,25 @@
+[package]
+name = "flotilla-daemon-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
+flotilla-client = { path = "../flotilla-client" }
+flotilla-core = { path = "../flotilla-core" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-transport = { path = "../flotilla-transport" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+flotilla-daemon = { path = "../flotilla-daemon" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

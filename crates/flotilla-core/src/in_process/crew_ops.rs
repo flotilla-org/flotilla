@@ -2424,7 +2424,6 @@ impl CrewService {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) async fn reconcile_crew_stalls_once(&self, namespace: &str) -> Result<(), String> {
         self.leaf_subscriptions.reconcile_stalls_once(namespace).await
     }
@@ -3287,3 +3286,6 @@ fn terminal_convoy_refusal(name: &str, cause: &str) -> String {
          or use explicit --continue-pr continuation once #2873 is available"
     )
 }
+
+#[cfg(test)]
+use flotilla_store_testkit::LegacyMessageFixture;

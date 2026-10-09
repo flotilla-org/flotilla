@@ -1,3 +1,5 @@
+pub mod http_contract;
+pub mod testing;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -8,7 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use super::{
+use flotilla_core::providers::{
     change_request::ObservationError,
     github_api::{
         github_rate_limit, rate_limit_error, rate_limit_reset, GhApi, GhApiFailure, GhApiFailureResponse, GhApiResponse, GithubRateLimit,
@@ -449,8 +451,8 @@ pub fn test_session(fixture_path: &str, masks: Masks) -> Session {
 /// - Replay: returns a `ReplayRunner`.
 pub fn test_runner(session: &Session) -> Arc<dyn CommandRunner> {
     match session {
-        Session::Recording(_) => Arc::new(RecordingRunner::new(session.clone(), Arc::new(super::ProcessCommandRunner))),
-        Session::Passthrough => Arc::new(super::ProcessCommandRunner),
+        Session::Recording(_) => Arc::new(RecordingRunner::new(session.clone(), Arc::new(flotilla_core::providers::ProcessCommandRunner))),
+        Session::Passthrough => Arc::new(flotilla_core::providers::ProcessCommandRunner),
         Session::Replaying(_) => Arc::new(ReplayRunner::new(session.clone())),
     }
 }
@@ -636,7 +638,7 @@ impl ReplayHttpClient {
 }
 
 #[async_trait]
-impl super::HttpClient for ReplayHttpClient {
+impl flotilla_core::providers::HttpClient for ReplayHttpClient {
     async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
         let interaction = self.session.next(label);
         let Interaction::Http {
@@ -912,7 +914,7 @@ impl CommandRunner for RecordingRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<Box<dyn super::CommandProcess>, String> {
+    ) -> Result<Box<dyn flotilla_core::providers::CommandProcess>, String> {
         // Lifecycle recording needs distinct spawn/kill/wait interactions.
         // Until that fixture shape is introduced, preserve the shared runner
         // boundary by delegating rather than bypassing the wrapped runner.
@@ -1111,13 +1113,13 @@ pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
             // Use a raw ProcessCommandRunner — NOT the passed-in runner, which is a
             // RecordingRunner.  GhApiClient shells out via its runner, so using a
             // RecordingRunner here would double-record (once as Command, once as GhApi).
-            let raw_runner = Arc::new(super::ProcessCommandRunner);
-            let real_api = Arc::new(super::github_api::GhApiClient::new(raw_runner));
+            let raw_runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
+            let real_api = Arc::new(flotilla_core::providers::github_api::GhApiClient::new(raw_runner));
             Arc::new(RecordingGhApi::new(session.clone(), real_api))
         }
         Session::Passthrough => {
-            let raw_runner = Arc::new(super::ProcessCommandRunner);
-            Arc::new(super::github_api::GhApiClient::new(raw_runner))
+            let raw_runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
+            Arc::new(flotilla_core::providers::github_api::GhApiClient::new(raw_runner))
         }
         Session::Replaying(_) => Arc::new(ReplayGhApi::new(session.clone())),
     }
@@ -1126,17 +1128,17 @@ pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
 /// An `HttpClient` that delegates to a real `HttpClient` and records all interactions.
 pub struct RecordingHttpClient {
     session: Session,
-    inner: Arc<dyn super::HttpClient>,
+    inner: Arc<dyn flotilla_core::providers::HttpClient>,
 }
 
 impl RecordingHttpClient {
-    pub fn new(session: Session, inner: Arc<dyn super::HttpClient>) -> Self {
+    pub fn new(session: Session, inner: Arc<dyn flotilla_core::providers::HttpClient>) -> Self {
         Self { session, inner }
     }
 }
 
 #[async_trait]
-impl super::HttpClient for RecordingHttpClient {
+impl flotilla_core::providers::HttpClient for RecordingHttpClient {
     async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
         let method = request.method().to_string();
         let url = request.url().to_string();
@@ -1187,13 +1189,13 @@ impl super::HttpClient for RecordingHttpClient {
 /// - Recording: wraps a real `ReqwestHttpClient` with recording.
 /// - Passthrough: returns a bare `ReqwestHttpClient`.
 /// - Replay: returns a `ReplayHttpClient`.
-pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
+pub fn test_http_client(session: &Session) -> Arc<dyn flotilla_core::providers::HttpClient> {
     match session {
         Session::Recording(_) => {
-            let real_client = Arc::new(super::ReqwestHttpClient::new());
+            let real_client = Arc::new(flotilla_core::providers::ReqwestHttpClient::new());
             Arc::new(RecordingHttpClient::new(session.clone(), real_client))
         }
-        Session::Passthrough => Arc::new(super::ReqwestHttpClient::new()),
+        Session::Passthrough => Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
         Session::Replaying(_) => Arc::new(ReplayHttpClient::new(session.clone())),
     }
 }
@@ -1234,4 +1236,5 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
 }
 
 #[cfg(test)]
+#[path = "replay/tests.rs"]
 mod tests;

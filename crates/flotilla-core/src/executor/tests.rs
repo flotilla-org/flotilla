@@ -5,44 +5,62 @@ use super::{
     checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
+use crate::environment_manager::EnvironmentManager;
+use crate::event_sink::RecordingEventSink;
+use crate::provider_data::ProviderData;
+use crate::providers::ai_utility::AiUtility;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::coding_agent::CloudAgentService;
+use crate::providers::discovery::EnvironmentBag;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
-use crate::{
-    environment_manager::EnvironmentManager,
-    event_sink::RecordingEventSink,
-    provider_data::ProviderData,
-    providers::{
-        ai_utility::AiUtility,
-        change_request::ChangeRequestTracker,
-        coding_agent::CloudAgentService,
-        discovery::{
-            test_support::{fake_discovery, test_vcs_resolver, DiscoveryMockRunner, TestEnvVars},
-            EnvironmentBag, ProviderCategory, ProviderDescriptor,
-        },
-        environment::ProvisionedMount,
-        issue_tracker::IssueProvider,
-        registry::ProviderRegistry,
-        terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag},
-        testing::MockRunner,
-        types::*,
-        vcs::write_branch_issue_links,
-        CommandRunner,
-    },
-    step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
-    vcs::{EnumeratedCheckout, Vcs},
-};
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use crate::providers::issue_tracker::IssueProvider;
+use crate::providers::registry::ProviderRegistry;
+use crate::providers::terminal::TerminalEnvVars;
+use crate::providers::terminal::TerminalPool;
+use crate::providers::terminal::TerminalSession;
+use crate::providers::terminal::TerminalSessionTag;
+use crate::providers::types::*;
+use crate::providers::vcs::write_branch_issue_links;
+use crate::providers::CommandRunner;
+use crate::step::StepAction;
+use crate::step::StepExecutionContext;
+use crate::step::StepOutcome;
+use crate::step::StepResolver;
+use crate::testkits::discovery::fake_discovery;
+use crate::testkits::discovery::test_vcs_resolver;
+use crate::testkits::discovery::DiscoveryMockRunner;
+use crate::testkits::discovery::TestEnvVars;
+use crate::testkits::replay::testing::MockRunner;
+use crate::vcs::EnumeratedCheckout;
+use crate::vcs::Vcs;
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
 }
 use async_trait::async_trait;
-use flotilla_protocol::{
-    issue_query::{IssueQuery, IssueResultPage},
-    qualified_path::HostId,
-    test_support::{TestCheckout, TestIssue, TestSession},
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, IssueChangeset, IssueRef, IssueSource,
-    NodeId, RepoSelector,
-};
+use flotilla_protocol::issue_query::IssueQuery;
+use flotilla_protocol::issue_query::IssueResultPage;
+use flotilla_protocol::qualified_path::HostId;
+use flotilla_protocol::CheckoutSelector;
+use flotilla_protocol::CheckoutTarget;
+use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::HostName;
+use flotilla_protocol::HostPath;
+use flotilla_protocol::IssueChangeset;
+use flotilla_protocol::IssueRef;
+use flotilla_protocol::IssueSource;
+use flotilla_protocol::NodeId;
+use flotilla_protocol::RepoSelector;
+use flotilla_protocol_testkit::TestCheckout;
+use flotilla_protocol_testkit::TestIssue;
+use flotilla_protocol_testkit::TestSession;
 
 fn hp(path: &str) -> HostPath {
     HostPath::new(HostName::local(), PathBuf::from(path))

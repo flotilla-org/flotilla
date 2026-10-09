@@ -1,0 +1,26 @@
+[package]
+name = "flotilla-orchestration-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+toml = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sha2 = "0.10"
+flotilla-core = { path = "../flotilla-core" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

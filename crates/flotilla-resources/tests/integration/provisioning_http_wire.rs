@@ -1,14 +1,12 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
-use common::convoy_spec;
 use flotilla_resources::{canonicalize_repo_url, clone_key, repo_key, Convoy, HttpBackend, InputMeta, OwnerReference, ResourceBackend};
+use flotilla_store_testkit::fixtures::convoy_spec;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::oneshot,
 };
-
-use crate::common;
 
 async fn spawn_one_shot_server(response: String) -> (String, oneshot::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");

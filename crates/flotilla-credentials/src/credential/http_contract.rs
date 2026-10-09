@@ -8,8 +8,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use flotilla_core::providers::{discovery::test_support::TestEnvVars, http_contract::StandIn};
-use flotilla_resources::VirtualClock;
+use flotilla_discovery_testkit::TestEnvVars;
+use flotilla_replay_testkit::http_contract::StandIn;
+use flotilla_store_testkit::VirtualClock;
 use http::{HeaderMap, StatusCode};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde_json::{json, Value};
@@ -18,7 +19,7 @@ use super::*;
 
 const NOW: i64 = 1_791_072_000;
 // Throwaway RSA test key pair, never registered with an App or used for live authentication.
-const KEY: &[u8] = include_bytes!("../fixtures/github_app_test.pem");
+const KEY: &[u8] = flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY.as_bytes();
 const PUBLIC_KEY: &[u8] = include_bytes!("../fixtures/github_app_test.pub.pem");
 
 #[derive(Clone, Deserialize)]

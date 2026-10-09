@@ -15,7 +15,7 @@ use super::support::{
 };
 use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]

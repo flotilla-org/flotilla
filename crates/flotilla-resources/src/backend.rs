@@ -160,9 +160,8 @@ impl<T: Resource> ReplicaReadResolver<T> {
     /// Fault-injection seam for convergence tests. Production callers must
     /// leave self-origin suppression enabled.
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
-    pub fn with_self_origin_suppression_disabled_for_test(mut self) -> Self {
-        self.suppress_self_origin = false;
+    pub fn with_self_origin_suppression(mut self, suppress: bool) -> Self {
+        self.suppress_self_origin = suppress;
         self
     }
 
@@ -762,5 +761,12 @@ impl<T: FieldOwnedResource> TypedResolver<T> {
             self.backend.record_field_ownership_violation(violation.clone()).await?;
         }
         Ok(())
+    }
+}
+
+impl<T: Resource> TypedResolver<T> {
+    /// The backing store and namespace used by this typed resolver.
+    pub fn context(&self) -> (&ResourceBackend, &str) {
+        (&self.backend, &self.namespace)
     }
 }

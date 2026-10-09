@@ -26,7 +26,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
     let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
     let workflow = backend
         .using::<WorkflowTemplate>("flotilla")
-        .get(&crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
+        .get(&flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
         .await
         .expect("standing workflow");
     let mut status = admitted.status.clone().unwrap_or_default();
@@ -86,7 +86,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         clock.clone(),
     )
     .await;
-    restarted.install_convoy_ensure_reconciler(factory.create(restarted.resource_backend.clone(), restarted.clock.clone())).await;
+    restarted.install_convoy_ensure_reconciler(factory.create(restarted.resource_backend(), restarted.clock_for_scenarios())).await;
 
     let reconciler =
         flotilla_resources::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
@@ -165,8 +165,8 @@ pub async fn declaration_refusal_staleness_uses_the_daemon_clock_at_the_24_hour_
             &InputMeta::builder()
                 .name("declaration-refused-standing-project".to_string())
                 .annotations(BTreeMap::from([
-                    (crate::ops_entry::DECLARATION_REFUSAL_REASON_ANNOTATION.into(), "invalid declaration".into()),
-                    (crate::ops_entry::DECLARATION_REFUSED_SINCE_ANNOTATION.into(), clock.now().to_rfc3339()),
+                    (flotilla_core::ops_entry::DECLARATION_REFUSAL_REASON_ANNOTATION.into(), "invalid declaration".into()),
+                    (flotilla_core::ops_entry::DECLARATION_REFUSED_SINCE_ANNOTATION.into(), clock.now().to_rfc3339()),
                 ]))
                 .build(),
             &DemandSpec::for_dispatching_principal(
@@ -401,8 +401,7 @@ pub async fn admission_rejects_agent_roles_reused_across_vessels_before_writing_
         ])
         .build();
     let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
-    let error =
-        daemon.convoy_admission.write_admission_briefs("flotilla", "convoy-ambiguous", &spec, &workflow).await.expect_err("duplicate role");
+    let error = daemon.write_admission_briefs("flotilla", "convoy-ambiguous", &spec, &workflow).await.expect_err("duplicate role");
     assert!(error.contains("agent role `coder` occurs in vessels `implement` and `verify`"), "{error}");
     assert!(writer.writes.lock().await.is_empty(), "admission must not publish a partial set of briefs");
 }
@@ -602,7 +601,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         target.clone(),
     )
     .await;
-    daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend.clone(), daemon.clock.clone())).await;
+    daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend(), daemon.clock_for_scenarios())).await;
     let driver_ref = daemon.canonical_local_host_id().expect("root B host identity").to_string();
     target
         .using::<ResourceHost>("flotilla")
@@ -758,7 +757,6 @@ pub async fn duplicate_operational_entry_refusal_records_a_project_event(factory
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture(factory).await;
 
     daemon
-        .project_service()
         .record_project_operational_refusal("flotilla", "standing-project", "duplicate materialized WorkflowTemplate `quartermaster`")
         .await;
 
@@ -816,7 +814,7 @@ pub async fn standing_ensure_does_not_capture_another_projects_bare_workflow_but
     factory: &dyn EnsureScenarioController,
 ) {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture(factory).await;
-    let own_name = crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
+    let own_name = flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     let own = backend.definitions::<WorkflowTemplate>("flotilla").get(&own_name).await.expect("own workflow");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&own_name).await.expect("remove own workflow");
     backend
@@ -877,7 +875,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
         driver_backend.clone(),
     )
     .await;
-    driver.install_convoy_ensure_reconciler(factory.create(driver.resource_backend.clone(), driver.clock.clone())).await;
+    driver.install_convoy_ensure_reconciler(factory.create(driver.resource_backend(), driver.clock_for_scenarios())).await;
     let ensure = home_backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("home ensure");
 
     factory.start(&driver, "flotilla", &ensure).await.expect("driver admits replicated template");
@@ -919,7 +917,7 @@ pub async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact
     project.spec.default_workflow_ref.clear();
     project.spec.charter_prose.insert("governor".into(), "Govern the child project from this delivered charter.".into());
     let mut meta = InputMeta::from(&project.metadata);
-    meta.annotations.insert(crate::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
+    meta.annotations.insert(flotilla_core::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
     projects.apply(&meta, &project.spec).await.expect("local charter");
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("presence");
@@ -961,8 +959,7 @@ pub async fn admission_refuses_same_role_briefs_before_writing_any_artifact(fact
     second.name = "second".into();
     workflow.vessels.push(second);
     let spec = ConvoySpec::builder().workflow_ref("same-role".into()).build();
-    let error =
-        daemon.convoy_admission.write_admission_briefs("flotilla", "same-role", &spec, &workflow).await.expect_err("collision refused");
+    let error = daemon.write_admission_briefs("flotilla", "same-role", &spec, &workflow).await.expect_err("collision refused");
     assert!(error.contains("convoy-wide unique roles"));
     assert!(writer.writes.lock().await.is_empty(), "refusal is before all artifact writes");
 }

@@ -3,10 +3,16 @@ use std::sync::Arc;
 use chrono::{Duration, TimeZone, Utc};
 use flotilla_core::demand_lifecycle::DemandLifecycle;
 use flotilla_protocol::{PrincipalRef, ResourceRef};
-use flotilla_resources::{
-    Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, InputMeta, ResourceBackend,
-    VirtualClock,
-};
+use flotilla_resources::Demand;
+use flotilla_resources::DemandAddressee;
+use flotilla_resources::DemandExpiry;
+use flotilla_resources::DemandExpiryDisposition;
+use flotilla_resources::DemandKind;
+use flotilla_resources::DemandSpec;
+use flotilla_resources::DemandState;
+use flotilla_resources::InputMeta;
+use flotilla_resources::ResourceBackend;
+use flotilla_store_testkit::VirtualClock;
 
 fn timestamp(second: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, second).single().expect("valid timestamp")

@@ -237,7 +237,6 @@ impl LeafSubscriptionTable {
 
     /// Step locally authored convoys once. Supervisor and child context is read
     /// from the replica view during judgement; replica convoys are never actuated.
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn reconcile_stalls_once(&self, namespace: &str) -> Result<(), String> {
         let convoys = self
             .inner

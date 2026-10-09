@@ -25,10 +25,10 @@ use crate::in_process::{
     ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, issue_source_for_subject, prepared_snapshot_name,
     CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition,
 };
-use crate::providers::discovery::test_support::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
-use crate::providers::testing::MockRunner;
 use crate::providers::types::ChangeRequest;
 use crate::repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
+use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
+use crate::testkits::replay::testing::MockRunner;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]

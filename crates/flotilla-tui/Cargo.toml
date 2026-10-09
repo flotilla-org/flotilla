@@ -44,15 +44,18 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 libc = "0.2"
 
 [dev-dependencies]
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.22", features = ["json"] }
 async-trait = { workspace = true }
-flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
-flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
+flotilla-core = { path = "../flotilla-core" }
+flotilla-protocol = { path = "../flotilla-protocol" }
 insta = "1"
 tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
-flotilla-daemon = { path = "../flotilla-daemon", features = ["test-support"] }
+flotilla-daemon = { path = "../flotilla-daemon" }
 
 [lints]
 workspace = true

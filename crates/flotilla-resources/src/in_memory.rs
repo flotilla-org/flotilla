@@ -27,8 +27,7 @@ type StoreKey = (String, String, String, String);
 #[builder(builder_type(vis = "pub(in crate::in_memory)"))]
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
-    #[cfg(feature = "test-support")]
-    read_counts: Option<Arc<std::sync::Mutex<BTreeMap<String, usize>>>>,
+    read_observer: Option<Arc<dyn ReadObserver>>,
     replicas: Arc<Mutex<ReplicaState>>,
     durable_replicas: Option<crate::SqliteBackend>,
     generation: Option<String>,
@@ -128,28 +127,20 @@ impl Default for ResourceStore {
 }
 
 impl InMemoryBackend {
-    /// Enable timing-independent read-cost assertions on this backend and its clones.
-    #[cfg(feature = "test-support")]
-    pub fn with_read_counts(mut self) -> Self {
-        self.read_counts = Some(Arc::default());
+    /// Observe decoded objects without changing query results or store ownership.
+    pub fn with_read_observer(mut self, observer: Arc<dyn ReadObserver>) -> Self {
+        self.read_observer = Some(observer);
         self
     }
 
-    /// Counts objects decoded by get, list and indexed queries, by resource kind.
-    #[cfg(feature = "test-support")]
-    pub fn read_counts(&self) -> BTreeMap<String, usize> {
-        self.read_counts.as_ref().map(|counts| counts.lock().expect("read counts").clone()).unwrap_or_default()
+    pub fn read_observer(&self) -> Option<&dyn ReadObserver> {
+        self.read_observer.as_deref()
     }
 
     fn count_read<T: Resource>(&self, count: usize) {
-        #[cfg(feature = "test-support")]
-        {
-            if let Some(counts) = &self.read_counts {
-                *counts.lock().expect("read counts").entry(T::API_PATHS.kind.into()).or_default() += count;
-            }
+        if let Some(observer) = &self.read_observer {
+            observer.read(T::API_PATHS.kind, count);
         }
-        #[cfg(not(feature = "test-support"))]
-        let _ = count;
     }
 
     pub(crate) async fn query_messages(
@@ -199,8 +190,7 @@ impl InMemoryBackend {
     pub fn observed() -> Self {
         Self {
             stores: Arc::default(),
-            #[cfg(feature = "test-support")]
-            read_counts: None,
+            read_observer: None,
             replicas: Arc::default(),
             durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
@@ -228,8 +218,7 @@ impl InMemoryBackend {
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
         Self {
             stores: Arc::default(),
-            #[cfg(feature = "test-support")]
-            read_counts: None,
+            read_observer: None,
             replicas: Arc::default(),
             durable_replicas: None,
             generation: None,
@@ -243,8 +232,7 @@ impl InMemoryBackend {
     pub fn observed_with_event_retention(event_retention: EventRetention) -> Self {
         Self {
             stores: Arc::default(),
-            #[cfg(feature = "test-support")]
-            read_counts: None,
+            read_observer: None,
             replicas: Arc::default(),
             durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
@@ -1183,4 +1171,10 @@ impl InMemoryBackend {
         });
         Ok(WatchStream::new(generation, Box::pin(replay_stream.chain(live_stream))))
     }
+}
+
+/// Observer supplied by callers that need resource decoding metrics.
+pub trait ReadObserver: std::fmt::Debug + Send + Sync {
+    fn read(&self, kind: &str, count: usize);
+    fn as_any(&self) -> &dyn std::any::Any;
 }

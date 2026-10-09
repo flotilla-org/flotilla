@@ -63,9 +63,12 @@ Controller-backed in-process daemon coverage lives in `flotilla-controllers`' re
 cargo test -p flotilla-controllers --locked --test integration in_process_daemon::
 ```
 
-The small `test-support` features and core's `replay` feature are enabled by default, so package-local commands need no extra
-helper flags. Native libraries share `flotilla-build-features`' feature-only dependency selections on stable Cargo;
-`ci/build-graph/check.py` checks both build and test selections for every workspace package, and its registered integration target runs the guard and Python unit tests in workspace CI. Keep its anchors aligned when
+Shared helpers live in dev-only `flotilla-*-testkit` crates; production crates have no `test-support` or `replay` features.
+Tokio `test-util` is selected only by dev-dependencies. Package-local test commands need no helper flags.
+Core and daemon unit tests compile shared adapter sources only under `cfg(test)` to retain the unit-test library's trait identity;
+integration tests import the testkit crates directly. Native libraries share `flotilla-build-features`' feature-only dependency
+selections on stable Cargo; `ci/build-graph/check.py` checks build and test selections separately for every workspace package,
+rejects production testkit dependencies and production `test-util`, and runs in workspace CI. Keep its anchors aligned when
 adding dependencies. Optional TLS providers and sandbox skips remain opt-in. The Relay Workers WebAssembly target does not
 depend on the native feature selections.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.

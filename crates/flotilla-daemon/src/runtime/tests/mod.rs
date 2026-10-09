@@ -19,44 +19,65 @@ use flotilla_controllers::reconcilers::{
     CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome,
     TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime, TerminalSessionReconciler, VesselReconciler,
 };
-use flotilla_core::{
-    agent_adapter::AgentAdapterRegistry,
-    aggregator_projection::AggregatorProjectionState,
-    config::ConfigStore,
-    in_process::{InProcessDaemon, StandingConvoyBackingInspector, DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE},
-    providers::{
-        change_request::ChangeRequestTracker,
-        discovery::{
-            test_support::{
-                fake_discovery_with_provider_set, git_process_discovery, DiscoveryMockRunner, FakeChangeRequest, FakeChangeRequestFactory,
-                FakeDiscoveryProviders, FakeTerminalPool, MergedPrProcessRunner, TestEnvVars,
-            },
-            EnvVars, EnvironmentAssertion, EnvironmentBag, ProviderCategory, ProviderDescriptor,
-        },
-        environment::{
-            CreateOpts, EnvironmentHandle, EnvironmentProvider, EnvironmentVariableUpdate, PreparedEnvironmentAuth, ProvisionedEnvironment,
-            ProvisionedMount, ProvisionedMountMode,
-        },
-        registry::ProviderRegistry,
-        replay::{Masks, ReplayHttpClient, Session},
-        terminal::{
-            ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionLiveness,
-            TerminalSessionTag, TerminalSize,
-        },
-        types::ChangeRequest as ProviderChangeRequest,
-        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
-    },
-};
-use flotilla_credentials::{
-    crew_git_identity_environment, test_support::GITHUB_APP_TEST_PRIVATE_KEY, AgentMaterialRegistry, CredentialRefreshError,
-    CredentialStore, CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV,
-};
+use flotilla_core::agent_adapter::AgentAdapterRegistry;
+use flotilla_core::aggregator_projection::AggregatorProjectionState;
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::in_process::StandingConvoyBackingInspector;
+use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
+use flotilla_core::providers::change_request::ChangeRequestTracker;
+use flotilla_core::providers::discovery::EnvVars;
+use flotilla_core::providers::discovery::EnvironmentAssertion;
+use flotilla_core::providers::discovery::EnvironmentBag;
+use flotilla_core::providers::discovery::ProviderCategory;
+use flotilla_core::providers::discovery::ProviderDescriptor;
+use flotilla_core::providers::environment::CreateOpts;
+use flotilla_core::providers::environment::EnvironmentHandle;
+use flotilla_core::providers::environment::EnvironmentProvider;
+use flotilla_core::providers::environment::EnvironmentVariableUpdate;
+use flotilla_core::providers::environment::PreparedEnvironmentAuth;
+use flotilla_core::providers::environment::ProvisionedEnvironment;
+use flotilla_core::providers::environment::ProvisionedMount;
+use flotilla_core::providers::environment::ProvisionedMountMode;
+use flotilla_core::providers::registry::ProviderRegistry;
+use flotilla_core::providers::terminal::ScreenActivity;
+use flotilla_core::providers::terminal::TerminalEnvVars;
+use flotilla_core::providers::terminal::TerminalPool;
+use flotilla_core::providers::terminal::TerminalSession as ProviderTerminalSession;
+use flotilla_core::providers::terminal::TerminalSessionLiveness;
+use flotilla_core::providers::terminal::TerminalSessionTag;
+use flotilla_core::providers::terminal::TerminalSize;
+use flotilla_core::providers::types::ChangeRequest as ProviderChangeRequest;
+use flotilla_core::providers::ChannelLabel;
+use flotilla_core::providers::CommandOutput;
+use flotilla_core::providers::CommandRunner;
+use flotilla_core::providers::ProcessCommandRunner;
+use flotilla_credentials::crew_git_identity_environment;
+use flotilla_credentials::AgentMaterialRegistry;
+use flotilla_credentials::CredentialRefreshError;
+use flotilla_credentials::CredentialStore;
+use flotilla_credentials::CONTAINER_CODEX_HOME;
+use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
+use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_discovery_testkit::fake_discovery_with_provider_set;
+use flotilla_discovery_testkit::git_process_discovery;
+use flotilla_discovery_testkit::DiscoveryMockRunner;
+use flotilla_discovery_testkit::FakeChangeRequest;
+use flotilla_discovery_testkit::FakeChangeRequestFactory;
+use flotilla_discovery_testkit::FakeDiscoveryProviders;
+use flotilla_discovery_testkit::FakeTerminalPool;
+use flotilla_discovery_testkit::MergedPrProcessRunner;
+use flotilla_discovery_testkit::TestEnvVars;
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
     NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, TerminalStatus,
 };
+use flotilla_replay_testkit::Masks;
+use flotilla_replay_testkit::ReplayHttpClient;
+use flotilla_replay_testkit::Session;
 use flotilla_resources::{
     clone_key,
     controller::{Actuation, ControllerLoop, Reconciler},

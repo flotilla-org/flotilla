@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{
         Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
@@ -15,10 +14,9 @@ use flotilla_resources::{
     ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, RepositoryKey,
     Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel, VesselSpec,
 };
+use flotilla_store_testkit::fixtures::{resource_meta, TestLoopHarness};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, time::timeout};
-
-use crate::common;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrimaryResource;

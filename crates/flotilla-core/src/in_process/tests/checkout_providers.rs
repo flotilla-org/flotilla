@@ -12,7 +12,7 @@ use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::test_support::{fake_discovery, FakeChangeRequest, FakeVcsFactory, FakeVcsState};
+use crate::testkits::discovery::{fake_discovery, FakeChangeRequest, FakeVcsFactory, FakeVcsState};
 
 #[tokio::test]
 async fn checkout_vcs_discovery_is_cached_per_checkout() {

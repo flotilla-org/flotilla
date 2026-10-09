@@ -13,9 +13,7 @@ use tokio::sync::broadcast;
 use super::support::test_meta;
 use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
-use crate::providers::discovery::test_support::{
-    fake_discovery, fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders,
-};
+use crate::testkits::discovery::{fake_discovery, fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 // UTC-to-monotonic conversion must preserve a future header deadline and keep
@@ -41,7 +39,7 @@ async fn observation_cache_deadline_crosses_both_clocks() {
 fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use crate::providers::discovery::test_support::FakeTerminalPool;
+    use crate::testkits::discovery::FakeTerminalPool;
 
     // Cover no roots, multiple roots, both discovery outcomes, repeated removals,
     // and either root removal order. Factories stand in for process providers.

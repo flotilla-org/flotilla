@@ -1,14 +1,12 @@
-use common::{
+use flotilla_resources::WorkflowTemplate;
+use flotilla_store_testkit::fixtures::{
     contract::{
         assert_metadata_roundtrip, assert_namespace_isolation, assert_stale_resource_version_conflicts, in_memory_backend,
         WorkflowTemplateFixture,
     },
     updated_workflow_template_spec, valid_workflow_template_spec, workflow_template_meta,
 };
-use flotilla_resources::WorkflowTemplate;
 use rstest::rstest;
-
-use crate::common;
 
 // Keep the rstest shape even with a single fixture so this suite can grow into
 // shared backend contract coverage without restructuring each test.

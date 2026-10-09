@@ -9,13 +9,13 @@ use std::{
 
 use chrono::Utc;
 use flotilla_controllers::reconcilers::VesselReconciler;
-use flotilla_core::{
-    config::ConfigStore, in_process::InProcessDaemon, leaf_engine::CrewTurnIntent, providers::discovery::test_support::fake_discovery,
-};
-use flotilla_daemon::{
-    runtime::{spawn_pending_supervisor_turn_task, spawn_pending_supervisor_turn_task_with_watches},
-    server::test_support::spawn_in_memory_request_topology_stateful,
-};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::leaf_engine::CrewTurnIntent;
+use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;
+use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task_with_watches;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
+use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     controller::{Actuation, Reconciler},

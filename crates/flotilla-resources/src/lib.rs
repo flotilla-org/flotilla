@@ -86,8 +86,6 @@ mod role_routing;
 mod sqlite;
 mod status_patch;
 mod terminal_session;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
 pub mod tls;
 mod usage;
 mod vessel;
@@ -108,8 +106,6 @@ pub use checkout::{
     CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
     RemoteRefObservation,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use clock::VirtualClock;
 pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling, PROVISIONING_RETRY_BACKOFF};
@@ -166,7 +162,7 @@ pub use host::{
     TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
-pub use in_memory::InMemoryBackend;
+pub use in_memory::{InMemoryBackend, ReadObserver};
 pub use issue::{issue_record_name, Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{
     label_value, labels_match, LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL,

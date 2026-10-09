@@ -768,9 +768,14 @@ mod tests {
     use std::{collections::HashMap, sync::Mutex};
 
     use flotilla_protocol::IssueSource;
-    use flotilla_resources::{
-        single_agent_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, VirtualClock,
-    };
+    use flotilla_resources::single_agent_workflow_spec;
+    use flotilla_resources::ConvoyIssue;
+    use flotilla_resources::ConvoySpec;
+    use flotilla_resources::InputValue;
+    use flotilla_resources::IssueSnapshot;
+    use flotilla_resources::ProjectSpec;
+    use flotilla_resources::RepositoryKey;
+    use flotilla_store_testkit::VirtualClock;
 
     use super::*;
 

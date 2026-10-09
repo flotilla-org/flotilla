@@ -1,3 +1,4 @@
+use flotilla_daemon::server::replicator::{DigestControl, DigestScheduler};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use flotilla_client::SocketDaemon;
@@ -10,8 +11,8 @@ use flotilla_protocol::{
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-use super::{build_remote_command_router, peer_runtime::PeerRuntime};
-use crate::{
+use flotilla_daemon::server::{build_remote_command_router, peer_runtime::PeerRuntime};
+use flotilla_daemon::{
     blob_store::TieredBlobStore,
     peer::{
         channel_transport::{channel_transport_pair_with_nodes, ChannelTransport},
@@ -85,7 +86,12 @@ impl Drop for InMemoryRequestMesh {
     }
 }
 
-type DigestControls = HashMap<(NodeId, NodeId, String), Arc<DigestControl>>;
+type DigestControls = HashMap<(NodeId, NodeId, String), Arc<DrivenDigest>>;
+
+struct DrivenDigest {
+    sender: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<bool, String>>>,
+    control: Arc<DigestControl>,
+}
 
 /// Explicit digest rounds for routed test sessions. Production keeps its periodic timer.
 #[derive(Clone, Default)]
@@ -93,14 +99,8 @@ pub struct DigestDriver {
     controls: Arc<std::sync::Mutex<DigestControls>>,
 }
 
-pub(super) struct DigestControl {
-    sender: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<bool, String>>>,
-    pub(super) requests: Mutex<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<bool, String>>>>,
-    pub(super) ready: watch::Sender<bool>,
-}
-
 impl DigestDriver {
-    pub(super) fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DigestControl> {
+    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DrivenDigest> {
         self.controls
             .lock()
             .expect("digest controls")
@@ -108,7 +108,7 @@ impl DigestDriver {
             .or_insert_with(|| {
                 let (sender, requests) = mpsc::unbounded_channel();
                 let (ready, _) = watch::channel(false);
-                Arc::new(DigestControl { sender, requests: Mutex::new(requests), ready })
+                Arc::new(DrivenDigest { sender, control: Arc::new(DigestControl { requests: Mutex::new(requests), ready }) })
             })
             .clone()
     }
@@ -117,7 +117,7 @@ impl DigestDriver {
     /// Readiness resets when it restarts; later bookmarks keep it ready.
     pub async fn watch_ready(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<(), String> {
         let control = self.control(holder, origin, kind);
-        let mut ready = control.ready.subscribe();
+        let mut ready = control.control.ready.subscribe();
         ready.wait_for(|ready| *ready).await.map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -220,7 +220,7 @@ async fn spawn_request_mesh(
             None,
         )
         .with_replication_kinds(replication_kinds)
-        .with_digest_driver(digest_driver.clone())
+        .with_digest_driver(digest_driver.clone().map(|driver| Arc::new(driver) as Arc<dyn DigestScheduler>))
         .spawn();
         tasks.push(runtime);
 
@@ -233,7 +233,7 @@ async fn spawn_request_mesh(
         let host = Arc::clone(host);
         let peer_manager = Arc::clone(peer_manager);
         tasks.push(tokio::spawn(async move {
-            super::handle_client_session_with_caller(
+            flotilla_daemon::server::handle_client_session_with_caller(
                 server_session,
                 host,
                 shutdown_request_tx,
@@ -395,7 +395,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     let client_count_for_task = Arc::clone(&client_count);
     let client_notify_for_task = Arc::clone(&client_notify);
     let client_session_handle = tokio::spawn(async move {
-        super::handle_client_session_with_caller(
+        flotilla_daemon::server::handle_client_session_with_caller(
             server_session,
             leader_for_client,
             shutdown_request_tx,
@@ -499,4 +499,36 @@ impl PeerTransport for FilteredTransport {
     fn remote_node_info(&self) -> Option<NodeInfo> {
         self.inner.remote_node_info()
     }
+}
+
+impl DigestScheduler for DigestDriver {
+    fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DigestControl> {
+        self.control(holder, origin, kind).control.clone()
+    }
+}
+
+/// Spawn the peer networking runtime with pre-built components.
+///
+/// Test-only entry point: callers provide a PeerManager with pre-configured
+/// senders (e.g. CapturePeerSender). Passes `None` for `inbound_peer_rx` to skip
+/// the inbound connection task — tests drive the outbound task via the returned
+/// `PeerConnectionEvent` sender.
+pub fn spawn_test_peer_networking(
+    daemon: Arc<InProcessDaemon>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
+    // Receiver dropped intentionally — None is passed for the inbound task,
+    // so no messages are forwarded; the sender satisfies the runtime signature.
+    let (inbound_peer_tx, _inbound_peer_rx) = mpsc::channel(256);
+    let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
+    PeerRuntime::new(
+        daemon,
+        peer_manager,
+        None, // No inbound task — test drives outbound via PeerConnectionEvent
+        inbound_peer_tx,
+        remote_command_router,
+        None,
+    )
+    .with_replication_kinds(None)
+    .spawn()
 }

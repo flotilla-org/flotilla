@@ -8,7 +8,7 @@ pub async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refus
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route sole terminal generation").expect("routing target");
-    assert_eq!(target.home, daemon.host_name);
+    assert_eq!(target.home, daemon.host_name().clone());
 
     seed_convoy_routing_row(&daemon, "convoy-two", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Failed).await;
     assert_eq!(
@@ -24,7 +24,7 @@ pub async fn convoy_routing_prefers_an_exact_terminal_pre_identity_record(factor
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "pre-identity-record".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route exact terminal record").expect("routing target");
-    assert_eq!(target.home, daemon.host_name);
+    assert_eq!(target.home, daemon.host_name().clone());
 }
 
 pub async fn convoy_routing_does_not_treat_a_legacy_display_name_as_role_identity(factory: &dyn EnsureScenarioController) {
@@ -34,7 +34,7 @@ pub async fn convoy_routing_does_not_treat_a_legacy_display_name_as_role_identit
     let action = flotilla_protocol::CommandAction::ConvoyDelete { namespace: None, name: "reviewer@flotilla".to_string(), force: false };
 
     let target = daemon.resolve_existing_convoy_target(&action).await.expect("route explicit role identity").expect("routing target");
-    assert_eq!(target.home, daemon.host_name);
+    assert_eq!(target.home, daemon.host_name().clone());
 }
 
 pub async fn convoy_explain_addresses_an_exact_terminal_pre_identity_record(factory: &dyn EnsureScenarioController) {
@@ -68,7 +68,7 @@ pub async fn convoy_explain_surfaces_queued_turn_age_and_blocker(factory: &dyn E
     let namespace = "queued-explain";
     let convoys = backend.using::<ResourceConvoy>(namespace);
     let convoy = convoys.create(&test_meta("queued"), &ConvoySpec::builder().workflow_ref("review".into()).build()).await.unwrap();
-    let queued_at = daemon.clock.now() - chrono::Duration::seconds(601);
+    let queued_at = daemon.clock_for_scenarios().now() - chrono::Duration::seconds(601);
     convoys
         .update_status(
             "queued",
@@ -148,7 +148,7 @@ pub async fn convoy_explain_rejects_projectless_and_project_bound_role_ambiguity
 }
 
 pub async fn ensure_roll_targets_the_running_convoy_home_over_an_explicit_other_host(factory: &dyn EnsureScenarioController) {
-    use crate::command_target::{RemoteDelivery, TargetHost, TargetReason};
+    use flotilla_core::command_target::{RemoteDelivery, TargetHost, TargetReason};
     let (driver, driver_backend, _clock, _temp) = standing_ensure_fixture(factory).await;
     driver.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
     let (observer, observer_backend, _observer_clock, _observer_temp) = standing_ensure_fixture_for(factory, "observer", false).await;

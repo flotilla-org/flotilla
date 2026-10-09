@@ -123,10 +123,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory, ClaudeCodingAgentFactory};
-    use crate::{
-        config::ConfigStore,
-        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
-    };
+    use crate::config::ConfigStore;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::discovery::Factory;
+    use crate::providers::discovery::UnmetRequirement;
+    use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_claude_binary() -> EnvironmentBag {

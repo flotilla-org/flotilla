@@ -8,7 +8,8 @@ use flotilla_core::providers::{
     },
     terminal::TerminalPool,
 };
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_resources::{
     DockerEnvironmentSpec, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSource, TerminalSessionSpec,
 };

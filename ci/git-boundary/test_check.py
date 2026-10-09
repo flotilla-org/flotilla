@@ -43,7 +43,7 @@ class GitBoundaryTests(unittest.TestCase):
         source = 'fn a() { Command::new("git"); }'
         for path in ['build.rs', 'crates/a/build.rs', 'crates/build_identity.rs',
                      'crates/a/tests/fixture.rs', check.VCS + 'vcs.rs',
-                     check.VCS + 'providers/vcs/git.rs', check.VCS + 'providers/discovery/test_support.rs']:
+                     check.VCS + 'providers/vcs/git.rs', 'crates/flotilla-discovery-testkit/src/lib.rs']:
             self.assertEqual(check.violations(source, path), [])
         for path in ['src/build.rs.bak', 'src/tests_like.rs', check.VCS + 'vcs_extra.rs',
                      check.VCS + 'providers/vcs_extra/git.rs', 'crates/other/src/vcs.rs', 'src/tests/fixture.rs', 'crates/a/src/tests/fixture.rs']:
@@ -130,6 +130,17 @@ class GitBoundaryTests(unittest.TestCase):
             with self.subTest(directory=directory):
                 package = tomllib.loads((root / directory / 'Cargo.toml').read_text())
                 self.assertIs(package['lints']['workspace'], True)
+
+
+class TestkitContract(unittest.TestCase):
+    def test_fixture_git_is_allowed_only_in_testkit_context(self):
+        # Testkit crates construct real Git fixtures; production inclusions remain checked.
+        source = 'fn fixture() { Command::new("git"); }'
+        for path in ["crates/flotilla-discovery-testkit/src/lib.rs",
+                     "crates/future-testkit/src/fixture.rs"]:
+            with self.subTest(path=path):
+                self.assertEqual(check.violations(source, path), [])
+                self.assertEqual(check.violations(source, path, production=True), [1])
 
 
 if __name__ == '__main__':

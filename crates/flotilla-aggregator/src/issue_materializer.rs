@@ -964,12 +964,16 @@ mod tests {
         event_sink::BroadcastEventSink,
         providers::{github_api::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner},
     };
-    use flotilla_protocol::{
-        issue_query::{IssueResultPage, READY_ISSUE_LABEL},
-        result_set::{ConvoyIssueRow, ConvoyPhase, ConvoyRow},
-        test_support::TestIssue,
-        Issue, IssueChangeset, QueryCursor, ResourceRef,
-    };
+    use flotilla_protocol::issue_query::IssueResultPage;
+    use flotilla_protocol::issue_query::READY_ISSUE_LABEL;
+    use flotilla_protocol::result_set::ConvoyIssueRow;
+    use flotilla_protocol::result_set::ConvoyPhase;
+    use flotilla_protocol::result_set::ConvoyRow;
+    use flotilla_protocol::Issue;
+    use flotilla_protocol::IssueChangeset;
+    use flotilla_protocol::QueryCursor;
+    use flotilla_protocol::ResourceRef;
+    use flotilla_protocol_testkit::TestIssue;
     use tokio::sync::{Mutex, Notify};
     use uuid::Uuid;
 

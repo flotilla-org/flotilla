@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use common::{
+use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, ResourceBackend};
+use flotilla_store_testkit::fixtures::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip,
         assert_delete_emits_event, assert_get_all_provenances_contract, assert_identical_status_update_is_noop_with_backend,
@@ -19,9 +20,6 @@ use common::{
     },
     convoy_meta, convoy_spec,
 };
-use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, ResourceBackend};
-
-use crate::common;
 
 #[tokio::test]
 async fn local_authority_shadows_self_origin_replica() {
@@ -149,8 +147,10 @@ async fn missing_authority_delete_tombstones_replica() {
 
 #[tokio::test]
 async fn watch_rejects_version_ahead_of_stream() {
-    common::contract::assert_watch_rejects_version_ahead_of_stream_with_backend(ResourceBackend::InMemory(InMemoryBackend::default()))
-        .await;
+    flotilla_store_testkit::fixtures::contract::assert_watch_rejects_version_ahead_of_stream_with_backend(ResourceBackend::InMemory(
+        InMemoryBackend::default(),
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -215,7 +215,10 @@ async fn list_matching_labels_returns_only_exact_matches() {
 
 #[tokio::test]
 async fn terminal_session_label_lookup_contract() {
-    common::contract::assert_terminal_session_label_lookup_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    flotilla_store_testkit::fixtures::contract::assert_terminal_session_label_lookup_with_backend(ResourceBackend::InMemory(
+        InMemoryBackend::default(),
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -308,12 +311,14 @@ async fn observed_backend_expires_compacted_version_within_current_generation() 
 
 #[tokio::test]
 async fn slow_convoy_watch_is_bounded() {
-    common::contract::assert_slow_convoy_watch_is_bounded(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    flotilla_store_testkit::fixtures::contract::assert_slow_convoy_watch_is_bounded(ResourceBackend::InMemory(InMemoryBackend::default()))
+        .await;
 }
 
 #[tokio::test]
 async fn slow_replica_watch_is_bounded() {
-    common::contract::assert_slow_replica_watch_is_bounded(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    flotilla_store_testkit::fixtures::contract::assert_slow_replica_watch_is_bounded(ResourceBackend::InMemory(InMemoryBackend::default()))
+        .await;
 }
 
 // ADR 0016: the observation store offers the same overlay contract as other
@@ -322,9 +327,9 @@ async fn slow_replica_watch_is_bounded() {
 async fn observed_store_with_durable_replicas_satisfies_overlay_contract() {
     let temp = tempfile::tempdir().expect("replica directory");
     let replicas = flotilla_resources::SqliteBackend::open(temp.path().join("replicas.sqlite")).expect("replica store");
-    common::contract::assert_replica_read_view_contract(ResourceBackend::InMemory(InMemoryBackend::observed_with_durable_replicas(
-        replicas,
-    )))
+    flotilla_store_testkit::fixtures::contract::assert_replica_read_view_contract(ResourceBackend::InMemory(
+        InMemoryBackend::observed_with_durable_replicas(replicas),
+    ))
     .await;
 }
 
@@ -426,5 +431,8 @@ fn current_position_tracks_mutation_sequences(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn replica_snapshots_reconcile_without_relay_resurrection() {
-    common::contract::assert_replica_snapshot_reconciliation(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    flotilla_store_testkit::fixtures::contract::assert_replica_snapshot_reconciliation(ResourceBackend::InMemory(
+        InMemoryBackend::default(),
+    ))
+    .await;
 }

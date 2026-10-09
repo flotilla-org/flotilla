@@ -1,12 +1,12 @@
 //! Shared test builders for protocol types.
 //!
-//! Available when `cfg(test)` or the `test-support` feature is enabled.
+//! Import this crate as a dev-dependency; production protocol code has no helper feature.
 //! All builders produce minimal structs with empty/default fields — callers
 //! opt in to correlation keys and other detail via fluent methods.
 
 use std::path::PathBuf;
 
-use crate::{
+use flotilla_protocol::{
     provider_data::{
         ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, Issue, IssueRef, IssueSource, IssueState, SessionStatus,
     },

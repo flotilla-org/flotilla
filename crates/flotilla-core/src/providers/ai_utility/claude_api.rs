@@ -143,7 +143,7 @@ mod tests {
         use http::{HeaderMap, StatusCode};
         use serde_json::{json, Value};
 
-        use crate::providers::http_contract::StandIn;
+        use crate::testkits::replay::http_contract::StandIn;
         async fn receive(headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
             let valid_headers = headers.get("x-api-key").is_some_and(|v| v == "test-key")
                 && headers.get("anthropic-version").is_some_and(|v| v == "2023-06-01")

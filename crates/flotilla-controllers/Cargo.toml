@@ -22,14 +22,18 @@ sha2 = "0.10"
 serde_json = { workspace = true }
 
 [dev-dependencies]
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { workspace = true }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
-flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
+flotilla-core = { path = "../flotilla-core" }
 hegeltest = "=0.48.1"
-flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+flotilla-resources = { path = "../flotilla-resources" }
 rstest = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -32,10 +32,10 @@ use super::stalls::*;
 use super::subscriptions::*;
 use super::wake::*;
 use super::*;
-use crate::providers::{
-    replay::{test_runner, Masks, Session},
-    testing::fixture_path,
-};
+use crate::testkits::replay::test_runner;
+use crate::testkits::replay::testing::fixture_path;
+use crate::testkits::replay::Masks;
+use crate::testkits::replay::Session;
 use crate::{
     change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
     issue_observer::{IssueRefreshCadence, IssueRefresher},

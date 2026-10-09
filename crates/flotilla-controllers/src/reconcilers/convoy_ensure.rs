@@ -1194,7 +1194,12 @@ mod tests {
 
     use chrono::TimeZone;
     use flotilla_protocol::CanonicalHostId;
-    use flotilla_resources::{ConvoySpec, ConvoyStatus, InMemoryBackend, ProjectSpec, VirtualClock, WorkflowTemplateSpec};
+    use flotilla_resources::ConvoySpec;
+    use flotilla_resources::ConvoyStatus;
+    use flotilla_resources::InMemoryBackend;
+    use flotilla_resources::ProjectSpec;
+    use flotilla_resources::WorkflowTemplateSpec;
+    use flotilla_store_testkit::VirtualClock;
 
     use super::*;
 

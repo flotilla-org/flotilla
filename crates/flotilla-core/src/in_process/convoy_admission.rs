@@ -2716,7 +2716,7 @@ impl fmt::Display for RoleAddress {
     }
 }
 
-pub(super) async fn allocate_convoy_generation(
+pub async fn allocate_convoy_generation(
     backend: &ResourceBackend,
     namespace: &str,
     project: Option<&str>,
@@ -3980,10 +3980,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::{
-        discovery::test_support::{fake_discovery, FakeChangeRequest},
-        types::ChangeRequest,
-    };
+    use crate::providers::types::ChangeRequest;
+    use crate::testkits::discovery::fake_discovery;
+    use crate::testkits::discovery::FakeChangeRequest;
 
     // #2701: Projects with either retired builtin reference admit using the
     // current rules even when the stale builtin still exists, or has been deleted.
@@ -4047,7 +4046,7 @@ mod tests {
         // will be persisted. Later defaults cannot alter that admitted snapshot.
         use flotilla_resources::{CrewDefaults, CrewDefaultsSpec, Selector, SkillCatalogEntry};
 
-        use crate::providers::discovery::test_support::TestEnvVars;
+        use crate::testkits::discovery::TestEnvVars;
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"admission-skills-test\"\n").expect("config");
         let catalog = ["research", "testing", "implement", "wayfinder", "review"]

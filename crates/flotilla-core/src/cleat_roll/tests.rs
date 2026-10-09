@@ -1,8 +1,7 @@
 use super::*;
-use crate::providers::{
-    discovery::{EnvironmentAssertion, EnvironmentBag},
-    testing::MockRunner,
-};
+use crate::providers::discovery::EnvironmentAssertion;
+use crate::providers::discovery::EnvironmentBag;
+use crate::testkits::replay::testing::MockRunner;
 
 #[derive(Deserialize)]
 struct RecordedOutput {

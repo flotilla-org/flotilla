@@ -1056,3 +1056,5 @@ fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_r
         .join()
         .expect("test thread completed");
 }
+
+use flotilla_discovery_testkit::InProcessDiscoveryExt;

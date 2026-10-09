@@ -22,7 +22,7 @@ use crate::in_process::convoy_admission::{
     default_convoy_placement_policy, resolve_workflow_credentials, validate_workflow_agent_adapters, validate_workflow_credentials,
 };
 use crate::in_process::{placement_actuator_host_ref, placement_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 #[tokio::test]
 async fn default_remote_placement_resolves_replicated_credentials_before_admission() {

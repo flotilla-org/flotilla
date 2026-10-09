@@ -46,17 +46,20 @@ mod tests {
     use std::sync::Arc;
 
     use super::CleatTerminalPoolFactory;
-    use crate::{
-        config::ConfigStore,
-        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
-    };
+    use crate::config::ConfigStore;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::discovery::Factory;
+    use crate::providers::discovery::UnmetRequirement;
+    use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // #2706: factory discovery supplies the execution host baseline, while
     // Cleat owns terminal identity and ambient harness values never transfer.
     #[tokio::test]
     async fn session_factory_uses_declared_host_baseline_and_leaves_vt_identity_to_cleat() {
-        use crate::providers::{testing::MockRunner, CommandRunner};
+        use crate::providers::CommandRunner;
+        use crate::testkits::replay::testing::MockRunner;
 
         for outer_identity in [None, Some(("screen-256color", "truecolor"))] {
             let mut bag = EnvironmentBag::new()

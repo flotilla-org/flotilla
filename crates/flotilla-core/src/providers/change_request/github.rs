@@ -551,13 +551,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::providers::{
-        change_request::ChangeRequestTracker,
-        github_api::{GhApiClient, GithubRetrySource},
-        replay,
-        testing::{fixture_path, MockRunner},
-        CommandOutput,
-    };
+    use crate::providers::change_request::ChangeRequestTracker;
+    use crate::providers::github_api::GhApiClient;
+    use crate::providers::github_api::GithubRetrySource;
+    use crate::providers::CommandOutput;
+    use crate::testkits::replay;
+    use crate::testkits::replay::testing::fixture_path;
+    use crate::testkits::replay::testing::MockRunner;
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };

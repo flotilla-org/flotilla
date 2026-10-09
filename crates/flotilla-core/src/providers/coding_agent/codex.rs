@@ -571,7 +571,9 @@ impl super::CloudAgentService for CodexCodingAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{coding_agent::CloudAgentService, replay, testing::fixture_path};
+    use crate::providers::coding_agent::CloudAgentService;
+    use crate::testkits::replay;
+    use crate::testkits::replay::testing::fixture_path;
 
     // A transient probe failure preserves prior credentials and cache age,
     // and must not consume the separate missing-auth warning.

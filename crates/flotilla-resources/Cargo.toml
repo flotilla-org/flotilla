@@ -6,10 +6,9 @@ license.workspace = true
 
 [features]
 # Keep helper features uniform across build/workspace/package commands on stable.
-default = ["test-support"]
+default = []
 aws-lc-provider = ["rustls/aws_lc_rs"]
 skip-no-sandbox-tests = []
-test-support = []
 
 [dependencies]
 flotilla-protocol = { path = "../flotilla-protocol" }
@@ -36,8 +35,9 @@ object_store = { version = "0.12", features = ["aws"] }
 serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 hegeltest = "=0.48.1"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rstest = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -248,12 +248,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::{
-        issue_tracker::{tests::assert_provider_contract, IssueProvider},
-        replay::{self, Masks},
-        testing::{fixture_path, MockRunner},
-        ChannelLabel,
-    };
+    use crate::providers::issue_tracker::IssueProvider;
+    use crate::providers::ChannelLabel;
+    use crate::testkits::discovery::assert_provider_contract;
+    use crate::testkits::replay;
+    use crate::testkits::replay::testing::fixture_path;
+    use crate::testkits::replay::testing::MockRunner;
+    use crate::testkits::replay::Masks;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {

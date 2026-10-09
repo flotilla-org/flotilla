@@ -557,13 +557,12 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
-    use crate::{
-        providers::{
-            discovery::test_support::{test_vcs_resolver, DiscoveryMockRunner},
-            ChannelLabel, CommandOutput, CommandRunner,
-        },
-        vcs::EnumeratedCheckout,
-    };
+    use crate::providers::ChannelLabel;
+    use crate::providers::CommandOutput;
+    use crate::providers::CommandRunner;
+    use crate::testkits::discovery::test_vcs_resolver;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::vcs::EnumeratedCheckout;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // Process boundary: count and reject every Git command except worktree enumeration.

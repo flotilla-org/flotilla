@@ -13,9 +13,7 @@ pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
 use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator};
 
 #[path = "in_process/convoy_admission.rs"]
-mod convoy_admission;
-#[cfg(feature = "test-support")]
-pub mod ensure_scenarios;
+pub mod convoy_admission;
 mod project_ops;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
 mod repository_operations;
@@ -1197,7 +1195,7 @@ async fn discover_vcs_for_checkout(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn discover_repo_for_environment(
+pub async fn discover_repo_for_environment(
     environment_manager: &EnvironmentManager,
     discovery: &DiscoveryRuntime,
     config: &ConfigStore,
@@ -2919,77 +2917,6 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn register_direct_environment_for_test(
-        &self,
-        env_id: EnvironmentId,
-        runner: Arc<dyn CommandRunner>,
-        env_bag: EnvironmentBag,
-        host_id: Option<flotilla_protocol::qualified_path::HostId>,
-    ) -> Result<(), String> {
-        self.environment_manager.register_direct_environment(env_id, runner, env_bag, host_id)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_direct_environment_ssh_destination_for_test(&self, env_id: &EnvironmentId, destination: String) -> Result<(), String> {
-        self.environment_manager.set_direct_environment_ssh_destination(env_id, destination)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn register_provisioned_environment_for_test(
-        &self,
-        env_id: EnvironmentId,
-        handle: EnvironmentHandle,
-        env_bag: EnvironmentBag,
-    ) -> Result<(), String> {
-        self.environment_manager.register_provisioned_environment(env_id, handle, env_bag, None)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn replace_local_environment_bag_for_test(&self, env_bag: EnvironmentBag) -> Result<(), String> {
-        self.environment_manager.replace_local_environment_bag_for_test(env_bag)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn managed_environment_ids_for_test(&self) -> Vec<EnvironmentId> {
-        self.environment_manager.managed_environments().into_iter().map(|(env_id, _)| env_id).collect()
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn environment_bag_for_test(&self, env_id: &EnvironmentId) -> Option<EnvironmentBag> {
-        self.environment_manager.environment_bag(env_id)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn discover_repo_for_environment_for_test(
-        &self,
-        repo_path: &Path,
-        environment_id: &EnvironmentId,
-    ) -> Result<DiscoveryResult, String> {
-        let repository = match self.repository_key_for_path(repo_path).await {
-            Some(key) => self
-                .resource_backend
-                .including_replicas::<Repository>(&self.provisioning_namespace().await)
-                .get(&key.to_string())
-                .await
-                .ok()
-                .map(|source| source.object),
-            None => None,
-        };
-        discover_repo_for_environment(
-            &self.environment_manager,
-            &self.discovery,
-            &self.config,
-            &self.resource_backend,
-            &self.provisioning_namespace().await,
-            &self.local_environment_id,
-            environment_id,
-            repo_path,
-            repository.as_ref().map(|repository| &repository.spec),
-        )
-        .await
-    }
-
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         self.host_registry.peer_connection_status(node_id).await
@@ -3076,7 +3003,6 @@ impl InProcessDaemon {
     }
 
     /// Legacy presentation fixtures; production descriptions come from Host status.
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn set_peer_host_summaries(&self, summaries: HashMap<EnvironmentId, HostSummary>) {
         let remote_counts = HashMap::new();
         self.host_registry
@@ -3108,7 +3034,6 @@ impl InProcessDaemon {
     }
 
     /// Legacy presentation fixtures; production descriptions come from Host status.
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
         self.host_registry
             .publish_peer_summary(summary, &|e| {
@@ -4057,11 +3982,10 @@ impl InProcessDaemon {
     async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String> {
         self.convoy_ensure_reconciler().await?.reap_ensured_convoy(self, namespace, ensure_name, convoy_name, force).await
     }
-    #[cfg(feature = "test-support")]
     pub fn clock_for_scenarios(&self) -> Arc<dyn Clock> {
         self.clock.clone()
     }
-    async fn prepare_ensured_convoy(
+    pub async fn prepare_ensured_convoy(
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
@@ -4123,7 +4047,7 @@ impl InProcessDaemon {
         Ok((ensure, admission))
     }
 
-    async fn verify_standing_convoy_resource_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+    pub async fn verify_standing_convoy_resource_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
         let environments = self
             .resource_backend
             .using::<ResourceEnvironment>(&convoy.metadata.namespace)
@@ -4154,7 +4078,7 @@ impl InProcessDaemon {
             Err(format!("backing is not verified dead: {}", not_dead.join(", ")))
         }
     }
-    async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+    pub async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         self.crew_ops.reap(namespace, name, force).await
     }
 
@@ -4291,7 +4215,7 @@ impl InProcessDaemon {
         }
     }
 
-    async fn snapshot_project_repositories(
+    pub async fn snapshot_project_repositories(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -5345,7 +5269,7 @@ impl InProcessDaemon {
         self.crew_ops.verify_convoy_teardown_gate_for_checkouts(convoy, checkout_list, force).await
     }
 
-    async fn abandon_convoy_internal(
+    pub async fn abandon_convoy_internal(
         &self,
         namespace: &str,
         name: &str,
@@ -5355,8 +5279,7 @@ impl InProcessDaemon {
         self.crew_ops.abandon(namespace, name, reason, principal_ref).await
     }
 
-    #[cfg(feature = "test-support")]
-    async fn abandon_convoy_internal_with_hook<F, Fut>(
+    pub async fn abandon_convoy_internal_with_hook<F, Fut>(
         &self,
         namespace: &str,
         name: &str,
@@ -5401,7 +5324,6 @@ impl InProcessDaemon {
         self.crew_ops.withdraw_pending_brief(namespace, name).await
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub async fn reconcile_crew_stalls_once(&self, namespace: &str) -> Result<(), String> {
         self.crew_ops.reconcile_crew_stalls_once(namespace).await
     }
@@ -5689,7 +5611,7 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("references unknown host `{host_ref}`"))
     }
 
-    fn canonical_local_host_id(&self) -> Option<CanonicalHostId> {
+    pub fn canonical_local_host_id(&self) -> Option<CanonicalHostId> {
         self.local_host_id().map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
     }
 
@@ -7554,7 +7476,7 @@ async fn execute_local_remote_step_batch(
 }
 
 impl InProcessDaemon {
-    async fn explain_project_internal(&self, name: &str) -> Result<serde_json::Value, String> {
+    pub async fn explain_project_internal(&self, name: &str) -> Result<serde_json::Value, String> {
         let namespace = self.provisioning_namespace().await;
         let project = self.resource_backend.definitions::<Project>(&namespace).get(name).await.map_err(|error| error.to_string())?;
         let cascade = flotilla_resources::ResolvedCascade::load(&self.resource_backend, &namespace, name, &project.spec)
@@ -7563,7 +7485,7 @@ impl InProcessDaemon {
         Ok(serde_json::json!({ "namespace": namespace, "project": name, "cascade": cascade }))
     }
 
-    async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
+    pub async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
         self.read_projections().explain_convoy(&namespace, name).await
     }
@@ -8054,4 +7976,30 @@ where
         }
     }
     unreachable!("retry budget always makes an attempt")
+}
+
+impl InProcessDaemon {
+    /// Write the crew admission materials using the configured admission collaborators.
+    pub async fn write_admission_briefs(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        workflow: &WorkflowTemplateSpec,
+    ) -> Result<bool, String> {
+        self.convoy_admission.write_admission_briefs(namespace, name, spec, workflow).await
+    }
+}
+
+impl InProcessDaemon {
+    pub async fn record_project_operational_refusal(&self, namespace: &str, project: &str, reason: &str) {
+        self.project_service().record_project_operational_refusal(namespace, project, reason).await;
+    }
+}
+
+impl InProcessDaemon {
+    /// Access the environment collaborator used for discovery and registration.
+    pub fn environment_manager(&self) -> &EnvironmentManager {
+        &self.environment_manager
+    }
 }

@@ -13,7 +13,7 @@ use flotilla_resources::{
 use super::support::{resume_staging_fixture, test_meta, RecordingWorkCredentials};
 use crate::config::ConfigStore;
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 #[tokio::test]
 async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {

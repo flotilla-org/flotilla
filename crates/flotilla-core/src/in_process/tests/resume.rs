@@ -14,7 +14,7 @@ use super::support::{resume_staging_fixture, resume_staging_fixture_with_backend
 use crate::config::ConfigStore;
 use crate::in_process::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
 use crate::in_process::{input_meta_from_resource, InProcessDaemon};
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 // Working crews already own staged credentials. Operator input is admitted as
 // durable intent; ordinary attention changes cannot fabricate its delivery receipt.

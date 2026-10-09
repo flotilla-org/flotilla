@@ -172,7 +172,7 @@ pub trait ChangeRequestTracker: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::test_support::FakeChangeRequest;
+    use crate::testkits::discovery::FakeChangeRequest;
 
     #[tokio::test]
     async fn default_bound_observation_preserves_healthy_requests_after_a_missing_one() {

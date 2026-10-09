@@ -2,7 +2,7 @@
 // Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
-mod admission;
+pub mod admission;
 pub mod agent_adapter;
 pub mod agent_process;
 pub mod agents;
@@ -71,3 +71,12 @@ pub use flotilla_resources::tls;
 pub mod forge_observation;
 
 pub mod forge_budget;
+
+// Unit tests compile this library under cfg(test), which gives its traits a
+// different Rust identity from the normal library used by external testkits.
+// Compile the shared adapters against that identity; integration tests use the
+// testkit crates directly. No helper is included in the production library.
+#[cfg(test)]
+extern crate self as flotilla_core;
+#[cfg(test)]
+mod testkits;

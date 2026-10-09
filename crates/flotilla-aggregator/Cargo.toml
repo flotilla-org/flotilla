@@ -5,8 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = ["test-support"]
-test-support = ["flotilla-core/test-support", "flotilla-protocol/test-support", "flotilla-resources/test-support"]
+default = []
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests"]
 
@@ -26,6 +25,8 @@ futures = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 hegeltest = "=0.48.1"
 

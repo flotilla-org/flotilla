@@ -1,13 +1,11 @@
-use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
     admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_address_with_forges,
     issue_record_name, single_agent_shepherd_workflow_spec, single_agent_workflow_spec, validate, ExitDeclaration, InterpolationField,
     InterpolationLocation, RepositoryKey, ValidationError, WorkflowTemplateSpec,
 };
+use flotilla_store_testkit::fixtures::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use serde::Deserialize;
-
-use crate::common;
 
 #[derive(Debug, Deserialize)]
 struct WorkflowTemplateDocument {
@@ -392,9 +390,9 @@ fn turn_delivery_can_subscribe_to_an_artifact_leaf() {
         turn_delivery: workflow.turn_delivery,
         vessels: workflow.vessels,
     };
-    let convoy = common::convoy_object(
+    let convoy = flotilla_store_testkit::fixtures::convoy_object(
         "artifact-turn",
-        common::task_provisioning_convoy_spec(),
+        flotilla_store_testkit::fixtures::task_provisioning_convoy_spec(),
         Some(flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }),
     );
     let turns = flotilla_resources::instantiate_turn_delivery(&convoy, &Default::default(), &Default::default(), &[])

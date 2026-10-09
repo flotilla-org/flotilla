@@ -481,7 +481,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     );
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 
-    let materialized_name = crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
+    let materialized_name = flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster");
     backend.definitions::<WorkflowTemplate>("flotilla").delete(&materialized_name).await.expect("temporary resolution loss");
     let second_ref =
         ensures.get("quartermaster").await.expect("ensure").status.and_then(|status| status.convoy_ref).expect("second convoy ref");
@@ -519,7 +519,7 @@ pub async fn operator_reap_restarts_immediately_without_burning_budget_and_past_
     )
     .await;
     restarted_daemon
-        .install_convoy_ensure_reconciler(factory.create(restarted_daemon.resource_backend.clone(), restarted_daemon.clock.clone()))
+        .install_convoy_ensure_reconciler(factory.create(restarted_daemon.resource_backend(), restarted_daemon.clock_for_scenarios()))
         .await;
     assert!(restarted_daemon.reconcile_convoy_ensures_once("flotilla").await.expect("retry not due").is_empty());
     clock.set(retry_at);

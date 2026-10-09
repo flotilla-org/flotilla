@@ -9,7 +9,7 @@ pub(crate) fn free_space_floor_bytes(floor_gib: u64) -> Result<u64, String> {
     floor_gib.checked_mul(BYTES_PER_GIB).ok_or_else(|| format!("free-space floor is too large: {floor_gib} GiB"))
 }
 
-pub(crate) trait AvailableSpaceProbe: Send + Sync {
+pub trait AvailableSpaceProbe: Send + Sync {
     fn measure(&self, path: &Path) -> Option<u64>;
 }
 

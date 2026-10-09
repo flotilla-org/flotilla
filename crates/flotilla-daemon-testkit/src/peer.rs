@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use flotilla_protocol::{GoodbyeReason, NodeId, NodeInfo, PeerWireMessage};
 use tokio::sync::Notify;
 
-use crate::peer::{
+use flotilla_daemon::peer::{
     transport::{PeerConnectionStatus, PeerTransport},
     ActivationResult, ConnectionDirection, ConnectionMeta, PeerManager, PeerSender,
 };

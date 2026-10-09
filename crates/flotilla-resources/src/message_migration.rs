@@ -1,9 +1,5 @@
 //! Translate ephemeral crew-command inputs into receiver-homed Message intents.
-#[cfg(any(test, feature = "test-support"))]
-use chrono::{DateTime, Utc};
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::{Convoy, InputMeta, MessageInbox, ResourceError, ResourceObject, TerminalSession, TypedResolver, CONVOY_LABEL, VESSEL_LABEL};
 use crate::{CrewMessageSender, MessageRelation, MessageSpec, TerminalCrewMessage};
 
 /// Map crew-command sender attribution to a Message address and relation.
@@ -61,30 +57,4 @@ pub fn legacy_message_spec(receiver: &str, message: &TerminalCrewMessage) -> Mes
         }
     }
     MessageSpec::builder().sender(sender).receiver(receiver.into()).relation(relation).body(message.text.clone()).build()
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl TypedResolver<TerminalSession> {
-    /// Test-only fixture entry point for previous-generation sender envelopes.
-    /// Production producers construct MessageSpec directly.
-    /// Remove after the first fleet roll deploying #2710.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn accept_crew_message(
-        &self,
-        terminal: &ResourceObject<TerminalSession>,
-        message: &TerminalCrewMessage,
-        now: DateTime<Utc>,
-    ) -> Result<(), ResourceError> {
-        let convoy_name =
-            terminal.metadata.labels.get(CONVOY_LABEL).ok_or_else(|| ResourceError::invalid("crew message requires convoy context"))?;
-        let vessel =
-            terminal.metadata.labels.get(VESSEL_LABEL).ok_or_else(|| ResourceError::invalid("crew message requires vessel context"))?;
-        let convoy = self.backend.including_replicas::<Convoy>(&self.namespace).get(convoy_name).await?;
-        let project = convoy.object.spec.project_ref.as_deref().unwrap_or(&self.namespace);
-        let receiver = format!("{project}/{convoy_name}/{vessel}/{}", terminal.spec.role);
-        let spec = legacy_message_spec(&receiver, message);
-        let name = crate::message_record_name(&receiver, &spec.sender, &message.id);
-        MessageInbox::new(self.backend.clone(), &self.namespace).accept(&InputMeta::builder().name(name).build(), &spec, now).await?;
-        Ok(())
-    }
 }

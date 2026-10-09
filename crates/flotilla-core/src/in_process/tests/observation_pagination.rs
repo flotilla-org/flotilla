@@ -10,9 +10,9 @@ use super::support::test_meta;
 use crate::change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef};
 use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
-use crate::providers::discovery::test_support::fake_discovery_with_runner;
 use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag};
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use crate::testkits::discovery::fake_discovery_with_runner;
 
 #[derive(Default)]
 struct BusyObservationRunner {
@@ -107,3 +107,5 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
         assert!(pages[cycle * 8].contains(&format!("number:{number}")), "priority rotates through every PR and wraps across rediscovery");
     }
 }
+
+use crate::testkits::discovery::InProcessDiscoveryExt;

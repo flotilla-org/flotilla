@@ -1057,6 +1057,8 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
+ "flotilla-daemon-testkit",
+ "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1088,6 +1090,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon-api",
  "flotilla-protocol",
+ "flotilla-protocol-testkit",
  "flotilla-resources",
  "futures",
  "hegeltest",
@@ -1190,6 +1193,7 @@ dependencies = [
  "hegeltest",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1203,10 +1207,14 @@ dependencies = [
  "flotilla-build-features",
  "flotilla-core",
  "flotilla-daemon-api",
+ "flotilla-discovery-testkit",
  "flotilla-manifest",
+ "flotilla-orchestration-testkit",
  "flotilla-paths",
  "flotilla-protocol",
+ "flotilla-protocol-testkit",
  "flotilla-resources",
+ "flotilla-store-testkit",
  "futures",
  "hegeltest",
  "rstest",
@@ -1235,11 +1243,15 @@ dependencies = [
  "ed25519-dalek",
  "flotilla-build-features",
  "flotilla-daemon-api",
+ "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
  "flotilla-protocol",
+ "flotilla-protocol-testkit",
  "flotilla-relay-protocol",
+ "flotilla-replay-testkit",
  "flotilla-resources",
+ "flotilla-store-testkit",
  "futures",
  "hegeltest",
  "http",
@@ -1278,8 +1290,12 @@ dependencies = [
  "chrono",
  "flotilla-build-features",
  "flotilla-core",
+ "flotilla-credentials-testkit",
+ "flotilla-discovery-testkit",
  "flotilla-protocol",
+ "flotilla-replay-testkit",
  "flotilla-resources",
+ "flotilla-store-testkit",
  "futures",
  "hegeltest",
  "http",
@@ -1293,6 +1309,14 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "flotilla-credentials-testkit"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "tokio",
 ]
 
 [[package]]
@@ -1311,11 +1335,17 @@ dependencies = [
  "flotilla-controllers",
  "flotilla-core",
  "flotilla-credentials",
+ "flotilla-credentials-testkit",
  "flotilla-daemon-api",
+ "flotilla-daemon-testkit",
+ "flotilla-discovery-testkit",
  "flotilla-paths",
  "flotilla-protocol",
+ "flotilla-protocol-testkit",
  "flotilla-relay-protocol",
+ "flotilla-replay-testkit",
  "flotilla-resources",
+ "flotilla-store-testkit",
  "flotilla-test-support",
  "flotilla-transport",
  "futures",
@@ -1353,6 +1383,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-daemon-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-client",
+ "flotilla-core",
+ "flotilla-daemon",
+ "flotilla-daemon-api",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "flotilla-transport",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "flotilla-discovery-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-core",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-protocol-testkit",
+ "flotilla-resources",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-manifest"
 version = "0.1.0"
 dependencies = [
@@ -1373,12 +1433,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-orchestration-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-core",
+ "flotilla-discovery-testkit",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "flotilla-store-testkit",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "flotilla-paths"
 version = "0.1.0"
 dependencies = [
  "dirs",
  "flotilla-build-features",
  "flotilla-protocol",
+ "tokio",
 ]
 
 [[package]]
@@ -1404,6 +1483,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-protocol-testkit"
+version = "0.1.0"
+dependencies = [
+ "flotilla-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-relay"
 version = "0.1.0"
 dependencies = [
@@ -1418,6 +1505,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "tokio",
  "worker",
 ]
 
@@ -1431,6 +1519,31 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "flotilla-replay-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "flotilla-core",
+ "flotilla-paths",
+ "hegeltest",
+ "http",
+ "libc",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_yml",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -1445,6 +1558,7 @@ dependencies = [
  "flotilla-build-features",
  "flotilla-protocol",
  "flotilla-relay-protocol",
+ "flotilla-store-testkit",
  "futures",
  "hegeltest",
  "indexmap",
@@ -1467,11 +1581,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-store-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-test-support"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1504,9 +1634,11 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
+ "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
  "flotilla-protocol",
+ "flotilla-protocol-testkit",
  "flotilla-resources",
  "futures",
  "humantime",

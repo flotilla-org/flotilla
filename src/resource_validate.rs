@@ -629,8 +629,9 @@ mod tests {
     // its actual server; no external-service stand-in or recorded replay applies.
     use std::{path::Path, sync::Arc, time::Duration};
 
-    use flotilla_core::{config::ConfigStore, providers::discovery::test_support::fake_discovery};
+    use flotilla_core::config::ConfigStore;
     use flotilla_daemon::server::DaemonServer;
+    use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::NodeId;
     use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
     use flotilla_test_support::TestSocketDir;

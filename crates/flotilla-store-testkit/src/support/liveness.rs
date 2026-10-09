@@ -353,7 +353,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
-    use crate::Clock;
+    use flotilla_resources::Clock;
 
     #[derive(Debug, Default)]
     struct TestWorld {

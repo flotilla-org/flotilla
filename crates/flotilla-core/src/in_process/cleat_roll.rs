@@ -150,6 +150,7 @@ impl InProcessDaemon {
 
 #[cfg(test)]
 mod tests {
+    use crate::testkits::discovery::InProcessDiscoveryExt;
     use std::{collections::HashMap, sync::Arc};
 
     use async_trait::async_trait;
@@ -159,18 +160,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        config::ConfigStore,
-        providers::{
-            discovery::{
-                test_support::{fake_discovery, fake_discovery_with_runner, DiscoveryMockRunner},
-                EnvironmentAssertion, EnvironmentBag,
-            },
-            environment::{ProvisionedEnvironment, ProvisionedMount},
-            testing::MockRunner,
-            CommandRunner,
-        },
-    };
+    use crate::config::ConfigStore;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::environment::ProvisionedEnvironment;
+    use crate::providers::environment::ProvisionedMount;
+    use crate::providers::CommandRunner;
+    use crate::testkits::discovery::fake_discovery;
+    use crate::testkits::discovery::fake_discovery_with_runner;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testkits::replay::testing::MockRunner;
 
     struct Contained {
         id: EnvironmentId,

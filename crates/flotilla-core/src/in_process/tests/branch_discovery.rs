@@ -11,9 +11,9 @@ use flotilla_resources::{
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::test_meta;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::test_support::FakeChangeRequest;
 use crate::providers::types::ChangeRequest;
 use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+use crate::testkits::discovery::FakeChangeRequest;
 use crate::vcs::GitCheckoutStrategy;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 

@@ -28,7 +28,8 @@ use crate::{
     },
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
 };
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 #[derive(Clone)]
 pub struct RepoExecutionContext {
