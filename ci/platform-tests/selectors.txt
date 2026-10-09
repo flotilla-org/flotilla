@@ -4,8 +4,8 @@
 # all runs only on windows/macos, never tender-ssh; write shared coverage once under all.
 windows| -p flotilla-client --locked --lib windows_tests::
 windows| -p flotilla-client --locked --lib endpoint::
-windows| --locked --bin flotilla remote_
-windows| --locked --bin flotilla daemon_endpoint_conflicts
+windows| -p flotilla-client --locked --lib reconnect::tests::
+windows| -p flotilla-tui --locked --lib cli::args::tests::
 windows| -p flotilla-tui --locked --lib terminal::tests::
 windows| -p flotilla-tui --locked --lib remote_connector_keeps_viewer_locality
 windows| -p flotilla-manifest --locked --lib sink::tests::

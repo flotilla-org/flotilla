@@ -1,3 +1,5 @@
+pub mod args;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,

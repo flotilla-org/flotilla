@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+humantime = "2"
 bon = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-client = { path = "../flotilla-client" }
