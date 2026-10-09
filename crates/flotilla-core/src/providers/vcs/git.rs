@@ -2,10 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{run, types::*, CommandRunner},
-};
+use crate::providers::{run, types::*, CommandRunner};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct GitVcs {
     runner: Arc<dyn CommandRunner>,

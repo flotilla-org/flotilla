@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_resources::{Checkout, Convoy, Demand, Environment, Project, Regard, Repository, ResourceError};
 use futures::future::BoxFuture;
 

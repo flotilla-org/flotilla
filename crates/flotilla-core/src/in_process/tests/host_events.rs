@@ -12,11 +12,11 @@ use tokio::sync::broadcast;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
-use crate::daemon::DaemonHandle;
 use crate::in_process::InProcessDaemon;
 use crate::providers::discovery::test_support::{
     fake_discovery, fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders,
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
 
 // UTC-to-monotonic conversion must preserve a future header deadline and keep
 // expired/zero deadlines from causing a burst of concurrent cache misses.

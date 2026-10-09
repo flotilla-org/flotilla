@@ -8,7 +8,8 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle};
+use flotilla_core::config::ConfigStore;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     qualified_path::HostId, Command, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo, ProvisioningTarget,
     RepoInfo, RepoLabels, StatusResponse, StreamKey, TopologyResponse,

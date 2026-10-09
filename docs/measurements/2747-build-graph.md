@@ -19,6 +19,11 @@ in order without another edit. Measure wall time with Python's monotonic clock.
 Restore the comment after the sequence. The complete workspace test command
 precedes the package-local core command, as requested by the contract.
 
+That edit path records the historical revisions measured here. #2968 later
+moved the module to `crates/flotilla-daemon-api/src/daemon.rs`; editing it now
+measures an API edit rather than a core edit. For the later core-edit/client
+isolation measurement, see [#2968](2968-client-core-extraction.md).
+
 ## Results
 
 | Command | Before | After | Recompiled packages before → after |

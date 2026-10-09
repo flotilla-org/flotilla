@@ -14,7 +14,6 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     command_target::TargetHost,
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::{InProcessDaemon, WorkCredentialReconciler},
     providers::{
         discovery::{
@@ -36,6 +35,7 @@ use flotilla_daemon::{
         spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestMesh, InMemoryRequestTopology,
     },
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::HostId,

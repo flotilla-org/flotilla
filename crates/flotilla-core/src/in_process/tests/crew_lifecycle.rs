@@ -14,9 +14,9 @@ use super::support::{
     claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
 };
 use crate::config::ConfigStore;
-use crate::daemon::DaemonHandle;
 use crate::in_process::InProcessDaemon;
 use crate::providers::discovery::test_support::fake_discovery;
+use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]
 async fn crew_fail_requires_operator_force() {

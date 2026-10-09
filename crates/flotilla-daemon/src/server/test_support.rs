@@ -1,7 +1,8 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use flotilla_client::SocketDaemon;
-use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
     CommandCaller, GoodbyeReason, HostName, NodeId, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,

@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_core::{
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::{
-        environment::{EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
-        terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
-    },
+use flotilla_core::providers::{
+    environment::{EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
+    terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
 };
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
     DockerEnvironmentSpec, DockerImagePullPolicy, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSpec,

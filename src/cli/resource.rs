@@ -3,7 +3,8 @@ use std::path::Path;
 use std::{path::PathBuf, sync::Arc};
 
 use color_eyre::Result;
-use flotilla_core::{config::ConfigStore, path_context::DaemonHostPath};
+use flotilla_core::config::ConfigStore;
+use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
 use flotilla_tui::cli::args::{ArtifactSubCommand, Cli, CliPaths, ResourceSubCommand, ResourceWatchArgs};
@@ -650,7 +651,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn cli_resource_document(
-        daemon: &dyn flotilla_core::daemon::DaemonHandle,
+        daemon: &dyn flotilla_daemon_api::daemon::DaemonHandle,
         node_id: Option<NodeId>,
         kind: &str,
         name: &str,
@@ -685,7 +686,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn cli_apply_document(
-        daemon: &dyn flotilla_core::daemon::DaemonHandle,
+        daemon: &dyn flotilla_daemon_api::daemon::DaemonHandle,
         node_id: Option<NodeId>,
         document: serde_json::Value,
     ) -> CommandValue {
@@ -719,7 +720,7 @@ mod tests {
     #[cfg(unix)]
     async fn cli_round_trip_host_reference<T: flotilla_resources::Resource>(
         backend: &flotilla_resources::ResourceBackend,
-        daemon: &dyn flotilla_core::daemon::DaemonHandle,
+        daemon: &dyn flotilla_daemon_api::daemon::DaemonHandle,
         node_id: Option<NodeId>,
         spec: &T::Spec,
     ) {

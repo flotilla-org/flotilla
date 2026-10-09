@@ -22,13 +22,13 @@ use crate::providers::environment::{legacy_environment_spec, EnvironmentKind};
 use crate::{
     data,
     environment_manager::{CreateProvisionedEnvironmentRequest, EnvironmentManager},
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{
         discovery::EnvVars, issue_tracker::forge_issue_source, registry::ProviderRegistry, vcs::write_branch_issue_links, CommandRunner,
     },
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
 };
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 #[derive(Clone)]
 pub struct RepoExecutionContext {

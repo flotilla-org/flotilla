@@ -12,11 +12,12 @@ use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
-    path_context::ExecutionEnvironmentPath,
     providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
+#[cfg(unix)]
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_resources::validate_resource_document;
 #[cfg(unix)]
 use flotilla_resources::{
@@ -1148,11 +1149,11 @@ mod tests {
         use std::sync::Arc;
 
         use flotilla_core::{
-            path_context::ExecutionEnvironmentPath,
             providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
             repository_inspection::GitRepositoryInspector,
             vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
         };
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
         let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
         let tmp = tmp_guard.path().to_path_buf();
@@ -1234,11 +1235,11 @@ mod tests {
         use std::sync::Arc;
 
         use flotilla_core::{
-            path_context::ExecutionEnvironmentPath,
             providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
             repository_inspection::GitRepositoryInspector,
             vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
         };
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
         let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
         let tmp = tmp_guard.path().to_path_buf();

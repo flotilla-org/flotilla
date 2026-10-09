@@ -1056,7 +1056,9 @@ dependencies = [
  "flotilla-commands",
  "flotilla-core",
  "flotilla-daemon",
+ "flotilla-daemon-api",
  "flotilla-manifest",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-test-support",
@@ -1084,6 +1086,7 @@ dependencies = [
  "chrono",
  "flotilla-build-features",
  "flotilla-core",
+ "flotilla-daemon-api",
  "flotilla-protocol",
  "flotilla-resources",
  "futures",
@@ -1162,7 +1165,8 @@ dependencies = [
  "async-trait",
  "bon",
  "flotilla-build-features",
- "flotilla-core",
+ "flotilla-daemon-api",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-test-support",
@@ -1198,7 +1202,9 @@ dependencies = [
  "dirs",
  "flotilla-build-features",
  "flotilla-core",
+ "flotilla-daemon-api",
  "flotilla-manifest",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-resources",
  "futures",
@@ -1228,7 +1234,9 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "flotilla-build-features",
+ "flotilla-daemon-api",
  "flotilla-manifest",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-relay-protocol",
  "flotilla-resources",
@@ -1303,6 +1311,8 @@ dependencies = [
  "flotilla-controllers",
  "flotilla-core",
  "flotilla-credentials",
+ "flotilla-daemon-api",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-relay-protocol",
  "flotilla-resources",
@@ -1332,6 +1342,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-daemon-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-build-features",
+ "flotilla-protocol",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-manifest"
 version = "0.1.0"
 dependencies = [
@@ -1349,6 +1370,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "flotilla-paths"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "flotilla-build-features",
+ "flotilla-protocol",
 ]
 
 [[package]]
@@ -1473,7 +1503,9 @@ dependencies = [
  "flotilla-commands",
  "flotilla-core",
  "flotilla-daemon",
+ "flotilla-daemon-api",
  "flotilla-manifest",
+ "flotilla-paths",
  "flotilla-protocol",
  "flotilla-resources",
  "futures",

@@ -9,9 +9,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{
     in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
-    path_context::ExecutionEnvironmentPath,
     providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner},
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_resources::{
     CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend,
     ResourceBackend, SqliteBackend,

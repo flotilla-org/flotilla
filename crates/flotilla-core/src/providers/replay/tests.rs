@@ -62,10 +62,8 @@ interactions:
     let session = Session::replaying(&path, masks);
     let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-    use crate::{
-        path_context::ExecutionEnvironmentPath,
-        providers::vcs::{git::GitVcs, VcsInspection},
-    };
+    use crate::providers::vcs::{git::GitVcs, VcsInspection};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     let git = GitVcs::new(runner);
     let repo = ExecutionEnvironmentPath::new("/test/repo");
     let branches = git.list_local_branches(&repo).await.unwrap();

@@ -17,10 +17,10 @@ use flotilla_core::{
     agent_process::ExitReceiptObserver,
     config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
     in_process::{InProcessDaemon, StandingConvoyBackingInspector},
-    path_context::DaemonHostPath,
     providers::{registry::ProviderRegistry, ChannelLabel},
 };
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
 use tokio::sync::{Mutex, Semaphore};

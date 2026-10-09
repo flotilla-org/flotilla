@@ -10,7 +10,6 @@ pub mod aggregator_projection;
 pub mod attachable;
 pub mod awareness_projection;
 mod branch_lookup_observer;
-pub mod build_info;
 pub mod change_request_observer;
 mod charter_notifications;
 pub mod charter_store;
@@ -22,7 +21,6 @@ pub mod convert;
 pub mod convoy_branch_refresh;
 pub mod convoy_ensure;
 pub mod crew_capabilities;
-pub mod daemon;
 pub mod data;
 pub mod decision_log;
 pub mod demand_lifecycle;
@@ -46,8 +44,6 @@ pub mod log_file;
 pub mod model;
 pub(crate) mod observed_resources;
 pub mod ops_entry;
-pub mod path_context;
-pub mod path_policy;
 pub mod placement_policy;
 pub mod probe;
 pub mod project_declaration;
@@ -67,8 +63,6 @@ mod standing_roles;
 pub mod step;
 pub mod terminal_health;
 pub mod vcs;
-
-pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";
 
 // Re-export shared infrastructure and host types for convenience.
 pub use flotilla_protocol::HostName;

@@ -557,10 +557,10 @@ mod tests {
 #[cfg(test)]
 mod runner_contract {
     use flotilla_core::{
-        path_context::ExecutionEnvironmentPath,
         providers::{vcs::git_worktree::GitWorktreeStrategy, CommandOutput},
         vcs::{FlotillaVcs, GitCheckoutStrategy},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_resources::{
         ImageBuildReason, ImageBuildReservation, ImageInputStability, ImageLayerSpec, ImageLayerStage, ResolvedImageInputs,
     };

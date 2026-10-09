@@ -5,7 +5,8 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-flotilla-core = { path = "../flotilla-core" }
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }

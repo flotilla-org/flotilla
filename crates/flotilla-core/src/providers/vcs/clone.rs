@@ -6,10 +6,10 @@ use flotilla_resources::CheckoutBranchProvenance;
 use tracing::info;
 
 use crate::{
-    path_context::ExecutionEnvironmentPath,
     providers::{types::Checkout, ChannelLabel, CommandRunner},
     vcs::{existing_checkout_branch_error, CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 /// A `CheckoutManager` for sandbox/container environments that uses
 /// `git clone --reference` from a read-only reference repo (typically

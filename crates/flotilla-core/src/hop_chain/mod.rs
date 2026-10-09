@@ -16,7 +16,7 @@ mod tests;
 pub use flotilla_protocol::{arg::Arg, ResolvedAttachAction as ResolvedAction};
 use flotilla_protocol::{EnvironmentId, HostName};
 
-use crate::path_context::ExecutionEnvironmentPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 /// Declarative — what needs to happen, not how.
 #[derive(Debug, Clone, PartialEq, Eq)]

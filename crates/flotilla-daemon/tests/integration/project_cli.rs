@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
     ops_entry::{
         materialized_workflow_name, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
@@ -24,6 +23,7 @@ use flotilla_core::{
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
 };
@@ -113,7 +113,7 @@ impl RepositoryInspector for DeclarationInspector {
             spec: self.bootstrap.clone(),
             checkout: LocalCheckoutInspection {
                 // Match GitRepositoryInspector: local checkout facts use physical paths.
-                path: flotilla_core::path_context::canonical_or_original(path),
+                path: flotilla_paths::path_context::canonical_or_original(path),
                 host_ref: self.host_ref.clone(),
                 git_ref: "main".to_string(),
                 is_main: true,

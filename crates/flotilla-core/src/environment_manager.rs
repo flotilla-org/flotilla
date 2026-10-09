@@ -13,7 +13,6 @@ use flotilla_resources::host_direct_environment_name;
 use crate::providers::environment::{EnvironmentKind, PreparedEnvironment};
 use crate::{
     config::ConfigStore,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag, FactoryRegistry, HostDetector},
         environment::{
@@ -25,6 +24,7 @@ use crate::{
         CommandRunner,
     },
 };
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 #[derive(Clone)]
 pub enum ManagedEnvironmentKind {
@@ -1223,21 +1223,27 @@ mod tests {
         assert!(manager
             .resolve_environment_path_to_host_path(
                 &EnvironmentId::new("missing"),
-                &crate::path_context::ExecutionEnvironmentPath::new("/ref/repo")
+                &flotilla_paths::path_context::ExecutionEnvironmentPath::new("/ref/repo")
             )
             .is_none());
 
         let host_path = manager
-            .resolve_environment_path_to_host_path(&env_id, &crate::path_context::ExecutionEnvironmentPath::new("/ref/repo/subdir"))
+            .resolve_environment_path_to_host_path(
+                &env_id,
+                &flotilla_paths::path_context::ExecutionEnvironmentPath::new("/ref/repo/subdir"),
+            )
             .expect("host path");
         assert_eq!(host_path.to_string(), format!("host:{}:/host/reference-repo/subdir", test_local_host_id()));
 
         let env_path = manager.resolve_host_path_to_environment_path(&env_id, &host_path).expect("environment path");
-        assert_eq!(env_path, crate::path_context::ExecutionEnvironmentPath::new("/ref/repo/subdir"));
+        assert_eq!(env_path, flotilla_paths::path_context::ExecutionEnvironmentPath::new("/ref/repo/subdir"));
 
         assert!(
             manager
-                .resolve_environment_path_to_host_path(&env_id, &crate::path_context::ExecutionEnvironmentPath::new("/ref/repo/../other"))
+                .resolve_environment_path_to_host_path(
+                    &env_id,
+                    &flotilla_paths::path_context::ExecutionEnvironmentPath::new("/ref/repo/../other")
+                )
                 .is_none(),
             "escaping parent components must be rejected"
         );

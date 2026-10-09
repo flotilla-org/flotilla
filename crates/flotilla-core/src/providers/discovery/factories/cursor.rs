@@ -6,13 +6,13 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         coding_agent::{cursor::CursorCodingAgent, CloudAgentService},
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         CommandRunner, ReqwestHttpClient,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // ---------------------------------------------------------------------------
 // CursorCodingAgentFactory
@@ -66,9 +66,9 @@ mod tests {
     use super::CursorCodingAgentFactory;
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_agent_and_api_key() -> EnvironmentBag {
         EnvironmentBag::new()

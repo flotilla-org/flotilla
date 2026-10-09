@@ -14,10 +14,8 @@ use async_trait::async_trait;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::{
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
     model::RepoModel,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
         change_request::ChangeRequestTracker,
@@ -39,6 +37,8 @@ use flotilla_core::{
     },
     repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     test_support::TestIssue,

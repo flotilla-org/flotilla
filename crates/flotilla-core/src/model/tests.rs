@@ -5,9 +5,7 @@ use flotilla_protocol::{
 };
 
 use super::*;
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{
+use crate::{providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
@@ -17,8 +15,8 @@ use crate::{
             ChangeRequest, Checkout, CloudAgentSession, Issue,
         },
         vcs::Vcs,
-    },
-};
+    }};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 fn named_desc(category: ProviderCategory, name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(category, name)

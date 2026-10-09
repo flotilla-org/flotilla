@@ -103,7 +103,6 @@ use crate::{
         inspect_convoy_checkout_integration,
     },
     config::{ConfigStore, StaticEnvironmentConfig},
-    daemon::{DaemonHandle, QuerySubscription},
     environment_manager::{EnvironmentManager, ResolvedEnvironment},
     event_sink::{BroadcastEventSink, EventSink},
     executor,
@@ -118,7 +117,6 @@ use crate::{
     leaf_engine::LeafSubscriptionTable,
     model::{provider_names_from_registry, repo_name, RepoModel},
     ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
-    path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
         change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
@@ -142,6 +140,8 @@ use crate::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
 };
+use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
+use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 
 type ObservationScope = (String, String, String);
 const OBSERVATION_CACHE_FALLBACK_DELAY: Duration = Duration::from_secs(9);
@@ -4557,10 +4557,8 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::{
-            path_context::ExecutionEnvironmentPath,
-            providers::vcs::{git::GitVcs, VcsInspection},
-        };
+        use crate::providers::vcs::{git::GitVcs, VcsInspection};
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
         let vcs = GitVcs::new(self.discovery.runner.clone());
         let ee_path = ExecutionEnvironmentPath::new(path);

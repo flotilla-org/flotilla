@@ -21,12 +21,12 @@ use flotilla_resources::{
 use crate::config::ConfigStore;
 use crate::in_process::dispatch_board::tests::board;
 use crate::in_process::{input_meta_from_resource, InProcessDaemon, WorkCredentialReconciler};
-use crate::path_context::ExecutionEnvironmentPath;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::discovery::test_support::fake_discovery;
 use crate::providers::discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) struct RecordingWorkCredentials {
     pub(super) backend: ResourceBackend,

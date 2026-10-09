@@ -8,10 +8,8 @@ use async_trait::async_trait;
 use flotilla_protocol::commands::AttachMode;
 use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize},
-};
+use crate::providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(crate) struct SharedScan<T> {
     ttl: Duration,

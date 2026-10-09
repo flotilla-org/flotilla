@@ -5,7 +5,7 @@ fn main() -> Result<(), String> {
 
 #[cfg(unix)]
 fn main() -> Result<(), String> {
-    flotilla_core::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
+    flotilla_daemon_api::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
     unix::run()
 }
 
@@ -14,7 +14,7 @@ mod unix {
     use std::{path::PathBuf, sync::OnceLock};
 
     use clap::Parser;
-    use flotilla_core::path_policy::{daemon_socket_path, ensure_daemon_socket_belongs_to_config, PathPolicy};
+    use flotilla_paths::path_policy::{daemon_socket_path, ensure_daemon_socket_belongs_to_config, PathPolicy};
 
     const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 

@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use flotilla_core::{
     config::ConfigStore,
     in_process::InProcessDaemon,
-    path_context::DaemonHostPath,
     providers::{
         environment::{
             contained_daemon_socket_path, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
@@ -18,6 +17,7 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
+use flotilla_paths::path_context::DaemonHostPath;
 use tokio::sync::OnceCell;
 
 /// A registered provider key. The private representation keeps factory contracts

@@ -6,7 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flotilla_core::{in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest};
+use flotilla_core::{in_process::InProcessDaemon, step::RemoteStepBatchRequest};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfigLabel, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, RepoIdentity};
 use tokio::{
     sync::{mpsc, Mutex},

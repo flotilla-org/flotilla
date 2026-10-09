@@ -12,10 +12,10 @@ use std::{
 use flotilla_core::{
     agents::AgentEntry,
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     commands::DaemonLogQuery,
     qualified_path::QualifiedPath,
@@ -703,7 +703,7 @@ async fn complete_client_hello(session: &MessageSession) {
     };
     assert_eq!(protocol_version, PROTOCOL_VERSION);
     let info = flotilla_protocol::hello_build_info(&display_name).expect("daemon build metadata");
-    assert_eq!(info.build_id, flotilla_core::build_info::build_id());
+    assert_eq!(info.build_id, flotilla_daemon_api::build_info::build_id());
     assert_eq!(info.protocol_fingerprint, flotilla_protocol::PROTOCOL_FINGERPRINT);
 }
 
@@ -4924,7 +4924,7 @@ impl flotilla_core::providers::discovery::Factory for GatedStartupEnvironmentFac
         &self,
         _env: &flotilla_core::providers::discovery::EnvironmentBag,
         _config: &ConfigStore,
-        _root: &flotilla_core::path_context::ExecutionEnvironmentPath,
+        _root: &flotilla_paths::path_context::ExecutionEnvironmentPath,
         _runner: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<flotilla_core::providers::discovery::UnmetRequirement>> {
         Ok(self.0.clone())

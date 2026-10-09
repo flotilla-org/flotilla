@@ -460,10 +460,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        path_context::ExecutionEnvironmentPath,
         providers::{testing::MockRunner, vcs::git_worktree::GitWorktreeStrategy},
         vcs::{FlotillaVcs, GitCheckoutStrategy},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[test]
     fn claim_links_a_pr_from_a_different_branch_and_forge() {

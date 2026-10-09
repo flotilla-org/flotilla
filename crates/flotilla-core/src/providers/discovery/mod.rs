@@ -31,7 +31,6 @@ use crate::{
     admission::{system_available_space_probe, AvailableSpaceProbe},
     agent_adapter::AgentAdapterRegistry,
     config::ConfigStore,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
@@ -44,6 +43,7 @@ use crate::{
     },
     vcs::Vcs,
 };
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 // ---------------------------------------------------------------------------
 // Environment assertion types
@@ -996,12 +996,12 @@ mod orchestrator_tests {
     use super::*;
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{
             detectors,
             test_support::{DiscoveryMockRunner, TestEnvVars},
         },
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     /// Build a DiscoveryMockRunner with git binary available plus
     /// git rev-parse responses for a repo at the given path.

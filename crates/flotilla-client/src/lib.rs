@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 pub use endpoint::{DaemonEndpoint, SshEndpoint};
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoInfo, Request, Response,
     ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
@@ -30,7 +30,7 @@ pub mod launchd;
 pub mod reconnect;
 pub mod resource;
 pub mod systemd;
-pub use flotilla_core::build_info::build_id;
+pub use flotilla_daemon_api::build_info::build_id;
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
@@ -647,7 +647,7 @@ async fn connect_or_spawn_with_optional_surface_using(
     // client may deliberately inspect or drive an existing daemon through a
     // socket owned by another root, but it must never create that daemon with
     // its own mismatched config and state directories.
-    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(socket_path, config_dir)?;
+    flotilla_paths::path_policy::ensure_daemon_socket_belongs_to_config(socket_path, config_dir)?;
 
     ensure_no_live_daemon_without_socket(state_dir, socket_path)?;
 
@@ -782,7 +782,7 @@ async fn wait_for_daemon(socket_path: &Path, surface: Option<&SurfaceDeclaration
 fn ensure_no_live_daemon_without_socket(state_dir: &Path, socket_path: &Path) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
-    let lock_path = state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE);
+    let lock_path = state_dir.join(flotilla_daemon_api::DAEMON_LIFECYCLE_LOCK_FILE);
     let file = match std::fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1254,7 +1254,7 @@ mod spawn_lock_tests {
         let state = config.join("state");
         fs::create_dir_all(config.join("run")).expect("socket parent");
         fs::create_dir_all(&state).expect("state directory");
-        let socket = flotilla_core::path_policy::daemon_socket_path(&config);
+        let socket = flotilla_paths::path_policy::daemon_socket_path(&config);
         (dir, socket, config, state)
     }
 

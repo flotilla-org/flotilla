@@ -7,7 +7,7 @@ use std::{
 use flotilla_protocol::{AgentHarness, AgentStatus, AttachableId};
 use serde::{Deserialize, Serialize};
 
-use crate::path_context::DaemonHostPath;
+use flotilla_paths::path_context::DaemonHostPath;
 
 /// Persisted state for a single agent instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

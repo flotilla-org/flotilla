@@ -15,12 +15,12 @@ use tokio::sync::Mutex;
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{claim_crew, stall_test_daemon, stall_workflow_snapshot, test_meta};
 use crate::change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef};
-use crate::daemon::DaemonHandle;
 use crate::in_process::{
     observation_cache_delay, observation_during_cooldown, observation_rate_limit_error, CachedObservation, ChangeRequestQueryPort,
     ProviderChangeRequestObservationSource, OBSERVATION_CACHE_FALLBACK_DELAY,
 };
 use crate::providers::change_request::{BoundObservations, ChangeRequestTracker, ObservationError};
+use flotilla_daemon_api::daemon::DaemonHandle;
 
 // #2543: scope waits use the latest deadline independently of batch ordering;
 // hard errors and untimed limits remain substantive refusals for their subjects.

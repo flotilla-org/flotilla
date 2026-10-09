@@ -5,6 +5,8 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 humantime = "2"
 bon = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

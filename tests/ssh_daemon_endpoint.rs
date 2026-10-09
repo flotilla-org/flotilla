@@ -7,7 +7,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use flotilla_client::{DaemonEndpoint, SocketDaemon, SshEndpoint};
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     ConnectionRole, Message, NodeId, Request, Response, ResponseResult, SurfaceDeclaration, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };

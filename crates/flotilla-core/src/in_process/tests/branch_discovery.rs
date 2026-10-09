@@ -10,12 +10,12 @@ use flotilla_resources::{
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::test_meta;
-use crate::path_context::ExecutionEnvironmentPath;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::discovery::test_support::FakeChangeRequest;
 use crate::providers::types::ChangeRequest;
 use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
 use crate::vcs::GitCheckoutStrategy;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // #2698: automatic branch discovery must not bind an already terminal PR
 // to a newly created convoy. Explicit adoption remains a separate operation.

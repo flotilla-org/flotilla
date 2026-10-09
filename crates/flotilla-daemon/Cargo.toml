@@ -12,6 +12,8 @@ skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resour
 test-support = ["flotilla-protocol/test-support", "dep:flotilla-client"]
 
 [dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 bon = { workspace = true }
 flotilla-aggregator = { path = "../flotilla-aggregator" }
 flotilla-client = { path = "../flotilla-client", optional = true }

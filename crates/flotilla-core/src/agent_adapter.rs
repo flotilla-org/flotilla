@@ -13,9 +13,9 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::{
     crew_capabilities::CAPABILITIES_HEADING,
-    path_context::ExecutionEnvironmentPath,
     providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 mod fleet_canary;
 
@@ -1231,13 +1231,13 @@ mod tests {
             CrewBriefTemplateOverride, CrewBriefTemplateResolver, CLAUDE_MANAGED_SETTINGS_PATH,
         },
         crew_capabilities::CAPABILITIES_HEADING,
-        path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{factories::git::GitVcsFactory, EnvironmentAssertion, EnvironmentBag, Factory},
             testing::MockRunner,
             ProcessCommandRunner,
         },
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";
 

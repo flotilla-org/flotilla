@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use color_eyre::Result;
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 
 use flotilla_tui::cli::args::{Cli, CliPaths, PmSubCommand};

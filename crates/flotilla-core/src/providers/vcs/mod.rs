@@ -12,10 +12,8 @@ use flotilla_protocol::CheckoutIntent;
 pub use provisioning::{CloneInspection, CloneProvisioner, GitCloneProvisioner};
 use tracing::warn;
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{run, types::*, ChannelLabel, CommandRunner},
-};
+use crate::providers::{run, types::*, ChannelLabel, CommandRunner};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 

@@ -132,7 +132,7 @@ mod tests {
         let codex = adapters.get("codex").expect("codex agent adapter should register when the binary is present");
         codex
             .prepare(
-                &crate::path_context::ExecutionEnvironmentPath::new("/workspace"),
+                &flotilla_paths::path_context::ExecutionEnvironmentPath::new("/workspace"),
                 &flotilla_resources::TerminalBrief {
                     artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".into(),
