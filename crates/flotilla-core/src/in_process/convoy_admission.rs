@@ -4326,6 +4326,55 @@ mod tests {
         let needs = daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("needs");
         assert!(needs.contains(&CapabilityNeed::Harness { adapter: "codex".into(), minimum_version: "0.160.0".into() }));
     }
+    // #2972: frozen provider-instance labels must not borrow legacy host-only
+    // evidence or another instance's digest on the same host.
+    #[hegel::test]
+    fn image_placement_cost_respects_frozen_instance(tc: hegel::TestCase) {
+        // Covers both stored generations and present/missing selected instances.
+        let legacy = tc.draw(hegel::generators::booleans());
+        let other_instance = tc.draw(hegel::generators::booleans());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let hosts = backend.using::<ResourceHost>("test");
+            let host = hosts
+                .create(&InputMeta::builder().name("host".into()).build(), &flotilla_resources::HostSpec::default())
+                .await
+                .expect("host");
+            let digest = format!("sha256:{}", "1".repeat(64));
+            let inventory = if legacy { serde_json::json!([digest]) } else { serde_json::json!({"cache-a": [digest]}) };
+            let mut status = flotilla_resources::HostStatus::default();
+            status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), inventory);
+            hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("inventory");
+            let host = hosts.get("host").await.expect("host");
+            let labels = BTreeMap::from([(
+                ENVIRONMENT_PROVIDER_INSTANCE_LABEL.to_string(),
+                if other_instance { "cache-b".into() } else { "cache-a".into() },
+            )]);
+            let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel {
+                image: flotilla_resources::DockerImageSource::Literal(digest),
+            };
+            let cost = image_placement_cost(
+                &backend,
+                "test",
+                Some(&host),
+                labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
+                &realisation,
+                None,
+                None,
+            )
+            .await
+            .expect("cost");
+            assert_eq!(
+                cost,
+                if !legacy && !other_instance {
+                    flotilla_resources::ImageAcquisitionCost::Held
+                } else {
+                    flotilla_resources::ImageAcquisitionCost::Build
+                }
+            );
+        });
+    }
+
     #[test]
     fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
         let now = chrono::Utc::now();

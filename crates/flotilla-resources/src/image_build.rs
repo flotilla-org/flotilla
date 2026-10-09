@@ -252,10 +252,7 @@ impl<'de> Deserialize<'de> for LocalImageInventories {
         }
         Ok(match Record::deserialize(deserializer)? {
             Record::PerCache(caches) => Self(caches),
-            Record::Legacy(digests) => {
-                drop(digests);
-                Self::default()
-            }
+            Record::Legacy(_digests) => Self::default(),
         })
     }
 }

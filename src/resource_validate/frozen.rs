@@ -59,15 +59,13 @@ impl Probes for CandidateProbes<'_> {
         // separately checks the exact host/provider-instance identity.
         let digest = reference.rsplit_once('@').map_or(reference, |(_, digest)| digest);
         for host in self.inventory.iter().filter(|document| document["kind"] == "Host") {
-            if host
-                .pointer(&format!("/status/capabilities/{IMAGE_DIGESTS_CAPABILITY}"))
+            let inventory = host.pointer(&format!("/status/capabilities/{IMAGE_DIGESTS_CAPABILITY}"));
+            if inventory
                 .and_then(|value| serde_json::from_value::<flotilla_resources::LocalImageInventories>(value.clone()).ok())
                 .is_some_and(|inventory| inventory.0.values().any(|held| held.contains(reference) || held.contains(digest)))
-                // ADR 0047: previous host-only evidence can establish fleet-wide
-                // existence at the pre-roll gate, but never a specific cache.
-                || host.pointer(&format!("/status/capabilities/{IMAGE_DIGESTS_CAPABILITY}"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|held| held.iter().any(|value| value == reference || value == digest))
+                // ADR 0047: remove one roll after B1. Old host-only evidence can
+                // establish fleet-wide existence, but never a specific cache.
+                || inventory.and_then(Value::as_array).is_some_and(|held| held.iter().any(|value| value == reference || value == digest))
             {
                 return Ok(());
             }
@@ -1030,6 +1028,60 @@ mod tests {
                 assert!(error.contains("absent from host digest inventories") && error.contains("manifest unknown"), "{error}");
             }
         });
+    }
+
+    // ADR 0047: old ImageBuild host-only availability can establish fleet-wide
+    // existence at the pre-roll gate even when new per-cache inventory is empty.
+    #[tokio::test]
+    async fn legacy_build_availability_with_new_cache_inventory() {
+        use flotilla_resources::{
+            FrozenImageLayer, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageInputStability,
+            ImageLayerParent, ImageLayerSpec, ImageLayerStage, InputMeta, PlacedImageIdentity, ResolvedImageInputs,
+        };
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let inputs = ResolvedImageInputs::builder()
+            .parent_digest(digest.clone())
+            .content_hashes(vec![digest.clone()])
+            .architecture("amd64".into())
+            .stability(ImageInputStability::Pinned)
+            .build();
+        let spec = ImageBuildSpec::builder()
+            .recipe_key(inputs.recipe_key().expect("key"))
+            .inputs(inputs)
+            .layer(FrozenImageLayer {
+                name: "base".into(),
+                spec: ImageLayerSpec::builder()
+                    .stage(ImageLayerStage::Base)
+                    .parent(ImageLayerParent::Image(digest.clone()))
+                    .repository("https://example.test/repo".into())
+                    .revision("a".repeat(40))
+                    .fragment("Dockerfile".into())
+                    .build(),
+            })
+            .host_ref("host".into())
+            .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1024 })
+            .attempt(0)
+            .reason(ImageBuildReason { description: "test".into(), old_inputs: BTreeMap::new(), new_inputs: BTreeMap::new() })
+            .build();
+        let builds = backend.using::<ImageBuild>("test");
+        let mut build = builds.create(&InputMeta::builder().name("build".into()).build(), &spec).await.expect("build");
+        build.status = Some(ImageBuildStatus {
+            phase: flotilla_resources::ImageBuildPhase::Built,
+            identity: Some(PlacedImageIdentity { local_image_id: digest.clone(), registry_digest: None }),
+            ..Default::default()
+        });
+        let mut document = serde_json::to_value(build.to_k8s_object()).expect("document");
+        document["status"]["availability"] = serde_json::json!({"hosts":["host"], "registry_ref":null, "failure":null});
+        let mut inventory =
+            vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:{"cache-a":[]}}}}), document];
+        let options = ProbeOptions::default();
+        // Stands in for a registry process: this cache-only case must not invoke it.
+        let runner = RegistryRunner { reference: "unused".into(), available: false, calls: std::sync::Mutex::new(0) };
+        CandidateProbes { options: &options, inventory: &inventory, runner: &runner }.image(&digest).await.expect("legacy build existence");
+        assert_eq!(*runner.calls.lock().expect("calls"), 0);
+        inventory[1]["status"]["availability"]["hosts"] = serde_json::json!([]);
+        assert!(CandidateProbes { options: &options, inventory: &inventory, runner: &runner }.image(&digest).await.is_err());
     }
 
     // Generated inventory property: terminal convoys are exempt; live convoys
