@@ -54,6 +54,8 @@ def tree_features(output):
     for line in output.splitlines():
         if "|" not in line:
             continue
+        # Keep Cargo {p} suffixes (including proc-macro and source paths) in the
+        # identity: both trees use the same format, so comparisons stay consistent.
         package, features = line.split("|", 1)
         # Preserve distinct host/target feature selections instead of unioning them.
         # A selected command may omit contexts, but may not invent a different set.

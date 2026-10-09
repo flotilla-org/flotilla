@@ -40,7 +40,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/convoy.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/vessel.crd.yaml")).await?;
 
-
     let backend = ResourceBackend::Http(backend);
     let convoys = backend.clone().using::<Convoy>(&namespace);
     let templates = backend.definitions::<WorkflowTemplate>(&namespace);

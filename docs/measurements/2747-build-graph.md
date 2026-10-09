@@ -148,3 +148,10 @@ lock. The measured full workspace run includes this guard's subprocess cost.
 The checker explicitly requests `cargo --color never` for machine-readable
 output. Its registered integration test forces `CARGO_TERM_COLOR=always`,
 matching CI, to prevent ANSI duplicate markers being parsed as feature names.
+
+Contributors adding behavior-changing hooks under default helper/replay features
+must update the release-build trade-off section above in the same change.
+The checker launches one metadata process and one workspace tree plus two trees
+per workspace member. A single metadata resolve graph does not describe each
+package selection under resolver 2; replacing these calls requires preserving
+that per-selection evidence. Revisit the cost if workspace membership grows.
