@@ -203,6 +203,15 @@ impl StderrTail {
     }
 }
 
+pub fn remote_daemon_from(flag: Option<&str>, environment: Option<&str>, explicit_socket: bool) -> Result<Option<SshEndpoint>, String> {
+    // Explicit local selection overrides a remote endpoint inherited from the
+    // environment. Clap rejects an explicit --daemon/--socket conflict.
+    if explicit_socket && flag.is_none() {
+        return Ok(None);
+    }
+    flag.or(environment.filter(|value| !value.is_empty())).map(SshEndpoint::parse).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +306,18 @@ exit 255
 
         assert!(error.contains("cannot reach daemon via ssh://udder"), "{error}");
         assert!(error.contains("Permission denied (publickey)"), "{error}");
+    }
+    // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
+    #[test]
+    fn remote_daemon_prefers_flag_and_ignores_empty_environment() {
+        let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi"), false).expect("valid").expect("remote");
+        assert_eq!(flag.to_string(), "ssh://udder");
+        let environment = remote_daemon_from(None, Some("ssh://kiwi"), false).expect("valid").expect("remote");
+        assert_eq!(environment.to_string(), "ssh://kiwi");
+        assert_eq!(remote_daemon_from(None, Some(""), false).expect("valid"), None);
+        assert_eq!(remote_daemon_from(None, None, false).expect("valid"), None);
+        assert_eq!(remote_daemon_from(None, Some("ssh://kiwi"), true).expect("explicit socket"), None);
+        assert_eq!(remote_daemon_from(None, Some("invalid environment"), true).expect("explicit socket"), None);
+        assert!(remote_daemon_from(Some("udder"), None, false).is_err(), "a bare host is not an endpoint");
     }
 }

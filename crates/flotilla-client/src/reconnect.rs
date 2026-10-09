@@ -82,6 +82,12 @@ where
     }
 }
 
+pub fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>, remote_daemon_selected: bool) -> bool {
+    // Re-exec can pick up a newly installed local client. It cannot upgrade a
+    // remote daemon, and on Windows would detach a replacement and exit zero.
+    !remote_daemon_selected && is_incompatible_daemon_error(error) && already_reexecuted_build != Some(crate::build_id())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -172,6 +178,20 @@ mod tests {
             [ResourceError::not_found("name"), ResourceError::conflict("name", "stale view"), ResourceError::other("daemon unavailable")]
         {
             assert!(!is_permanent_daemon_error(&error.to_string()));
+        }
+    }
+    #[test]
+    fn incompatible_daemon_reexecs_once_per_client_build() {
+        let mismatch = "daemon protocol version mismatch: daemon has 18, client has 17";
+        assert!(should_reexec_for_incompatible_daemon(mismatch, None, false));
+        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(crate::build_id()), false));
+        assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None, false));
+    }
+
+    #[test]
+    fn incompatible_remote_daemon_reports_failure_without_reexec() {
+        for error in ["daemon protocol version mismatch", "wire generation mismatch"] {
+            assert!(!should_reexec_for_incompatible_daemon(error, None, true));
         }
     }
 }
