@@ -4,7 +4,10 @@ use super::*;
 use crate::{
     agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
     branch_lookup_observer::BranchLookupObserver,
-    providers::discovery::{detectors::git::remote_assertion, FORGEJO_AUTH_PROVIDER},
+    providers::{
+        discovery::{detectors::git::remote_assertion, FORGEJO_AUTH_PROVIDER},
+        environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL,
+    },
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -1211,6 +1214,7 @@ impl ConvoyAdmission {
                         &self.backend,
                         namespace,
                         host,
+                        policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                         &kind.spec.realisation,
                         composed.as_deref(),
                         self.image_build_inputs.read().await.clone(),
@@ -3911,6 +3915,7 @@ async fn image_placement_cost(
     backend: &ResourceBackend,
     namespace: &str,
     host: Option<&ResourceObject<ResourceHost>>,
+    provider_instance: Option<&str>,
     realisation: &flotilla_resources::FulfilmentRealisation,
     composition: Option<&flotilla_resources::ImageComposition>,
     resolver: Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>,
@@ -3941,9 +3946,11 @@ async fn image_placement_cost(
     let held = host
         .and_then(|host| host.status.as_ref())
         .and_then(|status| status.capabilities.get(IMAGE_DIGESTS_CAPABILITY))
-        .and_then(|value| serde_json::from_value::<BTreeSet<String>>(value.clone()).ok())
+        .and_then(|value| serde_json::from_value::<flotilla_resources::LocalImageInventories>(value.clone()).ok())
         .unwrap_or_default();
-    if image.is_some_and(|image| held.contains(image) || image.rsplit_once('@').is_some_and(|(_, digest)| held.contains(digest))) {
+    if held.held(provider_instance).is_some_and(|held| {
+        image.is_some_and(|image| held.contains(image) || image.rsplit_once('@').is_some_and(|(_, digest)| held.contains(digest)))
+    }) {
         return Ok(flotilla_resources::ImageAcquisitionCost::Held);
     }
     let cache = match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {

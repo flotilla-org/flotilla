@@ -96,9 +96,9 @@ the first immutable execution log and emits a debug diagnostic for that reuse.
 ## Availability and distribution
 
 Hosts publish full local image IDs and known registry manifest digests under
-Host.status.capabilities.image_digests. Inventories are observations, refreshed
+Host.status.capabilities.image_digests as a map from provider instance identity to digest sets. Inventories are observations, refreshed
 every 30 seconds independently of asynchronous publication; placement still requires host readiness. Completed
-ImageBuild.status.availability records the hosts holding its exact local ID and
+ImageBuild.status.availability.caches records host-plus-provider-instance pairs holding its exact local ID and
 an optional repository@manifest-digest publication. Availability may change
 after execution completes; identity, inputs, verification and build-log evidence
 remain immutable.

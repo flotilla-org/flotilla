@@ -201,11 +201,74 @@ pub async fn read_image_build(
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ImageAvailabilityRecord")]
 pub struct ImageAvailability {
-    pub hosts: BTreeSet<String>,
+    #[serde(default)]
+    pub caches: BTreeSet<LocalImageCacheKey>,
     /// Repository@manifest digest; local config IDs are never substituted.
     pub registry_ref: Option<String>,
     pub failure: Option<String>,
+}
+
+// ADR 0047: accept and drop host-only availability for one roll after B1.
+#[derive(Deserialize)]
+struct ImageAvailabilityRecord {
+    #[serde(default)]
+    caches: BTreeSet<LocalImageCacheKey>,
+    #[serde(default, rename = "hosts")]
+    _hosts: BTreeSet<String>,
+    registry_ref: Option<String>,
+    failure: Option<String>,
+}
+
+impl From<ImageAvailabilityRecord> for ImageAvailability {
+    fn from(record: ImageAvailabilityRecord) -> Self {
+        Self { caches: record.caches, registry_ref: record.registry_ref, failure: record.failure }
+    }
+}
+
+/// A cache belongs to an exact provider instance on an exact host.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalImageCacheKey {
+    pub host: String,
+    pub provider_instance: String,
+}
+
+/// Stored host inventory. Legacy host-only lists decode without attributing
+/// their contents to an arbitrary provider. Remove the list decoder one roll
+/// after B1 (ADR 0047).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct LocalImageInventories(pub BTreeMap<String, BTreeSet<String>>);
+
+impl<'de> Deserialize<'de> for LocalImageInventories {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Record {
+            PerCache(BTreeMap<String, BTreeSet<String>>),
+            Legacy(BTreeSet<String>),
+        }
+        Ok(match Record::deserialize(deserializer)? {
+            Record::PerCache(caches) => Self(caches),
+            Record::Legacy(digests) => {
+                drop(digests);
+                Self::default()
+            }
+        })
+    }
+}
+
+impl LocalImageInventories {
+    /// An omitted instance resolves only when exactly one cache is observed.
+    pub fn held(&self, instance: Option<&str>) -> Option<&BTreeSet<String>> {
+        match instance {
+            Some(instance) => self.0.get(instance),
+            None if self.0.len() == 1 => self.0.values().next(),
+            None => None,
+        }
+    }
 }
 
 pub const IMAGE_DIGESTS_CAPABILITY: &str = "image_digests";
@@ -229,6 +292,38 @@ pub enum ImageAcquisitionCost {
 mod tests {
     use super::*;
     use crate::ImageInputStability;
+
+    // #2972: a digest held by one provider is unavailable to another provider
+    // on the same host; missing and ambiguous identities fail closed.
+    #[hegel::test]
+    fn cache_inventory_isolates_provider_instances(tc: hegel::TestCase) {
+        // Covers empty inventories and duplicate digest observations in two caches.
+        let duplicate = tc.draw(hegel::generators::booleans());
+        let digest = format!("sha256:{:064x}", tc.draw(hegel::generators::integers::<u64>()));
+        let mut inventory = LocalImageInventories::default();
+        assert!(inventory.held(None).is_none());
+        inventory.0.insert("a".into(), BTreeSet::from([digest.clone()]));
+        assert!(inventory.held(Some("a")).expect("cache a").contains(&digest));
+        assert!(inventory.held(Some("b")).is_none());
+        assert_eq!(inventory.held(None), inventory.held(Some("a")));
+        inventory.0.insert("b".into(), if duplicate { BTreeSet::from([digest.clone()]) } else { BTreeSet::new() });
+        assert!(inventory.held(None).is_none());
+        assert_eq!(inventory.held(Some("b")).expect("cache b").contains(&digest), duplicate);
+        let encoded = serde_json::to_value(&inventory).expect("encode inventory");
+        assert_eq!(serde_json::from_value::<LocalImageInventories>(encoded).expect("decode inventory"), inventory);
+    }
+
+    // ADR 0047: the previous generation's host-only records remain decodable;
+    // they cannot be attributed to a specific provider, and new writes omit hosts.
+    #[test]
+    fn legacy_host_inventory_decodes_without_claiming_a_cache() {
+        let inventory: LocalImageInventories = serde_json::from_str(r#"["sha256:old"]"#).expect("old inventory");
+        assert!(inventory.0.is_empty());
+        let availability: ImageAvailability =
+            serde_json::from_str(r#"{"hosts":["host-a"],"registry_ref":null,"failure":null}"#).expect("old availability");
+        assert!(availability.caches.is_empty());
+        assert!(serde_json::to_value(availability).expect("new availability").get("hosts").is_none());
+    }
 
     // #2271: unknown external inputs have no shareable key. Identical execution
     // evidence is stable, but every distinct nonce (including host identity)

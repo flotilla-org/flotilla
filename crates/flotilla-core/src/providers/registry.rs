@@ -84,6 +84,11 @@ impl<D, T: ?Sized> TypedSet<D, T> {
         self.inner.values().map(|(d, p)| (d, p))
     }
 
+    /// Registered identity of this exact provider instance.
+    pub fn instance_name(&self, provider: &Arc<T>) -> Option<&str> {
+        self.inner.iter().find(|(_, (_, candidate))| Arc::ptr_eq(candidate, provider)).map(|(name, _)| name.as_str())
+    }
+
     /// The name (key) of the preferred entry, if any.
     pub fn preferred_name(&self) -> Option<&str> {
         self.inner.keys().next().map(|s| s.as_str())
