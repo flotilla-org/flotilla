@@ -10,10 +10,10 @@ use flotilla_resources::{
 };
 
 use super::support::test_meta;
-use crate::change_request_observer::ChangeRequestRef;
 use crate::config::ConfigStore;
 use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
 use crate::model::RepoModel;
+use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::providers::registry::ProviderRegistry;
 use crate::repo_state::{RepoRootState, RepoState};
 use crate::testkits::discovery::fake_discovery;

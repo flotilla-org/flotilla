@@ -10,15 +10,15 @@ use flotilla_protocol::{
 };
 use flotilla_resources::host_direct_environment_name;
 
-use crate::providers::environment::{EnvironmentKind, PreparedEnvironment};
 use crate::{
     config::ConfigStore,
+    discovery_api::EnvironmentBag,
     providers::{
-        discovery::{run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag, FactoryRegistry, HostDetector},
+        discovery::{run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, FactoryRegistry, HostDetector},
         environment::{
-            contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-            EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth, ProvisionedMount, ProvisionedMountMode,
-            CONTAINED_DAEMON_REQUIRED_ENV,
+            contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentKind, EnvironmentTool, EnvironmentToolAsset,
+            EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironment, PreparedEnvironmentAuth,
+            ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
         },
         registry::ProviderRegistry,
         CommandRunner,
@@ -588,8 +588,8 @@ mod tests {
     use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
     use super::*;
+    use crate::discovery_api::EnvironmentAssertion;
     use crate::providers::discovery::detectors::default_host_detectors;
-    use crate::providers::discovery::EnvironmentAssertion;
     use crate::providers::discovery::ProviderCategory;
     use crate::providers::discovery::ProviderDescriptor;
     use crate::providers::environment::EnvironmentHandle;

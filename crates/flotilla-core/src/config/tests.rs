@@ -602,3 +602,56 @@ fn retired_presentation_manager_config_is_accepted_and_dropped(tc: hegel::TestCa
     let active: FlotillaConfig = toml::from_str("[terminal_pool]\nbackend = 'cleat'\n").expect("active config");
     assert_eq!(serialized, toml::to_string(&active).expect("active serialization"));
 }
+
+// Glue: the provider view preserves every provider field and delegates paths to the store.
+#[tokio::test]
+async fn provider_config_view_preserves_settings_and_paths() {
+    use crate::provider_config::ProviderConfigView;
+    let directory = tempfile::tempdir().expect("config directory");
+    let store = ConfigStore::with_base(directory.path());
+    std::fs::write(
+        directory.path().join("config.toml"),
+        r#"
+[change_request]
+backend = "github"
+review_bot_login = "reviewer"
+operator_login = "operator"
+[issue_tracker]
+backend = "forgejo"
+[issue_tracker.forgejo]
+service_url = "https://forge.example"
+api_base_url = "https://forge.example/api/v1"
+token_path = "token"
+token_agent = "coder"
+[cloud_agent]
+backend = "codex"
+[ai_utility]
+backend = "claude"
+[ai_utility.claude]
+implementation = "cli"
+[terminal_pool]
+backend = "cleat"
+[vcs.git]
+checkout_path = "../worktrees/{{ branch }}"
+"#,
+    )
+    .expect("persist settings");
+    let view: &dyn ProviderConfigView = &store;
+    let settings = view.load_config_for_probe().await.expect("provider settings");
+    assert_eq!(settings.change_request.preference.backend.as_deref(), Some("github"));
+    assert_eq!(settings.change_request.review_bot_login.as_deref(), Some("reviewer"));
+    assert_eq!(settings.change_request.operator_login.as_deref(), Some("operator"));
+    assert_eq!(settings.issue_tracker.preference.backend.as_deref(), Some("forgejo"));
+    let forgejo = settings.issue_tracker.forgejo.expect("forgejo settings");
+    assert_eq!(forgejo.service_url.as_deref(), Some("https://forge.example"));
+    assert_eq!(forgejo.api_base_url.as_deref(), Some("https://forge.example/api/v1"));
+    assert_eq!(forgejo.token_path.as_deref(), Some("token"));
+    assert_eq!(forgejo.token_agent.as_deref(), Some("coder"));
+    assert_eq!(settings.cloud_agent.preference.backend.as_deref(), Some("codex"));
+    assert_eq!(settings.ai_utility.preference.backend.as_deref(), Some("claude"));
+    assert_eq!(settings.ai_utility.claude.unwrap().implementation.as_deref(), Some("cli"));
+    assert_eq!(settings.terminal_pool.preference.backend.as_deref(), Some("cleat"));
+    assert_eq!(view.base_path(), store.base_path());
+    assert_eq!(view.state_dir(), store.state_dir());
+    assert_eq!(view.resolve_checkout_config(&ExecutionEnvironmentPath::new(directory.path())).path, "../worktrees/{{ branch }}");
+}

@@ -1,3 +1,4 @@
+use crate::providers::github_poll;
 use std::{
     collections::HashMap,
     path::Path,
@@ -7,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::providers::{change_request::ObservationError, run_output, ChannelLabel, CommandRunner};
+use crate::providers::{forge::observation_error::ObservationError, ChannelLabel, CommandRunner};
 
 const MAX_PER_PAGE: usize = 100;
 const MIN_REMAINING_BUDGET: u32 = 100;
@@ -499,7 +500,7 @@ impl GhApiClient {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             let entry = CacheEntry { etag: etag.clone(), body: parsed.body.clone(), has_next_page: parsed.has_next_page };
             if let Some(path) = self.cache_path(endpoint) {
-                super::github_poll::persist(&path, &entry).map_err(GhApiFailure::from)?;
+                github_poll::persist(&path, &entry).map_err(GhApiFailure::from)?;
             }
             cache.insert(endpoint.to_string(), entry);
         }

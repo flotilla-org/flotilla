@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::providers::{
-    discovery::{EnvVars, EnvironmentAssertion, HostDetector},
-    run, CommandRunner,
+use crate::{
+    discovery_api::EnvironmentAssertion,
+    providers::{
+        discovery::{EnvVars, HostDetector},
+        run, CommandRunner,
+    },
 };
 
 pub type VersionParser = fn(&str) -> Option<String>;

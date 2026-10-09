@@ -1,5 +1,6 @@
 //! Shared scenario fixtures and stand-ins for credential-controller and forge I/O.
 
+use crate::provider_config;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -220,7 +221,7 @@ impl Factory for ForgeAwareTestChangeRequestFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn provider_config::ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {

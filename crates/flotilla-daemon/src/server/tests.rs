@@ -1,3 +1,4 @@
+use flotilla_core::provider_config;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -4940,8 +4941,8 @@ impl flotilla_core::providers::discovery::Factory for GatedStartupEnvironmentFac
     }
     async fn probe(
         &self,
-        _env: &flotilla_core::providers::discovery::EnvironmentBag,
-        _config: &ConfigStore,
+        _env: &flotilla_core::discovery_api::EnvironmentBag,
+        _config: &dyn provider_config::ProviderConfigView,
         _root: &flotilla_paths::path_context::ExecutionEnvironmentPath,
         _runner: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<flotilla_core::providers::discovery::UnmetRequirement>> {

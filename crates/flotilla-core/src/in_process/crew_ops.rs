@@ -1,5 +1,6 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
 
+use crate::providers::change_request::observation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -43,11 +44,11 @@ use super::{
 };
 use crate::{
     agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
-    change_request_observer::ChangeRequestRef,
     checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
     config::ConfigStore,
     fleet::crew_attention,
     leaf_engine::{LeafSubscriptionTable, TurnDeliveryActuator},
+    providers::change_request::observation::ChangeRequestRef,
     resource_explain::explain_unmet_expectation,
 };
 
@@ -930,8 +931,7 @@ impl CrewService {
                     }
                 }
                 for (service, scope, number) in subjects {
-                    let subject =
-                        crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
+                    let subject = observation::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                     if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
                         if let Some(retry_at) = error.retry_at().filter(|retry_at| *retry_at > Utc::now()) {
                             observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number)));

@@ -4,12 +4,15 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::providers::{
-    discovery::{
-        detectors::generic::{parse_first_dotted_version, CommandDetector},
-        EnvVars, EnvironmentAssertion, RepoDetector, VcsKind,
+use crate::{
+    discovery_api::{EnvironmentAssertion, VcsKind},
+    providers::{
+        discovery::{
+            detectors::generic::{parse_first_dotted_version, CommandDetector},
+            EnvVars, RepoDetector,
+        },
+        run, CommandRunner,
     },
-    run, CommandRunner,
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 

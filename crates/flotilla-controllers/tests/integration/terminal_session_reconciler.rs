@@ -2604,7 +2604,7 @@ impl TerminalRuntime for ExitedAgentRuntime {
     async fn agent_exit_failure(&self, _: &str, _: &TerminalSessionSpec, code: i32) -> Result<Option<String>, String> {
         use flotilla_core::{
             agent_adapter::AgentAdapterRegistry,
-            providers::discovery::{EnvironmentAssertion, EnvironmentBag},
+            discovery_api::{EnvironmentAssertion, EnvironmentBag},
         };
         let registry = AgentAdapterRegistry::discover(
             &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),

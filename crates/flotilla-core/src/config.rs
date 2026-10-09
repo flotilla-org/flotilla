@@ -11,67 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 
-/// Per-category provider preference.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ProviderPreference {
-    pub backend: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ChangeRequestConfig {
-    #[serde(flatten)]
-    pub preference: ProviderPreference,
-    /// GitHub bot whose review comments should wake a crew (GraphQL login, without `[bot]`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_bot_login: Option<String>,
-    /// Login of the operator who owns merge decisions on the configured forge.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_login: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct IssueTrackerConfig {
-    #[serde(flatten)]
-    pub preference: ProviderPreference,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forgejo: Option<ForgejoIssueTrackerConfig>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ForgejoIssueTrackerConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_base_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_agent: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct CloudAgentConfig {
-    #[serde(flatten)]
-    pub preference: ProviderPreference,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct AiUtilityConfig {
-    #[serde(flatten)]
-    pub preference: ProviderPreference,
-    pub claude: Option<ClaudeAiUtilityConfig>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ClaudeAiUtilityConfig {
-    pub implementation: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct TerminalPoolConfig {
-    #[serde(flatten)]
-    pub preference: ProviderPreference,
-}
+use crate::provider_config::{
+    AiUtilityConfig, ChangeRequestConfig, CloudAgentConfig, IssueTrackerConfig, ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig,
+    TerminalPoolConfig,
+};
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -199,11 +142,6 @@ pub enum RepoViewLayoutConfig {
     Zoom,
     Right,
     Below,
-}
-
-/// Resolved checkout configuration from host defaults.
-pub struct ResolvedCheckoutConfig {
-    pub path: String,
 }
 
 /// Global SSH settings for remote host connections.
@@ -837,6 +775,29 @@ impl ConfigStore {
         ResolvedCheckoutConfig {
             path: git.and_then(|git| git.checkout_path.clone()).unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProviderConfigView for ConfigStore {
+    fn base_path(&self) -> &DaemonHostPath {
+        self.base_path()
+    }
+    fn state_dir(&self) -> &DaemonHostPath {
+        self.state_dir()
+    }
+    fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
+        self.resolve_checkout_config(repo_root)
+    }
+    async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
+        let config = self.load_config_for_probe().await?;
+        Ok(ProviderConfig {
+            change_request: config.change_request,
+            issue_tracker: config.issue_tracker,
+            cloud_agent: config.cloud_agent,
+            ai_utility: config.ai_utility,
+            terminal_pool: config.terminal_pool,
+        })
     }
 }
 

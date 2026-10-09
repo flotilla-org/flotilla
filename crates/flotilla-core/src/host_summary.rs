@@ -1,14 +1,9 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{fs, path::Path};
 
 use flotilla_protocol::{EnvironmentId, HostEnvironment, HostName, HostProviderStatus, HostSummary, NodeId, NodeInfo, SystemInfo};
 use sysinfo::System;
 
-use crate::{
-    convert::inventory_from_bag,
-    environment_manager::EnvironmentManager,
-    model::provider_names_from_registry,
-    providers::{discovery::EnvVars, registry::ProviderRegistry},
-};
+use crate::{convert::inventory_from_bag, environment_manager::EnvironmentManager, providers::discovery::EnvVars};
 
 /// Resident bytes of this daemon process, sampled for the host heartbeat.
 /// Failure is unknown, never zero; refresh only this PID rather than the fleet.
@@ -43,30 +38,6 @@ pub async fn build_local_host_summary(
         providers,
         environments,
     }
-}
-
-pub fn provider_statuses_from_registries<'a>(registries: impl IntoIterator<Item = &'a ProviderRegistry>) -> Vec<HostProviderStatus> {
-    let mut seen = BTreeSet::new();
-    let mut statuses = Vec::new();
-
-    for registry in registries {
-        for (category, entries) in provider_names_from_registry(registry) {
-            for entry in entries {
-                if seen.insert((category.clone(), entry.implementation.clone())) {
-                    statuses.push(HostProviderStatus {
-                        category: category.clone(),
-                        name: entry.display_name,
-                        implementation: entry.implementation,
-                        healthy: true,
-                        disabled_reason: None,
-                    });
-                }
-            }
-        }
-    }
-
-    statuses.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
-    statuses
 }
 
 pub fn collect_system_info(env: &dyn EnvVars) -> SystemInfo {
@@ -126,9 +97,9 @@ mod tests {
         assert!(daemon_rss_bytes().is_some_and(|bytes| bytes > 0));
     }
 
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::environment_manager::EnvironmentManager;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
     use crate::providers::environment::EnvironmentHandle;
     use crate::providers::environment::ProvisionedEnvironment;
     use crate::providers::CommandRunner;

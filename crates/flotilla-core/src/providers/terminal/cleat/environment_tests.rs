@@ -7,10 +7,9 @@ use std::{
 use async_trait::async_trait;
 
 use super::CleatTerminalPool;
-use crate::providers::{
-    discovery::{EnvironmentAssertion, EnvironmentBag},
-    terminal::TerminalPool,
-    ChannelLabel, CommandOutput, CommandRunner,
+use crate::{
+    discovery_api::{EnvironmentAssertion, EnvironmentBag},
+    providers::{terminal::TerminalPool, ChannelLabel, CommandOutput, CommandRunner},
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
@@ -153,7 +152,7 @@ impl CommandRunner for PollutedProcessRunner {
 #[cfg(unix)]
 #[tokio::test]
 async fn controlled_runner_replaces_the_real_process_environment() {
-    use crate::providers::{discovery::EnvironmentAssertion, terminal::environment::ControlledTerminalEnvironment};
+    use crate::{discovery_api::EnvironmentAssertion, providers::terminal::environment::ControlledTerminalEnvironment};
 
     let value = "/host with 'quotes' $() `literal`\nsecond-line";
     let bag = EnvironmentBag::new()

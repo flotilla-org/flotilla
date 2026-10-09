@@ -14,7 +14,10 @@ use flotilla_resources::{
 use super::sources::{change_request_sources, freshest_change_requests};
 use super::wake::ReconcilerWake;
 use super::{CrewTurnIntent, LeafWatcher, UnableEvidenceKey};
-use crate::{change_request_observer::ChangeRequestRef, in_process::convoy_message_address, providers::change_request::ObservationError};
+use crate::{
+    in_process::convoy_message_address,
+    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
+};
 
 pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
     format!("{project}/{convoy}/{vessel}/{role}")

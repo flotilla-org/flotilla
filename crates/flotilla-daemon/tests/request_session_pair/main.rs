@@ -13,9 +13,9 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::command_target::TargetHost;
 use flotilla_core::config::ConfigStore;
+use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::WorkCredentialReconciler;
-use flotilla_core::providers::discovery::EnvironmentBag;
 use flotilla_core::providers::environment::ProvisionedEnvironment;
 use flotilla_core::providers::environment::ProvisionedMount;
 use flotilla_core::providers::issue_tracker::IssueProvider;

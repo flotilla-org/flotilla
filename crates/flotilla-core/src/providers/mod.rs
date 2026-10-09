@@ -3,7 +3,6 @@ pub mod change_request;
 pub mod coding_agent;
 pub mod discovery;
 pub mod environment;
-pub mod github_api;
 pub(crate) mod github_observation;
 pub(crate) mod github_poll;
 pub mod issue_tracker;
@@ -845,7 +844,7 @@ impl HttpClient for ReqwestHttpClient {
 pub(crate) mod github_test_support {
     use std::{path::PathBuf, sync::Arc};
 
-    use crate::providers::github_api::GhApi;
+    use crate::providers::forge::github::GhApi;
     use crate::providers::CommandRunner;
     use crate::testkits::replay;
 
@@ -961,3 +960,5 @@ mod tests {
         assert_eq!(label, ChannelLabel::Default);
     }
 }
+
+pub mod forge;

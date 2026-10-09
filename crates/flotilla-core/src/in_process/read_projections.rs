@@ -1,5 +1,6 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
+use crate::providers::change_request::observation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -42,7 +43,6 @@ use tracing::warn;
 
 use super::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::{
-    change_request_observer::ChangeRequestRef,
     checkout_integration::LANDING_EVIDENCE_TTL,
     config::ConfigStore,
     environment_manager::EnvironmentManager,
@@ -56,7 +56,7 @@ use crate::{
         DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
         DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
     },
-    providers::change_request::ObservationError,
+    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
 
@@ -985,7 +985,7 @@ impl ReadProjections<'_> {
         let mut observation_errors = BTreeMap::new();
         for leaf in expected_change_request_leaves {
             if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
-                let subject = crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
+                let subject = observation::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                 if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
                     observation_errors.insert(subject.record_name(), error.to_string());
                 }
@@ -1531,9 +1531,10 @@ mod tests {
     use super::*;
     use crate::{
         aggregator_projection::AggregatorProjectionState,
-        change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher, GhChangeRequestObservationSource},
+        change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher},
+        discovery_api::EnvironmentBag,
         event_sink::{EventSink, RecordingEventSink},
-        providers::{discovery::EnvironmentBag, ProcessCommandRunner},
+        providers::{change_request::observation::GhChangeRequestObservationSource, ProcessCommandRunner},
     };
 
     // #2498: every distinct stalled actor is visible across namespaces and replica stores.

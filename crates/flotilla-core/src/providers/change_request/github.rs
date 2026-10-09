@@ -5,17 +5,17 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 use chrono::Utc;
 
-use super::ObservationError;
-use crate::providers::github_observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape};
-use crate::{
-    change_request_observer::{parse_gh_observation_value_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
-    providers::{
-        gh_api_channel_label, gh_api_get,
-        github_api::{clamp_per_page, GhApi},
-        run, run_output,
-        types::*,
-        CommandRunner,
+use crate::providers::{
+    change_request::observation::{parse_gh_observation_value_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
+    forge::{
+        github::{clamp_per_page, GhApi},
+        observation_error::ObservationError,
     },
+    gh_api_channel_label, gh_api_get,
+    github_observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape},
+    run, run_output,
+    types::*,
+    CommandRunner,
 };
 
 fn execution_root() -> &'static Path {
@@ -552,8 +552,8 @@ mod tests {
 
     use super::*;
     use crate::providers::change_request::ChangeRequestTracker;
-    use crate::providers::github_api::GhApiClient;
-    use crate::providers::github_api::GithubRetrySource;
+    use crate::providers::forge::github::GhApiClient;
+    use crate::providers::forge::github::GithubRetrySource;
     use crate::providers::CommandOutput;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
@@ -1163,7 +1163,7 @@ mod tests {
     // fabricate a retry deadline. Glue: classifier matrix owns response variants.
     #[tokio::test]
     async fn primary_limit_without_deadline_keeps_classification_without_timed_wait() {
-        use crate::providers::github_api::GithubRateLimitKind;
+        use crate::providers::forge::github::GithubRateLimitKind;
         let runner = Arc::new(MockRunner::new(vec![Ok(
             "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
         )]));

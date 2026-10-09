@@ -1,13 +1,15 @@
 //! Terminal pool factory for passthrough (unconditional fallback).
 
+use crate::provider_config::ProviderConfigView;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
-    config::ConfigStore,
+    discovery_api::EnvironmentBag,
     providers::{
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         terminal::{passthrough::PassthroughTerminalPool, TerminalPool},
         CommandRunner,
     },
@@ -28,7 +30,7 @@ impl Factory for PassthroughTerminalPoolFactory {
     async fn probe(
         &self,
         _env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
@@ -42,7 +44,7 @@ mod tests {
 
     use super::PassthroughTerminalPoolFactory;
     use crate::config::ConfigStore;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;

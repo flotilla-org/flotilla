@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
+use flotilla_core::provider_config;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -13,6 +14,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::config::ConfigStore;
+use flotilla_core::discovery_api::EnvironmentAssertion;
+use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::model::RepoModel;
 use flotilla_core::providers::ai_utility::AiUtility;
@@ -20,8 +23,6 @@ use flotilla_core::providers::ai_utility::ConvoyNames;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::coding_agent::CloudAgentService;
 use flotilla_core::providers::discovery::DiscoveryRuntime;
-use flotilla_core::providers::discovery::EnvironmentAssertion;
-use flotilla_core::providers::discovery::EnvironmentBag;
 use flotilla_core::providers::discovery::Factory;
 use flotilla_core::providers::discovery::HostDetector;
 use flotilla_core::providers::discovery::ProviderCategory;
@@ -390,7 +391,7 @@ impl Factory for SlowCloudAgentFactory {
     async fn probe(
         &self,
         _: &EnvironmentBag,
-        _: &ConfigStore,
+        _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
@@ -449,7 +450,7 @@ impl Factory for SlowAiUtilityFactory {
     async fn probe(
         &self,
         _: &EnvironmentBag,
-        _: &ConfigStore,
+        _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
@@ -500,7 +501,7 @@ impl Factory for PanicOnceAiUtilityFactory {
     async fn probe(
         &self,
         _: &EnvironmentBag,
-        _: &ConfigStore,
+        _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
@@ -546,7 +547,7 @@ impl Factory for CountingConvoyAiUtilityFactory {
     async fn probe(
         &self,
         _: &EnvironmentBag,
-        _: &ConfigStore,
+        _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
@@ -620,7 +621,7 @@ impl Factory for EnvGatedTerminalPoolFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _: &ConfigStore,
+        _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
@@ -889,7 +890,7 @@ impl Factory for FreshIssueFactory {
     async fn probe(
         &self,
         _: &EnvironmentBag,
-        _: &ConfigStore,
+        _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
@@ -5771,7 +5772,7 @@ hostname = "buildbox.example"
         .await
         .expect("discover repo in remote direct environment");
 
-    assert!(result.repo_bag.find_vcs_checkout(flotilla_core::providers::discovery::VcsKind::Git).is_none());
+    assert!(result.repo_bag.find_vcs_checkout(flotilla_core::discovery_api::VcsKind::Git).is_none());
     assert!(
         result.registry.provider_infos().iter().all(|(category, name)| { !(category == ProviderCategory::Vcs.slug() && name == "Git") }),
         "remote discovery should not activate git from the daemon-local checkout path"

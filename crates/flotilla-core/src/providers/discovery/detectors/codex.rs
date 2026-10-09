@@ -8,9 +8,12 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::providers::{
-    discovery::{EnvVars, EnvironmentAssertion, HostDetector},
-    CommandRunner,
+use crate::{
+    discovery_api::EnvironmentAssertion,
+    providers::{
+        discovery::{EnvVars, HostDetector},
+        CommandRunner,
+    },
 };
 
 /// Returns the Codex home directory: `$CODEX_HOME` or `$HOME/.codex`.

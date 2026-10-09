@@ -95,16 +95,17 @@ pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, St
 use crate::{
     agent_adapter::{required_agent_adapters, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
-    change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef},
     checkout_integration::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
         inspect_convoy_checkout_integration,
     },
     config::{ConfigStore, StaticEnvironmentConfig},
+};
+use crate::{
+    discovery_api::{EnvironmentAssertion, EnvironmentBag},
     environment_manager::{EnvironmentManager, ResolvedEnvironment},
     event_sink::{BroadcastEventSink, EventSink},
-    executor,
-    executor::checkout::CheckoutResolutionScope,
+    executor::{self, checkout::CheckoutResolutionScope},
     fleet::FleetService,
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
@@ -113,16 +114,20 @@ use crate::{
     host_registry::{HostCounts, HostQueryDetails},
     host_resolution::canonical_placement_host_ref_from_sources,
     leaf_engine::LeafSubscriptionTable,
-    model::{provider_names_from_registry, repo_name, RepoModel},
+    model::{repo_name, RepoModel},
     ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
-        change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
+        change_request::{
+            observation::{ChangeRequestObservationSource, ChangeRequestRef},
+            BoundObservations, ChangeRequestTracker,
+        },
         discovery::{
-            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvVars, EnvironmentAssertion,
-            EnvironmentBag,
+            discover_checkout_with_host_scoped, run_host_detectors, status::provider_names_from_registry, DiscoveryResult,
+            DiscoveryRuntime, EnvVars,
         },
         environment::EnvironmentHandle,
+        forge::observation_error::ObservationError,
         issue_tracker::IssueProvider,
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
@@ -8003,3 +8008,4 @@ impl InProcessDaemon {
         &self.environment_manager
     }
 }
+mod forge_demands;

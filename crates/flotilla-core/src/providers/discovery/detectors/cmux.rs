@@ -7,9 +7,12 @@
 
 use async_trait::async_trait;
 
-use crate::providers::{
-    discovery::{EnvVars, EnvironmentAssertion, HostDetector},
-    CommandRunner,
+use crate::{
+    discovery_api::EnvironmentAssertion,
+    providers::{
+        discovery::{EnvVars, HostDetector},
+        CommandRunner,
+    },
 };
 
 /// Hardcoded path to the cmux binary inside the macOS app bundle.

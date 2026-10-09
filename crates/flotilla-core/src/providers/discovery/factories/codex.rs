@@ -1,14 +1,16 @@
 //! Cloud agent factory for Codex-based provider.
 
+use crate::provider_config::ProviderConfigView;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
-    config::ConfigStore,
+    discovery_api::EnvironmentBag,
     providers::{
         coding_agent::{codex::CodexCodingAgent, CloudAgentService},
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         CommandRunner, ReqwestHttpClient,
     },
 };
@@ -32,7 +34,7 @@ impl Factory for CodexCodingAgentFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
@@ -54,8 +56,8 @@ mod tests {
 
     use super::CodexCodingAgentFactory;
     use crate::config::ConfigStore;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;

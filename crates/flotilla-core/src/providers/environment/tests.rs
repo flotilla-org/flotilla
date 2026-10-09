@@ -1189,7 +1189,8 @@ async fn destroy_calls_docker_rm() {
 async fn environment_runner_supports_factory_probe() {
     use crate::{
         config::ConfigStore,
-        providers::discovery::{factories::cleat::CleatTerminalPoolFactory, EnvironmentAssertion, EnvironmentBag, Factory},
+        discovery_api::{EnvironmentAssertion, EnvironmentBag},
+        providers::discovery::{factories::cleat::CleatTerminalPoolFactory, Factory},
     };
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
@@ -1218,9 +1219,9 @@ async fn environment_runner_supports_factory_probe() {
 #[tokio::test]
 async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
     use crate::config::ConfigStore;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::factories::cleat::CleatTerminalPoolFactory;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::testkits::replay::testing::MockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;

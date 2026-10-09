@@ -9,26 +9,12 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use async_trait::async_trait;
 
 use super::TerminalEnvVars;
-use crate::providers::{discovery::EnvironmentBag, ChannelLabel, CommandOutput, CommandRunner};
+use crate::discovery_api::HOST_ENVIRONMENT_KEYS;
+use crate::{
+    discovery_api::EnvironmentBag,
+    providers::{ChannelLabel, CommandOutput, CommandRunner},
+};
 
-pub(crate) const HOST_ENVIRONMENT_KEYS: &[&str] = &[
-    "PATH",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TMPDIR",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "XDG_RUNTIME_DIR",
-    "LD_LIBRARY_PATH",
-    "DYLD_LIBRARY_PATH",
-];
 const CLEAT_CLIENT_KEYS: &[&str] = &["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON"];
 // Cleat sets these session coordinates itself and refuses them as launch
 // `--env` values (cleat `AMBIENT_COORDINATE_ENV_NAMES`, matched ignoring case).
@@ -153,7 +139,7 @@ mod tests {
     use hegel::generators as gs;
 
     use super::*;
-    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentAssertion;
 
     // #2706: host facts enter launches only through the allowlist; explicit
     // declarations override them, including empty and shell-special values.

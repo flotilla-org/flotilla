@@ -1,3 +1,4 @@
+use crate::providers::change_request::observation;
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -37,13 +38,23 @@ use crate::testkits::replay::testing::fixture_path;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
 use crate::{
-    change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
+    change_request_observer::ChangeRequestRefresher,
+    event_sink::broadcast_test_sink,
     issue_observer::{IssueRefreshCadence, IssueRefresher},
-    providers::change_request::ObservationError,
+    providers::{
+        change_request::observation::ChangeRequestRef,
+        forge::{
+            github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
+            observation_error::ObservationError,
+        },
+        replay::{test_runner, Masks, Session},
+        testing::fixture_path,
+    },
 };
 use crate::{
-    event_sink::broadcast_test_sink,
-    providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
+    change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
+    issue_observer::{IssueRefreshCadence, IssueRefresher},
+    providers::forge::observation_error::ObservationError,
 };
 
 #[derive(Clone)]
@@ -66,11 +77,8 @@ fn captured_subscriber(logs: Arc<std::sync::Mutex<Vec<u8>>>, level: tracing::Lev
 struct UnavailableChangeRequests;
 
 #[async_trait]
-impl crate::change_request_observer::ChangeRequestObservationSource for UnavailableChangeRequests {
-    async fn observe(
-        &self,
-        _subject: &crate::change_request_observer::ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+impl observation::ChangeRequestObservationSource for UnavailableChangeRequests {
+    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         Err("unavailable in non-CR leaf contract".into())
     }
 }
@@ -119,11 +127,8 @@ impl TurnDeliveryActuator for RecordingTurnDelivery {
 }
 
 #[async_trait]
-impl crate::change_request_observer::ChangeRequestObservationSource for ControlledChangeRequests {
-    async fn observe(
-        &self,
-        _subject: &crate::change_request_observer::ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+impl observation::ChangeRequestObservationSource for ControlledChangeRequests {
+    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         let observed_at = Utc::now();
         let state = if self.merged.load(Ordering::SeqCst) {
             flotilla_resources::ObservedChangeRequestState::Merged
@@ -147,11 +152,8 @@ impl crate::change_request_observer::ChangeRequestObservationSource for Controll
 }
 
 #[async_trait]
-impl crate::change_request_observer::ChangeRequestObservationSource for CountingChangeRequests {
-    async fn observe(
-        &self,
-        _subject: &crate::change_request_observer::ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+impl observation::ChangeRequestObservationSource for CountingChangeRequests {
+    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let observed_at = Utc::now();
         Ok(flotilla_resources::ChangeRequestStatus {

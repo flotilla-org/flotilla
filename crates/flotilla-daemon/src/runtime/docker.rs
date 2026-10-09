@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
 use flotilla_core::{
     config::ConfigStore,
+    discovery_api::EnvironmentBag,
     providers::{
-        discovery::{run_provisioned_host_detectors, EnvironmentBag},
+        discovery::run_provisioned_host_detectors,
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth},
         registry::ProviderRegistry,
         ChannelLabel,

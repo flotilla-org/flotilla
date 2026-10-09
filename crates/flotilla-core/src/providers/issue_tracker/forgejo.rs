@@ -1,7 +1,5 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use crate::providers::forge::forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -10,85 +8,22 @@ use flotilla_protocol::{
     Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
 };
 
-use crate::providers::{http_execute, run, CommandRunner, HttpClient};
+use crate::providers::{run, CommandRunner, HttpClient};
 
 const MAX_FORGEJO_LIMIT: usize = 50;
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct ForgejoAuth {
-    pub token: String,
-    pub token_path: PathBuf,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ForgejoIssueProviderConfig {
-    pub service_url: String,
-    pub api_base_url: String,
-    pub auth: ForgejoAuth,
-}
-
-impl ForgejoIssueProviderConfig {
-    pub fn new(service_url: String, api_base_url: Option<String>, auth: ForgejoAuth) -> Self {
-        let service_url = service_url.trim_end_matches('/').to_string();
-        let api_base_url = api_base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{service_url}/api/v1"));
-        Self { service_url, api_base_url, auth }
-    }
-}
-
 pub struct ForgejoIssueProvider {
-    http: Arc<dyn HttpClient>,
     runner: Arc<dyn CommandRunner>,
-    client: reqwest::Client,
-    config: ForgejoIssueProviderConfig,
+    forge: ForgejoClient,
 }
 
 impl ForgejoIssueProvider {
     pub fn new(http: Arc<dyn HttpClient>, runner: Arc<dyn CommandRunner>, config: ForgejoIssueProviderConfig) -> Self {
-        let client = crate::tls::client_builder().build().expect("build Forgejo request client");
-        Self { http, runner, client, config }
-    }
-
-    fn request(&self, path: &str, query: &[(&str, String)]) -> Result<reqwest::Request, String> {
-        let mut url = format!("{}/{}", self.config.api_base_url.trim_end_matches('/'), path.trim_start_matches('/'));
-        if !query.is_empty() {
-            let query = query
-                .iter()
-                .map(|(name, value)| format!("{}={}", urlencoding::encode(name), urlencoding::encode(value)))
-                .collect::<Vec<_>>()
-                .join("&");
-            url.push('?');
-            url.push_str(&query);
-        }
-        self.client
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("token {}", self.config.auth.token))
-            .build()
-            .map_err(|error| error.to_string())
-    }
-
-    async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<(serde_json::Value, bool), String> {
-        let response = http_execute!(self.http, self.request(path, query)?)?;
-        let status = response.status();
-        let has_more = response
-            .headers()
-            .get(reqwest::header::LINK)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|link| link.contains("rel=\"next\""));
-        let body = String::from_utf8_lossy(response.body()).to_string();
-        if !status.is_success() {
-            return Err(format!("Forgejo HTTP {status}: {body}"));
-        }
-        serde_json::from_str(&body).map(|value| (value, has_more)).map_err(|error| error.to_string())
+        Self { forge: ForgejoClient::new(http, config), runner }
     }
 
     fn html_url(&self, reference: &IssueRef) -> String {
-        format!("{}/{}/issues/{}", self.config.service_url.trim_end_matches('/'), reference.source.scope, reference.id)
+        format!("{}/{}/issues/{}", self.forge.config.service_url.trim_end_matches('/'), reference.source.scope, reference.id)
     }
 }
 
@@ -166,7 +101,7 @@ fn browser_open_command(url: &str) -> (&'static str, Vec<String>) {
 #[async_trait]
 impl super::IssueProvider for ForgejoIssueProvider {
     fn supports(&self, source: &IssueSource) -> bool {
-        is_forgejo_source(source, &self.config.service_url)
+        is_forgejo_source(source, &self.forge.config.service_url)
     }
 
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
@@ -187,7 +122,7 @@ impl super::IssueProvider for ForgejoIssueProvider {
         for (field, values) in &params.match_fields {
             query.push((field, values.join(",")));
         }
-        let (value, has_more) = self.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
+        let (value, has_more) = self.forge.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
         let fetched_at = Utc::now();
         let raw_items = value.as_array().ok_or("Forgejo issue list response was not an array")?;
         let items = raw_items.iter().filter_map(|value| parse_issue(source, value, fetched_at)).collect();
@@ -195,7 +130,7 @@ impl super::IssueProvider for ForgejoIssueProvider {
     }
 
     async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
-        let (value, _) = self.get_json(&format!("repos/{}/issues/{}", reference.source.scope, reference.id), &[]).await?;
+        let (value, _) = self.forge.get_json(&format!("repos/{}/issues/{}", reference.source.scope, reference.id), &[]).await?;
         parse_issue(&reference.source, &value, Utc::now()).ok_or_else(|| format!("failed to parse Forgejo issue {}", reference.id))
     }
 
@@ -208,7 +143,7 @@ impl super::IssueProvider for ForgejoIssueProvider {
             ("sort", "recentupdate".to_string()),
             ("limit", limit.to_string()),
         ];
-        let (value, has_more) = self.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
+        let (value, has_more) = self.forge.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
         let fetched_at = Utc::now();
         let raw_items = value.as_array().ok_or("Forgejo changed-since response was not an array")?;
         let mut updated = Vec::new();
@@ -242,6 +177,8 @@ impl super::IssueProvider for ForgejoIssueProvider {
 
 #[cfg(test)]
 mod tests {
+    use crate::providers::forge::forgejo::ForgejoAuth;
+    use std::path::PathBuf;
     use std::{
         collections::HashMap,
         sync::{Arc, Mutex},

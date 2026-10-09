@@ -149,3 +149,5 @@ pub(crate) mod tests {
         assert_eq!(provider.max_active.load(Ordering::SeqCst), MAX_CONCURRENT_ISSUE_FETCHES);
     }
 }
+
+pub mod mission_fields;

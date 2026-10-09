@@ -13,7 +13,8 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::{
     crew_capabilities::CAPABILITIES_HEADING,
-    providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
+    discovery_api::EnvironmentBag,
+    providers::{terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
@@ -154,7 +155,7 @@ impl CrewBriefRenderOptions {
     /// The pinned exit declaration is the same signal used by convoy exit
     /// instantiation: an absent declaration keeps the convoy standing.
     fn for_convoy(mut self, convoy: &ResourceObject<Convoy>) -> Self {
-        self.is_standing = convoy.metadata.annotations.contains_key(crate::ops_entry::ENSURED_FROM_ANNOTATION)
+        self.is_standing = convoy.metadata.annotations.contains_key(flotilla_resources::ENSURED_FROM_ANNOTATION)
             || convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| snapshot.exit.is_none());
         self
     }
@@ -1238,9 +1239,9 @@ mod tests {
     use crate::agent_adapter::CrewBriefTemplateResolver;
     use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
     use crate::crew_capabilities::CAPABILITIES_HEADING;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::factories::git::GitVcsFactory;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::providers::ProcessCommandRunner;
     use crate::testkits::replay::testing::MockRunner;
@@ -1403,7 +1404,7 @@ mod tests {
     #[test]
     fn standing_brief_keeps_the_convoy_active_across_tasks() {
         let (mut convoy, _) = convoy_brief_fixture();
-        convoy.metadata.annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
+        convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
         let content = build_convoy_crew_brief_with_options(
             &convoy,
             &TerminalCrewContext {
@@ -1874,7 +1875,7 @@ mod tests {
         assert!(!options.clone().for_convoy(&declared_exit).is_standing);
         declared_exit.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").exit = None;
         assert!(options.clone().for_convoy(&declared_exit).is_standing);
-        declared_exit.metadata.annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
+        declared_exit.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
         declared_exit.status = None;
         assert!(options.for_convoy(&declared_exit).is_standing);
     }

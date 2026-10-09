@@ -7,10 +7,9 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::providers::{
-    discovery::{EnvVars, EnvironmentBag},
-    environment::PreparedEnvironmentAuth,
-    ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
+use flotilla_core::{
+    discovery_api::EnvironmentBag,
+    providers::{discovery::EnvVars, environment::PreparedEnvironmentAuth, ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient},
 };
 use flotilla_protocol::DaemonHostPath;
 use flotilla_resources::{
@@ -2462,7 +2461,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_core::providers::discovery::EnvironmentAssertion;
+    use flotilla_core::discovery_api::EnvironmentAssertion;
     use flotilla_core::providers::CommandOutput;
     use flotilla_core::providers::ProcessCommandRunner;
     use flotilla_protocol::NodeId;

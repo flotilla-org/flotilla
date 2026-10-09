@@ -1,3 +1,4 @@
+use crate::providers::discovery::status::{provider_names_from_registry, ProviderNameEntry};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub use flotilla_protocol::{CategoryLabels, EnvironmentId, RepoLabels};
@@ -20,35 +21,6 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
         issues: labels(&registry.issue_trackers),
         cloud_agents: labels(&registry.cloud_agents),
     }
-}
-
-#[derive(Clone)]
-pub struct ProviderNameEntry {
-    pub display_name: String,
-    pub implementation: String,
-}
-
-pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<String, Vec<ProviderNameEntry>> {
-    let mut names = HashMap::new();
-    fn collect<T: ?Sized>(names: &mut HashMap<String, Vec<ProviderNameEntry>>, set: &ProviderSet<T>) {
-        if let Some((first, _)) = set.iter().next() {
-            let entries = set
-                .iter()
-                .map(|(desc, _)| ProviderNameEntry { display_name: desc.display_name.clone(), implementation: desc.implementation.clone() })
-                .collect::<Vec<_>>();
-            if !entries.is_empty() {
-                names.insert(first.category.slug().to_string(), entries);
-            }
-        }
-    }
-    collect(&mut names, &registry.vcs);
-    collect(&mut names, &registry.change_requests);
-    collect(&mut names, &registry.issue_trackers);
-    collect(&mut names, &registry.cloud_agents);
-    collect(&mut names, &registry.ai_utilities);
-    collect(&mut names, &registry.terminal_pools);
-    collect(&mut names, &registry.environment_providers);
-    names
 }
 
 pub fn repo_name(path: &Path) -> String {

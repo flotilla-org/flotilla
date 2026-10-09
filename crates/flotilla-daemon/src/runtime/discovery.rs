@@ -10,12 +10,9 @@ use std::{
 use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
+    discovery_api::EnvironmentBag,
     in_process::InProcessDaemon,
-    providers::{
-        discovery::{EnvVars, EnvironmentBag},
-        registry::ProviderRegistry,
-        ChannelLabel, CommandRunner,
-    },
+    providers::{discovery::EnvVars, registry::ProviderRegistry, ChannelLabel, CommandRunner},
 };
 use flotilla_credentials::CredentialStore;
 use flotilla_paths::path_context::DaemonHostPath;

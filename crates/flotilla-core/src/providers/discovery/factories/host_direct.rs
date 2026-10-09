@@ -1,13 +1,15 @@
 //! Host adoption factory.
 
+use crate::provider_config::ProviderConfigView;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
-    config::ConfigStore,
+    discovery_api::{EnvironmentAssertion, EnvironmentBag},
     providers::{
-        discovery::{EnvironmentAssertion, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         environment::{host_direct::HostDirectEnvironmentProvider, EnvironmentProvider},
         CommandRunner,
     },
@@ -28,7 +30,7 @@ impl Factory for HostDirectEnvironmentFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {

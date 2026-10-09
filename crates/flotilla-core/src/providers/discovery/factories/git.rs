@@ -1,13 +1,15 @@
 //! Checkout-scoped Git provider factory.
 
+use crate::provider_config::ProviderConfigView;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::{
-    config::ConfigStore,
+    discovery_api::EnvironmentBag,
     providers::{
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         vcs::{clone::ReferenceCloneStrategy, detection::reference_clone_available, git_worktree::GitWorktreeStrategy},
         CommandRunner,
     },
@@ -29,7 +31,7 @@ impl Factory for GitVcsFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        config: &ConfigStore,
+        config: &dyn ProviderConfigView,
         repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
@@ -61,8 +63,8 @@ mod tests {
 
     use super::GitVcsFactory;
     use crate::config::ConfigStore;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;

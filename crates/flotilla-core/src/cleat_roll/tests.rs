@@ -1,6 +1,6 @@
 use super::*;
-use crate::providers::discovery::EnvironmentAssertion;
-use crate::providers::discovery::EnvironmentBag;
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::EnvironmentBag;
 use crate::testkits::replay::testing::MockRunner;
 
 #[derive(Deserialize)]
