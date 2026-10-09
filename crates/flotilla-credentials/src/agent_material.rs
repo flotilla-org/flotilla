@@ -449,7 +449,7 @@ done"#,
 }
 
 /// Delivers the host's single central Codex login — the `auth.json` the daemon
-/// refresher keeps fresh (`crates/flotilla-daemon/src/codex_central.rs`) — as a
+/// refresher keeps fresh (`crates/flotilla-credentials/src/codex_central.rs`) — as a
 /// per-crew read-only copy.
 ///
 /// There is no pool: one login serves every crew because exactly one refresher

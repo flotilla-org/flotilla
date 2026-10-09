@@ -40,7 +40,7 @@ const DEAD_REFRESH_TOKEN_REASONS: &[&str] = &["refresh_token_expired", "refresh_
 /// Well-known location of the central Codex `auth.json` this host keeps
 /// fresh. This file lives outside any crew's `CODEX_HOME`, and the refresh
 /// task is its sole writer; `CodexMaterialAdapter`
-/// (`crates/flotilla-daemon/src/agent_material.rs`) reads from this same
+/// (`crates/flotilla-credentials/src/agent_material.rs`) reads from this same
 /// path to deliver read-only `0400` copies into crew homes.
 pub fn codex_central_auth_path(env: &dyn EnvVars) -> PathBuf {
     env.get("HOME")

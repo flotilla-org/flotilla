@@ -3,6 +3,8 @@
 //! The daemon owns scheduling and resource reconciliation. This crate owns
 //! credential minting/staging, agent homes/skills, and configuration composition;
 //! callers supply resource storage, environment access, and command runners.
+// async_trait's generated futures trigger Clippy 1.99's redundant must-use lint.
+// Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
 mod agent_material;

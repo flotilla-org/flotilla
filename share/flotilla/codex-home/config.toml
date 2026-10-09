@@ -3,7 +3,7 @@
 # This directory is baked into a fleet generation at
 # `share/flotilla/codex-home` and pointed at by `FLOTILLA_CODEX_HOME_TEMPLATE`
 # (`scripts/fleet-install`). At provision, `CodexMaterialAdapter::seed_scratch`
-# (`crates/flotilla-daemon/src/agent_material.rs`) copies every top-level entry
+# (`crates/flotilla-credentials/src/agent_material.rs`) copies every top-level entry
 # into the crew's `CODEX_HOME`, skipping entries the crew already has — so a
 # resumed crew keeps its own `sessions/`, history, and any local edits to this
 # file.

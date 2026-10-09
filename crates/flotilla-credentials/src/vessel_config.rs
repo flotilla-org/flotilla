@@ -108,8 +108,8 @@ impl fmt::Display for GitConfigKey {
 pub enum Merge {
     Set,
     Append,
-    // Preserve the tested composition policy internally; runtime claims use Set/Append.
-    #[allow(dead_code)]
+    // Keep this composition policy in tests; runtime claims use Set/Append.
+    #[cfg(test)]
     ErrorOnDuplicate,
 }
 
@@ -193,14 +193,41 @@ pub struct ComposedFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposeError {
-    InvalidProvenance { provenance: Provenance },
-    InvalidKey { provenance: Provenance },
-    InvalidValue { key: TargetKey, provenance: Provenance },
-    TargetKeyMismatch { target: TargetId, key: TargetKey, provenance: Provenance },
-    SetConflict { key: TargetKey, first: Provenance, second: Provenance },
-    MergePolicyConflict { key: TargetKey, first: Provenance, second: Provenance },
-    Duplicate { key: TargetKey, first: Provenance, second: Provenance },
-    UnsupportedAppend { key: TargetKey, provenance: Provenance },
+    InvalidProvenance {
+        provenance: Provenance,
+    },
+    InvalidKey {
+        provenance: Provenance,
+    },
+    InvalidValue {
+        key: TargetKey,
+        provenance: Provenance,
+    },
+    TargetKeyMismatch {
+        target: TargetId,
+        key: TargetKey,
+        provenance: Provenance,
+    },
+    SetConflict {
+        key: TargetKey,
+        first: Provenance,
+        second: Provenance,
+    },
+    MergePolicyConflict {
+        key: TargetKey,
+        first: Provenance,
+        second: Provenance,
+    },
+    #[cfg(test)]
+    Duplicate {
+        key: TargetKey,
+        first: Provenance,
+        second: Provenance,
+    },
+    UnsupportedAppend {
+        key: TargetKey,
+        provenance: Provenance,
+    },
 }
 
 impl fmt::Display for ComposeError {
@@ -224,6 +251,7 @@ impl fmt::Display for ComposeError {
             Self::MergePolicyConflict { key, first, second } => {
                 write!(formatter, "fragments from `{first}` and `{second}` declare different merge policies for key `{key}`")
             }
+            #[cfg(test)]
             Self::Duplicate { key, first, second } => {
                 write!(formatter, "duplicate fragments from `{first}` and `{second}` are forbidden for key `{key}`")
             }
@@ -362,6 +390,7 @@ fn resolve_fragments(fragments: &[Fragment], append_supported: bool) -> Result<V
             Merge::Append => {
                 return Err(ComposeError::UnsupportedAppend { key: first.key.clone(), provenance: first.provenance.clone() });
             }
+            #[cfg(test)]
             Merge::ErrorOnDuplicate => {
                 if let Some(other) = fragments_for_key.get(1) {
                     return Err(ComposeError::Duplicate {
