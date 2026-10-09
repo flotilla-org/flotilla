@@ -1,22 +1,18 @@
-use super::{
-    credentials::*, discovery::*, docker::*, environments::*, health::*, ports::*, seed::*, tasks::*, terminal::*,
-    test_git_repo::TestGitRepo, *,
-};
-use crate::{
-    blob_store::{BlobStore, MemoryBlobStore, TieredBlobStore},
-    environment_tools::{
-        tests::with_fourth_tool, EnvironmentToolProvisioner, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH,
-        CONTAINED_RUSTC_WRAPPER_PATH, ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH,
-        ENVIRONMENT_CLEAT_RUNTIME_DIR, ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH, RUSTC_LINKER_WRAPPER,
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
     },
-    resource_manifest::materialize_manifest_root,
-    startup::{phase, test_support::GatedCredentialPreflight, PENDING_WARNING_THRESHOLD},
-    supervisor::{ControllerSupervision, RestartBudgetExhausted},
+    time::Duration,
 };
+
 use async_trait::async_trait;
 use chrono::Utc;
-use daemon_support::*;
-use environment_support::*;
 use flotilla_controllers::reconcilers::clone::runtime::{CloneControllerRuntime, CloneFlights};
 use flotilla_controllers::reconcilers::{
     checkout::runtime::CheckoutControllerRuntime, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime,
@@ -82,26 +78,32 @@ use flotilla_resources::{
     CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
 };
 use futures::StreamExt;
+use serde_json::json;
+use tempfile::TempDir;
+use tokio::sync::{Mutex, Notify, RwLock};
+
+use super::{
+    credentials::*, discovery::*, docker::*, environments::*, health::*, ports::*, seed::*, tasks::*, terminal::*,
+    test_git_repo::TestGitRepo, *,
+};
+use crate::{
+    blob_store::{BlobStore, MemoryBlobStore, TieredBlobStore},
+    environment_tools::{
+        tests::with_fourth_tool, EnvironmentToolProvisioner, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH,
+        CONTAINED_RUSTC_WRAPPER_PATH, ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH,
+        ENVIRONMENT_CLEAT_RUNTIME_DIR, ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH, RUSTC_LINKER_WRAPPER,
+    },
+    resource_manifest::materialize_manifest_root,
+    startup::{phase, test_support::GatedCredentialPreflight, PENDING_WARNING_THRESHOLD},
+    supervisor::{ControllerSupervision, RestartBudgetExhausted},
+};
+use daemon_support::*;
+use environment_support::*;
 use launch_support::*;
 use lifecycle_support::*;
 use placement_support::*;
 use recovery_scenario::*;
-use serde_json::json;
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    fs,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    process::Command as ProcessCommand,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex as StdMutex,
-    },
-    time::Duration,
-};
-use tempfile::TempDir;
 use terminal_support::*;
-use tokio::sync::{Mutex, Notify, RwLock};
 
 mod adopted_checkouts;
 mod convoy_lifecycle;

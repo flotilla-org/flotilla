@@ -1,7 +1,12 @@
 //! Work-credential delivery, refresh, and agent-environment composition.
 
-use super::state::ControllerRuntimeState;
-use super::tasks::{spawn_periodic_task, PeriodicTaskStart};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_core::{
@@ -19,14 +24,11 @@ use flotilla_resources::{
     EnvironmentStatusPatch, InputMeta, Repository, RepositoryTrust, ResourceBackend, ResourceError, RetryBackoff, TerminalSession,
     TerminalSessionSource, Vessel, VesselStatusPatch,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Weak},
-    time::Duration,
-};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+use super::state::ControllerRuntimeState;
+use super::tasks::{spawn_periodic_task, PeriodicTaskStart};
 
 /// Staging and launch resolve the same adapter defaults, delivered values, and
 /// explicit home overrides. Selection metadata is carried only for staging.

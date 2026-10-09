@@ -1,9 +1,12 @@
 //! Terminal resource runtime and confirmed input delivery.
 
-use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
-use super::state::ControllerRuntimeState;
-use crate::blob_store::BlobDigest;
-use crate::blob_store::BlobStore;
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
@@ -27,14 +30,13 @@ use flotilla_resources::{
     TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::Path,
-    sync::{Arc, Mutex as StdMutex},
-    time::Duration,
-};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+
+use super::credentials::{agent_material_environment, RuntimeSessionCapabilities};
+use super::state::ControllerRuntimeState;
+use crate::blob_store::BlobDigest;
+use crate::blob_store::BlobStore;
 
 pub(super) struct PendingTerminalDelivery {
     pub(super) message_batch: Option<String>,

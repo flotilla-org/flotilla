@@ -1,13 +1,15 @@
 //! Shared controller state and standing-convoy backing inspection.
 
-use super::discovery::AgentlessSshProfile;
-use super::environments::{stage_remote_rustc_wrapper, ActiveProvisionedEnvironment};
-use super::tasks::{load_checkout_archive_roots, CheckoutArchiveRoot};
-use super::terminal::PendingTerminalDelivery;
-use crate::{
-    blob_store::TieredBlobStore,
-    environment_tools::{stage_local_rustc_wrapper_async, EnvironmentToolProvisioner},
+use std::{
+    collections::{BTreeSet, HashMap},
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
 };
+
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::clone::runtime::CloneFlights;
 use flotilla_controllers::reconcilers::CheckoutRemoval;
@@ -21,16 +23,16 @@ use flotilla_core::{
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
-use std::{
-    collections::{BTreeSet, HashMap},
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
-    },
-};
 use tokio::sync::{Mutex, Semaphore};
+
+use super::discovery::AgentlessSshProfile;
+use super::environments::{stage_remote_rustc_wrapper, ActiveProvisionedEnvironment};
+use super::tasks::{load_checkout_archive_roots, CheckoutArchiveRoot};
+use super::terminal::PendingTerminalDelivery;
+use crate::{
+    blob_store::TieredBlobStore,
+    environment_tools::{stage_local_rustc_wrapper_async, EnvironmentToolProvisioner},
+};
 
 pub(super) struct ControllerRuntimeState {
     pub(super) daemon: Arc<InProcessDaemon>,

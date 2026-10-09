@@ -11,6 +11,35 @@ mod seed;
 mod state;
 mod tasks;
 mod terminal;
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
+};
+
+use chrono::Utc;
+use flotilla_controllers::reconcilers::{
+    convoy_ensure::EnsureReconciler, CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver,
+    RepositoryReconciler, TerminalSessionReconciler, VesselReconciler,
+};
+use flotilla_core::{
+    checkout_integration::LANDING_EVIDENCE_TTL,
+    config::ConfigStore,
+    in_process::InProcessDaemon,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    providers::registry::ProviderRegistry,
+};
+use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_protocol::CanonicalHostId;
+use flotilla_resources::{
+    controller::ControllerLoop, host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, ConvoyReconciler, Environment, Forge,
+    Host, ManifestRoot, Repository, Resource, ResourceBackend, ResourceError, SystemClock, TerminalSession, Vessel, WorkflowTemplate,
+};
+use tokio::{sync::watch, task::JoinHandle};
+use tokio_util::task::AbortOnDropHandle;
+use tracing::{debug, error, info, warn};
+
 use self::credentials::{
     reconcile_work_credentials, spawn_codex_central_refresh_task, spawn_codex_credential_redelivery_task, spawn_credential_refresh_task,
     RuntimeSessionCapabilities, RuntimeWorkCredentialReconciler,
@@ -43,37 +72,12 @@ use self::tasks::{
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::{blob_store::TieredBlobStore, resource_manifest::manifest_root_name, startup::phase, supervisor::ControllerSupervision};
-use chrono::Utc;
-use flotilla_controllers::reconcilers::{
-    convoy_ensure::EnsureReconciler, CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver,
-    RepositoryReconciler, TerminalSessionReconciler, VesselReconciler,
-};
-use flotilla_core::{
-    checkout_integration::LANDING_EVIDENCE_TTL,
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::registry::ProviderRegistry,
-};
-use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
-use flotilla_protocol::CanonicalHostId;
-use flotilla_resources::{
-    controller::ControllerLoop, host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, ConvoyReconciler, Environment, Forge,
-    Host, ManifestRoot, Repository, Resource, ResourceBackend, ResourceError, SystemClock, TerminalSession, Vessel, WorkflowTemplate,
-};
-use std::{
-    collections::BTreeSet,
-    path::PathBuf,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
 #[cfg(any(test, feature = "test-support"))]
 pub use tasks::spawn_pending_supervisor_turn_task_with_watches;
-use tokio::{sync::watch, task::JoinHandle};
-use tokio_util::task::AbortOnDropHandle;
-use tracing::{debug, error, info, warn};
+#[cfg(test)]
+pub(crate) use tasks::wait_for_listening;
 
 #[derive(Debug, Clone, bon::Builder)]
 pub struct RuntimeOptions {
@@ -911,6 +915,3 @@ fn spawn_controller_loops(
 mod test_git_repo;
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(crate) use tasks::wait_for_listening;

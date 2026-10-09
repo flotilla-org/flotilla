@@ -1,11 +1,11 @@
-use super::*;
-use crate::{
-    reconcilers::{
-        clone::runtime::clone_staging_path, runtime_tests::FailFirstCloneProcessRunner, BranchPreservationReason, CheckoutRemoval,
-        CheckoutRemovalOutcome,
-    },
-    test_git_repo::TestGitRepo,
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    process::Command as ProcessCommand,
+    sync::{atomic::AtomicBool, Arc, Mutex as StdMutex},
 };
+
 use async_trait::async_trait;
 use flotilla_core::{
     in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
@@ -16,14 +16,16 @@ use flotilla_resources::{
     CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend,
     ResourceBackend, SqliteBackend,
 };
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::Path,
-    process::Command as ProcessCommand,
-    sync::{atomic::AtomicBool, Arc, Mutex as StdMutex},
-};
 use tempfile::TempDir;
+
+use super::*;
+use crate::{
+    reconcilers::{
+        clone::runtime::clone_staging_path, runtime_tests::FailFirstCloneProcessRunner, BranchPreservationReason, CheckoutRemoval,
+        CheckoutRemovalOutcome,
+    },
+    test_git_repo::TestGitRepo,
+};
 
 #[tokio::test]
 async fn checkout_runtime_creates_convoy_branch_from_snapshotted_base() {

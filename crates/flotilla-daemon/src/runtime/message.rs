@@ -1,7 +1,7 @@
 //! Durable Message reconciliation and terminal transport.
 
-use super::state::ControllerRuntimeState;
-use super::terminal::{deliver_guarded_and_confirm, PendingTerminalDelivery, TerminalControllerRuntime};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{TerminalDeliveryFailure, TerminalDeliveryOutcome};
@@ -9,7 +9,9 @@ use flotilla_resources::{
     Resource, ResourceBackend, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
 };
 use futures::StreamExt;
-use std::sync::Arc;
+
+use super::state::ControllerRuntimeState;
+use super::terminal::{deliver_guarded_and_confirm, PendingTerminalDelivery, TerminalControllerRuntime};
 
 /// Dependency events wake one inbox pass, not one timer per pending record.
 /// Federated watches include references and holders authored on other hosts.

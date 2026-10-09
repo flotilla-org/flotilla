@@ -1,9 +1,3 @@
-use super::*;
-use crate::{
-    reconcilers::runtime_tests::{BlockingCloneProcessRunner, FailFirstCloneProcessRunner},
-    test_git_repo::TestGitRepo,
-};
-use flotilla_core::providers::ProcessCommandRunner;
 use std::{
     collections::BTreeSet,
     fs,
@@ -15,8 +9,16 @@ use std::{
     },
     time::Duration,
 };
+
+use flotilla_core::providers::ProcessCommandRunner;
 use tempfile::TempDir;
 use tokio::sync::Notify;
+
+use super::*;
+use crate::{
+    reconcilers::runtime_tests::{BlockingCloneProcessRunner, FailFirstCloneProcessRunner},
+    test_git_repo::TestGitRepo,
+};
 
 #[tokio::test]
 async fn clone_runtime_single_flights_concurrent_requests_for_the_same_target() {

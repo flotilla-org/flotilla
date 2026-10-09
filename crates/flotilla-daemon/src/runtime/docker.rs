@@ -1,9 +1,11 @@
 //! Docker resource runtime and provisioning cleanup.
 
-use super::credentials::{agent_material_environment, stage_agent_environment};
-use super::environments::ActiveProvisionedEnvironment;
-use super::state::{canonical_runtime_host_id, ControllerRuntimeState};
-use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
 use flotilla_core::{
@@ -22,13 +24,13 @@ use flotilla_resources::{
     Environment, EnvironmentSpec, PlacementPolicy, Resource, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ENV,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
+
+use super::credentials::{agent_material_environment, stage_agent_environment};
+use super::environments::ActiveProvisionedEnvironment;
+use super::state::{canonical_runtime_host_id, ControllerRuntimeState};
+use crate::environment_tools::{EnvironmentToolContext, DOCKER_PROVIDER_KIND};
 
 pub(super) struct DockerControllerRuntime {
     pub(super) state: Arc<ControllerRuntimeState>,

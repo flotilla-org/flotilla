@@ -1,20 +1,22 @@
 //! Provisioned-environment readoption and durable observation updates.
 
-use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
-use super::state::{canonical_runtime_host_id, ControllerRuntimeState};
-use crate::environment_tools::RUSTC_LINKER_WRAPPER;
-use flotilla_core::providers::{environment::EnvironmentHandle, ChannelLabel, CommandRunner};
-use flotilla_protocol::{CanonicalHostId, EnvironmentId};
-use flotilla_resources::{
-    Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
-};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
+
+use flotilla_core::providers::{environment::EnvironmentHandle, ChannelLabel, CommandRunner};
+use flotilla_protocol::{CanonicalHostId, EnvironmentId};
+use flotilla_resources::{
+    Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
+};
 use tracing::{info, warn};
+
+use super::docker::{probe_provisioned_environment, verify_declared_agent_adapters};
+use super::state::{canonical_runtime_host_id, ControllerRuntimeState};
+use crate::environment_tools::RUSTC_LINKER_WRAPPER;
 
 pub(super) async fn stage_remote_rustc_wrapper(runner: &dyn CommandRunner, base: &Path) -> Result<PathBuf, String> {
     let directory = base.join("environment-tools");

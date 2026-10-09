@@ -1,11 +1,15 @@
 //! Runtime health, heartbeat conditions, and projection parity.
 
-use super::discovery::LocalProvisioningProfile;
-use super::seed::{ensure_host_exists, migrate_live_placement_policies};
-use super::tasks::{spawn_periodic_task, PeriodicTaskStart, CONVOY_ENSURE_CONDITION_TYPE};
-use crate::{
-    resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    time::Duration,
 };
+
 use chrono::Utc;
 use flotilla_aggregator::IssuePollingHealth;
 use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
@@ -18,17 +22,15 @@ use flotilla_resources::{
     CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, REGISTERED_RESOURCE_KINDS,
 };
 use serde_json::json;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
-    time::Duration,
-};
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
+
+use super::discovery::LocalProvisioningProfile;
+use super::seed::{ensure_host_exists, migrate_live_placement_policies};
+use super::tasks::{spawn_periodic_task, PeriodicTaskStart, CONVOY_ENSURE_CONDITION_TYPE};
+use crate::{
+    resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct DaemonHealthIdentity {

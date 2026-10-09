@@ -1,9 +1,12 @@
 //! Local and agentless-SSH discovery and fulfilment observations.
 
-use super::seed::{
-    empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
 };
-use super::tasks::FULFILMENT_CHANGE_CHECK_INTERVAL;
+
 use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
@@ -24,14 +27,13 @@ use flotilla_resources::{
     TRANSPORT_CAPABILITY,
 };
 use serde_json::json;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
 use tokio::sync::RwLock;
 use tracing::warn;
+
+use super::seed::{
+    empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
+};
+use super::tasks::FULFILMENT_CHANGE_CHECK_INTERVAL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalProvisioningProfile {

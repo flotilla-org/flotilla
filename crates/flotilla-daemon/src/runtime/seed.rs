@@ -1,6 +1,10 @@
 //! Startup resource seeding and placement-policy migration.
 
-use super::discovery::{LocalProvisioningProfile, DEFAULT_DOCKER_IMAGE};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
 use flotilla_core::{in_process::InProcessDaemon, placement_policy::reconcile_registered_policy};
 use flotilla_resources::{
     canonical_host_id, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, DockerCheckoutStrategy,
@@ -8,11 +12,9 @@ use flotilla_resources::{
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
     Repository, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
 use tracing::warn;
+
+use super::discovery::{LocalProvisioningProfile, DEFAULT_DOCKER_IMAGE};
 
 pub(super) async fn register_startup_resources(
     daemon: &Arc<InProcessDaemon>,

@@ -1,10 +1,11 @@
-use async_trait::async_trait;
-use flotilla_core::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
 use std::{
     fs,
     path::Path,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+
+use async_trait::async_trait;
+use flotilla_core::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
 use tokio::sync::Notify;
 
 pub(crate) struct FailFirstCloneProcessRunner {

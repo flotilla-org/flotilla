@@ -1,10 +1,7 @@
 //! Checkout materialisation, integration inspection, removal, and convoy-directory cleanup.
 
-use super::super::clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path};
-use crate::reconcilers::{
-    checkout::managed_checkout_reason, checkout_path_component, BranchPreservationReason, CheckoutRemoval, CheckoutRemovalOutcome,
-    CheckoutRuntime, PreparedCheckout,
-};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
+
 use async_trait::async_trait;
 use flotilla_core::{
     checkout_integration::{
@@ -18,8 +15,13 @@ use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, Environment, ForgeSpec,
     ReplicaReadResolver, ResourceBackend, ResourceObject,
 };
-use std::{collections::BTreeSet, path::Path, sync::Arc};
 use tracing::{debug, warn};
+
+use super::super::clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path};
+use crate::reconcilers::{
+    checkout::managed_checkout_reason, checkout_path_component, BranchPreservationReason, CheckoutRemoval, CheckoutRemovalOutcome,
+    CheckoutRuntime, PreparedCheckout,
+};
 
 pub struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,

@@ -1,19 +1,13 @@
 //! Background task ownership, supervision, retention, and watch loops.
 
-use super::credentials::reconcile_work_credentials;
-use super::discovery::{observe_fulfilment_facts, AgentlessSshProfile, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile};
-use super::docker::DockerControllerRuntime;
-use super::environments::reconcile_provisioned_environments;
-use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, RuntimeHealth};
-use super::state::ControllerRuntimeState;
-use super::StartupRestoration;
-use crate::{
-    blob_store::TieredBlobStore,
-    dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
-    resource_manifest::{materialize_bound_manifest_root, ResourceManifestReconciler},
-    sleep_inhibitor,
-    supervisor::{supervise, ControllerSupervision},
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
+
 use chrono::Utc;
 use flotilla_controllers::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
@@ -31,18 +25,26 @@ use futures::stream::{BoxStream, SelectAll};
 use futures::FutureExt;
 use futures::StreamExt;
 use serde_json::Value;
-use std::{
-    collections::BTreeSet,
-    future::Future,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
 };
 use tracing::{debug, info, warn};
+
+use super::credentials::reconcile_work_credentials;
+use super::discovery::{observe_fulfilment_facts, AgentlessSshProfile, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile};
+use super::docker::DockerControllerRuntime;
+use super::environments::reconcile_provisioned_environments;
+use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, RuntimeHealth};
+use super::state::ControllerRuntimeState;
+use super::StartupRestoration;
+use crate::{
+    blob_store::TieredBlobStore,
+    dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
+    resource_manifest::{materialize_bound_manifest_root, ResourceManifestReconciler},
+    sleep_inhibitor,
+    supervisor::{supervise, ControllerSupervision},
+};
 
 /// Cadence of the liveness marker (see `spawn_liveness_watchdog_task`). Long
 /// enough to be quiet in a healthy log, short enough to bound how much time a
