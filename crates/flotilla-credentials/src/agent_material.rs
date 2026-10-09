@@ -109,6 +109,13 @@ pub struct AgentMaterialRegistry {
 
 impl AgentMaterialRegistry {
     pub fn new(env: Arc<dyn EnvVars>) -> Self {
+        Self::with_codex_delivery_support(env, cfg!(target_os = "linux"))
+    }
+
+    /// Supply the placement host's Codex delivery capability explicitly.
+    /// Tests can model Linux delivery on any host; production callers use
+    /// [`Self::new`] to retain the Linux-only platform policy.
+    pub fn with_codex_delivery_support(env: Arc<dyn EnvVars>, codex_delivery_supported: bool) -> Self {
         let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"));
         let homes_dir = home.join(".local/share/flotilla/agent-homes");
         let codex_central_auth_path = codex_central_auth_path(&*env);
@@ -117,7 +124,7 @@ impl AgentMaterialRegistry {
             codex_central_auth_path.clone(),
             env.get(FLOTILLA_CODEX_HOME_TEMPLATE_ENV).map(PathBuf::from),
             homes_dir.clone(),
-            cfg!(any(target_os = "linux", test)),
+            codex_delivery_supported,
         ));
         let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter);
         let mut adapters = BTreeMap::from([(codex.id(), codex), (claude_code.id(), Arc::clone(&claude_code))]);
@@ -1330,9 +1337,13 @@ esac
         skills
     }
 
+    fn test_registry(env: Arc<dyn EnvVars>) -> AgentMaterialRegistry {
+        AgentMaterialRegistry::with_codex_delivery_support(env, true)
+    }
+
     fn registry(home: &Path) -> AgentMaterialRegistry {
         let skills = write_skill_sources(home);
-        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        test_registry(Arc::new(TestEnvVars::new([
             ("HOME", home.to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
         ])))
@@ -1343,7 +1354,7 @@ esac
             return registry(home);
         }
         let skills = write_skill_sources(home);
-        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        test_registry(Arc::new(TestEnvVars::new([
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
             ("FLOTILLA_FLEET_CANARY", "1".to_string()),
@@ -1352,7 +1363,7 @@ esac
 
     fn registry_with_home_template(home: &Path, template: &Path) -> AgentMaterialRegistry {
         let skills = write_skill_sources(home);
-        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        test_registry(Arc::new(TestEnvVars::new([
             ("HOME", home.to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
             (FLOTILLA_CODEX_HOME_TEMPLATE_ENV, template.to_string_lossy().into_owned()),
@@ -1361,6 +1372,59 @@ esac
 
     fn delivered_auth_mode(path: &Path) -> u32 {
         std::fs::metadata(path).expect("delivered credential metadata").permissions().mode() & 0o777
+    }
+
+    // The injected capability controls delivery on every test host. Exhaust both
+    // boolean values and both managed/external home cases; concurrency is irrelevant
+    // to this immutable policy input.
+    #[tokio::test]
+    async fn codex_delivery_obeys_injected_support() {
+        for supported in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            write_central_auth(temp.path(), "test-access-token");
+            let skills = write_skill_sources(temp.path());
+            let env = Arc::new(TestEnvVars::new([
+                ("HOME", temp.path().display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
+            ]));
+            let registry = AgentMaterialRegistry::with_codex_delivery_support(env, supported);
+            let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+            let result = registry.prepare("crew", &required, &BTreeMap::new()).await;
+            if supported {
+                let deliveries = result.expect("injected Linux support permits delivery");
+                assert_eq!(deliveries.len(), 2);
+                assert_eq!(
+                    std::fs::read(deliveries[0].mount.host_path.as_path().join(CODEX_AUTH_FILE)).expect("delivered auth"),
+                    std::fs::read(registry.codex_credential_source()).expect("central auth"),
+                );
+            } else {
+                assert_eq!(
+                    result.expect_err("unsupported host refuses delivery"),
+                    "Codex login material delivery is supported only on Linux placement hosts"
+                );
+                assert!(!temp.path().join(".local/share/flotilla/agent-homes").exists());
+            }
+            let external = BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]);
+            assert!(registry.prepare("external", &required, &external).await.expect("external home bypasses delivery").is_empty());
+        }
+    }
+
+    // The production constructor retains Linux-only support even when test-support
+    // is enabled. A missing credential distinguishes support from platform refusal.
+    #[tokio::test]
+    async fn codex_production_support_matches_the_placement_host() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env = Arc::new(TestEnvVars::new([("HOME", temp.path().display().to_string())]));
+        let registry = AgentMaterialRegistry::new(env);
+        let error = registry
+            .prepare("crew", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect_err("no central credential");
+        if cfg!(target_os = "linux") {
+            assert!(error.contains("is not provisioned on this host"), "{error}");
+        } else {
+            assert_eq!(error, "Codex login material delivery is supported only on Linux placement hosts");
+        }
     }
 
     #[tokio::test]
@@ -1555,8 +1619,7 @@ esac
                 skills_source: skills.clone(),
                 path: std::env::var("PATH").expect("test process PATH"),
             };
-            let registry =
-                AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([(FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned())])));
+            let registry = test_registry(Arc::new(TestEnvVars::new([(FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned())])));
             let environment = vec![("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())];
             let error = registry
                 .stage_test_skills("crew-fetch", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &environment, &tokens, &runner)
@@ -2419,7 +2482,7 @@ esac
     async fn missing_generation_skill_sources_fail_before_agent_container_creation() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_central_auth(temp.path(), "access-token-one");
-        let registry = AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])));
+        let registry = test_registry(Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])));
 
         let error = registry
             .prepare("env-a", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &BTreeMap::new())
@@ -2454,7 +2517,7 @@ esac
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(!registry(temp.path()).adapters.contains_key("fleet-canary"));
         let skills = write_skill_sources(temp.path());
-        let registry = AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        let registry = test_registry(Arc::new(TestEnvVars::new([
             ("HOME", temp.path().display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
             ("FLOTILLA_FLEET_CANARY", "1".to_string()),

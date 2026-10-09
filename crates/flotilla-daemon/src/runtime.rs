@@ -7656,6 +7656,11 @@ mod tests {
         assert_eq!(pinned.fixed_repositories, repositories);
     }
 
+    // Runtime scenarios model Linux placement capability independently of the test host.
+    fn test_agent_material_registry(env: Arc<dyn EnvVars>) -> AgentMaterialRegistry {
+        AgentMaterialRegistry::with_codex_delivery_support(env, true)
+    }
+
     fn fixed_environment_tools(state_dir: impl Into<PathBuf>) -> EnvironmentToolProvisioner {
         EnvironmentToolProvisioner::fixed(
             DaemonHostPath::new("/opt/flotilla/bin/flotilla"),
@@ -10158,7 +10163,7 @@ mod tests {
             Arc::new(ReplayHttpClient::new(mint_session.clone())),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
             ("HOME", temp.path().join("home").display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, write_test_credentialed_skill_sources(temp.path()).display().to_string()),
         ]))));
@@ -10245,7 +10250,7 @@ mod tests {
             Arc::new(ProcessCommandRunner),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
         ]))));
@@ -10328,7 +10333,7 @@ mod tests {
             HostName::new("dinghy"),
         )
         .await;
-        let material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        let material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
         ]))));
@@ -10451,7 +10456,7 @@ mod tests {
             Arc::new(ProcessCommandRunner),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(env));
+        let agent_material = Arc::new(test_agent_material_registry(env));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -10537,7 +10542,7 @@ mod tests {
             registry_runner.clone(),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
             ("HOME", home.display().to_string()),
             (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
         ]))));
@@ -10643,7 +10648,7 @@ mod tests {
                 registry_runner.clone(),
                 config.state_dir().as_path().to_path_buf(),
             ));
-            let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
                 ("HOME", home.display().to_string()),
                 (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
             ]))));
@@ -10743,7 +10748,7 @@ mod tests {
         let environment_home = home.join(".local/share/flotilla/agent-homes/contained-restarted");
         fs::create_dir_all(environment_home.join("codex/sessions")).expect("persistent agent home");
         fs::write(environment_home.join("codex/sessions/rollout.jsonl"), "session state").expect("persistent session state");
-        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([("HOME", home.display().to_string())]))));
+        let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([("HOME", home.display().to_string())]))));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -18689,7 +18694,7 @@ mod tests {
                 "host-direct-host-test".to_string(),
             )
             .with_credential_store(credential_store)
-            .with_agent_material(Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
+            .with_agent_material(Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
         );
         let spec = flotilla_resources::TerminalSessionSpec {
             env_ref: env_id.to_string(),
@@ -18950,7 +18955,7 @@ mod tests {
         std::fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
         std::fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
         std::fs::set_permissions(&central, std::fs::Permissions::from_mode(0o600)).expect("protect central auth");
-        let material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+        let material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
             ("HOME", temp.path().to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
         ]))));
