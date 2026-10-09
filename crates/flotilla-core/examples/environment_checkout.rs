@@ -13,10 +13,9 @@ use std::{path::Path, sync::Arc};
 
 use flotilla_core::{
     config::ConfigStore,
+    discovery_api::{EnvironmentAssertion, EnvironmentBag},
     providers::{
-        discovery::{
-            detectors::default_host_detectors, run_host_detectors, EnvironmentAssertion, EnvironmentBag, FactoryRegistry, ProcessEnvVars,
-        },
+        discovery::{detectors::default_host_detectors, run_host_detectors, FactoryRegistry, ProcessEnvVars},
         environment::{CreateOpts, EnvironmentKind},
         ChannelLabel, CommandRunner, ProcessCommandRunner,
     },

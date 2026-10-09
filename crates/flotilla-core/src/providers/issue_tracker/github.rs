@@ -1,3 +1,4 @@
+use crate::providers::issue_tracker::mission_fields;
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
@@ -7,13 +8,19 @@ use flotilla_protocol::{
     Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
 };
 
-use crate::providers::{
-    gh_api_get, gh_api_get_with_headers,
-    github_api::{clamp_per_page, rate_limit_error_for, GhApi},
-    github_observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape},
-    github_poll::{PendingBoard, PollCache},
-    run, run_output, CommandRunner,
-};
+use crate::providers::forge::github::clamp_per_page;
+use crate::providers::forge::github::rate_limit_error_for;
+use crate::providers::forge::github::GhApi;
+use crate::providers::gh_api_get;
+use crate::providers::gh_api_get_with_headers;
+use crate::providers::github_observation::ObservationTelemetry;
+use crate::providers::github_observation::ParsedObservationResponse;
+use crate::providers::github_observation::QueryShape;
+use crate::providers::github_poll::PendingBoard;
+use crate::providers::github_poll::PollCache;
+use crate::providers::run;
+use crate::providers::run_output;
+use crate::providers::CommandRunner;
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
 
@@ -348,7 +355,7 @@ fn parse_board(
                 .url(string("url")?)
                 .updated_at(string("updatedAt")?)
                 .maybe_issue_type(issue["issueType"]["name"].as_str().map(str::to_string))
-                .maybe_parent(issue["parent"]["url"].as_str().map(crate::dispatch_missions::issue_ref_from_url).transpose()?)
+                .maybe_parent(issue["parent"]["url"].as_str().map(mission_fields::issue_ref_from_url).transpose()?)
                 .maybe_closed_at(issue["closedAt"].as_str().map(str::to_string))
                 .labels(
                     issue["labels"]
@@ -535,7 +542,7 @@ impl super::IssueProvider for GitHubIssueProvider {
                 return Err("mission field window is truncated".into());
             }
         }
-        crate::dispatch_missions::parse_mission_fields(&values)
+        mission_fields::parse_mission_fields(&values)
     }
 
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
@@ -646,9 +653,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::github_api::GhApi;
-    use crate::providers::github_api::GhApiClient;
-    use crate::providers::github_api::GhApiResponse;
+    use crate::providers::forge::github::GhApi;
+    use crate::providers::forge::github::GhApiClient;
+    use crate::providers::forge::github::GhApiResponse;
     use crate::providers::github_test_support::build_api_and_runner;
     use crate::providers::github_test_support::repo_root_for_recording;
     use crate::providers::issue_tracker::IssueProvider;

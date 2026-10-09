@@ -13,9 +13,9 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::command_target::TargetHost;
 use flotilla_core::config::ConfigStore;
+use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::WorkCredentialReconciler;
-use flotilla_core::providers::discovery::EnvironmentBag;
 use flotilla_core::providers::environment::ProvisionedEnvironment;
 use flotilla_core::providers::environment::ProvisionedMount;
 use flotilla_core::providers::issue_tracker::IssueProvider;
@@ -4545,7 +4545,8 @@ fn generated_message_role_waiting_home(tc: hegel::TestCase) {
 }
 
 async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
-    use flotilla_core::crew_capabilities::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_core::crew_capabilities::CredentialCapability;
+    use flotilla_core::crew_capabilities::SessionCapabilitySource;
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
     // Credential-delivery I/O is the boundary; routing and stores are real.
     struct Delivery(bool);

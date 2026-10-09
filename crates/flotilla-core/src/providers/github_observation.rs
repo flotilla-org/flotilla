@@ -2,9 +2,11 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use super::change_request::ObservationError;
 use crate::providers::{
-    github_api::{github_rate_limit_from_document, parse_gh_api_response, response_header, GhApiResponse, GithubRateLimit},
+    forge::{
+        github::{github_rate_limit_from_document, parse_gh_api_response, response_header, GhApiResponse, GithubRateLimit},
+        observation_error::ObservationError,
+    },
     CommandOutput,
 };
 
@@ -36,7 +38,7 @@ impl ParsedObservationResponse {
             .build()
     }
     pub(crate) fn low_budget(&self) -> Option<chrono::DateTime<Utc>> {
-        super::github_api::low_graphql_budget(&self.headers, self.document.as_ref().unwrap_or(&serde_json::Value::Null))
+        super::forge::github::low_graphql_budget(&self.headers, self.document.as_ref().unwrap_or(&serde_json::Value::Null))
     }
     pub fn into_document(self) -> Result<serde_json::Value, ObservationError> {
         self.document.map_err(|error| format!("decode GitHub GraphQL observation: {error}").into())

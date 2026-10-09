@@ -7,7 +7,10 @@ use std::collections::HashMap;
 
 use flotilla_protocol::{DiscoveryEntry, DiscoveryFact, HostProviderStatus, ToolInventory, UnmetRequirementInfo};
 
-use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag, UnmetRequirement};
+use crate::{
+    discovery_api::{EnvironmentAssertion, EnvironmentBag},
+    providers::discovery::UnmetRequirement,
+};
 
 pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> DiscoveryEntry {
     let mut detail = HashMap::new();

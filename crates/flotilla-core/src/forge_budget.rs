@@ -15,7 +15,7 @@ use chrono::Utc;
 use flotilla_protocol::ForgeBudgetRow;
 
 use crate::providers::{
-    github_api::{github_rate_limit, low_graphql_budget, parse_gh_api_response, response_header},
+    forge::github::{github_rate_limit, low_graphql_budget, parse_gh_api_response, response_header},
     ChannelLabel, CommandOutput, CommandProcess, CommandRunner,
 };
 

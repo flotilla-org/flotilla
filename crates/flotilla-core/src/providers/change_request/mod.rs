@@ -4,10 +4,10 @@ pub mod github;
 use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState};
 
-use crate::providers::{github_api::GithubRateLimit, types::ChangeRequest};
+use crate::providers::types::ChangeRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRequestAdmission {
@@ -15,48 +15,6 @@ pub struct ChangeRequestAdmission {
     pub change_request: ChangeRequest,
     pub base_ref: Option<String>,
 }
-
-/// Observation failures retain forge classification until a presentation boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObservationError {
-    Forge(String),
-    RateLimited { budget: String, limit: GithubRateLimit },
-}
-
-impl ObservationError {
-    pub fn retry_at(&self) -> Option<DateTime<Utc>> {
-        match self {
-            Self::RateLimited { limit, .. } => limit.retry_at,
-            Self::Forge(_) => None,
-        }
-    }
-}
-
-impl From<String> for ObservationError {
-    fn from(error: String) -> Self {
-        Self::Forge(error)
-    }
-}
-impl From<&str> for ObservationError {
-    fn from(error: &str) -> Self {
-        Self::Forge(error.to_string())
-    }
-}
-impl std::fmt::Display for ObservationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Forge(error) => f.write_str(error),
-            Self::RateLimited { budget, limit } => write!(
-                f,
-                "github rate limited (budget={budget}, identity=host gh login, kind={}, retry_source={}, retry_at={})",
-                limit.kind.as_str(),
-                limit.retry_source,
-                limit.retry_at.map(|at| at.to_rfc3339()).unwrap_or_else(|| "unavailable".into())
-            ),
-        }
-    }
-}
-impl std::error::Error for ObservationError {}
 
 pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, ObservationError>>;
 pub type CrewGithubLoginsByRequest = BTreeMap<u64, Vec<String>>;
@@ -168,6 +126,9 @@ pub trait ChangeRequestTracker: Send + Sync {
     async fn merge_change_request(&self, id: &str) -> Result<(), String>;
     async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String>;
 }
+
+pub mod observation;
+use crate::providers::forge::observation_error::ObservationError;
 
 #[cfg(test)]
 mod tests {

@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use flotilla_core::providers::{
-    change_request::ObservationError,
-    github_api::{
+    forge::github::{
         github_rate_limit, rate_limit_error, rate_limit_reset, GhApi, GhApiFailure, GhApiFailureResponse, GhApiResponse, GithubRateLimit,
         GithubRateLimitKind,
     },
+    forge::observation_error::ObservationError,
     ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
 };
 
@@ -1114,12 +1114,12 @@ pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
             // RecordingRunner.  GhApiClient shells out via its runner, so using a
             // RecordingRunner here would double-record (once as Command, once as GhApi).
             let raw_runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
-            let real_api = Arc::new(flotilla_core::providers::github_api::GhApiClient::new(raw_runner));
+            let real_api = Arc::new(flotilla_core::providers::forge::github::GhApiClient::new(raw_runner));
             Arc::new(RecordingGhApi::new(session.clone(), real_api))
         }
         Session::Passthrough => {
             let raw_runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
-            Arc::new(flotilla_core::providers::github_api::GhApiClient::new(raw_runner))
+            Arc::new(flotilla_core::providers::forge::github::GhApiClient::new(raw_runner))
         }
         Session::Replaying(_) => Arc::new(ReplayGhApi::new(session.clone())),
     }

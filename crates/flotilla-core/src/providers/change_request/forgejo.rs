@@ -6,20 +6,21 @@ use flotilla_resources::{
     ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedReviewDecision,
 };
 
-use super::{ChangeRequestAdmission, ChangeRequestTracker, ObservationError};
+use super::ChangeRequestAdmission;
+use super::ChangeRequestTracker;
 use crate::providers::{
-    http_execute,
-    issue_tracker::forgejo::ForgejoIssueProviderConfig,
-    run,
+    forge::{
+        forgejo::{ForgejoClient, ForgejoIssueProviderConfig},
+        observation_error::ObservationError,
+    },
+    http_execute, run,
     types::{ChangeRequest, ChangeRequestStatus},
     CommandRunner, HttpClient,
 };
 
 pub struct ForgejoChangeRequestProvider {
-    http: Arc<dyn HttpClient>,
     runner: Arc<dyn CommandRunner>,
-    client: reqwest::Client,
-    config: ForgejoIssueProviderConfig,
+    forge: ForgejoClient,
     repo_slug: String,
     operator_login: Option<String>,
 }
@@ -79,8 +80,7 @@ fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecisi
 
 impl ForgejoChangeRequestProvider {
     pub fn new(http: Arc<dyn HttpClient>, runner: Arc<dyn CommandRunner>, config: ForgejoIssueProviderConfig, repo_slug: String) -> Self {
-        let client = crate::tls::client_builder().build().expect("build Forgejo request client");
-        Self { http, runner, client, config, repo_slug, operator_login: None }
+        Self { forge: ForgejoClient::new(http, config), runner, repo_slug, operator_login: None }
     }
 
     pub fn with_operator_login(mut self, login: String) -> Self {
@@ -120,64 +120,19 @@ impl ForgejoChangeRequestProvider {
         }
     }
 
-    fn request(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        query: &[(&str, String)],
-        body: Option<serde_json::Value>,
-    ) -> Result<reqwest::Request, String> {
-        let mut url = format!("{}/repos/{}/{}", self.config.api_base_url.trim_end_matches('/'), self.repo_slug, path);
-        if !query.is_empty() {
-            url.push('?');
-            url.push_str(
-                &query
-                    .iter()
-                    .map(|(key, value)| format!("{}={}", urlencoding::encode(key), urlencoding::encode(value)))
-                    .collect::<Vec<_>>()
-                    .join("&"),
-            );
-        }
-        let mut request = self
-            .client
-            .request(method, url)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("token {}", self.config.auth.token));
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        request.build().map_err(|error| error.to_string())
-    }
-
-    async fn execute(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        query: &[(&str, String)],
-        body: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, String> {
-        let response = http_execute!(self.http, self.request(method, path, query, body)?)?;
-        if !response.status().is_success() {
-            return Err(format!("Forgejo HTTP {}: {}", response.status(), String::from_utf8_lossy(response.body())));
-        }
-        if response.body().is_empty() {
-            return Ok(serde_json::Value::Null);
-        }
-        serde_json::from_slice(response.body()).map_err(|error| error.to_string())
-    }
-
     async fn read_review_decision(&self, number: u64) -> Result<Option<ObservedReviewDecision>, String> {
         const PAGE_SIZE: usize = 50;
         const MAX_PAGES: usize = 100;
         let mut reviews = Vec::new();
         for page in 1..=MAX_PAGES {
-            let request = self.request(
+            let request = self.forge.repository_request(
+                &self.repo_slug,
                 reqwest::Method::GET,
                 &format!("pulls/{number}/reviews"),
                 &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
                 None,
             )?;
-            let response = http_execute!(self.http, request)?;
+            let response = http_execute!(self.forge.http, request)?;
             if !response.status().is_success() {
                 return Err(format!("Forgejo HTTP {}: {}", response.status(), String::from_utf8_lossy(response.body())));
             }
@@ -231,7 +186,9 @@ impl ForgejoChangeRequestProvider {
         while items.len() < limit {
             let page = items.len() / page_size + 1;
             let value = self
+                .forge
                 .execute(
+                    &self.repo_slug,
                     reqwest::Method::GET,
                     "pulls",
                     &[("state", state.into()), ("limit", page_size.to_string()), ("page", page.to_string())],
@@ -259,10 +216,10 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         &self,
         numbers: &[u64],
         _crew_logins: &super::CrewGithubLoginsByRequest,
-    ) -> Result<super::BoundObservations, super::ObservationError> {
+    ) -> Result<super::BoundObservations, ObservationError> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
-            let result = match self.execute(reqwest::Method::GET, &format!("pulls/{number}"), &[], None).await {
+            let result = match self.forge.execute(&self.repo_slug, reqwest::Method::GET, &format!("pulls/{number}"), &[], None).await {
                 Ok(value) => {
                     let mut status = self.observed_status(&value);
                     let observed_at = Utc::now();
@@ -290,7 +247,9 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         // (or a short page from a server-side limit) as proof of absence.
         for page in 1..=100 {
             let value = self
+                .forge
                 .execute(
+                    &self.repo_slug,
                     reqwest::Method::GET,
                     "pulls",
                     &[("state", "all".into()), ("limit", "50".into()), ("page", page.to_string())],
@@ -309,23 +268,25 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     }
 
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
-        let value = self.execute(reqwest::Method::GET, &format!("pulls/{id}"), &[], None).await?;
+        let value = self.forge.execute(&self.repo_slug, reqwest::Method::GET, &format!("pulls/{id}"), &[], None).await?;
         self.parse(&value).ok_or_else(|| format!("malformed Forgejo pull request {id}"))
     }
 
     async fn get_change_request_for_admission(&self, id: &str) -> Result<ChangeRequestAdmission, ObservationError> {
-        let value = self.execute(reqwest::Method::GET, &format!("pulls/{id}"), &[], None).await?;
+        let value = self.forge.execute(&self.repo_slug, reqwest::Method::GET, &format!("pulls/{id}"), &[], None).await?;
         let (id, change_request) = self.parse(&value).ok_or_else(|| format!("malformed Forgejo pull request {id}"))?;
         Ok(ChangeRequestAdmission { id, change_request, base_ref: value["base"]["ref"].as_str().map(str::to_string) })
     }
 
     async fn update_body(&self, id: &str, body: &str) -> Result<(), String> {
-        self.execute(reqwest::Method::PATCH, &format!("pulls/{id}"), &[], Some(serde_json::json!({"body": body}))).await?;
+        self.forge
+            .execute(&self.repo_slug, reqwest::Method::PATCH, &format!("pulls/{id}"), &[], Some(serde_json::json!({"body": body})))
+            .await?;
         Ok(())
     }
 
     async fn open_in_browser(&self, id: &str) -> Result<(), String> {
-        let url = format!("{}/{}/pulls/{id}", self.config.service_url, self.repo_slug);
+        let url = format!("{}/{}/pulls/{id}", self.forge.config.service_url, self.repo_slug);
         #[cfg(target_os = "macos")]
         let (cmd, args): (&str, Vec<&str>) = ("open", vec![&url]);
         #[cfg(target_os = "windows")]
@@ -337,12 +298,16 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     }
 
     async fn close_change_request(&self, id: &str) -> Result<(), String> {
-        self.execute(reqwest::Method::PATCH, &format!("pulls/{id}"), &[], Some(serde_json::json!({"state":"closed"}))).await?;
+        self.forge
+            .execute(&self.repo_slug, reqwest::Method::PATCH, &format!("pulls/{id}"), &[], Some(serde_json::json!({"state":"closed"})))
+            .await?;
         Ok(())
     }
 
     async fn merge_change_request(&self, id: &str) -> Result<(), String> {
-        self.execute(reqwest::Method::POST, &format!("pulls/{id}/merge"), &[], Some(serde_json::json!({"Do":"squash"}))).await?;
+        self.forge
+            .execute(&self.repo_slug, reqwest::Method::POST, &format!("pulls/{id}/merge"), &[], Some(serde_json::json!({"Do":"squash"})))
+            .await?;
         Ok(())
     }
 
@@ -369,7 +334,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::issue_tracker::forgejo::ForgejoAuth;
+    use crate::providers::forge::forgejo::ForgejoAuth;
     use crate::providers::ChannelLabel;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
@@ -836,7 +801,9 @@ mod tests {
             [("drop-retired-stance", 1), ("robert:drop-retired-stance", 0), ("refs/pull/1/head", 0), ("flotilla-2585-definitely-absent", 0)]
         {
             let result = provider
+                .forge
                 .execute(
+                    &provider.repo_slug,
                     reqwest::Method::GET,
                     "pulls",
                     &[("state", "all".into()), ("limit", "50".into()), ("page", "1".into()), ("head", head.into())],

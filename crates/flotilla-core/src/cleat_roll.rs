@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use crate::providers::{
-    discovery::EnvironmentBag, terminal::environment::ControlledTerminalEnvironment, ChannelLabel, CommandOutput, CommandRunner,
+use crate::{
+    discovery_api::EnvironmentBag,
+    providers::{terminal::environment::ControlledTerminalEnvironment, ChannelLabel, CommandOutput, CommandRunner},
 };
 
 #[derive(bon::Builder)]

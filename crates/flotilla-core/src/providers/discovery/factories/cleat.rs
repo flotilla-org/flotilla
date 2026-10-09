@@ -1,17 +1,19 @@
 //! Terminal pool factory for cleat.
 
+use crate::provider_config::ProviderConfigView;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    config::ConfigStore,
-    providers::{
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        terminal::{cleat::CleatTerminalPool, TerminalPool},
-        CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::terminal::cleat::CleatTerminalPool;
+use crate::providers::terminal::TerminalPool;
+use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct CleatTerminalPoolFactory;
@@ -28,7 +30,7 @@ impl Factory for CleatTerminalPoolFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
@@ -47,8 +49,8 @@ mod tests {
 
     use super::CleatTerminalPoolFactory;
     use crate::config::ConfigStore;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;

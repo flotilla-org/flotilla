@@ -10,7 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::{gh_api_channel_label, github_api::GhApi};
+use super::{forge::github::GhApi, gh_api_channel_label};
 
 pub(super) fn persist(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().ok_or("poll cache has no parent")?;
@@ -192,7 +192,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::providers::github_api::GhApiClient;
+    use crate::providers::forge::github::GhApiClient;
     use crate::providers::ChannelLabel;
     use crate::providers::CommandOutput;
     use crate::providers::CommandRunner;

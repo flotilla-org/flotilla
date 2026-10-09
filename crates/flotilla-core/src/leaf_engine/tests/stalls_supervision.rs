@@ -1,4 +1,5 @@
 use super::*;
+use crate::providers::change_request::observation;
 
 // #2560: the inactivity bound follows the newest tool/hook evidence, not
 // total turn age or refreshed screen timestamps. Generated ages straddle
@@ -1322,7 +1323,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
 async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     struct LimitedSource(ObservationError);
     #[async_trait]
-    impl crate::change_request_observer::ChangeRequestObservationSource for LimitedSource {
+    impl observation::ChangeRequestObservationSource for LimitedSource {
         async fn observe(&self, _: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
             Err(self.0.clone())
         }

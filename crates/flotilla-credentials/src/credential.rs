@@ -7,11 +7,13 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::providers::{
-    discovery::{EnvVars, EnvironmentBag},
-    environment::PreparedEnvironmentAuth,
-    ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
-};
+use flotilla_core::discovery_api::EnvironmentBag;
+use flotilla_core::providers::discovery::EnvVars;
+use flotilla_core::providers::environment::PreparedEnvironmentAuth;
+use flotilla_core::providers::ChannelLabel;
+use flotilla_core::providers::CommandRunner;
+use flotilla_core::providers::HttpClient;
+use flotilla_core::providers::ReqwestHttpClient;
 use flotilla_protocol::DaemonHostPath;
 use flotilla_resources::{
     capped_github_app_permissions, Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec,
@@ -24,9 +26,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 use url::Url;
 
-use crate::vessel_config::{
-    agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
-};
+use crate::vessel_config::agent_environment_fragment;
+use crate::vessel_config::compose;
+use crate::vessel_config::crew_gitconfig_fragments;
+use crate::vessel_config::Fragment;
+use crate::vessel_config::GitConfigKey;
+use crate::vessel_config::Merge;
+use crate::vessel_config::Provenance;
+use crate::vessel_config::TargetId;
+use crate::vessel_config::TargetKey;
 
 /// Shared, side-effect-free authority check for skill staging and the candidate
 /// pre-roll probe. Returns the repository name used to narrow the App token.
@@ -2462,7 +2470,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_core::providers::discovery::EnvironmentAssertion;
+    use flotilla_core::discovery_api::EnvironmentAssertion;
     use flotilla_core::providers::CommandOutput;
     use flotilla_core::providers::ProcessCommandRunner;
     use flotilla_protocol::NodeId;
@@ -2479,7 +2487,9 @@ mod tests {
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
-    use crate::agent_material::{tests::promisor_runner, AgentMaterialRegistry, FLOTILLA_SKILLS_DIR_ENV};
+    use crate::agent_material::tests::promisor_runner;
+    use crate::agent_material::AgentMaterialRegistry;
+    use crate::agent_material::FLOTILLA_SKILLS_DIR_ENV;
 
     #[derive(Default)]
     struct TestEnv(BTreeMap<String, String>);
@@ -2906,7 +2916,8 @@ mod tests {
 
     #[tokio::test]
     async fn project_membership_remints_live_token_without_widening_fixed_scope() {
-        use flotilla_core::crew_capabilities::{credential_card, SessionCapabilitySource};
+        use flotilla_core::crew_capabilities::credential_card;
+        use flotilla_core::crew_capabilities::SessionCapabilitySource;
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {

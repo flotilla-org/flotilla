@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::{charter_store::read_charter_source, vcs::Vcs};
+use flotilla_core::charter_store::read_charter_source;
+use flotilla_core::vcs::Vcs;
 use flotilla_resources::{
     apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, CharterSource,
     ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRecorder, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
@@ -1105,10 +1106,10 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_core::config::ConfigStore;
+    use flotilla_core::discovery_api::EnvironmentAssertion;
+    use flotilla_core::discovery_api::EnvironmentBag;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_core::providers::discovery::factories::git::GitVcsFactory;
-    use flotilla_core::providers::discovery::EnvironmentAssertion;
-    use flotilla_core::providers::discovery::EnvironmentBag;
     use flotilla_core::providers::discovery::Factory;
     use flotilla_core::providers::ProcessCommandRunner;
     use flotilla_discovery_testkit::fake_discovery_with_provider_set;

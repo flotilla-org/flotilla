@@ -11,9 +11,9 @@ use flotilla_resources::{
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};
-use crate::change_request_observer::ChangeRequestRef;
 use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
+use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::types::ChangeRequest;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};

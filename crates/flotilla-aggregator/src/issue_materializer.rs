@@ -16,7 +16,7 @@ use flotilla_core::{
     event_sink::EventSink,
     in_process::InProcessDaemon,
     providers::{
-        github_api::{core_rate_limit_reset, rate_limit_reset},
+        forge::github::{core_rate_limit_reset, rate_limit_reset},
         issue_tracker::IssueProvider,
     },
 };
@@ -962,7 +962,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use flotilla_core::{
         event_sink::BroadcastEventSink,
-        providers::{github_api::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner},
+        providers::{forge::github::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner},
     };
     use flotilla_protocol::issue_query::IssueResultPage;
     use flotilla_protocol::issue_query::READY_ISSUE_LABEL;

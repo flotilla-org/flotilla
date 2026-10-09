@@ -1,5 +1,6 @@
 //! #1770: identity and provider lifetimes follow resources, not presentation roots.
 
+use crate::provider_config;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hegel::generators as gs;
@@ -36,7 +37,7 @@ impl Factory for CountingVcsFactory {
     async fn probe(
         &self,
         bag: &EnvironmentBag,
-        config: &ConfigStore,
+        config: &dyn provider_config::ProviderConfigView,
         path: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn crate::vcs::Vcs>, Vec<UnmetRequirement>> {

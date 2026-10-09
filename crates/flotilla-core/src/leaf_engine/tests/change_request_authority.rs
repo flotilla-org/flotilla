@@ -1,4 +1,5 @@
 use super::*;
+use crate::providers::change_request::observation;
 
 #[tokio::test]
 async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path() {
@@ -233,7 +234,7 @@ async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
     let (event_tx, _) = broadcast::channel(16);
     let fixture = fixture_path("change_request", "cr_observation_merge.yaml");
     let session = Session::replaying(fixture, Masks::new());
-    let source = Arc::new(crate::change_request_observer::GhChangeRequestObservationSource::new(test_runner(&session)));
+    let source = Arc::new(observation::GhChangeRequestObservationSource::new(test_runner(&session)));
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
         state: Duration::from_secs(60),
         checks_pending: Duration::from_secs(5),
@@ -419,7 +420,7 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
         Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
         cadence,
     );
-    let subject = crate::change_request_observer::ChangeRequestRef {
+    let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
         scope: "flotilla-org/flotilla".to_string(),
@@ -439,7 +440,7 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
 async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
     let owner = ResourceBackend::InMemory(InMemoryBackend::default());
     let reader = ResourceBackend::InMemory(InMemoryBackend::default());
-    let subject = crate::change_request_observer::ChangeRequestRef {
+    let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
         scope: "flotilla-org/flotilla".to_string(),
@@ -579,7 +580,7 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
     refresher
         .demand(
             keeper_id,
-            crate::change_request_observer::ChangeRequestRef {
+            observation::ChangeRequestRef {
                 namespace: "flotilla".to_string(),
                 service: "github.com".to_string(),
                 scope: "flotilla-org/flotilla".to_string(),
@@ -648,7 +649,7 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
 async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
     let former = ResourceBackend::InMemory(InMemoryBackend::default());
     let takeover = ResourceBackend::InMemory(InMemoryBackend::default());
-    let subject = crate::change_request_observer::ChangeRequestRef {
+    let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
         scope: "flotilla-org/flotilla".to_string(),
@@ -732,7 +733,7 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
 async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
     let owner = ResourceBackend::InMemory(InMemoryBackend::default());
     let reader = ResourceBackend::InMemory(InMemoryBackend::default());
-    let subject = crate::change_request_observer::ChangeRequestRef {
+    let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
         scope: "flotilla-org/flotilla".to_string(),

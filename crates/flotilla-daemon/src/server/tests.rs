@@ -1,3 +1,4 @@
+use flotilla_core::provider_config;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -75,19 +76,19 @@ use super::ACCEPT_ERROR_INITIAL_BACKOFF;
 use super::ACCEPT_ERROR_MAX_BACKOFF;
 use super::CONNECTION_PREFACE_TIMEOUT;
 use super::HELLO_HANDSHAKE_TIMEOUT;
+use crate::peer::ConnectionDirection;
+use crate::peer::ConnectionMeta;
+use crate::startup::test_support::GatedCredentialPreflight;
 use crate::testkits::server::apply_convoy_replica_feed;
 use crate::testkits::server::seed_trusted_remote_convoy_project;
-use crate::{
-    peer::{ConnectionDirection, ConnectionMeta},
-    startup::test_support::GatedCredentialPreflight,
-};
 
 #[tokio::test(start_paused = true)]
 async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
     use flotilla_resources::Resource;
 
     use super::{build_remote_command_router, peer_runtime::PeerRuntime};
-    use crate::peer::{channel_transport::channel_transport_pair_with_nodes, PeerTransport};
+    use crate::peer::channel_transport::channel_transport_pair_with_nodes;
+    use crate::peer::PeerTransport;
 
     // Runtime teardown must release both a live connection loop and the outbound
     // replication supervisor, even while its peer and notification sender live.
@@ -2234,7 +2235,10 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
 
 #[tokio::test]
 async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery() {
-    use flotilla_core::command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason};
+    use flotilla_core::command_target::RemoteDelivery;
+    use flotilla_core::command_target::TargetError;
+    use flotilla_core::command_target::TargetHost;
+    use flotilla_core::command_target::TargetReason;
 
     let (_tmp, daemon) = empty_daemon().await;
     let read = daemon.resolve_command_target(&CommandAction::QueryHostList {}, None).await.expect("resolve read");
@@ -4940,8 +4944,8 @@ impl flotilla_core::providers::discovery::Factory for GatedStartupEnvironmentFac
     }
     async fn probe(
         &self,
-        _env: &flotilla_core::providers::discovery::EnvironmentBag,
-        _config: &ConfigStore,
+        _env: &flotilla_core::discovery_api::EnvironmentBag,
+        _config: &dyn provider_config::ProviderConfigView,
         _root: &flotilla_paths::path_context::ExecutionEnvironmentPath,
         _runner: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<flotilla_core::providers::discovery::UnmetRequirement>> {

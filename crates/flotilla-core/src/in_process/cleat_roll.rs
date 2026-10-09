@@ -161,8 +161,8 @@ mod tests {
 
     use super::*;
     use crate::config::ConfigStore;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::environment::ProvisionedEnvironment;
     use crate::providers::environment::ProvisionedMount;
     use crate::providers::CommandRunner;

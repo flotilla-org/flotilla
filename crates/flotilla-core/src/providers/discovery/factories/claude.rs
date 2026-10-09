@@ -1,18 +1,23 @@
 //! Cloud agent and AI utility factories for Claude-based providers.
 
+use crate::provider_config::ProviderConfigView;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    config::ConfigStore,
-    providers::{
-        ai_utility::{claude_api::ClaudeApiAiUtility, claude_cli::ClaudeCliAiUtility, AiUtility},
-        coding_agent::{claude::ClaudeCodingAgent, CloudAgentService},
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        CommandRunner, ReqwestHttpClient,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::ai_utility::claude_api::ClaudeApiAiUtility;
+use crate::providers::ai_utility::claude_cli::ClaudeCliAiUtility;
+use crate::providers::ai_utility::AiUtility;
+use crate::providers::coding_agent::claude::ClaudeCodingAgent;
+use crate::providers::coding_agent::CloudAgentService;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::CommandRunner;
+use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +38,7 @@ impl Factory for ClaudeCodingAgentFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CloudAgentService>, Vec<UnmetRequirement>> {
@@ -64,7 +69,7 @@ impl Factory for ClaudeApiAiUtilityFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
@@ -95,7 +100,7 @@ impl Factory for ClaudeCliAiUtilityFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
@@ -124,8 +129,8 @@ mod tests {
 
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory, ClaudeCodingAgentFactory};
     use crate::config::ConfigStore;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;

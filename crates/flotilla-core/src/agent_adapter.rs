@@ -11,10 +11,11 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
-use crate::{
-    crew_capabilities::CAPABILITIES_HEADING,
-    providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
-};
+use crate::crew_capabilities::CAPABILITIES_HEADING;
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::terminal::TerminalEnvVars;
+use crate::providers::ChannelLabel;
+use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 mod fleet_canary;
@@ -154,7 +155,7 @@ impl CrewBriefRenderOptions {
     /// The pinned exit declaration is the same signal used by convoy exit
     /// instantiation: an absent declaration keeps the convoy standing.
     fn for_convoy(mut self, convoy: &ResourceObject<Convoy>) -> Self {
-        self.is_standing = convoy.metadata.annotations.contains_key(crate::ops_entry::ENSURED_FROM_ANNOTATION)
+        self.is_standing = convoy.metadata.annotations.contains_key(flotilla_resources::ENSURED_FROM_ANNOTATION)
             || convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| snapshot.exit.is_none());
         self
     }
@@ -1238,9 +1239,9 @@ mod tests {
     use crate::agent_adapter::CrewBriefTemplateResolver;
     use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
     use crate::crew_capabilities::CAPABILITIES_HEADING;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::factories::git::GitVcsFactory;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::providers::ProcessCommandRunner;
     use crate::testkits::replay::testing::MockRunner;
@@ -1403,7 +1404,7 @@ mod tests {
     #[test]
     fn standing_brief_keeps_the_convoy_active_across_tasks() {
         let (mut convoy, _) = convoy_brief_fixture();
-        convoy.metadata.annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
+        convoy.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
         let content = build_convoy_crew_brief_with_options(
             &convoy,
             &TerminalCrewContext {
@@ -1874,7 +1875,7 @@ mod tests {
         assert!(!options.clone().for_convoy(&declared_exit).is_standing);
         declared_exit.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").exit = None;
         assert!(options.clone().for_convoy(&declared_exit).is_standing);
-        declared_exit.metadata.annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
+        declared_exit.metadata.annotations.insert(flotilla_resources::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
         declared_exit.status = None;
         assert!(options.for_convoy(&declared_exit).is_standing);
     }
@@ -2691,10 +2692,9 @@ gpt-6.1-sol · /workspace"
     // must refuse launch rather than silently expose runtime files.
     #[tokio::test]
     async fn runtime_exclusion_handles_existing_patterns_and_refuses_overrides() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         const RUNTIME_PATHS: &[&str] = &[".flotilla/briefs/coder.md", CLAUDE_MANAGED_SETTINGS_PATH];
         for (existing, ignore, overridden, tracks_declarations) in [
             ("previous-pattern", None, false, false),
@@ -2770,10 +2770,9 @@ gpt-6.1-sol · /workspace"
     // exclusion while each repository it holds still proves its own.
     #[tokio::test]
     async fn runtime_exclusion_skips_a_plain_workspace_directory() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         let workspace = tempfile::tempdir().expect("workspace root");
         let runner = Arc::new(ProcessCommandRunner);
         let vcs = FlotillaVcs::new(
@@ -2791,10 +2790,9 @@ gpt-6.1-sol · /workspace"
     // expose runtime files to git add -A. This is the lowest falsifying seam.
     #[tokio::test]
     async fn runtime_exclusion_refuses_discovery_and_write_failures() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         for responses in [
             vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
             vec![Ok("true\n".to_string()), Ok(String::new())],
@@ -2820,10 +2818,9 @@ gpt-6.1-sol · /workspace"
     // any runtime file is written. This example covers the two subprocess edges.
     #[tokio::test]
     async fn preparation_refuses_unavailable_runtime_file_exclusion() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         for responses in [
             vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
             vec![Ok("true\n".to_string()), Ok(String::new())],

@@ -1,24 +1,31 @@
 //! GitHub and Forgejo factories for change request and issue tracker providers.
 
+use crate::provider_config::ProviderConfigView;
+
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_resources::ForgeKind;
 
-use crate::{
-    config::{ConfigStore, FlotillaConfig, ForgejoIssueTrackerConfig},
-    providers::{
-        change_request::{forgejo::ForgejoChangeRequestProvider, github::GitHubChangeRequest, ChangeRequestTracker},
-        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement, FORGEJO_AUTH_PROVIDER},
-        github_api::GhApiClient,
-        issue_tracker::{
-            forgejo::{ForgejoAuth, ForgejoIssueProvider, ForgejoIssueProviderConfig},
-            github::GitHubIssueProvider,
-            IssueProvider,
-        },
-        CommandRunner, ReqwestHttpClient,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::provider_config::ForgejoIssueTrackerConfig;
+use crate::provider_config::ProviderConfig;
+use crate::providers::change_request::forgejo::ForgejoChangeRequestProvider;
+use crate::providers::change_request::github::GitHubChangeRequest;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::discovery::FORGEJO_AUTH_PROVIDER;
+use crate::providers::forge::forgejo::ForgejoAuth;
+use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
+use crate::providers::forge::github::GhApiClient;
+use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
+use crate::providers::issue_tracker::github::GitHubIssueProvider;
+use crate::providers::issue_tracker::IssueProvider;
+use crate::providers::CommandRunner;
+use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
@@ -64,7 +71,7 @@ impl Factory for GitHubChangeRequestFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        config: &ConfigStore,
+        config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
@@ -101,7 +108,7 @@ impl Factory for GitHubIssueProviderFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        config: &ConfigStore,
+        config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
@@ -134,7 +141,7 @@ impl Factory for ForgejoIssueProviderFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        config: &ConfigStore,
+        config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
@@ -165,7 +172,7 @@ impl Factory for ForgejoChangeRequestFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        config: &ConfigStore,
+        config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
@@ -185,12 +192,12 @@ impl Factory for ForgejoChangeRequestFactory {
 
 async fn bounded_forgejo_provider_config(
     env: &EnvironmentBag,
-    config: &ConfigStore,
-    settings: &FlotillaConfig,
+    config: &dyn ProviderConfigView,
+    settings: &ProviderConfig,
 ) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
     let env = env.clone();
     let settings = settings.clone();
-    let config = ConfigStore::with_base(config.base_path().as_path());
+    let config = config.base_path().clone();
     crate::probe::blocking("Forgejo credential", crate::probe::PROBE_TIMEOUT, move || Ok(forgejo_provider_config(&env, &config, &settings)))
         .await
         .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?
@@ -198,8 +205,8 @@ async fn bounded_forgejo_provider_config(
 
 fn forgejo_provider_config(
     env: &EnvironmentBag,
-    config: &ConfigStore,
-    settings: &FlotillaConfig,
+    config: &flotilla_paths::path_context::DaemonHostPath,
+    settings: &ProviderConfig,
 ) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
     let forge = env.find_origin_forge().filter(|forge| forge.kind == ForgeKind::Forgejo);
     let forgejo = settings.issue_tracker.forgejo.clone().unwrap_or_default();
@@ -214,7 +221,11 @@ fn forgejo_provider_config(
     Ok(ForgejoIssueProviderConfig::new(service_url.into(), forgejo.api_base_url, auth))
 }
 
-fn resolve_forgejo_auth(env: &EnvironmentBag, config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<ForgejoAuth, String> {
+fn resolve_forgejo_auth(
+    env: &EnvironmentBag,
+    config: &flotilla_paths::path_context::DaemonHostPath,
+    forgejo: &ForgejoIssueTrackerConfig,
+) -> Result<ForgejoAuth, String> {
     if env.find_origin_forge().is_some_and(|forge| forge.kind == ForgeKind::Forgejo) && env.find_auth_path(FORGEJO_AUTH_PROVIDER).is_none()
     {
         return Err("no explicit daemon credential configured for Forgejo Forge".into());
@@ -233,11 +244,14 @@ fn resolve_forgejo_auth(env: &EnvironmentBag, config: &ConfigStore, forgejo: &Fo
     Ok(ForgejoAuth { token, token_path: path })
 }
 
-fn config_parent(config: &ConfigStore) -> PathBuf {
-    config.base_path().as_path().parent().map(PathBuf::from).unwrap_or_else(|| config.base_path().as_path().to_path_buf())
+fn config_parent(config: &flotilla_paths::path_context::DaemonHostPath) -> PathBuf {
+    config.as_path().parent().map(PathBuf::from).unwrap_or_else(|| config.as_path().to_path_buf())
 }
 
-fn resolve_forgejo_token_path(config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<PathBuf, String> {
+fn resolve_forgejo_token_path(
+    config: &flotilla_paths::path_context::DaemonHostPath,
+    forgejo: &ForgejoIssueTrackerConfig,
+) -> Result<PathBuf, String> {
     let config_parent = config_parent(config);
     if let Some(path) = &forgejo.token_path {
         return Ok(config_path(&config_parent, path));
@@ -287,6 +301,7 @@ fn config_path(config_parent: &std::path::Path, path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider_config::ProviderConfig;
     use std::{collections::BTreeSet, sync::Arc};
 
     use flotilla_protocol::{IssueRef, IssueSource};
@@ -297,9 +312,9 @@ mod tests {
         GitHubChangeRequestFactory, GitHubIssueProviderFactory,
     };
     use crate::config::ConfigStore;
-    use crate::config::ForgejoIssueTrackerConfig;
-    use crate::providers::discovery::EnvironmentAssertion;
-    use crate::providers::discovery::EnvironmentBag;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
+    use crate::provider_config::ForgejoIssueTrackerConfig;
     use crate::providers::discovery::Factory;
     use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;
@@ -530,7 +545,12 @@ mod tests {
             .with(EnvironmentAssertion::origin_forge(forge))
             .with(EnvironmentAssertion::auth_file("forgejo", dir.path().join("lab-forgejo-coder-token")));
 
-        let resolved = forgejo_provider_config(&bag, &config, &config.load_config()).expect("Forgejo config");
+        let resolved = forgejo_provider_config(
+            &bag,
+            config.base_path(),
+            &ProviderConfig { issue_tracker: config.load_config().issue_tracker, ..Default::default() },
+        )
+        .expect("Forgejo config");
         assert_eq!(resolved.service_url, "https://forgejo.lab.flotilla.work");
     }
 
@@ -552,7 +572,7 @@ mod tests {
         let config = ConfigStore::with_base(dir.path().join("flotilla"));
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::auth_file("forgejo", &selected));
 
-        let auth = resolve_forgejo_auth(&bag, &config, &ForgejoIssueTrackerConfig::default()).expect("discovered auth");
+        let auth = resolve_forgejo_auth(&bag, config.base_path(), &ForgejoIssueTrackerConfig::default()).expect("discovered auth");
         assert_eq!(auth.token_path, selected);
         assert_eq!(auth.token, "selected");
     }
@@ -569,7 +589,8 @@ mod tests {
         let bag = EnvironmentBag::new()
             .with(EnvironmentAssertion::auth_file("forgejo", "~/.config/flotilla/credentials/lab-forgejo-daemon.token"));
 
-        let auth = resolve_forgejo_auth(&bag, &config, &ForgejoIssueTrackerConfig::default()).expect("expanded daemon credential");
+        let auth =
+            resolve_forgejo_auth(&bag, config.base_path(), &ForgejoIssueTrackerConfig::default()).expect("expanded daemon credential");
         assert_eq!(auth.token_path, credentials.join("lab-forgejo-daemon.token"));
         assert_eq!(auth.token, "daemon");
     }

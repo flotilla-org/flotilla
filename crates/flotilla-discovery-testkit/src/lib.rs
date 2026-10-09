@@ -4,6 +4,8 @@
 //! responses keyed by `(cmd, args)` and tracks which `cwd` paths and
 //! `exists` calls were made.
 
+use flotilla_core::provider_config::ProviderConfigView;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -21,10 +23,10 @@ use flotilla_protocol::{
 use tokio::sync::Mutex as TokioMutex;
 
 use flotilla_core::providers::discovery::{
-    DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement,
+    DiscoveryRuntime, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement,
 };
 use flotilla_core::{
-    config::ConfigStore,
+    discovery_api::EnvironmentBag,
     providers::{
         change_request::ChangeRequestTracker,
         discovery::EnvVars,
@@ -1024,8 +1026,10 @@ impl ChangeRequestTracker for FakeChangeRequest {
     async fn get_change_request_for_admission(
         &self,
         id: &str,
-    ) -> Result<flotilla_core::providers::change_request::ChangeRequestAdmission, flotilla_core::providers::change_request::ObservationError>
-    {
+    ) -> Result<
+        flotilla_core::providers::change_request::ChangeRequestAdmission,
+        flotilla_core::providers::forge::observation_error::ObservationError,
+    > {
         let (id, change_request) = self.get_change_request(id).await?;
         Ok(flotilla_core::providers::change_request::ChangeRequestAdmission {
             id,
@@ -1091,7 +1095,7 @@ impl Factory for FakeIssueProviderFactory {
     async fn probe(
         &self,
         _env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
@@ -1131,7 +1135,7 @@ impl Factory for FakeVcsFactory {
     async fn probe(
         &self,
         _env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
@@ -1159,7 +1163,7 @@ impl Factory for FakeChangeRequestFactory {
     async fn probe(
         &self,
         _env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
@@ -1188,7 +1192,7 @@ impl Factory for FakeTerminalPoolFactory {
     async fn probe(
         &self,
         _env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
@@ -1249,7 +1253,7 @@ impl Factory for ArcVcsFactory {
     async fn probe(
         &self,
         _env: &EnvironmentBag,
-        _config: &ConfigStore,
+        _config: &dyn ProviderConfigView,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
@@ -1350,7 +1354,8 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
-    use flotilla_core::providers::discovery::{run_host_detectors, EnvironmentAssertion};
+    use flotilla_core::discovery_api::EnvironmentAssertion;
+    use flotilla_core::providers::discovery::run_host_detectors;
 
     #[tokio::test]
     async fn fake_discovery_uses_only_git_host_detector() {

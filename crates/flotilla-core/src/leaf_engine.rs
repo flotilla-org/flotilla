@@ -19,10 +19,10 @@ use tokio::{
 };
 
 use crate::{
-    change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
+    change_request_observer::ChangeRequestRefresher,
     event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
-    providers::change_request::ObservationError,
+    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
 };
 use turn_delivery::UnavailableTurnDeliveryActuator;
 use wake::ReconcilerWake;

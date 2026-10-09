@@ -5,13 +5,13 @@ use super::{
     checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
+use crate::discovery_api::EnvironmentBag;
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::EnvironmentBag;
 use crate::providers::discovery::ProviderCategory;
 use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::environment::ProvisionedMount;
@@ -832,7 +832,7 @@ fn link_request_response(body: &str) -> String {
 }
 
 fn install_link_provider(registry: &mut ProviderRegistry, runner: MockRunner) {
-    use crate::providers::{change_request::github::GitHubChangeRequest, github_api::GhApiClient};
+    use crate::providers::{change_request::github::GitHubChangeRequest, forge::github::GhApiClient};
     let runner: Arc<dyn CommandRunner> = Arc::new(runner);
     let provider = GitHubChangeRequest::new("github".into(), "owner/repo".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
     registry.change_requests.insert("github", desc("github"), Arc::new(provider));

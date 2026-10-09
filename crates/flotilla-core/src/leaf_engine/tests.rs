@@ -1,3 +1,4 @@
+use crate::providers::change_request::observation;
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -32,19 +33,19 @@ use super::stalls::*;
 use super::subscriptions::*;
 use super::wake::*;
 use super::*;
+use crate::change_request_observer::ChangeRequestRefresher;
+use crate::event_sink::broadcast_test_sink;
+use crate::issue_observer::IssueRefreshCadence;
+use crate::issue_observer::IssueRefresher;
+use crate::providers::change_request::observation::ChangeRequestRef;
+use crate::providers::forge::github::GithubRateLimit;
+use crate::providers::forge::github::GithubRateLimitKind;
+use crate::providers::forge::github::GithubRetrySource;
+use crate::providers::forge::observation_error::ObservationError;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::testing::fixture_path;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
-use crate::{
-    change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
-    issue_observer::{IssueRefreshCadence, IssueRefresher},
-    providers::change_request::ObservationError,
-};
-use crate::{
-    event_sink::broadcast_test_sink,
-    providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
-};
 
 #[derive(Clone)]
 struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -66,11 +67,8 @@ fn captured_subscriber(logs: Arc<std::sync::Mutex<Vec<u8>>>, level: tracing::Lev
 struct UnavailableChangeRequests;
 
 #[async_trait]
-impl crate::change_request_observer::ChangeRequestObservationSource for UnavailableChangeRequests {
-    async fn observe(
-        &self,
-        _subject: &crate::change_request_observer::ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+impl observation::ChangeRequestObservationSource for UnavailableChangeRequests {
+    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         Err("unavailable in non-CR leaf contract".into())
     }
 }
@@ -119,11 +117,8 @@ impl TurnDeliveryActuator for RecordingTurnDelivery {
 }
 
 #[async_trait]
-impl crate::change_request_observer::ChangeRequestObservationSource for ControlledChangeRequests {
-    async fn observe(
-        &self,
-        _subject: &crate::change_request_observer::ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+impl observation::ChangeRequestObservationSource for ControlledChangeRequests {
+    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         let observed_at = Utc::now();
         let state = if self.merged.load(Ordering::SeqCst) {
             flotilla_resources::ObservedChangeRequestState::Merged
@@ -147,11 +142,8 @@ impl crate::change_request_observer::ChangeRequestObservationSource for Controll
 }
 
 #[async_trait]
-impl crate::change_request_observer::ChangeRequestObservationSource for CountingChangeRequests {
-    async fn observe(
-        &self,
-        _subject: &crate::change_request_observer::ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+impl observation::ChangeRequestObservationSource for CountingChangeRequests {
+    async fn observe(&self, _subject: &observation::ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let observed_at = Utc::now();
         Ok(flotilla_resources::ChangeRequestStatus {
@@ -419,7 +411,8 @@ async fn observe_actor_source(
 }
 
 async fn observe_claude_hook(backend: &ResourceBackend, wake: &ReconcilerWake, event: &str, now: DateTime<Utc>) {
-    use crate::agents::hooks::{ClaudeCodeParser, HarnessHookParser};
+    use crate::agents::hooks::ClaudeCodeParser;
+    use crate::agents::hooks::HarnessHookParser;
     let parsed = ClaudeCodeParser.parse_event(event, br#"{"session_id":"claude-scenario"}"#).expect("Claude hook");
     let state = match parsed.event_type {
         flotilla_protocol::AgentEventType::Active | flotilla_protocol::AgentEventType::ToolActive => TerminalAttentionState::Working,

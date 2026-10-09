@@ -22,13 +22,13 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::agent_adapter::AgentAdapterRegistry;
 use flotilla_core::aggregator_projection::AggregatorProjectionState;
 use flotilla_core::config::ConfigStore;
+use flotilla_core::discovery_api::EnvironmentAssertion;
+use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::EnvVars;
-use flotilla_core::providers::discovery::EnvironmentAssertion;
-use flotilla_core::providers::discovery::EnvironmentBag;
 use flotilla_core::providers::discovery::ProviderCategory;
 use flotilla_core::providers::discovery::ProviderDescriptor;
 use flotilla_core::providers::environment::CreateOpts;

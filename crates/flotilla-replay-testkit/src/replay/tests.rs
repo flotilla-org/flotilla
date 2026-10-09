@@ -70,7 +70,8 @@ interactions:
     let session = Session::replaying(&path, masks);
     let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-    use flotilla_core::providers::vcs::{git::GitVcs, VcsInspection};
+    use flotilla_core::providers::vcs::git::GitVcs;
+    use flotilla_core::providers::vcs::VcsInspection;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     let git = GitVcs::new(runner);
     let repo = ExecutionEnvironmentPath::new("/test/repo");
@@ -935,7 +936,7 @@ impl GhApi for ClassifiedTestApi {
 fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use flotilla_core::providers::github_api::GithubRetrySource;
+    use flotilla_core::providers::forge::github::GithubRetrySource;
     // Exhaust error variants, both kinds, every retry source and absent/present
     // deadlines in each case; generate timestamps across zero and modern dates,
     // pagination boundaries and counts across the empty/100-item page boundary.
@@ -1018,7 +1019,8 @@ impl CommandRunner for RestFailureRunner {
 fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use flotilla_core::providers::github_api::{GhApiClient, GithubRetrySource};
+    use flotilla_core::providers::forge::github::GhApiClient;
+    use flotilla_core::providers::forge::github::GithubRetrySource;
     // Exhaust ordinary 403/404, primary and secondary 403/429, missing reset,
     // and transport failure each run. Generate reset boundaries and retry delay.
     let reset = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
@@ -1129,7 +1131,7 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
 #[tokio::test]
 async fn classified_issue_budget_recording_has_no_failure_response() {
     use super::testing::MockRunner;
-    use flotilla_core::providers::github_api::GhApiClient;
+    use flotilla_core::providers::forge::github::GhApiClient;
     let reset = chrono::Utc::now().timestamp() + 3600;
     // Substitute the gh subprocess boundary with one successful low-budget response.
     let runner = Arc::new(MockRunner::new(vec![Ok(format!(

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use super::{GitHubIssueProvider, BOARD_BATCH_SIZE};
 
 use crate::providers::{
-    github_api::{rate_limit_reset, GhApiClient},
+    forge::github::{rate_limit_reset, GhApiClient},
     github_poll::BoardState,
     issue_tracker::IssueProvider,
     ChannelLabel, CommandOutput, CommandRunner,
