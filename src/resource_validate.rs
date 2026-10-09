@@ -16,6 +16,7 @@ use flotilla_core::{
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
+#[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_resources::validate_resource_document;
 #[cfg(unix)]
