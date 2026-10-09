@@ -3,14 +3,19 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+mod admission_actions;
 #[path = "attach.rs"]
 mod attach;
 mod checkout_providers;
+mod crew_actions;
+mod executor_actions;
+mod projections_actions;
+
 mod cleat_roll;
 mod crew_ops;
 pub(crate) use crew_ops::convoy_message_address;
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
-use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator};
+use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, MessageAttribution};
 
 #[path = "in_process/convoy_admission.rs"]
 pub mod convoy_admission;
@@ -36,10 +41,8 @@ use attach::AttachResolver;
 pub use attach::ResolvedAttach;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use convoy_admission::{
-    allocate_convoy_generation, convoy_address, convoy_ensure_name, convoy_record_name, discover_repository_change_request_with,
-    normalize_convoy_start_intent, project_not_ready_error, resolve_and_validate_workflow_credentials, resolve_convoy_candidate_indices,
-    validate_convoy_name, ConvoyAddressIdentity, ConvoyAdmission, ConvoyCreateAdmission, ConvoyStartKey, ConvoyStartTask,
-    PlacementResolution, StaticFulfilmentDecider,
+    convoy_address, convoy_ensure_name, discover_repository_change_request_with, project_not_ready_error, resolve_convoy_candidate_indices,
+    ConvoyAddressIdentity, ConvoyAdmission, ConvoyStartTask, PlacementResolution, StaticFulfilmentDecider,
 };
 pub use convoy_admission::{PreparedConvoyAdmission, RoleAddress};
 #[cfg(test)]
@@ -54,30 +57,28 @@ use flotilla_protocol::{
     HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, NodeId, NodeInfo,
     PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
     ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
-    ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceRecordType, ResourceRef, StatusResponse, StreamKey,
-    SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ResolvedAttachPlan, ResourceJsonResponse, ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute,
+    ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
     active_change_request_subjects, api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, capped_github_app_permissions, change_request_address,
-    change_request_address_with_forges, change_request_record_name, current_resource_kind_position,
-    external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas, host_direct_environment_name,
-    list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec,
+    capped_github_app_permissions, change_request_address, change_request_address_with_forges, change_request_record_name,
+    get_resource_kind, get_resource_kind_including_replicas, host_direct_environment_name, normalize_issue_source,
     observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed,
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
     CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
     ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant,
     CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec, DocumentKey, Environment as ResourceEnvironment,
-    EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
-    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
-    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock,
-    TerminalCrewContext, TurnDeliveryRung, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
-    WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    EnvironmentPhase, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
+    LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec, ReadResourceObject, Repository, RepositoryIdentity,
+    RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext, TurnDeliveryRung, VesselRequirement, WatchEvent,
+    WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{
@@ -85,7 +86,6 @@ use flotilla_resources::{
     TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
 };
 use futures::{FutureExt, StreamExt};
-use project_ops::{is_declaration_backed_project, validate_project_name};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -156,11 +156,6 @@ use crate::repository_inspection::GitRepositoryInspector;
 use crate::repository_inspection::RepositoryContinuity;
 use crate::repository_inspection::RepositoryInspection;
 use crate::repository_inspection::RepositoryInspector;
-use crate::resource_explain::resource_read_envelope;
-use crate::resource_explain::resource_record;
-use crate::resource_explain::run_resource_watch_command;
-use crate::resource_explain::ResourceWatchCommandContext;
-use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepBatchRequest;
 use crate::step::RemoteStepExecutor;
 use crate::step::RemoteStepProgressSink;
@@ -5772,19 +5767,6 @@ impl InProcessDaemon {
         result
     }
 
-    async fn execute_action_artifact_reserve_ledger_comment(&self, id: u64, command: &Command) -> Result<u64, String> {
-        let CommandAction::ArtifactReserveLedgerComment { namespace, name, address } = &command.action else {
-            return Err("ledger reservation selected the wrong handler".into());
-        };
-        let identity = self.start_context_free_command(id, command.description().to_string());
-        let result = match flotilla_resources::reserve_ledger_comment_creation(&self.resource_backend, namespace, name, address).await {
-            Ok(granted) => CommandValue::LedgerCommentCreationReserved { granted },
-            Err(error) => CommandValue::Error { message: error.to_string() },
-        };
-        self.finish_context_free_command(id, identity, result);
-        Ok(id)
-    }
-
     pub async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
         self.message_inboxes
             .lock()
@@ -5824,1334 +5806,6 @@ impl InProcessDaemon {
             MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         get_resource_kind(&self.resource_backend, namespace, "Message", &record.metadata.name).await
-    }
-
-    async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            // Artifact reservations and Message admission can race status writers.
-            // Both mutations are replay-safe; retain a bounded conflict budget.
-            let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
-            let applied = retry_resource_apply(kind, || self.apply_intent_document(namespace, document.clone())).await;
-            let result = match applied {
-                Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
-                    kind: applied.kind,
-                    plural: applied.plural,
-                    namespace: applied.namespace,
-                    value: applied.value,
-                    replica_origin: None,
-                })),
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ResourceApply action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_repository_remote_remove(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let repositories = self.resource_backend.clone().using::<Repository>(namespace);
-            let result = match repositories.get(name).await {
-                Ok(repository) => match repository.spec.clone().remove_remote(remote) {
-                    Ok(spec) => match repositories
-                        .update(&InputMeta::from(&repository.metadata), &repository.metadata.resource_version, &spec)
-                        .await
-                    {
-                        Ok(_) => flotilla_protocol::CommandValue::Ok,
-                        Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-                    },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("RepositoryRemoteRemove action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_resource_manifest_resolve(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } =
-            &command.action
-        {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = request_manifest_resolution(&self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
-            self.finish_context_free_command(
-                id,
-                empty_identity,
-                match result {
-                    Ok(root) => CommandValue::ResourceObject(Box::new(root)),
-                    Err(error) => CommandValue::Error { message: error },
-                },
-            );
-            return Ok(id);
-        }
-        Err("ResourceManifestResolve action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
-        let CommandAction::ConvoyEnsureRoll { namespace, name } = &command.action else {
-            return Err("ensure roll selected the wrong handler".into());
-        };
-        let identity = self.start_context_free_command(id, command.description().to_string());
-        let result = match self.roll_convoy_ensure(namespace, name).await {
-            Ok(message) => CommandValue::ResourceReconciled { resource_kind: "ConvoyEnsure".into(), name: name.clone(), message },
-            Err(message) => CommandValue::Error { message },
-        };
-        self.finish_context_free_command(id, identity, result);
-        Ok(id)
-    }
-
-    async fn execute_action_resource_reconcile_now(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.operator_reconciler.read().await.clone() {
-                Some(reconciler) => match reconciler.reconcile_now(namespace, kind, name).await {
-                    Ok(message) => CommandValue::ResourceReconciled { resource_kind: kind.clone(), name: name.clone(), message },
-                    Err(message) => CommandValue::Error { message },
-                },
-                None => CommandValue::Error { message: "operator reconciliation is unavailable before runtime startup".to_string() },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ResourceReconcileNow action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } =
-            &command.action
-        {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let patched = match expected_resource_version {
-                Some(expected) => {
-                    flotilla_resources::patch_resource_status_if_version(
-                        &self.resource_backend,
-                        namespace,
-                        kind,
-                        name,
-                        status.clone(),
-                        expected,
-                    )
-                    .await
-                }
-                None => flotilla_resources::patch_resource_status(&self.resource_backend, namespace, kind, name, status.clone()).await,
-            };
-            let result = match patched {
-                Ok(patched) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
-                    kind: patched.kind,
-                    plural: patched.plural,
-                    namespace: patched.namespace,
-                    value: patched.value,
-                    replica_origin: None,
-                })),
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ResourceStatusPatch action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = if let Some(origin_root) = replica_origin {
-                let deleted = if self.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
-                    Err(ResourceError::invalid(format!(
-                        "replica origin {origin_root} is connected; delete the authoritative resource instead"
-                    )))
-                } else {
-                    flotilla_resources::collect_resource_replica_kind(&self.resource_backend, namespace, kind, name, origin_root).await
-                };
-                match deleted {
-                    Ok(deleted) => flotilla_protocol::CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
-                        kind: deleted.kind,
-                        plural: deleted.plural,
-                        namespace: deleted.namespace,
-                        value: deleted.value,
-                        replica_origin: replica_origin.clone(),
-                    })),
-                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-                }
-            } else {
-                // Serialize deletion and cleanup with adopted checkout writes.
-                let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-                let deleted = async {
-                    let deleted = flotilla_resources::delete_resource_kind(&self.resource_backend, namespace, kind, name).await?;
-                    if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
-                        crate::observed_resources::delete_stale_adopted_checkouts(
-                            &self.resource_backend,
-                            &self.observed_resource_backend,
-                            namespace,
-                        )
-                        .await?;
-                    }
-                    Ok::<_, ResourceError>(deleted)
-                }
-                .await;
-                match deleted {
-                    Ok(deleted) => {
-                        let response = Box::new(ResourceJsonResponse {
-                            kind: deleted.object.kind,
-                            plural: deleted.object.plural,
-                            namespace: deleted.object.namespace,
-                            value: deleted.object.value,
-                            replica_origin: None,
-                        });
-                        if deleted.already_deleted {
-                            flotilla_protocol::CommandValue::ResourceAlreadyDeleted(response)
-                        } else {
-                            flotilla_protocol::CommandValue::ResourceDeleted(response)
-                        }
-                    }
-                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-                }
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ResourceDelete action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_resource_watch(&self, id: u64, command: &Command, command_node_id: &NodeId) -> Result<u64, String> {
-        let command_node_id = command_node_id.clone();
-        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } =
-            command.action.clone()
-        {
-            let repo_identity = empty_repo_identity();
-            let description = format!("watch resource {namespace}/{kind}");
-            let token = CancellationToken::new();
-            {
-                let mut guard = self.active_commands.lock().await;
-                guard.insert(id, token.clone());
-            }
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: command_node_id.clone(),
-                repo_identity: repo_identity.clone(),
-                repo: None,
-                description,
-            });
-
-            let (backend, kind) = match kind.strip_prefix("observed/") {
-                Some(kind) => (self.observed_resource_backend.clone(), kind.to_string()),
-                None => (self.resource_backend.clone(), kind),
-            };
-            let event_sink = self.event_sink.clone();
-            let active_ref = Arc::clone(&self.active_commands);
-            tokio::spawn(async move {
-                let result = run_resource_watch_command(
-                    ResourceWatchCommandContext::builder()
-                        .backend(backend)
-                        .namespace(namespace)
-                        .kind(kind)
-                        .maybe_name(name)
-                        .include_replicas(include_replicas)
-                        .replica_sources(replica_sources)
-                        .maybe_cursor(cursor)
-                        .command_id(id)
-                        .node_id(command_node_id.clone())
-                        .repo_identity(repo_identity.clone())
-                        .event_sink(event_sink.clone())
-                        .token(token)
-                        .build(),
-                )
-                .await;
-                active_ref.lock().await.remove(&id);
-                event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: command_node_id,
-                    repo_identity,
-                    repo: None,
-                    result,
-                });
-            });
-            return Ok(id);
-        }
-        Err("ResourceWatch action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_refresh_all(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if matches!(command.action, flotilla_protocol::CommandAction::Refresh { repo: None }) {
-            let repositories = self
-                .resource_backend
-                .including_replicas::<Repository>(&self.provisioning_namespace().await)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items;
-            let repo_identity = empty_repo_identity();
-            let description = command.description().to_string();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: repo_identity.clone(),
-                repo: None,
-                description,
-            });
-            let mut refreshed = Vec::new();
-            let mut identity_changes = Vec::new();
-            let result = match async {
-                for repository in &repositories {
-                    let key = repository.object.spec.key();
-                    if let Some(change) = self.refresh(&flotilla_protocol::RepoSelector::Repository(key.clone())).await? {
-                        identity_changes.push(change);
-                    }
-                    if let Some(path) = self.local_checkout_for_repository(&key).await? {
-                        refreshed.push(path);
-                    }
-                }
-                Ok::<(), String>(())
-            }
-            .await
-            {
-                Ok(()) => {
-                    flotilla_protocol::CommandValue::Refreshed { repos: refreshed, repository_count: repositories.len(), identity_changes }
-                }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("Refresh action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match Box::pin(self.crew_ops.handoff_with_carries(context, target, message, carries.clone())).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("CrewHandoff action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_resume(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-        dispatching_principal_ref: &Option<PrincipalRef>,
-    ) -> Result<u64, String> {
-        let caller = caller.clone();
-        let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => {
-                    match Box::pin(self.crew_ops.convoy_resume_with_sender_internal(
-                        &namespace,
-                        &record_name,
-                        prompt,
-                        vessel.as_deref(),
-                        role.as_deref(),
-                        crew_ops::MessageAttribution::operator(dispatching_principal_ref.as_ref()),
-                    ))
-                    .await
-                    {
-                        Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
-                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
-                                .await;
-                            flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
-                        }
-                        Ok(ConvoyResumeOutcome::Queued { displaced }) => {
-                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
-                                .await;
-                            flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced }
-                        }
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                    }
-                }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ConvoyResume action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_withdraw_pending_brief(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => match self.convoy_withdraw_pending_brief_internal(&namespace, &record_name).await {
-                    Ok(withdrawn) => flotilla_protocol::CommandValue::ConvoyBriefWithdrawn { withdrawn },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ConvoyWithdrawPendingBrief action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_crew_complete(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-        dispatching_principal_ref: &Option<PrincipalRef>,
-    ) -> Result<u64, String> {
-        let caller = caller.clone();
-        let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } =
-            &command.action
-        {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let routing = Box::pin(self.resolve_crew_routing_context(context)).await.ok();
-            let result = match self
-                .crew_complete_as_principal_internal(
-                    context,
-                    message.clone(),
-                    disposition.clone(),
-                    decision_ledger_ref.clone(),
-                    *force,
-                    dispatching_principal_ref.clone(),
-                )
-                .await
-            {
-                Ok(value) => {
-                    if let Some(resolved) = routing {
-                        let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
-                        self.record_lifecycle_mutation_best_effort(namespace, &resolved.convoy, "crew_complete", caller.as_ref(), false)
-                            .await;
-                    }
-                    value
-                }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("CrewComplete action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_crew_fail(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-    ) -> Result<u64, String> {
-        let caller = caller.clone();
-        if let flotilla_protocol::CommandAction::CrewFail { context, message, force } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let operator =
-                caller.as_ref().filter(|caller| caller.crew.is_none() && context.crew_id.is_none()).map(|caller| &caller.principal_ref);
-            let result = match self.crew_fail_internal(context, message.clone(), *force, operator).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("CrewFail action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_crew_stall(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::CrewStall { context, reason, proposed_disposition, message } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.crew_stall_internal(context, *reason, *proposed_disposition, message.clone()).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("CrewStall action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_crew_supervise(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-        dispatching_principal_ref: &Option<PrincipalRef>,
-    ) -> Result<u64, String> {
-        let caller = caller.clone();
-        let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, vessel, role, operation, message, actor_crew_id } =
-            &command.action
-        {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, convoy).await {
-                Ok(name) => match self
-                    .crew_supervise_internal(
-                        CrewSupervisionRequest::builder()
-                            .namespace(&namespace)
-                            .convoy_name(&name)
-                            .vessel(vessel)
-                            .role(role)
-                            .operation(*operation)
-                            .message(message)
-                            .maybe_actor_crew_id(actor_crew_id.as_deref())
-                            .maybe_principal(dispatching_principal_ref.as_ref())
-                            .build(),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        self.record_lifecycle_mutation_best_effort(
-                            &namespace,
-                            &name,
-                            &format!("crew_supervise_{operation:?}"),
-                            caller.as_ref(),
-                            false,
-                        )
-                        .await;
-                        flotilla_protocol::CommandValue::Ok
-                    }
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("CrewSupervise action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_link(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = match namespace {
-                Some(namespace) => namespace.clone(),
-                None => self.provisioning_namespace().await,
-            };
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => self.link_convoy_subject(&namespace, &record_name, reference, Some(*relationship)).await,
-                Err(error) => Err(error),
-            };
-            self.finish_context_free_command(
-                id,
-                empty_identity,
-                result.map_or_else(|message| flotilla_protocol::CommandValue::Error { message }, |()| flotilla_protocol::CommandValue::Ok),
-            );
-            return Ok(id);
-        }
-        Err("ConvoyLink action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_unlink(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, reference } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = match namespace {
-                Some(namespace) => namespace.clone(),
-                None => self.provisioning_namespace().await,
-            };
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => self.link_convoy_subject(&namespace, &record_name, reference, None).await,
-                Err(error) => Err(error),
-            };
-            self.finish_context_free_command(
-                id,
-                empty_identity,
-                result.map_or_else(|message| flotilla_protocol::CommandValue::Error { message }, |()| flotilla_protocol::CommandValue::Ok),
-            );
-            return Ok(id);
-        }
-        Err("ConvoyUnlink action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_delete(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-    ) -> Result<u64, String> {
-        let caller = caller.clone();
-        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = match namespace {
-                Some(namespace) => namespace.clone(),
-                None => self.provisioning_namespace().await,
-            };
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => match self.reap_convoy_internal(&namespace, &record_name, *force).await {
-                    Ok(()) => {
-                        // Finalizers retain an explainable convoy after delete; a fully
-                        // removed convoy has no remaining status to annotate.
-                        self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_delete", caller.as_ref(), true).await;
-                        flotilla_protocol::CommandValue::Ok
-                    }
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ConvoyDelete action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_abandon(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-        dispatching_principal_ref: &Option<PrincipalRef>,
-    ) -> Result<u64, String> {
-        let caller = caller.clone();
-        let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, reason } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = match namespace {
-                Some(namespace) => namespace.clone(),
-                None => self.provisioning_namespace().await,
-            };
-            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => {
-                    match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
-                        Ok(archives) => {
-                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_abandon", caller.as_ref(), false)
-                                .await;
-                            flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives }
-                        }
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                    }
-                }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ConvoyAbandon action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_work_force_complete(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = self.provisioning_namespace().await;
-            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let record_name = match resolve_local_convoy_name(&self.resource_backend, &namespace, convoy).await {
-                Ok(record_name) => record_name,
-                Err(message) => {
-                    self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error { message });
-                    return Ok(id);
-                }
-            };
-            let check_work_is_completable = |current: &ResourceObject<ResourceConvoy>| match current.status.as_ref() {
-                None => Err(ResourceError::other(format!("convoy {convoy} has no status"))),
-                Some(status) => match status.work.get(work) {
-                    None => Err(ResourceError::other(format!("convoy {convoy} does not contain work {work}"))),
-                    Some(state)
-                        if matches!(
-                            state.phase,
-                            flotilla_resources::WorkPhase::Failed
-                                | flotilla_resources::WorkPhase::Cancelled
-                                | flotilla_resources::WorkPhase::Abandoned
-                        ) =>
-                    {
-                        Err(ResourceError::other(format!("convoy {convoy} work {work} is already terminal")))
-                    }
-                    Some(_) => Ok(()),
-                },
-            };
-            let result = match apply_resource_status_patch_checked(
-                &convoys,
-                &record_name,
-                &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
-                check_work_is_completable,
-            )
-            .await
-            {
-                Ok(_) => flotilla_protocol::CommandValue::Ok,
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-            };
-            self.finish_context_free_command(id, empty_identity, result);
-            return Ok(id);
-        }
-        Err("ConvoyWorkForceComplete action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_start(
-        &self,
-        id: u64,
-        command: &Command,
-        dispatching_principal_ref: &Option<PrincipalRef>,
-    ) -> Result<u64, String> {
-        let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
-            let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let acting_namespace = self.provisioning_namespace().await;
-            let default_namespace = intent.namespace.clone().unwrap_or_else(|| acting_namespace.clone());
-            let (namespace, intent) = match normalize_convoy_start_intent(&default_namespace, intent) {
-                Ok(resolved) => resolved,
-                Err(message) => {
-                    self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error { message });
-                    return Ok(id);
-                }
-            };
-            let dispatching_principal_ref =
-                dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&acting_namespace));
-            let key = ConvoyStartKey::new(namespace, &intent);
-            if !self.convoy_admission.mark_pending(key.clone()).await {
-                self.finish_context_free_command(
-                    id,
-                    empty_identity,
-                    flotilla_protocol::CommandValue::Error {
-                        message: format!("convoy start for project {} is already in progress", intent.project_ref),
-                    },
-                );
-                return Ok(id);
-            }
-            let task = ConvoyStartTask::builder()
-                .command_id(id)
-                .intent(intent)
-                .key(key.clone())
-                .dispatching_principal_ref(dispatching_principal_ref)
-                .build();
-            if let Some(daemon) = self.self_weak.upgrade() {
-                tokio::spawn(async move {
-                    daemon.supervise_convoy_start(task).await;
-                });
-            } else {
-                self.convoy_admission.clear_pending(&key).await;
-                self.finish_context_free_command(
-                    id,
-                    empty_identity,
-                    flotilla_protocol::CommandValue::Error { message: "convoy start worker is unavailable".to_string() },
-                );
-            }
-            return Ok(id);
-        }
-        Err("ConvoyStart action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_convoy_create(
-        &self,
-        id: u64,
-        command: &Command,
-        dispatching_principal_ref: &Option<PrincipalRef>,
-    ) -> Result<u64, String> {
-        let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyCreate {
-            name,
-            workflow_ref,
-            inputs,
-            repository_url,
-            r#ref,
-            project_ref,
-            placement_policy,
-            adopted_checkout,
-        } = &command.action
-        {
-            let empty_identity = empty_repo_identity();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let namespace = self.provisioning_namespace().await;
-            let role = name.clone();
-            let project_identity = project_ref.as_deref();
-            if let Err(message) = validate_convoy_name(&role) {
-                let result = flotilla_protocol::CommandValue::Error { message };
-                self.event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
-                return Ok(id);
-            }
-            if let Err(message) = self.check_local_free_space_floor().await {
-                let result = flotilla_protocol::CommandValue::Error { message };
-                self.event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
-                return Ok(id);
-            }
-            // Use the admission transaction before checking identity or writing
-            // adopted checkout resources. A duplicate must have no side effects.
-            let admission_guard = self.convoy_admission.lock().await;
-            if let Err(message) = allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
-                let result = flotilla_protocol::CommandValue::Error { message };
-                self.event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
-                return Ok(id);
-            }
-            let record_name = convoy_record_name();
-            let name = &record_name;
-            let mut workflow = match self
-                .resource_backend
-                .clone()
-                .including_replicas::<WorkflowTemplate>(&namespace)
-                .get(workflow_ref)
-                .await
-                .map(|source| source.object)
-                .map_err(|error| format!("workflow template {workflow_ref}: {error}"))
-            {
-                Ok(workflow) => workflow,
-                Err(message) => {
-                    self.event_sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
-                    });
-                    return Ok(id);
-                }
-            };
-            let project_repositories = if let Some(project_ref) = project_ref {
-                match self.snapshot_project_repositories(&namespace, project_ref, None).await {
-                    Ok(repositories) => Some(repositories),
-                    Err(message) => {
-                        self.event_sink.emit(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
-                        });
-                        return Ok(id);
-                    }
-                }
-            } else {
-                None
-            };
-            if project_repositories.is_some() && repository_url.is_some() {
-                let message = "convoy repository selection is not allowed when a project is supplied".to_string();
-                self.event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
-                });
-                return Ok(id);
-            }
-            let mut direct_repository_url = repository_url.clone();
-            let mut r#ref = r#ref.clone();
-            let adopted_checkout = match adopted_checkout {
-                Some(path) => {
-                    let adopted_result = async {
-                        let inspection =
-                            self.inspect_adopted_checkout(path.as_ref(), direct_repository_url.as_deref(), r#ref.as_deref()).await?;
-                        let repo_ref = inspection.spec.key();
-                        let transport_url = inspection
-                            .transport_url
-                            .as_deref()
-                            .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
-                        let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
-                        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-                        let (checkout_ref, inferred_repository_url, inferred_ref) = create_adopted_checkout_resource(
-                            &self.resource_backend,
-                            &self.observed_resource_backend,
-                            AdoptedCheckoutRequest::builder()
-                                .namespace(&namespace)
-                                .convoy_name(name)
-                                .checkout_path(&inspection.checkout.path)
-                                .repository_spec(&inspection.spec)
-                                .repository_url(transport_url)
-                                .git_ref(git_ref)
-                                .host_ref(&inspection.checkout.host_ref)
-                                .build(),
-                        )
-                        .await?;
-                        Ok::<_, String>((repo_ref, checkout_ref, inferred_repository_url, inferred_ref))
-                    }
-                    .await;
-                    match adopted_result {
-                        Ok((repo_ref, checkout_ref, inferred_repository_url, inferred_ref)) => {
-                            if project_repositories.is_none() {
-                                direct_repository_url.get_or_insert(inferred_repository_url);
-                            }
-                            r#ref.get_or_insert(inferred_ref);
-                            Some((repo_ref, checkout_ref))
-                        }
-                        Err(message) => {
-                            let result = flotilla_protocol::CommandValue::Error { message };
-                            self.event_sink.emit(DaemonEvent::CommandFinished {
-                                command_id: id,
-                                node_id: self.node_id.clone(),
-                                repo_identity: empty_identity,
-                                repo: None,
-                                result,
-                            });
-                            return Ok(id);
-                        }
-                    }
-                }
-                None => None,
-            };
-            let repositories = if let Some(repositories) = project_repositories {
-                repositories
-            } else if let Some(url) = direct_repository_url {
-                let resolved = async {
-                    let repository_spec = self.resolve_repository_remote(&url).await?;
-                    let canonical_url = self.project_service().repository_transport_url(&namespace, &repository_spec).await?;
-                    let repo_ref = repository_spec.key();
-                    let repository = flotilla_resources::ensure_repository(
-                        &self.resource_backend.clone().using::<Repository>(&namespace),
-                        &repo_ref,
-                        &repository_spec,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                    let default_ref = repository
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.default_branch.clone())
-                        .or_else(|| if adopted_checkout.is_some() { r#ref.clone() } else { None })
-                        .ok_or_else(|| format!("repository {repo_ref} has no resolved default branch"))?;
-                    let workspace_slug = flotilla_resources::repository_workspace_slugs([(&repo_ref, &repository_spec)])
-                        .remove(&repo_ref)
-                        .expect("repository slug should resolve");
-                    Ok::<_, String>(vec![ConvoyRepositorySpec {
-                        url: canonical_url,
-                        repo_ref,
-                        source_ref: default_ref.clone(),
-                        target_ref: default_ref,
-                        workspace_slug,
-                        subpaths: Vec::new(),
-                    }])
-                }
-                .await;
-                match resolved {
-                    Ok(repositories) => repositories,
-                    Err(message) => {
-                        self.event_sink.emit(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
-                        });
-                        return Ok(id);
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            let adopted_checkout_ref_to_cleanup = adopted_checkout.as_ref().map(|(_, checkout_ref)| checkout_ref.clone());
-            let mut adopted_checkout_refs = BTreeMap::new();
-            if let Some((repo_ref, checkout_ref)) = adopted_checkout {
-                if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
-                    let message =
-                        format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
-                    self.event_sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
-                    });
-                    return Ok(id);
-                }
-                adopted_checkout_refs.insert(repo_ref, checkout_ref);
-            }
-            let placement = match self
-                .resolve_convoy_placement(
-                    &namespace,
-                    project_ref.as_deref(),
-                    &repositories,
-                    &workflow.spec,
-                    placement_policy.as_deref(),
-                    false,
-                )
-                .await
-            {
-                Ok(placement) => placement,
-                Err(message) => {
-                    self.event_sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
-                    });
-                    return Ok(id);
-                }
-            };
-            let credential_result = resolve_and_validate_workflow_credentials(
-                &self.resource_backend,
-                &namespace,
-                project_ref.as_deref(),
-                &repositories,
-                placement.selected.as_ref(),
-                &mut workflow.spec,
-            )
-            .await;
-            if let Err(message) = credential_result {
-                self.event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
-                });
-                return Ok(id);
-            }
-            let placement_decision = match placement.selected.as_ref() {
-                Some(selected) => match placement_target_host(&self.resource_backend, &namespace, selected).await {
-                    Ok(target_host) => Some(PlacementDecision {
-                        minimal_alternatives: Vec::new(),
-                        escalation_reason: None,
-                        policy_name: selected.metadata.name.clone(),
-                        target_host,
-                        refused_candidates: placement.refused_candidates.clone(),
-                        viable_not_selected: placement.viable_not_selected.clone(),
-                        allocation: placement.allocation.clone(),
-                    }),
-                    Err(message) => {
-                        self.event_sink.emit(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
-                        });
-                        return Ok(id);
-                    }
-                },
-                None => None,
-            };
-            if let Err(message) = self.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
-                self.event_sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
-                });
-                return Ok(id);
-            }
-            let result = self
-                .convoy_admission
-                .admit_created_convoy(
-                    ConvoyCreateAdmission::builder()
-                        .namespace(&namespace)
-                        .name(name)
-                        .role(&role)
-                        .workflow_ref(workflow_ref)
-                        .workflow(&workflow.spec)
-                        .placement(placement)
-                        .maybe_placement_decision(placement_decision)
-                        .inputs(inputs)
-                        .repositories(repositories)
-                        .maybe_source_ref(r#ref)
-                        .maybe_project_ref(project_ref.clone())
-                        .adopted_checkout_refs(adopted_checkout_refs)
-                        .maybe_adopted_checkout_ref_to_cleanup(adopted_checkout_ref_to_cleanup)
-                        .maybe_dispatching_principal_ref(dispatching_principal_ref)
-                        .build(),
-                    admission_guard,
-                )
-                .await;
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("ConvoyCreate action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_workflow_template_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
-            let empty_identity = empty_repo_identity();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let namespace = self.provisioning_namespace().await;
-            let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
-            let result = match parse_and_validate_workflow_template_yaml(spec_yaml) {
-                Ok(spec) => {
-                    let meta = InputMeta::builder().name(name.clone()).build();
-                    let outcome = match templates.get(name).await {
-                        Ok(existing) => templates.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
-                        Err(ResourceError::NotFound { .. }) => templates.create(&meta, &spec).await.map(|_| ()),
-                        Err(err) => Err(err),
-                    };
-                    match outcome {
-                        Ok(()) => flotilla_protocol::CommandValue::WorkflowTemplateApplied { name: name.clone() },
-                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-                    }
-                }
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("WorkflowTemplateApply action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_project_add(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
-            let empty_identity = empty_repo_identity();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let result = match self.project_add(target, name.as_deref(), display_name.as_deref(), remote.as_deref()).await {
-                Ok(name) => flotilla_protocol::CommandValue::ProjectAdded { name },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("ProjectAdd action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_project_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectApply { name, spec_yaml } = &command.action {
-            let empty_identity = empty_repo_identity();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let namespace = self.provisioning_namespace().await;
-            let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
-            let result = match validate_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
-                Ok(spec) => match normalize_project_spec(spec) {
-                    Ok(spec) => {
-                        let outcome = match projects.get(name).await {
-                            Ok(existing) if is_declaration_backed_project(&existing) => {
-                                Err(format!("project {name} is managed by a declaration; use project refresh to update it"))
-                            }
-                            Ok(existing) => projects
-                                .apply_as(
-                                    &WriterIdentity::operator().with_source("project-apply"),
-                                    &InputMeta::from(&existing.metadata),
-                                    &spec,
-                                )
-                                .await
-                                .map(|_| ())
-                                .map_err(|error| error.to_string()),
-                            Err(ResourceError::NotFound { .. }) => projects
-                                .apply_as(
-                                    &WriterIdentity::operator().with_source("project-apply"),
-                                    &InputMeta::builder().name(name.clone()).build(),
-                                    &spec,
-                                )
-                                .await
-                                .map(|_| ())
-                                .map_err(|error| error.to_string()),
-                            Err(error) => Err(error.to_string()),
-                        };
-                        match outcome {
-                            Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
-                            Err(message) => flotilla_protocol::CommandValue::Error { message },
-                        }
-                    }
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("ProjectApply action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_project_register(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectRegister { target } = &command.action {
-            let empty_identity = empty_repo_identity();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let result = match self.project_register(target).await {
-                Ok((name, members)) => CommandValue::ProjectRegistered { name, members },
-                Err(message) => CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("ProjectRegister action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_project_refresh(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectRefresh { name } = &command.action {
-            let empty_identity = empty_repo_identity();
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let result = match self.project_refresh(name).await {
-                Ok((members, converged, changes, operational_entries)) => {
-                    CommandValue::ProjectRefreshed { name: name.clone(), members, converged, changes, operational_entries }
-                }
-                Err(message) => CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("ProjectRefresh action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_track_repo_path(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::TrackRepoPath { path } = &command.action {
-            let description = command.description().to_string();
-            let repo_path = path.clone();
-            let repo_identity = self.detect_repo_identity(path).await;
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: repo_identity.clone(),
-                repo: Some(repo_path.clone()),
-                description,
-            });
-            let result = match self.add_repo(path).await {
-                Ok(outcome) => flotilla_protocol::CommandValue::RepoTracked {
-                    path: outcome.tracked_path,
-                    resolved_from: outcome.resolved_from,
-                    identity_change: outcome.identity_change,
-                },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
-                repo: Some(repo_path),
-                result,
-            });
-            return Ok(id);
-        }
-        Err("TrackRepoPath action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_untrack_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
-            let repo_path = match self.resolve_repo_selector(repo).await {
-                Ok(path) => path,
-                Err(tracked_error) => self.resolve_observation_root_selector(repo).map_err(|_| tracked_error)?,
-            };
-            let description = command.description().to_string();
-            let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: repo_identity.clone(),
-                repo: Some(repo_path.clone()),
-                description,
-            });
-            let result = match self.remove_repo(&repo_path).await {
-                Ok(()) => flotilla_protocol::CommandValue::RepoUntracked { path: repo_path.clone() },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity,
-                repo: Some(repo_path),
-                result,
-            });
-            return Ok(id);
-        }
-        Err("UntrackRepo action selected the wrong handler".to_string())
-    }
-
-    async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } = &command.action {
-            let repository = self.repository_for_selector(selector).await?;
-            let repo_path = self.local_checkout_for_repository(&repository.spec.key()).await?;
-            let description = command.description().to_string();
-            let repo_identity = repository_operations::repository_event_identity(&repository.spec, repo_path.as_deref());
-            self.event_sink.emit(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: repo_identity.clone(),
-                repo: repo_path.clone(),
-                description,
-            });
-            let result = match self.refresh(selector).await {
-                Ok(identity_change) => flotilla_protocol::CommandValue::Refreshed {
-                    repository_count: 1,
-                    repos: repo_path.clone().into_iter().collect(),
-                    identity_changes: identity_change.into_iter().collect(),
-                },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
-            };
-            self.event_sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity,
-                repo: repo_path,
-                result,
-            });
-            return Ok(id);
-        }
-        Err("Refresh action selected the wrong handler".to_string())
     }
 
     // This executor has many async arms. Box substantial nested futures below
@@ -7222,220 +5876,108 @@ impl InProcessDaemon {
             };
         }
 
-        if let CommandAction::FleetPostInstall { cleat_bin, generation, diagnostics_dir } = &command.action {
-            let identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.post_install_cleat(cleat_bin, generation, diagnostics_dir).await {
-                Ok(report) => CommandValue::FleetPostInstall {
-                    failed: report.failed(),
-                    report: serde_json::to_value(report).map_err(|error| error.to_string())?,
-                },
-                Err(message) => CommandValue::Error { message },
-            };
-            self.finish_context_free_command(id, identity, result);
-            return Ok(id);
-        }
-
+        let admission = admission_actions::AdmissionActions { port: self };
+        let crew = crew_actions::CrewActions { port: self };
+        let projections = projections_actions::ProjectionsActions { port: self };
+        let executor = executor_actions::ExecutorActions { port: self };
         match &command.action {
             CommandAction::ArtifactReserveLedgerComment { .. } => {
-                return boxed_action!(self.execute_action_artifact_reserve_ledger_comment(id, &command))
+                return boxed_action!(crew.execute_action_artifact_reserve_ledger_comment(id, &command))
             }
             flotilla_protocol::CommandAction::ResourceApply { .. } => {
-                return boxed_action!(self.execute_action_resource_apply(id, &command))
+                return boxed_action!(executor.execute_action_resource_apply(id, &command))
             }
             flotilla_protocol::CommandAction::RepositoryRemoteRemove { .. } => {
-                return boxed_action!(self.execute_action_repository_remote_remove(id, &command))
+                return boxed_action!(executor.execute_action_repository_remote_remove(id, &command))
             }
             flotilla_protocol::CommandAction::ResourceManifestResolve { .. } => {
-                return boxed_action!(self.execute_action_resource_manifest_resolve(id, &command))
+                return boxed_action!(executor.execute_action_resource_manifest_resolve(id, &command))
             }
             flotilla_protocol::CommandAction::ConvoyEnsureRoll { .. } => {
-                return boxed_action!(self.execute_action_ensure_roll(id, &command))
+                return boxed_action!(admission.execute_action_ensure_roll(id, &command))
             }
             flotilla_protocol::CommandAction::ResourceReconcileNow { .. } => {
-                return boxed_action!(self.execute_action_resource_reconcile_now(id, &command))
+                return boxed_action!(executor.execute_action_resource_reconcile_now(id, &command))
             }
-            flotilla_protocol::CommandAction::MessageFailBatch { namespace, name, reason } => {
-                let empty_identity = self.start_context_free_command(id, command.description().to_string());
-                let result = match self.message_inbox(namespace).await.fail_batch(name, reason, self.clock.now()).await {
-                    Ok(()) => CommandValue::Ok,
-                    Err(error) => CommandValue::Error { message: error.to_string() },
-                };
-                self.finish_context_free_command(id, empty_identity, result);
-                return Ok(id);
-            }
+            CommandAction::MessageFailBatch { .. } => return boxed_action!(crew.execute_action_message_fail_batch(id, &command)),
+            CommandAction::FleetPostInstall { .. } => return boxed_action!(executor.execute_action_fleet_post_install(id, &command)),
             flotilla_protocol::CommandAction::ResourceStatusPatch { .. } => {
-                return boxed_action!(self.execute_action_resource_status_patch(id, &command))
+                return boxed_action!(executor.execute_action_resource_status_patch(id, &command))
             }
             flotilla_protocol::CommandAction::ResourceDelete { .. } => {
-                return boxed_action!(self.execute_action_resource_delete(id, &command))
+                return boxed_action!(executor.execute_action_resource_delete(id, &command))
             }
             flotilla_protocol::CommandAction::ResourceWatch { .. } => {
-                return boxed_action!(self.execute_action_resource_watch(id, &command, &command_node_id))
+                return boxed_action!(projections.execute_action_resource_watch(id, &command, &command_node_id))
             }
-            flotilla_protocol::CommandAction::Refresh { repo: None } => return boxed_action!(self.execute_action_refresh_all(id, &command)),
-            flotilla_protocol::CommandAction::CrewHandoff { .. } => return boxed_action!(self.execute_action_crew_handoff(id, &command)),
+            flotilla_protocol::CommandAction::Refresh { repo: None } => {
+                return boxed_action!(executor.execute_action_refresh_all(id, &command))
+            }
+            flotilla_protocol::CommandAction::CrewHandoff { .. } => return boxed_action!(crew.execute_action_crew_handoff(id, &command)),
             flotilla_protocol::CommandAction::ConvoyResume { .. } => {
-                return boxed_action!(self.execute_action_convoy_resume(id, &command, &caller, &dispatching_principal_ref))
+                return boxed_action!(crew.execute_action_convoy_resume(id, &command, &caller, &dispatching_principal_ref))
             }
             flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { .. } => {
-                return boxed_action!(self.execute_action_convoy_withdraw_pending_brief(id, &command))
+                return boxed_action!(crew.execute_action_convoy_withdraw_pending_brief(id, &command))
             }
             flotilla_protocol::CommandAction::CrewComplete { .. } => {
-                return boxed_action!(self.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref))
+                return boxed_action!(crew.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::CrewFail { .. } => return boxed_action!(self.execute_action_crew_fail(id, &command, &caller)),
-            flotilla_protocol::CommandAction::CrewStall { .. } => return boxed_action!(self.execute_action_crew_stall(id, &command)),
+            flotilla_protocol::CommandAction::CrewFail { .. } => return boxed_action!(crew.execute_action_crew_fail(id, &command, &caller)),
+            flotilla_protocol::CommandAction::CrewStall { .. } => return boxed_action!(crew.execute_action_crew_stall(id, &command)),
             flotilla_protocol::CommandAction::CrewSupervise { .. } => {
-                return boxed_action!(self.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref))
+                return boxed_action!(crew.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::ConvoyLink { .. } => return boxed_action!(self.execute_action_convoy_link(id, &command)),
-            flotilla_protocol::CommandAction::ConvoyUnlink { .. } => return boxed_action!(self.execute_action_convoy_unlink(id, &command)),
+            flotilla_protocol::CommandAction::ConvoyLink { .. } => return boxed_action!(crew.execute_action_convoy_link(id, &command)),
+            flotilla_protocol::CommandAction::ConvoyUnlink { .. } => return boxed_action!(crew.execute_action_convoy_unlink(id, &command)),
             flotilla_protocol::CommandAction::ConvoyDelete { .. } => {
-                return boxed_action!(self.execute_action_convoy_delete(id, &command, &caller))
+                return boxed_action!(crew.execute_action_convoy_delete(id, &command, &caller))
             }
             flotilla_protocol::CommandAction::ConvoyAbandon { .. } => {
-                return boxed_action!(self.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
+                return boxed_action!(crew.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
             }
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { .. } => {
-                return boxed_action!(self.execute_action_convoy_work_force_complete(id, &command))
+                return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command))
             }
             flotilla_protocol::CommandAction::ConvoyStart { .. } => {
-                return boxed_action!(self.execute_action_convoy_start(id, &command, &dispatching_principal_ref))
+                return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))
             }
             flotilla_protocol::CommandAction::ConvoyCreate { .. } => {
-                return boxed_action!(self.execute_action_convoy_create(id, &command, &dispatching_principal_ref))
+                return boxed_action!(admission.execute_action_convoy_create(id, &command, &dispatching_principal_ref))
             }
             flotilla_protocol::CommandAction::WorkflowTemplateApply { .. } => {
-                return boxed_action!(self.execute_action_workflow_template_apply(id, &command))
+                return boxed_action!(admission.execute_action_workflow_template_apply(id, &command))
             }
-            flotilla_protocol::CommandAction::ProjectAdd { .. } => return boxed_action!(self.execute_action_project_add(id, &command)),
-            flotilla_protocol::CommandAction::ProjectApply { .. } => return boxed_action!(self.execute_action_project_apply(id, &command)),
+            flotilla_protocol::CommandAction::ProjectAdd { .. } => return boxed_action!(admission.execute_action_project_add(id, &command)),
+            flotilla_protocol::CommandAction::ProjectApply { .. } => {
+                return boxed_action!(admission.execute_action_project_apply(id, &command))
+            }
             flotilla_protocol::CommandAction::ProjectRegister { .. } => {
-                return boxed_action!(self.execute_action_project_register(id, &command))
+                return boxed_action!(admission.execute_action_project_register(id, &command))
             }
             flotilla_protocol::CommandAction::ProjectRefresh { .. } => {
-                return boxed_action!(self.execute_action_project_refresh(id, &command))
+                return boxed_action!(admission.execute_action_project_refresh(id, &command))
             }
             flotilla_protocol::CommandAction::TrackRepoPath { .. } => {
-                return boxed_action!(self.execute_action_track_repo_path(id, &command))
+                return boxed_action!(executor.execute_action_track_repo_path(id, &command))
             }
-            flotilla_protocol::CommandAction::UntrackRepo { .. } => return boxed_action!(self.execute_action_untrack_repo(id, &command)),
+            flotilla_protocol::CommandAction::UntrackRepo { .. } => {
+                return boxed_action!(executor.execute_action_untrack_repo(id, &command))
+            }
             flotilla_protocol::CommandAction::OpenChangeRequest { .. }
             | flotilla_protocol::CommandAction::CloseChangeRequest { .. }
             | flotilla_protocol::CommandAction::MergeChangeRequest { .. }
             | flotilla_protocol::CommandAction::OpenIssue { .. }
             | flotilla_protocol::CommandAction::LinkIssuesToChangeRequest { .. } => {
-                return boxed_action!(self.execute_action_repository_forge(id, &command))
+                return boxed_action!(executor.execute_action_repository_forge(id, &command))
             }
             flotilla_protocol::CommandAction::Refresh { repo: Some(_) } => {
-                return boxed_action!(self.execute_action_refresh_repo(id, &command))
+                return boxed_action!(executor.execute_action_refresh_repo(id, &command))
             }
             _ => {}
         }
 
-        // Gather what the spawned task needs — validate repo before broadcasting
-        let repo = self.resolve_repo_for_command(&command).await?;
-        let runner = Arc::clone(&self.discovery.runner);
-        let env = Arc::clone(&self.discovery.env);
-        let event_sink = self.event_sink.clone();
-        let repository = self.repository_for_selector(&flotilla_protocol::RepoSelector::Path(repo.clone())).await?;
-        let repo_identity = repository_operations::repository_event_identity(&repository.spec, None);
-        let registry = self.execution_registry(&repository, &repo).await?;
-        let providers_data = Arc::new(self.executor_provider_data(&repo_identity, &repo, &registry).await);
-
-        let description = command.description().to_string();
-        let repo_path = repo.to_path_buf();
-        let config_base = DaemonHostPath::new(self.config.base_path().as_path());
-
-        let active_ref = Arc::clone(&self.active_commands);
-        let token = CancellationToken::new();
-        {
-            let mut guard = active_ref.lock().await;
-            guard.insert(id, token.clone());
-        }
-
-        self.event_sink.emit(DaemonEvent::CommandStarted {
-            command_id: id,
-            node_id: command_node_id.clone(),
-            repo_identity: repo_identity.clone(),
-            repo: Some(repo_path.clone()),
-            description,
-        });
-
-        let local_host = self.host_name.clone();
-        let local_node_id = self.node_id.clone();
-        let daemon_socket_path = self.daemon_socket_path.read().await.clone();
-        let environment_manager = Arc::clone(&self.environment_manager);
-        let vcs_resolver = self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>;
-        tokio::spawn(async move {
-            let resolver_registry = Arc::clone(&registry);
-            let resolver_providers_data = Arc::clone(&providers_data);
-            let resolver_runner = Arc::clone(&runner);
-            let resolver_env = Arc::clone(&env);
-            let resolver_config_base = config_base.clone();
-            let resolver_local_host = local_host.clone();
-            let ee_repo_path = ExecutionEnvironmentPath::new(&repo_path);
-            let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path.clone() };
-            let daemon_socket_dhp = daemon_socket_path.map(DaemonHostPath::new);
-
-            let plan = executor::build_plan(command, providers_data, local_node_id.clone(), local_host)
-                .await
-                .map_err(executor::PlannerRefusal::into_command_value);
-
-            match plan {
-                Err(result) => {
-                    {
-                        let mut guard = active_ref.lock().await;
-                        guard.remove(&id);
-                    }
-                    event_sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: command_node_id.clone(),
-                        repo_identity: repo_identity.clone(),
-                        repo: Some(repo_path),
-                        result,
-                    });
-                }
-                Ok(step_plan) => {
-                    let resolver = executor::ExecutorStepResolver {
-                        repo: resolver_repo,
-                        registry: resolver_registry,
-                        providers_data: resolver_providers_data,
-                        runner: resolver_runner,
-                        env: resolver_env,
-                        config_base: resolver_config_base,
-                        daemon_socket_path: daemon_socket_dhp.clone(),
-
-                        local_host: resolver_local_host.clone(),
-                        environment_manager: Arc::clone(&environment_manager),
-                        vcs_resolver: Arc::clone(&vcs_resolver),
-                    };
-                    let result = run_step_plan_with_remote_executor(
-                        step_plan,
-                        id,
-                        local_node_id,
-                        repo_identity.clone(),
-                        ExecutionEnvironmentPath::new(&repo_path),
-                        token,
-                        event_sink.clone(),
-                        &resolver,
-                        remote_executor.as_ref(),
-                    )
-                    .await;
-                    let mut guard = active_ref.lock().await;
-                    guard.remove(&id);
-                    event_sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: command_node_id,
-                        repo_identity,
-                        repo: Some(repo_path),
-                        result,
-                    });
-                }
-            }
-        });
-
-        Ok(id)
+        executor_actions::ExecutorActions { port: self }.execute_provider_action(id, command, command_node_id, remote_executor).await
     }
 }
 
@@ -7568,266 +6110,8 @@ impl DaemonHandle for InProcessDaemon {
         self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, None).await
     }
 
-    async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
-        use flotilla_protocol::CommandAction;
-        match &command.action {
-            CommandAction::QueryResolveRepository { repo } => {
-                let key = self.resolve_repository_selector(repo).await?;
-                Ok(CommandValue::RepositoryResolved { key })
-            }
-            CommandAction::QueryRepoProviders { repo } => match self.get_repo_providers_internal(repo).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::RepoProviders(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryHostList {} => match self.list_hosts_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::HostList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryExplainProject { name } => match self.explain_project_internal(name).await {
-                Ok(explanation) => Ok(CommandValue::ProjectExplanation(explanation)),
-                Err(message) => Ok(CommandValue::Error { message }),
-            },
-            CommandAction::QueryProjectList {} => match self.list_projects_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::ProjectList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryCliList { kind } => match self.list_cli_items_internal(*kind).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::CliList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryDispatchBoard { project } => match self.dispatch_board_internal(project.as_deref()).await {
-                Ok(board) => Ok(CommandValue::DispatchBoard(Box::new(board))),
-                Err(error) => Ok(CommandValue::Error { message: error }),
-            },
-            CommandAction::QueryDispatchQueue { project } => match self.dispatch_queue_internal(project.as_deref()).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::DispatchQueue(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryHostStatus { target_environment_id } => match self.get_host_status_internal(target_environment_id).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::HostStatus(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryHostProviders { target_environment_id } => {
-                match self.get_host_providers_internal(target_environment_id).await {
-                    Ok(v) => Ok(flotilla_protocol::CommandValue::HostProviders(Box::new(v))),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-                }
-            }
-            CommandAction::QueryFleetHealth {} => match self.fleet_health_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetHealth(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryFulfilmentList {} => match self.fulfilment_list_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::FulfilmentList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryFleetList { project, crew_id, convoy } => {
-                match self.scoped_fleet_list(project.as_deref(), crew_id.as_deref(), convoy.as_deref()).await {
-                    Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-                }
-            }
-            CommandAction::QueryCrewStalls { full } => {
-                match read_projections::ReadProjections::crew_stalls(&self.resource_backend, *full, self.clock.now()).await {
-                    Ok(value) => Ok(CommandValue::CrewStalls(Box::new(value))),
-                    Err(message) => Ok(CommandValue::Error { message }),
-                }
-            }
-            CommandAction::QueryCrewCapabilities { context } => match self.crew_capabilities_internal(context).await {
-                Ok(card) => Ok(CommandValue::CrewCapabilities { card }),
-                Err(message) => Ok(CommandValue::Error { message }),
-            },
-            CommandAction::QueryMessageContacts { context } => match self.crew_ops.message_contacts_internal(context).await {
-                Ok(book) => Ok(CommandValue::MessageContacts {
-                    text: book.render(),
-                    book: serde_json::to_value(book).map_err(|error| error.to_string())?,
-                }),
-                Err(message) => Ok(CommandValue::Error { message }),
-            },
-            CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryDaemonLogs { query } => {
-                let generations = self.config.load_daemon_config()?.logging.generations;
-                let state_dir = self.config.state_dir().as_path().to_path_buf();
-                let query = query.clone();
-                let read_result = tokio::task::spawn_blocking(move || crate::log_file::read_daemon_logs(&state_dir, generations, &query))
-                    .await
-                    .map_err(|error| format!("daemon log reader task failed: {error}"))?;
-                match read_result {
-                    Ok(lines) => Ok(flotilla_protocol::CommandValue::DaemonLogs { lines }),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-                }
-            }
-            CommandAction::QueryExplainConvoy { namespace, name } => match self.explain_convoy_internal(namespace.as_deref(), name).await {
-                Ok(explanation) => Ok(CommandValue::ConvoyExplanation(Box::new(explanation))),
-                Err(message) => Ok(CommandValue::Error { message }),
-            },
-            CommandAction::QueryResourceDigest { namespace, kind, query } => {
-                let (kind, backend) = match kind.strip_prefix("observed/") {
-                    Some(kind) => (kind, self.observed_resource_backend()),
-                    None => (kind.as_str(), self.resource_backend()),
-                };
-                let result = flotilla_resources::digest_resource_kind(&backend, namespace, kind, query).await;
-                match result {
-                    Ok(digest) => Ok(CommandValue::ResourceDigest(Box::new(digest.into()))),
-                    Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
-                }
-            }
-            CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
-                let listed = if *include_replicas {
-                    list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
-                } else {
-                    list_resource_kind(&self.resource_backend, namespace, kind).await
-                };
-                match listed {
-                    Ok(v) => {
-                        let resource_version = v.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
-                        let generation = v.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
-                        let records = v.value["items"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .cloned()
-                            .map(|object| resource_record(ResourceRecordType::Current, object, &self.node_id))
-                            .collect();
-                        Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
-                            v.kind,
-                            v.plural,
-                            v.namespace,
-                            ResourceCursor::from_position(resource_version, generation),
-                            records,
-                        ))))
-                    }
-                    Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
-                }
-            }
-            CommandAction::QueryResourceGet { namespace, kind, name } => {
-                // Take the collection cursor before reading the object. A
-                // concurrent mutation can then be replayed (at worst as a
-                // duplicate) instead of being hidden behind a newer cursor.
-                let position = match current_resource_kind_position(&self.resource_backend, namespace, kind).await {
-                    Ok(listed) => listed,
-                    Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
-                };
-                let visible = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
-                    Ok(object) => object,
-                    Err(ResourceError::NotFound { .. }) => {
-                        return Ok(CommandValue::Error { message: format!("resource {kind}/{namespace}/{name} not found") });
-                    }
-                    Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
-                };
-                let resource_version = position.resource_version;
-                let generation = position.generation;
-                let mut value = visible.value;
-                if visible.kind == "Project" {
-                    match serde_json::from_value::<flotilla_resources::ProjectSpec>(value["spec"].clone()) {
-                        Ok(spec) => {
-                            match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &spec)
-                                .await
-                            {
-                                IssueSourceResolution::Available { bindings } => {
-                                    value["resolvedIssueSources"] = serde_json::Value::Array(
-                                        bindings
-                                            .into_iter()
-                                            .map(|binding| {
-                                                serde_json::json!({
-                                                    "service": binding.source.service,
-                                                    "scope": binding.source.scope,
-                                                    "alias": binding.alias,
-                                                    "creatable": binding.creatable,
-                                                })
-                                            })
-                                            .collect(),
-                                    );
-                                }
-                                IssueSourceResolution::Unavailable(reason) => {
-                                    value["resolvedIssueSources"] = serde_json::Value::Array(Vec::new());
-                                    let message = match reason {
-                                        IssueSourceUnavailable::RepositoryUnavailable { repository, message } => {
-                                            format!("repository {repository}: {message}")
-                                        }
-                                        IssueSourceUnavailable::InvalidBindings { message } => message,
-                                        IssueSourceUnavailable::NoIssueSource => format!("project {name} has no issue source"),
-                                    };
-                                    value["issueSourceResolutionError"] = serde_json::Value::String(message);
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            warn!(resource_kind = %visible.kind, resource = %name, %error, "failed to decode project spec for resource read");
-                        }
-                    }
-                }
-                if visible.kind != "Event" {
-                    let object_name = value["metadata"]["name"].as_str().unwrap_or(name);
-                    let regarding = EventRegarding {
-                        api_version: value["apiVersion"].as_str().unwrap_or("flotilla.work/v1").to_string(),
-                        kind: visible.kind.clone(),
-                        namespace: namespace.clone(),
-                        name: object_name.to_string(),
-                    };
-                    match EventRecorder::new(self.resource_backend.clone()).recent_for(&regarding, Utc::now()).await {
-                        Ok(events) if !events.is_empty() => {
-                            value["recentEvents"] =
-                                serde_json::Value::Array(events.into_iter().filter_map(|event| serde_json::to_value(event).ok()).collect());
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(resource_kind = %visible.kind, resource = %name, %error, "failed to enrich resource read with recent events")
-                        }
-                    }
-                }
-                let record = resource_record(ResourceRecordType::Current, value, &self.node_id);
-                Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
-                    visible.kind,
-                    visible.plural,
-                    visible.namespace,
-                    ResourceCursor::from_position(resource_version, generation),
-                    vec![record],
-                ))))
-            }
-            CommandAction::Attach { reference, host, mode } => {
-                let project_context = self.attach_resolver().attach_project_context(command.context_repo.as_ref()).await?;
-                match self.resolve_attach_with_context(reference, host.as_ref(), false, *mode, project_context.as_deref()).await {
-                    Ok(resolved) => {
-                        if let Some(binding) = &resolved.binding {
-                            if let Err(error) = self.emit_attach_regard(binding, session_id).await {
-                                warn!(%error, "failed to emit attach regard");
-                            }
-                        }
-                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
-                    }
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-                }
-            }
-            CommandAction::AttachTransient { reference, host, mode } => {
-                let project_context = self.attach_resolver().attach_project_context(command.context_repo.as_ref()).await?;
-                match self.resolve_attach_with_context(reference, host.as_ref(), true, *mode, project_context.as_deref()).await {
-                    Ok(resolved) => {
-                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
-                    }
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-                }
-            }
-            CommandAction::QueryIssues { repo, params, page, count } => {
-                let (provider, source) = self.get_issue_provider_for_repository(repo).await?;
-                let page = provider.query(&source, params, *page, *count).await?;
-                Ok(flotilla_protocol::CommandValue::IssuePage(page))
-            }
-            CommandAction::QueryIssueFetchByIds { repo, ids } => {
-                let (provider, source) = self.get_issue_provider_for_repository(repo).await?;
-                let items = provider.fetch_by_ids(&source, ids).await?;
-                Ok(flotilla_protocol::CommandValue::IssuesByIds { items })
-            }
-            CommandAction::QueryIssueOpenInBrowser { repo, id } => {
-                let (provider, source) = self.get_issue_provider_for_repository(repo).await?;
-                provider.open_in_browser(&flotilla_protocol::IssueRef { source, id: id.clone() }).await?;
-                Ok(flotilla_protocol::CommandValue::Ok)
-            }
-            other => Err(format!("execute_query not implemented for this command type: {:?}", std::mem::discriminant(other))),
-        }
+    async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        projections_actions::ProjectionsActions { port: self }.execute_query(command, session_id).await
     }
 
     async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
@@ -8033,3 +6317,444 @@ impl InProcessDaemon {
     }
 }
 mod forge_demands;
+
+#[async_trait]
+impl admission_actions::AdmissionActionPort for InProcessDaemon {
+    async fn repository_transport_url(&self, namespace: &str, repository: &RepositorySpec) -> Result<String, String> {
+        self.project_service().repository_transport_url(namespace, repository).await
+    }
+    async fn check_local_free_space_floor(&self) -> Result<(), String> {
+        InProcessDaemon::check_local_free_space_floor(self).await
+    }
+    async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
+        InProcessDaemon::check_remote_placement_free_space_floor(self, namespace, placement).await
+    }
+    fn convoy_admission(&self) -> &ConvoyAdmission {
+        &self.convoy_admission
+    }
+    fn event_sink(&self) -> &Arc<dyn EventSink> {
+        &self.event_sink
+    }
+    fn finish_context_free_command(
+        &self,
+        command_id: u64,
+        repo_identity: flotilla_protocol::RepoIdentity,
+        result: flotilla_protocol::CommandValue,
+    ) {
+        InProcessDaemon::finish_context_free_command(self, command_id, repo_identity, result)
+    }
+    async fn inspect_adopted_checkout(
+        &self,
+        path: &Path,
+        repository_url: Option<&str>,
+        git_ref: Option<&str>,
+    ) -> Result<RepositoryInspection, String> {
+        InProcessDaemon::inspect_adopted_checkout(self, path, repository_url, git_ref).await
+    }
+    fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+    fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>> {
+        &self.observed_checkout_reconciliation
+    }
+    fn observed_resource_backend(&self) -> &ResourceBackend {
+        &self.observed_resource_backend
+    }
+    async fn project_add(
+        &self,
+        target: &str,
+        explicit_name: Option<&str>,
+        explicit_display_name: Option<&str>,
+        remote: Option<&str>,
+    ) -> Result<String, String> {
+        InProcessDaemon::project_add(self, target, explicit_name, explicit_display_name, remote).await
+    }
+    async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
+        InProcessDaemon::project_refresh(self, name).await
+    }
+    async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
+        InProcessDaemon::project_register(self, target).await
+    }
+    async fn provisioning_namespace(&self) -> String {
+        InProcessDaemon::provisioning_namespace(self).await
+    }
+    async fn resolve_convoy_placement(
+        &self,
+        namespace: &str,
+        project_ref: Option<&str>,
+        repositories: &[ConvoyRepositorySpec],
+        workflow: &WorkflowTemplateSpec,
+        placement_policy: Option<&str>,
+        allow_unready: bool,
+    ) -> Result<PlacementResolution, String> {
+        InProcessDaemon::resolve_convoy_placement(self, namespace, project_ref, repositories, workflow, placement_policy, allow_unready)
+            .await
+    }
+    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        InProcessDaemon::resolve_repository_remote(self, remote).await
+    }
+    fn resource_backend(&self) -> &ResourceBackend {
+        &self.resource_backend
+    }
+    async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String> {
+        InProcessDaemon::roll_convoy_ensure(self, namespace, name).await
+    }
+    async fn snapshot_project_repositories(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        selected: Option<&[RepositoryKey]>,
+    ) -> Result<Vec<ConvoyRepositorySpec>, String> {
+        InProcessDaemon::snapshot_project_repositories(self, namespace, project_ref, selected).await
+    }
+    fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
+        if let Some(daemon) = self.self_weak.upgrade() {
+            tokio::spawn(async move {
+                daemon.supervise_convoy_start(task).await;
+            });
+            true
+        } else {
+            false
+        }
+    }
+    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
+        InProcessDaemon::start_context_free_command(self, command_id, description)
+    }
+}
+
+#[async_trait]
+impl crew_actions::CrewActionPort for InProcessDaemon {
+    fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+    async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
+        InProcessDaemon::message_inbox(self, namespace).await
+    }
+    async fn convoy_resume_with_sender_internal(
+        &self,
+        namespace: &str,
+        name: &str,
+        prompt: &str,
+        requested_vessel: Option<&str>,
+        requested_role: Option<&str>,
+        attribution: MessageAttribution,
+    ) -> Result<ConvoyResumeOutcome, String> {
+        self.crew_ops.convoy_resume_with_sender_internal(namespace, name, prompt, requested_vessel, requested_role, attribution).await
+    }
+    async fn handoff_with_carries(
+        &self,
+        requested: &CrewCommandContext,
+        target: &str,
+        message: &str,
+        carries: Vec<flotilla_resources::MessageReference>,
+    ) -> Result<(), String> {
+        self.crew_ops.handoff_with_carries(requested, target, message, carries).await
+    }
+    async fn abandon_convoy_internal(
+        &self,
+        namespace: &str,
+        name: &str,
+        reason: &str,
+        principal_ref: Option<&PrincipalRef>,
+    ) -> Result<Vec<CheckoutArchiveOutcome>, String> {
+        InProcessDaemon::abandon_convoy_internal(self, namespace, name, reason, principal_ref).await
+    }
+    async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
+        InProcessDaemon::convoy_withdraw_pending_brief_internal(self, namespace, name).await
+    }
+    async fn crew_complete_as_principal_internal(
+        &self,
+        requested: &CrewCommandContext,
+        message: Option<String>,
+        disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
+        force: bool,
+        principal: Option<PrincipalRef>,
+    ) -> Result<flotilla_protocol::CommandValue, String> {
+        InProcessDaemon::crew_complete_as_principal_internal(self, requested, message, disposition, decision_ledger_ref, force, principal)
+            .await
+    }
+    async fn crew_fail_internal(
+        &self,
+        requested: &CrewCommandContext,
+        message: String,
+        force: bool,
+        principal: Option<&PrincipalRef>,
+    ) -> Result<(), String> {
+        InProcessDaemon::crew_fail_internal(self, requested, message, force, principal).await
+    }
+    async fn crew_stall_internal(
+        &self,
+        requested: &CrewCommandContext,
+        reason: flotilla_protocol::StallReason,
+        proposed_disposition: Option<flotilla_protocol::StallProposedDisposition>,
+        message: String,
+    ) -> Result<(), String> {
+        InProcessDaemon::crew_stall_internal(self, requested, reason, proposed_disposition, message).await
+    }
+    async fn crew_supervise_internal(&self, request: CrewSupervisionRequest<'_>) -> Result<(), String> {
+        InProcessDaemon::crew_supervise_internal(self, request).await
+    }
+    fn finish_context_free_command(
+        &self,
+        command_id: u64,
+        repo_identity: flotilla_protocol::RepoIdentity,
+        result: flotilla_protocol::CommandValue,
+    ) {
+        InProcessDaemon::finish_context_free_command(self, command_id, repo_identity, result)
+    }
+    async fn link_convoy_subject(
+        &self,
+        namespace: &str,
+        convoy_name: &str,
+        reference: &str,
+        relationship: Option<flotilla_protocol::Relationship>,
+    ) -> Result<(), String> {
+        InProcessDaemon::link_convoy_subject(self, namespace, convoy_name, reference, relationship).await
+    }
+    async fn provisioning_namespace(&self) -> String {
+        InProcessDaemon::provisioning_namespace(self).await
+    }
+    async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        InProcessDaemon::reap_convoy_internal(self, namespace, name, force).await
+    }
+    async fn record_lifecycle_mutation_best_effort(
+        &self,
+        namespace: &str,
+        name: &str,
+        action: &str,
+        caller: Option<&flotilla_protocol::CommandCaller>,
+        missing_expected: bool,
+    ) {
+        InProcessDaemon::record_lifecycle_mutation_best_effort(self, namespace, name, action, caller, missing_expected).await
+    }
+    async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
+        InProcessDaemon::resolve_crew_routing_context(self, requested).await
+    }
+    fn resource_backend(&self) -> &ResourceBackend {
+        &self.resource_backend
+    }
+    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
+        InProcessDaemon::start_context_free_command(self, command_id, description)
+    }
+}
+
+#[async_trait]
+impl projections_actions::ProjectionsActionPort for InProcessDaemon {
+    async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
+        self.attach_resolver().attach_project_context(selector).await
+    }
+    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<flotilla_resources::CrewAddressBook, String> {
+        self.crew_ops.message_contacts_internal(requested).await
+    }
+    async fn scoped_fleet_list(
+        &self,
+        project: Option<&str>,
+        crew_id: Option<&str>,
+        convoy: Option<&str>,
+    ) -> Result<FleetListResponse, String> {
+        self.scoped_fleet_list(project, crew_id, convoy).await
+    }
+    async fn resolve_repository_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryKey>, String> {
+        self.resolve_repository_selector(selector).await
+    }
+    async fn resolve_attach_with_context(
+        &self,
+        reference: &str,
+        host: Option<&HostName>,
+        transient: bool,
+        mode: AttachMode,
+        project_context: Option<&str>,
+    ) -> Result<ResolvedAttach, String> {
+        self.resolve_attach_with_context(reference, host, transient, mode, project_context).await
+    }
+    fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+    async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
+        self.list_projects_internal().await
+    }
+    async fn list_hosts_internal(&self) -> Result<HostListResponse, String> {
+        self.list_hosts_internal().await
+    }
+    async fn list_cli_items_internal(&self, kind: CliListKind) -> Result<CliListResponse, String> {
+        self.list_cli_items_internal(kind).await
+    }
+    async fn get_repo_providers_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
+        self.get_repo_providers_internal(repo).await
+    }
+    async fn get_issue_provider_for_repository(
+        &self,
+        selector: &flotilla_protocol::RepoSelector,
+    ) -> Result<(Arc<dyn IssueProvider>, flotilla_protocol::IssueSource), String> {
+        self.get_issue_provider_for_repository(selector).await
+    }
+    async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String> {
+        self.get_host_status_internal(environment_id).await
+    }
+    async fn get_host_providers_internal(&self, environment_id: &EnvironmentId) -> Result<HostProvidersResponse, String> {
+        self.get_host_providers_internal(environment_id).await
+    }
+    async fn fulfilment_list_internal(&self) -> Result<FulfilmentListResponse, String> {
+        self.fulfilment_list_internal().await
+    }
+    async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
+        self.fleet_health_internal().await
+    }
+    async fn explain_project_internal(&self, name: &str) -> Result<serde_json::Value, String> {
+        self.explain_project_internal(name).await
+    }
+    async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
+        self.explain_convoy_internal(requested_namespace, name).await
+    }
+    async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
+        self.emit_attach_regard(binding, surface_id).await
+    }
+    async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {
+        self.dispatch_queue_internal(project_filter).await
+    }
+    async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
+        self.dispatch_board_internal(project_filter).await
+    }
+    async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
+        self.crew_list_internal(requested).await
+    }
+    async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {
+        self.crew_capabilities_internal(requested).await
+    }
+    fn config(&self) -> &Arc<ConfigStore> {
+        &self.config
+    }
+    fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+    fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>> {
+        &self.active_commands
+    }
+    fn event_sink(&self) -> &Arc<dyn EventSink> {
+        &self.event_sink
+    }
+    fn observed_resource_backend(&self) -> &ResourceBackend {
+        &self.observed_resource_backend
+    }
+    fn resource_backend(&self) -> &ResourceBackend {
+        &self.resource_backend
+    }
+}
+
+#[async_trait]
+impl executor_actions::ExecutorActionPort for InProcessDaemon {
+    async fn post_install_cleat(
+        &self,
+        incoming: &Path,
+        generation: &str,
+        diagnostics_dir: &Path,
+    ) -> Result<crate::cleat_roll::RollReport, String> {
+        InProcessDaemon::post_install_cleat(self, incoming, generation, diagnostics_dir).await
+    }
+    fn vcs_resolver(&self) -> Result<Arc<dyn crate::vcs::CheckoutVcsResolver>, String> {
+        Ok(self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>)
+    }
+    async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String> {
+        InProcessDaemon::resolve_repo_for_command(self, command).await
+    }
+    async fn repository_registry(&self, repository: &ResourceObject<Repository>) -> Result<Arc<ProviderRegistry>, String> {
+        Ok(Arc::clone(&InProcessDaemon::repository_providers(self, repository).await?.registry))
+    }
+    fn host_name(&self) -> &HostName {
+        &self.host_name
+    }
+    async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
+        InProcessDaemon::executor_provider_data(self, repo_identity, _repo_root, registry).await
+    }
+    async fn execution_registry(&self, repository: &ResourceObject<Repository>, path: &Path) -> Result<Arc<ProviderRegistry>, String> {
+        InProcessDaemon::execution_registry(self, repository, path).await
+    }
+    fn environment_manager(&self) -> &Arc<EnvironmentManager> {
+        &self.environment_manager
+    }
+    fn runner(&self) -> &Arc<dyn CommandRunner> {
+        &self.discovery.runner
+    }
+    fn env(&self) -> &Arc<dyn EnvVars> {
+        &self.discovery.env
+    }
+    fn daemon_socket_path(&self) -> &RwLock<Option<PathBuf>> {
+        &self.daemon_socket_path
+    }
+    fn config(&self) -> &Arc<ConfigStore> {
+        &self.config
+    }
+    fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>> {
+        &self.active_commands
+    }
+    async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String> {
+        InProcessDaemon::add_repo(self, path).await
+    }
+    async fn apply_intent_document(
+        &self,
+        namespace: &str,
+        document: serde_json::Value,
+    ) -> Result<flotilla_resources::DynamicResourceObject, ResourceError> {
+        InProcessDaemon::apply_intent_document(self, namespace, document).await
+    }
+    async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
+        InProcessDaemon::detect_repo_identity(self, repo_path).await
+    }
+    fn event_sink(&self) -> &Arc<dyn EventSink> {
+        &self.event_sink
+    }
+    fn finish_context_free_command(
+        &self,
+        command_id: u64,
+        repo_identity: flotilla_protocol::RepoIdentity,
+        result: flotilla_protocol::CommandValue,
+    ) {
+        InProcessDaemon::finish_context_free_command(self, command_id, repo_identity, result)
+    }
+    async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String> {
+        InProcessDaemon::local_checkout_for_repository(self, key).await
+    }
+    fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+    fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>> {
+        &self.observed_checkout_reconciliation
+    }
+    fn observed_resource_backend(&self) -> &ResourceBackend {
+        &self.observed_resource_backend
+    }
+    async fn operator_reconciler(&self) -> Option<Arc<dyn OperatorReconciler>> {
+        self.operator_reconciler.read().await.clone()
+    }
+    async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
+        InProcessDaemon::peer_connection_status(self, node_id).await
+    }
+    async fn provisioning_namespace(&self) -> String {
+        InProcessDaemon::provisioning_namespace(self).await
+    }
+    async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
+        InProcessDaemon::refresh(self, repo).await
+    }
+    async fn remove_repo(&self, path: &Path) -> Result<(), String> {
+        InProcessDaemon::remove_repo(self, path).await
+    }
+    async fn repository_for_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<ResourceObject<Repository>, String> {
+        InProcessDaemon::repository_for_selector(self, selector).await
+    }
+    fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+        InProcessDaemon::resolve_observation_root_selector(self, selector)
+    }
+    async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+        InProcessDaemon::resolve_repo_selector(self, selector).await
+    }
+    fn resource_backend(&self) -> &ResourceBackend {
+        &self.resource_backend
+    }
+    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
+        InProcessDaemon::start_context_free_command(self, command_id, description)
+    }
+    async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
+        InProcessDaemon::tracked_repo_identity_for_path(self, repo_path).await
+    }
+}

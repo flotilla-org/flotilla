@@ -181,65 +181,6 @@ impl InProcessDaemon {
         Ok(lease)
     }
 
-    pub(super) async fn execute_action_repository_forge(&self, command_id: u64, command: &Command) -> Result<u64, String> {
-        let selector = command.context_repo.as_ref().ok_or("command requires Repository context")?;
-        let repository = self.repository_for_selector(selector).await?;
-        if repository.spec.forge().is_none() {
-            return Err("Repository has no forge identity".into());
-        }
-        let identity = repository_event_identity(&repository.spec, None);
-        let lease = self.repository_providers(&repository).await?;
-        let action = command.action.clone();
-        let event_sink = self.event_sink.clone();
-        let node_id = self.node_id.clone();
-        let active_commands = Arc::clone(&self.active_commands);
-        let cancel = CancellationToken::new();
-        active_commands.lock().await.insert(command_id, cancel.clone());
-        event_sink.emit(DaemonEvent::CommandStarted {
-            command_id,
-            node_id: node_id.clone(),
-            repo_identity: identity.clone(),
-            repo: None,
-            description: command.description().into(),
-        });
-        tokio::spawn(async move {
-            let operation = async {
-                if let CommandAction::OpenIssue { id } = &action {
-                    let forge = repository.spec.issue_source_forge().ok_or("Repository has no forge issue source")?;
-                    let source = flotilla_protocol::IssueSource { service: forge.service_url, scope: forge.repository };
-                    let provider = lease.registry.issue_provider_for(&source).ok_or("no issue provider available for Repository")?;
-                    return provider.open_in_browser(&flotilla_protocol::IssueRef { source, id: id.clone() }).await;
-                }
-                if let CommandAction::MergeChangeRequest { id, confirmed } = &action {
-                    if repository.spec.is_fork() {
-                        return Err(format!("merging change request {id} is forbidden for fork-stance repository; landing is human-only"));
-                    }
-                    if !confirmed {
-                        return Err(format!("merging change request {id} requires explicit confirmation"));
-                    }
-                }
-                let provider =
-                    lease.registry.change_requests.preferred().ok_or("no change request provider is active for this Repository")?;
-                match action {
-                    CommandAction::OpenChangeRequest { id } => provider.open_in_browser(&id).await,
-                    CommandAction::CloseChangeRequest { id } => provider.close_change_request(&id).await,
-                    CommandAction::MergeChangeRequest { id, .. } => provider.merge_change_request(&id).await,
-                    CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
-                        provider.link_issues(&change_request_id, &issue_ids).await
-                    }
-                    _ => Err("not a Repository forge action".into()),
-                }
-            };
-            let result = tokio::select! {
-                result = operation => match result { Ok(()) => CommandValue::Ok, Err(message) => CommandValue::Error { message } },
-                _ = cancel.cancelled() => CommandValue::Cancelled,
-            };
-            active_commands.lock().await.remove(&command_id);
-            event_sink.emit(DaemonEvent::CommandFinished { command_id, node_id, repo_identity: identity, repo: None, result });
-        });
-        Ok(command_id)
-    }
-
     pub(super) async fn repository_providers_response(
         &self,
         selector: &flotilla_protocol::RepoSelector,
