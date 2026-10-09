@@ -20,12 +20,20 @@ use flotilla_resources::{
 };
 
 use crate::config::ConfigStore;
+use crate::discovery_api::EnvironmentBag;
 use crate::in_process::dispatch_board::tests::board;
-use crate::in_process::{input_meta_from_resource, InProcessDaemon, WorkCredentialReconciler};
+use crate::in_process::input_meta_from_resource;
+use crate::in_process::InProcessDaemon;
+use crate::in_process::WorkCredentialReconciler;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
 use crate::providers::issue_tracker::IssueProvider;
-use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::ChannelLabel;
+use crate::providers::CommandOutput;
+use crate::providers::CommandRunner;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 

@@ -4545,7 +4545,8 @@ fn generated_message_role_waiting_home(tc: hegel::TestCase) {
 }
 
 async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
-    use flotilla_core::crew_capabilities::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_core::crew_capabilities::CredentialCapability;
+    use flotilla_core::crew_capabilities::SessionCapabilitySource;
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
     // Credential-delivery I/O is the boundary; routing and stores are real.
     struct Delivery(bool);

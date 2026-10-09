@@ -22,23 +22,23 @@ use flotilla_protocol::EnvironmentId;
 use futures::stream;
 use tokio::sync::OnceCell as AsyncOnceCell;
 
-use crate::{
-    admission::{system_available_space_probe, AvailableSpaceProbe},
-    agent_adapter::AgentAdapterRegistry,
-    discovery_api::{EnvironmentAssertion, EnvironmentBag, VcsKind},
-    provider_config::ProviderConfigView,
-    providers::{
-        ai_utility::AiUtility,
-        change_request::ChangeRequestTracker,
-        coding_agent::CloudAgentService,
-        issue_tracker::IssueProvider,
-        registry::{ProviderRegistry, ProviderSet},
-        scan_cache::SharedTerminalPool,
-        terminal::TerminalPool,
-        CommandRunner,
-    },
-    vcs::Vcs,
-};
+use crate::admission::system_available_space_probe;
+use crate::admission::AvailableSpaceProbe;
+use crate::agent_adapter::AgentAdapterRegistry;
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::EnvironmentBag;
+use crate::discovery_api::VcsKind;
+use crate::provider_config::ProviderConfigView;
+use crate::providers::ai_utility::AiUtility;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::coding_agent::CloudAgentService;
+use crate::providers::issue_tracker::IssueProvider;
+use crate::providers::registry::ProviderRegistry;
+use crate::providers::registry::ProviderSet;
+use crate::providers::scan_cache::SharedTerminalPool;
+use crate::providers::terminal::TerminalPool;
+use crate::providers::CommandRunner;
+use crate::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub trait EnvVars: Send + Sync {
@@ -550,7 +550,8 @@ mod timeout_tests {
     async fn detector_timeout_preserves_other_capabilities() {
         let detectors: Vec<Box<dyn HostDetector>> =
             vec![Box::new(PendingDetector), Box::new(detectors::generic::EnvVarDetector::new("HOME"))];
-        use crate::testkits::discovery::{DiscoveryMockRunner, TestEnvVars};
+        use crate::testkits::discovery::DiscoveryMockRunner;
+        use crate::testkits::discovery::TestEnvVars;
         let runner = DiscoveryMockRunner::builder().build();
         let env = TestEnvVars::new([("HOME", "/safe/home")]);
         let bag = run_host_detectors(&detectors, &runner, &env).await;

@@ -3,7 +3,9 @@ use std::{fs, path::Path};
 use flotilla_protocol::{EnvironmentId, HostEnvironment, HostName, HostProviderStatus, HostSummary, NodeId, NodeInfo, SystemInfo};
 use sysinfo::System;
 
-use crate::{convert::inventory_from_bag, environment_manager::EnvironmentManager, providers::discovery::EnvVars};
+use crate::convert::inventory_from_bag;
+use crate::environment_manager::EnvironmentManager;
+use crate::providers::discovery::EnvVars;
 
 /// Resident bytes of this daemon process, sampled for the host heartbeat.
 /// Failure is unknown, never zero; refresh only this PID rather than the fleet.

@@ -7,20 +7,25 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use flotilla_resources::ForgeKind;
 
-use crate::{
-    discovery_api::EnvironmentBag,
-    provider_config::{ForgejoIssueTrackerConfig, ProviderConfig},
-    providers::{
-        change_request::{forgejo::ForgejoChangeRequestProvider, github::GitHubChangeRequest, ChangeRequestTracker},
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement, FORGEJO_AUTH_PROVIDER},
-        forge::{
-            forgejo::{ForgejoAuth, ForgejoIssueProviderConfig},
-            github::GhApiClient,
-        },
-        issue_tracker::{forgejo::ForgejoIssueProvider, github::GitHubIssueProvider, IssueProvider},
-        CommandRunner, ReqwestHttpClient,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::provider_config::ForgejoIssueTrackerConfig;
+use crate::provider_config::ProviderConfig;
+use crate::providers::change_request::forgejo::ForgejoChangeRequestProvider;
+use crate::providers::change_request::github::GitHubChangeRequest;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::discovery::FORGEJO_AUTH_PROVIDER;
+use crate::providers::forge::forgejo::ForgejoAuth;
+use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
+use crate::providers::forge::github::GhApiClient;
+use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
+use crate::providers::issue_tracker::github::GitHubIssueProvider;
+use crate::providers::issue_tracker::IssueProvider;
+use crate::providers::CommandRunner;
+use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
@@ -307,9 +312,9 @@ mod tests {
         GitHubChangeRequestFactory, GitHubIssueProviderFactory,
     };
     use crate::config::ConfigStore;
-    use crate::config::ForgejoIssueTrackerConfig;
     use crate::discovery_api::EnvironmentAssertion;
     use crate::discovery_api::EnvironmentBag;
+    use crate::provider_config::ForgejoIssueTrackerConfig;
     use crate::providers::discovery::Factory;
     use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;

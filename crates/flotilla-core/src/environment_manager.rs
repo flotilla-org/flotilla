@@ -10,20 +10,29 @@ use flotilla_protocol::{
 };
 use flotilla_resources::host_direct_environment_name;
 
-use crate::{
-    config::ConfigStore,
-    discovery_api::EnvironmentBag,
-    providers::{
-        discovery::{run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, FactoryRegistry, HostDetector},
-        environment::{
-            contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentKind, EnvironmentTool, EnvironmentToolAsset,
-            EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironment, PreparedEnvironmentAuth,
-            ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
-        },
-        registry::ProviderRegistry,
-        CommandRunner,
-    },
-};
+use crate::config::ConfigStore;
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::discovery::run_host_detectors;
+use crate::providers::discovery::run_provisioned_host_detectors;
+use crate::providers::discovery::DiscoveryRuntime;
+use crate::providers::discovery::FactoryRegistry;
+use crate::providers::discovery::HostDetector;
+use crate::providers::environment::contained_daemon_socket_path;
+use crate::providers::environment::CreateOpts;
+use crate::providers::environment::EnvironmentHandle;
+use crate::providers::environment::EnvironmentKind;
+use crate::providers::environment::EnvironmentTool;
+use crate::providers::environment::EnvironmentToolAsset;
+use crate::providers::environment::EnvironmentToolAssetAccess;
+use crate::providers::environment::EnvironmentToolAssetKind;
+use crate::providers::environment::EnvironmentVariableUpdate;
+use crate::providers::environment::PreparedEnvironment;
+use crate::providers::environment::PreparedEnvironmentAuth;
+use crate::providers::environment::ProvisionedMount;
+use crate::providers::environment::ProvisionedMountMode;
+use crate::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
+use crate::providers::registry::ProviderRegistry;
+use crate::providers::CommandRunner;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
@@ -583,7 +592,8 @@ mod tests {
         },
     };
 
-    use crate::providers::environment::{PrepareOpts, ProvisionOpts};
+    use crate::providers::environment::PrepareOpts;
+    use crate::providers::environment::ProvisionOpts;
     use async_trait::async_trait;
     use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
@@ -1091,7 +1101,8 @@ mod tests {
     // Glue: the same custom command detector exercises both probe callers.
     #[tokio::test]
     async fn provisioned_discovery_retains_configured_detectors() {
-        use crate::providers::discovery::detectors::generic::{parse_first_dotted_version, CommandDetector};
+        use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
+        use crate::providers::discovery::detectors::generic::CommandDetector;
 
         let mut discovery = fake_discovery(false);
         discovery.host_detectors =

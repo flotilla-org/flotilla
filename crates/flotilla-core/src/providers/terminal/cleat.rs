@@ -13,10 +13,10 @@ use super::{
     environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
     TerminalSessionTag, TerminalSize,
 };
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{run, ChannelLabel, CommandRunner},
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::run;
+use crate::providers::ChannelLabel;
+use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";

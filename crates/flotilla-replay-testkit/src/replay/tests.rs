@@ -70,7 +70,8 @@ interactions:
     let session = Session::replaying(&path, masks);
     let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-    use flotilla_core::providers::vcs::{git::GitVcs, VcsInspection};
+    use flotilla_core::providers::vcs::git::GitVcs;
+    use flotilla_core::providers::vcs::VcsInspection;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     let git = GitVcs::new(runner);
     let repo = ExecutionEnvironmentPath::new("/test/repo");
@@ -1018,7 +1019,8 @@ impl CommandRunner for RestFailureRunner {
 fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use flotilla_core::providers::forge::github::{GhApiClient, GithubRetrySource};
+    use flotilla_core::providers::forge::github::GhApiClient;
+    use flotilla_core::providers::forge::github::GithubRetrySource;
     // Exhaust ordinary 403/404, primary and secondary 403/429, missing reset,
     // and transport failure each run. Generate reset boundaries and retry delay.
     let reset = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));

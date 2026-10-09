@@ -14,19 +14,18 @@ use tokio::sync::Mutex;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{claim_crew, stall_test_daemon, stall_workflow_snapshot, test_meta};
-use crate::{
-    in_process::{
-        observation_cache_delay, observation_during_cooldown, observation_rate_limit_error, CachedObservation, ChangeRequestQueryPort,
-        ProviderChangeRequestObservationSource, OBSERVATION_CACHE_FALLBACK_DELAY,
-    },
-    providers::{
-        change_request::{
-            observation::{ChangeRequestObservationSource, ChangeRequestRef},
-            BoundObservations, ChangeRequestTracker,
-        },
-        forge::observation_error::ObservationError,
-    },
-};
+use crate::in_process::observation_cache_delay;
+use crate::in_process::observation_during_cooldown;
+use crate::in_process::observation_rate_limit_error;
+use crate::in_process::CachedObservation;
+use crate::in_process::ChangeRequestQueryPort;
+use crate::in_process::ProviderChangeRequestObservationSource;
+use crate::in_process::OBSERVATION_CACHE_FALLBACK_DELAY;
+use crate::providers::change_request::observation::ChangeRequestObservationSource;
+use crate::providers::change_request::observation::ChangeRequestRef;
+use crate::providers::change_request::BoundObservations;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::forge::observation_error::ObservationError;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 // #2543: scope waits use the latest deadline independently of batch ordering;
@@ -35,7 +34,9 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 fn observation_cooldown_is_deterministic(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use crate::providers::forge::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
+    use crate::providers::forge::github::GithubRateLimit;
+    use crate::providers::forge::github::GithubRateLimitKind;
+    use crate::providers::forge::github::GithubRetrySource;
     // Deadlines span expired, current and future resets; duplicates exercise the
     // lowest-subject tie break. Generated permutations, their reversals and fresh HashMaps vary order.
     let now = Utc.timestamp_opt(1800000000, 0).single().expect("now");
@@ -106,7 +107,9 @@ impl ChangeRequestQueryPort for NoCooldownForgeReads {
 // cached scope cooldown, including new subjects and prior successful outcomes.
 #[tokio::test(start_paused = true)]
 async fn distinct_cooldowns_block_all_observation_reads() {
-    use crate::providers::forge::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
+    use crate::providers::forge::github::GithubRateLimit;
+    use crate::providers::forge::github::GithubRateLimitKind;
+    use crate::providers::forge::github::GithubRetrySource;
     let source =
         ProviderChangeRequestObservationSource::new(ResourceBackend::InMemory(InMemoryBackend::default()), Arc::new(NoCooldownForgeReads));
     let now = Utc::now();

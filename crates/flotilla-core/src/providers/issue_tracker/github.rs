@@ -8,13 +8,19 @@ use flotilla_protocol::{
     Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
 };
 
-use crate::providers::{
-    forge::github::{clamp_per_page, rate_limit_error_for, GhApi},
-    gh_api_get, gh_api_get_with_headers,
-    github_observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape},
-    github_poll::{PendingBoard, PollCache},
-    run, run_output, CommandRunner,
-};
+use crate::providers::forge::github::clamp_per_page;
+use crate::providers::forge::github::rate_limit_error_for;
+use crate::providers::forge::github::GhApi;
+use crate::providers::gh_api_get;
+use crate::providers::gh_api_get_with_headers;
+use crate::providers::github_observation::ObservationTelemetry;
+use crate::providers::github_observation::ParsedObservationResponse;
+use crate::providers::github_observation::QueryShape;
+use crate::providers::github_poll::PendingBoard;
+use crate::providers::github_poll::PollCache;
+use crate::providers::run;
+use crate::providers::run_output;
+use crate::providers::CommandRunner;
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
 

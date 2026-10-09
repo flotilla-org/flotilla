@@ -17,10 +17,14 @@ use flotilla_resources::{
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
-use crate::change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef};
 use crate::config::ConfigStore;
-use crate::in_process::{forge_service_matches, CrewCompletionRefusalCause, InProcessDaemon};
-use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::EnvironmentBag;
+use crate::in_process::forge_service_matches;
+use crate::in_process::CrewCompletionRefusalCause;
+use crate::in_process::InProcessDaemon;
+use crate::providers::change_request::observation::ChangeRequestObservationSource;
+use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::discovery::fake_discovery_with_runner;
 
 // #2585: the real convoy resolver shares proven branch absence across callers

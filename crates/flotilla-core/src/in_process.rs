@@ -91,58 +91,81 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::agent_adapter::required_agent_adapters;
+use crate::agent_adapter::CapabilityTable;
+use crate::aggregator_projection::AggregatorProjectionState;
+use crate::checkout_integration::checkout_path_from_status_and_spec;
+use crate::checkout_integration::convoy_change_request_id_for_checkout;
+use crate::checkout_integration::inspect_checkout_integration;
+use crate::checkout_integration::inspect_convoy_checkout_integration;
+use crate::config::ConfigStore;
+use crate::config::StaticEnvironmentConfig;
 pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
-use crate::{
-    agent_adapter::{required_agent_adapters, CapabilityTable},
-    aggregator_projection::AggregatorProjectionState,
-    checkout_integration::{
-        checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
-        inspect_convoy_checkout_integration,
-    },
-    config::{ConfigStore, StaticEnvironmentConfig},
-};
-use crate::{
-    discovery_api::{EnvironmentAssertion, EnvironmentBag},
-    environment_manager::{EnvironmentManager, ResolvedEnvironment},
-    event_sink::{BroadcastEventSink, EventSink},
-    executor::{self, checkout::CheckoutResolutionScope},
-    fleet::FleetService,
-    host_identity::{
-        resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
-        resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
-    },
-    host_registry::{HostCounts, HostQueryDetails},
-    host_resolution::canonical_placement_host_ref_from_sources,
-    leaf_engine::LeafSubscriptionTable,
-    model::{repo_name, RepoModel},
-    ops_entry::{ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
-    providers::{
-        ai_utility::{AiUtility, ConvoyNames},
-        change_request::{
-            observation::{ChangeRequestObservationSource, ChangeRequestRef},
-            BoundObservations, ChangeRequestTracker,
-        },
-        discovery::{
-            discover_checkout_with_host_scoped, run_host_detectors, status::provider_names_from_registry, DiscoveryResult,
-            DiscoveryRuntime, EnvVars,
-        },
-        environment::EnvironmentHandle,
-        forge::observation_error::ObservationError,
-        issue_tracker::IssueProvider,
-        registry::ProviderRegistry,
-        ssh_runner::SshCommandRunner,
-        types::RepoCriteria,
-        vcs::git_worktree::GitWorktreeStrategy,
-        ChannelLabel, CommandRunner,
-    },
-    regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
-    repo_state::{RepoRootState, RepoState},
-    repository_inspection::{GitRepositoryInspector, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
-    resource_explain::{resource_read_envelope, resource_record, run_resource_watch_command, ResourceWatchCommandContext},
-    step::{
-        run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::EnvironmentBag;
+use crate::environment_manager::EnvironmentManager;
+use crate::environment_manager::ResolvedEnvironment;
+use crate::event_sink::BroadcastEventSink;
+use crate::event_sink::EventSink;
+use crate::executor;
+use crate::executor::checkout::CheckoutResolutionScope;
+use crate::fleet::FleetService;
+use crate::host_identity::resolve_local_environment_state_dir;
+use crate::host_identity::resolve_local_host_id;
+use crate::host_identity::resolve_local_node_id;
+use crate::host_identity::resolve_or_create_environment_id;
+use crate::host_identity::resolve_or_create_remote_environment_id;
+use crate::host_identity::resolve_or_create_remote_host_id;
+use crate::host_registry::HostCounts;
+use crate::host_registry::HostQueryDetails;
+use crate::host_resolution::canonical_placement_host_ref_from_sources;
+use crate::leaf_engine::LeafSubscriptionTable;
+use crate::model::repo_name;
+use crate::model::RepoModel;
+use crate::ops_entry::ENSURED_FROM_ANNOTATION;
+use crate::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
+use crate::ops_entry::SOURCE_COMMIT_ANNOTATION;
+use crate::providers::ai_utility::AiUtility;
+use crate::providers::ai_utility::ConvoyNames;
+use crate::providers::change_request::observation::ChangeRequestObservationSource;
+use crate::providers::change_request::observation::ChangeRequestRef;
+use crate::providers::change_request::BoundObservations;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::discovery::discover_checkout_with_host_scoped;
+use crate::providers::discovery::run_host_detectors;
+use crate::providers::discovery::status::provider_names_from_registry;
+use crate::providers::discovery::DiscoveryResult;
+use crate::providers::discovery::DiscoveryRuntime;
+use crate::providers::discovery::EnvVars;
+use crate::providers::environment::EnvironmentHandle;
+use crate::providers::forge::observation_error::ObservationError;
+use crate::providers::issue_tracker::IssueProvider;
+use crate::providers::registry::ProviderRegistry;
+use crate::providers::ssh_runner::SshCommandRunner;
+use crate::providers::types::RepoCriteria;
+use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+use crate::providers::ChannelLabel;
+use crate::providers::CommandRunner;
+use crate::regard_lifecycle::RegardLifecycle;
+use crate::regard_lifecycle::SurfaceGestureOutcome;
+use crate::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
+use crate::regard_lifecycle::DEFAULT_REGARD_REFRESH_SECONDS;
+use crate::repo_state::RepoRootState;
+use crate::repo_state::RepoState;
+use crate::repository_inspection::GitRepositoryInspector;
+use crate::repository_inspection::RepositoryContinuity;
+use crate::repository_inspection::RepositoryInspection;
+use crate::repository_inspection::RepositoryInspector;
+use crate::resource_explain::resource_read_envelope;
+use crate::resource_explain::resource_record;
+use crate::resource_explain::run_resource_watch_command;
+use crate::resource_explain::ResourceWatchCommandContext;
+use crate::step::run_step_plan_with_remote_executor;
+use crate::step::RemoteStepBatchRequest;
+use crate::step::RemoteStepExecutor;
+use crate::step::RemoteStepProgressSink;
+use crate::step::StepOutcome;
+use crate::step::StepResolver;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 
@@ -4486,7 +4509,8 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::providers::vcs::{git::GitVcs, VcsInspection};
+        use crate::providers::vcs::git::GitVcs;
+        use crate::providers::vcs::VcsInspection;
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
         let vcs = GitVcs::new(self.discovery.runner.clone());

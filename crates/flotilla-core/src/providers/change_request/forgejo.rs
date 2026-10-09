@@ -334,7 +334,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::issue_tracker::forgejo::ForgejoAuth;
+    use crate::providers::forge::forgejo::ForgejoAuth;
     use crate::providers::ChannelLabel;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;

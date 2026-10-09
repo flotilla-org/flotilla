@@ -7,11 +7,15 @@ use flotilla_protocol::HostName;
 use flotilla_resources::{InMemoryBackend, Repository, RepositorySpec, ResourceBackend};
 
 use super::support::test_meta;
-use crate::change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef};
 use crate::config::ConfigStore;
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::EnvironmentBag;
 use crate::in_process::InProcessDaemon;
-use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag};
-use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::change_request::observation::ChangeRequestObservationSource;
+use crate::providers::change_request::observation::ChangeRequestRef;
+use crate::providers::ChannelLabel;
+use crate::providers::CommandOutput;
+use crate::providers::CommandRunner;
 use crate::testkits::discovery::fake_discovery_with_runner;
 
 #[derive(Default)]

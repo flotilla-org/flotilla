@@ -33,29 +33,19 @@ use super::stalls::*;
 use super::subscriptions::*;
 use super::wake::*;
 use super::*;
+use crate::change_request_observer::ChangeRequestRefresher;
+use crate::event_sink::broadcast_test_sink;
+use crate::issue_observer::IssueRefreshCadence;
+use crate::issue_observer::IssueRefresher;
+use crate::providers::change_request::observation::ChangeRequestRef;
+use crate::providers::forge::github::GithubRateLimit;
+use crate::providers::forge::github::GithubRateLimitKind;
+use crate::providers::forge::github::GithubRetrySource;
+use crate::providers::forge::observation_error::ObservationError;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::testing::fixture_path;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
-use crate::{
-    change_request_observer::ChangeRequestRefresher,
-    event_sink::broadcast_test_sink,
-    issue_observer::{IssueRefreshCadence, IssueRefresher},
-    providers::{
-        change_request::observation::ChangeRequestRef,
-        forge::{
-            github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
-            observation_error::ObservationError,
-        },
-        replay::{test_runner, Masks, Session},
-        testing::fixture_path,
-    },
-};
-use crate::{
-    change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
-    issue_observer::{IssueRefreshCadence, IssueRefresher},
-    providers::forge::observation_error::ObservationError,
-};
 
 #[derive(Clone)]
 struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -421,7 +411,8 @@ async fn observe_actor_source(
 }
 
 async fn observe_claude_hook(backend: &ResourceBackend, wake: &ReconcilerWake, event: &str, now: DateTime<Utc>) {
-    use crate::agents::hooks::{ClaudeCodeParser, HarnessHookParser};
+    use crate::agents::hooks::ClaudeCodeParser;
+    use crate::agents::hooks::HarnessHookParser;
     let parsed = ClaudeCodeParser.parse_event(event, br#"{"session_id":"claude-scenario"}"#).expect("Claude hook");
     let state = match parsed.event_type {
         flotilla_protocol::AgentEventType::Active | flotilla_protocol::AgentEventType::ToolActive => TerminalAttentionState::Working,

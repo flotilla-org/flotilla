@@ -6,14 +6,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{
-        coding_agent::{codex::CodexCodingAgent, CloudAgentService},
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        CommandRunner, ReqwestHttpClient,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::coding_agent::codex::CodexCodingAgent;
+use crate::providers::coding_agent::CloudAgentService;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::CommandRunner;
+use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // ---------------------------------------------------------------------------

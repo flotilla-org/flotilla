@@ -6,15 +6,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{
-        ai_utility::{claude_api::ClaudeApiAiUtility, claude_cli::ClaudeCliAiUtility, AiUtility},
-        coding_agent::{claude::ClaudeCodingAgent, CloudAgentService},
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        CommandRunner, ReqwestHttpClient,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::ai_utility::claude_api::ClaudeApiAiUtility;
+use crate::providers::ai_utility::claude_cli::ClaudeCliAiUtility;
+use crate::providers::ai_utility::AiUtility;
+use crate::providers::coding_agent::claude::ClaudeCodingAgent;
+use crate::providers::coding_agent::CloudAgentService;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::CommandRunner;
+use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // ---------------------------------------------------------------------------

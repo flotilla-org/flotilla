@@ -6,15 +6,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        vcs::{clone::ReferenceCloneStrategy, detection::reference_clone_available, git_worktree::GitWorktreeStrategy},
-        CommandRunner,
-    },
-    vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs},
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::vcs::clone::ReferenceCloneStrategy;
+use crate::providers::vcs::detection::reference_clone_available;
+use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+use crate::providers::CommandRunner;
+use crate::vcs::FlotillaVcs;
+use crate::vcs::GitCheckoutStrategy;
+use crate::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct GitVcsFactory;

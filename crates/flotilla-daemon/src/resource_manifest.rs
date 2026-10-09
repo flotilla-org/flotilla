@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::{charter_store::read_charter_source, vcs::Vcs};
+use flotilla_core::charter_store::read_charter_source;
+use flotilla_core::vcs::Vcs;
 use flotilla_resources::{
     apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, CharterSource,
     ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRecorder, EventRegarding, InputMeta, LeafMaker, ManifestRoot,

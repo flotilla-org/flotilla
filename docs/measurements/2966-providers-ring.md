@@ -2,10 +2,12 @@
 
 Baseline: `faf399ac1d31a4fd726425a1a61dc831d36cccba` (the dispatch base).
 
-Rechecked after rebasing onto `c43a555e6` (paths/daemon-api extraction and leaf routing):
-the current base still has the same 25-module provider SCC, and the rebased
-change has the same five-module SCC with no observer or `in_process` reach.
-New neutral seams import path types directly from `flotilla-paths`.
+Rechecked after rebasing onto `51b145f9e` (paths/daemon-api, leaf routing,
+and dev-only testkits): the current base has a 24-module provider SCC, and the
+rebased change has the same five-module SCC with no observer or `in_process`
+reach. The table below retains the dispatch baseline for comparison with ADR
+0060. New neutral seams import path types directly from `flotilla-paths`;
+test helpers retain the new testkit ownership and import moved types directly.
 
 The same module-graph analysis before and after the moves gives:
 

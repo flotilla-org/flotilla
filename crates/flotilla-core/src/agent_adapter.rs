@@ -11,11 +11,11 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
-use crate::{
-    crew_capabilities::CAPABILITIES_HEADING,
-    discovery_api::EnvironmentBag,
-    providers::{terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
-};
+use crate::crew_capabilities::CAPABILITIES_HEADING;
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::terminal::TerminalEnvVars;
+use crate::providers::ChannelLabel;
+use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 mod fleet_canary;
@@ -2692,10 +2692,9 @@ gpt-6.1-sol · /workspace"
     // must refuse launch rather than silently expose runtime files.
     #[tokio::test]
     async fn runtime_exclusion_handles_existing_patterns_and_refuses_overrides() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         const RUNTIME_PATHS: &[&str] = &[".flotilla/briefs/coder.md", CLAUDE_MANAGED_SETTINGS_PATH];
         for (existing, ignore, overridden, tracks_declarations) in [
             ("previous-pattern", None, false, false),
@@ -2771,10 +2770,9 @@ gpt-6.1-sol · /workspace"
     // exclusion while each repository it holds still proves its own.
     #[tokio::test]
     async fn runtime_exclusion_skips_a_plain_workspace_directory() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         let workspace = tempfile::tempdir().expect("workspace root");
         let runner = Arc::new(ProcessCommandRunner);
         let vcs = FlotillaVcs::new(
@@ -2792,10 +2790,9 @@ gpt-6.1-sol · /workspace"
     // expose runtime files to git add -A. This is the lowest falsifying seam.
     #[tokio::test]
     async fn runtime_exclusion_refuses_discovery_and_write_failures() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         for responses in [
             vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
             vec![Ok("true\n".to_string()), Ok(String::new())],
@@ -2821,10 +2818,9 @@ gpt-6.1-sol · /workspace"
     // any runtime file is written. This example covers the two subprocess edges.
     #[tokio::test]
     async fn preparation_refuses_unavailable_runtime_file_exclusion() {
-        use crate::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
-            vcs::{FlotillaVcs, GitCheckoutStrategy},
-        };
+        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use crate::vcs::FlotillaVcs;
+        use crate::vcs::GitCheckoutStrategy;
         for responses in [
             vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
             vec![Ok("true\n".to_string()), Ok(String::new())],

@@ -12,7 +12,9 @@ use super::{
     EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate,
     ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
 };
-use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::ChannelLabel;
+use crate::providers::CommandOutput;
+use crate::providers::CommandRunner;
 
 fn test_daemon_tool(socket_path: impl Into<PathBuf>) -> EnvironmentTool {
     let socket_path = socket_path.into();
@@ -1187,11 +1189,11 @@ async fn destroy_calls_docker_rm() {
 /// pattern works end-to-end with real factory logic.
 #[tokio::test]
 async fn environment_runner_supports_factory_probe() {
-    use crate::{
-        config::ConfigStore,
-        discovery_api::{EnvironmentAssertion, EnvironmentBag},
-        providers::discovery::{factories::cleat::CleatTerminalPoolFactory, Factory},
-    };
+    use crate::config::ConfigStore;
+    use crate::discovery_api::EnvironmentAssertion;
+    use crate::discovery_api::EnvironmentBag;
+    use crate::providers::discovery::factories::cleat::CleatTerminalPoolFactory;
+    use crate::providers::discovery::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // A runner that succeeds for any docker exec call (simulates cleat present in container)
@@ -1298,10 +1300,13 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
 
     use flotilla_protocol::arg::{flatten, Arg};
 
-    use crate::hop_chain::{
-        environment::DockerEnvironmentHopResolver, remote::RemoteHopResolver, resolver::HopResolver, Hop, HopPlan, ResolutionContext,
-        ResolvedAction,
-    };
+    use crate::hop_chain::environment::DockerEnvironmentHopResolver;
+    use crate::hop_chain::remote::RemoteHopResolver;
+    use crate::hop_chain::resolver::HopResolver;
+    use crate::hop_chain::Hop;
+    use crate::hop_chain::HopPlan;
+    use crate::hop_chain::ResolutionContext;
+    use crate::hop_chain::ResolvedAction;
 
     // ── Mock resolvers ───────────────────────────────────────────────
 
@@ -1641,10 +1646,9 @@ async fn list_backings_rejects_incomplete_identity() {
 #[hegel::test]
 fn provider_selection_is_kind_and_instance_scoped(tc: hegel::TestCase) {
     use super::{host_direct::HostDirectEnvironmentProvider, EnvironmentKind};
-    use crate::providers::{
-        discovery::{ProviderCategory, ProviderDescriptor},
-        registry::ProviderRegistry,
-    };
+    use crate::providers::discovery::ProviderCategory;
+    use crate::providers::discovery::ProviderDescriptor;
+    use crate::providers::registry::ProviderRegistry;
     use hegel::generators as gs;
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let mut registry = ProviderRegistry::new();

@@ -6,14 +6,15 @@ use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        environment::{docker::DockerEnvironmentProvider, EnvironmentProvider},
-        ChannelLabel, CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::environment::docker::DockerEnvironmentProvider;
+use crate::providers::environment::EnvironmentProvider;
+use crate::providers::ChannelLabel;
+use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct DockerEnvironmentFactory;
