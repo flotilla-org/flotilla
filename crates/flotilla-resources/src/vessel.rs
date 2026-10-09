@@ -205,10 +205,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
     }
 }
 
-/// Per-vessel convoy resources (`Vessel`, `Presentation`) share the name
-/// shape `<convoy>-<vessel>`. Resource kinds have separate namespaces, so the
-/// shared shape causes no collision and keeps both resources discoverable
-/// together by name.
+/// Name a convoy Vessel `<convoy>-<vessel>`.
 pub fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
     format!("{convoy_name}-{vessel}")
 }

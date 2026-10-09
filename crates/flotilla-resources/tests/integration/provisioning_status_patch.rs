@@ -3,9 +3,9 @@ use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost,
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, Host, HostCondition, HostSpec,
-    HostStatus, HostStatusPatch, InMemoryBackend, InnerCommandStatus, InputMeta, IntegrationCondition, LandedEvidence, PresentationPhase,
-    PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, Stance, StatusPatch, TerminalSessionPhase,
-    TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
+    HostStatus, HostStatusPatch, InMemoryBackend, InnerCommandStatus, InputMeta, IntegrationCondition, LandedEvidence, ResourceBackend,
+    ResourceError, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase, VesselStatus,
+    VesselStatusPatch,
 };
 
 #[test]
@@ -402,54 +402,6 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     VesselStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Failed);
     assert_eq!(status.message.as_deref(), Some("clone failed"));
-}
-
-#[test]
-fn presentation_status_patch_marks_active_torn_down_and_failed() {
-    let mut status = PresentationStatus::default();
-    let ready_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
-
-    PresentationStatusPatch::MarkActive {
-        presentation_manager: "tmux".to_string(),
-        workspace_ref: "ws-123".to_string(),
-        spec_hash: "hash-abc".to_string(),
-        ready_at,
-    }
-    .apply(&mut status);
-    PresentationStatusPatch::MarkActive {
-        presentation_manager: "tmux".to_string(),
-        workspace_ref: "ws-456".to_string(),
-        spec_hash: "hash-def".to_string(),
-        ready_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
-    }
-    .apply(&mut status);
-    assert_eq!(status.phase, PresentationPhase::Active);
-    assert_eq!(status.observed_presentation_manager.as_deref(), Some("tmux"));
-    assert_eq!(status.observed_workspace_ref.as_deref(), Some("ws-456"));
-    assert_eq!(status.observed_spec_hash.as_deref(), Some("hash-def"));
-    assert_eq!(status.ready_at, Some(ready_at), "an in-place presentation refresh is not a new Active transition");
-    assert_eq!(status.message, None);
-
-    PresentationStatusPatch::MarkTornDown { message: Some("create failed after replace".to_string()) }.apply(&mut status);
-    assert_eq!(status.phase, PresentationPhase::TornDown);
-    assert_eq!(status.observed_presentation_manager, None);
-    assert_eq!(status.observed_workspace_ref, None);
-    assert_eq!(status.observed_spec_hash, None);
-    assert_eq!(status.message.as_deref(), Some("create failed after replace"));
-
-    let reactivated_at = Utc.timestamp_opt(12, 0).single().expect("timestamp");
-    PresentationStatusPatch::MarkActive {
-        presentation_manager: "tmux".to_string(),
-        workspace_ref: "ws-789".to_string(),
-        spec_hash: "hash-ghi".to_string(),
-        ready_at: reactivated_at,
-    }
-    .apply(&mut status);
-    assert_eq!(status.ready_at, Some(reactivated_at), "TornDown to Active is a new transition");
-
-    PresentationStatusPatch::MarkFailed { message: "unknown policy".to_string() }.apply(&mut status);
-    assert_eq!(status.phase, PresentationPhase::Failed);
-    assert_eq!(status.message.as_deref(), Some("unknown policy"));
 }
 
 // #1496: heartbeat descriptions persist with ADR 0047 defaults. Placement keys

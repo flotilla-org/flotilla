@@ -27,7 +27,6 @@ use crate::{
     environment::EnvironmentSpec,
     error::ResourceError,
     labels::LifecycleAuthority,
-    presentation::PresentationSpec,
     resource::{InputMeta, Resource, ResourceObject},
     terminal_session::TerminalSessionSpec,
     vessel::VesselSpec,
@@ -187,8 +186,6 @@ pub enum Actuation {
     PruneTerminalMessages { name: String },
     DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
-    CreatePresentation { meta: InputMeta, spec: PresentationSpec },
-    DeletePresentation { name: String },
     DeleteVessel { name: String },
     DeleteCheckout { name: String },
 }
@@ -615,14 +612,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Err(ResourceError::Conflict { .. }) => Ok(()),
                     Err(error) => Err(error),
                 }
-            }
-            Actuation::CreatePresentation { meta, spec } => {
-                let resolver = backend.using::<crate::Presentation>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
-            }
-            Actuation::DeletePresentation { name } => {
-                let resolver = backend.using::<crate::Presentation>(namespace);
-                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
             Actuation::DeleteVessel { name } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);

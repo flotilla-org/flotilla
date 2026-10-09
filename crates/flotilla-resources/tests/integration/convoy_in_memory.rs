@@ -6,8 +6,8 @@ use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase,
     ConvoyReconciler, Event, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, PlacementPolicy,
-    PlacementPolicySpec, PreparedSnapshotGarbageCollector, Presentation, PresentationSpec, RepositoryKey, RepositorySpec, ResourceBackend,
-    ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
+    PlacementPolicySpec, PreparedSnapshotGarbageCollector, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, Vessel,
+    VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
     PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
 use tokio::time::{timeout, Duration};
@@ -326,7 +326,6 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
-    let presentations = backend.clone().using::<Presentation>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let workflow_snapshot_name = "workflow-snapshot-012345abcdef";
     let placement_snapshot_name = "placement-snapshot-012345abcdef";
@@ -380,30 +379,6 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
         )
         .await
         .expect("task workspace create should succeed");
-    presentations
-        .create(
-            &InputMeta::builder()
-                .name("convoy-delete-implement".to_string())
-                .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]
-                        .into_iter()
-                        .collect(),
-                )
-                .build(),
-            &PresentationSpec {
-                convoy_ref: "convoy-delete".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "implement".to_string(),
-                process_selector: [
-                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (VESSEL_LABEL.to_string(), "implement".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            },
-        )
-        .await
-        .expect("presentation create should succeed");
     checkouts
         .create(
             &InputMeta::builder()
@@ -461,56 +436,6 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
         )
         .await
         .expect("observed task workspace create should succeed");
-    presentations
-        .create(
-            &InputMeta::builder()
-                .name("convoy-delete-adopted".to_string())
-                .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "adopted".to_string())]
-                        .into_iter()
-                        .collect(),
-                )
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &PresentationSpec {
-                convoy_ref: "convoy-delete".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "adopted".to_string(),
-                process_selector: [
-                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (VESSEL_LABEL.to_string(), "adopted".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            },
-        )
-        .await
-        .expect("adopted presentation create should succeed");
-    presentations
-        .create(
-            &InputMeta::builder()
-                .name("convoy-delete-observed".to_string())
-                .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "observed".to_string())]
-                        .into_iter()
-                        .collect(),
-                )
-                .build()
-                .with_lifecycle_authority(LifecycleAuthority::Observed),
-            &PresentationSpec {
-                convoy_ref: "convoy-delete".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "observed".to_string(),
-                process_selector: [
-                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (VESSEL_LABEL.to_string(), "observed".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-            },
-        )
-        .await
-        .expect("observed presentation create should succeed");
 
     let loop_task = tokio::spawn(
         ControllerLoop {
@@ -577,26 +502,6 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
             .get("convoy-delete-observed")
             .await
             .expect("observed task workspace should remain")
-            .metadata
-            .lifecycle_authority()
-            .expect("authority label should parse"),
-        Some(LifecycleAuthority::Observed)
-    );
-    assert_eq!(
-        presentations
-            .get("convoy-delete-adopted")
-            .await
-            .expect("adopted presentation should remain")
-            .metadata
-            .lifecycle_authority()
-            .expect("authority label should parse"),
-        Some(LifecycleAuthority::Adopted)
-    );
-    assert_eq!(
-        presentations
-            .get("convoy-delete-observed")
-            .await
-            .expect("observed presentation should remain")
             .metadata
             .lifecycle_authority()
             .expect("authority label should parse"),

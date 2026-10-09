@@ -10,6 +10,33 @@ use flotilla_resources::{
 };
 use serde_json::Value;
 
+// #2915 step 5: Presentation was purged in r617 and is now retired.
+// Keep this allowance only until the stored corpus is refreshed; never
+// regenerate the corpus to accommodate retirement.
+fn retired_corpus_files(generation: &str) -> BTreeSet<String> {
+    if generation == "r355" {
+        BTreeSet::from(["Presentation.json".to_string()])
+    } else {
+        BTreeSet::new()
+    }
+}
+
+// The allowance is confined to the recorded r355 Presentation file, while
+// runtime decoding refuses the retired kind. This finite mapping is corpus glue.
+#[test]
+fn presentation_retirement_is_only_a_corpus_allowance() {
+    for generation in ["", "r354", "r355", "r356", "r355-extra"] {
+        let expected = if generation == "r355" { vec!["Presentation.json".to_string()] } else { Vec::new() };
+        assert_eq!(retired_corpus_files(generation), expected.into_iter().collect());
+    }
+    assert!(!REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == "Presentation"));
+    let documents: Vec<Value> =
+        serde_json::from_str(include_str!("../fixtures/stored-records/r355/Presentation.json")).expect("unchanged retired corpus");
+    for document in documents {
+        assert!(decode_stored_resource_document(&document).is_err(), "retired Presentation has no runtime decoder");
+    }
+}
+
 #[test]
 fn frozen_ensure_admission_snapshot_stays_decodable() {
     // A fixed embedded shape supplements the deployed corpus until the next
@@ -48,7 +75,7 @@ fn deployed_stored_records_still_decode() {
         // ManifestRoot, CrewDefaults, ImageLayer, ImageBuild (#2728), Message (#2716) and FleetDesignation (#2718) were introduced
         // after this deployed generation, as were DispatchHold and DispatchDeployment (#2782), ForgeRead (#2868),
         // and ForgeReadHeartbeat (#2928). Remove exemptions when the corpus is refreshed after the next fleet roll (ADR 0047).
-        let expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
+        let mut expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
             .iter()
             .filter(|kind| {
                 !matches!(
@@ -67,6 +94,7 @@ fn deployed_stored_records_still_decode() {
             })
             .map(|kind| format!("{}.json", kind.kind))
             .collect();
+        expected.extend(retired_corpus_files(generation.file_name().and_then(|name| name.to_str()).expect("UTF-8 generation")));
         let actual: BTreeSet<_> = fs::read_dir(&generation)
             .expect("read generation")
             .map(|entry| entry.expect("read corpus file").file_name().into_string().expect("UTF-8 corpus file name"))

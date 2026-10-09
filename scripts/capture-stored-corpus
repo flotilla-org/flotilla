@@ -19,7 +19,7 @@ KINDS = (
     "Artifact", "ChangeRequest", "Issue", "Checkout", "Clone", "Convoy",
     "ConvoyEnsure", "CredentialGrant", "CredentialSpec", "CrewImageBaseline",
     "Demand", "DispatchObservation", "Environment", "Event", "Forge",
-    "FulfilmentKind", "Host", "PlacementPolicy", "Presentation", "Project",
+    "FulfilmentKind", "Host", "PlacementPolicy", "Project",
     "Regard", "Repository", "TerminalSession", "Usage", "Vessel",
     "WorkflowTemplate",
 )

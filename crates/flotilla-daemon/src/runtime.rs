@@ -713,17 +713,6 @@ impl DaemonRuntime {
         )
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        // The preceding quarantine scan isolates undecodable stored rows before
-        // typed listing. No Presentation producer runs before or after retirement;
-        // an update conflict gets one fresh read and retry. Other errors abort
-        // startup rather than silently skipping rows. Only the retired finalizer
-        // is released; unrelated finalizers remain visible in the cleanup count.
-        phase(
-            "purge_retired_presentations",
-            flotilla_resources::purge_retired_presentations(&daemon.resource_backend(), &options.namespace),
-        )
-        .await
-        .map_err(|error| format!("purge retired Presentations: {error}"))?;
         phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
@@ -13894,7 +13883,6 @@ mod tests {
                 passthrough_registry(),
                 None,
                 daemon.local_host_id().expect("host").to_string(),
-                None,
                 "host-direct-test".into(),
             ));
             let runtime = DockerControllerRuntime { state };

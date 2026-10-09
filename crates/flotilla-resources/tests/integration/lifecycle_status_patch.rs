@@ -6,9 +6,9 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, LandingCredentialScope,
-    PlacementStatus, PresentationPhase, PresentationStatus, PresentationStatusPatch, RepositoryKey, Stance, StatusPatch,
-    TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
-    VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    PlacementStatus, RepositoryKey, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch,
+    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 #[test]
@@ -45,7 +45,6 @@ const NONE: &[LifecycleClass] = &[];
 const DUPLICATE: &[LifecycleClass] = &[LifecycleClass::Duplicate];
 const CONTINUATION: &[LifecycleClass] = &[LifecycleClass::Continuation];
 const NEW_ATTEMPT: &[LifecycleClass] = &[LifecycleClass::NewAttempt];
-const DUPLICATE_NEW_ATTEMPT: &[LifecycleClass] = &[LifecycleClass::Duplicate, LifecycleClass::NewAttempt];
 const DUPLICATE_RESETTLEMENT: &[LifecycleClass] = &[LifecycleClass::Duplicate, LifecycleClass::Resettlement];
 const DUPLICATE_CONTINUATION_RESETTLEMENT: &[LifecycleClass] =
     &[LifecycleClass::Duplicate, LifecycleClass::Continuation, LifecycleClass::Resettlement];
@@ -137,9 +136,6 @@ define_patch_kinds! {
     VesselMarkInterrupted => NONE,
     VesselMarkLost => NONE,
     VesselMarkFailed => NONE,
-    PresentationMarkActive => DUPLICATE_NEW_ATTEMPT,
-    PresentationMarkTornDown => NONE,
-    PresentationMarkFailed => NONE,
 }
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
@@ -232,14 +228,6 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
         VesselStatusPatch::StageLandingCredentials { .. } => PatchKind::VesselStageLandingCredentials,
         VesselStatusPatch::MarkLost { .. } => PatchKind::VesselMarkLost,
         VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
-    }
-}
-
-fn presentation_patch_kind(patch: &PresentationStatusPatch) -> PatchKind {
-    match patch {
-        PresentationStatusPatch::MarkActive { .. } => PatchKind::PresentationMarkActive,
-        PresentationStatusPatch::MarkTornDown { .. } => PatchKind::PresentationMarkTornDown,
-        PresentationStatusPatch::MarkFailed { .. } => PatchKind::PresentationMarkFailed,
     }
 }
 
@@ -391,15 +379,6 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
             message: None,
         }),
         PatchKind::VesselMarkProvisioning
-    );
-    assert_eq!(
-        presentation_patch_kind(&PresentationStatusPatch::MarkActive {
-            presentation_manager: "tmux".to_string(),
-            workspace_ref: "workspace-a".to_string(),
-            spec_hash: "hash-a".to_string(),
-            ready_at: ts(30),
-        }),
-        PatchKind::PresentationMarkActive
     );
 }
 
@@ -883,24 +862,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 (before, convoy_timestamps(&status))
             },
         },
-        LifecycleCase {
-            name: "presentation active",
-            kind: PatchKind::PresentationMarkActive,
-            exercise: || {
-                let mut status =
-                    PresentationStatus { phase: PresentationPhase::Active, ready_at: Some(ts(10)), ..PresentationStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.ready_at, finished_at: None };
-                let patch = PresentationStatusPatch::MarkActive {
-                    presentation_manager: "tmux".to_string(),
-                    workspace_ref: "workspace-a".to_string(),
-                    spec_hash: "hash-a".to_string(),
-                    ready_at: ts(30),
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.ready_at, finished_at: None };
-                (before, after)
-            },
-        },
     ];
 
     assert_case_coverage(LifecycleClass::Duplicate, &cases);
@@ -1097,52 +1058,32 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
 
 #[test]
 fn new_attempt_transitions_replace_attempt_timestamps() {
-    let cases = [
-        LifecycleCase {
-            name: "terminal session restart",
-            kind: PatchKind::TerminalMarkStarting,
-            exercise: || {
-                let mut status = TerminalSessionStatus {
-                    phase: TerminalSessionPhase::Stopped,
-                    started_at: Some(ts(10)),
-                    stopped_at: Some(ts(20)),
-                    ..TerminalSessionStatus::default()
-                };
-                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                apply_and_replay(&mut status, &TerminalSessionStatusPatch::MarkStarting);
-                let patch = TerminalSessionStatusPatch::MarkRunning {
-                    configured_limits: None,
-                    session_id: "session-b".to_string(),
-                    pid: Some(43),
-                    started_at: ts(30),
-                    crew: None,
-                    launch_command: "bash".to_string(),
-                    delivered_message_id: None,
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
-                (before, after)
-            },
+    let cases = [LifecycleCase {
+        name: "terminal session restart",
+        kind: PatchKind::TerminalMarkStarting,
+        exercise: || {
+            let mut status = TerminalSessionStatus {
+                phase: TerminalSessionPhase::Stopped,
+                started_at: Some(ts(10)),
+                stopped_at: Some(ts(20)),
+                ..TerminalSessionStatus::default()
+            };
+            let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
+            apply_and_replay(&mut status, &TerminalSessionStatusPatch::MarkStarting);
+            let patch = TerminalSessionStatusPatch::MarkRunning {
+                configured_limits: None,
+                session_id: "session-b".to_string(),
+                pid: Some(43),
+                started_at: ts(30),
+                crew: None,
+                launch_command: "bash".to_string(),
+                delivered_message_id: None,
+            };
+            apply_and_replay(&mut status, &patch);
+            let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
+            (before, after)
         },
-        LifecycleCase {
-            name: "presentation realization",
-            kind: PatchKind::PresentationMarkActive,
-            exercise: || {
-                let mut status =
-                    PresentationStatus { phase: PresentationPhase::TornDown, ready_at: Some(ts(10)), ..PresentationStatus::default() };
-                let before = LifecycleTimestamps { started_at: status.ready_at, finished_at: None };
-                let patch = PresentationStatusPatch::MarkActive {
-                    presentation_manager: "tmux".to_string(),
-                    workspace_ref: "workspace-b".to_string(),
-                    spec_hash: "hash-b".to_string(),
-                    ready_at: ts(30),
-                };
-                apply_and_replay(&mut status, &patch);
-                let after = LifecycleTimestamps { started_at: status.ready_at, finished_at: None };
-                (before, after)
-            },
-        },
-    ];
+    }];
 
     assert_case_coverage(LifecycleClass::NewAttempt, &cases);
     for case in &cases {

@@ -39,11 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crd(&backend, include_str!("../src/crds/workflow_template.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../src/crds/convoy.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../src/crds/vessel.crd.yaml")).await?;
-    ensure_crd(&backend, include_str!("../src/crds/presentation.crd.yaml")).await?;
 
     let backend = ResourceBackend::Http(backend);
-    // ADR 0047: remove this cleanup one fleet roll after #2915 step 3.
-    flotilla_resources::purge_retired_presentations(&backend, &namespace).await?;
     let convoys = backend.clone().using::<Convoy>(&namespace);
     let templates = backend.definitions::<WorkflowTemplate>(&namespace);
     let vessels = backend.clone().using::<Vessel>(&namespace);
