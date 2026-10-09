@@ -1,18 +1,29 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use flotilla_protocol::qualified_path::HostId;
+use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_resources::{
-    ChangeRequestStatus, ConvoySpec, ConvoyStatus, CrewWorkState, InMemoryBackend, Selector, SystemClock, TerminalSessionPhase,
-    TerminalSessionSpec, TerminalSessionStatus, WorkState, WorkflowSnapshot,
+    ChangeRequestStatus, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, CrewWorkState, InMemoryBackend,
+    InputMeta, ResourceBackend, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, WorkState, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use tokio::sync::RwLock;
 
-use super::*;
-use crate::{
-    change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef, ChangeRequestRefreshCadence, ChangeRequestRefresher},
-    environment_manager::EnvironmentManager,
-    event_sink::RecordingEventSink,
-    providers::{change_request::ObservationError, discovery::test_support::fake_discovery},
+use crate::change_request_observer::{
+    ChangeRequestObservationSource, ChangeRequestRef, ChangeRequestRefreshCadence, ChangeRequestRefresher,
 };
+use crate::config::ConfigStore;
+use crate::environment_manager::EnvironmentManager;
+use crate::event_sink::RecordingEventSink;
+use crate::in_process::checkout_providers::CheckoutProviders;
+use crate::in_process::crew_ops::{frame_crew_message, CrewService};
+use crate::in_process::{ConvoyPhase, CrewMessageSender, WorkCredentialReconciler};
+use crate::leaf_engine::LeafSubscriptionTable;
+use crate::providers::change_request::ObservationError;
+use crate::providers::discovery::test_support::fake_discovery;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;

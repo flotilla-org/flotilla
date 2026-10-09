@@ -1,4 +1,19 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use chrono::Utc;
+use flotilla_protocol::HostName;
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta, ResourceBackend,
+    Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, TurnDeliveryRung, VesselRequirement, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+
+use super::support::{resume_staging_fixture, test_meta, RecordingWorkCredentials};
+use crate::config::ConfigStore;
+use crate::in_process::{input_meta_from_resource, InProcessDaemon};
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn turn_delivery_accepts_intent_when_terminal_changes_during_staging() {

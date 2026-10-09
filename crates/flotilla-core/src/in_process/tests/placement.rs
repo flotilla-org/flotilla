@@ -1,4 +1,28 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use chrono::Utc;
+use flotilla_protocol::{HostName, NodeId};
+use flotilla_resources::{
+    Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, Host as ResourceHost,
+    HostCondition, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta,
+    PlacementPolicy, PlacementPolicySpec, Project, ProjectSpec, ResourceBackend, ResourceProvenance, Selector,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+};
+
+use super::support::{
+    create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, placement_policy, test_meta,
+    trusted_codex_workflow,
+};
+use crate::config::ConfigStore;
+use crate::in_process::convoy_admission::{
+    default_convoy_placement_policy, resolve_workflow_credentials, validate_workflow_agent_adapters, validate_workflow_credentials,
+};
+use crate::in_process::{placement_actuator_host_ref, placement_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn default_remote_placement_resolves_replicated_credentials_before_admission() {

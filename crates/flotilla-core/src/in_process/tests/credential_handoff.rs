@@ -1,4 +1,19 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use flotilla_protocol::{CrewCommandContext, HostName};
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InMemoryBackend, RepositoryKey,
+    ResourceBackend, Selector, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    Vessel, VesselRequirement, CREDENTIAL_REFS_ANNOTATION,
+};
+
+use super::support::{test_meta, SessionStagingProbe};
+use crate::config::ConfigStore;
+use crate::in_process::crew_ops::terminal_meta_with_vessel_credentials;
+use crate::in_process::{InProcessDaemon, TerminalSessionIdentity, CREDENTIAL_SCOPES_ANNOTATION};
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {

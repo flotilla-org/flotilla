@@ -1,4 +1,20 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use flotilla_protocol::HostName;
+use flotilla_resources::{
+    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoySpec,
+    ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, ResourceBackend, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+
+use super::support::{resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
+use crate::config::ConfigStore;
+use crate::in_process::crew_ops::{ConvoyResumeOutcome, CrewSupervisionRequest};
+use crate::in_process::{input_meta_from_resource, InProcessDaemon};
+use crate::providers::discovery::test_support::fake_discovery;
 
 // Working crews already own staged credentials. Operator input is admitted as
 // durable intent; ordinary attention changes cannot fabricate its delivery receipt.

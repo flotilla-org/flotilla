@@ -1,4 +1,18 @@
-use super::*;
+use std::sync::Arc;
+use std::time::Duration;
+
+use flotilla_protocol::HostName;
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InMemoryBackend,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceBackend,
+};
+
+use super::support::test_meta;
+use crate::config::ConfigStore;
+use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
+use crate::in_process::InProcessDaemon;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::discovery::test_support::{fake_discovery, FakeChangeRequest, FakeVcsFactory, FakeVcsState};
 
 #[tokio::test]
 async fn checkout_vcs_discovery_is_cached_per_checkout() {

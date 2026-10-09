@@ -1,7 +1,32 @@
 //! Shared scenario fixtures and stand-ins for credential-controller and forge I/O.
 
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::HostName;
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
+    EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
+    ResourceObject, Selector, TerminalAttention, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+};
+
+use crate::config::ConfigStore;
 use crate::in_process::dispatch_board::tests::board;
+use crate::in_process::{input_meta_from_resource, InProcessDaemon, WorkCredentialReconciler};
+use crate::path_context::ExecutionEnvironmentPath;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::discovery::test_support::fake_discovery;
+use crate::providers::discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
+use crate::providers::issue_tracker::IssueProvider;
+use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
 
 pub(super) struct RecordingWorkCredentials {
     pub(super) backend: ResourceBackend,

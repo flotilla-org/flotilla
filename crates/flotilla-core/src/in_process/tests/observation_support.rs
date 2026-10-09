@@ -1,6 +1,19 @@
 //! REST observation fixture shared by admission, completion, branch, and cooldown scenarios.
 
-use super::*;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use flotilla_protocol::HostName;
+use flotilla_resources::{InMemoryBackend, Repository, RepositoryKey, RepositorySpec, ResourceBackend};
+
+use super::support::test_meta;
+use crate::config::ConfigStore;
+use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
+use crate::in_process::InProcessDaemon;
+use crate::providers::discovery::test_support::fake_discovery;
+use crate::providers::{CommandOutput, CommandRunner};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {

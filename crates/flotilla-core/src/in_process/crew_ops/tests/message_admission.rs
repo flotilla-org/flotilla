@@ -1,4 +1,19 @@
-use super::*;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::{HostName, ResourceRef};
+use flotilla_resources::{
+    apply_status_patch as apply_resource_status_patch, Convoy as ResourceConvoy, ConvoyStatusPatch, CrewCompletionPending,
+    CrewMessageSender, CrewWorkPhase, InMemoryBackend, InputMeta, ResourceBackend, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+};
+
+use super::{fixture, StagingProbe};
+use crate::config::ConfigStore;
+use crate::in_process::WorkCredentialReconciler;
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn turn_admission_returns_the_canonical_suppressed_message() {

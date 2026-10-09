@@ -1,4 +1,35 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::result_set::ConvoyChangeRequest;
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
+use flotilla_resources::{
+    change_request_record_name, BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
+    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle,
+    CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, ImageAcquisitionCost, InMemoryBackend, InputMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
+    ResourceBackend, ResourceObject, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+};
+
+use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
+use crate::admission::AvailableSpaceProbe;
+use crate::config::ConfigStore;
+use crate::daemon::DaemonHandle;
+use crate::in_process::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
+use crate::in_process::{
+    ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, issue_source_for_subject, prepared_snapshot_name,
+    CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition,
+};
+use crate::providers::discovery::test_support::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
+use crate::providers::testing::MockRunner;
+use crate::providers::types::ChangeRequest;
+use crate::repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
 
 #[tokio::test]
 async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credential() {

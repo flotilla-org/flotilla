@@ -1,4 +1,22 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use chrono::Utc;
+use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta,
+    ResourceBackend, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+
+use super::support::{
+    claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
+};
+use crate::config::ConfigStore;
+use crate::daemon::DaemonHandle;
+use crate::in_process::InProcessDaemon;
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn crew_fail_requires_operator_force() {

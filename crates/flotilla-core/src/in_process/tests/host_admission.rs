@@ -1,4 +1,21 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
+use std::sync::Arc;
+
+use chrono::Utc;
+use flotilla_protocol::{HostName, PlacementDecision, PlacementTargetHost};
+use flotilla_resources::{
+    CapabilityNeed, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
+    FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
+    WorkflowTemplateSpec, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+};
+
+use super::support::{create_identity_convoy, placement_policy, test_meta};
+use crate::config::ConfigStore;
+use crate::in_process::convoy_admission::{allocate_convoy_generation, convoy_record_name, parse_role_address, RoleAddress};
+use crate::in_process::{placement_target_host, resolve_local_convoy_name, InProcessDaemon};
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[test]
 fn convoy_role_addresses_reject_malformed_values() {

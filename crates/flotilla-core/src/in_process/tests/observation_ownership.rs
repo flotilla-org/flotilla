@@ -1,4 +1,22 @@
-use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::HostName;
+use flotilla_resources::{
+    ConvoyRepositorySpec, Host as ResourceHost, HostSpec, HostStatus, InMemoryBackend, InputMeta, Project, ProjectSpec, Repository,
+    RepositorySpec, ResourceBackend,
+};
+
+use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
+use super::support::{test_meta, SuspendedBoardProvider};
+use crate::change_request_observer::ChangeRequestRef;
+use crate::config::ConfigStore;
+use crate::in_process::InProcessDaemon;
+use crate::providers::change_request::ChangeRequestTracker;
+use crate::providers::discovery::test_support::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
+use crate::providers::types::ChangeRequest;
 
 // #2868: three daemons sharing a Project poll its source once per pass.
 // Nonowners obtain board facts through real resource replication; explicit

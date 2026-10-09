@@ -1,4 +1,15 @@
-use super::*;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use flotilla_protocol::HostName;
+use flotilla_resources::{
+    CrewSource, CrewSpec, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend, VesselRequirement, WorkflowTemplateSpec,
+};
+
+use super::support::{create_docker_placement, test_meta};
+use crate::config::ConfigStore;
+use crate::in_process::InProcessDaemon;
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image() {

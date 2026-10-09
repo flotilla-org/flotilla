@@ -1,4 +1,27 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::{CrewCommandContext, HostName};
+use flotilla_resources::{
+    change_request_record_name, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec,
+    ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta,
+    Repository, RepositorySpec, ResourceBackend, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement,
+    VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+
+use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
+use super::support::{test_meta, BatchedObservationRunner};
+use crate::change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef};
+use crate::config::ConfigStore;
+use crate::in_process::{forge_service_matches, CrewCompletionRefusalCause, InProcessDaemon};
+use crate::providers::discovery::test_support::fake_discovery_with_runner;
+use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag};
 
 // #2585: the real convoy resolver shares proven branch absence across callers
 // while preserving ordered repository selection and refreshing after five minutes.

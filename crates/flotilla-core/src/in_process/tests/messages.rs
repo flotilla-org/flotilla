@@ -1,4 +1,18 @@
-use super::*;
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use chrono::Utc;
+use flotilla_protocol::{CommandAction, HostName, NodeId};
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InMemoryBackend, ResourceBackend, ResourceError,
+};
+
+use super::support::test_meta;
+use crate::config::ConfigStore;
+use crate::in_process::convoy_admission::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+use crate::in_process::crew_ops::{convoy_message_address, convoy_sender_address};
+use crate::in_process::{retry_resource_apply, InProcessDaemon};
+use crate::providers::discovery::test_support::fake_discovery;
 
 // #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
 // successful reads never emit fallback diagnostics. Glue: exhaust the three read outcomes.

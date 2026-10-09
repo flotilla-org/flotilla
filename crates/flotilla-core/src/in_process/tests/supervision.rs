@@ -1,4 +1,22 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::{HostName, NodeId};
+use flotilla_resources::{
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta,
+    ResourceBackend, Selector, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+use futures::{FutureExt, StreamExt};
+
+use super::support::test_meta;
+use crate::config::ConfigStore;
+use crate::in_process::crew_ops::queue_pending_crew_message;
+use crate::in_process::InProcessDaemon;
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn operator_brief_survives_a_racing_nudge_until_delivery() {

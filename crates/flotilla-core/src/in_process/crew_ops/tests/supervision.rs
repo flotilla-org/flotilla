@@ -1,4 +1,21 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_protocol::{CrewCommandContext, PrincipalRef, ResourceRef};
+use flotilla_resources::{
+    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase,
+    ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, HoldAct, InMemoryBackend, InputMeta, ResourceBackend,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
+};
+use tokio::sync::RwLock;
+
+use super::fixture;
+use crate::in_process::crew_ops::{CrewService, CrewSupervisionRequest, ResolvedCrewContext};
+use crate::in_process::{Vessel, WorkCredentialReconciler};
 
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {

@@ -1,4 +1,23 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use chrono::Utc;
+use flotilla_protocol::{HostName, NodeId};
+use flotilla_resources::{
+    ConvoyRepositorySpec, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
+    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+    Host as ResourceHost, HostSpec, HostStatus, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
+    RepositoryTrust, ResourceBackend, Selector, VesselRequirement, WorkflowTemplateSpec,
+};
+
+use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
+use crate::agent_adapter::CapabilityTable;
+use crate::config::ConfigStore;
+use crate::in_process::convoy_admission::{
+    resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
+};
+use crate::in_process::InProcessDaemon;
+use crate::providers::discovery::test_support::fake_discovery;
 
 #[tokio::test]
 async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {
