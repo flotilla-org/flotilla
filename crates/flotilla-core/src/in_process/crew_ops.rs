@@ -740,11 +740,6 @@ impl CrewService {
             .into_iter()
             .filter_map(|demand| credential_refresh_alert_for_vessel(&demand, &context.convoy, &context.vessel))
             .collect::<Vec<_>>();
-        let mut inbox_messages: HashMap<String, Vec<_>> = HashMap::new();
-        for message in super::read_projections::crew_message_views(&self.resource_backend, &context.namespace).await? {
-            inbox_messages.entry(message.current_receiver.as_ref().unwrap_or(&message.receiver).clone()).or_default().push(message);
-        }
-        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let crew_work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&context.vessel));
         let loss_reason =
             match self.resource_backend.including_replicas::<flotilla_resources::Vessel>(&context.namespace).get(&context.vessel_ref).await
@@ -783,12 +778,6 @@ impl CrewService {
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
                 CrewListMember::builder()
-                    .messages(
-                        inbox_messages
-                            .get(&crate::leaf_engine::crew_role_address(project, &context.convoy, &context.vessel, &process.role))
-                            .cloned()
-                            .unwrap_or_default(),
-                    )
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())

@@ -1865,7 +1865,6 @@ mod tests {
                 vessel_ref: "convoy-a-implement".into(),
                 vessel: "implement".into(),
                 members: vec![CrewListMember {
-                    messages: Vec::new(),
                     role: "coder".into(),
                     kind: "agent".into(),
                     state: "active".into(),

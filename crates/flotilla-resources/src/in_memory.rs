@@ -27,6 +27,8 @@ type StoreKey = (String, String, String, String);
 #[builder(builder_type(vis = "pub(in crate::in_memory)"))]
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
+    #[cfg(feature = "test-support")]
+    read_counts: Option<Arc<std::sync::Mutex<BTreeMap<String, usize>>>>,
     replicas: Arc<Mutex<ReplicaState>>,
     durable_replicas: Option<crate::SqliteBackend>,
     generation: Option<String>,
@@ -126,6 +128,30 @@ impl Default for ResourceStore {
 }
 
 impl InMemoryBackend {
+    /// Enable timing-independent read-cost assertions on this backend and its clones.
+    #[cfg(feature = "test-support")]
+    pub fn with_read_counts(mut self) -> Self {
+        self.read_counts = Some(Arc::default());
+        self
+    }
+
+    /// Counts objects decoded by get, list and indexed queries, by resource kind.
+    #[cfg(feature = "test-support")]
+    pub fn read_counts(&self) -> BTreeMap<String, usize> {
+        self.read_counts.as_ref().map(|counts| counts.lock().expect("read counts").clone()).unwrap_or_default()
+    }
+
+    fn count_read<T: Resource>(&self, count: usize) {
+        #[cfg(feature = "test-support")]
+        {
+            if let Some(counts) = &self.read_counts {
+                *counts.lock().expect("read counts").entry(T::API_PATHS.kind.into()).or_default() += count;
+            }
+        }
+        #[cfg(not(feature = "test-support"))]
+        let _ = count;
+    }
+
     pub(crate) async fn query_messages(
         &self,
         namespace: &str,
@@ -166,12 +192,15 @@ impl InMemoryBackend {
                 }
             }
         }
+        self.count_read::<crate::Message>(items.len());
         Ok(items)
     }
 
     pub fn observed() -> Self {
         Self {
             stores: Arc::default(),
+            #[cfg(feature = "test-support")]
+            read_counts: None,
             replicas: Arc::default(),
             durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
@@ -199,6 +228,8 @@ impl InMemoryBackend {
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
         Self {
             stores: Arc::default(),
+            #[cfg(feature = "test-support")]
+            read_counts: None,
             replicas: Arc::default(),
             durable_replicas: None,
             generation: None,
@@ -212,6 +243,8 @@ impl InMemoryBackend {
     pub fn observed_with_event_retention(event_retention: EventRetention) -> Self {
         Self {
             stores: Arc::default(),
+            #[cfg(feature = "test-support")]
+            read_counts: None,
             replicas: Arc::default(),
             durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
@@ -357,6 +390,7 @@ impl InMemoryBackend {
                 });
             }
         }
+        self.count_read::<T>(items.len());
         Ok(items)
     }
 
@@ -391,6 +425,7 @@ impl InMemoryBackend {
                 },
             ));
         }
+        self.count_read::<T>(items.len());
         items.sort_by(|(left, _), (right, _)| left.cmp(right));
         Ok(items.into_iter().map(|(_, item)| item).collect())
     }
@@ -700,6 +735,7 @@ impl InMemoryBackend {
     pub(crate) async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         self.with_store::<T, _>(namespace, |store| {
             let value = store.objects.get(name).cloned().ok_or_else(|| ResourceError::not_found(name))?;
+            self.count_read::<T>(1);
             Self::decode_object::<T>(value)
         })
         .await
@@ -790,6 +826,7 @@ impl InMemoryBackend {
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         self.with_store::<T, _>(namespace, |store| {
+            self.count_read::<T>(store.objects.len());
             let mut items = Vec::with_capacity(store.objects.len());
             for value in store.objects.values().cloned() {
                 items.push(Self::decode_object::<T>(value)?);
@@ -810,6 +847,7 @@ impl InMemoryBackend {
         }
 
         self.with_store::<T, _>(namespace, |store| {
+            self.count_read::<T>(store.objects.len());
             let mut items = Vec::new();
             for value in store.objects.values().cloned() {
                 let object = Self::decode_object::<T>(value)?;
