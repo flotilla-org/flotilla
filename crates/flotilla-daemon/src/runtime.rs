@@ -13883,7 +13883,6 @@ mod tests {
                 passthrough_registry(),
                 None,
                 daemon.local_host_id().expect("host").to_string(),
-                None,
                 "host-direct-test".into(),
             ));
             let runtime = DockerControllerRuntime { state };
