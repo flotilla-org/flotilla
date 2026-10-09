@@ -6,23 +6,6 @@ use std::{
 use flotilla_protocol::NodeId;
 use flotilla_resources::{ChangeRequest, Issue, ReadResourceObject, ResourceObject, ResourceProvenance};
 
-pub(super) fn apply_read_event<T: flotilla_resources::Resource>(
-    event: flotilla_resources::ReadWatchEvent<T>,
-    objects: &mut HashMap<String, ResourceObject<T>>,
-) {
-    match event {
-        flotilla_resources::ReadWatchEvent::Added(item) | flotilla_resources::ReadWatchEvent::Modified(item) => {
-            objects.insert(item.object.metadata.name.clone(), item.object);
-        }
-        flotilla_resources::ReadWatchEvent::Deleted(item) => {
-            objects.remove(&item.object.metadata.name);
-        }
-        flotilla_resources::ReadWatchEvent::DeletedByName { tombstone, .. } => {
-            objects.remove(&tombstone.name);
-        }
-    }
-}
-
 pub(super) type ChangeRequestSources = HashMap<String, BTreeMap<Option<NodeId>, ResourceObject<ChangeRequest>>>;
 
 pub(super) fn resource_source(provenance: &ResourceProvenance) -> Option<NodeId> {

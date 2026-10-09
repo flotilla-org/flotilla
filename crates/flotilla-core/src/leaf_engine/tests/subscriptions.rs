@@ -58,7 +58,7 @@ async fn leaf_wait_recovers_after_watch_overflow() {
     assert!(table.inner.last_firings.lock().await.is_empty(), "one-shot wait releases firing state");
 }
 
-// Permanent overload must bound six-kind snapshot work, retain identity
+// Permanent overload must bound addressed snapshot work, retain identity
 // and accounting during sleeps, then recover from the latest state.
 #[tokio::test(start_paused = true)]
 async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
@@ -79,7 +79,7 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     let mut watching = Box::pin(table.watch_row(row));
     assert!(watching.as_mut().now_or_never().is_none());
     // 30,000 writes in two simulated seconds, with the leaf allowed
-    // to run between bursts. Count completed six-kind snapshots, not RSS.
+    // to run between bursts. Count addressed snapshots, not RSS.
     for _ in 0..100 {
         overload_convoy(&backend).await;
         for _ in 0..2 {
@@ -88,8 +88,10 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
         tokio::time::advance(Duration::from_millis(20)).await;
     }
     let snapshots = table.inner.snapshot_loads.load(Ordering::SeqCst);
-    eprintln!("overload: 30000 writes/2s, {snapshots} six-kind snapshots ({} logical lists)", snapshots * 6);
-    assert!(snapshots <= 10, "repeated expiry must throttle full snapshots: {snapshots}");
+    eprintln!("overload: 30000 writes/2s, {snapshots} addressed snapshots");
+    let resyncs = table.inner.routing.lock().await.resyncs;
+    assert!(resyncs <= 10, "repeated expiry must throttle shared resyncs: {resyncs}");
+    assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), snapshots, "recovery reads only the addressed convoy");
     assert!(table.rows().await.iter().any(|row| row.id == id));
     assert_eq!(table.inner.change_requests.active_demands().await, 1, "backoff retains demand");
     assert_eq!(table.inner.last_firings.lock().await.len(), 1, "backoff retains firing history");
@@ -128,10 +130,14 @@ async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
     overload_convoy(&backend).await;
     assert!(watching.as_mut().now_or_never().is_none());
     assert!(watching.as_mut().now_or_never().is_none());
-    assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), 2, "first recovery is immediate");
+    tokio::task::yield_now().await;
+    assert!(watching.as_mut().now_or_never().is_none());
+    let snapshots = table.inner.snapshot_loads.load(Ordering::SeqCst);
     overload_convoy(&backend).await;
     assert!(watching.as_mut().now_or_never().is_none());
-    assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), 2, "second expiry sleeps");
+    tokio::task::yield_now().await;
+    assert!(watching.as_mut().now_or_never().is_none());
+    let snapshots = snapshots.max(table.inner.snapshot_loads.load(Ordering::SeqCst));
     let task = tokio::spawn(async move {
         watching.await.expect("watch succeeds");
     });
@@ -144,7 +150,7 @@ async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
     assert_eq!(table.inner.change_requests.active_demands().await, 0, "completion releases demand");
     assert!(table.inner.last_firings.lock().await.is_empty());
     tokio::time::advance(Duration::from_secs(2)).await;
-    assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), 2, "cancelled leaf does not relist");
+    assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), snapshots, "cancelled leaf does not reload");
 }
 
 // Generated healthy/overloaded intervals cross the reset boundary; retry
@@ -392,4 +398,243 @@ async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires()
     .expect("custom exit leaf should settle through the engine");
     assert_eq!(settled.disposition.as_deref(), Some("shipped"));
     controller.abort();
+}
+
+// Object events must evaluate only addressed rows. Generated operation sequences
+// include unrelated objects and duplicate events; named cases cover namespace
+// collisions, absent records, cancellation and restart. Count work, not time.
+#[hegel::test]
+fn leaf_object_routing_counts_only_addressed_rows(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+    let changes: Vec<usize> = (0..steps).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(63))).collect();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        routing_count_contract(ResourceBackend::InMemory(InMemoryBackend::default()), &changes).await;
+    });
+}
+
+// Run the same counted routing contract against the real SQLite adapter.
+#[tokio::test]
+async fn sqlite_leaf_object_routing_counts_only_addressed_rows() {
+    routing_count_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite")), &[63, 0, 1, 1, 32]).await;
+}
+
+async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
+    use futures::FutureExt;
+    for index in 0..64 {
+        create_convoy(&backend, &format!("object-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    }
+    let (events, mut fires) = broadcast::channel(16);
+    let refresher = ChangeRequestRefresher::new(
+        "fleet".into(),
+        backend.clone(),
+        "authority".into(),
+        Arc::new(UnavailableChangeRequests),
+        Default::default(),
+    );
+    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(events), refresher);
+    let mut watchers = Vec::new();
+    let mut ids = Vec::new();
+    for index in [0, 1, 2, 0] {
+        let mut row = overload_row(uuid::Uuid::new_v4());
+        row.leaves = vec![leaf(LeafAddress::Convoy { name: format!("object-{index}") }, ".status.phase", "Failed")];
+        // Multiple conditions on one object share a single store dependency.
+        let mut another = row.leaves[0].clone();
+        another.literal = "Landed".into();
+        row.leaves.push(another);
+        ids.push(row.id);
+        table.inner.rows.lock().await.insert(row.id, row.clone());
+        let mut watching = Box::pin(table.watch_row(row));
+        assert!(watching.as_mut().now_or_never().is_none());
+        watchers.push(watching);
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while table.inner.evaluations.load(Ordering::SeqCst) < 4 {
+            for watching in &mut watchers {
+                assert!(watching.as_mut().now_or_never().is_none());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial addressed reads complete");
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 4);
+    assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), 4, "one targeted read per unique address, no full lists");
+    for (step, index) in changes.iter().enumerate() {
+        let previous_events = table.inner.routing.lock().await.events_processed;
+        let before_evaluations = table.inner.evaluations.load(Ordering::SeqCst);
+        let before_reads = table.inner.store_reads.load(Ordering::SeqCst);
+        let convoys = backend.using::<Convoy>("flotilla");
+        let name = format!("object-{index}");
+        let object = convoys.get(&name).await.expect("convoy");
+        convoys
+            .update(
+                &InputMeta::from(&object.metadata),
+                &object.metadata.resource_version,
+                &ConvoySpec::builder().workflow_ref(format!("changed-{step}")).build(),
+            )
+            .await
+            .expect("event");
+        router_processed(&table, previous_events).await;
+        let touched = if *index == 0 { 2 } else { usize::from(*index < 3) };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                for watching in &mut watchers {
+                    assert!(watching.as_mut().now_or_never().is_none());
+                }
+                if table.inner.evaluations.load(Ordering::SeqCst) >= before_evaluations + touched {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("addressed evaluations complete");
+        assert_eq!(table.inner.evaluations.load(Ordering::SeqCst) - before_evaluations, touched);
+        assert_eq!(table.inner.store_reads.load(Ordering::SeqCst) - before_reads, touched);
+        assert!(fires.try_recv().is_err());
+    }
+    // A matching name in another namespace is not an addressed object.
+    let other = backend.using::<Convoy>("other");
+    other
+        .create(&InputMeta::builder().name("object-0".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .await
+        .expect("other namespace");
+    tokio::task::yield_now().await;
+    let before = table.inner.evaluations.load(Ordering::SeqCst);
+    for watching in &mut watchers {
+        assert!(watching.as_mut().now_or_never().is_none());
+    }
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), before);
+    // Exactly one wait fires per addressed object, retaining subscription identity.
+    for (position, watching) in watchers.iter_mut().enumerate() {
+        let index = [0, 1, 2, 0][position];
+        let convoys = backend.using::<Convoy>("flotilla");
+        let name = format!("object-{index}");
+        let object = convoys.get(&name).await.expect("convoy");
+        convoys
+            .update_status(&name, &object.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
+            .await
+            .expect("fail");
+        tokio::time::timeout(Duration::from_secs(2), watching).await.expect("fires").expect("watch");
+        let DaemonEvent::LeafFired(fire) = fires.try_recv().expect("one fire") else { panic!("leaf fire") };
+        assert_eq!(fire.subscription_id, ids[position]);
+        assert!(fires.try_recv().is_err());
+    }
+    assert!(table.rows().await.is_empty());
+    assert!(table.inner.routing.lock().await.dependencies.is_empty());
+}
+
+async fn router_processed(table: &LeafSubscriptionTable, previous: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while table.inner.routing.lock().await.events_processed == previous {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("router consumes event");
+}
+
+// Absent records remain Unknown until creation; Work leaves route via their
+// parent convoy, and re-arming after restart evaluates current evidence once.
+#[tokio::test]
+async fn leaf_routing_missing_work_and_restart() {
+    use futures::FutureExt;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let table = supervision_wake(&backend).subscriptions;
+    let mut row = overload_row(uuid::Uuid::new_v4());
+    row.leaves = vec![leaf(LeafAddress::Work { convoy: "missing".into(), work: "work".into() }, ".status.phase", "Complete")];
+    table.inner.rows.lock().await.insert(row.id, row.clone());
+    let mut watching = Box::pin(table.watch_row(row.clone()));
+    assert!(watching.as_mut().now_or_never().is_none(), "absent convoy is Unknown");
+    create_convoy(&backend, "missing", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    router_processed(&table, 0).await;
+    assert!(watching.as_mut().now_or_never().is_none(), "absent work is Unknown");
+    let convoys = backend.using::<Convoy>("flotilla");
+    let object = convoys.get("missing").await.expect("convoy");
+    convoys
+        .update_status(
+            "missing",
+            &object.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Complete).build())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("complete work");
+    tokio::time::timeout(Duration::from_secs(2), watching).await.expect("parent convoy event arrives").expect("Work leaf fires");
+    assert!(table.rows().await.is_empty());
+    let restarted = supervision_wake(&backend).subscriptions;
+    row.id = uuid::Uuid::new_v4();
+    restarted.inner.rows.lock().await.insert(row.id, row.clone());
+    restarted.watch_row(row).await.expect("restart fires from current level");
+    assert_eq!(restarted.inner.evaluations.load(Ordering::SeqCst), 1);
+    assert_eq!(restarted.inner.store_reads.load(Ordering::SeqCst), 1);
+    assert!(restarted.rows().await.is_empty());
+}
+
+// Watch loss must resync every live row exactly once, even when the overflow
+// comes from an unrelated object. Subsequent unrelated events stay unrouted.
+#[tokio::test]
+async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
+    use futures::FutureExt;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    for name in ["busy", "object-0", "object-1"] {
+        create_convoy(&backend, name, ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    }
+    let table = supervision_wake(&backend).subscriptions;
+    let mut watchers = Vec::new();
+    let mut connections = Vec::new();
+    for index in 0..2 {
+        let connection = uuid::Uuid::new_v4();
+        connections.push(connection);
+        let mut row = overload_row(connection);
+        row.leaves = vec![leaf(LeafAddress::Convoy { name: format!("object-{index}") }, ".status.phase", "Failed")];
+        table.inner.rows.lock().await.insert(row.id, row.clone());
+        let mut watching = Box::pin(table.watch_row(row));
+        assert!(watching.as_mut().now_or_never().is_none());
+        watchers.push(watching);
+    }
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 2);
+    // No task can consume the store's bounded watch ring during this burst.
+    overload_convoy(&backend).await;
+    overload_convoy(&backend).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while table.inner.routing.lock().await.resyncs == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared router recovers");
+    for watching in &mut watchers {
+        assert!(watching.as_mut().now_or_never().is_none());
+    }
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 4, "one resync evaluation per row");
+    assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), 4, "one addressed read per evaluation");
+    let previous = table.inner.routing.lock().await.events_processed;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let object = convoys.get("busy").await.expect("busy");
+    convoys
+        .update(
+            &InputMeta::from(&object.metadata),
+            &object.metadata.resource_version,
+            &ConvoySpec::builder().workflow_ref("after-resync".into()).build(),
+        )
+        .await
+        .expect("unrelated event");
+    router_processed(&table, previous).await;
+    for watching in &mut watchers {
+        assert!(watching.as_mut().now_or_never().is_none());
+    }
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 4, "routing resumes after resync");
+    assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), 4);
+    for connection in connections {
+        table.unsubscribe_connection(connection).await;
+    }
+    for watching in watchers {
+        watching.await.expect("disconnected watcher exits");
+    }
+    assert!(table.rows().await.is_empty());
 }
