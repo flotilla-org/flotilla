@@ -36,9 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let namespace = parse_namespace();
     let backend = HttpBackend::from_kubeconfig(kubeconfig_path())?;
     ensure_namespace(&backend, &namespace).await?;
-    ensure_crd(&backend, include_str!("../src/crds/workflow_template.crd.yaml")).await?;
-    ensure_crd(&backend, include_str!("../src/crds/convoy.crd.yaml")).await?;
-    ensure_crd(&backend, include_str!("../src/crds/vessel.crd.yaml")).await?;
+    ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/workflow_template.crd.yaml")).await?;
+    ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/convoy.crd.yaml")).await?;
+    ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/vessel.crd.yaml")).await?;
+
 
     let backend = ResourceBackend::Http(backend);
     let convoys = backend.clone().using::<Convoy>(&namespace);

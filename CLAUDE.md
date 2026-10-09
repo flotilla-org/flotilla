@@ -32,6 +32,8 @@ cargo build                                    # build
 cargo fmt --check          # CI format gate
 cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
 cargo test --workspace --locked                # CI test gate
+python3 ci/build-graph/check.py                 # CI dependency/feature gate
+python3 -m unittest discover -s ci/build-graph -p test_check.py
 cargo fmt                  # apply pinned formatting
 uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py  # ast-grep Git boundary check
 cargo run                                      # run, auto-detect repo from cwd
@@ -55,11 +57,18 @@ Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARG
 
 Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR` and run `cargo test --workspace --locked`. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
 
-Package-local `flotilla-core` daemon integration coverage uses shared discovery test helpers behind `test-support`, so run it as:
+Controller-backed in-process daemon coverage lives in `flotilla-controllers`' registered integration binary:
 
 ```bash
-cargo test -p flotilla-core --locked --features test-support --test in_process_daemon
+cargo test -p flotilla-controllers --locked --test integration in_process_daemon::
 ```
+
+The small `test-support` features and core's `replay` feature are enabled by default, so package-local commands need no extra
+helper flags. Native libraries share `flotilla-build-features`' feature-only dependency selections on stable Cargo;
+`ci/build-graph/check.py` checks both build and test selections for every workspace package, and its registered integration target runs the guard and Python unit tests in workspace CI. Keep its anchors aligned when
+adding dependencies. Optional TLS providers and sandbox skips remain opt-in. The Relay Workers WebAssembly target does not
+depend on the native feature selections.
+Workspace tests require Python 3 on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
 `flotilla-resources` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
 The resources `watch_allocations` target stays separate because it installs a process-wide counting allocator.
@@ -117,6 +126,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 
 | Crate | Role |
 |-------|------|
+| `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `DaemonHandle` trait, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |

@@ -73,10 +73,20 @@ struct RetryBackoff {
     reset_after: Duration,
 }
 
+/// Production waits for a forwarded socket; routed sessions are a harness opt-in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MissingSocketTransport {
+    #[default]
+    WaitForSocket,
+    #[cfg(any(test, feature = "test-support"))]
+    Routed,
+}
+
 /// Test harnesses can select authored kinds and drive digest rounds explicitly.
 /// Production keeps full-fleet replication and periodic digest scheduling.
 #[derive(Clone, Default)]
 pub(super) struct ReplicationTestOptions {
+    missing_socket_transport: MissingSocketTransport,
     #[cfg(any(test, feature = "test-support"))]
     kinds: Option<&'static [&'static str]>,
     #[cfg(any(test, feature = "test-support"))]
@@ -86,7 +96,7 @@ pub(super) struct ReplicationTestOptions {
 impl ReplicationTestOptions {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
-        Self { kinds, digest_driver: None }
+        Self { kinds, digest_driver: None, missing_socket_transport: MissingSocketTransport::Routed }
     }
 
     fn includes<T: Resource>(&self) -> bool {
@@ -173,8 +183,7 @@ impl PeerReplicatorSupervisors {
         let transport = match resource_socket_path {
             Some(_) => ReplicationTransport::Http(socket_path_source),
             #[cfg(any(test, feature = "test-support"))]
-            None => ReplicationTransport::Routed(_router),
-            #[cfg(not(any(test, feature = "test-support")))]
+            None if self.test_options.missing_socket_transport == MissingSocketTransport::Routed => ReplicationTransport::Routed(_router),
             None => {
                 debug!(%peer, generation, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
                 ReplicationTransport::Http(socket_path_source)
@@ -1138,6 +1147,14 @@ fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn routed_replication_requires_explicit_harness_options() {
+        // Glue: the production constructor waits for a forwarded socket even
+        // when helpers are compiled; only the in-memory harness opts into routing.
+        assert_eq!(super::ReplicationTestOptions::default().missing_socket_transport, super::MissingSocketTransport::WaitForSocket);
+        assert_eq!(super::ReplicationTestOptions::new(None).missing_socket_transport, super::MissingSocketTransport::Routed);
+    }
+
     #[test]
     fn digest_failures_warn_after_three_and_reset_after_success() {
         let mut failures = super::DigestFailures::default();

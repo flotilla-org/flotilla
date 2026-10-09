@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod contract;
+pub mod owner_gc;
 
 use std::{collections::BTreeMap, future::Future, time::Duration};
 

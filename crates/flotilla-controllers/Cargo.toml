@@ -20,6 +20,9 @@ sha2 = "0.10"
 serde_json = { workspace = true }
 
 [dev-dependencies]
+serde = { workspace = true }
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 hegeltest = "=0.48.1"
 flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
@@ -30,3 +33,11 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "convoy_controller"
+test = false
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }

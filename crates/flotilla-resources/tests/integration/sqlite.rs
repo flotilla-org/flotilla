@@ -1,10 +1,5 @@
-use std::{
-    sync::{mpsc as std_mpsc, Arc},
-    thread,
-    time::Instant,
-};
+use std::{sync::mpsc as std_mpsc, thread, time::Instant};
 
-use async_trait::async_trait;
 use chrono::Utc;
 use common::{
     contract::{
@@ -24,16 +19,11 @@ use common::{
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
-    convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, valid_workflow_template_spec, workflow_template_meta,
-    TestLoopHarness,
+    convoy_meta, convoy_spec, resource_meta, valid_workflow_template_spec, workflow_template_meta,
 };
-use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
-    controller::{Actuation, ControllerLoop, Reconciler},
-    delete_resource_kind, ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend,
-    InputMeta, NoStatusPatch, Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate,
-    WorkflowTemplateSpec, CONVOY_LABEL, VESSEL_REF_LABEL,
+    delete_resource_kind, ApiPaths, Convoy, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch, Project, ProjectSpec, Resource,
+    ResourceBackend, ResourceError, SqliteBackend, TerminalSession, WatchEvent, WatchStart, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -139,19 +129,6 @@ fn replica_point_lookup_uses_resource_name_index() {
         .expect("explain replica point lookup");
 
     assert!(plan.contains("replica_objects_by_resource_name"), "unexpected replica point-lookup plan: {plan}");
-}
-
-struct AlwaysEligible;
-
-#[async_trait]
-impl ConvoyTeardownRuntime for AlwaysEligible {
-    async fn verify_reclaim(
-        &self,
-        _convoy: &flotilla_resources::ResourceObject<Convoy>,
-        _checkouts: &[flotilla_resources::ResourceObject<flotilla_resources::Checkout>],
-    ) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -841,145 +818,6 @@ async fn concurrent_create_and_watch_delivers_the_committed_version_once() {
         timeout(Duration::from_millis(50), watch.next()).await.is_err(),
         "the committed version must not be emitted by both replay and live notification"
     );
-}
-
-#[tokio::test]
-async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_vessel_finalizer() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("resources.sqlite");
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    let terminals = backend.clone().using::<TerminalSession>("flotilla");
-
-    let convoy =
-        convoys.create(&convoy_meta("convoy-restart"), &convoy_spec("workflow-restart")).await.expect("convoy create should succeed");
-    let mut completed_status = convoy_status(ConvoyPhase::Landed);
-    completed_status.observed_workflow_ref = Some("workflow-restart".to_string());
-    let mut completed_work = pending_task_state();
-    completed_work.phase = WorkPhase::Complete;
-    completed_work.finished_at = Some(Utc::now());
-    completed_work.message = Some("done".to_string());
-    completed_status.work.insert("implement".to_string(), completed_work);
-    convoys
-        .update_status("convoy-restart", &convoy.metadata.resource_version, &completed_status)
-        .await
-        .expect("convoy completion should be recorded");
-
-    vessels
-        .create(
-            &resource_meta()
-                .name("convoy-restart-implement")
-                .labels([(CONVOY_LABEL.to_string(), "convoy-restart".to_string())].into_iter().collect())
-                .finalizers(vec!["flotilla.work/vessel-workspace-teardown".to_string()])
-                .call(),
-            &restart_vessel_spec(),
-        )
-        .await
-        .expect("vessel create should succeed");
-    terminals
-        .create(
-            &resource_meta()
-                .name("terminal-convoy-restart-implement-coder")
-                .labels([(VESSEL_REF_LABEL.to_string(), "convoy-restart-implement".to_string())].into_iter().collect())
-                .call(),
-            &restart_terminal_session_spec(),
-        )
-        .await
-        .expect("terminal child should be created");
-
-    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_vessels(vessels.clone())
-        .with_teardown_runtime(Arc::new(AlwaysEligible));
-    let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
-    let initial_dependencies = convoy_reconciler.prepare(&completed_convoy).await.expect("initial cleanup dependencies should load");
-    let initial_cleanup = convoy_reconciler.reconcile(&completed_convoy, &initial_dependencies, Utc::now());
-    assert!(initial_cleanup
-        .actuations
-        .iter()
-        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-restart-implement")));
-
-    vessels.delete("convoy-restart-implement").await.expect("initial convoy cleanup should mark the vessel");
-    assert!(terminals.get("terminal-convoy-restart-implement-coder").await.is_ok(), "delayed finalizer should retain terminal child");
-
-    drop(convoy_reconciler);
-    drop(terminals);
-    drop(vessels);
-    drop(convoys);
-    drop(backend);
-
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
-    let convoys = backend.clone().using::<Convoy>("flotilla");
-    let vessels = backend.clone().using::<Vessel>("flotilla");
-    let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
-        .with_vessels(vessels.clone())
-        .with_teardown_runtime(Arc::new(AlwaysEligible));
-    let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");
-    let restart_dependencies = convoy_reconciler.prepare(&restarted_convoy).await.expect("restart cleanup dependencies should load");
-    let restart_cleanup = convoy_reconciler.reconcile(&restarted_convoy, &restart_dependencies, Utc::now());
-    assert!(
-        !restart_cleanup
-            .actuations
-            .iter()
-            .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-restart-implement")),
-        "restart cleanup must leave a persisted pending vessel to its finalizer"
-    );
-
-    vessels
-        .delete("convoy-restart-implement")
-        .await
-        .expect("a repeated queued cleanup after restart should not hard-delete the pending vessel");
-    let pending = vessels.get("convoy-restart-implement").await.expect("pending vessel should survive the repeated delete");
-    assert!(pending.metadata.deletion_timestamp.is_some());
-    assert_eq!(pending.metadata.finalizers, vec!["flotilla.work/vessel-workspace-teardown".to_string()]);
-
-    let mut harness = TestLoopHarness::new();
-    harness.spawn(
-        ControllerLoop {
-            primary: vessels.clone(),
-            secondaries: Vec::new(),
-            reconciler: VesselReconciler::new(backend.clone(), "flotilla"),
-            resync_interval: Duration::from_secs(60),
-            backend,
-        }
-        .run(),
-    );
-    // Restart replays the pending vessel from the primary list, then finalizes
-    // its terminal child and vessel through separate SQLite writes. Give that
-    // work a CI-load bound; the former one-second deadline measured scheduling
-    // delay as much as cleanup progress.
-    harness
-        .wait_until(Duration::from_secs(10), || {
-            let vessels = vessels.clone();
-            let terminals = terminals.clone();
-            async move {
-                matches!(vessels.get("convoy-restart-implement").await, Err(ResourceError::NotFound { .. }))
-                    && matches!(terminals.get("terminal-convoy-restart-implement-coder").await, Err(ResourceError::NotFound { .. }))
-            }
-        })
-        .await;
-    harness.shutdown().await;
-}
-
-fn restart_vessel_spec() -> VesselSpec {
-    VesselSpec {
-        convoy_ref: "convoy-restart".to_string(),
-        vessel_name: "implement".to_string(),
-        placement_policy_ref: "policy-restart".to_string(),
-        adopted_checkout_refs: Default::default(),
-    }
-}
-
-fn restart_terminal_session_spec() -> TerminalSessionSpec {
-    TerminalSessionSpec {
-        env_ref: "host-direct-01HXYZ".to_string(),
-        role: "coder".to_string(),
-        source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-        cwd: "/workspace".to_string(),
-        env: Default::default(),
-        pool: "cleat".to_string(),
-    }
 }
 
 #[test]

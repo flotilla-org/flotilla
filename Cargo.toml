@@ -3,6 +3,7 @@ debug = "line-tables-only"
 
 [workspace]
 members = [
+    "crates/flotilla-build-features",
     "crates/flotilla-client",
     "crates/flotilla-commands",
     "crates/flotilla-core",

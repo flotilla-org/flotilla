@@ -16,3 +16,7 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }

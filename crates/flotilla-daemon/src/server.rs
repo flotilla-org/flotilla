@@ -296,7 +296,7 @@ pub fn spawn_test_peer_networking(
     // so no messages are forwarded; the sender satisfies the runtime signature.
     let (inbound_peer_tx, _inbound_peer_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
-    spawn_peer_networking_runtime(
+    PeerRuntime::new(
         daemon,
         peer_manager,
         None, // No inbound task — test drives outbound via PeerConnectionEvent
@@ -304,6 +304,8 @@ pub fn spawn_test_peer_networking(
         remote_command_router,
         None,
     )
+    .with_replication_kinds(None)
+    .spawn()
 }
 
 /// The daemon server that listens on a Unix socket and dispatches requests
