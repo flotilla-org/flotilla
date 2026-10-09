@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use flotilla_core::providers::{ChannelLabel, CommandRunner};
 use flotilla_credentials::CredentialStore;
 use flotilla_resources::{
-    is_image_digest, FleetDesignation, Host, HostImageAction, ImageBuild, ImageBuildPhase, ImageCacheBinding, PlacedImageIdentity,
-    ResourceBackend, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY,
+    is_image_digest, FleetDesignation, Host, HostImageAction, ImageBuild, ImageBuildPhase, ImageCacheBinding, LocalImageCacheKey,
+    LocalImageInventories, PlacedImageIdentity, ResourceBackend, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME,
+    IMAGE_DIGESTS_CAPABILITY,
 };
 
 const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
@@ -33,6 +34,8 @@ pub(crate) struct ImageDistributor<I> {
     pub backend: ResourceBackend,
     pub namespace: String,
     pub host: String,
+    pub provider_instance: String,
+    pub registered_instances: BTreeSet<String>,
     #[builder(default)]
     pub jobs: tokio::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<PlacedImageIdentity, String>>>>,
     #[builder(default)]
@@ -117,7 +120,10 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         let hosts = self.backend.using::<Host>(&self.namespace);
         let host = hosts.get(&self.host).await.map_err(|error| error.to_string())?;
         let mut status = host.status.clone().unwrap_or_default();
-        status.capabilities.insert(IMAGE_DIGESTS_CAPABILITY.into(), serde_json::to_value(&held).map_err(|error| error.to_string())?);
+        let mut inventory = decode_inventory(status.capabilities.get(IMAGE_DIGESTS_CAPABILITY), &self.host);
+        inventory.0.retain(|instance, _| self.registered_instances.contains(instance));
+        inventory.0.insert(self.provider_instance.clone(), held.clone());
+        status.capabilities.insert(IMAGE_DIGESTS_CAPABILITY.into(), serde_json::to_value(&inventory).map_err(|error| error.to_string())?);
         if host.status.as_ref() != Some(&status) {
             hosts.update_status(&self.host, &host.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
         }
@@ -133,14 +139,23 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
                     return Ok(());
                 };
                 let identity = status.identity.as_ref().ok_or("built image has no identity")?;
-                status.availability.hosts = inventories
+                status.availability.caches = inventories
                     .items
                     .iter()
-                    .filter_map(|source| {
+                    .flat_map(|source| {
                         let object = &source.object;
-                        let digests = object.status.as_ref()?.capabilities.get(IMAGE_DIGESTS_CAPABILITY)?;
-                        let digests: BTreeSet<String> = serde_json::from_value(digests.clone()).ok()?;
-                        digests.contains(&identity.local_image_id).then(|| object.metadata.name.clone())
+                        let inventory = object
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.capabilities.get(IMAGE_DIGESTS_CAPABILITY))
+                            .and_then(|value| serde_json::from_value::<LocalImageInventories>(value.clone()).ok())
+                            .unwrap_or_default();
+                        inventory
+                            .0
+                            .into_iter()
+                            .filter(|(_, digests)| digests.contains(&identity.local_image_id))
+                            .map(|(provider_instance, _)| LocalImageCacheKey { host: object.metadata.name.clone(), provider_instance })
+                            .collect::<Vec<_>>()
                     })
                     .collect();
                 if held.contains(&identity.local_image_id) {
@@ -205,6 +220,56 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
         }
         Ok(())
     }
+}
+
+fn decode_inventory(value: Option<&serde_json::Value>, host: &str) -> LocalImageInventories {
+    match value.map(|value| serde_json::from_value(value.clone())).transpose() {
+        Ok(inventory) => inventory.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(%host, %error, "invalid image inventory; replacing it with fresh cache observations");
+            LocalImageInventories::default()
+        }
+    }
+}
+
+/// Registration is authoritative for cache identities. Run even on hosts with
+/// no image provider, where no distributor exists to refresh old observations.
+pub(crate) async fn prune_unregistered_caches(
+    backend: &ResourceBackend,
+    namespace: &str,
+    host: &str,
+    registered: &BTreeSet<String>,
+) -> Result<(), String> {
+    let hosts = backend.using::<Host>(namespace);
+    let object = hosts.get(host).await.map_err(|error| error.to_string())?;
+    if let Some(mut status) = object.status.clone() {
+        if status.capabilities.contains_key(IMAGE_DIGESTS_CAPABILITY) {
+            let mut inventory = decode_inventory(status.capabilities.get(IMAGE_DIGESTS_CAPABILITY), host);
+            inventory.0.retain(|instance, _| registered.contains(instance));
+            status
+                .capabilities
+                .insert(IMAGE_DIGESTS_CAPABILITY.into(), serde_json::to_value(inventory).map_err(|error| error.to_string())?);
+            if object.status.as_ref() != Some(&status) {
+                hosts.update_status(host, &object.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    let builds = backend.using::<ImageBuild>(namespace);
+    for object in builds.list().await.map_err(|error| error.to_string())?.items {
+        if object.spec.host_ref != host {
+            continue;
+        }
+        if let Some(mut status) = object.status.clone() {
+            status.availability.caches.retain(|cache| cache.host != host || registered.contains(&cache.provider_instance));
+            if object.status.as_ref() != Some(&status) {
+                builds
+                    .update_status(&object.metadata.name, &object.metadata.resource_version, &status)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn retry_ready(deadline: Option<Instant>, now: Instant) -> bool {
@@ -428,7 +493,7 @@ mod tests {
             finished_at: Some(Utc::now()),
             identity: Some(PlacedImageIdentity { local_image_id: id.clone(), registry_digest: None }),
             availability: flotilla_resources::ImageAvailability {
-                hosts: BTreeSet::from(["builder".into()]),
+                caches: BTreeSet::from([LocalImageCacheKey { host: "builder".into(), provider_instance: "cache-a".into() }]),
                 registry_ref: registry.then(|| format!("{}@{manifest}", cache().repository)),
                 failure: None,
             },
@@ -445,7 +510,17 @@ mod tests {
             corrupt_manifest: false,
             fail_push: std::sync::atomic::AtomicBool::new(false),
         });
-        (ImageDistributor::builder().io(io).backend(backend).namespace("test".into()).host("destination".into()).build(), build)
+        (
+            ImageDistributor::builder()
+                .io(io)
+                .backend(backend)
+                .namespace("test".into())
+                .host("destination".into())
+                .provider_instance("cache-a".into())
+                .registered_instances(BTreeSet::from(["cache-a".into(), "cache-b".into()]))
+                .build(),
+            build,
+        )
     }
 
     #[tokio::test]
@@ -490,7 +565,7 @@ mod tests {
         let builds = delivery.backend.using::<ImageBuild>("test");
         let later = builds.create(&InputMeta::builder().name("z-later".into()).build(), &build.spec).await.expect("later build");
         let mut status = build.status.clone().expect("status");
-        status.availability.hosts.clear();
+        status.availability.caches.clear();
         builds.update_status("z-later", &later.metadata.resource_version, &status).await.expect("later built");
         status.availability.registry_ref = None;
         builds.update_status("build", &build.metadata.resource_version, &status).await.expect("unpublished");
@@ -499,7 +574,7 @@ mod tests {
         delivery.publications.lock().await.insert("build".into(), job);
         delivery.refresh().await.expect("refresh continues");
         let status = builds.get("z-later").await.expect("later").status.expect("status");
-        assert!(status.availability.hosts.contains("builder"));
+        assert!(status.availability.caches.contains(&LocalImageCacheKey { host: "builder".into(), provider_instance: "cache-a".into() }));
         assert!(builds.get("build").await.expect("build").status.expect("status").availability.failure.is_some());
     }
 
@@ -572,15 +647,85 @@ mod tests {
         delivery.refresh().await.expect("publish");
         let published = builds.get("build").await.expect("build");
         assert_eq!(published.status.as_ref().expect("status").identity, build.status.as_ref().expect("status").identity);
-        assert_eq!(published.status.as_ref().expect("status").availability.hosts, BTreeSet::from(["builder".into()]));
+        assert_eq!(
+            published.status.as_ref().expect("status").availability.caches,
+            BTreeSet::from([LocalImageCacheKey { host: "builder".into(), provider_instance: "cache-a".into() }])
+        );
         assert!(published.status.as_ref().expect("status").availability.registry_ref.as_ref().expect("registry").contains('@'));
         delivery.io.held.lock().expect("inventory").clear();
         delivery.refresh().await.expect("evict");
         let evicted = builds.get("build").await.expect("build");
-        assert!(evicted.status.as_ref().expect("status").availability.hosts.is_empty());
+        assert!(evicted.status.as_ref().expect("status").availability.caches.is_empty());
         let mut forbidden = evicted.status.clone().expect("status");
         forbidden.identity.as_mut().expect("identity").local_image_id = format!("sha256:{}", "9".repeat(64));
         assert!(builds.update_status("build", &evicted.metadata.resource_version, &forbidden).await.is_err());
+    }
+
+    // #2972: refreshing one cache preserves another instance's inventory on
+    // the same host; evicting from one must not erase the other's availability.
+    #[tokio::test]
+    async fn same_host_cache_refresh_preserves_other_provider_inventory() {
+        let (mut delivery, build) = setup(false, true, false, 7).await;
+        delivery.host = "builder".into();
+        delivery.refresh().await.expect("cache a refresh");
+        delivery.provider_instance = "cache-b".into();
+        delivery.io.held.lock().expect("cache b inventory").clear();
+        delivery.refresh().await.expect("empty cache b refresh");
+        let hosts = delivery.backend.using::<Host>("test");
+        let host = hosts.get("builder").await.expect("host");
+        let inventory: LocalImageInventories =
+            serde_json::from_value(host.status.expect("status").capabilities[IMAGE_DIGESTS_CAPABILITY].clone()).expect("inventory");
+        let digest = &build.status.as_ref().expect("status").identity.as_ref().expect("identity").local_image_id;
+        assert!(inventory.held(Some("cache-a")).expect("cache a").contains(digest));
+        assert!(!inventory.held(Some("cache-b")).expect("cache b").contains(digest));
+        let refreshed = delivery.backend.using::<ImageBuild>("test").get("build").await.expect("build");
+        assert_eq!(
+            refreshed.status.expect("status").availability.caches,
+            BTreeSet::from([LocalImageCacheKey { host: "builder".into(), provider_instance: "cache-a".into() }])
+        );
+    }
+
+    // #2972: renamed and removed instances cannot retain inventory or mutable
+    // build availability, including a host with no cache/distributor at startup.
+    #[tokio::test]
+    async fn retired_instances_are_pruned_on_refresh_and_cacheless_startup() {
+        let (mut delivery, _) = setup(false, true, false, 8).await;
+        delivery.host = "builder".into();
+        delivery.refresh().await.expect("observe old instance");
+        delivery.registered_instances = BTreeSet::from(["cache-b".into()]);
+        delivery.provider_instance = "cache-b".into();
+        delivery.io.held.lock().expect("new empty cache").clear();
+        delivery.refresh().await.expect("renamed instance refresh");
+        let hosts = delivery.backend.using::<Host>("test");
+        let inventory = hosts.get("builder").await.expect("host").status.expect("status").capabilities[IMAGE_DIGESTS_CAPABILITY].clone();
+        assert_eq!(inventory, serde_json::json!({"cache-b": []}));
+        assert!(delivery
+            .backend
+            .using::<ImageBuild>("test")
+            .get("build")
+            .await
+            .expect("build")
+            .status
+            .expect("status")
+            .availability
+            .caches
+            .is_empty());
+        delivery.io.held.lock().expect("new cache image").insert(delivery.io.id.clone());
+        delivery.refresh().await.expect("observe new cache");
+        prune_unregistered_caches(&delivery.backend, "test", "builder", &BTreeSet::new()).await.expect("cacheless startup");
+        let inventory = hosts.get("builder").await.expect("host").status.expect("status").capabilities[IMAGE_DIGESTS_CAPABILITY].clone();
+        assert_eq!(inventory, serde_json::json!({}));
+        assert!(delivery
+            .backend
+            .using::<ImageBuild>("test")
+            .get("build")
+            .await
+            .expect("build")
+            .status
+            .expect("status")
+            .availability
+            .caches
+            .is_empty());
     }
 
     // A declared cache is required to publish a manifest before pull; a missing

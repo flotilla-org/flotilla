@@ -84,6 +84,16 @@ impl<D, T: ?Sized> TypedSet<D, T> {
         self.inner.values().map(|(d, p)| (d, p))
     }
 
+    /// Registered identity of this exact provider instance.
+    /// Even zero-sized providers have distinct Arc allocations: the allocation
+    /// includes reference counts, so this does not compare dangling ZST pointers.
+    pub fn instance_name(&self, provider: &Arc<T>) -> Option<&str> {
+        self.inner
+            .iter()
+            .find(|(_, (_, candidate))| Arc::as_ptr(candidate).cast::<()>() == Arc::as_ptr(provider).cast::<()>())
+            .map(|(name, _)| name.as_str())
+    }
+
     /// The name (key) of the preferred entry, if any.
     pub fn preferred_name(&self) -> Option<&str> {
         self.inner.keys().next().map(|s| s.as_str())
@@ -257,6 +267,17 @@ mod tests {
             set.insert(key.to_string(), test_desc(backend, implementation), Arc::new(DummyImpl) as Arc<dyn Dummy>);
         }
         set
+    }
+
+    // Registered identity follows the exact Arc allocation, including cloned
+    // trait objects, and never another instance with the same descriptor.
+    #[test]
+    fn instance_name_uses_allocation_identity() {
+        let set = make_set_with_entries(&[("a", "same", "same"), ("b", "same", "same")]);
+        let provider = Arc::clone(set.get("b").expect("b").1);
+        assert_eq!(set.instance_name(&provider), Some("b"));
+        let other: Arc<dyn Dummy> = Arc::new(DummyImpl);
+        assert_eq!(set.instance_name(&other), None);
     }
 
     #[test]

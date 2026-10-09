@@ -204,6 +204,19 @@ impl DaemonRuntime {
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
+        let registered_image_caches = local_registry
+            .environment_providers
+            .iter()
+            .filter(|(_, provider)| provider.kind() == flotilla_core::providers::environment::EnvironmentKind::Docker)
+            .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
+            .collect::<BTreeSet<_>>();
+        crate::image_distribution::prune_unregistered_caches(
+            &daemon.resource_backend(),
+            &options.namespace,
+            &profile.host_id,
+            &registered_image_caches,
+        )
+        .await?;
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
             if let Err(error) = phase(
@@ -375,22 +388,38 @@ impl DaemonRuntime {
                     Arc::clone(&runner),
                     GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
                 ));
-                let distributor = Arc::new(
-                    crate::image_distribution::ImageDistributor::builder()
-                        .io(Arc::new(
-                            crate::image_distribution::DockerImageIo::builder()
-                                .runner(Arc::clone(&runner))
-                                .credentials(Arc::clone(&credential_store))
-                                .host(profile.host_id.clone())
-                                .build(),
-                        ))
-                        .backend(daemon.resource_backend())
-                        .namespace(options.namespace.clone())
-                        .host(profile.host_id.clone())
-                        .build(),
-                );
+                let distributor = if let Some((_, provider)) =
+                    local_registry.environment_providers.for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker)
+                {
+                    Some(Arc::new(
+                        crate::image_distribution::ImageDistributor::builder()
+                            .io(Arc::new(
+                                crate::image_distribution::DockerImageIo::builder()
+                                    .runner(Arc::clone(&runner))
+                                    .credentials(Arc::clone(&credential_store))
+                                    .host(profile.host_id.clone())
+                                    .build(),
+                            ))
+                            .backend(daemon.resource_backend())
+                            .namespace(options.namespace.clone())
+                            .host(profile.host_id.clone())
+                            .provider_instance(
+                                local_registry
+                                    .environment_providers
+                                    .instance_name(provider)
+                                    .ok_or("image cache provider instance is not registered")?
+                                    .to_string(),
+                            )
+                            .registered_instances(registered_image_caches.clone())
+                            .build(),
+                    ))
+                } else {
+                    // Host-direct has no local image cache. An ambiguous provider
+                    // registry also cannot attest which instance owns an observation.
+                    None
+                };
                 Arc::new(crate::image_build::BuildxRunner {
-                    distributor: Some(distributor),
+                    distributor,
                     runner,
                     vcs,
                     directory,

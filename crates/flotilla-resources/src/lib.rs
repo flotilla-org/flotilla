@@ -310,6 +310,8 @@ pub use workflow_template::{
 pub mod role_cascade;
 pub use credential::{HostActionSelector, HostImageAction};
 pub use fleet_designation::ImageCacheBinding;
-pub use image_build::{is_image_digest, ImageAcquisitionCost, ImageAvailability, IMAGE_DIGESTS_CAPABILITY};
+pub use image_build::{
+    is_image_digest, ImageAcquisitionCost, ImageAvailability, LocalImageCacheKey, LocalImageInventories, IMAGE_DIGESTS_CAPABILITY,
+};
 pub use role_cascade::{ResolvedCascade, ResolvedSetting, RoleCascadeLayer, RoleDefinition, RoleSubscription};
 pub use role_routing::*;
