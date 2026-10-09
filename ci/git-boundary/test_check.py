@@ -132,14 +132,16 @@ class GitBoundaryTests(unittest.TestCase):
                 self.assertIs(package['lints']['workspace'], True)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestkitContract(unittest.TestCase):
     def test_fixture_git_is_allowed_only_in_testkit_context(self):
         # Testkit crates construct real Git fixtures; production inclusions remain checked.
         source = 'fn fixture() { Command::new("git"); }'
-        path = "crates/flotilla-discovery-testkit/src/lib.rs"
-        self.assertEqual(check.violations(source, path), [])
-        self.assertEqual(check.violations(source, path, production=True), [1])
+        for path in ["crates/flotilla-discovery-testkit/src/lib.rs",
+                     "crates/future-testkit/src/fixture.rs"]:
+            with self.subTest(path=path):
+                self.assertEqual(check.violations(source, path), [])
+                self.assertEqual(check.violations(source, path, production=True), [1])
+
+
+if __name__ == '__main__':
+    unittest.main()

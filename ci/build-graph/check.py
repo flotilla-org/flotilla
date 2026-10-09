@@ -7,6 +7,10 @@ import subprocess
 import sys
 
 
+def is_testkit(name):
+    return name.endswith("-testkit") or name == "flotilla-test-support"
+
+
 def violations(metadata):
     packages = {package["name"]: package for package in metadata["packages"]}
     members = set(metadata["workspace_members"])
@@ -32,14 +36,15 @@ def violations(metadata):
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
     for name, package in sorted(packages.items()):
+        # A dev-only testkit may depend on the library it tests, closing a
+        # Cargo dev cycle without introducing an upward production edge.
         for dependency in package["dependencies"]:
             target = dependency["name"]
-            if dependency["kind"] == "dev" and target != name and target in packages and not (target.endswith("-testkit") or target == "flotilla-test-support") and reaches(target, name):
+            if dependency["kind"] == "dev" and target != name and target in packages and not is_testkit(target) and reaches(target, name):
                 errors.append(f"{name}: upward dev-dependency on {target}; move its tests/examples to the higher crate")
-        is_testkit = name.endswith("-testkit") or name == "flotilla-test-support"
-        if not is_testkit:
+        if not is_testkit(name):
             for target in production[name]:
-                if target.endswith("-testkit") or target == "flotilla-test-support":
+                if is_testkit(target):
                     errors.append(f"{name}: production dependency on testkit {target}")
             for helper in ("test-support", "replay"):
                 if helper in package["features"]:
@@ -96,7 +101,7 @@ def main():
         if package["id"] not in metadata["workspace_members"]:
             continue
         for edges in ("normal,build", "normal,build,dev"):
-            if edges == "normal,build" and (package["name"].endswith("-testkit") or package["name"] == "flotilla-test-support"):
+            if edges == "normal,build" and is_testkit(package["name"]):
                 continue
             selected = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", edges))
             if edges == "normal,build":

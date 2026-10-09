@@ -1,12 +1,12 @@
 import unittest
 
-from check import feature_differences, tree_features, violations
+from check import feature_differences, is_testkit, tree_features, violations
 
 
 def package(name, normal=(), dev=(), build=(), features=None):
     return {
         "id": name, "name": name, "features": features or {},
-        "dependencies": [{"name": target, "kind": kind}
+        "dependencies": [{"name": target, "kind": kind, "rename": None, "features": []}
                          for kind, targets in ((None, normal), ("dev", dev), ("build", build)) for target in targets],
     }
 
@@ -16,6 +16,12 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_testkit_names(self):
+        for name in ("flotilla-store-testkit", "future-testkit", "flotilla-test-support"):
+            self.assertTrue(is_testkit(name))
+        for name in ("flotilla-core", "testkit-like", "flotilla-test-support-extra"):
+            self.assertFalse(is_testkit(name))
+
     def test_empty_and_downward_graphs_are_valid(self):
         # Lower crates may use unrelated shared test helpers; higher crates may
         # test their normal dependencies, including redundant dev declarations.
@@ -102,7 +108,7 @@ class BuildGraphContract(unittest.TestCase):
         for alias in ("tokio/test-util", "tokio?/test-util", "runtime/test-util", "runtime?/test-util"):
             with self.subTest(alias=alias):
                 core = package("core", features={"hidden-helper": [alias]})
-                core["dependencies"].append({"name": "tokio", "rename": "runtime" if alias.startswith("runtime") else None, "kind": None})
+                core["dependencies"].append({"name": "tokio", "rename": "runtime" if alias.startswith("runtime") else None, "kind": None, "features": []})
                 self.assertIn("production feature", violations(graph(core))[0])
 
 

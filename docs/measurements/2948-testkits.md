@@ -82,7 +82,7 @@ contained build defaults.
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --workspace --locked`
-- `python3 ci/build-graph/check.py` and its 12 Python contract tests
+- `python3 ci/build-graph/check.py` and its 13 Python contract tests
 - `uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py` and its 11 Python contract tests
 - Both targeted guard mutants fail the contract tests and were reverted.
 - The root binary's locked normal/build dependency tree contains no testkits,
