@@ -22,12 +22,9 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::agent_adapter::AgentAdapterRegistry;
 use flotilla_core::aggregator_projection::AggregatorProjectionState;
 use flotilla_core::config::ConfigStore;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
-use flotilla_paths::path_context::DaemonHostPath;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::EnvVars;
 use flotilla_core::providers::discovery::EnvironmentAssertion;
@@ -62,6 +59,7 @@ use flotilla_credentials::CredentialStore;
 use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::DiscoveryMockRunner;
@@ -71,7 +69,8 @@ use flotilla_discovery_testkit::FakeDiscoveryProviders;
 use flotilla_discovery_testkit::FakeTerminalPool;
 use flotilla_discovery_testkit::MergedPrProcessRunner;
 use flotilla_discovery_testkit::TestEnvVars;
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
     NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, TerminalStatus,

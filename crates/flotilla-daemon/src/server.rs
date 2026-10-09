@@ -157,8 +157,8 @@ impl AcceptErrorBackoff {
 /// peer connects or reconnects. The outbound task responds by sending
 /// current local state for all repos to the specific peer.
 ///
-/// Visibility is promoted to `pub` with the `test-support` feature so
-/// integration tests can construct notices to drive the outbound task.
+/// Public construction lets dev-only testkits and integration tests drive
+/// the outbound task.
 #[visibility::make(pub)]
 pub(crate) struct PeerConnectedNotice {
     pub peer: NodeId,

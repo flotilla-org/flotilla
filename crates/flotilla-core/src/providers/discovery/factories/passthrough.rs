@@ -42,7 +42,6 @@ mod tests {
 
     use super::PassthroughTerminalPoolFactory;
     use crate::config::ConfigStore;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::discovery::EnvironmentBag;
     use crate::providers::discovery::Factory;
     use crate::testkits::discovery::DiscoveryMockRunner;

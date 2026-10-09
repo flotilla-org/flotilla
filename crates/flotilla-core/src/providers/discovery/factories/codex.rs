@@ -54,7 +54,6 @@ mod tests {
 
     use super::CodexCodingAgentFactory;
     use crate::config::ConfigStore;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::discovery::EnvironmentAssertion;
     use crate::providers::discovery::EnvironmentBag;
     use crate::providers::discovery::Factory;

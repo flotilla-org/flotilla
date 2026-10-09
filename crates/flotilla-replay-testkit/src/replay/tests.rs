@@ -70,9 +70,7 @@ interactions:
     let session = Session::replaying(&path, masks);
     let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-    use flotilla_core::{
-        providers::vcs::{git::GitVcs, VcsInspection},
-    };
+    use flotilla_core::providers::vcs::{git::GitVcs, VcsInspection};
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     let git = GitVcs::new(runner);
     let repo = ExecutionEnvironmentPath::new("/test/repo");

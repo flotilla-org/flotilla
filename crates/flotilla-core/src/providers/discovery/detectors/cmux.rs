@@ -47,11 +47,10 @@ impl HostDetector for CmuxDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotilla_paths::path_context::DaemonHostPath;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::discovery::TestEnvVars;
-    use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+    use flotilla_paths::path_context::DaemonHostPath;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn cmux_detector_with_socket_and_binary() {

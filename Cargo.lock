@@ -1457,6 +1457,7 @@ dependencies = [
  "dirs",
  "flotilla-build-features",
  "flotilla-protocol",
+ "tokio",
 ]
 
 [[package]]

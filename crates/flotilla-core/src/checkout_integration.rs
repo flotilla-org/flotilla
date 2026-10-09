@@ -459,7 +459,6 @@ mod tests {
     };
 
     use super::*;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
     use crate::testkits::replay::testing::MockRunner;
     use crate::vcs::FlotillaVcs;

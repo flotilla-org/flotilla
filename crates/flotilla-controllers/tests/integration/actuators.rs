@@ -5,7 +5,8 @@ use flotilla_core::providers::{
     environment::{EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
     terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
 };
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
     DockerEnvironmentSpec, DockerImagePullPolicy, EnvironmentMount, EnvironmentMountMode, FreshCloneCheckoutSpec, TerminalSessionSpec,

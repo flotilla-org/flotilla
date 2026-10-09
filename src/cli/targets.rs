@@ -292,7 +292,6 @@ mod tests {
 
         use flotilla_core::config::ConfigStore;
         use flotilla_core::in_process::InProcessDaemon;
-        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_discovery_testkit::fake_discovery_with_provider_set;
         use flotilla_discovery_testkit::FakeDiscoveryProviders;
         use flotilla_discovery_testkit::FakeIssueProvider;

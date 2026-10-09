@@ -1063,7 +1063,6 @@ mod tests {
 
     use super::*;
     use crate::config::ConfigStore;
-    use flotilla_daemon_api::daemon::DaemonHandle;
     use crate::in_process::tests::create_identity_convoy;
     use crate::in_process::tests::create_running_session;
     use crate::in_process::tests::create_test_environment;

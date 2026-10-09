@@ -40,7 +40,8 @@ use crate::{
     },
     vcs::Vcs,
 };
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // ---------------------------------------------------------------------------
 // Environment assertion types
@@ -995,7 +996,6 @@ mod orchestrator_tests {
 
     use super::*;
     use crate::config::ConfigStore;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::discovery::detectors;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::discovery::TestEnvVars;

@@ -1238,7 +1238,6 @@ mod tests {
     use crate::agent_adapter::CrewBriefTemplateResolver;
     use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
     use crate::crew_capabilities::CAPABILITIES_HEADING;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::discovery::factories::git::GitVcsFactory;
     use crate::providers::discovery::EnvironmentAssertion;
     use crate::providers::discovery::EnvironmentBag;

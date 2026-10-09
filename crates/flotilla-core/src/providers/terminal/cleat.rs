@@ -404,7 +404,6 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use super::*;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::CommandRunner;
     use crate::testkits::replay::testing::MockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;

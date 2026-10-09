@@ -24,7 +24,8 @@ use crate::{
         CommandRunner,
     },
 };
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 #[derive(Clone)]
 pub enum ManagedEnvironmentKind {

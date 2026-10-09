@@ -557,7 +557,6 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use crate::providers::ChannelLabel;
     use crate::providers::CommandOutput;
     use crate::providers::CommandRunner;

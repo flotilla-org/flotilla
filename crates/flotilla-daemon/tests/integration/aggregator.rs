@@ -10,11 +10,11 @@ use std::{
 };
 
 use flotilla_core::config::ConfigStore;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::providers::terminal::TerminalSession as PoolTerminalSession;
 use flotilla_core::providers::terminal::TerminalSessionLiveness;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::FakeDiscoveryProviders;

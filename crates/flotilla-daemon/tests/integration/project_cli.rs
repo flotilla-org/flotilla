@@ -12,7 +12,6 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_core::config::ConfigStore;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::ops_entry::materialized_workflow_name;
 use flotilla_core::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
@@ -29,6 +28,7 @@ use flotilla_core::repository_inspection::ProjectDeclarationInspection;
 use flotilla_core::repository_inspection::RepositoryInspection;
 use flotilla_core::repository_inspection::RepositoryInspector;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::fake_discovery_on_host_os;
 use flotilla_discovery_testkit::git_process_discovery;

@@ -52,6 +52,9 @@ edge to a testkit, and allowing a production Tokio `test-util` declaration.
 
 ## Measurements
 
+The original extraction measurements below precede the conflict-driven rebase
+onto `bedce9caa` (the paths/daemon API extraction).
+
 The sequence follows the [#2947 measurements](2747-build-graph.md): warm the
 workspace, append a comment to core's `daemon.rs`, build workspace tests, run
 workspace tests, then immediately run core tests and daemon integration tests.
@@ -82,7 +85,7 @@ contained build defaults.
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test --workspace --locked`
-- `python3 ci/build-graph/check.py` and its 13 Python contract tests
+- `python3 ci/build-graph/check.py` and its 15 Python contract tests
 - `uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py` and its 11 Python contract tests
 - Both targeted guard mutants fail the contract tests and were reverted.
 - The root binary's locked normal/build dependency tree contains no testkits,
@@ -93,3 +96,26 @@ contained build defaults.
   namespaces, `ReplayRunner`, `VirtualClock`, `ensure_scenarios`, discovery
   mock runner, or Tokio clock-pause symbols. Dependency feature scans, rather
   than symbol absence alone, establish that Tokio `test-util` is disabled.
+
+## Conflict-driven rebase verification
+
+Rebased onto `bedce9caa`, retaining the landed paths and daemon API owners and
+using those lower crates directly from testkits. Cargo regenerated the lockfile
+from the base lockfile without changing third-party versions. The new API/type
+crates receive dev-only Tokio feature anchors, preserving the production/test
+feature boundary.
+
+The exact formatting, Clippy and workspace test gates passed again, as did both
+repository guards (15 build-graph tests and 11 Git-boundary tests). The rebased
+root normal/build tree has 1,171 dependency rows and still contains no helpers
+or Tokio `test-util`. Release executable/symbol evidence above belongs to the
+original extraction run.
+
+After the rebased workspace run and Clippy, with no competing Cargo command:
+
+| Command | Seconds | Recompiled packages |
+| --- | ---: | ---: |
+| `cargo test -p flotilla-core --locked` | 12.67 | 0 |
+| `cargo test -p flotilla-daemon --locked --test integration` | 4.75 | 0 |
+
+Both commands passed; the command-switch reuse requirement still holds.

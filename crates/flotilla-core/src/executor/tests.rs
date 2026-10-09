@@ -7,8 +7,6 @@ use super::{
 };
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
-use flotilla_paths::path_context::DaemonHostPath;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use crate::provider_data::ProviderData;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::change_request::ChangeRequestTracker;
@@ -38,7 +36,8 @@ use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
 use crate::vcs::EnumeratedCheckout;
 use crate::vcs::Vcs;
-use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
