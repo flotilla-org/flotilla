@@ -195,9 +195,6 @@ mod project_repository_role_tests {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewListMember {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[builder(default)]
-    pub messages: Vec<CrewMessageView>,
     pub role: String,
     pub kind: String,
     pub state: String,

@@ -1473,6 +1473,8 @@ fn explain_subject_observation(
 }
 
 /// Project durable inbox state without inferring delivery from terminal phases.
+/// Convoy explanation still scans namespace history here (tracked in #2953).
+/// Crew orientation deliberately avoids this projection (#2952).
 pub(super) async fn crew_message_views(
     backend: &flotilla_resources::ResourceBackend,
     namespace: &str,

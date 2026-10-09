@@ -823,22 +823,6 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
             Cell::new(member.reason.as_deref().unwrap_or("-")),
         ]);
     }
-    let mut inbox = String::new();
-    for member in &response.members {
-        for message in &member.messages {
-            let _ = writeln!(
-                inbox,
-                "Message {} for {}: {} since {} from {} ({}){}",
-                message.name,
-                member.role,
-                message.phase,
-                message.since,
-                message.sender,
-                message.relation,
-                message.reason.as_ref().map_or_else(String::new, |reason| format!(": {reason}"))
-            );
-        }
-    }
     let mut charter = String::new();
     if let Some(error) = &response.project_error {
         let _ = writeln!(charter, "Live Project unavailable: {error}");
@@ -860,7 +844,7 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
         }
     }
     let alerts = response.credential_alerts.iter().map(|alert| format!("Credential attention: {alert}\n")).collect::<String>();
-    format!("Convoy: {}  Vessel: {} ({})\n{}\n{inbox}{alerts}{charter}", response.convoy, response.vessel, response.vessel_ref, table)
+    format!("Convoy: {}  Vessel: {} ({})\n{}\n{alerts}{charter}", response.convoy, response.vessel, response.vessel_ref, table)
 }
 
 fn explained_condition_label(condition: Option<&flotilla_protocol::ExplainedCondition>) -> String {

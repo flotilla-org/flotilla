@@ -49,7 +49,7 @@ impl WorkCredentialReconciler for StagingProbe {
 }
 
 async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default().with_read_counts());
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
     let discovery = Arc::new(fake_discovery(false));
@@ -1968,5 +1968,90 @@ async fn lost_vessel_resume_explains_rehydration() {
         let view = restarted.crew_state(&context, &convoy).await.expect("view");
         assert_eq!(view.members[0].state, expected, "{session_phase:?}, {crew_phase:?}");
         assert_eq!(view.members[0].reason.is_some(), expected == "lost");
+    }
+}
+
+// #2952: orientation reports crew state without reading Message bodies or
+// resolving inbox roles. Empty, local and replicated histories give identical
+// output and read cost, even with thousands of unrelated messages and expired
+// messages for this crew. No transport concurrency affects this read scenario.
+#[tokio::test]
+async fn crew_list_never_reads_message_history() {
+    use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec};
+    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    backend
+        .using::<flotilla_resources::Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("crew-work".into()).build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let context = CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".into()),
+        convoy: Some("crew".into()),
+        vessel_ref: Some("crew-work".into()),
+        role: Some("coder".into()),
+    };
+    let ResourceBackend::InMemory(memory) = &backend else { unreachable!() };
+    let before = memory.read_counts();
+    let expected = crew.crew_list_internal(&context).await.unwrap();
+    assert_eq!(expected.members[0].role, "coder");
+    let baseline = memory.read_counts();
+    let convoy_reads = baseline.get("Convoy").copied().unwrap_or_default() - before.get("Convoy").copied().unwrap_or_default();
+    assert_eq!(baseline.get("Message").copied().unwrap_or_default() - before.get("Message").copied().unwrap_or_default(), 0);
+    let messages = backend.using::<Message>("flotilla");
+    for index in 0..2003 {
+        let receiver = if index < 2000 { format!("flotilla/other-{index}/work/coder") } else { "flotilla/crew/work/coder".into() };
+        let message = messages
+            .create(
+                &InputMeta::builder().name(format!("inbox-{index}")).build(),
+                &MessageSpec::builder()
+                    .sender("system:test".into())
+                    .receiver(receiver)
+                    .relation(MessageRelation::System)
+                    .body("test".into())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        if index == 2002 {
+            let mut status = message.status.unwrap_or_default();
+            status.phase = MessagePhase::Expired;
+            messages.update_status(&message.metadata.name, &message.metadata.resource_version, &status).await.unwrap();
+        }
+    }
+    for replicated in [false, true] {
+        if replicated {
+            backend
+                .replica_writer::<Message>(flotilla_protocol::NodeId::new("message-home"), "flotilla")
+                .replace(&messages.list().await.unwrap(), Utc::now())
+                .await
+                .unwrap();
+            for record in messages.list().await.unwrap().items {
+                messages.delete(&record.metadata.name).await.unwrap();
+            }
+        }
+        let before = memory.read_counts();
+        let response = crew.crew_list_internal(&context).await.unwrap();
+        let after = memory.read_counts();
+        assert_eq!(
+            after.get("Message").copied().unwrap_or_default() - before.get("Message").copied().unwrap_or_default(),
+            0,
+            "orientation must not read messages (replicated={replicated})"
+        );
+        assert_eq!(
+            after.get("Convoy").copied().unwrap_or_default() - before.get("Convoy").copied().unwrap_or_default(),
+            convoy_reads,
+            "orientation must not resolve message receivers"
+        );
+        assert_eq!(response, expected, "history must not affect crew state");
+        assert!(serde_json::to_value(response).unwrap()["members"][0].get("messages").is_none(), "orientation has no inbox wire field");
     }
 }
