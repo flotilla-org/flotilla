@@ -638,3 +638,79 @@ async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
     }
     assert!(table.rows().await.is_empty());
 }
+
+// A namespace awaiting its store opener must not block another namespace's
+// events or cancellation. The pending future stands in for stalled store I/O.
+#[tokio::test]
+async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
+    use futures::FutureExt;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    let table = supervision_wake(&backend).subscriptions;
+    let connection = uuid::Uuid::new_v4();
+    let row = overload_row(connection);
+    table.inner.rows.lock().await.insert(row.id, row.clone());
+    let mut watching = Box::pin(table.watch_row(row));
+    assert!(watching.as_mut().now_or_never().is_none());
+    let mut slow_row = overload_row(uuid::Uuid::new_v4());
+    slow_row.namespace = "slow-store".into();
+    let previous = table.inner.routing.lock().await.events_processed;
+    let mut opening = Box::pin(table.register_routing_with(&slow_row, std::future::pending()));
+    assert!(opening.as_mut().now_or_never().is_none());
+    let convoys = backend.using::<Convoy>("flotilla");
+    let object = convoys.get("busy").await.expect("convoy");
+    convoys
+        .update(
+            &InputMeta::from(&object.metadata),
+            &object.metadata.resource_version,
+            &ConvoySpec::builder().workflow_ref("while-other-store-stalls".into()).build(),
+        )
+        .await
+        .expect("update");
+    router_processed(&table, previous).await;
+    assert!(watching.as_mut().now_or_never().is_none());
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 2);
+    tokio::time::timeout(Duration::from_secs(2), table.unsubscribe_connection(connection)).await.expect("independent cancellation");
+    watching.await.expect("watcher exits");
+    drop(opening);
+    assert!(table.inner.routing.lock().await.dependencies.is_empty());
+}
+
+// Racing openers must join the same live namespace router. Removing a row
+// releases only its dependency entries, leaves its sibling live, and is idempotent.
+#[tokio::test]
+async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
+    use futures::FutureExt;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let table = supervision_wake(&backend).subscriptions;
+    let row = overload_row(uuid::Uuid::new_v4());
+    let mut sibling = row.clone();
+    sibling.id = uuid::Uuid::new_v4();
+    let permit = tokio::sync::Notify::new();
+    // Store-I/O seam: release an obsolete candidate after another opener won.
+    let mut opening = Box::pin(table.register_routing_with(&row, async {
+        permit.notified().await;
+        Ok(futures::stream::SelectAll::new())
+    }));
+    assert!(opening.as_mut().now_or_never().is_none());
+    let (_, mut sibling_changes) = table.register_routing(&sibling).await.expect("live router");
+    permit.notify_one();
+    let (_, mut changes) = opening.await.expect("join winning router");
+    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        changes.changed().await.expect("first row receives event");
+        sibling_changes.changed().await.expect("sibling receives event");
+    })
+    .await
+    .expect("same router routes to both rows");
+    assert_eq!(table.inner.routing.lock().await.resyncs, 0, "obsolete empty candidate never starts");
+    table.remove_routing(row.id).await;
+    assert!(changes.has_changed().is_err(), "removed row's senders are released");
+    assert!(sibling_changes.has_changed().is_ok(), "sibling keeps the router alive");
+    table.remove_routing(row.id).await;
+    assert_eq!(table.inner.routing.lock().await.removal_visits, 1, "repeat removal does no index work");
+    table.remove_routing(sibling.id).await;
+    assert!(sibling_changes.has_changed().is_err());
+    assert_eq!(table.inner.routing.lock().await.removal_visits, 2, "cleanup visits only each row's dependencies");
+    assert!(table.inner.routing.lock().await.dependencies.is_empty());
+}

@@ -13,7 +13,7 @@ use flotilla_resources::{
     WorkLeafSubject,
 };
 
-use super::routing::{ObjectAddress, RowDependencies};
+use super::routing::{ObjectAddress, ObjectKind, RowDependencies};
 use super::sources::{change_request_sources, freshest_change_requests, freshest_issues, issue_sources, LeafObservationStaleness};
 use super::{EpisodeKeyFields, LeafFiringRecord, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher};
 
@@ -94,8 +94,7 @@ impl LeafSubscriptionTable {
             .collect::<Vec<_>>();
         for id in ids {
             self.inner.rows.lock().await.remove(&id);
-            // Abort before taking the routing lock: watch registration may be
-            // awaiting a store while holding it.
+            // Stop the evaluator before releasing its routing registration.
             if let Some(task) = self.inner.tasks.lock().await.remove(&id) {
                 task.abort();
             }
@@ -200,19 +199,18 @@ impl LeafSubscriptionTable {
                 };
             }
             match address.kind {
-                "Convoy" => load!(Convoy, convoys),
-                "Vessel" => load!(Vessel, vessels),
-                "Usage" => load!(Usage, usages),
-                "Artifact" => load!(Artifact, artifacts),
-                "ChangeRequest" => {
+                ObjectKind::Convoy => load!(Convoy, convoys),
+                ObjectKind::Vessel => load!(Vessel, vessels),
+                ObjectKind::Usage => load!(Usage, usages),
+                ObjectKind::Artifact => load!(Artifact, artifacts),
+                ObjectKind::ChangeRequest => {
                     let copies = self.inner.backend.including_replicas::<ChangeRequest>(namespace).get_all(&address.name).await?;
                     subjects.change_requests.extend(freshest_change_requests(&change_request_sources(copies)));
                 }
-                "Issue" => {
+                ObjectKind::Issue => {
                     let copies = self.inner.backend.including_replicas::<Issue>(namespace).get_all(&address.name).await?;
                     subjects.issues.extend(freshest_issues(&issue_sources(copies)));
                 }
-                _ => unreachable!("leaf resource kind"),
             }
         }
         Ok(subjects)
