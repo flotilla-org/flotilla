@@ -20,5 +20,3 @@ mod vessel_placement;
 mod vessel_reconciler;
 
 // Reuse the lower crate's backend contracts and fixtures without reversing its build graph.
-#[path = "../../../flotilla-resources/tests/common/mod.rs"]
-mod resources_common;

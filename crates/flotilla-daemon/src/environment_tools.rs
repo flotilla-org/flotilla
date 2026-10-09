@@ -660,7 +660,7 @@ pub(crate) mod tests {
         },
     };
 
-    use flotilla_core::providers::discovery::test_support::DiscoveryMockRunner;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
     use tempfile::TempDir;
 
     use super::*;

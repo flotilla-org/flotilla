@@ -247,3 +247,5 @@ async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
     assert!(commands.iter().any(|command| command == "git"));
     assert!(commands.iter().any(|command| command == "mv"));
 }
+
+use flotilla_discovery_testkit::InProcessDiscoveryExt;

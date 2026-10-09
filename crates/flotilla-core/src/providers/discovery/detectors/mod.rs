@@ -44,10 +44,9 @@ pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::{
-        test_support::{DiscoveryMockRunner, TestEnvVars},
-        EnvironmentAssertion,
-    };
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testkits::discovery::TestEnvVars;
 
     #[test]
     fn default_host_detectors_non_empty() {

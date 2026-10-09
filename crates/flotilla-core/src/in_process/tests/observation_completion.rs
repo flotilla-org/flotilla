@@ -20,8 +20,8 @@ use super::support::{test_meta, BatchedObservationRunner};
 use crate::change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef};
 use crate::config::ConfigStore;
 use crate::in_process::{forge_service_matches, CrewCompletionRefusalCause, InProcessDaemon};
-use crate::providers::discovery::test_support::fake_discovery_with_runner;
 use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag};
+use crate::testkits::discovery::fake_discovery_with_runner;
 
 // #2585: the real convoy resolver shares proven branch absence across callers
 // while preserving ordered repository selection and refreshing after five minutes.
@@ -731,3 +731,5 @@ fn observation_service_matching_preserves_http_and_authority_port() {
     assert!(forge_service_matches("https://github.com/", "github.com"));
     assert!(!forge_service_matches("http://forgejo.local:3000", "forgejo.local:3001"));
 }
+
+use crate::testkits::discovery::InProcessDiscoveryExt;

@@ -1,0 +1,16 @@
+[package]
+name = "flotilla-protocol-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+
+flotilla-protocol = { path = "../flotilla-protocol" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

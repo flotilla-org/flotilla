@@ -1,3 +1,11 @@
+macro_rules! run {
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr) => {
+        $runner.run($cmd, $args, $cwd, &flotilla_core::providers::command_channel_label($cmd, $args)).await
+    };
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr) => {
+        $runner.run($cmd, $args, $cwd, &flotilla_core::providers::command_channel_label_with::<true, _>($cmd, $args, &$labeler)).await
+    };
+}
 use super::*;
 
 #[test]
@@ -62,7 +70,9 @@ interactions:
     let session = Session::replaying(&path, masks);
     let runner = Arc::new(ReplayRunner::new(session.clone()));
 
-    use crate::providers::vcs::{git::GitVcs, VcsInspection};
+    use flotilla_core::{
+        providers::vcs::{git::GitVcs, VcsInspection},
+    };
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     let git = GitVcs::new(runner);
     let repo = ExecutionEnvironmentPath::new("/test/repo");
@@ -252,7 +262,7 @@ interactions:
 
 #[tokio::test]
 async fn record_then_replay() {
-    use crate::providers::testing::MockRunner;
+    use super::testing::MockRunner;
 
     let dir = tempfile::tempdir().unwrap();
     let fixture_path = dir.path().join("recorded.yaml");
@@ -289,7 +299,7 @@ async fn record_then_replay() {
 
 #[tokio::test]
 async fn replay_http_client_round_trip() {
-    use crate::providers::HttpClient;
+    use flotilla_core::providers::HttpClient;
 
     let yaml = r#"
 interactions:
@@ -309,7 +319,7 @@ interactions:
     let session = Session::replaying(&path, Masks::new());
     let client = ReplayHttpClient::new(session.clone());
 
-    let request = crate::tls::client()
+    let request = flotilla_core::tls::client()
         .get("https://example.test/v1/sessions")
         .header("authorization", "Bearer token-1")
         .header("anthropic-version", "2023-06-01")
@@ -437,7 +447,7 @@ fn default_labeler_no_args_uses_cmd() {
 
 #[test]
 fn task_id_overrides_label() {
-    use super::super::TaskId;
+    use flotilla_core::providers::TaskId;
     let request = ChannelRequest::Command { cmd: "git", args: &["rev-list", "--left-right", "--count", "HEAD...main"] };
     assert_eq!(TaskId("trunk-ab").label_for(&request), ChannelLabel::Command("trunk-ab".into()));
 }
@@ -725,7 +735,7 @@ fn recorder_applies_masks() {
 
 #[tokio::test]
 async fn session_record_then_replay_round_trip() {
-    use crate::providers::testing::MockRunner;
+    use super::testing::MockRunner;
 
     let dir = tempfile::tempdir().expect("create temp dir");
     let fixture_path = dir.path().join("round_trip.yaml");
@@ -764,7 +774,7 @@ async fn session_record_then_replay_round_trip() {
 
 #[tokio::test]
 async fn concurrent_same_subcommand_with_task_id() {
-    use super::super::TaskId;
+    use flotilla_core::providers::TaskId;
 
     let yaml = r#"
 rounds:
@@ -927,7 +937,7 @@ impl GhApi for ClassifiedTestApi {
 fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use crate::providers::github_api::GithubRetrySource;
+    use flotilla_core::providers::github_api::GithubRetrySource;
     // Exhaust error variants, both kinds, every retry source and absent/present
     // deadlines in each case; generate timestamps across zero and modern dates,
     // pagination boundaries and counts across the empty/100-item page boundary.
@@ -960,7 +970,7 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
             let recording = Session::recording(&path, Masks::new());
             let api = RecordingGhApi::new(recording.clone(), Arc::new(ClassifiedTestApi(expected)));
             let endpoint = "repos/team/one/pulls";
-            let label = super::super::gh_api_channel_label("GET", endpoint);
+            let label = flotilla_core::providers::gh_api_channel_label("GET", endpoint);
             let recorded = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await;
             recording.finish();
             let replay = Session::replaying(&path, Masks::new());
@@ -1010,7 +1020,7 @@ impl CommandRunner for RestFailureRunner {
 fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use crate::providers::github_api::{GhApiClient, GithubRetrySource};
+    use flotilla_core::providers::github_api::{GhApiClient, GithubRetrySource};
     // Exhaust ordinary 403/404, primary and secondary 403/429, missing reset,
     // and transport failure each run. Generate reset boundaries and retry delay.
     let reset = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
@@ -1048,7 +1058,7 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
                 transport_failure: status == 0,
             });
             let endpoint = "repos/team/one/pulls";
-            let label = super::super::gh_api_channel_label("GET", endpoint);
+            let label = flotilla_core::providers::gh_api_channel_label("GET", endpoint);
             let path = temp.path().join("recording.yaml");
             let live = GhApiClient::new(runner.clone());
             let expected_legacy = live.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("live failure");
@@ -1120,7 +1130,8 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
 // cached refusal makes no further subprocess call; replay retains that distinction.
 #[tokio::test]
 async fn classified_issue_budget_recording_has_no_failure_response() {
-    use crate::providers::{github_api::GhApiClient, testing::MockRunner};
+    use super::testing::MockRunner;
+    use flotilla_core::providers::github_api::GhApiClient;
     let reset = chrono::Utc::now().timestamp() + 3600;
     // Substitute the gh subprocess boundary with one successful low-budget response.
     let runner = Arc::new(MockRunner::new(vec![Ok(format!(
@@ -1131,7 +1142,7 @@ async fn classified_issue_budget_recording_has_no_failure_response() {
     let recording = Session::recording(&path, Masks::new());
     let api = RecordingGhApi::new(recording.clone(), Arc::new(GhApiClient::new(runner.clone())));
     let endpoint = "repos/team/one/issues?state=all";
-    let label = super::super::gh_api_channel_label("GET", endpoint);
+    let label = flotilla_core::providers::gh_api_channel_label("GET", endpoint);
     let first = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("budget refusal");
     let second = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("cached refusal");
     assert!(first.response.is_none());
@@ -1155,9 +1166,9 @@ async fn classified_issue_budget_recording_has_no_failure_response() {
 fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use crate::providers::testing::MockRunner;
+    use super::testing::MockRunner;
 
-    let label = crate::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let label = flotilla_core::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
     let generated = tc.draw(gs::integers::<i32>());
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let temp = tempfile::tempdir().expect("recording directory");
@@ -1206,10 +1217,10 @@ fn legacy_command_exit_status_is_readable() {
 // exit code 1 that pgrep callers must interpret as a successful empty match.
 #[tokio::test]
 async fn command_execution_error_survives_record_replay() {
-    use crate::providers::testing::MockRunner;
+    use super::testing::MockRunner;
     let temp = tempfile::tempdir().expect("recording directory");
     let path = temp.path().join("failure.yaml");
-    let label = crate::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let label = flotilla_core::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
     let mut masks = Masks::new();
     masks.add("/private/runtime", "{runtime}");
     let session = Session::recording(&path, masks.clone());

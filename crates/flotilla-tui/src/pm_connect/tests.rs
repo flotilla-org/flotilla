@@ -932,7 +932,8 @@ fn connector_clock_expires_landed_subjects_without_resource_updates() {
 // This uses the actual daemon command consumer, which rejects replica cursor resume.
 #[tokio::test]
 async fn connector_real_daemon_stays_subscribed() {
-    use flotilla_core::{in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{InMemoryBackend, ResourceBackend};
     let tmp = tempfile::tempdir().expect("config directory");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-2523\"\n").expect("machine id");
@@ -964,7 +965,8 @@ async fn connector_real_daemon_stays_subscribed() {
 #[tokio::test]
 async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
     use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
-    use flotilla_core::{in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{InMemoryBackend, ResourceBackend};
     let tmp = tempfile::tempdir().expect("config directory");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-refusal-2523\"\n").expect("machine id");
@@ -1012,7 +1014,8 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
 // actual daemon watch. Query rows are the input seam; resource consumers are real.
 #[tokio::test]
 async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
-    use flotilla_core::{in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{ChangeRequest, InMemoryBackend, K8sResourceObject, ResourceBackend, ResourceObject, WatchEvent};
     let tmp = tempfile::tempdir().expect("config");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-namespace-2523\"\n").expect("config");

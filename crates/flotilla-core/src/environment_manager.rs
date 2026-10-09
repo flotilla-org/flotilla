@@ -469,8 +469,7 @@ impl EnvironmentManager {
         managed
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn replace_local_environment_bag_for_test(&self, env_bag: EnvironmentBag) -> Result<(), String> {
+    pub fn replace_local_environment_bag(&self, env_bag: EnvironmentBag) -> Result<(), String> {
         self.update_direct_environment_bag(&self.local_environment_id, env_bag)
     }
 
@@ -588,16 +587,18 @@ mod tests {
     use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
     use super::*;
-    use crate::providers::{
-        discovery::{
-            detectors::default_host_detectors,
-            test_support::{fake_discovery, DiscoveryMockRunner},
-            EnvironmentAssertion, ProviderCategory, ProviderDescriptor,
-        },
-        environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
-        registry::ProviderRegistry,
-        CommandRunner,
-    };
+    use crate::providers::discovery::detectors::default_host_detectors;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::ProviderCategory;
+    use crate::providers::discovery::ProviderDescriptor;
+    use crate::providers::environment::EnvironmentHandle;
+    use crate::providers::environment::EnvironmentProvider;
+    use crate::providers::environment::ProvisionedEnvironment;
+    use crate::providers::environment::ProvisionedMount;
+    use crate::providers::registry::ProviderRegistry;
+    use crate::providers::CommandRunner;
+    use crate::testkits::discovery::fake_discovery;
+    use crate::testkits::discovery::DiscoveryMockRunner;
 
     struct MockProvisionedEnvironment {
         id: EnvironmentId,

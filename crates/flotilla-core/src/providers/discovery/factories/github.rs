@@ -296,10 +296,14 @@ mod tests {
         config_path, forgejo_provider_config, resolve_forgejo_auth, ForgejoChangeRequestFactory, ForgejoIssueProviderFactory,
         GitHubChangeRequestFactory, GitHubIssueProviderFactory,
     };
-    use crate::{
-        config::{ConfigStore, ForgejoIssueTrackerConfig},
-        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
-    };
+    use crate::config::ConfigStore;
+    use crate::config::ForgejoIssueTrackerConfig;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::discovery::Factory;
+    use crate::providers::discovery::UnmetRequirement;
+    use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {

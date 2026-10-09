@@ -745,8 +745,10 @@ mod tests {
     async fn placement_policy_cli_apply_scenario(target: u8, percent: u8) {
         use std::sync::Arc;
 
-        use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
-        use flotilla_daemon::server::test_support::spawn_in_memory_request_topology_stateful;
+        use flotilla_core::config::ConfigStore;
+        use flotilla_core::in_process::InProcessDaemon;
+        use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
+        use flotilla_discovery_testkit::fake_discovery;
         use flotilla_resources::{
             Environment, EnvironmentSpec, FulfilmentKind, HostDirectEnvironmentSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
         };

@@ -3,9 +3,11 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
-use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_core::config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
     single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,

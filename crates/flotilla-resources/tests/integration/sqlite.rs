@@ -1,7 +1,11 @@
 use std::{sync::mpsc as std_mpsc, thread, time::Instant};
 
 use chrono::Utc;
-use common::{
+use flotilla_resources::{
+    delete_resource_kind, ApiPaths, Convoy, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch, Project, ProjectSpec, Resource,
+    ResourceBackend, ResourceError, SqliteBackend, TerminalSession, WatchEvent, WatchStart, WorkflowTemplate, WorkflowTemplateSpec,
+};
+use flotilla_store_testkit::fixtures::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
         assert_delete_emits_event_with_backend, assert_get_all_provenances_contract, assert_identical_status_update_is_noop_with_backend,
@@ -21,16 +25,10 @@ use common::{
     },
     convoy_meta, convoy_spec, resource_meta, valid_workflow_template_spec, workflow_template_meta,
 };
-use flotilla_resources::{
-    delete_resource_kind, ApiPaths, Convoy, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch, Project, ProjectSpec, Resource,
-    ResourceBackend, ResourceError, SqliteBackend, TerminalSession, WatchEvent, WatchStart, WorkflowTemplate, WorkflowTemplateSpec,
-};
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
-
-use crate::common;
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
@@ -38,7 +36,7 @@ fn backend() -> ResourceBackend {
 
 #[tokio::test]
 async fn terminal_session_label_lookup_contract() {
-    common::contract::assert_terminal_session_label_lookup_with_backend(backend()).await;
+    flotilla_store_testkit::fixtures::contract::assert_terminal_session_label_lookup_with_backend(backend()).await;
 }
 
 #[tokio::test]
@@ -310,7 +308,7 @@ async fn missing_authority_delete_tombstones_replica() {
 
 #[tokio::test]
 async fn watch_rejects_version_ahead_of_stream() {
-    common::contract::assert_watch_rejects_version_ahead_of_stream_with_backend(backend()).await;
+    flotilla_store_testkit::fixtures::contract::assert_watch_rejects_version_ahead_of_stream_with_backend(backend()).await;
 }
 
 #[tokio::test]
@@ -1025,17 +1023,17 @@ async fn reopening_with_smaller_retention_compacts_existing_events_and_persists_
 
 #[tokio::test]
 async fn slow_convoy_watch_is_bounded() {
-    common::contract::assert_slow_convoy_watch_is_bounded(backend()).await;
+    flotilla_store_testkit::fixtures::contract::assert_slow_convoy_watch_is_bounded(backend()).await;
 }
 
 #[tokio::test]
 async fn slow_replica_watch_is_bounded() {
-    common::contract::assert_slow_replica_watch_is_bounded(backend()).await;
+    flotilla_store_testkit::fixtures::contract::assert_slow_replica_watch_is_bounded(backend()).await;
 }
 
 #[tokio::test]
 async fn replica_snapshots_reconcile_without_relay_resurrection() {
-    common::contract::assert_replica_snapshot_reconciliation(backend()).await;
+    flotilla_store_testkit::fixtures::contract::assert_replica_snapshot_reconciliation(backend()).await;
 }
 
 // #2640 review: resnapshot writes scale with changed keys. SQLite triggers

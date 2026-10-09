@@ -12,8 +12,8 @@ use super::support::test_meta;
 use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
-use crate::providers::discovery::test_support::fake_discovery;
 use crate::providers::{CommandOutput, CommandRunner};
+use crate::testkits::discovery::fake_discovery;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {

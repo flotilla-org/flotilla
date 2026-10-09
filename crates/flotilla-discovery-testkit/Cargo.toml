@@ -1,0 +1,22 @@
+[package]
+name = "flotilla-discovery-testkit"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flotilla-core = { path = "../flotilla-core" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+tokio = { workspace = true, features = ["test-util"] }

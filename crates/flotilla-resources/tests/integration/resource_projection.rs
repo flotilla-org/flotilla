@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
 
-use common::{convoy_object, convoy_spec, convoy_status, timestamp};
 use flotilla_resources::{
     Checkout, CheckoutSpec, CheckoutWorktreeSpec, Convoy, ConvoyPhase, ConvoyRepositorySpec, InputMeta, K8sResourceObject,
     LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, Usage, UsageSpec, UsageStatus, UsageWindow,
     AUTHORITY_LABEL,
 };
-
-use crate::common;
+use flotilla_store_testkit::fixtures::{convoy_object, convoy_spec, convoy_status, timestamp};
 
 #[test]
 fn resource_object_projects_to_k8s_object_shape() {
@@ -125,7 +123,7 @@ fn dispatch_observation_crd_parses_with_immutable_record_fields() {
 fn usage_resource_roundtrips_provider_account_subject_and_window_set() {
     let observed_at = "2026-08-06T10:39:55Z".parse().expect("valid timestamp");
     let object = ResourceObject::<Usage> {
-        metadata: common::object_meta("usage-example", "flotilla", "3"),
+        metadata: flotilla_store_testkit::fixtures::object_meta("usage-example", "flotilla", "3"),
         spec: UsageSpec { provider: "codex".to_string(), account: "user@example.com".to_string() },
         status: Some(UsageStatus {
             plan: Some("plus".to_string()),
@@ -239,7 +237,7 @@ fn lifecycle_authority_roundtrips_through_k8s_projection_labels() {
 #[test]
 fn checkout_spec_worktree_variant_roundtrips_through_k8s_projection() {
     let object = ResourceObject::<Checkout> {
-        metadata: common::object_meta("checkout-a", "flotilla", "3"),
+        metadata: flotilla_store_testkit::fixtures::object_meta("checkout-a", "flotilla", "3"),
         spec: CheckoutSpec::Worktree(CheckoutWorktreeSpec {
             repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
             env_ref: "env-a".to_string(),
@@ -265,7 +263,7 @@ fn checkout_spec_worktree_variant_roundtrips_through_k8s_projection() {
 #[test]
 fn checkout_spec_observed_variant_carries_only_observed_facts() {
     let object = ResourceObject::<Checkout> {
-        metadata: common::object_meta("checkout-a", "flotilla", "3"),
+        metadata: flotilla_store_testkit::fixtures::object_meta("checkout-a", "flotilla", "3"),
         spec: CheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: "main".to_string(),
             path: "/Users/dev/flotilla".to_string(),

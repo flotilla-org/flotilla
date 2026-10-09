@@ -187,7 +187,10 @@ pub(super) mod tests {
     #[tokio::test(start_paused = true)]
     async fn layered_deadlines_preserve_observation_timeout_and_recover() {
         use crate::forge_observation::ForgeReads;
-        use flotilla_resources::{Clock, InMemoryBackend, ResourceBackend, VirtualClock};
+        use flotilla_resources::Clock;
+        use flotilla_resources::InMemoryBackend;
+        use flotilla_resources::ResourceBackend;
+        use flotilla_store_testkit::VirtualClock;
         let cache = DispatchBoardCache::default();
         let source = source("org/shared");
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("owner"));

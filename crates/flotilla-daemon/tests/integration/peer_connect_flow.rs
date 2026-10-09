@@ -9,15 +9,15 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use flotilla_core::{
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    providers::discovery::test_support::{fake_discovery, init_git_repo},
-};
-use flotilla_daemon::{
-    peer::{test_support::ensure_test_connection_generation, PeerManager, PeerSender},
-    server::{PeerConnectedNotice, PeerConnectionEvent},
-};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon::peer::PeerManager;
+use flotilla_daemon::peer::PeerSender;
+use flotilla_daemon::server::PeerConnectedNotice;
+use flotilla_daemon::server::PeerConnectionEvent;
+use flotilla_daemon_testkit::peer::ensure_test_connection_generation;
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::init_git_repo;
 use flotilla_protocol::{GoodbyeReason, HostName, NodeId, PeerWireMessage};
 use tokio::sync::{Mutex, Notify};
 
@@ -98,7 +98,8 @@ async fn peer_connect_triggers_local_state_send() {
         ensure_test_connection_generation(&mut pm, &node_b, || Arc::clone(&sender))
     };
 
-    let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
+    let (_handle, peer_connected_tx) =
+        flotilla_daemon_testkit::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
     peer_connected_tx
         .send(PeerConnectionEvent::Connected(PeerConnectedNotice { peer: node_b.clone(), generation, resource_socket_path: None }))
@@ -135,7 +136,8 @@ async fn peer_reconnect_resends_local_state() {
         ensure_test_connection_generation(&mut pm, &node_b, || Arc::clone(&sender))
     };
 
-    let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
+    let (_handle, peer_connected_tx) =
+        flotilla_daemon_testkit::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
     // First connection
     peer_connected_tx

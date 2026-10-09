@@ -1,7 +1,3 @@
-use common::{
-    bootstrapped_tool_only_convoy_status, convoy_meta, task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object,
-    valid_convoy_spec, workflow_template_meta,
-};
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase,
@@ -10,9 +6,11 @@ use flotilla_resources::{
     VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
     PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
 };
+use flotilla_store_testkit::fixtures::{
+    bootstrapped_tool_only_convoy_status, convoy_meta, task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object,
+    valid_convoy_spec, workflow_template_meta,
+};
 use tokio::time::{timeout, Duration};
-
-use crate::common;
 
 async fn reconcile_once(
     convoys: &flotilla_resources::TypedResolver<Convoy>,

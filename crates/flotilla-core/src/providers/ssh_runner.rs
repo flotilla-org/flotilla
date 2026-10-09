@@ -195,9 +195,12 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
-    use crate::providers::{
-        command_timeout_message, testing::TimeoutOnlyRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
-    };
+    use crate::providers::command_timeout_message;
+    use crate::providers::ChannelLabel;
+    use crate::providers::CommandOutput;
+    use crate::providers::CommandRunner;
+    use crate::providers::ProcessCommandRunner;
+    use crate::testkits::replay::testing::TimeoutOnlyRunner;
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_ssh_client() {

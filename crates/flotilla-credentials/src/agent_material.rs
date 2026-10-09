@@ -1091,7 +1091,8 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 pub(crate) mod tests {
     use std::{io, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::Mutex};
 
-    use flotilla_core::providers::{discovery::test_support::TestEnvVars, CommandOutput};
+    use flotilla_core::providers::CommandOutput;
+    use flotilla_discovery_testkit::TestEnvVars;
 
     use super::*;
 

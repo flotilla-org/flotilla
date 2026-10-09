@@ -12,13 +12,13 @@ use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::in_process::crew_ops::{convoy_message_address, convoy_sender_address};
 use crate::in_process::{retry_resource_apply, InProcessDaemon};
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 // #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
 // successful reads never emit fallback diagnostics. Glue: exhaust the three read outcomes.
 #[tokio::test]
 async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
-    use crate::providers::testing::capture_logs;
+    use crate::testkits::replay::testing::capture_logs;
     let memory = ResourceBackend::InMemory(InMemoryBackend::default());
     memory
         .using::<ResourceConvoy>("attribution")

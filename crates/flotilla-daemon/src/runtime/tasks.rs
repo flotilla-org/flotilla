@@ -528,7 +528,7 @@ pub(super) type SupervisorTurnWatches = (BoxStream<'static, Result<(), ResourceE
 
 // Watch subscription is the notification boundary. Tests can close one input
 // without changing the resource stores or the reconciliation they exercise.
-#[cfg_attr(any(test, feature = "test-support"), visibility::make(pub))]
+#[visibility::make(pub)]
 #[doc(hidden)]
 pub(super) fn spawn_pending_supervisor_turn_task_with_watches<F, Fut>(
     daemon: Arc<InProcessDaemon>,

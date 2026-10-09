@@ -22,7 +22,7 @@ use flotilla_resources::{
     WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
-use crate::resources_common as common;
+use flotilla_store_testkit::fixtures as common;
 
 struct AlwaysEligible;
 

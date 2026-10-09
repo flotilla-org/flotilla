@@ -890,7 +890,7 @@ impl BlobStore for TieredBlobStore {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use flotilla_core::providers::replay::{self, Masks};
+    use flotilla_replay_testkit::{self as replay, Masks};
 
     use super::*;
 

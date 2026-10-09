@@ -162,10 +162,10 @@ pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerR
 }
 
 pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
-    use flotilla_core::providers::discovery::test_support::fake_discovery;
+    use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
 
-    use crate::server::test_support::spawn_in_memory_request_topology_stateful;
+    use crate::testkits::server::spawn_in_memory_request_topology_stateful;
     let temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-pool-test\"\n")
         .expect("cross-host Message fixture operation succeeds");
@@ -462,3 +462,5 @@ pub(super) async fn daemon_with_transient_terminal_pool(
         .expect("transient pool environment bag");
     daemon
 }
+
+use flotilla_discovery_testkit::InProcessDiscoveryExt;

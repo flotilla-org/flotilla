@@ -500,10 +500,9 @@ async fn resolve_or_create_remote_environment_id_at(runner: &dyn CommandRunner, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{
-        discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
-        ProcessCommandRunner,
-    };
+    use crate::providers::ProcessCommandRunner;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testkits::discovery::TestEnvVars;
 
     #[test]
     fn generates_and_persists_host_id() {

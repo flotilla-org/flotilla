@@ -319,3 +319,5 @@ pub(super) async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Rec
 pub(super) fn test_agent_material_registry(env: Arc<dyn EnvVars>) -> AgentMaterialRegistry {
     AgentMaterialRegistry::with_codex_delivery_support(env, true)
 }
+
+use flotilla_discovery_testkit::InProcessDiscoveryExt;

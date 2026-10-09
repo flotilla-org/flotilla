@@ -294,11 +294,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::providers::{
-        testing::{fixture_path, MockRunner},
-        vcs::parse_porcelain_status,
-        CommandRunner,
-    };
+    use crate::providers::vcs::parse_porcelain_status;
+    use crate::providers::CommandRunner;
+    use crate::testkits::replay::testing::fixture_path;
+    use crate::testkits::replay::testing::MockRunner;
 
     #[test]
     fn parse_porcelain_normal_worktrees() {
@@ -408,7 +407,8 @@ branch refs/heads/feature
 
     #[tokio::test]
     async fn record_replay_create_checkout_tracks_remote_branch() {
-        use crate::providers::{replay, vcs::checkout_test_support};
+        use crate::providers::vcs::checkout_test_support;
+        use crate::testkits::replay;
 
         let live = replay::is_live();
         let temp = if live { Some(checkout_test_support::setup_remote_only_branch()) } else { None };

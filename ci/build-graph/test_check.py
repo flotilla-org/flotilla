@@ -71,20 +71,39 @@ class BuildGraphContract(unittest.TestCase):
         # External test frameworks are outside workspace ownership constraints.
         self.assertEqual(violations(graph(package("core", dev=("hegeltest",)))), [])
 
-    def test_helpers_must_be_default_but_operational_features_need_not_be(self):
-        # Build/test switching must not activate a second helper feature set;
-        # TLS and sandbox options are deliberate caller-selected variations.
-        features = {"default": ["helpers"], "helpers": ["test-support", "replay"],
-                    "test-support": [], "replay": [], "aws-lc-provider": [], "skip-no-sandbox-tests": []}
-        self.assertEqual(violations(graph(package("core", features=features))), [])
-        features["helpers"] = ["test-support"]
-        self.assertIn("replay must be enabled by default", violations(graph(package("core", features=features)))[0])
+    def test_production_helpers_and_features_are_rejected(self):
+        # The issue contract excludes helpers from production, including build edges.
+        for kind in ("normal", "build"):
+            for target in ("flotilla-store-testkit", "flotilla-test-support"):
+                with self.subTest(kind=kind, target=target):
+                    errors = violations(graph(package("core", **{kind: (target,)}), package(target)))
+                    self.assertIn("production dependency on testkit", errors[0])
+        for helper in ("test-support", "replay"):
+            errors = violations(graph(package("core", features={"default": [helper], helper: []})))
+            self.assertIn("forbidden", errors[0])
 
-    def test_missing_helper_default_is_rejected(self):
-        # The original empty-default test-support gate is a build regression.
-        errors = violations(graph(package("daemon", features={"default": [], "test-support": []})))
-        self.assertEqual(len(errors), 1)
-        self.assertIn("test-support must be enabled by default", errors[0])
+    def test_testkit_may_depend_on_the_library_it_tests(self):
+        # Cargo dev cycles keep helper ownership outside the production library.
+        self.assertEqual(violations(graph(
+            package("core", dev=("flotilla-discovery-testkit",)),
+            package("flotilla-discovery-testkit", normal=("core",)),
+        )), [])
+
+    def test_tokio_test_util_is_dev_only(self):
+        # Both direct production and build-script activations are forbidden.
+        for kind in (None, "build", "dev"):
+            core = package("core")
+            core["dependencies"].append({"name": "tokio", "kind": kind, "features": ["test-util"]})
+            errors = violations(graph(core))
+            self.assertEqual(len(errors), 0 if kind == "dev" else 1)
+
+    def test_production_feature_aliases_cannot_activate_test_util(self):
+        # Disabled and optional aliases still violate the dev-only declaration rule.
+        for alias in ("tokio/test-util", "tokio?/test-util", "runtime/test-util", "runtime?/test-util"):
+            with self.subTest(alias=alias):
+                core = package("core", features={"hidden-helper": [alias]})
+                core["dependencies"].append({"name": "tokio", "rename": "runtime" if alias.startswith("runtime") else None, "kind": None})
+                self.assertIn("production feature", violations(graph(core))[0])
 
 
 class FeatureContract(unittest.TestCase):

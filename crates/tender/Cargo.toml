@@ -19,6 +19,7 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 hegeltest = "=0.48.1"
 
 [features]

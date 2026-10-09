@@ -16,10 +16,10 @@ tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 flotilla-test-support = { path = "../flotilla-test-support" }
 hegeltest = "=0.48.1"
-tokio = { version = "1", features = ["macros", "rt", "fs"] }
 tempfile = "3"
 
 [lints]

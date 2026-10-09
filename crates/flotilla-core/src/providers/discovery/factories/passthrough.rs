@@ -41,10 +41,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::PassthroughTerminalPoolFactory;
-    use crate::{
-        config::ConfigStore,
-        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentBag, Factory},
-    };
+    use crate::config::ConfigStore;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::discovery::Factory;
+    use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]

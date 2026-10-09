@@ -9,8 +9,7 @@ sha2 = "0.10"
 
 [features]
 # Keep helper features uniform across build/workspace/package commands on stable.
-default = ["test-support"]
-test-support = []
+default = []
 
 [dependencies]
 base64 = "0.22"
@@ -27,10 +26,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 serde_yml = "0.0.12"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

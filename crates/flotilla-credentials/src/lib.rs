@@ -20,13 +20,6 @@ pub use codex_central::{codex_central_auth_path, CodexCentralRefresher, CodexRef
 pub use credential::{CredentialRefreshError, CredentialStore, GithubAppScope};
 pub use vessel_config::Fragment;
 
-/// Shared fixtures for runtime tests using the credential HTTP seam.
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    /// Throwaway RSA key for offline GitHub App tests, never live credentials.
-    pub const GITHUB_APP_TEST_PRIVATE_KEY: &str = include_str!("fixtures/github_app_test.pem");
-}
-
 /// Validated shell configuration and the values used to launch the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEnvironment {

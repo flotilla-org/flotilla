@@ -172,11 +172,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
-    use crate::providers::{
-        command_timeout_message,
-        testing::{MockRunner, TimeoutOnlyRunner},
-        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
-    };
+    use crate::providers::command_timeout_message;
+    use crate::providers::ChannelLabel;
+    use crate::providers::CommandOutput;
+    use crate::providers::CommandRunner;
+    use crate::providers::ProcessCommandRunner;
+    use crate::testkits::replay::testing::MockRunner;
+    use crate::testkits::replay::testing::TimeoutOnlyRunner;
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_docker_exec() {

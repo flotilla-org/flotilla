@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep workspace test dependencies downward and helper features uniform on stable."""
+"""Keep production free of testkits and package-local test feature selections reusable."""
 
 import json
 from pathlib import Path
@@ -34,20 +34,24 @@ def violations(metadata):
     for name, package in sorted(packages.items()):
         for dependency in package["dependencies"]:
             target = dependency["name"]
-            if dependency["kind"] == "dev" and target != name and target in packages and reaches(target, name):
+            if dependency["kind"] == "dev" and target != name and target in packages and not (target.endswith("-testkit") or target == "flotilla-test-support") and reaches(target, name):
                 errors.append(f"{name}: upward dev-dependency on {target}; move its tests/examples to the higher crate")
-        # Default activation also covers transitive feature aliases. Optional
-        # operational features (TLS providers, sandbox skips) remain opt-in.
-        features = package["features"]
-        enabled, pending = set(), ["default"]
-        while pending:
-            feature = pending.pop()
-            if feature not in enabled:
-                enabled.add(feature)
-                pending.extend(features.get(feature, []))
-        for helper in ("test-support", "replay"):
-            if helper in features and helper not in enabled:
-                errors.append(f"{name}: {helper} must be enabled by default to avoid command-dependent library builds")
+        is_testkit = name.endswith("-testkit") or name == "flotilla-test-support"
+        if not is_testkit:
+            for target in production[name]:
+                if target.endswith("-testkit") or target == "flotilla-test-support":
+                    errors.append(f"{name}: production dependency on testkit {target}")
+            for helper in ("test-support", "replay"):
+                if helper in package["features"]:
+                    errors.append(f"{name}: production crate declares forbidden {helper} feature")
+            tokio_names = {dependency.get("rename") or dependency["name"]
+                           for dependency in package["dependencies"] if dependency["name"] == "tokio"}
+            if any(value in {f"{target}/test-util", f"{target}?/test-util"}
+                   for values in package["features"].values() for value in values for target in tokio_names):
+                errors.append(f"{name}: tokio test-util cannot be activated by a production feature")
+            for dependency in package["dependencies"]:
+                if dependency["kind"] != "dev" and dependency["name"] == "tokio" and "test-util" in dependency.get("features", []):
+                    errors.append(f"{name}: tokio test-util is dev-only")
     return errors
 
 
@@ -86,18 +90,25 @@ def main():
     metadata = json.loads(cargo("metadata", "--no-deps", "--locked", "--format-version", "1"))
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
-    workspace = tree_features(cargo(*tree_arguments, "--workspace", "--edges", "normal,build,dev"))
+    workspace = {edges: tree_features(cargo(*tree_arguments, "--workspace", "--edges", edges))
+                 for edges in ("normal,build", "normal,build,dev")}
     for package in metadata["packages"]:
         if package["id"] not in metadata["workspace_members"]:
             continue
         for edges in ("normal,build", "normal,build,dev"):
+            if edges == "normal,build" and (package["name"].endswith("-testkit") or package["name"] == "flotilla-test-support"):
+                continue
             selected = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", edges))
+            if edges == "normal,build":
+                for dependency, contexts in selected.items():
+                    if dependency.startswith("tokio v") and any("test-util" in features for features in contexts):
+                        errors.append(f"{package['name']}: production graph activates tokio test-util")
             errors.extend(f"{package['name']} ({edges}): {difference}"
-                          for difference in feature_differences(workspace, selected))
+                          for difference in feature_differences(workspace[edges], selected))
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("Workspace build graph: no upward dev-dependencies; default build/test features uniform")
+    print("Workspace build graph: production excludes testkits and test-util; package-local build/test features reusable")
     return 0
 
 

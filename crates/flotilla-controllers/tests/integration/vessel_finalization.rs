@@ -12,7 +12,7 @@ use flotilla_resources::{
 use futures::StreamExt;
 use tempfile::tempdir;
 
-use crate::resources_common::{
+use flotilla_store_testkit::fixtures::{
     convoy_meta, convoy_spec, convoy_status,
     owner_gc::{create, meta, start, NS},
     pending_task_state, resource_meta, TestLoopHarness,

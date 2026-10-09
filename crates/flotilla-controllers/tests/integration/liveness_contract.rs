@@ -12,20 +12,54 @@ use flotilla_controllers::reconcilers::{
     checkout::{CheckoutPrepared, CheckoutReconciler},
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
-use flotilla_resources::{
-    change_request_record_name,
-    controller::{Actuation, Reconciler},
-    test_support::{
-        assert_actuation_drop_recovery, assert_bounded_convergence, assert_degradation_not_wedging, assert_quiescence_at_fixpoint,
-        assert_staleness_edges, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, WorldBuilder,
-        WriteCountingBackend,
-    },
-    ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestReviewObservation, ChangeRequestSpec,
-    ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, ConditionValue, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch,
-    FreshCloneCheckoutSpec, InputMeta, IntegrationCondition, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
-    PlacementStatus, RepositoryKey, ResourceObject, VirtualClock, WorkPhase, CONVOY_LABEL,
-};
+use flotilla_resources::change_request_record_name;
+use flotilla_resources::controller::Actuation;
+use flotilla_resources::controller::Reconciler;
+use flotilla_resources::ChangeRequest;
+use flotilla_resources::ChangeRequestMergeability;
+use flotilla_resources::ChangeRequestObservation;
+use flotilla_resources::ChangeRequestReviewObservation;
+use flotilla_resources::ChangeRequestSpec;
+use flotilla_resources::ChangeRequestState;
+use flotilla_resources::ChangeRequestStatus;
+use flotilla_resources::Checkout;
+use flotilla_resources::CheckoutBranchProvenance;
+use flotilla_resources::CheckoutIntegrationStatus;
+use flotilla_resources::CheckoutPhase;
+use flotilla_resources::CheckoutSpec;
+use flotilla_resources::CheckoutStatus;
+use flotilla_resources::CheckoutStatusPatch;
+use flotilla_resources::Clock;
+use flotilla_resources::ConditionValue;
+use flotilla_resources::Convoy;
+use flotilla_resources::ConvoyPhase;
+use flotilla_resources::ConvoyReconciler;
+use flotilla_resources::ConvoyStatusPatch;
+use flotilla_resources::FreshCloneCheckoutSpec;
+use flotilla_resources::InputMeta;
+use flotilla_resources::IntegrationCondition;
+use flotilla_resources::Observation;
+use flotilla_resources::ObservedChangeRequestState;
+use flotilla_resources::ObservedChecks;
+use flotilla_resources::ObservedMergeability;
+use flotilla_resources::PlacementStatus;
+use flotilla_resources::RepositoryKey;
+use flotilla_resources::ResourceObject;
+use flotilla_resources::WorkPhase;
+use flotilla_resources::CONVOY_LABEL;
+use flotilla_store_testkit::assert_actuation_drop_recovery;
+use flotilla_store_testkit::assert_bounded_convergence;
+use flotilla_store_testkit::assert_degradation_not_wedging;
+use flotilla_store_testkit::assert_quiescence_at_fixpoint;
+use flotilla_store_testkit::assert_staleness_edges;
+use flotilla_store_testkit::FixpointPredicate;
+use flotilla_store_testkit::LivenessEnrollment;
+use flotilla_store_testkit::LivenessScenario;
+use flotilla_store_testkit::LivenessStep;
+use flotilla_store_testkit::ReconcileStep;
+use flotilla_store_testkit::VirtualClock;
+use flotilla_store_testkit::WorldBuilder;
+use flotilla_store_testkit::WriteCountingBackend;
 
 use crate::common;
 

@@ -17,7 +17,7 @@ use crate::in_process::convoy_admission::{
     resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
 };
 use crate::in_process::InProcessDaemon;
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 #[tokio::test]
 async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {

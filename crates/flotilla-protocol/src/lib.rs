@@ -29,9 +29,6 @@ pub mod step;
 pub mod subject;
 pub mod view_address;
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
-
 use std::fmt;
 
 pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan};

@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     remote_commands::RemoteCommandRouter,
-    replicator::{PeerReplicatorSupervisors, ReplicationTestOptions},
+    replicator::{PeerReplicatorSupervisors, ReplicationOptions},
     shared::sync_peer_query_state,
     PeerConnectedNotice, PeerConnectionEvent, SshTransport,
 };
@@ -154,18 +154,18 @@ fn resource_socket_path_for(resource_socket_dir: Option<&Path>, target_label: &C
 
 #[derive(bon::Builder)]
 #[builder(builder_type(vis = "pub(super)"))]
-pub(super) struct PeerRuntime {
+pub struct PeerRuntime {
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
     inbound_peer_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
-    replication_test_options: ReplicationTestOptions,
+    replication_options: ReplicationOptions,
 }
 
 impl PeerRuntime {
-    pub(super) fn new(
+    pub fn new(
         daemon: Arc<InProcessDaemon>,
         peer_manager: Arc<Mutex<PeerManager>>,
         inbound_peer_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
@@ -180,23 +180,21 @@ impl PeerRuntime {
             inbound_peer_tx,
             remote_command_router,
             resource_socket_dir,
-            replication_test_options: ReplicationTestOptions::default(),
+            replication_options: ReplicationOptions::default(),
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
-        self.replication_test_options = ReplicationTestOptions::new(kinds);
+    pub fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
+        self.replication_options = ReplicationOptions::new(kinds);
         self
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn with_digest_driver(mut self, driver: Option<super::test_support::DigestDriver>) -> Self {
-        self.replication_test_options.digest_driver = driver;
+    pub fn with_digest_driver(mut self, driver: Option<Arc<dyn super::replicator::DigestScheduler>>) -> Self {
+        self.replication_options.digest_driver = driver;
         self
     }
 
-    pub(super) fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
+    pub fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
         let outbound_peer_manager = Arc::clone(&self.peer_manager);
         let peer_manager_task = Arc::clone(&self.peer_manager);
         let inbound_peer_tx_for_ssh = self.inbound_peer_tx.clone();
@@ -587,12 +585,12 @@ impl PeerRuntime {
             }
         });
 
-        let replication_test_options = self.replication_test_options;
+        let replication_options = self.replication_options;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tasks.spawn(async move {
-            let mut peer_replicators = PeerReplicatorSupervisors::new(replication_test_options);
+            let mut peer_replicators = PeerReplicatorSupervisors::new(replication_options);
 
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {

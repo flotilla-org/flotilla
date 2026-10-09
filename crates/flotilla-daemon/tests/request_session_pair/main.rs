@@ -11,39 +11,63 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     convoy_ensure::EnsureReconciler, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
-use flotilla_core::{
-    command_target::TargetHost,
-    config::ConfigStore,
-    in_process::{InProcessDaemon, WorkCredentialReconciler},
-    providers::{
-        discovery::{
-            test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders},
-            EnvironmentBag,
-        },
-        environment::{ProvisionedEnvironment, ProvisionedMount},
-        issue_tracker::IssueProvider,
-        ChannelLabel, CommandOutput, CommandRunner,
-    },
-};
-use flotilla_daemon::{
-    blob_store::TieredBlobStore,
-    runtime::{DaemonRuntime, RuntimeOptions},
-    server::test_support::{
-        apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_mesh,
-        spawn_in_memory_request_mesh_with_replication_kinds, spawn_in_memory_request_topology, spawn_in_memory_request_topology_stateful,
-        spawn_in_memory_request_topology_stateful_with_caller, spawn_in_memory_request_topology_stateful_with_caller_and_blob_store,
-        spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestMesh, InMemoryRequestTopology,
-    },
-};
+use flotilla_core::command_target::TargetHost;
+use flotilla_core::config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_protocol::{
-    issue_query::{IssueQuery, IssueResultPage},
-    qualified_path::HostId,
-    test_support::TestIssue,
-    CallerCrew, CallerProcess, Command, CommandAction, CommandCaller, CommandValue, ConvoyStartIntent, CrewCommandContext, DaemonEvent,
-    EnvironmentId, EnvironmentStatus, HostName, ImageId, Issue, IssueChangeset, IssueRef, IssueSource, NodeInfo, PeerConnectionState,
-    PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
-};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::in_process::WorkCredentialReconciler;
+use flotilla_core::providers::discovery::EnvironmentBag;
+use flotilla_core::providers::environment::ProvisionedEnvironment;
+use flotilla_core::providers::environment::ProvisionedMount;
+use flotilla_core::providers::issue_tracker::IssueProvider;
+use flotilla_core::providers::ChannelLabel;
+use flotilla_core::providers::CommandOutput;
+use flotilla_core::providers::CommandRunner;
+use flotilla_daemon::blob_store::TieredBlobStore;
+use flotilla_daemon::runtime::DaemonRuntime;
+use flotilla_daemon::runtime::RuntimeOptions;
+use flotilla_daemon_testkit::server::apply_convoy_replica_feed;
+use flotilla_daemon_testkit::server::seed_trusted_remote_convoy_project;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_replication_kinds;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_caller_and_blob_store;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
+use flotilla_daemon_testkit::server::InMemoryRequestMesh;
+use flotilla_daemon_testkit::server::InMemoryRequestTopology;
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::fake_discovery_with_provider_set;
+use flotilla_discovery_testkit::FakeDiscoveryProviders;
+use flotilla_protocol::issue_query::IssueQuery;
+use flotilla_protocol::issue_query::IssueResultPage;
+use flotilla_protocol::qualified_path::HostId;
+use flotilla_protocol::CallerCrew;
+use flotilla_protocol::CallerProcess;
+use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
+use flotilla_protocol::CommandCaller;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::ConvoyStartIntent;
+use flotilla_protocol::CrewCommandContext;
+use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::EnvironmentId;
+use flotilla_protocol::EnvironmentStatus;
+use flotilla_protocol::HostName;
+use flotilla_protocol::ImageId;
+use flotilla_protocol::Issue;
+use flotilla_protocol::IssueChangeset;
+use flotilla_protocol::IssueRef;
+use flotilla_protocol::IssueSource;
+use flotilla_protocol::NodeInfo;
+use flotilla_protocol::PeerConnectionState;
+use flotilla_protocol::PrincipalRef;
+use flotilla_protocol::RepoSelector;
+use flotilla_protocol::ResourceRef;
+use flotilla_protocol::SurfaceCharacter;
+use flotilla_protocol::SurfaceDeclaration;
+use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
     api_version, controller::ControllerLoop, list_resource_kind, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec, ConvoyStatus, CredentialConsumer,
@@ -4182,7 +4206,7 @@ async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
 
     let path = Path::new("/checkouts/router-main");
     let leader = if observed {
-        use flotilla_core::providers::discovery::test_support::{FakeVcsFactory, FakeVcsState};
+        use flotilla_discovery_testkit::{FakeVcsFactory, FakeVcsState};
         let tmp = tempfile::tempdir().expect("config");
         let mut discovery = fake_discovery(false);
         discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(
@@ -4688,3 +4712,5 @@ fn generated_capabilities_queries_use_session_home(tc: hegel::TestCase) {
         .expect("runtime")
         .block_on(capabilities_routing_scenario(remote, workflows));
 }
+
+use flotilla_discovery_testkit::InProcessDiscoveryExt;

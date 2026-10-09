@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
-use flotilla_daemon::{
-    runtime::{DaemonRuntime, RuntimeOptions},
-    server::test_support::spawn_in_memory_request_topology,
-};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon::runtime::DaemonRuntime;
+use flotilla_daemon::runtime::RuntimeOptions;
+use flotilla_daemon_testkit::server::spawn_in_memory_request_topology;
+use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState, QueryId, Relationship, SubjectKind};
 use flotilla_resources::{
     watch_resource_kind_replica_sources, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutPhase,
@@ -1118,7 +1119,7 @@ async fn await_replica_names(daemon: &InProcessDaemon, expected: &[&str]) {
 async fn missed_delete_scenario(fail_resync: bool) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter;
     use flotilla_protocol::{
         CommandAction, CommandPeerEvent, CommandValue, PeerWireMessage, ResourceRecordType, RoutedPeerMessage, StepStatus,
     };
@@ -1252,7 +1253,7 @@ fn generated_missed_delete_resync(tc: hegel::TestCase) {
 async fn other_namespace_writes_do_not_force_replication_resnapshots() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter;
     use flotilla_protocol::{CommandAction, PeerWireMessage, RoutedPeerMessage};
 
     for sqlite in [false, true] {
@@ -1320,7 +1321,7 @@ async fn other_namespace_writes_do_not_force_replication_resnapshots() {
 async fn reconnect_uses_log_until_horizon_or_quarantine_requires_one_snapshot() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_filter;
     use flotilla_protocol::{CommandAction, PeerWireMessage, RoutedPeerMessage};
     use flotilla_resources::EventRetention;
 
@@ -1431,7 +1432,7 @@ async fn run_digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced
         Mutex,
     };
 
-    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_digest_driver;
+    use flotilla_daemon_testkit::server::spawn_in_memory_request_mesh_with_digest_driver;
     use flotilla_protocol::{
         CommandAction, CommandPeerEvent, CommandValue, PeerWireMessage, ResourceRecordType, RoutedPeerMessage, StepStatus,
     };

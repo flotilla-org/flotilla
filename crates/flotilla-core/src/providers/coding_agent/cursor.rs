@@ -368,7 +368,7 @@ mod tests {
         use axum::{routing::get, Router};
         use http::{HeaderMap, StatusCode, Uri};
 
-        use crate::providers::http_contract::StandIn;
+        use crate::testkits::replay::http_contract::StandIn;
         async fn receive(headers: HeaderMap, uri: Uri) -> (StatusCode, &'static str) {
             if headers.get("authorization").is_some_and(|v| v == "Basic dGVzdC1rZXk6") && uri.query() == Some("limit=100") {
                 (StatusCode::OK, r#"{"agents":[]}"#)

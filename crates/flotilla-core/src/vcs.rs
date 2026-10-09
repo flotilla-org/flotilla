@@ -2215,10 +2215,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::providers::{
-        replay,
-        testing::{fixture_path, TimeoutOnlyRunner},
-    };
+    use crate::testkits::replay;
+    use crate::testkits::replay::testing::fixture_path;
+    use crate::testkits::replay::testing::TimeoutOnlyRunner;
 
     fn git(cwd: &Path, args: &[&str]) {
         let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");

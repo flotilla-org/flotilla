@@ -77,14 +77,25 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
-    use flotilla_resources::{
-        test_support::{
-            run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
-            TransitionDriver, TransitionSequence, WorldBuilder,
-        },
-        DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
-        HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, ResourceObject, VirtualClock,
-    };
+    use flotilla_resources::DockerCheckoutStrategy;
+    use flotilla_resources::DockerImagePullPolicy;
+    use flotilla_resources::DockerImageSource;
+    use flotilla_resources::DockerPerVesselPlacementPolicySpec;
+    use flotilla_resources::HostDirectPlacementPolicyCheckout;
+    use flotilla_resources::HostDirectPlacementPolicySpec;
+    use flotilla_resources::InMemoryBackend;
+    use flotilla_resources::ResourceObject;
+    use flotilla_store_testkit::run_transition_sequence;
+    use flotilla_store_testkit::FixpointPredicate;
+    use flotilla_store_testkit::LivenessEnrollment;
+    use flotilla_store_testkit::LivenessScenario;
+    use flotilla_store_testkit::LivenessStep;
+    use flotilla_store_testkit::ReconcileStep;
+    use flotilla_store_testkit::Transition;
+    use flotilla_store_testkit::TransitionDriver;
+    use flotilla_store_testkit::TransitionSequence;
+    use flotilla_store_testkit::VirtualClock;
+    use flotilla_store_testkit::WorldBuilder;
 
     use super::*;
 

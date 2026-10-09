@@ -14,9 +14,9 @@ use crate::change_request_observer::ChangeRequestRef;
 use crate::config::ConfigStore;
 use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
 use crate::model::RepoModel;
-use crate::providers::discovery::test_support::fake_discovery;
 use crate::providers::registry::ProviderRegistry;
 use crate::repo_state::{RepoRootState, RepoState};
+use crate::testkits::discovery::fake_discovery;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]

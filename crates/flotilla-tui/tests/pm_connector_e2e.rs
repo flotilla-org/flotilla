@@ -8,8 +8,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_discovery_testkit::fake_discovery;
 use flotilla_manifest::{
     entity,
     recipe::FlotillaRecipes,

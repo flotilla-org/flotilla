@@ -12,41 +12,89 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
-use flotilla_core::{
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    model::RepoModel,
-    providers::{
-        ai_utility::{AiUtility, ConvoyNames},
-        change_request::ChangeRequestTracker,
-        coding_agent::CloudAgentService,
-        discovery::{
-            test_support::{
-                fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_discovery_with_runner,
-                fake_vcs_discovery, git_process_discovery, init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner,
-                FakeChangeRequest, FakeCheckoutManager, FakeDiscoveryProviders, FakeIssueProvider, FakeTerminalPool, FakeVcsFactory,
-                FakeVcsState, TestEnvVars,
-            },
-            DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, ProviderCategory, ProviderDescriptor,
-            RepoDetector, UnmetRequirement,
-        },
-        environment::{EnvironmentHandle, ProvisionedEnvironment},
-        terminal::TerminalPool,
-        types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus},
-        ChannelLabel, CommandRunner,
-    },
-    repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
-};
+use flotilla_core::config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::model::RepoModel;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::{
-    qualified_path::{HostId, QualifiedPath},
-    test_support::TestIssue,
-    Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent, DaemonEvent, EnvironmentId,
-    EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId, IssueRef,
-    IssueSelector, IssueSource, ManifestResolution, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector,
-    StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
-};
+use flotilla_core::providers::ai_utility::AiUtility;
+use flotilla_core::providers::ai_utility::ConvoyNames;
+use flotilla_core::providers::change_request::ChangeRequestTracker;
+use flotilla_core::providers::coding_agent::CloudAgentService;
+use flotilla_core::providers::discovery::DiscoveryRuntime;
+use flotilla_core::providers::discovery::EnvironmentAssertion;
+use flotilla_core::providers::discovery::EnvironmentBag;
+use flotilla_core::providers::discovery::Factory;
+use flotilla_core::providers::discovery::HostDetector;
+use flotilla_core::providers::discovery::ProviderCategory;
+use flotilla_core::providers::discovery::ProviderDescriptor;
+use flotilla_core::providers::discovery::RepoDetector;
+use flotilla_core::providers::discovery::UnmetRequirement;
+use flotilla_core::providers::environment::EnvironmentHandle;
+use flotilla_core::providers::environment::ProvisionedEnvironment;
+use flotilla_core::providers::terminal::TerminalPool;
+use flotilla_core::providers::types::ChangeRequest;
+use flotilla_core::providers::types::CloudAgentSession;
+use flotilla_core::providers::types::RepoCriteria;
+use flotilla_core::providers::types::SessionStatus;
+use flotilla_core::providers::ChannelLabel;
+use flotilla_core::providers::CommandRunner;
+use flotilla_core::repository_inspection::LocalCheckoutInspection;
+use flotilla_core::repository_inspection::RepositoryContinuity;
+use flotilla_core::repository_inspection::RepositoryInspection;
+use flotilla_core::repository_inspection::RepositoryInspector;
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::fake_discovery_with_provider_set;
+use flotilla_discovery_testkit::fake_discovery_with_providers;
+use flotilla_discovery_testkit::fake_discovery_with_runner;
+use flotilla_discovery_testkit::fake_vcs_discovery;
+use flotilla_discovery_testkit::git_process_discovery;
+use flotilla_discovery_testkit::init_git_repo;
+use flotilla_discovery_testkit::init_git_repo_with_remote;
+use flotilla_discovery_testkit::DiscoveryMockRunner;
+use flotilla_discovery_testkit::FakeChangeRequest;
+use flotilla_discovery_testkit::FakeCheckoutManager;
+use flotilla_discovery_testkit::FakeDiscoveryProviders;
+use flotilla_discovery_testkit::FakeIssueProvider;
+use flotilla_discovery_testkit::FakeTerminalPool;
+use flotilla_discovery_testkit::FakeVcsFactory;
+use flotilla_discovery_testkit::FakeVcsState;
+use flotilla_discovery_testkit::TestEnvVars;
+use flotilla_protocol::qualified_path::HostId;
+use flotilla_protocol::qualified_path::QualifiedPath;
+use flotilla_protocol::Checkout;
+use flotilla_protocol::CheckoutSelector;
+use flotilla_protocol::CheckoutTarget;
+use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::ConvoyStartIntent;
+use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::EnvironmentId;
+use flotilla_protocol::EnvironmentInfo;
+use flotilla_protocol::EnvironmentStatus;
+use flotilla_protocol::HostEnvironment;
+use flotilla_protocol::HostName;
+use flotilla_protocol::HostPath;
+use flotilla_protocol::HostProviderStatus;
+use flotilla_protocol::HostSummary;
+use flotilla_protocol::ImageId;
+use flotilla_protocol::IssueRef;
+use flotilla_protocol::IssueSelector;
+use flotilla_protocol::IssueSource;
+use flotilla_protocol::ManifestResolution;
+use flotilla_protocol::NodeId;
+use flotilla_protocol::NodeInfo;
+use flotilla_protocol::PeerConnectionState;
+use flotilla_protocol::ProviderData;
+use flotilla_protocol::RepoIdentity;
+use flotilla_protocol::RepoSelector;
+use flotilla_protocol::StepStatus;
+use flotilla_protocol::StreamKey;
+use flotilla_protocol::SystemInfo;
+use flotilla_protocol::ToolInventory;
+use flotilla_protocol::TopologyRoute;
+use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
     single_agent_shepherd_workflow_spec, single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
@@ -2910,7 +2958,7 @@ async fn allocation_shares_equal_need_roles_and_explains_grouping() {
 async fn implement_review_admission_shares_a_vessel_with_different_resolved_skills() {
     // Issue #2672: different role skill selections alone must not split an
     // implement-review vessel; admission retains each crew's resolved imports.
-    use flotilla_core::providers::discovery::test_support::TestEnvVars;
+    use flotilla_discovery_testkit::TestEnvVars;
     use flotilla_resources::{CrewDefaults, CrewDefaultsSpec, SkillCatalogEntry};
     let bundle = tempfile::tempdir().expect("skill bundle");
     let catalog = ["implement", "review"].map(|name| SkillCatalogEntry {
@@ -9646,3 +9694,5 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     assert!(matches!(result, CommandValue::Error { message } if message.contains("status changed")));
     assert_eq!(messages.get("namespace-message").await.expect("retained evidence").status, Some(next));
 }
+
+use flotilla_discovery_testkit::InProcessDiscoveryExt;

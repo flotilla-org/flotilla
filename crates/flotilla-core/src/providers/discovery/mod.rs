@@ -11,9 +11,6 @@ use crate::providers::environment::EnvironmentProvider;
 pub mod detectors;
 pub mod factories;
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
-
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -519,6 +516,7 @@ impl FactoryRegistry {
     }
 }
 
+#[derive(bon::Builder)]
 pub struct DiscoveryRuntime {
     pub runner: Arc<dyn CommandRunner>,
     pub env: Arc<dyn EnvVars>,
@@ -529,6 +527,7 @@ pub struct DiscoveryRuntime {
     pub host_detectors: Arc<Vec<Box<dyn HostDetector>>>,
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
+    #[builder(skip)]
     pub(crate) host_scoped_providers: HostScopedProviderCache,
 }
 
@@ -751,8 +750,9 @@ mod timeout_tests {
     async fn detector_timeout_preserves_other_capabilities() {
         let detectors: Vec<Box<dyn HostDetector>> =
             vec![Box::new(PendingDetector), Box::new(detectors::generic::EnvVarDetector::new("HOME"))];
-        let runner = test_support::DiscoveryMockRunner::builder().build();
-        let env = test_support::TestEnvVars::new([("HOME", "/safe/home")]);
+        use crate::testkits::discovery::{DiscoveryMockRunner, TestEnvVars};
+        let runner = DiscoveryMockRunner::builder().build();
+        let env = TestEnvVars::new([("HOME", "/safe/home")]);
         let bag = run_host_detectors(&detectors, &runner, &env).await;
         assert_eq!(bag.find_env_var("HOME"), Some("/safe/home"));
     }
@@ -994,13 +994,11 @@ mod orchestrator_tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{
-        config::ConfigStore,
-        providers::discovery::{
-            detectors,
-            test_support::{DiscoveryMockRunner, TestEnvVars},
-        },
-    };
+    use crate::config::ConfigStore;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::providers::discovery::detectors;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testkits::discovery::TestEnvVars;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     /// Build a DiscoveryMockRunner with git binary available plus

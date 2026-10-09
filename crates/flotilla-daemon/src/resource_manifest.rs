@@ -1104,18 +1104,16 @@ mod tests {
     use std::{process::Command, time::Duration};
 
     use chrono::Utc;
-    use flotilla_core::{
-        config::ConfigStore,
-        in_process::InProcessDaemon,
-        providers::{
-            discovery::{
-                factories::git::GitVcsFactory,
-                test_support::{fake_discovery_with_provider_set, FakeDiscoveryProviders},
-                EnvironmentAssertion, EnvironmentBag, Factory,
-            },
-            ProcessCommandRunner,
-        },
-    };
+    use flotilla_core::config::ConfigStore;
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_core::providers::discovery::factories::git::GitVcsFactory;
+    use flotilla_core::providers::discovery::EnvironmentAssertion;
+    use flotilla_core::providers::discovery::EnvironmentBag;
+    use flotilla_core::providers::discovery::Factory;
+    use flotilla_core::providers::ProcessCommandRunner;
+    use flotilla_discovery_testkit::fake_discovery_with_provider_set;
+    use flotilla_discovery_testkit::FakeDiscoveryProviders;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_protocol::{HostName, NodeId};
     use flotilla_resources::{
@@ -2102,7 +2100,9 @@ mod tests {
 
 #[cfg(test)]
 mod registered_charter_tests {
-    use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_core::config::ConfigStore;
+    use flotilla_core::in_process::InProcessDaemon;
+    use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::HostName;
     use flotilla_resources::{
         CharterPointer, InMemoryBackend, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
@@ -2110,7 +2110,7 @@ mod registered_charter_tests {
     };
 
     use super::*;
-    use crate::server::test_support::spawn_in_memory_request_topology;
+    use crate::testkits::server::spawn_in_memory_request_topology;
 
     fn project(pointer: CharterPointer) -> Value {
         let spec = ProjectSpec::builder()

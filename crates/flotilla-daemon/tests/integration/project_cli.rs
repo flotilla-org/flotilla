@@ -11,19 +11,28 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_core::{
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    ops_entry::{
-        materialized_workflow_name, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
-    },
-    project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
-    providers::discovery::test_support::{fake_discovery, fake_discovery_on_host_os, git_process_discovery, init_git_repo_with_remote},
-    repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
-};
-use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_core::config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::ops_entry::materialized_workflow_name;
+use flotilla_core::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
+use flotilla_core::ops_entry::PRESENTS_AS_ANNOTATION;
+use flotilla_core::ops_entry::SOURCE_COMMIT_ANNOTATION;
+use flotilla_core::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
+use flotilla_core::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
+use flotilla_core::ops_entry::VERIFICATION_PROJECT_ANNOTATION;
+use flotilla_core::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION;
+use flotilla_core::project_declaration::BOOTSTRAP_PATH_ANNOTATION;
+use flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION;
+use flotilla_core::repository_inspection::LocalCheckoutInspection;
+use flotilla_core::repository_inspection::ProjectDeclarationInspection;
+use flotilla_core::repository_inspection::RepositoryInspection;
+use flotilla_core::repository_inspection::RepositoryInspector;
+use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::fake_discovery_on_host_os;
+use flotilla_discovery_testkit::git_process_discovery;
+use flotilla_discovery_testkit::init_git_repo_with_remote;
 use flotilla_protocol::{
     commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
 };

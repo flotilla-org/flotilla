@@ -192,7 +192,11 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::providers::{github_api::GhApiClient, testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner};
+    use crate::providers::github_api::GhApiClient;
+    use crate::providers::ChannelLabel;
+    use crate::providers::CommandOutput;
+    use crate::providers::CommandRunner;
+    use crate::testkits::replay::testing::MockRunner;
 
     // Stand-in at the gh/HTTP boundary: refuse requests with an incorrect
     // route, ordering, cursor or conditional header instead of accepting any argv.

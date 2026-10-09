@@ -1596,10 +1596,9 @@ mod tests {
     async fn bound_ops_sources_apply_without_checkouts_and_preserve_last_good() {
         use flotilla_resources::{CharterSource, CharterStoreBinding, ManifestRoot};
 
-        use crate::{
-            providers::{discovery::test_support::test_vcs_resolver, ProcessCommandRunner},
-            repository_inspection::GitRepositoryInspector,
-        };
+        use crate::providers::ProcessCommandRunner;
+        use crate::repository_inspection::GitRepositoryInspector;
+        use crate::testkits::discovery::test_vcs_resolver;
         for local in [false, true] {
             let source_dir = tempfile::tempdir().expect("source");
             let cache = tempfile::tempdir().expect("cache");

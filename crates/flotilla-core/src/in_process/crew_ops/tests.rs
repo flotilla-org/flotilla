@@ -1,3 +1,4 @@
+use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use crate::in_process::crew_ops::{frame_crew_message, CrewService};
 use crate::in_process::{ConvoyPhase, CrewMessageSender, WorkCredentialReconciler};
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::providers::change_request::ObservationError;
-use crate::providers::discovery::test_support::fake_discovery;
+use crate::testkits::discovery::fake_discovery;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;

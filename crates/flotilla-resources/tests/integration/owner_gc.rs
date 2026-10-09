@@ -8,7 +8,7 @@ use flotilla_resources::{
 };
 use futures::StreamExt;
 
-use crate::common::owner_gc::{create, deleted, meta, start, NS};
+use flotilla_store_testkit::fixtures::owner_gc::{create, deleted, meta, start, NS};
 
 /// A deletion after the preceding writes on this kind confirms that the
 /// collector has consumed those watch events before assertions inspect it.

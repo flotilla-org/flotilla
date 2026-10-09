@@ -150,8 +150,7 @@ pub(crate) fn rate_limit_error_for(budget: &str, reset: &str) -> String {
     format!("github rate limited (budget={budget}, identity=host gh login, reset_at={reset})")
 }
 
-#[cfg(any(test, feature = "replay"))]
-pub(crate) fn rate_limit_error(reset: &str) -> String {
+pub fn rate_limit_error(reset: &str) -> String {
     rate_limit_error_for("REST core", reset)
 }
 
@@ -162,7 +161,7 @@ pub enum GithubRateLimitKind {
 }
 
 impl GithubRateLimitKind {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Primary => "primary",
             Self::Secondary => "secondary",
@@ -179,7 +178,7 @@ pub enum GithubRetrySource {
 }
 
 impl GithubRetrySource {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::RateLimitReset => "x-ratelimit-reset",
             Self::RetryAfter => "retry-after",
@@ -219,7 +218,7 @@ pub struct GithubRateLimit {
 /// Classify only error fields, never text in a successful response (for example
 /// a PR comment mentioning rate limits). Primary reset headers accompany ordinary
 /// errors too, and must not turn a secondary limit into an hourly suspension.
-pub(crate) fn github_rate_limit(raw: &str, received_at: DateTime<Utc>) -> Option<GithubRateLimit> {
+pub fn github_rate_limit(raw: &str, received_at: DateTime<Utc>) -> Option<GithubRateLimit> {
     let response = parse_gh_api_response(raw);
     let document: serde_json::Value = serde_json::from_str(&response.body).ok()?;
     github_rate_limit_from_document(raw, response.status, &document, received_at)
@@ -541,7 +540,7 @@ pub(crate) fn classified_rate_error(error: String) -> ObservationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::testing::MockRunner;
+    use crate::testkits::replay::testing::MockRunner;
 
     #[test]
     fn parse_200_response_extracts_etag_and_body() {

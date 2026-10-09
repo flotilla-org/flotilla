@@ -696,8 +696,8 @@ mod tests {
         to.replica_writer::<T>(from.local_root().unwrap(), "flotilla").replace(&list, Utc::now()).await.unwrap();
     }
 
-    fn clocked_reads(root: &str) -> (ForgeReads, Arc<flotilla_resources::VirtualClock>) {
-        let clock = Arc::new(flotilla_resources::VirtualClock::new(Utc::now()));
+    fn clocked_reads(root: &str) -> (ForgeReads, Arc<flotilla_store_testkit::VirtualClock>) {
+        let clock = Arc::new(flotilla_store_testkit::VirtualClock::new(Utc::now()));
         let mut reads = ForgeReads::new(backend(root), "flotilla".into());
         reads.clock = clock.clone();
         (reads, clock)

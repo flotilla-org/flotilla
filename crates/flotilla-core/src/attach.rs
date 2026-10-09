@@ -1062,14 +1062,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        config::ConfigStore,
-        in_process::{
-            tests::{create_identity_convoy, create_running_session, create_test_environment, test_meta},
-            InProcessDaemon,
-        },
-        providers::discovery::test_support::fake_discovery,
-    };
+    use crate::config::ConfigStore;
+    use flotilla_daemon_api::daemon::DaemonHandle;
+    use crate::in_process::tests::create_identity_convoy;
+    use crate::in_process::tests::create_running_session;
+    use crate::in_process::tests::create_test_environment;
+    use crate::in_process::tests::test_meta;
+    use crate::in_process::InProcessDaemon;
+    use crate::testkits::discovery::fake_discovery;
     use flotilla_daemon_api::daemon::DaemonHandle;
 
     // Attach scenarios need a daemon and providers, independent of standing-convoy admission.

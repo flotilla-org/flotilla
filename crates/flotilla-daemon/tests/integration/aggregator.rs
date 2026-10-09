@@ -9,23 +9,28 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::{
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    providers::{
-        discovery::test_support::{
-            fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeIssueProvider, FakeTerminalPool,
-        },
-        terminal::{TerminalSession as PoolTerminalSession, TerminalSessionLiveness},
-    },
-};
-use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_core::config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_protocol::{
-    result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet},
-    test_support::TestIssue,
-    DaemonEvent, HostName, LifecycleAuthority, QueryCursor, QueryScope, TerminalStatus,
-};
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::providers::terminal::TerminalSession as PoolTerminalSession;
+use flotilla_core::providers::terminal::TerminalSessionLiveness;
+use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::fake_discovery_with_provider_set;
+use flotilla_discovery_testkit::FakeDiscoveryProviders;
+use flotilla_discovery_testkit::FakeIssueProvider;
+use flotilla_discovery_testkit::FakeTerminalPool;
+use flotilla_protocol::result_set::ConvoyRow;
+use flotilla_protocol::result_set::IndependentRow;
+use flotilla_protocol::result_set::QueryId;
+use flotilla_protocol::result_set::ResultSet;
+use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::HostName;
+use flotilla_protocol::LifecycleAuthority;
+use flotilla_protocol::QueryCursor;
+use flotilla_protocol::QueryScope;
+use flotilla_protocol::TerminalStatus;
+use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
     Checkout, CheckoutPhase, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment,
     EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec,

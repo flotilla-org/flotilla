@@ -11,7 +11,10 @@ use flotilla_protocol::{ConfigLabel, HostName, NodeId, NodeInfo, PeerWireMessage
 use tokio::sync::mpsc;
 
 use super::{ActivationResult, ConnectionDirection, ConnectionMeta, HandleResult, InboundPeerEnvelope, PeerManager};
-use crate::peer::{test_support::MockPeerSender, PeerConnectionStatus, PeerSender, PeerTransport};
+use crate::peer::PeerConnectionStatus;
+use crate::peer::PeerSender;
+use crate::peer::PeerTransport;
+use crate::testkits::peer::MockPeerSender;
 
 fn activate(mgr: &mut PeerManager, peer: &str, sender: Arc<MockPeerSender>) -> u64 {
     match mgr.activate_connection(

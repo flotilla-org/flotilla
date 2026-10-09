@@ -20,8 +20,10 @@ use flotilla_protocol::{
 };
 use tokio::sync::Mutex as TokioMutex;
 
-use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement};
-use crate::{
+use flotilla_core::providers::discovery::{
+    DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement,
+};
+use flotilla_core::{
     config::ConfigStore,
     providers::{
         change_request::ChangeRequestTracker,
@@ -44,7 +46,10 @@ impl CheckoutVcsResolver for TestVcsResolver {
         Ok(Arc::new(FlotillaVcs::new(
             ExecutionEnvironmentPath::new(path),
             Arc::clone(&self.0),
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), Arc::clone(&self.0)))),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(
+                flotilla_core::config::default_checkout_path(),
+                Arc::clone(&self.0),
+            ))),
         )))
     }
 }
@@ -359,13 +364,13 @@ impl CommandRunner for DiscoveryMockRunner {
 }
 /// Build a `DiscoveryRuntime` that uses no-op env and a minimal fake runner
 /// (only responds to `git --version`). Avoids probing ambient host tools.
-pub fn fake_discovery(_legacy_mode: bool) -> super::DiscoveryRuntime {
+pub fn fake_discovery(_legacy_mode: bool) -> flotilla_core::providers::discovery::DiscoveryRuntime {
     minimal_discovery_runtime(std::sync::Arc::new(
         DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build(),
     ))
 }
 
-pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> super::DiscoveryRuntime {
+pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> flotilla_core::providers::discovery::DiscoveryRuntime {
     let mut discovery = fake_discovery(legacy_mode);
     discovery.env = std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]).with_host_os(host_os));
     discovery
@@ -373,31 +378,32 @@ pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> super::Dis
 
 /// Build a `DiscoveryRuntime` whose local environment runs entirely through
 /// the given (typically mock) command runner.
-pub fn fake_discovery_with_runner(_legacy_mode: bool, runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
+pub fn fake_discovery_with_runner(
+    _legacy_mode: bool,
+    runner: std::sync::Arc<dyn CommandRunner>,
+) -> flotilla_core::providers::discovery::DiscoveryRuntime {
     minimal_discovery_runtime(runner)
 }
 
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
-pub fn git_process_discovery(_legacy_mode: bool) -> super::DiscoveryRuntime {
-    minimal_discovery_runtime(std::sync::Arc::new(crate::providers::ProcessCommandRunner))
+pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+    minimal_discovery_runtime(std::sync::Arc::new(flotilla_core::providers::ProcessCommandRunner))
 }
 
-fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
-    super::DiscoveryRuntime {
-        runner,
-        // Runtime tests use real Git but must never make model API calls.
-        env: std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])),
-        available_space_probe: fixed_available_space_probe(),
-        host_detectors: std::sync::Arc::new(vec![Box::new(super::detectors::generic::CommandDetector::new(
+fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+    DiscoveryRuntime::builder()
+        .runner(runner)
+        .env(std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])))
+        .available_space_probe(fixed_available_space_probe())
+        .host_detectors(std::sync::Arc::new(vec![Box::new(flotilla_core::providers::discovery::detectors::generic::CommandDetector::new(
             "git",
             &["--version"],
-            super::detectors::generic::parse_first_dotted_version,
-        ))]),
-        repo_detectors: super::detectors::default_repo_detectors(),
-        factories: super::FactoryRegistry::default_all(),
-        host_scoped_providers: Default::default(),
-    }
+            flotilla_core::providers::discovery::detectors::generic::parse_first_dotted_version,
+        ))]))
+        .repo_detectors(flotilla_core::providers::discovery::detectors::default_repo_detectors())
+        .factories(flotilla_core::providers::discovery::FactoryRegistry::default_all())
+        .build()
 }
 // ---------------------------------------------------------------------------
 // Fake providers for integration / E2E tests
@@ -641,6 +647,8 @@ impl CheckoutBuilder {
         self
     }
 
+    // Fluent builder setter, matching the checkout property.
+    #[allow(clippy::wrong_self_convention)]
     pub fn is_main(mut self, yes: bool) -> Self {
         self.is_main = yes;
         self
@@ -812,7 +820,7 @@ pub struct FakeChangeRequest {
 }
 
 pub struct FakeTerminalPool {
-    pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
+    pub sessions: Arc<TokioMutex<Vec<flotilla_core::providers::terminal::TerminalSession>>>,
     liveness_override: Arc<TokioMutex<Option<Result<TerminalSessionLiveness, String>>>>,
     pub killed: Arc<TokioMutex<Vec<String>>>,
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
@@ -825,8 +833,8 @@ pub struct EnsuredTerminalSession {
     pub session_name: String,
     pub command: String,
     pub cwd: ExecutionEnvironmentPath,
-    pub env_vars: super::super::terminal::TerminalEnvVars,
-    pub initial_size: Option<super::super::terminal::TerminalSize>,
+    pub env_vars: flotilla_core::providers::terminal::TerminalEnvVars,
+    pub initial_size: Option<flotilla_core::providers::terminal::TerminalSize>,
 }
 
 impl Default for FakeTerminalPool {
@@ -848,7 +856,7 @@ impl FakeTerminalPool {
         }
     }
 
-    pub async fn add_sessions(&self, sessions: Vec<super::super::terminal::TerminalSession>) {
+    pub async fn add_sessions(&self, sessions: Vec<flotilla_core::providers::terminal::TerminalSession>) {
         self.sessions.lock().await.extend(sessions);
     }
 
@@ -886,7 +894,7 @@ impl TerminalPool for FakeTerminalPool {
         true
     }
 
-    async fn list_sessions(&self) -> Result<Vec<super::super::terminal::TerminalSession>, String> {
+    async fn list_sessions(&self) -> Result<Vec<flotilla_core::providers::terminal::TerminalSession>, String> {
         Ok(self.sessions.lock().await.clone())
     }
 
@@ -895,8 +903,8 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         command: &str,
         cwd: &ExecutionEnvironmentPath,
-        env_vars: &super::super::terminal::TerminalEnvVars,
-        tags: &[super::super::terminal::TerminalSessionTag],
+        env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
+        tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         self.ensure_session_with_size(session_name, command, cwd, env_vars, tags, None).await
     }
@@ -906,9 +914,9 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         command: &str,
         cwd: &ExecutionEnvironmentPath,
-        env_vars: &super::super::terminal::TerminalEnvVars,
-        _tags: &[super::super::terminal::TerminalSessionTag],
-        initial_size: Option<super::super::terminal::TerminalSize>,
+        env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
+        _tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
+        initial_size: Option<flotilla_core::providers::terminal::TerminalSize>,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
@@ -921,7 +929,7 @@ impl TerminalPool for FakeTerminalPool {
             env_vars: env_vars.clone(),
             initial_size,
         });
-        sessions.push(super::super::terminal::TerminalSession {
+        sessions.push(flotilla_core::providers::terminal::TerminalSession {
             session_name: session_name.to_string(),
             status: TerminalStatus::Running,
             command: Some(command.to_string()),
@@ -936,7 +944,7 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &super::super::terminal::TerminalEnvVars,
+        _env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
     }
@@ -953,7 +961,7 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &super::super::terminal::TerminalEnvVars,
+        _env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
         mode: flotilla_protocol::commands::AttachMode,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         let flag = match mode {
@@ -1016,9 +1024,14 @@ impl ChangeRequestTracker for FakeChangeRequest {
     async fn get_change_request_for_admission(
         &self,
         id: &str,
-    ) -> Result<super::super::change_request::ChangeRequestAdmission, super::super::change_request::ObservationError> {
+    ) -> Result<flotilla_core::providers::change_request::ChangeRequestAdmission, flotilla_core::providers::change_request::ObservationError>
+    {
         let (id, change_request) = self.get_change_request(id).await?;
-        Ok(super::super::change_request::ChangeRequestAdmission { id, change_request, base_ref: Some(self.admission_base_ref.clone()) })
+        Ok(flotilla_core::providers::change_request::ChangeRequestAdmission {
+            id,
+            change_request,
+            base_ref: Some(self.admission_base_ref.clone()),
+        })
     }
 
     async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
@@ -1248,49 +1261,50 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
     let runner: Arc<dyn CommandRunner> =
         Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build());
 
-    let mut vcs: Vec<Box<super::VcsFactory>> = Vec::new();
+    let mut vcs: Vec<Box<flotilla_core::providers::discovery::VcsFactory>> = Vec::new();
     if let Some(cm) = providers.checkout_manager {
         vcs.push(Box::new(ArcVcsFactory(cm)));
     }
 
-    let mut change_request_factories: Vec<Box<super::ChangeRequestFactory>> = Vec::new();
+    let mut change_request_factories: Vec<Box<flotilla_core::providers::discovery::ChangeRequestFactory>> = Vec::new();
     if let Some(cr) = providers.change_request {
         change_request_factories.push(Box::new(FakeChangeRequestFactory(cr)));
     }
 
-    let mut issue_tracker_factories: Vec<Box<super::IssueProviderFactory>> = Vec::new();
+    let mut issue_tracker_factories: Vec<Box<flotilla_core::providers::discovery::IssueProviderFactory>> = Vec::new();
     if let Some(it) = providers.issue_tracker {
         issue_tracker_factories.push(Box::new(FakeIssueProviderFactory(it)));
     }
 
-    let mut terminal_pool_factories: Vec<Box<super::TerminalPoolFactory>> = Vec::new();
+    let mut terminal_pool_factories: Vec<Box<flotilla_core::providers::discovery::TerminalPoolFactory>> = Vec::new();
     if let Some(pool) = providers.terminal_pool {
         terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
     }
 
-    DiscoveryRuntime {
-        runner,
-        env: Arc::new(TestEnvVars::default()),
-        available_space_probe: fixed_available_space_probe(),
-        host_detectors: std::sync::Arc::new(vec![]),
-        repo_detectors: vec![],
-        factories: FactoryRegistry {
+    DiscoveryRuntime::builder()
+        .runner(runner)
+        .env(Arc::new(TestEnvVars::default()))
+        .available_space_probe(fixed_available_space_probe())
+        .host_detectors(std::sync::Arc::new(vec![]))
+        .repo_detectors(vec![])
+        .factories(FactoryRegistry {
             vcs,
             change_requests: change_request_factories,
             issue_trackers: issue_tracker_factories,
             cloud_agents: vec![],
             ai_utilities: vec![],
             terminal_pools: terminal_pool_factories,
-            environment_providers: vec![Box::new(super::factories::host_direct::HostDirectEnvironmentFactory)],
-        },
-        host_scoped_providers: Default::default(),
-    }
+            environment_providers: vec![Box::new(
+                flotilla_core::providers::discovery::factories::host_direct::HostDirectEnvironmentFactory,
+            )],
+        })
+        .build()
 }
 
-fn fixed_available_space_probe() -> Arc<dyn crate::admission::AvailableSpaceProbe> {
+fn fixed_available_space_probe() -> Arc<dyn flotilla_core::admission::AvailableSpaceProbe> {
     struct FixedAvailableSpaceProbe;
 
-    impl crate::admission::AvailableSpaceProbe for FixedAvailableSpaceProbe {
+    impl flotilla_core::admission::AvailableSpaceProbe for FixedAvailableSpaceProbe {
         fn measure(&self, _path: &Path) -> Option<u64> {
             Some(100 * 1024 * 1024 * 1024)
         }
@@ -1310,15 +1324,33 @@ pub fn fake_vcs_discovery(state: Arc<RwLock<FakeVcsState>>) -> DiscoveryRuntime 
     runtime
 }
 
+pub async fn assert_provider_contract(provider: &dyn IssueProvider, source: &IssueSource, known_id: &str, since: &str) {
+    let page = provider.query(source, &IssueQuery::default(), 1, 30).await.expect("provider contract: initial query");
+    assert!(!page.items.is_empty(), "provider contract requires seeded open issues");
+    assert!(page.items.iter().all(|issue| issue.state == IssueState::Open));
+    assert!(page.items.iter().all(|issue| issue.reference.source == *source));
+    assert!(page.items.windows(2).all(|rows| rows[0].as_of >= rows[1].as_of), "initial query must be updated-descending");
+
+    let reference = IssueRef { source: source.clone(), id: known_id.to_string() };
+    let fetched = provider.fetch_by_id(&reference).await.expect("provider contract: opaque fetch-by-id");
+    assert_eq!(fetched.reference, reference);
+
+    let changes = provider.list_changed_since(source, since, 30).await.expect("provider contract: changed-since");
+    assert!(changes.updated.iter().all(|issue| issue.state == IssueState::Open));
+    assert!(changes.updated.iter().all(|issue| issue.reference.source == *source));
+    assert!(changes.closed.iter().all(|reference| reference.source == *source));
+    assert!(changes.updated.iter().all(|issue| !changes.closed.iter().any(|reference| reference == &issue.reference)));
+}
+
+mod in_process;
+pub use in_process::InProcessDiscoveryExt;
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
-    use crate::providers::{
-        discovery::{run_host_detectors, EnvironmentAssertion},
-        issue_tracker::tests::assert_provider_contract,
-    };
+    use flotilla_core::providers::discovery::{run_host_detectors, EnvironmentAssertion};
 
     #[tokio::test]
     async fn fake_discovery_uses_only_git_host_detector() {
@@ -1336,11 +1368,11 @@ mod tests {
     async fn fake_issue_provider_satisfies_the_shared_provider_contract() {
         let provider = FakeIssueProvider::new();
         let source = IssueSource { service: "fake".into(), scope: "owner/repo".into() };
-        let mut older = flotilla_protocol::test_support::TestIssue::new("Older").id("opaque-A").build();
+        let mut older = flotilla_protocol_testkit::TestIssue::new("Older").id("opaque-A").build();
         older.as_of = Utc::now() - Duration::minutes(2);
-        let mut newer = flotilla_protocol::test_support::TestIssue::new("Newer").id("opaque-B").build();
+        let mut newer = flotilla_protocol_testkit::TestIssue::new("Newer").id("opaque-B").build();
         newer.as_of = Utc::now() - Duration::minutes(1);
-        let mut closed = flotilla_protocol::test_support::TestIssue::new("Closed").id("opaque-C").build();
+        let mut closed = flotilla_protocol_testkit::TestIssue::new("Closed").id("opaque-C").build();
         closed.state = IssueState::Closed;
         closed.as_of = Utc::now();
         let cutoff = older.as_of.to_rfc3339();

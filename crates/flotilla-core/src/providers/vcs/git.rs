@@ -99,11 +99,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::providers::{
-        replay,
-        testing::fixture_path,
-        vcs::{checkout_test_support::git, VcsInspection},
-    };
+    use crate::providers::vcs::checkout_test_support::git;
+    use crate::providers::vcs::VcsInspection;
+    use crate::testkits::replay;
+    use crate::testkits::replay::testing::fixture_path;
 
     // ── Setup helpers (only called in record mode) ──
 

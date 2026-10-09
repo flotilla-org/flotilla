@@ -7,7 +7,7 @@ use bytes::Bytes;
 use tokio::task::JoinHandle;
 use url::Url;
 
-use super::{ChannelLabel, HttpClient, ReqwestHttpClient};
+use flotilla_core::providers::{ChannelLabel, HttpClient, ReqwestHttpClient};
 
 /// Loopback HTTP server with a production executor that preserves request shape.
 pub struct StandIn {

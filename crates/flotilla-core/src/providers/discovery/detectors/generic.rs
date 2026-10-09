@@ -146,10 +146,10 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{
-        discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
-        testing::capture_logs,
-    };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testkits::discovery::TestEnvVars;
+    use crate::testkits::replay::testing::capture_logs;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[test]

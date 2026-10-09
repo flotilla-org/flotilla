@@ -1,7 +1,5 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
 // Tests share a process: isolate state and keep process-wide mutations in separate targets.
-#[path = "../common/mod.rs"]
-mod common;
 mod controller_loop;
 mod convoy_in_memory;
 mod convoy_status_patch;

@@ -89,7 +89,9 @@ pub(crate) fn remote_assertion(url: &str, remote_name: &str) -> Option<Environme
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testkits::discovery::TestEnvVars;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // -- VcsRepoDetector --

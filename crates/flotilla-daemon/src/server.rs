@@ -2,14 +2,12 @@ mod caller;
 mod client_connection;
 pub mod environment_sockets;
 mod peer_connection;
-mod peer_runtime;
-mod remote_commands;
-mod replicator;
+pub mod peer_runtime;
+pub mod remote_commands;
+pub mod replicator;
 mod request_dispatch;
 mod resource_http;
 mod shared;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
 
 use std::{
     collections::HashMap,
@@ -161,7 +159,7 @@ impl AcceptErrorBackoff {
 ///
 /// Visibility is promoted to `pub` with the `test-support` feature so
 /// integration tests can construct notices to drive the outbound task.
-#[cfg_attr(any(test, feature = "test-support"), visibility::make(pub))]
+#[visibility::make(pub)]
 pub(crate) struct PeerConnectedNotice {
     pub peer: NodeId,
     pub generation: u64,
@@ -179,13 +177,13 @@ pub(crate) struct PeerConnectedNotice {
 /// replicators. The generation is checked against the currently tracked
 /// generation before acting, so a stale/displaced connection's belated
 /// teardown can't cancel a newer, already-reconnected generation.
-#[cfg_attr(any(test, feature = "test-support"), visibility::make(pub))]
+#[visibility::make(pub)]
 pub(crate) enum PeerConnectionEvent {
     Connected(PeerConnectedNotice),
     Disconnected { peer: NodeId, generation: u64 },
 }
 
-fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
+pub fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
     let pending_remote_commands: PendingRemoteCommandMap = Arc::new(Mutex::new(HashMap::new()));
     let forwarded_commands: ForwardedCommandMap = Arc::new(Mutex::new(HashMap::new()));
     let pending_remote_cancels: PendingRemoteCancelMap = Arc::new(Mutex::new(HashMap::new()));
@@ -279,33 +277,6 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
         Some(config.state_dir().as_path().join("peers")),
     );
     Ok(handle)
-}
-
-/// Spawn the peer networking runtime with pre-built components.
-///
-/// Test-only entry point: callers provide a PeerManager with pre-configured
-/// senders (e.g. CapturePeerSender). Passes `None` for `inbound_peer_rx` to skip
-/// the inbound connection task — tests drive the outbound task via the returned
-/// `PeerConnectionEvent` sender.
-#[cfg(any(test, feature = "test-support"))]
-pub fn spawn_test_peer_networking(
-    daemon: Arc<InProcessDaemon>,
-    peer_manager: Arc<Mutex<PeerManager>>,
-) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
-    // Receiver dropped intentionally — None is passed for the inbound task,
-    // so no messages are forwarded; the sender satisfies the runtime signature.
-    let (inbound_peer_tx, _inbound_peer_rx) = mpsc::channel(256);
-    let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
-    PeerRuntime::new(
-        daemon,
-        peer_manager,
-        None, // No inbound task — test drives outbound via PeerConnectionEvent
-        inbound_peer_tx,
-        remote_command_router,
-        None,
-    )
-    .with_replication_kinds(None)
-    .spawn()
 }
 
 /// The daemon server that listens on a Unix socket and dispatches requests
@@ -750,7 +721,6 @@ async fn handle_client_with_caller(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(test, feature = "test-support"))]
 #[allow(dead_code)]
 async fn handle_client_session(
     session: MessageSession,
@@ -785,7 +755,7 @@ async fn handle_client_session(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_client_session_with_caller(
+pub async fn handle_client_session_with_caller(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,

@@ -19,6 +19,14 @@ members = [
     "crates/flotilla-aggregator",
     "crates/flotilla-tui",
     "crates/flotilla-test-support",
+    "crates/flotilla-daemon-testkit",
+    "crates/flotilla-protocol-testkit",
+    "crates/flotilla-store-testkit",
+    "crates/flotilla-discovery-testkit",
+    "crates/flotilla-replay-testkit",
+    "crates/flotilla-orchestration-testkit",
+    "crates/flotilla-credentials-testkit",
+
     "crates/tender",
     "crates/flotilla-relay-protocol",
     "crates/flotilla-relay",
@@ -32,7 +40,7 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
@@ -86,8 +94,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
+flotilla-discovery-testkit = { path = "crates/flotilla-discovery-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
-flotilla-core = { path = "crates/flotilla-core", features = ["test-support"] }
+flotilla-core = { path = "crates/flotilla-core" }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
 hegeltest = "=0.48.1"
 tempfile = "3"
@@ -104,4 +114,5 @@ workspace = true
 
 # The daemon and its request-session test harness are Unix-only, like the tests.
 [target.'cfg(unix)'.dev-dependencies]
-flotilla-daemon = { path = "crates/flotilla-daemon", features = ["test-support"] }
+flotilla-daemon-testkit = { path = "crates/flotilla-daemon-testkit" }
+flotilla-daemon = { path = "crates/flotilla-daemon" }

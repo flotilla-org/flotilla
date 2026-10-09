@@ -189,7 +189,7 @@ pub fn updated_workflow_template_spec() -> WorkflowTemplateSpec {
 }
 
 pub fn valid_workflow_template_yaml() -> &'static str {
-    include_str!("../../examples/review-and-fix.yaml")
+    include_str!("../../../flotilla-resources/examples/review-and-fix.yaml")
 }
 
 pub fn timestamp(seconds: i64) -> chrono::DateTime<Utc> {
@@ -358,6 +358,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     }
 }
 
+#[derive(Default)]
 pub struct TestLoopHarness {
     handles: Vec<JoinHandle<()>>,
 }

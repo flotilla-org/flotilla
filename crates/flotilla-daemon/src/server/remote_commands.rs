@@ -174,11 +174,11 @@ type PendingRemoteStepCancelMap = Arc<Mutex<HashMap<u64, PendingRemoteStepCancel
 type ForwardedRemoteStepBatchMap = Arc<Mutex<HashMap<u64, ForwardedRemoteStepBatch>>>;
 
 #[derive(Clone)]
-pub(super) struct RemoteCommandRouter {
+pub struct RemoteCommandRouter {
     inner: Arc<RemoteCommandRouterInner>,
 }
 
-pub(super) struct RemoteCommandRouterInner {
+pub struct RemoteCommandRouterInner {
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
     pending_remote_commands: PendingRemoteCommandMap,
@@ -276,7 +276,7 @@ impl RemoteCommandRouter {
         Self { inner }
     }
 
-    pub(super) fn install_blob_store(&self, store: Arc<TieredBlobStore>) -> Result<(), String> {
+    pub fn install_blob_store(&self, store: Arc<TieredBlobStore>) -> Result<(), String> {
         self.blob_store.set(store).map_err(|_| "blob store already installed".to_string())
     }
 

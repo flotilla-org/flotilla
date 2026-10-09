@@ -2269,7 +2269,7 @@ mod tests {
     async fn convoy_explanation_joins_plural_subjects_to_observations() {
         let now = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).single().expect("time");
         let mut fixture = ProjectionFixture::new();
-        fixture.clock = Arc::new(flotilla_resources::VirtualClock::new(now));
+        fixture.clock = Arc::new(flotilla_store_testkit::VirtualClock::new(now));
         let subject = |scope: &str| Subject {
             kind: SubjectKind::ChangeRequest,
             source: IssueSource { service: "github.com".into(), scope: scope.into() },

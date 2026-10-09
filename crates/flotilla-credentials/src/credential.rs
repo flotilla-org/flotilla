@@ -2462,16 +2462,21 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_core::providers::{
-        discovery::EnvironmentAssertion,
-        replay::{Masks, ReplayHttpClient, Session},
-        CommandOutput, ProcessCommandRunner,
-    };
+    use flotilla_core::providers::discovery::EnvironmentAssertion;
+    use flotilla_core::providers::CommandOutput;
+    use flotilla_core::providers::ProcessCommandRunner;
     use flotilla_protocol::NodeId;
-    use flotilla_resources::{
-        CredentialPlacementRequirements, ForgeSpec, InMemoryBackend, InputMeta, ProjectRepositorySpec, ProjectSpec, RepositorySpec,
-        VirtualClock,
-    };
+    use flotilla_replay_testkit::Masks;
+    use flotilla_replay_testkit::ReplayHttpClient;
+    use flotilla_replay_testkit::Session;
+    use flotilla_resources::CredentialPlacementRequirements;
+    use flotilla_resources::ForgeSpec;
+    use flotilla_resources::InMemoryBackend;
+    use flotilla_resources::InputMeta;
+    use flotilla_resources::ProjectRepositorySpec;
+    use flotilla_resources::ProjectSpec;
+    use flotilla_resources::RepositorySpec;
+    use flotilla_store_testkit::VirtualClock;
 
     use super::*;
     use crate::agent_material::{tests::promisor_runner, AgentMaterialRegistry, FLOTILLA_SKILLS_DIR_ENV};
@@ -3460,7 +3465,9 @@ mod tests {
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
+            .await
+            .expect("write App private key");
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
@@ -3548,7 +3555,9 @@ interactions:
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
+            .await
+            .expect("write App private key");
         let session = Session::replaying_from_str(
             r#"interactions:
   - channel: http
@@ -3582,7 +3591,9 @@ interactions:
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
+            .await
+            .expect("write App private key");
 
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
@@ -3698,7 +3709,9 @@ interactions:
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
+            .await
+            .expect("write App private key");
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
@@ -3786,7 +3799,9 @@ interactions:
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
+            .await
+            .expect("write App private key");
 
         let fixture = r#"
 interactions:
@@ -3832,7 +3847,7 @@ interactions:
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("App key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY).await.expect("App key");
         let fixture = r#"
 interactions:
   - channel: http
@@ -3868,7 +3883,9 @@ interactions:
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
         tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
-        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
+            .await
+            .expect("write App private key");
         let fixture = r#"
 interactions:
   - channel: http

@@ -117,7 +117,8 @@ mod tests {
     use flotilla_protocol::HostEnvironment;
 
     use super::*;
-    use crate::providers::{discovery::test_support::DiscoveryMockRunner, environment::ProvisionedMount};
+    use crate::providers::environment::ProvisionedMount;
+    use crate::testkits::discovery::DiscoveryMockRunner;
 
     // Glue: the sampler queries only the current process and reports bytes.
     #[test]
@@ -125,14 +126,13 @@ mod tests {
         assert!(daemon_rss_bytes().is_some_and(|bytes| bytes > 0));
     }
 
-    use crate::{
-        environment_manager::EnvironmentManager,
-        providers::{
-            discovery::{test_support::TestEnvVars as FixtureEnvVars, EnvironmentAssertion, EnvironmentBag},
-            environment::{EnvironmentHandle, ProvisionedEnvironment},
-            CommandRunner,
-        },
-    };
+    use crate::environment_manager::EnvironmentManager;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::environment::EnvironmentHandle;
+    use crate::providers::environment::ProvisionedEnvironment;
+    use crate::providers::CommandRunner;
+    use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
 
     #[test]
     fn system_info_uses_fixture_host_os() {

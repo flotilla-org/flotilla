@@ -5,15 +5,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hegel::generators as gs;
 
 use super::*;
-use crate::providers::{
-    discovery::{
-        detectors::generic::{parse_first_dotted_version, CommandDetector},
-        factories::github::GitHubIssueProviderFactory,
-        test_support::{fake_discovery, fake_discovery_with_runner, FakeIssueProvider, FakeVcsFactory, FakeVcsState},
-        Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement,
-    },
-    testing::MockRunner,
-};
+use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
+use crate::providers::discovery::detectors::generic::CommandDetector;
+use crate::providers::discovery::factories::github::GitHubIssueProviderFactory;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::testkits::discovery::fake_discovery;
+use crate::testkits::discovery::fake_discovery_with_runner;
+use crate::testkits::discovery::FakeIssueProvider;
+use crate::testkits::discovery::FakeVcsFactory;
+use crate::testkits::discovery::FakeVcsState;
+use crate::testkits::replay::testing::MockRunner;
 
 struct CountingVcsFactory {
     inner: FakeVcsFactory,

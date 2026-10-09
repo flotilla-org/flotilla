@@ -1,3 +1,4 @@
+use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
 
 use chrono::Utc;

@@ -392,7 +392,7 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
         let projection = AggregatorProjectionState::new();
         let health = RuntimeHealth::default();
         let identity = test_health_identity();
-        let clock = flotilla_resources::VirtualClock::new(Utc::now());
+        let clock = flotilla_store_testkit::VirtualClock::new(Utc::now());
         for index in 0..count {
             // Store timestamps come from its real clock; pin the decision
             // clock to the newest write so test scheduling cannot age it.
@@ -498,7 +498,7 @@ async fn projection_parity_creation_age_boundaries() {
         .await
         .expect("create local convoy");
     for age_ms in [-1, 0, 1, 9_999, 10_000, 10_001, 60_000] {
-        let clock = flotilla_resources::VirtualClock::new(created.metadata.creation_timestamp + chrono::Duration::milliseconds(age_ms));
+        let clock = flotilla_store_testkit::VirtualClock::new(created.metadata.creation_timestamp + chrono::Duration::milliseconds(age_ms));
         let projection = AggregatorProjectionState::new();
         let condition = projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate missing row");
         assert_eq!(condition.is_some(), !(0..10_000).contains(&age_ms), "row age {age_ms}ms");
@@ -540,7 +540,7 @@ async fn projection_parity_reports_and_clears_missing_local_convoys() {
         .expect("mark durable convoy failed");
     convoys.delete(&failed.metadata.name).await.expect("begin durable convoy reaping");
     let projection = AggregatorProjectionState::new();
-    let clock = flotilla_resources::VirtualClock::new(created.metadata.creation_timestamp + PROJECTION_PARITY_GRACE);
+    let clock = flotilla_store_testkit::VirtualClock::new(created.metadata.creation_timestamp + PROJECTION_PARITY_GRACE);
 
     let degraded = projection_parity_condition(&backend, NAMESPACE, &projection, &clock)
         .await

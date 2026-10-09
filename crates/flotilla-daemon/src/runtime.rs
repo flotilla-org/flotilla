@@ -71,7 +71,6 @@ use self::terminal::TerminalControllerRuntime;
 use crate::{blob_store::TieredBlobStore, resource_manifest::manifest_root_name, startup::phase, supervisor::ControllerSupervision};
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
-#[cfg(any(test, feature = "test-support"))]
 pub use tasks::spawn_pending_supervisor_turn_task_with_watches;
 #[cfg(test)]
 pub(crate) use tasks::wait_for_listening;

@@ -1217,13 +1217,13 @@ async fn environment_runner_supports_factory_probe() {
 
 #[tokio::test]
 async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
-    use crate::{
-        config::ConfigStore,
-        providers::{
-            discovery::{factories::cleat::CleatTerminalPoolFactory, EnvironmentAssertion, EnvironmentBag, Factory},
-            testing::MockRunner,
-        },
-    };
+    use crate::config::ConfigStore;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::providers::discovery::factories::cleat::CleatTerminalPoolFactory;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::discovery::Factory;
+    use crate::testkits::replay::testing::MockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     let inner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("--env-clear --env".into()), Ok("{}".into())]));

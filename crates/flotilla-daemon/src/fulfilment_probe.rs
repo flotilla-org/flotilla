@@ -302,7 +302,7 @@ mod tests {
 
     use std::collections::BTreeSet;
 
-    use flotilla_core::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use flotilla_discovery_testkit::{DiscoveryMockRunner, TestEnvVars};
     use flotilla_resources::{FulfilmentGrant, FulfilmentKindSpec};
 
     use super::*;

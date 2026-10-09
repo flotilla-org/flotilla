@@ -1224,19 +1224,27 @@ mod tests {
     };
     use toml_edit::DocumentMut;
 
-    use crate::{
-        agent_adapter::{
-            append_convoy_work_context, build_convoy_crew_brief_with_options, build_crew_brief, build_crew_brief_with_options,
-            AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions,
-            CrewBriefTemplateOverride, CrewBriefTemplateResolver, CLAUDE_MANAGED_SETTINGS_PATH,
-        },
-        crew_capabilities::CAPABILITIES_HEADING,
-        providers::{
-            discovery::{factories::git::GitVcsFactory, EnvironmentAssertion, EnvironmentBag, Factory},
-            testing::MockRunner,
-            ProcessCommandRunner,
-        },
-    };
+    use crate::agent_adapter::append_convoy_work_context;
+    use crate::agent_adapter::build_convoy_crew_brief_with_options;
+    use crate::agent_adapter::build_crew_brief;
+    use crate::agent_adapter::build_crew_brief_with_options;
+    use crate::agent_adapter::AgentAdapterRegistry;
+    use crate::agent_adapter::AgentLaunchRequest;
+    use crate::agent_adapter::CapabilityTable;
+    use crate::agent_adapter::CrewAssignment;
+    use crate::agent_adapter::CrewBriefMember;
+    use crate::agent_adapter::CrewBriefRenderOptions;
+    use crate::agent_adapter::CrewBriefTemplateOverride;
+    use crate::agent_adapter::CrewBriefTemplateResolver;
+    use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
+    use crate::crew_capabilities::CAPABILITIES_HEADING;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::providers::discovery::factories::git::GitVcsFactory;
+    use crate::providers::discovery::EnvironmentAssertion;
+    use crate::providers::discovery::EnvironmentBag;
+    use crate::providers::discovery::Factory;
+    use crate::providers::ProcessCommandRunner;
+    use crate::testkits::replay::testing::MockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";

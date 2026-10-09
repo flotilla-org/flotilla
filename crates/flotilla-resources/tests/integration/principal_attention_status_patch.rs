@@ -1,12 +1,10 @@
-use common::timestamp;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
     resolve_demand, DemandAddressee, DemandKind, DemandPoolRef, DemandResponseOption, DemandSpec, DemandState, DemandStatus,
     DemandStatusPatch, DemandVerdict, DemandVerdictDisposition, PrincipalRef, RegardStatus, RegardStatusPatch, ResourceBackend,
     StatusPatch,
 };
-
-use crate::common;
+use flotilla_store_testkit::fixtures::timestamp;
 
 #[test]
 fn regard_refresh_records_created_and_latest_refreshed_time() {

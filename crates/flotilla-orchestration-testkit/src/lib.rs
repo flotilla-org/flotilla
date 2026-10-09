@@ -1,30 +1,80 @@
 //! Standing-convoy behavior scenarios driven by an injected controller.
+use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_core::config::ConfigStore;
+use flotilla_protocol::{CommandAction, HostName, NodeId};
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
+    Host as ResourceHost, InMemoryBackend, InputMeta, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceBackend,
+    ResourceError, ResourceObject, WorkflowTemplate,
+};
+use std::{sync::Arc, time::Duration};
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::*;
-use crate::{
-    ops_entry::{PRESENTS_AS_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION},
-    providers::discovery::test_support::fake_discovery,
-};
 use chrono::TimeZone;
-use flotilla_resources::{
-    controller_patches, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyPhase, ConvoyProvisioningState, ConvoyStatus,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, Demand as ResourceDemand, DemandKind, DemandSpec, DemandStatusPatch,
-    Environment as ResourceEnvironment, EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec,
-    EnvironmentStatus as ResourceEnvironmentStatus, Event, FulfilmentKindSpec, HarnessFacts, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
-    ProjectRepositorySpec, RepositoryStatus, Selector, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, Vessel, VesselRequirement, VesselSpec, VirtualClock, WorkflowTemplateSpec,
-    AUTHORITY_LABEL, CONVOY_LABEL, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
-};
+use flotilla_core::in_process::*;
+use flotilla_core::ops_entry::PRESENTS_AS_ANNOTATION;
+use flotilla_core::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
+use flotilla_core::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_resources::controller_patches;
+use flotilla_resources::ConvoyEnsureHoldReason;
+use flotilla_resources::ConvoyEnsureSpec;
+use flotilla_resources::ConvoyEnsureStatus;
+use flotilla_resources::ConvoyPhase;
+use flotilla_resources::ConvoyProvisioningState;
+use flotilla_resources::ConvoyStatus;
+use flotilla_resources::CrewSource;
+use flotilla_resources::CrewSpec;
+use flotilla_resources::CrewWorkPhase;
+use flotilla_resources::CrewWorkState;
+use flotilla_resources::Demand as ResourceDemand;
+use flotilla_resources::DemandKind;
+use flotilla_resources::DemandSpec;
+use flotilla_resources::DemandStatusPatch;
+use flotilla_resources::Environment as ResourceEnvironment;
+use flotilla_resources::EnvironmentPhase;
+use flotilla_resources::EnvironmentSpec as ResourceEnvironmentSpec;
+use flotilla_resources::EnvironmentStatus as ResourceEnvironmentStatus;
+use flotilla_resources::Event;
+use flotilla_resources::FulfilmentKindSpec;
+use flotilla_resources::HarnessFacts;
+use flotilla_resources::HostDirectPlacementPolicyCheckout;
+use flotilla_resources::HostDirectPlacementPolicySpec;
+use flotilla_resources::HostSpec;
+use flotilla_resources::HostStatus;
+use flotilla_resources::PlacementPolicy;
+use flotilla_resources::PlacementPolicySpec;
+use flotilla_resources::ProjectRepositoryRole;
+use flotilla_resources::ProjectRepositorySpec;
+use flotilla_resources::RepositoryStatus;
+use flotilla_resources::Selector;
+use flotilla_resources::TerminalSession as ResourceTerminalSession;
+use flotilla_resources::TerminalSessionSource;
+use flotilla_resources::TerminalSessionSpec as ResourceTerminalSessionSpec;
+use flotilla_resources::Vessel;
+use flotilla_resources::VesselRequirement;
+use flotilla_resources::VesselSpec;
+use flotilla_resources::WorkflowTemplateSpec;
+use flotilla_resources::AUTHORITY_LABEL;
+use flotilla_resources::CONVOY_LABEL;
+use flotilla_resources::DRIVER_ADMISSION_CONDITION_TYPE;
+use flotilla_resources::GENERATION_LABEL;
+use flotilla_resources::PROJECT_LABEL;
+use flotilla_resources::ROLE_LABEL;
+use flotilla_store_testkit::VirtualClock;
 
+#[path = "ensure_scenarios/admission.rs"]
 mod admission;
 pub use admission::*;
+#[path = "ensure_scenarios/retry.rs"]
 mod retry;
 pub use retry::*;
+#[path = "ensure_scenarios/teardown.rs"]
 mod teardown;
 pub use teardown::*;
+#[path = "ensure_scenarios/addressing.rs"]
 mod addressing;
 pub use addressing::*;
 
@@ -117,7 +167,8 @@ async fn seed_convoy_routing_row(
     project: Option<&str>,
     phase: flotilla_protocol::ConvoyPhase,
 ) {
-    let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", record).on_host(daemon.host_name.clone());
+    let resource =
+        flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", record).on_host(daemon.host_name().clone());
     let mut row = flotilla_protocol::ConvoyRow::builder()
         .resource(resource.clone())
         .maybe_address_role(role.map(str::to_string))
@@ -129,7 +180,7 @@ async fn seed_convoy_routing_row(
     daemon.aggregator_projection_state().await.write().await.local_rows.insert(resource, row);
 }
 
-pub(super) fn test_meta(name: &str) -> InputMeta {
+fn test_meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
 
@@ -158,7 +209,7 @@ async fn standing_ensure_fixture_for(
         clock.clone(),
     )
     .await;
-    daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend.clone(), daemon.clock.clone())).await;
+    daemon.install_convoy_ensure_reconciler(factory.create(daemon.resource_backend(), daemon.clock_for_scenarios())).await;
     let repository_spec = RepositorySpec::remote("https://github.com/acme/standing").expect("repository spec");
     let repository_key = repository_spec.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository_spec).await.expect("repository");
@@ -187,7 +238,7 @@ async fn standing_ensure_fixture_for(
         .using::<WorkflowTemplate>("flotilla")
         .create(
             &InputMeta::builder()
-                .name(crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
+                .name(flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
                 .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string())]))
                 .build(),
             &WorkflowTemplateSpec::builder()
@@ -465,3 +516,14 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
         .await
         .expect("placement create");
 }
+
+use chrono::Duration as ChronoDuration;
+use flotilla_core::ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
+use flotilla_protocol::{PrincipalRef, ResourceRef};
+use flotilla_resources::{
+    apply_status_patch as apply_resource_status_patch, CheckoutStatus as ResourceCheckoutStatus, ConvoySpec, FulfilmentKind,
+    LifecycleAuthority,
+};
+use sha2::{Digest, Sha256};
+
+use flotilla_core::in_process::convoy_admission::allocate_convoy_generation;

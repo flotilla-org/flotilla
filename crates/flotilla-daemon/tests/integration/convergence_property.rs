@@ -3,8 +3,10 @@
 use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
 
 use chrono::{TimeZone, Utc};
-use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
-use flotilla_daemon::server::test_support::{spawn_in_memory_request_mesh, spawn_in_memory_request_topology, InMemoryRequestTopology};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh, spawn_in_memory_request_topology, InMemoryRequestTopology};
+use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     collect_resource_replica_kind, delete_resource_kind, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta, ResourceBackend,
@@ -469,7 +471,7 @@ impl Harness {
             };
             let mut resolver = node.backend.including_replicas::<Host>(NAMESPACE);
             if fault {
-                resolver = resolver.with_self_origin_suppression_disabled_for_test();
+                resolver = resolver.with_self_origin_suppression(false);
             }
             let listed = resolver.list().await.map_err(|error| error.to_string())?;
             let named = listed.items.iter().filter(|row| row.object.metadata.name == name).collect::<Vec<_>>();
@@ -491,7 +493,7 @@ impl Harness {
         let node = &self.nodes[0];
         let mut resolver = node.backend.including_replicas::<Host>(NAMESPACE);
         if fault {
-            resolver = resolver.with_self_origin_suppression_disabled_for_test();
+            resolver = resolver.with_self_origin_suppression(false);
         }
         let mut watch = resolver.watch().await.map_err(|error| error.to_string())?;
         while tokio::time::timeout(Duration::from_millis(10), watch.next()).await.is_ok() {}

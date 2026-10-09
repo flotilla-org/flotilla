@@ -9,13 +9,13 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use flotilla_core::{
-    agents::AgentEntry,
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
-};
+use flotilla_core::agents::AgentEntry;
+use flotilla_core::config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_discovery_testkit::fake_discovery;
+use flotilla_discovery_testkit::git_process_discovery;
+use flotilla_discovery_testkit::init_git_repo_with_remote;
 use flotilla_protocol::{
     commands::DaemonLogQuery,
     qualified_path::QualifiedPath,
@@ -44,25 +44,39 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    cleanup_reverse_peer_resource_sockets,
-    client_connection::QuerySubscriptions,
-    handle_client, handle_client_session,
-    peer_connection::PEER_IDLE_TIMEOUT,
-    peer_runtime::{forward_with_keepalive_for_test, retry_with_backoff_for_test, send_link_state, ForwardResult},
-    publish_socket_path,
-    remote_commands::{
-        ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap, PendingRemoteCommand,
-        PendingRemoteCommandMap, RemoteCommandRouter,
-    },
-    replicator::{replicate_kind_over_http, ReplicationStore},
-    request_dispatch::RequestDispatcher,
-    resource_http::serve_resource_http,
-    shared::{sync_peer_query_state, write_message},
-    test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
-    AcceptErrorBackoff, BoundSocketGuard, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
-    CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
-};
+use super::cleanup_reverse_peer_resource_sockets;
+use super::client_connection::QuerySubscriptions;
+use super::handle_client;
+use super::handle_client_session;
+use super::peer_connection::PEER_IDLE_TIMEOUT;
+use super::peer_runtime::forward_with_keepalive_for_test;
+use super::peer_runtime::retry_with_backoff_for_test;
+use super::peer_runtime::send_link_state;
+use super::peer_runtime::ForwardResult;
+use super::publish_socket_path;
+use super::remote_commands::ForwardedCommand;
+use super::remote_commands::ForwardedCommandMap;
+use super::remote_commands::ForwardedCommandState;
+use super::remote_commands::PendingRemoteCancelMap;
+use super::remote_commands::PendingRemoteCommand;
+use super::remote_commands::PendingRemoteCommandMap;
+use super::remote_commands::RemoteCommandRouter;
+use super::replicator::replicate_kind_over_http;
+use super::replicator::ReplicationStore;
+use super::request_dispatch::RequestDispatcher;
+use super::resource_http::serve_resource_http;
+use super::shared::sync_peer_query_state;
+use super::shared::write_message;
+use super::AcceptErrorBackoff;
+use super::BoundSocketGuard;
+use super::DaemonServer;
+use super::PeerConnectionEvent;
+use super::ACCEPT_ERROR_INITIAL_BACKOFF;
+use super::ACCEPT_ERROR_MAX_BACKOFF;
+use super::CONNECTION_PREFACE_TIMEOUT;
+use super::HELLO_HANDSHAKE_TIMEOUT;
+use crate::testkits::server::apply_convoy_replica_feed;
+use crate::testkits::server::seed_trusted_remote_convoy_project;
 use crate::{
     peer::{ConnectionDirection, ConnectionMeta},
     startup::test_support::GatedCredentialPreflight,
@@ -658,10 +672,14 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
     std::fs::remove_file(&socket_path).expect("remove replicator HTTP socket");
 }
 
-use crate::peer::{
-    test_support::{ensure_test_connection_generation, BlockingPeerSender, MockPeerSender},
-    InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
-};
+use crate::peer::InboundPeerEnvelope;
+use crate::peer::PeerConnectionStatus;
+use crate::peer::PeerManager;
+use crate::peer::PeerSender;
+use crate::peer::PeerTransport;
+use crate::testkits::peer::ensure_test_connection_generation;
+use crate::testkits::peer::BlockingPeerSender;
+use crate::testkits::peer::MockPeerSender;
 
 fn ok_response(msg: Message, expected_id: u64) -> Response {
     match msg {
@@ -4953,10 +4971,8 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     let credential_runner = Arc::new(GatedCredentialPreflight::new());
     let mut discovery = fake_discovery(false);
     discovery.runner = credential_runner.clone();
-    discovery.env = Arc::new(flotilla_core::providers::discovery::test_support::TestEnvVars::new([
-        ("TEST_WORK_TOKEN", "fake-test-token"),
-        ("FLOTILLA_PROBE_MODELS", ""),
-    ]));
+    discovery.env =
+        Arc::new(flotilla_discovery_testkit::TestEnvVars::new([("TEST_WORK_TOKEN", "fake-test-token"), ("FLOTILLA_PROBE_MODELS", "")]));
     discovery.factories.environment_providers.push(Box::new(GatedStartupEnvironmentFactory(provider.clone())));
     let server =
         DaemonServer::new(Vec::new(), config.clone(), discovery, socket_path.clone(), StdDuration::from_secs(60)).await.expect("server");

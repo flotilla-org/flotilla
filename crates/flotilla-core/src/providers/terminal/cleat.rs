@@ -404,7 +404,9 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use super::*;
-    use crate::providers::{testing::MockRunner, CommandRunner};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use crate::providers::CommandRunner;
+    use crate::testkits::replay::testing::MockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // Existing command-layout tests exercise their operation after the launch

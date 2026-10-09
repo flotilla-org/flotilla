@@ -15,8 +15,8 @@ use crate::change_request_observer::ChangeRequestRef;
 use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::test_support::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
 use crate::providers::types::ChangeRequest;
+use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
 
 // #2868: three daemons sharing a Project poll its source once per pass.
 // Nonowners obtain board facts through real resource replication; explicit

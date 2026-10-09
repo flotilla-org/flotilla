@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-use crate::{
+use flotilla_resources::{
     apply_status_patch, InputMeta, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, StatusPatch, TypedResolver,
 };
 
@@ -100,10 +100,14 @@ impl<T: Resource> WriteCountingResolver<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        test_support::WriteCountingBackend, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, FreshCloneCheckoutSpec, InputMeta,
-        RepositoryKey,
-    };
+    use crate::WriteCountingBackend;
+    use flotilla_resources::Checkout;
+    use flotilla_resources::CheckoutPhase;
+    use flotilla_resources::CheckoutSpec;
+    use flotilla_resources::CheckoutStatus;
+    use flotilla_resources::FreshCloneCheckoutSpec;
+    use flotilla_resources::InputMeta;
+    use flotilla_resources::RepositoryKey;
 
     #[tokio::test]
     async fn counts_mutations_but_not_reads_and_can_be_reset() {

@@ -5,18 +5,15 @@ edition = "2021"
 license.workspace = true
 
 [features]
-# Keep helper features uniform across build/workspace/package commands on stable.
-default = ["test-support"]
+default = []
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider", "flotilla-credentials/aws-lc-provider", "flotilla-aggregator/aws-lc-provider"]
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
-test-support = ["flotilla-protocol/test-support", "dep:flotilla-client"]
 
 [dependencies]
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 bon = { workspace = true }
 flotilla-aggregator = { path = "../flotilla-aggregator" }
-flotilla-client = { path = "../flotilla-client", optional = true }
 flotilla-controllers = { path = "../flotilla-controllers" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-credentials = { path = "../flotilla-credentials" }
@@ -51,12 +48,19 @@ http = "1"
 libc = "0.2"
 
 [dev-dependencies]
+flotilla-daemon-testkit = { path = "../flotilla-daemon-testkit" }
+flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
+flotilla-credentials-testkit = { path = "../flotilla-credentials-testkit" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 bytes = "1"
-flotilla-core = { path = "../flotilla-core", features = ["test-support", "replay"] }
+flotilla-core = { path = "../flotilla-core" }
 flotilla-client = { path = "../flotilla-client" }
-flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
-flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
 flotilla-test-support = { path = "../flotilla-test-support" }
 hegeltest = "=0.48.1"
 http = "1"

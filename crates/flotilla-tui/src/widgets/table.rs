@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn scoped_issue_metadata_and_condition_snapshot() {
-        let issue = flotilla_protocol::test_support::TestIssue::new("Fix pagination").id("ENG-42").build();
+        let issue = flotilla_protocol_testkit::TestIssue::new("Fix pagination").id("ENG-42").build();
         let row = flotilla_protocol::IssueRow { reference: issue.reference.clone(), issue };
         let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
         let query = flotilla_protocol::QueryId::Issues { scope, search: None, label: None };
