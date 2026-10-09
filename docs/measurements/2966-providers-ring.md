@@ -2,6 +2,11 @@
 
 Baseline: `faf399ac1d31a4fd726425a1a61dc831d36cccba` (the dispatch base).
 
+Rechecked after rebasing onto `bedce9caa` (the paths/daemon-api extraction):
+the current base still has the same 25-module provider SCC, and the rebased
+change has the same five-module SCC with no observer or `in_process` reach.
+New neutral seams import path types directly from `flotilla-paths`.
+
 The same module-graph analysis before and after the moves gives:
 
 | Measurement | Before | After |
