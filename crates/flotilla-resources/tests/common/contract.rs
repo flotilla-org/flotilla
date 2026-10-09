@@ -15,7 +15,7 @@ use flotilla_resources::{
 use futures::StreamExt;
 use tokio::time::timeout;
 
-use crate::common::{convoy_meta, convoy_spec, updated_workflow_template_spec, valid_workflow_template_spec, workflow_template_meta};
+use super::{convoy_meta, convoy_spec, updated_workflow_template_spec, valid_workflow_template_spec, workflow_template_meta};
 
 pub async fn assert_terminal_session_label_lookup_with_backend(backend: ResourceBackend) {
     let sessions = backend.using::<TerminalSession>("flotilla");

@@ -4,56 +4,11 @@ use chrono::Utc;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     delete_resource_kind, EventRetention, Host, HostSpec, InMemoryBackend, InputMeta, LifecycleAuthority, OwnerGarbageCollector,
-    OwnerReference, ResourceBackend, ResourceError, SqliteBackend, WatchEvent, WatchStart,
+    ResourceBackend, ResourceError, SqliteBackend, WatchEvent, WatchStart,
 };
 use futures::StreamExt;
 
-const NS: &str = "gc-test";
-
-fn meta(name: &str, owner: Option<&str>) -> InputMeta {
-    InputMeta::builder()
-        .name(name.to_string())
-        .owner_references(
-            owner
-                .into_iter()
-                .map(|name| OwnerReference {
-                    api_version: "flotilla.work/v1".to_string(),
-                    kind: "Host".to_string(),
-                    name: name.to_string(),
-                    controller: true,
-                })
-                .collect(),
-        )
-        .build()
-        .with_lifecycle_authority(LifecycleAuthority::Managed)
-}
-
-async fn create(backend: &ResourceBackend, meta: InputMeta) {
-    backend.using::<Host>(NS).create(&meta, &HostSpec::default()).await.expect("create host");
-}
-
-async fn deleted(watch: &mut flotilla_resources::WatchStream<Host>, name: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(watch.next().await.expect("watch open").expect("watch event"), WatchEvent::Deleted(object) if object.metadata.name == name) {
-                break;
-            }
-        }
-    }).await.expect("reactive deletion without an hourly sweep");
-}
-
-async fn start(backend: &ResourceBackend) -> tokio::task::JoinHandle<Result<(), ResourceError>> {
-    let mut watch = backend.using::<Host>(NS).watch(WatchStart::Now).await.expect("watch startup");
-    create(backend, meta("startup-orphan", Some("missing"))).await;
-    let collector = OwnerGarbageCollector::new(backend.clone(), NS);
-    let mut task = tokio::spawn(async move { collector.run(Duration::from_secs(3600)).await });
-    // Startup recovery deletes this marker only after all watches are established.
-    tokio::select! {
-        _ = deleted(&mut watch, "startup-orphan") => {},
-        result = &mut task => panic!("collector stopped: {result:?}"),
-    }
-    task
-}
+use crate::common::owner_gc::{create, deleted, meta, start, NS};
 
 /// A deletion after the preceding writes on this kind confirms that the
 /// collector has consumed those watch events before assertions inspect it.
@@ -244,89 +199,4 @@ async fn memory_replica() {
 #[tokio::test]
 async fn sqlite_replica() {
     replica_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))).await;
-}
-
-async fn vessel_finalizer_contract(backend: ResourceBackend) {
-    use flotilla_controllers::reconcilers::VesselReconciler;
-    use flotilla_resources::{
-        controller::ControllerLoop, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, VESSEL_REF_LABEL,
-    };
-
-    create(&backend, meta("convoy-surrogate", None)).await;
-    let vessels = backend.using::<Vessel>(NS);
-    vessels
-        .create(
-            &meta("vessel", Some("convoy-surrogate")).with_added_finalizer("flotilla.work/vessel-workspace-teardown"),
-            &VesselSpec {
-                convoy_ref: "convoy-surrogate".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "unused".to_string(),
-                adopted_checkout_refs: Default::default(),
-            },
-        )
-        .await
-        .expect("create vessel");
-    let terminals = backend.using::<TerminalSession>(NS);
-    // A legacy label-only child proves the Vessel's finalizer actually ran;
-    // the generic collector cannot delete this terminal itself.
-    let mut terminal_meta = meta("running-terminal", None);
-    terminal_meta.labels.insert(VESSEL_REF_LABEL.to_string(), "vessel".to_string());
-    terminals
-        .create(
-            &terminal_meta,
-            &TerminalSessionSpec {
-                env_ref: "unused".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "true".to_string() },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "test".to_string(),
-            },
-        )
-        .await
-        .expect("create terminal");
-    let gc = start(&backend).await;
-    let mut vessel_watch = vessels.watch(WatchStart::Now).await.expect("watch vessel");
-    backend.using::<Host>(NS).delete("convoy-surrogate").await.expect("delete owner");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(vessel_watch.next().await.expect("watch open").expect("event"), WatchEvent::Modified(vessel) if vessel.metadata.is_pending_finalization()) {
-                break;
-            }
-        }
-    }).await.expect("cascade requests finalization");
-    assert!(terminals.get("running-terminal").await.is_ok());
-    let controller = tokio::spawn(
-        ControllerLoop {
-            primary: vessels.clone(),
-            secondaries: Vec::new(),
-            reconciler: VesselReconciler::new(backend.clone(), NS),
-            resync_interval: Duration::from_secs(3600),
-            backend,
-        }
-        .run(),
-    );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if matches!(vessel_watch.next().await.expect("watch open").expect("event"), WatchEvent::Deleted(_)) {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("vessel finalizes reactively");
-    assert!(matches!(terminals.get("running-terminal").await, Err(ResourceError::NotFound { .. })));
-    gc.abort();
-    controller.abort();
-    let _ = gc.await;
-    let _ = controller.await;
-}
-
-#[tokio::test]
-async fn memory_vessel_finalizer() {
-    vessel_finalizer_contract(ResourceBackend::InMemory(InMemoryBackend::default())).await;
-}
-#[tokio::test]
-async fn sqlite_vessel_finalizer() {
-    vessel_finalizer_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))).await;
 }

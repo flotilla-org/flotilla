@@ -4,7 +4,6 @@
 mod common;
 mod controller_loop;
 mod convoy_in_memory;
-mod convoy_reconcile;
 mod convoy_status_patch;
 mod crew_image_baseline;
 mod digest;

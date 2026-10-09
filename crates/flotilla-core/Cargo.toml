@@ -5,7 +5,8 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = []
+# Replay is also consumed by daemon tests; keep one library variant on stable.
+default = ["test-support", "replay"]
 cleat-environment-contract = []
 aws-lc-provider = ["flotilla-resources/aws-lc-provider"]
 replay = []
@@ -14,7 +15,7 @@ test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-suppo
 
 [dependencies]
 tempfile = { version = "3", optional = true }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
 flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
@@ -39,7 +40,7 @@ urlencoding = "2"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.38.4"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -49,18 +50,13 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = "0.2"
 
 [dev-dependencies]
-flotilla-controllers = { path = "../flotilla-controllers" }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 hegeltest = "=0.48.1"
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
 tempfile = "3"
 insta = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-
-[[test]]
-name = "in_process_daemon"
-required-features = ["test-support"]
 
 [[example]]
 name = "environment_checkout"
@@ -72,3 +68,7 @@ test = false
 
 [lints]
 workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }

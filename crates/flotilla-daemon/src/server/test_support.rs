@@ -9,7 +9,7 @@ use flotilla_protocol::{
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-use super::{build_remote_command_router, peer_runtime::PeerRuntime, spawn_peer_networking_runtime};
+use super::{build_remote_command_router, peer_runtime::PeerRuntime};
 use crate::{
     blob_store::TieredBlobStore,
     peer::{
@@ -357,23 +357,27 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
 
     let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
-        spawn_peer_networking_runtime(
+        PeerRuntime::new(
             Arc::clone(&leader),
             Arc::clone(&leader_peer_manager),
             Some(leader_inbound_peer_rx),
             leader_inbound_peer_tx.clone(),
             leader_remote_router.clone(),
             None,
-        );
+        )
+        .with_replication_kinds(None)
+        .spawn();
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =
-        spawn_peer_networking_runtime(
+        PeerRuntime::new(
             Arc::clone(&follower),
             Arc::clone(&follower_peer_manager),
             Some(follower_inbound_peer_rx),
             follower_inbound_peer_tx,
             follower_remote_router,
             None,
-        );
+        )
+        .with_replication_kinds(None)
+        .spawn();
 
     // Spawn the server-side client session handler BEFORE the client handshake,
     // because from_session_stateful sends Hello and blocks waiting for the reply.
