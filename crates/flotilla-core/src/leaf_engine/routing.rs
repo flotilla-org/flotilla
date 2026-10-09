@@ -268,7 +268,7 @@ impl LeafSubscriptionTable {
             for address in &dependencies.objects {
                 namespace.index.entry(address.clone()).or_default().insert(row.id, sender.clone());
             }
-            routing.dependencies.entry(row.id).or_insert_with(|| dependencies.clone());
+            routing.dependencies.insert(row.id, dependencies.clone());
             return Ok((dependencies, receiver));
         }
     }
