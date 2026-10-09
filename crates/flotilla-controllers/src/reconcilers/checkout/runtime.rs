@@ -9,7 +9,7 @@ use flotilla_core::{
         inspect_convoy_checkout_integration,
     },
     providers::{ChannelLabel, CommandRunner},
-    vcs::CheckoutRegistration,
+    vcs::{self as core_vcs, CheckoutRegistration, Vcs},
 };
 use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, Environment, ForgeSpec,
@@ -17,19 +17,21 @@ use flotilla_resources::{
 };
 use tracing::{debug, warn};
 
-use super::super::clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path};
 use crate::reconcilers::{
-    checkout::managed_checkout_reason, checkout_path_component, BranchPreservationReason, CheckoutRemoval, CheckoutRemovalOutcome,
-    CheckoutRuntime, PreparedCheckout,
+    checkout::managed_checkout_reason,
+    checkout_path_component,
+    clone::runtime::{clone_staging_path, controller_vcs, remove_checkout_path},
+    BranchPreservationReason, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 
 pub struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
-    vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
+    vcs: Option<Arc<dyn Vcs>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
-    forges: Vec<flotilla_resources::ForgeSpec>,
+    forges: Vec<ForgeSpec>,
 }
 
+/// Selects the VCS discovery path used by the daemon’s environment-routing adapter.
 pub fn removal_source_path(removal: &CheckoutRemoval) -> &str {
     match removal {
         CheckoutRemoval::Worktree { clone_path, .. }
@@ -80,12 +82,12 @@ impl CheckoutControllerRuntime {
 impl CheckoutRuntime for CheckoutControllerRuntime {
     async fn create_worktree(
         &self,
-        _clone_path: &str,
+        clone_path: &str,
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        let vcs = controller_vcs(&self.vcs, &self.runner, _clone_path)?;
+        let vcs = controller_vcs(&self.vcs, &self.runner, clone_path)?;
         let materialisation = vcs
             .materialise_checkout(
                 branch,
@@ -127,6 +129,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 }
 
 impl CheckoutControllerRuntime {
+    /// Accepts the change-request identity resolved by the daemon’s routing adapter.
     pub async fn inspect_integration_with_request(
         &self,
         checkout: &ResourceObject<Checkout>,
@@ -203,10 +206,7 @@ impl CheckoutControllerRuntime {
                 let result = if matches!(removal, CheckoutRemoval::LandedWorktree { .. })
                     && matches!(
                         result,
-                        flotilla_core::vcs::CheckoutRemoval::PreservedCheckout {
-                            reason: flotilla_core::vcs::CheckoutPreservationReason::DifferentBranch,
-                            ..
-                        }
+                        core_vcs::CheckoutRemoval::PreservedCheckout { reason: core_vcs::CheckoutPreservationReason::DifferentBranch, .. }
                     ) {
                     // A merged PR may have deleted its head ref after a squash.
                     // Archive first so a checkout that changed since settlement
@@ -216,27 +216,21 @@ impl CheckoutControllerRuntime {
                     result
                 };
                 match result {
-                    flotilla_core::vcs::CheckoutRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
-                    flotilla_core::vcs::CheckoutRemoval::ArchivedAndRemoved { archive_path } => {
+                    core_vcs::CheckoutRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
+                    core_vcs::CheckoutRemoval::ArchivedAndRemoved { archive_path } => {
                         tracing::warn!(checkout = %target_path, archive = %archive_path, "checkout archive saved before forced removal");
                         Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path })
                     }
-                    flotilla_core::vcs::CheckoutRemoval::PreservedBranch { branch, reason } => {
+                    core_vcs::CheckoutRemoval::PreservedBranch { branch, reason } => {
                         let reason = match reason {
-                            flotilla_core::vcs::CheckoutPreservationReason::CommitsPastBase => BranchPreservationReason::CommitsPastBase,
-                            flotilla_core::vcs::CheckoutPreservationReason::CheckedOutElsewhere => {
-                                BranchPreservationReason::CheckedOutElsewhere
-                            }
-                            flotilla_core::vcs::CheckoutPreservationReason::NotCreatedForConvoy => {
-                                BranchPreservationReason::NotCreatedForConvoy
-                            }
+                            core_vcs::CheckoutPreservationReason::CommitsPastBase => BranchPreservationReason::CommitsPastBase,
+                            core_vcs::CheckoutPreservationReason::CheckedOutElsewhere => BranchPreservationReason::CheckedOutElsewhere,
+                            core_vcs::CheckoutPreservationReason::NotCreatedForConvoy => BranchPreservationReason::NotCreatedForConvoy,
                             other => return Err(format!("checkout branch {branch} preserved: {other:?}")),
                         };
                         Ok(CheckoutRemovalOutcome::PreservedBranch { branch, reason })
                     }
-                    flotilla_core::vcs::CheckoutRemoval::PreservedCheckout { path, reason } => {
-                        Err(format!("checkout {path} preserved: {reason:?}"))
-                    }
+                    core_vcs::CheckoutRemoval::PreservedCheckout { path, reason } => Err(format!("checkout {path} preserved: {reason:?}")),
                 }
             }
         }?;
@@ -369,13 +363,13 @@ pub fn utf8_path(path: &str) -> Result<&str, String> {
 impl CheckoutControllerRuntime {
     pub fn new(
         runner: Arc<dyn CommandRunner>,
-        vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
+        vcs: Option<Arc<dyn Vcs>>,
         change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
         forges: Vec<ForgeSpec>,
     ) -> Self {
         Self { runner, vcs, change_requests, forges }
     }
-    pub fn vcs(&self, checkout: &str) -> Result<Arc<dyn flotilla_core::vcs::Vcs>, String> {
+    pub fn vcs(&self, checkout: &str) -> Result<Arc<dyn Vcs>, String> {
         controller_vcs(&self.vcs, &self.runner, checkout)
     }
 }

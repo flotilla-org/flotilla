@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::providers::{ChannelLabel, CommandRunner};
+use flotilla_core::vcs::Vcs;
 use flotilla_resources::{canonicalize_repo_url, ForgeSpec};
 use tokio::sync::Mutex;
 
@@ -33,16 +34,16 @@ impl CloneFlights {
 
 pub struct CloneControllerRuntime {
     runner: Arc<dyn CommandRunner>,
-    vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
+    vcs: Option<Arc<dyn Vcs>>,
     flights: Arc<CloneFlights>,
     forges: Vec<ForgeSpec>,
 }
 
 pub(crate) fn controller_vcs(
-    discovered: &Option<Arc<dyn flotilla_core::vcs::Vcs>>,
+    discovered: &Option<Arc<dyn Vcs>>,
     _runner: &Arc<dyn CommandRunner>,
     _checkout: &str,
-) -> Result<Arc<dyn flotilla_core::vcs::Vcs>, String> {
+) -> Result<Arc<dyn Vcs>, String> {
     if let Some(vcs) = discovered {
         return Ok(Arc::clone(vcs));
     }
@@ -101,7 +102,7 @@ impl CloneRuntime for CloneControllerRuntime {
 }
 
 async fn recover_existing_clone(
-    vcs: &dyn flotilla_core::vcs::Vcs,
+    vcs: &dyn Vcs,
     runner: &dyn CommandRunner,
     repo_url: &str,
     target_path: &str,
@@ -116,7 +117,7 @@ async fn recover_existing_clone(
 }
 
 async fn verify_clone_origin(
-    vcs: &dyn flotilla_core::vcs::Vcs,
+    vcs: &dyn Vcs,
     repo_url: &str,
     target_path: &str,
     target_label: &str,
@@ -169,12 +170,7 @@ pub(crate) fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
 }
 impl CloneControllerRuntime {
-    pub fn new(
-        runner: Arc<dyn CommandRunner>,
-        vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
-        flights: Arc<CloneFlights>,
-        forges: Vec<ForgeSpec>,
-    ) -> Self {
+    pub fn new(runner: Arc<dyn CommandRunner>, vcs: Option<Arc<dyn Vcs>>, flights: Arc<CloneFlights>, forges: Vec<ForgeSpec>) -> Self {
         Self { runner, vcs, flights, forges }
     }
 }
