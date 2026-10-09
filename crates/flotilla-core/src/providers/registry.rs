@@ -85,6 +85,8 @@ impl<D, T: ?Sized> TypedSet<D, T> {
     }
 
     /// Registered identity of this exact provider instance.
+    /// Even zero-sized providers have distinct Arc allocations: the allocation
+    /// includes reference counts, so this does not compare dangling ZST pointers.
     pub fn instance_name(&self, provider: &Arc<T>) -> Option<&str> {
         self.inner
             .iter()
