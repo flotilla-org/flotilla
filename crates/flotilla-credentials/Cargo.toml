@@ -1,0 +1,43 @@
+[package]
+name = "flotilla-credentials"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[features]
+default = ["test-support"]
+test-support = ["flotilla-core/test-support", "flotilla-protocol/test-support", "flotilla-resources/test-support"]
+aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider"]
+skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests"]
+
+[dependencies]
+flotilla-core = { path = "../flotilla-core" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+async-trait = { workspace = true }
+bon = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+serde = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+url = { workspace = true }
+tempfile = "3"
+futures = "0.3"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+bytes = "1"
+http = "1"
+hegeltest = "=0.48.1"
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }

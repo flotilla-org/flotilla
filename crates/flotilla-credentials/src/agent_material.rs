@@ -15,6 +15,7 @@ use flotilla_core::providers::{
     vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX, STAGE_RETRYABLE_PREFIX, STAGE_SOURCE_PREFIX},
     ChannelLabel, CommandRunner,
 };
+use futures::future::BoxFuture;
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::{info, warn};
 use url::Url;
@@ -26,7 +27,7 @@ use crate::{
 
 const CODEX_ADAPTER_ID: &str = "codex";
 const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
-pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
+pub const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 /// Generation-provided, credential-free `CODEX_HOME` template that seeds each
 /// crew's writable scratch (`config.toml`, `skills/`, static defaults). The
 /// generation-side artifact and its `fleet-install` wiring are
@@ -35,7 +36,7 @@ pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 pub(crate) const FLOTILLA_CODEX_HOME_TEMPLATE_ENV: &str = "FLOTILLA_CODEX_HOME_TEMPLATE";
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
-pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
+pub const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 /// The one credential file inside a crew's `CODEX_HOME`. Everything else under
 /// that directory is per-crew scratch Codex may write freely.
 const CODEX_AUTH_FILE: &str = "auth.json";
@@ -44,24 +45,24 @@ const CODEX_AUTH_FILE: &str = "auth.json";
 const CODEX_AUTH_MODE: u32 = 0o400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentMaterialPreflight {
-    pub(crate) command: String,
-    pub(crate) args: Vec<String>,
-    pub(crate) failure_context: String,
+pub struct AgentMaterialPreflight {
+    pub command: String,
+    pub args: Vec<String>,
+    pub failure_context: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentMaterialDelivery {
-    pub(crate) mount: ProvisionedMount,
-    pub(crate) preflight: AgentMaterialPreflight,
+pub struct AgentMaterialDelivery {
+    pub mount: ProvisionedMount,
+    pub preflight: AgentMaterialPreflight,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SkillSourceCredentialRequest {
-    pub(crate) source: String,
-    pub(crate) repository: String,
-    pub(crate) revision: String,
-    pub(crate) credential: String,
+pub struct SkillSourceCredentialRequest {
+    pub source: String,
+    pub repository: String,
+    pub revision: String,
+    pub credential: String,
 }
 
 #[async_trait]
@@ -99,7 +100,7 @@ trait AgentMaterialAdapter: Send + Sync {
         -> Result<Option<AgentMaterialDelivery>, String>;
 }
 
-pub(crate) struct AgentMaterialRegistry {
+pub struct AgentMaterialRegistry {
     homes_dir: PathBuf,
     codex_central_auth_path: PathBuf,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
@@ -107,7 +108,7 @@ pub(crate) struct AgentMaterialRegistry {
 }
 
 impl AgentMaterialRegistry {
-    pub(crate) fn new(env: Arc<dyn EnvVars>) -> Self {
+    pub fn new(env: Arc<dyn EnvVars>) -> Self {
         let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"));
         let homes_dir = home.join(".local/share/flotilla/agent-homes");
         let codex_central_auth_path = codex_central_auth_path(&*env);
@@ -128,29 +129,31 @@ impl AgentMaterialRegistry {
         Self { homes_dir, codex_central_auth_path, adapters, skills }
     }
 
-    pub(crate) async fn prepare(
-        &self,
-        environment_ref: &str,
-        required_adapters: &BTreeSet<String>,
-        environment: &BTreeMap<String, String>,
-    ) -> Result<Vec<AgentMaterialDelivery>, String> {
-        let mut deliveries = Vec::new();
-        for adapter_id in required_adapters {
-            let Some(adapter) = self.adapters.get(adapter_id.as_str()) else {
-                continue;
-            };
-            if let Some(delivery) = adapter.prepare(environment_ref, environment).await? {
-                deliveries.push(delivery);
+    pub fn prepare<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        required_adapters: &'a BTreeSet<String>,
+        environment: &'a BTreeMap<String, String>,
+    ) -> BoxFuture<'a, Result<Vec<AgentMaterialDelivery>, String>> {
+        Box::pin(async move {
+            let mut deliveries = Vec::new();
+            for adapter_id in required_adapters {
+                let Some(adapter) = self.adapters.get(adapter_id.as_str()) else {
+                    continue;
+                };
+                if let Some(delivery) = adapter.prepare(environment_ref, environment).await? {
+                    deliveries.push(delivery);
+                }
             }
-        }
-        if required_adapters
-            .iter()
-            .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
-            .any(|adapter| adapter.requires_skills_for_prepare(environment))
-        {
-            deliveries.push(self.skills.prepare().await?);
-        }
-        Ok(deliveries)
+            if required_adapters
+                .iter()
+                .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
+                .any(|adapter| adapter.requires_skills_for_prepare(environment))
+            {
+                deliveries.push(self.skills.prepare().await?);
+            }
+            Ok(deliveries)
+        })
     }
 
     #[cfg(test)]
@@ -179,97 +182,102 @@ impl AgentMaterialRegistry {
         self.stage_skills(environment_ref, required_adapters, &environment, source_token_files, runner).await
     }
 
-    pub(crate) async fn stage_skills(
-        &self,
-        environment_ref: &str,
-        required_adapters: &BTreeSet<String>,
-        environment: &[(String, String)],
-        source_token_files: &BTreeMap<String, PathBuf>,
-        runner: &dyn CommandRunner,
-    ) -> Result<(), String> {
-        let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-        let result = async {
-            if let Some(crews) = decode_crew_skills(environment)? {
-                let count = crews.len();
-                if count == 0 {
-                    return remove_source_token_files(source_token_files, runner).await;
+    pub fn stage_skills<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        required_adapters: &'a BTreeSet<String>,
+        environment: &'a [(String, String)],
+        source_token_files: &'a BTreeMap<String, PathBuf>,
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
+            let result = async {
+                if let Some(crews) = decode_crew_skills(environment)? {
+                    let count = crews.len();
+                    if count == 0 {
+                        return remove_source_token_files(source_token_files, runner).await;
+                    }
+                    for (index, (role, selected)) in crews.into_iter().enumerate() {
+                        let mut crew_environment = self.crew_environment(&role, required_adapters, environment, runner).await?;
+                        crew_environment.retain(|(key, _)| key != "FLOTILLA_CREW_SKILLS" && key != "FLOTILLA_RESOLVED_SKILLS");
+                        crew_environment.push((
+                            "FLOTILLA_RESOLVED_SKILLS".into(),
+                            serde_json::to_string(&selected).expect("resolved skills serialize"),
+                        ));
+                        self.skills
+                            .stage(environment_ref, &adapters, &crew_environment, source_token_files, runner, index + 1 == count)
+                            .await?;
+                    }
+                    Ok(())
+                } else {
+                    // ADR 0047: remove this legacy branch one fleet roll after #2673,
+                    // once stored environments have been rewritten or reaped.
+                    self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner, true).await
                 }
-                for (index, (role, selected)) in crews.into_iter().enumerate() {
-                    let mut crew_environment = self.crew_environment(&role, required_adapters, environment, runner).await?;
-                    crew_environment.retain(|(key, _)| key != "FLOTILLA_CREW_SKILLS" && key != "FLOTILLA_RESOLVED_SKILLS");
-                    crew_environment
-                        .push(("FLOTILLA_RESOLVED_SKILLS".into(), serde_json::to_string(&selected).expect("resolved skills serialize")));
-                    self.skills
-                        .stage(environment_ref, &adapters, &crew_environment, source_token_files, runner, index + 1 == count)
-                        .await?;
+            }
+            .await;
+            if let Err(ref error) = result {
+                let selected = decode_selected_skills(environment).unwrap_or_default();
+                let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
+                let source = if let Some(path) = self.skills.source.clone() {
+                    tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|inspection| inspection.sources.into_iter().find(|source| Some(source.name.as_str()) == source_name))
+                } else {
+                    None
+                };
+                let revision = selected
+                    .iter()
+                    .find(|entry| Some(entry.source.as_str()) == source_name)
+                    .map(|entry| entry.revision.as_str())
+                    .or_else(|| source.as_ref().map(|source| source.revision.as_str()));
+                warn!(
+                    environment = environment_ref,
+                    source = source_name.unwrap_or("skill-bundle"),
+                    revision = revision.unwrap_or("unresolved"),
+                    credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
+                    %error,
+                    "skill staging failed"
+                );
+                if let Err(error) = remove_source_token_files(source_token_files, runner).await {
+                    warn!(%error, "failed to clean skill-source tokens after staging error");
                 }
-                Ok(())
-            } else {
-                // ADR 0047: remove this legacy branch one fleet roll after #2673,
-                // once stored environments have been rewritten or reaped.
-                self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner, true).await
             }
-        }
-        .await;
-        if let Err(ref error) = result {
-            let selected = decode_selected_skills(environment).unwrap_or_default();
-            let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
-            let source = if let Some(path) = self.skills.source.clone() {
-                tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .and_then(|inspection| inspection.sources.into_iter().find(|source| Some(source.name.as_str()) == source_name))
-            } else {
-                None
-            };
-            let revision = selected
-                .iter()
-                .find(|entry| Some(entry.source.as_str()) == source_name)
-                .map(|entry| entry.revision.as_str())
-                .or_else(|| source.as_ref().map(|source| source.revision.as_str()));
-            warn!(
-                environment = environment_ref,
-                source = source_name.unwrap_or("skill-bundle"),
-                revision = revision.unwrap_or("unresolved"),
-                credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
-                %error,
-                "skill staging failed"
-            );
-            if let Err(error) = remove_source_token_files(source_token_files, runner).await {
-                warn!(%error, "failed to clean skill-source tokens after staging error");
-            }
-        }
-        result.map_err(|error| error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n"))
+            result.map_err(|error| error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n"))
+        })
     }
 
     /// Selects a crew's private scratch home while keeping refreshed credentials
     /// linked to the vessel's delivered material. Used by staging and launch.
-    pub(crate) async fn crew_environment(
-        &self,
-        role: &str,
-        required_adapters: &BTreeSet<String>,
-        environment: &[(String, String)],
-        runner: &dyn CommandRunner,
-    ) -> Result<Vec<(String, String)>, String> {
-        if role.is_empty() || role == "." || role == ".." || role.contains('/') || role.contains('\\') || role.contains('\0') {
-            return Err(format!("invalid crew home role {role:?}"));
-        }
-        let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
-        let mut result = environment.to_vec();
-        for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
-            let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
-            let base = destination.parent().expect("skill directory has a parent");
-            let home = base.join("crews").join(role);
-            // Static config seeds scratch once: later base edits intentionally do
-            // not overwrite crew-owned config or state. Auth follows atomic
-            // rotations in the delivered base. Never copy skills or other crews' state.
-            runner
-                .run(
-                    "sh",
-                    &[
-                        "-c",
-                        r#"set -eu
+    pub fn crew_environment<'a>(
+        &'a self,
+        role: &'a str,
+        required_adapters: &'a BTreeSet<String>,
+        environment: &'a [(String, String)],
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>> {
+        Box::pin(async move {
+            if role.is_empty() || role == "." || role == ".." || role.contains('/') || role.contains('\\') || role.contains('\0') {
+                return Err(format!("invalid crew home role {role:?}"));
+            }
+            let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
+            let mut result = environment.to_vec();
+            for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
+                let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
+                let base = destination.parent().expect("skill directory has a parent");
+                let home = base.join("crews").join(role);
+                // Static config seeds scratch once: later base edits intentionally do
+                // not overwrite crew-owned config or state. Auth follows atomic
+                // rotations in the delivered base. Never copy skills or other crews' state.
+                runner
+                    .run(
+                        "sh",
+                        &[
+                            "-c",
+                            r#"set -eu
 mkdir -p "$2"
 for file in config.toml settings.json .claude.json; do
   if [ -f "$1/$file" ] && [ ! -e "$2/$file" ]; then cp "$1/$file" "$2/$file"; fi
@@ -277,63 +285,68 @@ done
 for file in auth.json .credentials.json; do
   if [ -f "$1/$file" ]; then ln -sf "$1/$file" "$2/$file"; fi
 done"#,
-                        "flotilla-crew-home",
-                        &base.to_string_lossy(),
-                        &home.to_string_lossy(),
-                    ],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-            let variable = adapter.config_home_variable();
-            result.retain(|(key, _)| key != variable);
-            result.push((variable.into(), home.to_string_lossy().into_owned()));
-        }
-        Ok(result)
-    }
-
-    pub(crate) async fn selected_skill_source_credentials(
-        &self,
-        environment: &[(String, String)],
-    ) -> Result<Vec<SkillSourceCredentialRequest>, String> {
-        let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
-        let sources = self.skills.selected_sources(&selected).await?;
-        Ok(sources
-            .into_iter()
-            .filter_map(|source| {
-                source.credential.map(|credential| SkillSourceCredentialRequest {
-                    source: source.name,
-                    repository: source.repository,
-                    revision: source.revision,
-                    credential,
-                })
-            })
-            .collect())
-    }
-
-    pub(crate) async fn will_stage_skills(
-        &self,
-        required_adapters: &BTreeSet<String>,
-        environment: &[(String, String)],
-        runner: &dyn CommandRunner,
-    ) -> Result<bool, String> {
-        let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-        if adapters.is_empty() {
-            return Ok(false);
-        }
-        let config_base = runner
-            .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
-            .await
-            .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
-        for adapter in adapters {
-            if adapter.skill_destination(environment, &config_base)?.is_some() {
-                return Ok(true);
+                            "flotilla-crew-home",
+                            &base.to_string_lossy(),
+                            &home.to_string_lossy(),
+                        ],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
+                    .await?;
+                let variable = adapter.config_home_variable();
+                result.retain(|(key, _)| key != variable);
+                result.push((variable.into(), home.to_string_lossy().into_owned()));
             }
-        }
-        Ok(false)
+            Ok(result)
+        })
     }
 
-    pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
+    pub fn selected_skill_source_credentials<'a>(
+        &'a self,
+        environment: &'a [(String, String)],
+    ) -> BoxFuture<'a, Result<Vec<SkillSourceCredentialRequest>, String>> {
+        Box::pin(async move {
+            let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
+            let sources = self.skills.selected_sources(&selected).await?;
+            Ok(sources
+                .into_iter()
+                .filter_map(|source| {
+                    source.credential.map(|credential| SkillSourceCredentialRequest {
+                        source: source.name,
+                        repository: source.repository,
+                        revision: source.revision,
+                        credential,
+                    })
+                })
+                .collect())
+        })
+    }
+
+    pub fn will_stage_skills<'a>(
+        &'a self,
+        required_adapters: &'a BTreeSet<String>,
+        environment: &'a [(String, String)],
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
+            if adapters.is_empty() {
+                return Ok(false);
+            }
+            let config_base = runner
+                .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
+                .await
+                .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
+            for adapter in adapters {
+                if adapter.skill_destination(environment, &config_base)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    pub fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
         required_adapters
             .iter()
             .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
@@ -345,92 +358,98 @@ done"#,
     /// discarded or torn down. Nothing is returned to a pool — the central
     /// login is not scarce — this only avoids leaving a token behind in a home
     /// whose environment no longer exists.
-    pub(crate) async fn discard_delivered_credentials(&self, environment_ref: &str) -> Result<(), String> {
-        let auth = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID).join(CODEX_AUTH_FILE);
-        match fs::remove_file(&auth).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("remove delivered Codex credential {}: {error}", auth.display())),
-        }
+    pub fn discard_delivered_credentials<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let auth = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID).join(CODEX_AUTH_FILE);
+            match fs::remove_file(&auth).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("remove delivered Codex credential {}: {error}", auth.display())),
+            }
+        })
     }
 
     /// Names the credential a Codex crew was handed, for operator-facing
     /// failure reporting. Static material means every crew names the same
     /// central login rather than a leased slot.
-    pub(crate) fn codex_credential_source(&self) -> &Path {
+    pub fn codex_credential_source(&self) -> &Path {
         &self.codex_central_auth_path
     }
 
     /// Re-copies the central `auth.json` into an already-provisioned crew home
     /// so a long-lived vessel never runs on a credential older than the last
     /// refresher tick. Returns whether the delivered copy changed.
-    pub(crate) async fn refresh_delivered_credentials(&self, environment_ref: &str) -> Result<bool, String> {
-        let home = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID);
-        if !fs::try_exists(&home).await.map_err(|error| format!("inspect Codex home {}: {error}", home.display()))? {
-            return Ok(false);
-        }
-        let credential = read_central_credential(&self.codex_central_auth_path).await?;
-        install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
+    pub fn refresh_delivered_credentials<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let home = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID);
+            if !fs::try_exists(&home).await.map_err(|error| format!("inspect Codex home {}: {error}", home.display()))? {
+                return Ok(false);
+            }
+            let credential = read_central_credential(&self.codex_central_auth_path).await?;
+            install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
+        })
     }
 
-    pub(crate) async fn archive_environment_home(&self, convoy_ref: &str, environment_ref: &str) -> Result<(), String> {
-        for identity in [convoy_ref, environment_ref] {
-            if !matches!(Path::new(identity).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
-                return Err("archive identity must name one directory".into());
-            }
-        }
-        self.discard_delivered_credentials(environment_ref).await?;
-        let home = self.homes_dir.join(environment_ref);
-        if !fs::try_exists(&home).await.map_err(|error| error.to_string())? {
-            return Ok(());
-        }
-        let archive_root = self.homes_dir.parent().ok_or("agent homes parent missing")?.join("session-archive");
-        fs::create_dir_all(&archive_root).await.map_err(|error| format!("create session archive root: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o700))
-                .await
-                .map_err(|error| format!("protect session archive root: {error}"))?;
-        }
-        let archive = archive_root.join(convoy_ref);
-        fs::create_dir_all(&archive).await.map_err(|error| format!("create session archive: {error}"))?;
-        let mut destination = archive.join(environment_ref);
-        loop {
-            // Reserve an empty destination exclusively. Rename replaces only our
-            // reservation, never a pre-existing archive, even during concurrent cleanup.
-            match fs::create_dir(&destination).await {
-                Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    destination =
-                        archive.join(format!("{environment_ref}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+    pub fn archive_environment_home<'a>(&'a self, convoy_ref: &'a str, environment_ref: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            for identity in [convoy_ref, environment_ref] {
+                if !matches!(Path::new(identity).components().collect::<Vec<_>>().as_slice(), [std::path::Component::Normal(_)]) {
+                    return Err("archive identity must name one directory".into());
                 }
-                Err(error) => return Err(format!("reserve session archive: {error}")),
             }
-        }
-        // Retention starts at teardown, rather than the last session write.
-        // A failed reset must preserve the home for retry: otherwise an old
-        // home could be expired immediately after successful archival.
-        let result = async {
-            let directory = fs::File::open(&home).await?;
-            directory.into_std().await.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
-            // Both roots must be on the same filesystem: do not fall back to
-            // copying on EXDEV, since teardown promises an atomic move.
-            fs::rename(&home, &destination).await
-        }
-        .await;
-        if let Err(error) = result {
-            let _ = fs::remove_dir(&destination).await;
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!("archive persistent agent home {}: {error}", home.display()));
+            self.discard_delivered_credentials(environment_ref).await?;
+            let home = self.homes_dir.join(environment_ref);
+            if !fs::try_exists(&home).await.map_err(|error| error.to_string())? {
+                return Ok(());
             }
-        }
-        Ok(())
+            let archive_root = self.homes_dir.parent().ok_or("agent homes parent missing")?.join("session-archive");
+            fs::create_dir_all(&archive_root).await.map_err(|error| format!("create session archive root: {error}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&archive_root, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .map_err(|error| format!("protect session archive root: {error}"))?;
+            }
+            let archive = archive_root.join(convoy_ref);
+            fs::create_dir_all(&archive).await.map_err(|error| format!("create session archive: {error}"))?;
+            let mut destination = archive.join(environment_ref);
+            loop {
+                // Reserve an empty destination exclusively. Rename replaces only our
+                // reservation, never a pre-existing archive, even during concurrent cleanup.
+                match fs::create_dir(&destination).await {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        destination =
+                            archive.join(format!("{environment_ref}-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+                    }
+                    Err(error) => return Err(format!("reserve session archive: {error}")),
+                }
+            }
+            // Retention starts at teardown, rather than the last session write.
+            // A failed reset must preserve the home for retry: otherwise an old
+            // home could be expired immediately after successful archival.
+            let result = async {
+                let directory = fs::File::open(&home).await?;
+                directory.into_std().await.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+                // Both roots must be on the same filesystem: do not fall back to
+                // copying on EXDEV, since teardown promises an atomic move.
+                fs::rename(&home, &destination).await
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = fs::remove_dir(&destination).await;
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("archive persistent agent home {}: {error}", home.display()));
+                }
+            }
+            Ok(())
+        })
     }
 }
 
 /// Delivers the host's single central Codex login — the `auth.json` the daemon
-/// refresher keeps fresh (`crates/flotilla-daemon/src/codex_central.rs`) — as a
+/// refresher keeps fresh (`crates/flotilla-credentials/src/codex_central.rs`) — as a
 /// per-crew read-only copy.
 ///
 /// There is no pool: one login serves every crew because exactly one refresher
@@ -642,22 +661,26 @@ fn resolve_frozen_sources(sources: &[SkillSource], selected: &[flotilla_resource
 
 /// Validate all frozen crews aboard one vessel with provisioning's combined
 /// source authority, then stage each crew separately to retain name isolation.
-pub async fn validate_frozen_vessel_skills(
-    source: &Path,
-    crews: &BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>,
-    declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
-    credential_tokens: &BTreeMap<String, PathBuf>,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    let all = crews.values().flatten().cloned().collect::<Vec<_>>();
-    let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, &all)?;
-    authorize_frozen_sources(&sources, declared_credentials)?;
-    for (crew, selected) in crews {
-        if !selected.is_empty() {
-            stage_frozen_skills(&sources, selected, credential_tokens, runner).await.map_err(|error| format!("crew {crew}: {error}"))?;
+pub fn validate_frozen_vessel_skills<'a>(
+    source: &'a Path,
+    crews: &'a BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>,
+    declared_credentials: &'a BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
+    credential_tokens: &'a BTreeMap<String, PathBuf>,
+    runner: &'a dyn CommandRunner,
+) -> BoxFuture<'a, Result<(), String>> {
+    Box::pin(async move {
+        let all = crews.values().flatten().cloned().collect::<Vec<_>>();
+        let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, &all)?;
+        authorize_frozen_sources(&sources, declared_credentials)?;
+        for (crew, selected) in crews {
+            if !selected.is_empty() {
+                stage_frozen_skills(&sources, selected, credential_tokens, runner)
+                    .await
+                    .map_err(|error| format!("crew {crew}: {error}"))?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn authorize_frozen_sources(

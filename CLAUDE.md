@@ -131,7 +131,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
-| `flotilla-daemon` | Runtime, Aggregator, socket server, resource replication, peer networking, multi-host command routing |
+| `flotilla-daemon` | Runtime supervision, socket server, resource replication, peer networking, multi-host command routing |
+| `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
+| `flotilla-aggregator` | Durable/observed resource query projection and demand-backed issue materialization |
 | `flotilla-resources` | Resource kinds, typed resolvers, lifecycle authority, and storage backends |
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
@@ -168,7 +170,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-protocol/src/snapshot.rs` | `RepoInfo`, provider errors and labels |
 | `crates/flotilla-daemon/src/server.rs` | Daemon server with peer networking |
 | `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands |
-| `crates/flotilla-daemon/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
+| `crates/flotilla-aggregator/src/lib.rs` | Runtime-facing aggregator future; owns daemon collaborator and watch-source wiring |
+| `crates/flotilla-aggregator/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
+| `crates/flotilla-credentials/src/lib.rs` | Runtime-facing credential/material operations and agent-environment composition |
 | `crates/flotilla-daemon/src/server/replicator.rs` | Federates resource stores over `HttpBackend` |
 | `crates/flotilla-tui/src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
 | `crates/flotilla-tui/src/app/executor.rs` | Thin executor: routes to core, interprets results into UI state |

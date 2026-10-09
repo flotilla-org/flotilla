@@ -1076,6 +1076,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-aggregator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-core",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "futures",
+ "hegeltest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-build-features"
 version = "0.1.0"
 dependencies = [
@@ -1237,7 +1258,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flotilla-daemon"
+name = "flotilla-credentials"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1247,9 +1268,40 @@ dependencies = [
  "bytes",
  "chrono",
  "flotilla-build-features",
+ "flotilla-core",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "futures",
+ "hegeltest",
+ "http",
+ "jsonwebtoken",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "flotilla-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bon",
+ "bytes",
+ "chrono",
+ "flotilla-aggregator",
+ "flotilla-build-features",
  "flotilla-client",
  "flotilla-controllers",
  "flotilla-core",
+ "flotilla-credentials",
  "flotilla-protocol",
  "flotilla-relay-protocol",
  "flotilla-resources",
@@ -1259,7 +1311,6 @@ dependencies = [
  "hegeltest",
  "hmac",
  "http",
- "jsonwebtoken",
  "libc",
  "reqwest 0.13.2",
  "rusqlite",
