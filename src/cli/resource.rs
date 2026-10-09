@@ -1,7 +1,6 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+#[cfg(unix)]
+use std::path::Path;
+use std::{path::PathBuf, sync::Arc};
 
 use color_eyre::Result;
 use flotilla_core::{config::ConfigStore, path_context::DaemonHostPath};
@@ -604,6 +603,7 @@ mod tests {
     use flotilla_tui::cli::args::SubCommand;
 
     use clap::Parser;
+    #[cfg(unix)]
     use flotilla_protocol::{HostName, NodeId};
     #[test]
     fn default_convoy_start_does_not_auto_attach_non_interactively() {

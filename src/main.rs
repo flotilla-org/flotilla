@@ -1,7 +1,10 @@
 use std::sync::OnceLock;
 
 use color_eyre::Result;
-use flotilla_client::reconnect::should_reexec_for_incompatible_daemon;
+use flotilla_client::{
+    build_id,
+    reconnect::{should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
+};
 use flotilla_core::providers::ProcessCommandRunner;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 use flotilla_tui::cli::args::{
@@ -21,9 +24,7 @@ use cli::{
 
 fn binary_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), flotilla_client::build_id(), flotilla_protocol::PROTOCOL_VERSION)
-    })
+    VERSION.get_or_init(|| format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), build_id(), flotilla_protocol::PROTOCOL_VERSION))
 }
 
 // Parsing and dispatch run in sequence rather than nested: clap's derived
@@ -49,9 +50,9 @@ fn main() -> Result<()> {
 
     if let Err(error) = &result {
         let message = format!("{error:?}");
-        let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
+        let already_reexecuted = std::env::var(REEXEC_BUILD_ENV).ok();
         if allow_daemon_reexec && should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref(), remote_daemon_selected) {
-            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::build_id());
+            std::env::set_var(REEXEC_BUILD_ENV, build_id());
             if let Err(reexec_error) = reexec_current_process() {
                 return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
             }
