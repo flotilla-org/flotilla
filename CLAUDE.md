@@ -127,8 +127,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | Crate | Role |
 |-------|------|
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
-| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `DaemonHandle` trait, `InProcessDaemon` composition root |
+| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
+| `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
+| `flotilla-daemon-api` | `DaemonHandle` interface, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
 | `flotilla-daemon` | Runtime supervision, socket server, resource replication, peer networking, multi-host command routing |
@@ -147,7 +149,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | Path | Role |
 |------|------|
 | `src/main.rs` | Entry point, CLI dispatch |
-| `crates/flotilla-core/src/daemon.rs` | `DaemonHandle` trait |
+| `crates/flotilla-daemon-api/src/daemon.rs` | `DaemonHandle` trait |
 | `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` composition root and narrow controller ports |
 | `crates/flotilla-core/src/convoy_ensure.rs` | Narrow admission and controller ports for standing convoys |
 | `crates/flotilla-core/src/in_process/convoy_admission.rs` | Transaction-owning convoy admission primitive |
