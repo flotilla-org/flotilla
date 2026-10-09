@@ -2,6 +2,41 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::commands::RepositoryIdentityChange;
+use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::HostName;
+use flotilla_protocol::IssueRef;
+use flotilla_protocol::IssueSource;
+use flotilla_protocol::NodeId;
+use flotilla_protocol::PeerConnectionState;
+use flotilla_protocol::ProviderData;
+use flotilla_protocol::RepoIdentity;
+use flotilla_protocol::RepoSelector;
+use flotilla_protocol::ResourceJsonResponse;
+use flotilla_resources::Checkout as ResourceCheckout;
+use flotilla_resources::DynamicResourceObject;
+use flotilla_resources::InputMeta;
+use flotilla_resources::Repository;
+use flotilla_resources::RepositoryKey;
+use flotilla_resources::Resource;
+use flotilla_resources::ResourceBackend;
+use flotilla_resources::ResourceError;
+use flotilla_resources::ResourceObject;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
 use super::{
     empty_repo_identity, fallback_repo_identity, repository_operations, request_manifest_resolution, retry_resource_apply, AddRepoOutcome,
     OperatorReconciler,
@@ -15,35 +50,6 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::CommandRunner;
 use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepExecutor;
-use async_trait::async_trait;
-use flotilla_paths::path_context::DaemonHostPath;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_protocol::commands::RepositoryIdentityChange;
-use flotilla_protocol::Command;
-use flotilla_protocol::CommandAction;
-use flotilla_protocol::CommandValue;
-use flotilla_protocol::DaemonEvent;
-use flotilla_protocol::HostName;
-use flotilla_protocol::NodeId;
-use flotilla_protocol::PeerConnectionState;
-use flotilla_protocol::ProviderData;
-use flotilla_protocol::RepoIdentity;
-use flotilla_protocol::ResourceJsonResponse;
-use flotilla_resources::Checkout as ResourceCheckout;
-use flotilla_resources::InputMeta;
-use flotilla_resources::Repository;
-use flotilla_resources::RepositoryKey;
-use flotilla_resources::Resource;
-use flotilla_resources::ResourceBackend;
-use flotilla_resources::ResourceError;
-use flotilla_resources::ResourceObject;
-use std::collections::HashMap;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 pub(super) trait ExecutorActionPort: Send + Sync {
@@ -66,19 +72,10 @@ pub(super) trait ExecutorActionPort: Send + Sync {
     fn config(&self) -> &Arc<ConfigStore>;
     fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>>;
     async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String>;
-    async fn apply_intent_document(
-        &self,
-        namespace: &str,
-        document: serde_json::Value,
-    ) -> Result<flotilla_resources::DynamicResourceObject, ResourceError>;
-    async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity;
+    async fn apply_intent_document(&self, namespace: &str, document: serde_json::Value) -> Result<DynamicResourceObject, ResourceError>;
+    async fn detect_repo_identity(&self, repo_path: &Path) -> RepoIdentity;
     fn event_sink(&self) -> &Arc<dyn EventSink>;
-    fn finish_context_free_command(
-        &self,
-        command_id: u64,
-        repo_identity: flotilla_protocol::RepoIdentity,
-        result: flotilla_protocol::CommandValue,
-    );
+    fn finish_context_free_command(&self, command_id: u64, repo_identity: RepoIdentity, result: CommandValue);
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String>;
     fn node_id(&self) -> &NodeId;
     fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>>;
@@ -86,14 +83,14 @@ pub(super) trait ExecutorActionPort: Send + Sync {
     async fn operator_reconciler(&self) -> Option<Arc<dyn OperatorReconciler>>;
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState;
     async fn provisioning_namespace(&self) -> String;
-    async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
+    async fn refresh(&self, repo: &RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
-    async fn repository_for_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<ResourceObject<Repository>, String>;
-    fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String>;
-    async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String>;
+    async fn repository_for_selector(&self, selector: &RepoSelector) -> Result<ResourceObject<Repository>, String>;
+    fn resolve_observation_root_selector(&self, selector: &RepoSelector) -> Result<PathBuf, String>;
+    async fn resolve_repo_selector(&self, selector: &RepoSelector) -> Result<PathBuf, String>;
     fn resource_backend(&self) -> &ResourceBackend;
-    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity;
-    async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity>;
+    fn start_context_free_command(&self, command_id: u64, description: String) -> RepoIdentity;
+    async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<RepoIdentity>;
 }
 
 pub(super) struct ExecutorActions<'a> {
@@ -102,21 +99,21 @@ pub(super) struct ExecutorActions<'a> {
 
 impl ExecutorActions<'_> {
     pub(super) async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
+        if let CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             // Artifact reservations and Message admission can race status writers.
             // Both mutations are replay-safe; retain a bounded conflict budget.
             let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
             let applied = retry_resource_apply(kind, || self.port.apply_intent_document(namespace, document.clone())).await;
             let result = match applied {
-                Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                Ok(applied) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: applied.kind,
                     plural: applied.plural,
                     namespace: applied.namespace,
                     value: applied.value,
                     replica_origin: None,
                 })),
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                Err(error) => CommandValue::Error { message: error.to_string() },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -125,7 +122,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_repository_remote_remove(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
+        if let CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let repositories = self.port.resource_backend().clone().using::<Repository>(namespace);
             let result = match repositories.get(name).await {
@@ -134,12 +131,12 @@ impl ExecutorActions<'_> {
                         .update(&InputMeta::from(&repository.metadata), &repository.metadata.resource_version, &spec)
                         .await
                     {
-                        Ok(_) => flotilla_protocol::CommandValue::Ok,
-                        Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                        Ok(_) => CommandValue::Ok,
+                        Err(error) => CommandValue::Error { message: error.to_string() },
                     },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    Err(message) => CommandValue::Error { message },
                 },
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                Err(error) => CommandValue::Error { message: error.to_string() },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -148,9 +145,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_resource_manifest_resolve(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } =
-            &command.action
-        {
+        if let CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let result = request_manifest_resolution(self.port.resource_backend(), namespace, kind, name, *resolution, requested_by).await;
             self.port.finish_context_free_command(
@@ -167,7 +162,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_resource_reconcile_now(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
+        if let CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let result = match self.port.operator_reconciler().await {
                 Some(reconciler) => match reconciler.reconcile_now(namespace, kind, name).await {
@@ -183,9 +178,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } =
-            &command.action
-        {
+        if let CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let patched = match expected_resource_version {
                 Some(expected) => {
@@ -204,14 +197,14 @@ impl ExecutorActions<'_> {
                 }
             };
             let result = match patched {
-                Ok(patched) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                Ok(patched) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: patched.kind,
                     plural: patched.plural,
                     namespace: patched.namespace,
                     value: patched.value,
                     replica_origin: None,
                 })),
-                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                Err(error) => CommandValue::Error { message: error.to_string() },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -220,7 +213,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
+        if let CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let result = if let Some(origin_root) = replica_origin {
                 let deleted = if self.port.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
@@ -232,14 +225,14 @@ impl ExecutorActions<'_> {
                         .await
                 };
                 match deleted {
-                    Ok(deleted) => flotilla_protocol::CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
+                    Ok(deleted) => CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
                         kind: deleted.kind,
                         plural: deleted.plural,
                         namespace: deleted.namespace,
                         value: deleted.value,
                         replica_origin: replica_origin.clone(),
                     })),
-                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                    Err(error) => CommandValue::Error { message: error.to_string() },
                 }
             } else {
                 // Serialize deletion and cleanup with adopted checkout writes.
@@ -267,12 +260,12 @@ impl ExecutorActions<'_> {
                             replica_origin: None,
                         });
                         if deleted.already_deleted {
-                            flotilla_protocol::CommandValue::ResourceAlreadyDeleted(response)
+                            CommandValue::ResourceAlreadyDeleted(response)
                         } else {
-                            flotilla_protocol::CommandValue::ResourceDeleted(response)
+                            CommandValue::ResourceDeleted(response)
                         }
                     }
-                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                    Err(error) => CommandValue::Error { message: error.to_string() },
                 }
             };
             self.port.finish_context_free_command(id, empty_identity, result);
@@ -282,7 +275,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_refresh_all(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if matches!(command.action, flotilla_protocol::CommandAction::Refresh { repo: None }) {
+        if matches!(command.action, CommandAction::Refresh { repo: None }) {
             let repositories = self
                 .port
                 .resource_backend()
@@ -305,7 +298,7 @@ impl ExecutorActions<'_> {
             let result = match async {
                 for repository in &repositories {
                     let key = repository.object.spec.key();
-                    if let Some(change) = self.port.refresh(&flotilla_protocol::RepoSelector::Repository(key.clone())).await? {
+                    if let Some(change) = self.port.refresh(&RepoSelector::Repository(key.clone())).await? {
                         identity_changes.push(change);
                     }
                     if let Some(path) = self.port.local_checkout_for_repository(&key).await? {
@@ -316,10 +309,8 @@ impl ExecutorActions<'_> {
             }
             .await
             {
-                Ok(()) => {
-                    flotilla_protocol::CommandValue::Refreshed { repos: refreshed, repository_count: repositories.len(), identity_changes }
-                }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Ok(()) => CommandValue::Refreshed { repos: refreshed, repository_count: repositories.len(), identity_changes },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -334,7 +325,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_track_repo_path(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::TrackRepoPath { path } = &command.action {
+        if let CommandAction::TrackRepoPath { path } = &command.action {
             let description = command.description().to_string();
             let repo_path = path.clone();
             let repo_identity = self.port.detect_repo_identity(path).await;
@@ -346,12 +337,12 @@ impl ExecutorActions<'_> {
                 description,
             });
             let result = match self.port.add_repo(path).await {
-                Ok(outcome) => flotilla_protocol::CommandValue::RepoTracked {
+                Ok(outcome) => CommandValue::RepoTracked {
                     path: outcome.tracked_path,
                     resolved_from: outcome.resolved_from,
                     identity_change: outcome.identity_change,
                 },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -366,7 +357,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_untrack_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
+        if let CommandAction::UntrackRepo { repo } = &command.action {
             let repo_path = match self.port.resolve_repo_selector(repo).await {
                 Ok(path) => path,
                 Err(tracked_error) => self.port.resolve_observation_root_selector(repo).map_err(|_| tracked_error)?,
@@ -382,8 +373,8 @@ impl ExecutorActions<'_> {
                 description,
             });
             let result = match self.port.remove_repo(&repo_path).await {
-                Ok(()) => flotilla_protocol::CommandValue::RepoUntracked { path: repo_path.clone() },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Ok(()) => CommandValue::RepoUntracked { path: repo_path.clone() },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -398,7 +389,7 @@ impl ExecutorActions<'_> {
     }
 
     pub(super) async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } = &command.action {
+        if let CommandAction::Refresh { repo: Some(selector) } = &command.action {
             let repository = self.port.repository_for_selector(selector).await?;
             let repo_path = self.port.local_checkout_for_repository(&repository.spec.key()).await?;
             let description = command.description().to_string();
@@ -411,12 +402,12 @@ impl ExecutorActions<'_> {
                 description,
             });
             let result = match self.port.refresh(selector).await {
-                Ok(identity_change) => flotilla_protocol::CommandValue::Refreshed {
+                Ok(identity_change) => CommandValue::Refreshed {
                     repository_count: 1,
                     repos: repo_path.clone().into_iter().collect(),
                     identity_changes: identity_change.into_iter().collect(),
                 },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -444,7 +435,7 @@ impl ExecutorActions<'_> {
         let runner = Arc::clone(self.port.runner());
         let env = Arc::clone(self.port.env());
         let event_sink = self.port.event_sink().clone();
-        let repository = self.port.repository_for_selector(&flotilla_protocol::RepoSelector::Path(repo.clone())).await?;
+        let repository = self.port.repository_for_selector(&RepoSelector::Path(repo.clone())).await?;
         let repo_identity = repository_operations::repository_event_identity(&repository.spec, None);
         let registry = self.port.execution_registry(&repository, &repo).await?;
         let providers_data = Arc::new(self.port.executor_provider_data(&repo_identity, &repo, &registry).await);
@@ -568,9 +559,9 @@ impl ExecutorActions<'_> {
             let operation = async {
                 if let CommandAction::OpenIssue { id } = &action {
                     let forge = repository.spec.issue_source_forge().ok_or("Repository has no forge issue source")?;
-                    let source = flotilla_protocol::IssueSource { service: forge.service_url, scope: forge.repository };
+                    let source = IssueSource { service: forge.service_url, scope: forge.repository };
                     let provider = registry.issue_provider_for(&source).ok_or("no issue provider available for Repository")?;
-                    return provider.open_in_browser(&flotilla_protocol::IssueRef { source, id: id.clone() }).await;
+                    return provider.open_in_browser(&IssueRef { source, id: id.clone() }).await;
                 }
                 if let CommandAction::MergeChangeRequest { id, confirmed } = &action {
                     if repository.spec.is_fork() {

@@ -2,15 +2,9 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
-use super::{empty_repo_identity, read_projections};
-use crate::config::ConfigStore;
-use crate::event_sink::EventSink;
-use crate::in_process::attach::ResolvedAttach;
-use crate::providers::issue_tracker::IssueProvider;
-use crate::resource_explain::resource_read_envelope;
-use crate::resource_explain::resource_record;
-use crate::resource_explain::run_resource_watch_command;
-use crate::resource_explain::ResourceWatchCommandContext;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::commands::AttachMode;
@@ -18,11 +12,13 @@ use flotilla_protocol::AttachBinding;
 use flotilla_protocol::CliListKind;
 use flotilla_protocol::CliListResponse;
 use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
 use flotilla_protocol::CommandValue;
 use flotilla_protocol::ConvoyExplanation;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_protocol::CrewListResponse;
 use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::DispatchBoardResponse;
 use flotilla_protocol::DispatchQueueResponse;
 use flotilla_protocol::EnvironmentId;
 use flotilla_protocol::FleetHealthResponse;
@@ -32,9 +28,12 @@ use flotilla_protocol::HostListResponse;
 use flotilla_protocol::HostName;
 use flotilla_protocol::HostProvidersResponse;
 use flotilla_protocol::HostStatusResponse;
+use flotilla_protocol::IssueRef;
+use flotilla_protocol::IssueSource;
 use flotilla_protocol::NodeId;
 use flotilla_protocol::ProjectListResponse;
 use flotilla_protocol::RepoProvidersResponse;
+use flotilla_protocol::RepoSelector;
 use flotilla_protocol::ResourceCursor;
 use flotilla_protocol::ResourceRecordType;
 use flotilla_resources::current_resource_kind_position;
@@ -43,31 +42,41 @@ use flotilla_resources::list_resource_kind;
 use flotilla_resources::list_resource_kind_including_replicas;
 use flotilla_resources::resolve_project_issue_sources;
 use flotilla_resources::Clock;
+use flotilla_resources::CrewAddressBook;
 use flotilla_resources::EventRecorder;
 use flotilla_resources::EventRegarding;
 use flotilla_resources::IssueSourceResolution;
 use flotilla_resources::IssueSourceUnavailable;
+use flotilla_resources::ProjectSpec;
 use flotilla_resources::Repository;
 use flotilla_resources::RepositoryKey;
 use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::{empty_repo_identity, read_projections};
+use crate::config::ConfigStore;
+use crate::event_sink::EventSink;
+use crate::in_process::attach::ResolvedAttach;
+use crate::providers::issue_tracker::IssueProvider;
+use crate::resource_explain::resource_read_envelope;
+use crate::resource_explain::resource_record;
+use crate::resource_explain::run_resource_watch_command;
+use crate::resource_explain::ResourceWatchCommandContext;
+
 #[async_trait]
 pub(super) trait ProjectionsActionPort: Send + Sync {
-    async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String>;
-    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<flotilla_resources::CrewAddressBook, String>;
+    async fn attach_project_context(&self, selector: Option<&RepoSelector>) -> Result<Option<String>, String>;
+    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<CrewAddressBook, String>;
     async fn scoped_fleet_list(
         &self,
         project: Option<&str>,
         crew_id: Option<&str>,
         convoy: Option<&str>,
     ) -> Result<FleetListResponse, String>;
-    async fn resolve_repository_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryKey>, String>;
+    async fn resolve_repository_selector(&self, selector: &RepoSelector) -> Result<Option<RepositoryKey>, String>;
     async fn resolve_attach_with_context(
         &self,
         reference: &str,
@@ -80,11 +89,8 @@ pub(super) trait ProjectionsActionPort: Send + Sync {
     async fn list_projects_internal(&self) -> Result<ProjectListResponse, String>;
     async fn list_hosts_internal(&self) -> Result<HostListResponse, String>;
     async fn list_cli_items_internal(&self, kind: CliListKind) -> Result<CliListResponse, String>;
-    async fn get_repo_providers_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String>;
-    async fn get_issue_provider_for_repository(
-        &self,
-        selector: &flotilla_protocol::RepoSelector,
-    ) -> Result<(Arc<dyn IssueProvider>, flotilla_protocol::IssueSource), String>;
+    async fn get_repo_providers_internal(&self, repo: &RepoSelector) -> Result<RepoProvidersResponse, String>;
+    async fn get_issue_provider_for_repository(&self, selector: &RepoSelector) -> Result<(Arc<dyn IssueProvider>, IssueSource), String>;
     async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String>;
     async fn get_host_providers_internal(&self, environment_id: &EnvironmentId) -> Result<HostProvidersResponse, String>;
     async fn fulfilment_list_internal(&self) -> Result<FulfilmentListResponse, String>;
@@ -93,7 +99,7 @@ pub(super) trait ProjectionsActionPort: Send + Sync {
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String>;
     async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String>;
     async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String>;
-    async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String>;
+    async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<DispatchBoardResponse, String>;
     async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String>;
     async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String>;
     fn config(&self) -> &Arc<ConfigStore>;
@@ -111,9 +117,7 @@ pub(super) struct ProjectionsActions<'a> {
 impl ProjectionsActions<'_> {
     pub(super) async fn execute_action_resource_watch(&self, id: u64, command: &Command, command_node_id: &NodeId) -> Result<u64, String> {
         let command_node_id = command_node_id.clone();
-        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } =
-            command.action.clone()
-        {
+        if let CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } = command.action.clone() {
             let repo_identity = empty_repo_identity();
             let description = format!("watch resource {namespace}/{kind}");
             let token = CancellationToken::new();
@@ -169,65 +173,65 @@ impl ProjectionsActions<'_> {
 }
 
 impl ProjectionsActions<'_> {
-    pub(super) async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
-        use flotilla_protocol::CommandAction;
+    pub(super) async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        use CommandAction;
         match &command.action {
             CommandAction::QueryResolveRepository { repo } => {
                 let key = self.port.resolve_repository_selector(repo).await?;
                 Ok(CommandValue::RepositoryResolved { key })
             }
             CommandAction::QueryRepoProviders { repo } => match self.port.get_repo_providers_internal(repo).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::RepoProviders(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::RepoProviders(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryHostList {} => match self.port.list_hosts_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::HostList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::HostList(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryExplainProject { name } => match self.port.explain_project_internal(name).await {
                 Ok(explanation) => Ok(CommandValue::ProjectExplanation(explanation)),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryProjectList {} => match self.port.list_projects_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::ProjectList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::ProjectList(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryCliList { kind } => match self.port.list_cli_items_internal(*kind).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::CliList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::CliList(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryDispatchBoard { project } => match self.port.dispatch_board_internal(project.as_deref()).await {
                 Ok(board) => Ok(CommandValue::DispatchBoard(Box::new(board))),
                 Err(error) => Ok(CommandValue::Error { message: error }),
             },
             CommandAction::QueryDispatchQueue { project } => match self.port.dispatch_queue_internal(project.as_deref()).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::DispatchQueue(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::DispatchQueue(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryHostStatus { target_environment_id } => {
                 match self.port.get_host_status_internal(target_environment_id).await {
-                    Ok(v) => Ok(flotilla_protocol::CommandValue::HostStatus(Box::new(v))),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                    Ok(v) => Ok(CommandValue::HostStatus(Box::new(v))),
+                    Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
             CommandAction::QueryHostProviders { target_environment_id } => {
                 match self.port.get_host_providers_internal(target_environment_id).await {
-                    Ok(v) => Ok(flotilla_protocol::CommandValue::HostProviders(Box::new(v))),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                    Ok(v) => Ok(CommandValue::HostProviders(Box::new(v))),
+                    Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
             CommandAction::QueryFleetHealth {} => match self.port.fleet_health_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetHealth(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::FleetHealth(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryFulfilmentList {} => match self.port.fulfilment_list_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::FulfilmentList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::FulfilmentList(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryFleetList { project, crew_id, convoy } => {
                 match self.port.scoped_fleet_list(project.as_deref(), crew_id.as_deref(), convoy.as_deref()).await {
-                    Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                    Ok(v) => Ok(CommandValue::FleetList(Box::new(v))),
+                    Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
             CommandAction::QueryCrewStalls { full } => {
@@ -248,8 +252,8 @@ impl ProjectionsActions<'_> {
                 Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryCrewList { context } => match self.port.crew_list_internal(context).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                Ok(v) => Ok(CommandValue::CrewList(Box::new(v))),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryDaemonLogs { query } => {
                 let generations = self.port.config().load_daemon_config()?.logging.generations;
@@ -259,8 +263,8 @@ impl ProjectionsActions<'_> {
                     .await
                     .map_err(|error| format!("daemon log reader task failed: {error}"))?;
                 match read_result {
-                    Ok(lines) => Ok(flotilla_protocol::CommandValue::DaemonLogs { lines }),
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                    Ok(lines) => Ok(CommandValue::DaemonLogs { lines }),
+                    Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
             CommandAction::QueryExplainConvoy { namespace, name } => {
@@ -327,7 +331,7 @@ impl ProjectionsActions<'_> {
                 let generation = position.generation;
                 let mut value = visible.value;
                 if visible.kind == "Project" {
-                    match serde_json::from_value::<flotilla_resources::ProjectSpec>(value["spec"].clone()) {
+                    match serde_json::from_value::<ProjectSpec>(value["spec"].clone()) {
                         Ok(spec) => {
                             match resolve_project_issue_sources(
                                 &self.port.resource_backend().including_replicas::<Repository>(namespace),
@@ -405,34 +409,32 @@ impl ProjectionsActions<'_> {
                                 warn!(%error, "failed to emit attach regard");
                             }
                         }
-                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
+                        Ok(CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
                     }
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                    Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
             CommandAction::AttachTransient { reference, host, mode } => {
                 let project_context = self.port.attach_project_context(command.context_repo.as_ref()).await?;
                 match self.port.resolve_attach_with_context(reference, host.as_ref(), true, *mode, project_context.as_deref()).await {
-                    Ok(resolved) => {
-                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })
-                    }
-                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                    Ok(resolved) => Ok(CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding }),
+                    Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
             CommandAction::QueryIssues { repo, params, page, count } => {
                 let (provider, source) = self.port.get_issue_provider_for_repository(repo).await?;
                 let page = provider.query(&source, params, *page, *count).await?;
-                Ok(flotilla_protocol::CommandValue::IssuePage(page))
+                Ok(CommandValue::IssuePage(page))
             }
             CommandAction::QueryIssueFetchByIds { repo, ids } => {
                 let (provider, source) = self.port.get_issue_provider_for_repository(repo).await?;
                 let items = provider.fetch_by_ids(&source, ids).await?;
-                Ok(flotilla_protocol::CommandValue::IssuesByIds { items })
+                Ok(CommandValue::IssuesByIds { items })
             }
             CommandAction::QueryIssueOpenInBrowser { repo, id } => {
                 let (provider, source) = self.port.get_issue_provider_for_repository(repo).await?;
-                provider.open_in_browser(&flotilla_protocol::IssueRef { source, id: id.clone() }).await?;
-                Ok(flotilla_protocol::CommandValue::Ok)
+                provider.open_in_browser(&IssueRef { source, id: id.clone() }).await?;
+                Ok(CommandValue::Ok)
             }
             other => Err(format!("execute_query not implemented for this command type: {:?}", std::mem::discriminant(other))),
         }

@@ -2,6 +2,33 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::NodeId;
+use flotilla_protocol::PlacementDecision;
+use flotilla_protocol::PrincipalRef;
+use flotilla_protocol::RepoIdentity;
+use flotilla_resources::normalize_project_spec;
+use flotilla_resources::ConvoyRepositorySpec;
+use flotilla_resources::InputMeta;
+use flotilla_resources::Project;
+use flotilla_resources::Repository;
+use flotilla_resources::RepositoryKey;
+use flotilla_resources::RepositorySpec;
+use flotilla_resources::ResourceBackend;
+use flotilla_resources::ResourceError;
+use flotilla_resources::WorkflowTemplate;
+use flotilla_resources::WorkflowTemplateSpec;
+use flotilla_resources::WriterIdentity;
+use tokio::sync::Mutex;
+
 use super::{
     create_adopted_checkout_resource, empty_repo_identity, parse_and_validate_workflow_template_yaml, parse_project_yaml,
     placement_target_host, AdoptedCheckoutRequest,
@@ -20,30 +47,6 @@ use crate::in_process::convoy_admission::PlacementResolution;
 use crate::in_process::project_ops::is_declaration_backed_project;
 use crate::in_process::project_ops::validate_project_name;
 use crate::repository_inspection::RepositoryInspection;
-use async_trait::async_trait;
-use flotilla_protocol::Command;
-use flotilla_protocol::CommandAction;
-use flotilla_protocol::CommandValue;
-use flotilla_protocol::DaemonEvent;
-use flotilla_protocol::NodeId;
-use flotilla_protocol::PlacementDecision;
-use flotilla_protocol::PrincipalRef;
-use flotilla_resources::normalize_project_spec;
-use flotilla_resources::ConvoyRepositorySpec;
-use flotilla_resources::InputMeta;
-use flotilla_resources::Project;
-use flotilla_resources::Repository;
-use flotilla_resources::RepositoryKey;
-use flotilla_resources::RepositorySpec;
-use flotilla_resources::ResourceBackend;
-use flotilla_resources::ResourceError;
-use flotilla_resources::WorkflowTemplate;
-use flotilla_resources::WorkflowTemplateSpec;
-use flotilla_resources::WriterIdentity;
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[async_trait]
 pub(super) trait AdmissionActionPort: Send + Sync {
@@ -52,12 +55,7 @@ pub(super) trait AdmissionActionPort: Send + Sync {
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String>;
     fn convoy_admission(&self) -> &ConvoyAdmission;
     fn event_sink(&self) -> &Arc<dyn EventSink>;
-    fn finish_context_free_command(
-        &self,
-        command_id: u64,
-        repo_identity: flotilla_protocol::RepoIdentity,
-        result: flotilla_protocol::CommandValue,
-    );
+    fn finish_context_free_command(&self, command_id: u64, repo_identity: RepoIdentity, result: CommandValue);
     async fn inspect_adopted_checkout(
         &self,
         path: &Path,
@@ -96,7 +94,7 @@ pub(super) trait AdmissionActionPort: Send + Sync {
         selected: Option<&[RepositoryKey]>,
     ) -> Result<Vec<ConvoyRepositorySpec>, String>;
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;
-    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity;
+    fn start_context_free_command(&self, command_id: u64, description: String) -> RepoIdentity;
 }
 
 pub(super) struct AdmissionActions<'a> {
@@ -124,14 +122,14 @@ impl AdmissionActions<'_> {
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
+        if let CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let acting_namespace = self.port.provisioning_namespace().await;
             let default_namespace = intent.namespace.clone().unwrap_or_else(|| acting_namespace.clone());
             let (namespace, intent) = match normalize_convoy_start_intent(&default_namespace, intent) {
                 Ok(resolved) => resolved,
                 Err(message) => {
-                    self.port.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error { message });
+                    self.port.finish_context_free_command(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -142,9 +140,7 @@ impl AdmissionActions<'_> {
                 self.port.finish_context_free_command(
                     id,
                     empty_identity,
-                    flotilla_protocol::CommandValue::Error {
-                        message: format!("convoy start for project {} is already in progress", intent.project_ref),
-                    },
+                    CommandValue::Error { message: format!("convoy start for project {} is already in progress", intent.project_ref) },
                 );
                 return Ok(id);
             }
@@ -159,7 +155,7 @@ impl AdmissionActions<'_> {
                 self.port.finish_context_free_command(
                     id,
                     empty_identity,
-                    flotilla_protocol::CommandValue::Error { message: "convoy start worker is unavailable".to_string() },
+                    CommandValue::Error { message: "convoy start worker is unavailable".to_string() },
                 );
             }
             return Ok(id);
@@ -174,7 +170,7 @@ impl AdmissionActions<'_> {
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyCreate {
+        if let CommandAction::ConvoyCreate {
             name,
             workflow_ref,
             inputs,
@@ -197,7 +193,7 @@ impl AdmissionActions<'_> {
             let role = name.clone();
             let project_identity = project_ref.as_deref();
             if let Err(message) = validate_convoy_name(&role) {
-                let result = flotilla_protocol::CommandValue::Error { message };
+                let result = CommandValue::Error { message };
                 self.port.event_sink().emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.port.node_id().clone(),
@@ -208,7 +204,7 @@ impl AdmissionActions<'_> {
                 return Ok(id);
             }
             if let Err(message) = self.port.check_local_free_space_floor().await {
-                let result = flotilla_protocol::CommandValue::Error { message };
+                let result = CommandValue::Error { message };
                 self.port.event_sink().emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.port.node_id().clone(),
@@ -222,7 +218,7 @@ impl AdmissionActions<'_> {
             // adopted checkout resources. A duplicate must have no side effects.
             let admission_guard = self.port.convoy_admission().lock().await;
             if let Err(message) = allocate_convoy_generation(self.port.resource_backend(), &namespace, project_identity, &role).await {
-                let result = flotilla_protocol::CommandValue::Error { message };
+                let result = CommandValue::Error { message };
                 self.port.event_sink().emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.port.node_id().clone(),
@@ -251,7 +247,7 @@ impl AdmissionActions<'_> {
                         node_id: self.port.node_id().clone(),
                         repo_identity: empty_identity,
                         repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
+                        result: CommandValue::Error { message },
                     });
                     return Ok(id);
                 }
@@ -265,7 +261,7 @@ impl AdmissionActions<'_> {
                             node_id: self.port.node_id().clone(),
                             repo_identity: empty_identity,
                             repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
+                            result: CommandValue::Error { message },
                         });
                         return Ok(id);
                     }
@@ -280,7 +276,7 @@ impl AdmissionActions<'_> {
                     node_id: self.port.node_id().clone(),
                     repo_identity: empty_identity,
                     repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
+                    result: CommandValue::Error { message },
                 });
                 return Ok(id);
             }
@@ -324,7 +320,7 @@ impl AdmissionActions<'_> {
                             Some((repo_ref, checkout_ref))
                         }
                         Err(message) => {
-                            let result = flotilla_protocol::CommandValue::Error { message };
+                            let result = CommandValue::Error { message };
                             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                                 command_id: id,
                                 node_id: self.port.node_id().clone(),
@@ -379,7 +375,7 @@ impl AdmissionActions<'_> {
                             node_id: self.port.node_id().clone(),
                             repo_identity: empty_identity,
                             repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
+                            result: CommandValue::Error { message },
                         });
                         return Ok(id);
                     }
@@ -398,7 +394,7 @@ impl AdmissionActions<'_> {
                         node_id: self.port.node_id().clone(),
                         repo_identity: empty_identity,
                         repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
+                        result: CommandValue::Error { message },
                     });
                     return Ok(id);
                 }
@@ -423,7 +419,7 @@ impl AdmissionActions<'_> {
                         node_id: self.port.node_id().clone(),
                         repo_identity: empty_identity,
                         repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
+                        result: CommandValue::Error { message },
                     });
                     return Ok(id);
                 }
@@ -443,7 +439,7 @@ impl AdmissionActions<'_> {
                     node_id: self.port.node_id().clone(),
                     repo_identity: empty_identity,
                     repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
+                    result: CommandValue::Error { message },
                 });
                 return Ok(id);
             }
@@ -464,7 +460,7 @@ impl AdmissionActions<'_> {
                             node_id: self.port.node_id().clone(),
                             repo_identity: empty_identity,
                             repo: None,
-                            result: flotilla_protocol::CommandValue::Error { message },
+                            result: CommandValue::Error { message },
                         });
                         return Ok(id);
                     }
@@ -477,7 +473,7 @@ impl AdmissionActions<'_> {
                     node_id: self.port.node_id().clone(),
                     repo_identity: empty_identity,
                     repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
+                    result: CommandValue::Error { message },
                 });
                 return Ok(id);
             }
@@ -517,7 +513,7 @@ impl AdmissionActions<'_> {
     }
 
     pub(super) async fn execute_action_workflow_template_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
+        if let CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
             self.port.event_sink().emit(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -537,11 +533,11 @@ impl AdmissionActions<'_> {
                         Err(err) => Err(err),
                     };
                     match outcome {
-                        Ok(()) => flotilla_protocol::CommandValue::WorkflowTemplateApplied { name: name.clone() },
-                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                        Ok(()) => CommandValue::WorkflowTemplateApplied { name: name.clone() },
+                        Err(err) => CommandValue::Error { message: err.to_string() },
                     }
                 }
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
+                Err(err) => CommandValue::Error { message: err },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -556,7 +552,7 @@ impl AdmissionActions<'_> {
     }
 
     pub(super) async fn execute_action_project_add(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
+        if let CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
             let empty_identity = empty_repo_identity();
             self.port.event_sink().emit(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -566,8 +562,8 @@ impl AdmissionActions<'_> {
                 description: command.description().to_string(),
             });
             let result = match self.port.project_add(target, name.as_deref(), display_name.as_deref(), remote.as_deref()).await {
-                Ok(name) => flotilla_protocol::CommandValue::ProjectAdded { name },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Ok(name) => CommandValue::ProjectAdded { name },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -582,7 +578,7 @@ impl AdmissionActions<'_> {
     }
 
     pub(super) async fn execute_action_project_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectApply { name, spec_yaml } = &command.action {
+        if let CommandAction::ProjectApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
             self.port.event_sink().emit(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -621,13 +617,13 @@ impl AdmissionActions<'_> {
                             Err(error) => Err(error.to_string()),
                         };
                         match outcome {
-                            Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
-                            Err(message) => flotilla_protocol::CommandValue::Error { message },
+                            Ok(()) => CommandValue::ProjectApplied { name: name.clone() },
+                            Err(message) => CommandValue::Error { message },
                         }
                     }
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    Err(message) => CommandValue::Error { message },
                 },
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
+                Err(err) => CommandValue::Error { message: err },
             };
             self.port.event_sink().emit(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -642,7 +638,7 @@ impl AdmissionActions<'_> {
     }
 
     pub(super) async fn execute_action_project_register(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectRegister { target } = &command.action {
+        if let CommandAction::ProjectRegister { target } = &command.action {
             let empty_identity = empty_repo_identity();
             self.port.event_sink().emit(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -668,7 +664,7 @@ impl AdmissionActions<'_> {
     }
 
     pub(super) async fn execute_action_project_refresh(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ProjectRefresh { name } = &command.action {
+        if let CommandAction::ProjectRefresh { name } = &command.action {
             let empty_identity = empty_repo_identity();
             self.port.event_sink().emit(DaemonEvent::CommandStarted {
                 command_id: id,

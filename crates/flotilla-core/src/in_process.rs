@@ -5763,8 +5763,7 @@ impl InProcessDaemon {
             vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
         };
 
-        let result = execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await;
-        result
+        execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await
     }
 
     pub async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
@@ -5840,7 +5839,7 @@ impl InProcessDaemon {
                 repo: None,
                 description: command.description().to_string(),
             });
-            let result = flotilla_protocol::CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
+            let result = CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
             self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
@@ -5884,96 +5883,72 @@ impl InProcessDaemon {
             CommandAction::ArtifactReserveLedgerComment { .. } => {
                 return boxed_action!(crew.execute_action_artifact_reserve_ledger_comment(id, &command))
             }
-            flotilla_protocol::CommandAction::ResourceApply { .. } => {
-                return boxed_action!(executor.execute_action_resource_apply(id, &command))
-            }
-            flotilla_protocol::CommandAction::RepositoryRemoteRemove { .. } => {
+            CommandAction::ResourceApply { .. } => return boxed_action!(executor.execute_action_resource_apply(id, &command)),
+            CommandAction::RepositoryRemoteRemove { .. } => {
                 return boxed_action!(executor.execute_action_repository_remote_remove(id, &command))
             }
-            flotilla_protocol::CommandAction::ResourceManifestResolve { .. } => {
+            CommandAction::ResourceManifestResolve { .. } => {
                 return boxed_action!(executor.execute_action_resource_manifest_resolve(id, &command))
             }
-            flotilla_protocol::CommandAction::ConvoyEnsureRoll { .. } => {
-                return boxed_action!(admission.execute_action_ensure_roll(id, &command))
-            }
-            flotilla_protocol::CommandAction::ResourceReconcileNow { .. } => {
+            CommandAction::ConvoyEnsureRoll { .. } => return boxed_action!(admission.execute_action_ensure_roll(id, &command)),
+            CommandAction::ResourceReconcileNow { .. } => {
                 return boxed_action!(executor.execute_action_resource_reconcile_now(id, &command))
             }
             CommandAction::MessageFailBatch { .. } => return boxed_action!(crew.execute_action_message_fail_batch(id, &command)),
             CommandAction::FleetPostInstall { .. } => return boxed_action!(executor.execute_action_fleet_post_install(id, &command)),
-            flotilla_protocol::CommandAction::ResourceStatusPatch { .. } => {
-                return boxed_action!(executor.execute_action_resource_status_patch(id, &command))
-            }
-            flotilla_protocol::CommandAction::ResourceDelete { .. } => {
-                return boxed_action!(executor.execute_action_resource_delete(id, &command))
-            }
-            flotilla_protocol::CommandAction::ResourceWatch { .. } => {
+            CommandAction::ResourceStatusPatch { .. } => return boxed_action!(executor.execute_action_resource_status_patch(id, &command)),
+            CommandAction::ResourceDelete { .. } => return boxed_action!(executor.execute_action_resource_delete(id, &command)),
+            CommandAction::ResourceWatch { .. } => {
                 return boxed_action!(projections.execute_action_resource_watch(id, &command, &command_node_id))
             }
-            flotilla_protocol::CommandAction::Refresh { repo: None } => {
-                return boxed_action!(executor.execute_action_refresh_all(id, &command))
-            }
-            flotilla_protocol::CommandAction::CrewHandoff { .. } => return boxed_action!(crew.execute_action_crew_handoff(id, &command)),
-            flotilla_protocol::CommandAction::ConvoyResume { .. } => {
+            CommandAction::Refresh { repo: None } => return boxed_action!(executor.execute_action_refresh_all(id, &command)),
+            CommandAction::CrewHandoff { .. } => return boxed_action!(crew.execute_action_crew_handoff(id, &command)),
+            CommandAction::ConvoyResume { .. } => {
                 return boxed_action!(crew.execute_action_convoy_resume(id, &command, &caller, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { .. } => {
+            CommandAction::ConvoyWithdrawPendingBrief { .. } => {
                 return boxed_action!(crew.execute_action_convoy_withdraw_pending_brief(id, &command))
             }
-            flotilla_protocol::CommandAction::CrewComplete { .. } => {
+            CommandAction::CrewComplete { .. } => {
                 return boxed_action!(crew.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::CrewFail { .. } => return boxed_action!(crew.execute_action_crew_fail(id, &command, &caller)),
-            flotilla_protocol::CommandAction::CrewStall { .. } => return boxed_action!(crew.execute_action_crew_stall(id, &command)),
-            flotilla_protocol::CommandAction::CrewSupervise { .. } => {
+            CommandAction::CrewFail { .. } => return boxed_action!(crew.execute_action_crew_fail(id, &command, &caller)),
+            CommandAction::CrewStall { .. } => return boxed_action!(crew.execute_action_crew_stall(id, &command)),
+            CommandAction::CrewSupervise { .. } => {
                 return boxed_action!(crew.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::ConvoyLink { .. } => return boxed_action!(crew.execute_action_convoy_link(id, &command)),
-            flotilla_protocol::CommandAction::ConvoyUnlink { .. } => return boxed_action!(crew.execute_action_convoy_unlink(id, &command)),
-            flotilla_protocol::CommandAction::ConvoyDelete { .. } => {
-                return boxed_action!(crew.execute_action_convoy_delete(id, &command, &caller))
-            }
-            flotilla_protocol::CommandAction::ConvoyAbandon { .. } => {
+            CommandAction::ConvoyLink { .. } => return boxed_action!(crew.execute_action_convoy_link(id, &command)),
+            CommandAction::ConvoyUnlink { .. } => return boxed_action!(crew.execute_action_convoy_unlink(id, &command)),
+            CommandAction::ConvoyDelete { .. } => return boxed_action!(crew.execute_action_convoy_delete(id, &command, &caller)),
+            CommandAction::ConvoyAbandon { .. } => {
                 return boxed_action!(crew.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { .. } => {
+            CommandAction::ConvoyWorkForceComplete { .. } => {
                 return boxed_action!(crew.execute_action_convoy_work_force_complete(id, &command))
             }
-            flotilla_protocol::CommandAction::ConvoyStart { .. } => {
+            CommandAction::ConvoyStart { .. } => {
                 return boxed_action!(admission.execute_action_convoy_start(id, &command, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::ConvoyCreate { .. } => {
+            CommandAction::ConvoyCreate { .. } => {
                 return boxed_action!(admission.execute_action_convoy_create(id, &command, &dispatching_principal_ref))
             }
-            flotilla_protocol::CommandAction::WorkflowTemplateApply { .. } => {
+            CommandAction::WorkflowTemplateApply { .. } => {
                 return boxed_action!(admission.execute_action_workflow_template_apply(id, &command))
             }
-            flotilla_protocol::CommandAction::ProjectAdd { .. } => return boxed_action!(admission.execute_action_project_add(id, &command)),
-            flotilla_protocol::CommandAction::ProjectApply { .. } => {
-                return boxed_action!(admission.execute_action_project_apply(id, &command))
-            }
-            flotilla_protocol::CommandAction::ProjectRegister { .. } => {
-                return boxed_action!(admission.execute_action_project_register(id, &command))
-            }
-            flotilla_protocol::CommandAction::ProjectRefresh { .. } => {
-                return boxed_action!(admission.execute_action_project_refresh(id, &command))
-            }
-            flotilla_protocol::CommandAction::TrackRepoPath { .. } => {
-                return boxed_action!(executor.execute_action_track_repo_path(id, &command))
-            }
-            flotilla_protocol::CommandAction::UntrackRepo { .. } => {
-                return boxed_action!(executor.execute_action_untrack_repo(id, &command))
-            }
-            flotilla_protocol::CommandAction::OpenChangeRequest { .. }
-            | flotilla_protocol::CommandAction::CloseChangeRequest { .. }
-            | flotilla_protocol::CommandAction::MergeChangeRequest { .. }
-            | flotilla_protocol::CommandAction::OpenIssue { .. }
-            | flotilla_protocol::CommandAction::LinkIssuesToChangeRequest { .. } => {
+            CommandAction::ProjectAdd { .. } => return boxed_action!(admission.execute_action_project_add(id, &command)),
+            CommandAction::ProjectApply { .. } => return boxed_action!(admission.execute_action_project_apply(id, &command)),
+            CommandAction::ProjectRegister { .. } => return boxed_action!(admission.execute_action_project_register(id, &command)),
+            CommandAction::ProjectRefresh { .. } => return boxed_action!(admission.execute_action_project_refresh(id, &command)),
+            CommandAction::TrackRepoPath { .. } => return boxed_action!(executor.execute_action_track_repo_path(id, &command)),
+            CommandAction::UntrackRepo { .. } => return boxed_action!(executor.execute_action_untrack_repo(id, &command)),
+            CommandAction::OpenChangeRequest { .. }
+            | CommandAction::CloseChangeRequest { .. }
+            | CommandAction::MergeChangeRequest { .. }
+            | CommandAction::OpenIssue { .. }
+            | CommandAction::LinkIssuesToChangeRequest { .. } => {
                 return boxed_action!(executor.execute_action_repository_forge(id, &command))
             }
-            flotilla_protocol::CommandAction::Refresh { repo: Some(_) } => {
-                return boxed_action!(executor.execute_action_refresh_repo(id, &command))
-            }
+            CommandAction::Refresh { repo: Some(_) } => return boxed_action!(executor.execute_action_refresh_repo(id, &command)),
             _ => {}
         }
 

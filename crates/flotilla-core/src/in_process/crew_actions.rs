@@ -2,30 +2,41 @@
 //!
 //! Handlers use the capability-owned port below; the composition root supplies
 //! orchestration collaborators and shares their existing state.
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use flotilla_protocol::CheckoutArchiveOutcome;
+use flotilla_protocol::Command;
+use flotilla_protocol::CommandAction;
+use flotilla_protocol::CommandCaller;
+use flotilla_protocol::CommandValue;
+use flotilla_protocol::CrewCommandContext;
+use flotilla_protocol::PrincipalRef;
+use flotilla_protocol::Relationship;
+use flotilla_protocol::RepoIdentity;
+use flotilla_protocol::StallProposedDisposition;
+use flotilla_protocol::StallReason;
+use flotilla_resources::apply_status_patch_checked as apply_resource_status_patch_checked;
+use flotilla_resources::external_patches as convoy_external_patches;
+use flotilla_resources::Clock;
+use flotilla_resources::Convoy as ResourceConvoy;
+use flotilla_resources::MessageInbox;
+use flotilla_resources::MessageReference;
+use flotilla_resources::ResourceBackend;
+use flotilla_resources::ResourceError;
+use flotilla_resources::ResourceObject;
+use flotilla_resources::WorkPhase;
+
 use super::{crew_ops, resolve_local_convoy_name};
 use crate::in_process::crew_ops::ConvoyResumeOutcome;
 use crate::in_process::crew_ops::CrewRoutingContext;
 use crate::in_process::crew_ops::CrewSupervisionRequest;
 use crate::in_process::crew_ops::MessageAttribution;
-use async_trait::async_trait;
-use flotilla_protocol::CheckoutArchiveOutcome;
-use flotilla_protocol::Command;
-use flotilla_protocol::CommandAction;
-use flotilla_protocol::CommandValue;
-use flotilla_protocol::CrewCommandContext;
-use flotilla_protocol::PrincipalRef;
-use flotilla_resources::apply_status_patch_checked as apply_resource_status_patch_checked;
-use flotilla_resources::external_patches as convoy_external_patches;
-use flotilla_resources::Convoy as ResourceConvoy;
-use flotilla_resources::ResourceBackend;
-use flotilla_resources::ResourceError;
-use flotilla_resources::ResourceObject;
-use std::sync::Arc;
 
 #[async_trait]
 pub(super) trait CrewActionPort: Send + Sync {
-    fn clock(&self) -> &Arc<dyn flotilla_resources::Clock>;
-    async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox;
+    fn clock(&self) -> &Arc<dyn Clock>;
+    async fn message_inbox(&self, namespace: &str) -> MessageInbox;
     async fn convoy_resume_with_sender_internal(
         &self,
         namespace: &str,
@@ -40,7 +51,7 @@ pub(super) trait CrewActionPort: Send + Sync {
         requested: &CrewCommandContext,
         target: &str,
         message: &str,
-        carries: Vec<flotilla_resources::MessageReference>,
+        carries: Vec<MessageReference>,
     ) -> Result<(), String>;
     async fn abandon_convoy_internal(
         &self,
@@ -58,7 +69,7 @@ pub(super) trait CrewActionPort: Send + Sync {
         decision_ledger_ref: Option<String>,
         force: bool,
         principal: Option<PrincipalRef>,
-    ) -> Result<flotilla_protocol::CommandValue, String>;
+    ) -> Result<CommandValue, String>;
     async fn crew_fail_internal(
         &self,
         requested: &CrewCommandContext,
@@ -69,23 +80,18 @@ pub(super) trait CrewActionPort: Send + Sync {
     async fn crew_stall_internal(
         &self,
         requested: &CrewCommandContext,
-        reason: flotilla_protocol::StallReason,
-        proposed_disposition: Option<flotilla_protocol::StallProposedDisposition>,
+        reason: StallReason,
+        proposed_disposition: Option<StallProposedDisposition>,
         message: String,
     ) -> Result<(), String>;
     async fn crew_supervise_internal(&self, request: CrewSupervisionRequest<'_>) -> Result<(), String>;
-    fn finish_context_free_command(
-        &self,
-        command_id: u64,
-        repo_identity: flotilla_protocol::RepoIdentity,
-        result: flotilla_protocol::CommandValue,
-    );
+    fn finish_context_free_command(&self, command_id: u64, repo_identity: RepoIdentity, result: CommandValue);
     async fn link_convoy_subject(
         &self,
         namespace: &str,
         convoy_name: &str,
         reference: &str,
-        relationship: Option<flotilla_protocol::Relationship>,
+        relationship: Option<Relationship>,
     ) -> Result<(), String>;
     async fn provisioning_namespace(&self) -> String;
     async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String>;
@@ -94,12 +100,12 @@ pub(super) trait CrewActionPort: Send + Sync {
         namespace: &str,
         name: &str,
         action: &str,
-        caller: Option<&flotilla_protocol::CommandCaller>,
+        caller: Option<&CommandCaller>,
         missing_expected: bool,
     );
     async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String>;
     fn resource_backend(&self) -> &ResourceBackend;
-    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity;
+    fn start_context_free_command(&self, command_id: u64, description: String) -> RepoIdentity;
 }
 
 pub(super) struct CrewActions<'a> {
@@ -122,11 +128,11 @@ impl CrewActions<'_> {
     }
 
     pub(super) async fn execute_action_crew_handoff(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
+        if let CommandAction::CrewHandoff { context, target, message, carries } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let result = match Box::pin(self.port.handoff_with_carries(context, target, message, carries.clone())).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Ok(()) => CommandValue::Ok,
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -138,12 +144,12 @@ impl CrewActions<'_> {
         &self,
         id: u64,
         command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
+        caller: &Option<CommandCaller>,
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
+        if let CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.port.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(self.port.resource_backend(), &namespace, name).await {
@@ -162,18 +168,18 @@ impl CrewActions<'_> {
                             self.port
                                 .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
                                 .await;
-                            flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
+                            CommandValue::ConvoyBriefDelivered { displaced }
                         }
                         Ok(ConvoyResumeOutcome::Queued { displaced }) => {
                             self.port
                                 .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
                                 .await;
-                            flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced }
+                            CommandValue::ConvoyBriefQueued { displaced }
                         }
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                        Err(message) => CommandValue::Error { message },
                     }
                 }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -182,15 +188,15 @@ impl CrewActions<'_> {
     }
 
     pub(super) async fn execute_action_convoy_withdraw_pending_brief(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
+        if let CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.port.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(self.port.resource_backend(), &namespace, name).await {
                 Ok(record_name) => match self.port.convoy_withdraw_pending_brief_internal(&namespace, &record_name).await {
-                    Ok(withdrawn) => flotilla_protocol::CommandValue::ConvoyBriefWithdrawn { withdrawn },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    Ok(withdrawn) => CommandValue::ConvoyBriefWithdrawn { withdrawn },
+                    Err(message) => CommandValue::Error { message },
                 },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -202,14 +208,12 @@ impl CrewActions<'_> {
         &self,
         id: u64,
         command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
+        caller: &Option<CommandCaller>,
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } =
-            &command.action
-        {
+        if let CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let routing = Box::pin(self.port.resolve_crew_routing_context(context)).await.ok();
             let result = match self
@@ -233,7 +237,7 @@ impl CrewActions<'_> {
                     }
                     value
                 }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -241,20 +245,15 @@ impl CrewActions<'_> {
         Err("CrewComplete action selected the wrong handler".to_string())
     }
 
-    pub(super) async fn execute_action_crew_fail(
-        &self,
-        id: u64,
-        command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
-    ) -> Result<u64, String> {
+    pub(super) async fn execute_action_crew_fail(&self, id: u64, command: &Command, caller: &Option<CommandCaller>) -> Result<u64, String> {
         let caller = caller.clone();
-        if let flotilla_protocol::CommandAction::CrewFail { context, message, force } = &command.action {
+        if let CommandAction::CrewFail { context, message, force } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let operator =
                 caller.as_ref().filter(|caller| caller.crew.is_none() && context.crew_id.is_none()).map(|caller| &caller.principal_ref);
             let result = match self.port.crew_fail_internal(context, message.clone(), *force, operator).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Ok(()) => CommandValue::Ok,
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -263,11 +262,11 @@ impl CrewActions<'_> {
     }
 
     pub(super) async fn execute_action_crew_stall(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::CrewStall { context, reason, proposed_disposition, message } = &command.action {
+        if let CommandAction::CrewStall { context, reason, proposed_disposition, message } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let result = match self.port.crew_stall_internal(context, *reason, *proposed_disposition, message.clone()).await {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Ok(()) => CommandValue::Ok,
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -279,14 +278,12 @@ impl CrewActions<'_> {
         &self,
         id: u64,
         command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
+        caller: &Option<CommandCaller>,
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, vessel, role, operation, message, actor_crew_id } =
-            &command.action
-        {
+        if let CommandAction::CrewSupervise { namespace, convoy, vessel, role, operation, message, actor_crew_id } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.port.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(self.port.resource_backend(), &namespace, convoy).await {
@@ -316,11 +313,11 @@ impl CrewActions<'_> {
                                 false,
                             )
                             .await;
-                        flotilla_protocol::CommandValue::Ok
+                        CommandValue::Ok
                     }
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    Err(message) => CommandValue::Error { message },
                 },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -329,7 +326,7 @@ impl CrewActions<'_> {
     }
 
     pub(super) async fn execute_action_convoy_link(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
+        if let CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
@@ -342,7 +339,7 @@ impl CrewActions<'_> {
             self.port.finish_context_free_command(
                 id,
                 empty_identity,
-                result.map_or_else(|message| flotilla_protocol::CommandValue::Error { message }, |()| flotilla_protocol::CommandValue::Ok),
+                result.map_or_else(|message| CommandValue::Error { message }, |()| CommandValue::Ok),
             );
             return Ok(id);
         }
@@ -350,7 +347,7 @@ impl CrewActions<'_> {
     }
 
     pub(super) async fn execute_action_convoy_unlink(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, reference } = &command.action {
+        if let CommandAction::ConvoyUnlink { namespace, name, reference } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
@@ -363,7 +360,7 @@ impl CrewActions<'_> {
             self.port.finish_context_free_command(
                 id,
                 empty_identity,
-                result.map_or_else(|message| flotilla_protocol::CommandValue::Error { message }, |()| flotilla_protocol::CommandValue::Ok),
+                result.map_or_else(|message| CommandValue::Error { message }, |()| CommandValue::Ok),
             );
             return Ok(id);
         }
@@ -374,10 +371,10 @@ impl CrewActions<'_> {
         &self,
         id: u64,
         command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
+        caller: &Option<CommandCaller>,
     ) -> Result<u64, String> {
         let caller = caller.clone();
-        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
+        if let CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
@@ -391,11 +388,11 @@ impl CrewActions<'_> {
                         self.port
                             .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_delete", caller.as_ref(), true)
                             .await;
-                        flotilla_protocol::CommandValue::Ok
+                        CommandValue::Ok
                     }
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    Err(message) => CommandValue::Error { message },
                 },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -407,12 +404,12 @@ impl CrewActions<'_> {
         &self,
         id: u64,
         command: &Command,
-        caller: &Option<flotilla_protocol::CommandCaller>,
+        caller: &Option<CommandCaller>,
         dispatching_principal_ref: &Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let caller = caller.clone();
         let dispatching_principal_ref = dispatching_principal_ref.clone();
-        if let flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, reason } = &command.action {
+        if let CommandAction::ConvoyAbandon { namespace, name, reason } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
@@ -425,12 +422,12 @@ impl CrewActions<'_> {
                             self.port
                                 .record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_abandon", caller.as_ref(), false)
                                 .await;
-                            flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives }
+                            CommandValue::ConvoyAbandoned { name: name.clone(), archives }
                         }
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                        Err(message) => CommandValue::Error { message },
                     }
                 }
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+                Err(message) => CommandValue::Error { message },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
@@ -439,14 +436,14 @@ impl CrewActions<'_> {
     }
 
     pub(super) async fn execute_action_convoy_work_force_complete(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
+        if let CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let namespace = self.port.provisioning_namespace().await;
             let convoys = self.port.resource_backend().clone().using::<ResourceConvoy>(&namespace);
             let record_name = match resolve_local_convoy_name(self.port.resource_backend(), &namespace, convoy).await {
                 Ok(record_name) => record_name,
                 Err(message) => {
-                    self.port.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error { message });
+                    self.port.finish_context_free_command(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -454,14 +451,7 @@ impl CrewActions<'_> {
                 None => Err(ResourceError::other(format!("convoy {convoy} has no status"))),
                 Some(status) => match status.work.get(work) {
                     None => Err(ResourceError::other(format!("convoy {convoy} does not contain work {work}"))),
-                    Some(state)
-                        if matches!(
-                            state.phase,
-                            flotilla_resources::WorkPhase::Failed
-                                | flotilla_resources::WorkPhase::Cancelled
-                                | flotilla_resources::WorkPhase::Abandoned
-                        ) =>
-                    {
+                    Some(state) if matches!(state.phase, WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned) => {
                         Err(ResourceError::other(format!("convoy {convoy} work {work} is already terminal")))
                     }
                     Some(_) => Ok(()),
@@ -475,8 +465,8 @@ impl CrewActions<'_> {
             )
             .await
             {
-                Ok(_) => flotilla_protocol::CommandValue::Ok,
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                Ok(_) => CommandValue::Ok,
+                Err(err) => CommandValue::Error { message: err.to_string() },
             };
             self.port.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
