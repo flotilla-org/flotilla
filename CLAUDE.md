@@ -221,7 +221,7 @@ Checkout VCS providers are demand-discovered through `vcs_for_checkout` and cach
 
 ### VCS operation boundary
 
-Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-core/src/vcs.rs` and `crates/flotilla-core/src/providers/vcs/`. Add a typed operation to the trait when a caller needs a new VCS action. CLI via the checkout's environment runner is the universal implementation. A library backend may be used as a host-local fast path behind the same trait; it must not replace the CLI path for remote or provisioned environments.
+Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-core/src/vcs.rs` and `crates/flotilla-core/src/providers/vcs/`. Add a typed operation to the trait when a caller needs a new VCS action. Each VCS provider chooses its implementation: a CLI through the environment runner, or a library. ADR 0060 removed the earlier rule that the CLI is the universal implementation, because an environment may run a minimal flotilla agent beside cleat.
 
 Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 
