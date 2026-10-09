@@ -1,10 +1,8 @@
 use flotilla_resources::{ForgeKind, ForgeSpec};
 
 use super::*;
-use crate::{
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::issue_tracker::forge_issue_source,
-};
+use crate::providers::issue_tracker::forge_issue_source;
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 fn sample_bag() -> EnvironmentBag {
     EnvironmentBag::new()

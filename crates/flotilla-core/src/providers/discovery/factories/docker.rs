@@ -6,13 +6,13 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         environment::{docker::DockerEnvironmentProvider, EnvironmentProvider},
         ChannelLabel, CommandRunner,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct DockerEnvironmentFactory;
 
@@ -51,9 +51,9 @@ mod tests {
     use super::DockerEnvironmentFactory;
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn docker_factory_succeeds_with_binary_in_bag() {

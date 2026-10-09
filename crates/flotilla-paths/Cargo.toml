@@ -1,0 +1,16 @@
+[package]
+name = "flotilla-paths"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+dirs = "6"
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }

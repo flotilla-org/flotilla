@@ -1,9 +1,9 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
-#[cfg(any(test, feature = "test-support"))]
-use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
+#[cfg(any(test, feature = "test-support"))]
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::NodeId;
 #[cfg(any(test, feature = "test-support"))]
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};

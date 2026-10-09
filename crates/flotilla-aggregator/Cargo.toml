@@ -11,6 +11,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-p
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }

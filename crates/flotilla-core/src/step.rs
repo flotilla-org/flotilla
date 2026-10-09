@@ -8,7 +8,8 @@ pub use flotilla_protocol::{Step, StepAction, StepExecutionContext, StepOutcome}
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::{event_sink::EventSink, path_context::ExecutionEnvironmentPath};
+use crate::event_sink::EventSink;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 /// Resolves symbolic step actions into outcomes.
 #[async_trait::async_trait]

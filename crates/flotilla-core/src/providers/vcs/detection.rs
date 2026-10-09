@@ -4,16 +4,14 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{
-        discovery::{
-            detectors::generic::{parse_first_dotted_version, CommandDetector},
-            EnvVars, EnvironmentAssertion, RepoDetector, VcsKind,
-        },
-        run, CommandRunner,
+use crate::providers::{
+    discovery::{
+        detectors::generic::{parse_first_dotted_version, CommandDetector},
+        EnvVars, EnvironmentAssertion, RepoDetector, VcsKind,
     },
+    run, CommandRunner,
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub fn git_binary_detector() -> CommandDetector {
     CommandDetector::new("git", &["--version"], parse_first_dotted_version)
@@ -91,10 +89,8 @@ pub(crate) fn remote_assertion(url: &str, remote_name: &str) -> Option<Environme
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        path_context::ExecutionEnvironmentPath,
-        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
-    };
+    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // -- VcsRepoDetector --
 

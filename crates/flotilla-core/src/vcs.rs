@@ -20,7 +20,6 @@ use tracing::warn;
 
 use crate::{
     charter_store::{is_charter_file, reconciliation_lock, CharterSnapshot},
-    path_context::ExecutionEnvironmentPath,
     providers::{
         command_channel_label,
         types::Checkout,
@@ -28,6 +27,7 @@ use crate::{
         CommandOutput, CommandRunner,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 /// Check host-owned repository configuration before a local Git process can
 /// interpret it. A contained worktree can write refs in the shared gitdir, so

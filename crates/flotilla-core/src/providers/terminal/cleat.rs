@@ -13,10 +13,8 @@ use super::{
     environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
     TerminalSessionTag, TerminalSize,
 };
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{discovery::EnvironmentBag, run, ChannelLabel, CommandRunner},
-};
+use crate::providers::{discovery::EnvironmentBag, run, ChannelLabel, CommandRunner};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
@@ -406,10 +404,8 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use super::*;
-    use crate::{
-        path_context::ExecutionEnvironmentPath,
-        providers::{testing::MockRunner, CommandRunner},
-    };
+    use crate::providers::{testing::MockRunner, CommandRunner};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // Existing command-layout tests exercise their operation after the launch
     // capability has been established. environment_tests covers the real probe.

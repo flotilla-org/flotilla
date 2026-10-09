@@ -8,10 +8,10 @@ use std::{
 use flotilla_core::{
     config::ConfigStore,
     log_file::{rotating_log_writer, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE},
-    path_context::DaemonHostPath,
-    path_policy::PathPolicy,
     providers::discovery::DiscoveryRuntime,
 };
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_policy::PathPolicy;
 use tracing::{info, Subscriber};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -128,7 +128,7 @@ mod tests {
         std::fs::write(&socket_path, "owned by live daemon").expect("create live socket stand-in");
 
         std::fs::create_dir_all(&state_dir).expect("create state dir");
-        let lock_path = state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE);
+        let lock_path = state_dir.join(flotilla_daemon_api::DAEMON_LIFECYCLE_LOCK_FILE);
         let lifecycle =
             std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path).expect("open lifecycle lock");
         // SAFETY: the file owns this descriptor for the rest of the test.

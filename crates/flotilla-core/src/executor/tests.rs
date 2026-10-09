@@ -9,7 +9,6 @@ use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnviro
 use crate::{
     environment_manager::EnvironmentManager,
     event_sink::RecordingEventSink,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{
         ai_utility::AiUtility,
@@ -31,6 +30,7 @@ use crate::{
     step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
     vcs::{EnumeratedCheckout, Vcs},
 };
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)

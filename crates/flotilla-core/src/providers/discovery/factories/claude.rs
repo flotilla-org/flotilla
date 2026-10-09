@@ -6,7 +6,6 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         ai_utility::{claude_api::ClaudeApiAiUtility, claude_cli::ClaudeCliAiUtility, AiUtility},
         coding_agent::{claude::ClaudeCodingAgent, CloudAgentService},
@@ -14,6 +13,7 @@ use crate::{
         CommandRunner, ReqwestHttpClient,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // ---------------------------------------------------------------------------
 // ClaudeCodingAgentFactory
@@ -125,9 +125,9 @@ mod tests {
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory, ClaudeCodingAgentFactory};
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_claude_binary() -> EnvironmentBag {
         EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))

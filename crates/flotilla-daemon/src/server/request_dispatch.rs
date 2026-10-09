@@ -2,9 +2,9 @@ use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, Message, RepoSelector, Request, Response,
 };

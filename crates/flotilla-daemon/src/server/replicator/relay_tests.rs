@@ -1,8 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
-};
+use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyStartIntent, DaemonEvent, HostName};
 use flotilla_resources::{
     single_agent_workflow_spec, Convoy, CrewSource, HttpBackend, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend,

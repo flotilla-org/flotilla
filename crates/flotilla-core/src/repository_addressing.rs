@@ -8,7 +8,7 @@ use std::{
 use flotilla_protocol::{RepoIdentity, RepoSelector};
 use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Environment, Project, Repository, RepositoryKey, ResourceBackend};
 
-use crate::path_context::canonical_or_original;
+use flotilla_paths::path_context::canonical_or_original;
 
 pub(crate) async fn resolve_repository(
     backend: &ResourceBackend,

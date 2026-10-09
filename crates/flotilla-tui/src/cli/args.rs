@@ -6,7 +6,7 @@ use std::{
 use clap::{CommandFactory, FromArgMatches, Parser};
 use color_eyre::Result;
 use flotilla_client::endpoint::{remote_daemon_from, DaemonEndpoint, SshEndpoint};
-use flotilla_core::path_policy::{daemon_socket_path, PathPolicy};
+use flotilla_paths::path_policy::{daemon_socket_path, PathPolicy};
 
 /// Flotilla: TUI dashboard for managing development workspaces
 #[derive(Parser)]
@@ -845,7 +845,7 @@ fn client_dirs_from(
     environment_socket: Option<&std::ffi::OsStr>,
 ) -> Result<(PathBuf, PathBuf), String> {
     if explicit_root.is_none() && explicit_config_dir.is_none() && explicit_state_dir.is_none() {
-        if let Some(dirs) = environment_socket.map(Path::new).and_then(flotilla_core::path_policy::scoped_daemon_dirs) {
+        if let Some(dirs) = environment_socket.map(Path::new).and_then(flotilla_paths::path_policy::scoped_daemon_dirs) {
             return Ok(dirs);
         }
     }
@@ -1423,8 +1423,8 @@ mod tests {
         assert_eq!(paths_a.socket_path, Path::new("/work/a/config/run/flotilla.sock"));
         assert_ne!(paths_a.state_dir.join("resources.sqlite"), paths_b.state_dir.join("resources.sqlite"));
         assert_ne!(
-            paths_a.state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE),
-            paths_b.state_dir.join(flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE),
+            paths_a.state_dir.join(flotilla_daemon_api::DAEMON_LIFECYCLE_LOCK_FILE),
+            paths_b.state_dir.join(flotilla_daemon_api::DAEMON_LIFECYCLE_LOCK_FILE),
         );
     }
 

@@ -2,7 +2,8 @@ use flotilla_protocol::{arg::Arg, HostName};
 use tracing::warn;
 
 use super::{ResolutionContext, ResolvedAction};
-use crate::{config::HostsConfig, path_context::DaemonHostPath};
+use crate::config::HostsConfig;
+use flotilla_paths::path_context::DaemonHostPath;
 
 /// Resolves a `Hop::RemoteToHost` into SSH-specific actions on the context.
 ///

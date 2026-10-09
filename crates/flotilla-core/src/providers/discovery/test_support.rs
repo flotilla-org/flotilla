@@ -23,7 +23,6 @@ use tokio::sync::Mutex as TokioMutex;
 use super::{DiscoveryRuntime, EnvironmentBag, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         change_request::ChangeRequestTracker,
         discovery::EnvVars,
@@ -35,6 +34,7 @@ use crate::{
     },
     vcs::{CheckoutVcsResolver, EnumeratedCheckout, FlotillaVcs, GitCheckoutStrategy, Vcs},
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
 

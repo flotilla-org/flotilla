@@ -1107,7 +1107,6 @@ mod tests {
     use flotilla_core::{
         config::ConfigStore,
         in_process::InProcessDaemon,
-        path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{
                 factories::git::GitVcsFactory,
@@ -1117,6 +1116,7 @@ mod tests {
             ProcessCommandRunner,
         },
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_protocol::{HostName, NodeId};
     use flotilla_resources::{
         patch_resource_annotation, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, ResourceBackend,

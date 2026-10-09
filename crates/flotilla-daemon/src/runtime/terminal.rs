@@ -16,7 +16,6 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::crew_capabilities::SessionCapabilitySource;
 use flotilla_core::{
     agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
-    path_context::ExecutionEnvironmentPath,
     providers::{
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
@@ -24,6 +23,7 @@ use flotilla_core::{
     },
 };
 use flotilla_credentials::crew_git_identity_environment;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
 use flotilla_resources::{
     Checkout, Convoy, Environment, FulfilmentKind, ResourceBackend, ResourceError, ResourceObject, TerminalAttentionSource,

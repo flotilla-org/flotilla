@@ -13,7 +13,6 @@ use std::{path::Path, sync::Arc};
 
 use flotilla_core::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{
             detectors::default_host_detectors, run_host_detectors, EnvironmentAssertion, EnvironmentBag, FactoryRegistry, ProcessEnvVars,
@@ -23,6 +22,7 @@ use flotilla_core::{
     },
     vcs::RepositoryRead,
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 
 #[tokio::main]

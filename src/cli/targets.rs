@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, EnvironmentId, HostName, RepoSelector};
 use tracing::info;
 
@@ -293,9 +293,9 @@ mod tests {
         use flotilla_core::{
             config::ConfigStore,
             in_process::InProcessDaemon,
-            path_context::ExecutionEnvironmentPath,
             providers::discovery::test_support::{fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeIssueProvider},
         };
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_protocol::{Command, CommandAction, DaemonEvent, RepoSelector};
         use flotilla_resources::{
             Checkout, CheckoutSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
@@ -420,7 +420,7 @@ mod tests {
             .action(CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Query("primary".into()), ids: vec!["1".into()] })
             .build();
         super::resolve_command_repositories(&*daemon, &mut query).await.expect("issue query identity");
-        use flotilla_core::daemon::DaemonHandle;
+        use flotilla_daemon_api::daemon::DaemonHandle;
         let result = daemon.execute_query(query, uuid::Uuid::new_v4()).await.expect("issue query without checkout");
         assert!(matches!(result, CommandValue::IssuesByIds { .. }));
         assert_eq!(*issues.fetched_by_id.lock().await, vec![vec!["1".to_string()]]);

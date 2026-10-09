@@ -17,7 +17,8 @@ impl QuerySubscription {
         Self { cleanup: None }
     }
 
-    pub(crate) fn new(cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
+    /// Create an in-process subscription token whose cleanup runs once on drop.
+    pub fn new(cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
         Self { cleanup: Some(Box::new(cleanup)) }
     }
 }

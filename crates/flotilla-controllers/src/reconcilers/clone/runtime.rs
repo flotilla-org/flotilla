@@ -50,10 +50,10 @@ pub(crate) fn controller_vcs(
     #[cfg(test)]
     {
         use flotilla_core::{
-            path_context::ExecutionEnvironmentPath,
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         Ok(Arc::new(FlotillaVcs::new(
             ExecutionEnvironmentPath::new(_checkout),
             Arc::clone(_runner),

@@ -6,13 +6,13 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         environment::{host_direct::HostDirectEnvironmentProvider, EnvironmentProvider},
         CommandRunner,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct HostDirectEnvironmentFactory;
 

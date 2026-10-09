@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use flotilla_protocol::arg::Arg;
 
 use super::{TerminalEnvVars, TerminalPool, TerminalSession};
-use crate::path_context::ExecutionEnvironmentPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct PassthroughTerminalPool;
 
@@ -50,7 +50,7 @@ impl TerminalPool for PassthroughTerminalPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::path_context::ExecutionEnvironmentPath;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn list_returns_empty() {

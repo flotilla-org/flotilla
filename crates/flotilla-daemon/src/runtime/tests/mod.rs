@@ -23,9 +23,7 @@ use flotilla_core::{
     agent_adapter::AgentAdapterRegistry,
     aggregator_projection::AggregatorProjectionState,
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::{InProcessDaemon, StandingConvoyBackingInspector, DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE},
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         change_request::ChangeRequestTracker,
         discovery::{
@@ -53,6 +51,8 @@ use flotilla_credentials::{
     crew_git_identity_environment, test_support::GITHUB_APP_TEST_PRIVATE_KEY, AgentMaterialRegistry, CredentialRefreshError,
     CredentialStore, CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV,
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
     NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, TerminalStatus,

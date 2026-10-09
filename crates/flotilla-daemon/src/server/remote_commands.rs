@@ -11,10 +11,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::{
     command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason},
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, CommandAction, CommandPeerEvent, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, NodeId,
     PeerWireMessage, RepoIdentity, RepoSelector, RoutedPeerMessage, Step, StepStatus,

@@ -57,16 +57,16 @@ fn binaries_report_their_wire_generation_and_protocol_version() {
 // This integration binary isolates process-wide identity initialization from library tests.
 #[test]
 fn executable_identity_is_shared_with_libraries() {
-    assert_eq!(flotilla_core::build_info::build_id(), "unknown");
-    assert!(std::panic::catch_unwind(|| flotilla_core::build_info::initialize_build_id("")).is_err());
-    assert_eq!(flotilla_core::build_info::build_id(), "unknown");
-    flotilla_core::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
-    assert_eq!(flotilla_core::build_info::build_id(), env!("FLOTILLA_BUILD_ID"));
+    assert_eq!(flotilla_daemon_api::build_info::build_id(), "unknown");
+    assert!(std::panic::catch_unwind(|| flotilla_daemon_api::build_info::initialize_build_id("")).is_err());
+    assert_eq!(flotilla_daemon_api::build_info::build_id(), "unknown");
+    flotilla_daemon_api::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
+    assert_eq!(flotilla_daemon_api::build_info::build_id(), env!("FLOTILLA_BUILD_ID"));
     assert_eq!(flotilla_client::build_id(), env!("FLOTILLA_BUILD_ID"));
     // Embedders may repeat initialization, but empty or conflicting identities
     // must not replace the process identity.
-    flotilla_core::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
-    assert!(std::panic::catch_unwind(|| flotilla_core::build_info::initialize_build_id("")).is_err());
-    assert!(std::panic::catch_unwind(|| flotilla_core::build_info::initialize_build_id("conflicting-build")).is_err());
-    assert_eq!(flotilla_core::build_info::build_id(), env!("FLOTILLA_BUILD_ID"));
+    flotilla_daemon_api::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
+    assert!(std::panic::catch_unwind(|| flotilla_daemon_api::build_info::initialize_build_id("")).is_err());
+    assert!(std::panic::catch_unwind(|| flotilla_daemon_api::build_info::initialize_build_id("conflicting-build")).is_err());
+    assert_eq!(flotilla_daemon_api::build_info::build_id(), env!("FLOTILLA_BUILD_ID"));
 }

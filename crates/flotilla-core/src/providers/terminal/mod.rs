@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint, TerminalStatus};
 pub use flotilla_resources::TerminalSessionTag;
 
-use crate::path_context::ExecutionEnvironmentPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 /// Environment variables to inject into the terminal session.
 pub type TerminalEnvVars = Vec<(String, String)>;

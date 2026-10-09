@@ -7,14 +7,12 @@ use std::{
 use async_trait::async_trait;
 
 use super::CleatTerminalPool;
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{
-        discovery::{EnvironmentAssertion, EnvironmentBag},
-        terminal::TerminalPool,
-        ChannelLabel, CommandOutput, CommandRunner,
-    },
+use crate::providers::{
+    discovery::{EnvironmentAssertion, EnvironmentBag},
+    terminal::TerminalPool,
+    ChannelLabel, CommandOutput, CommandRunner,
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // Process boundary: emulate Cleat's additive/default and declared
 // spawn contracts, with an already-running daemon polluted independently of

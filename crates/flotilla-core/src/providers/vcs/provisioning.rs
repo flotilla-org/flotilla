@@ -2,10 +2,8 @@ use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{ChannelLabel, CommandRunner},
-};
+use crate::providers::{ChannelLabel, CommandRunner};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CloneInspection {
@@ -87,10 +85,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::CloneProvisioner;
-    use crate::{
-        path_context::ExecutionEnvironmentPath,
-        providers::{ChannelLabel, CommandOutput, CommandRunner},
-    };
+    use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[derive(Default)]
     struct RecordingRunner {

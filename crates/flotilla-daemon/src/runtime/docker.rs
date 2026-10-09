@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
 use flotilla_core::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{run_provisioned_host_detectors, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth},
@@ -19,6 +18,7 @@ use flotilla_core::{
     },
 };
 use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, CredentialStore};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, EnvironmentId};
 use flotilla_resources::{
     Environment, EnvironmentSpec, PlacementPolicy, Resource, ResourceError, Vessel, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ENV,

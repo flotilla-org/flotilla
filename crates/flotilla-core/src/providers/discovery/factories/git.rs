@@ -6,7 +6,6 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         vcs::{clone::ReferenceCloneStrategy, detection::reference_clone_available, git_worktree::GitWorktreeStrategy},
@@ -14,6 +13,7 @@ use crate::{
     },
     vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs},
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct GitVcsFactory;
 
@@ -62,9 +62,9 @@ mod tests {
     use super::GitVcsFactory;
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn git_factory_succeeds_when_binary_available() {

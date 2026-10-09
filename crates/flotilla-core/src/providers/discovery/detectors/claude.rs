@@ -49,10 +49,8 @@ impl HostDetector for ClaudeDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        path_context::ExecutionEnvironmentPath,
-        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
-    };
+    use crate::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn claude_detector_found_on_path() {

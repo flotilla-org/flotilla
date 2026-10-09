@@ -22,10 +22,10 @@ use super::{checkout_path, discover_vcs_for_checkout, InProcessDaemon};
 use crate::{
     config::ConfigStore,
     environment_manager::ManagedEnvironmentKind,
-    path_context::ExecutionEnvironmentPath,
     providers::{discovery::ProviderDescriptor, registry::ProviderRegistry},
     vcs::Vcs,
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) struct CheckoutProvider {
     pub(super) descriptor: ProviderDescriptor,

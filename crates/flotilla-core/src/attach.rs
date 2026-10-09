@@ -33,10 +33,10 @@ use crate::{
         resolver::HopResolver,
         Hop, HopPlan, ResolutionContext,
     },
-    path_context::ExecutionEnvironmentPath,
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
     providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry, terminal::TerminalSessionLiveness},
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,
@@ -1064,13 +1064,13 @@ mod tests {
     use super::*;
     use crate::{
         config::ConfigStore,
-        daemon::DaemonHandle,
         in_process::{
             tests::{create_identity_convoy, create_running_session, create_test_environment, test_meta},
             InProcessDaemon,
         },
         providers::discovery::test_support::fake_discovery,
     };
+    use flotilla_daemon_api::daemon::DaemonHandle;
 
     // Attach scenarios need a daemon and providers, independent of standing-convoy admission.
     async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {

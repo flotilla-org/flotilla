@@ -45,6 +45,28 @@ class BuildGraphContract(unittest.TestCase):
             package("middle", normal=("lower",)),
         ))), 1)
 
+    def test_client_cannot_compile_core(self):
+        # ADR 0060 step 2: neither a direct nor an indirect production edge may
+        # make a client build compile core, including build-script edges.
+        for kind in ("normal", "build"):
+            for middle in ("flotilla-core", "adapter"):
+                with self.subTest(kind=kind, middle=middle):
+                    errors = violations(graph(
+                        package("flotilla-client", **{kind: (middle,)}),
+                        package("adapter", normal=("flotilla-core",)),
+                        package("flotilla-core"),
+                    ))
+                    self.assertEqual(errors, ["flotilla-client: must not depend on flotilla-core, directly or transitively"])
+
+    def test_client_downward_types_and_unrelated_core_are_valid(self):
+        # Client retains resource types and the extracted API/path interfaces;
+        # core may consume those same lower crates without reversing the edge.
+        self.assertEqual(violations(graph(
+            package("flotilla-client", normal=("flotilla-paths", "flotilla-daemon-api", "flotilla-resources")),
+            package("flotilla-core", normal=("flotilla-paths", "flotilla-daemon-api")),
+            package("flotilla-paths"), package("flotilla-daemon-api"), package("flotilla-resources"),
+        )), [])
+
     def test_non_workspace_dependencies_do_not_define_layers(self):
         # External test frameworks are outside workspace ownership constraints.
         self.assertEqual(violations(graph(package("core", dev=("hegeltest",)))), [])

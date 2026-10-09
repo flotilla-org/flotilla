@@ -14,6 +14,8 @@ skip-no-sandbox-tests = ["flotilla-resources/skip-no-sandbox-tests"]
 test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-support", "dep:axum", "dep:tempfile"]
 
 [dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 tempfile = { version = "3", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
 flotilla-manifest = { path = "../flotilla-manifest" }

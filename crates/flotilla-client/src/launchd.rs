@@ -12,8 +12,8 @@ fn default_agent_plist() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "macos")]
 fn is_default_daemon_identity(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> bool {
-    let policy = flotilla_core::path_policy::PathPolicy::from_process_env();
-    let default_socket = flotilla_core::path_policy::daemon_socket_path(policy.config_dir.as_path());
+    let policy = flotilla_paths::path_policy::PathPolicy::from_process_env();
+    let default_socket = flotilla_paths::path_policy::daemon_socket_path(policy.config_dir.as_path());
     socket_path == default_socket && config_dir == policy.config_dir.as_path() && state_dir == policy.state_dir.as_path()
 }
 

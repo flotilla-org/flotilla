@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, HostListEntry, NodeId, PeerConnectionState, ResourceCursor, ResourceReadEnvelope,
     StepStatus,

@@ -7,7 +7,6 @@ use flotilla_resources::ForgeKind;
 
 use crate::{
     config::{ConfigStore, FlotillaConfig, ForgejoIssueTrackerConfig},
-    path_context::ExecutionEnvironmentPath,
     providers::{
         change_request::{forgejo::ForgejoChangeRequestProvider, github::GitHubChangeRequest, ChangeRequestTracker},
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement, FORGEJO_AUTH_PROVIDER},
@@ -20,6 +19,7 @@ use crate::{
         CommandRunner, ReqwestHttpClient,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
     let mut unmet = vec![];
@@ -298,9 +298,9 @@ mod tests {
     };
     use crate::{
         config::{ConfigStore, ForgejoIssueTrackerConfig},
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {
         EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")).with(EnvironmentAssertion::remote_host(

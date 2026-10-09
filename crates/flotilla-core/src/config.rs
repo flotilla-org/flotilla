@@ -9,7 +9,7 @@ use flotilla_protocol::NodeId;
 use flotilla_resources::RepositoryVcsSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 
 /// Per-category provider preference.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

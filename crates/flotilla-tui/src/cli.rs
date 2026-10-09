@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandAction, CommandValue,
     CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness,

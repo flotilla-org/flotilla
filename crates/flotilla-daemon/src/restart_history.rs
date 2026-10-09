@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_core::DAEMON_LIFECYCLE_LOCK_FILE;
+use flotilla_daemon_api::DAEMON_LIFECYCLE_LOCK_FILE;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 

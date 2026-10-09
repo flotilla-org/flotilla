@@ -14,10 +14,8 @@ use super::{
     resolver::HopResolver,
     Hop, HopPlan, ResolutionContext, ResolvedAction,
 };
-use crate::{
-    config::{HostsConfig, RemoteHostConfig, SshConfig},
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-};
+use crate::config::{HostsConfig, RemoteHostConfig, SshConfig};
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
 fn context() -> ResolutionContext {
     ResolutionContext {

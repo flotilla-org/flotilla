@@ -255,7 +255,7 @@ async fn build_embedded_resource_backend(config: &ConfigStore) -> Result<Resourc
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
-    let local_daemon_socket_path = flotilla_core::path_policy::daemon_socket_path(config.base_path().as_path());
+    let local_daemon_socket_path = flotilla_paths::path_policy::daemon_socket_path(config.base_path().as_path());
     let peer_manager = build_peer_manager(&daemon, config, local_daemon_socket_path.as_path())?;
     {
         let daemon = Arc::clone(&daemon);
@@ -818,7 +818,7 @@ async fn handle_client_session_with_caller(
         _ = shutdown_rx.changed() => None,
     };
 
-    let build_id = flotilla_core::build_info::build_id();
+    let build_id = flotilla_daemon_api::build_info::build_id();
 
     let Some(first_msg) = first_msg else {
         return;

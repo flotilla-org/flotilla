@@ -395,7 +395,7 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn charter_snapshot(&self, source: &flotilla_resources::CharterSource) -> Result<crate::charter_store::CharterSnapshot, String> {
         let vcs = crate::vcs::FlotillaVcs::new(
-            crate::path_context::ExecutionEnvironmentPath::new("/"),
+            flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
             self.runner.clone(),
             crate::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
         );
@@ -558,13 +558,13 @@ mod tests {
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::{
-        path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::test_support::{test_vcs_resolver, DiscoveryMockRunner},
             ChannelLabel, CommandOutput, CommandRunner,
         },
         vcs::EnumeratedCheckout,
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // Process boundary: count and reject every Git command except worktree enumeration.
     struct ObservationRunner {

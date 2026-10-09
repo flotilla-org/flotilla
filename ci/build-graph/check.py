@@ -29,6 +29,8 @@ def violations(metadata):
         return False
 
     errors = []
+    if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
+        errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
     for name, package in sorted(packages.items()):
         for dependency in package["dependencies"]:
             target = dependency["name"]

@@ -231,7 +231,7 @@ pub(super) trait ProjectOperations: Send + Sync {
 #[async_trait]
 impl ProjectOperations for InProcessDaemon {
     fn remember_bootstrap_checkout(&self, inspection: &RepositoryInspection) -> Result<(), String> {
-        use crate::path_context::ExecutionEnvironmentPath;
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         let path = ExecutionEnvironmentPath::new(&inspection.checkout.path);
         self.config.add_observation_root(&path)?;
         self.config.set_checkout_config(&path, inspection.spec.vcs().clone());

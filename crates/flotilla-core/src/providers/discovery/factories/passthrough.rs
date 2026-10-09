@@ -6,13 +6,13 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         terminal::{passthrough::PassthroughTerminalPool, TerminalPool},
         CommandRunner,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct PassthroughTerminalPoolFactory;
 
@@ -43,9 +43,9 @@ mod tests {
     use super::PassthroughTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentBag, Factory},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn passthrough_factory_always_succeeds() {

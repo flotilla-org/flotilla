@@ -7,13 +7,13 @@ use std::{
 use color_eyre::Result;
 use flotilla_core::{
     config::ConfigStore,
-    daemon::DaemonHandle,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         vcs::{git::GitVcs, VcsInspection},
         ProcessCommandRunner,
     },
 };
+use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, ProjectListResponse, RepoIdentity, RepoInfo, ViewAddress};
 use flotilla_tui::{
     app, event_log,
@@ -279,7 +279,7 @@ pub(crate) async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
     cli.require_local_daemon("daemon")?;
     let daemon_binary = resolve_flotillad_binary()?;
     let CliPaths { config_dir, state_dir, socket_path } = cli.daemon_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
-    flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
+    flotilla_paths::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
         .map_err(|error| color_eyre::eyre::eyre!(error))?;
     let mut command = tokio::process::Command::new(&daemon_binary);
     command.arg("--timeout").arg(timeout_secs.to_string());

@@ -5,10 +5,8 @@ use std::{
 
 use tracing::info;
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{run, types::*, CommandRunner, TaskId},
-};
+use crate::providers::{run, types::*, CommandRunner, TaskId};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 /// Resolve `.` and `..` components in-place without touching the filesystem.
 fn normalize_path(path: &Path) -> PathBuf {

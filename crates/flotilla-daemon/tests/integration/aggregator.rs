@@ -11,7 +11,6 @@ use std::{
 
 use flotilla_core::{
     config::ConfigStore,
-    daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
         discovery::test_support::{
@@ -21,6 +20,7 @@ use flotilla_core::{
     },
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet},
     test_support::TestIssue,

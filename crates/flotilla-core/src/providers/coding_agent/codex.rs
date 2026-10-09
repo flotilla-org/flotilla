@@ -11,10 +11,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::{
-    path_context::ExecutionEnvironmentPath,
-    providers::{http_execute, types::*, HttpClient},
-};
+use crate::providers::{http_execute, types::*, HttpClient};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 // --- Auth ---
 

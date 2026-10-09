@@ -6,13 +6,13 @@ use async_trait::async_trait;
 
 use crate::{
     config::ConfigStore,
-    path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         terminal::{cleat::CleatTerminalPool, TerminalPool},
         CommandRunner,
     },
 };
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub struct CleatTerminalPoolFactory;
 
@@ -48,9 +48,9 @@ mod tests {
     use super::CleatTerminalPoolFactory;
     use crate::{
         config::ConfigStore,
-        path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // #2706: factory discovery supplies the execution host baseline, while
     // Cleat owns terminal identity and ambient harness values never transfer.

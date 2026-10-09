@@ -11,7 +11,6 @@ use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
     in_process::InProcessDaemon,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{EnvVars, EnvironmentBag},
         registry::ProviderRegistry,
@@ -19,6 +18,7 @@ use flotilla_core::{
     },
 };
 use flotilla_credentials::CredentialStore;
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
     host_direct_environment_name, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host, HostCondition,

@@ -12,10 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
-};
+use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend,

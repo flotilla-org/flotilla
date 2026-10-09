@@ -24,13 +24,10 @@ use flotilla_controllers::reconcilers::{
     RepositoryReconciler, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
-    checkout_integration::LANDING_EVIDENCE_TTL,
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::registry::ProviderRegistry,
+    checkout_integration::LANDING_EVIDENCE_TTL, config::ConfigStore, in_process::InProcessDaemon, providers::registry::ProviderRegistry,
 };
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     controller::ControllerLoop, host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, ConvoyReconciler, Environment, Forge,

@@ -12,12 +12,12 @@ use flotilla_resources::{
 use super::support::test_meta;
 use crate::change_request_observer::ChangeRequestRef;
 use crate::config::ConfigStore;
-use crate::daemon::DaemonHandle;
 use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
 use crate::model::RepoModel;
 use crate::providers::discovery::test_support::fake_discovery;
 use crate::providers::registry::ProviderRegistry;
 use crate::repo_state::{RepoRootState, RepoState};
+use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]
 async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
