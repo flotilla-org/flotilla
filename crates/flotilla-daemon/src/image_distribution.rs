@@ -9,12 +9,11 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::providers::{ChannelLabel, CommandRunner};
+use flotilla_credentials::CredentialStore;
 use flotilla_resources::{
     is_image_digest, FleetDesignation, Host, HostImageAction, ImageBuild, ImageBuildPhase, ImageCacheBinding, PlacedImageIdentity,
     ResourceBackend, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY,
 };
-
-use crate::credential::CredentialStore;
 
 const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 

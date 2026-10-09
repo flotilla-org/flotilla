@@ -7,15 +7,17 @@ license.workspace = true
 [features]
 # Keep helper features uniform across build/workspace/package commands on stable.
 default = ["test-support"]
-aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests"]
+aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider", "flotilla-credentials/aws-lc-provider", "flotilla-aggregator/aws-lc-provider"]
+skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
 test-support = ["flotilla-protocol/test-support", "dep:flotilla-client"]
 
 [dependencies]
 bon = { workspace = true }
+flotilla-aggregator = { path = "../flotilla-aggregator" }
 flotilla-client = { path = "../flotilla-client", optional = true }
 flotilla-controllers = { path = "../flotilla-controllers" }
 flotilla-core = { path = "../flotilla-core" }
+flotilla-credentials = { path = "../flotilla-credentials" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
@@ -34,7 +36,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 url = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 futures = "0.3"
 tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-webpki-roots"] }
 visibility = "0.1.1"

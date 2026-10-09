@@ -107,7 +107,7 @@ struct SharedIssueRefresh {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct IssuePollingHealth {
+pub struct IssuePollingHealth {
     backoff: Arc<StdMutex<BudgetBackoff>>,
 }
 
@@ -117,7 +117,7 @@ struct BudgetBackoff {
 }
 
 impl IssuePollingHealth {
-    pub(crate) fn note(&self, message: &str) {
+    pub fn note(&self, message: &str) {
         if let Some(reset) = core_rate_limit_reset(message) {
             let mut backoff = self.backoff.lock().expect("issue polling health lock poisoned");
             if backoff.current.as_ref().is_none_or(|(current, _)| reset > *current) {
@@ -135,7 +135,7 @@ impl IssuePollingHealth {
             .and_then(|(reset, message)| (*reset > Utc::now()).then(|| message.clone()))
     }
 
-    pub(crate) fn condition(&self) -> Option<HostCondition> {
+    pub fn condition(&self) -> Option<HostCondition> {
         let message = self.active_error()?;
         Some(
             HostCondition::builder()

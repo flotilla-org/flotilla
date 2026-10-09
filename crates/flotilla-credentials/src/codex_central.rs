@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use flotilla_core::providers::{discovery::EnvVars, ChannelLabel, HttpClient, ReqwestHttpClient};
+use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
@@ -41,7 +42,7 @@ const DEAD_REFRESH_TOKEN_REASONS: &[&str] = &["refresh_token_expired", "refresh_
 /// task is its sole writer; `CodexMaterialAdapter`
 /// (`crates/flotilla-daemon/src/agent_material.rs`) reads from this same
 /// path to deliver read-only `0400` copies into crew homes.
-pub(crate) fn codex_central_auth_path(env: &dyn EnvVars) -> PathBuf {
+pub fn codex_central_auth_path(env: &dyn EnvVars) -> PathBuf {
     env.get("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
@@ -60,7 +61,7 @@ struct CodexRefreshResponse {
 /// so a WARN log line tells an operator whether to expect the next tick to
 /// self-heal or whether the central slot needs a fresh login.
 #[derive(Debug)]
-pub(crate) enum CodexRefreshFailure {
+pub enum CodexRefreshFailure {
     /// Local problem with the central `auth.json` itself (missing, invalid,
     /// no refresh token, or a write failure) — not the token endpoint's fault.
     Local(String),
@@ -83,9 +84,9 @@ impl std::fmt::Display for CodexRefreshFailure {
 
 /// A successful refresh, reported so the caller can log what moved.
 #[derive(Debug)]
-pub(crate) struct CodexRefreshSuccess {
-    pub(crate) rotated_fields: Vec<&'static str>,
-    pub(crate) access_token_expires_at: Option<DateTime<Utc>>,
+pub struct CodexRefreshSuccess {
+    pub rotated_fields: Vec<&'static str>,
+    pub access_token_expires_at: Option<DateTime<Utc>>,
 }
 
 #[async_trait]
@@ -157,7 +158,7 @@ impl CodexTokenRefresher for RealCodexTokenRefresher {
 
 /// Refreshes a single host-owned Codex `auth.json` by direct OAuth
 /// `grant_type=refresh_token`, the same primitive as `scripts/codex-token-refresh`.
-pub(crate) struct CodexCentralRefresher {
+pub struct CodexCentralRefresher {
     auth_path: PathBuf,
     refresher: Arc<dyn CodexTokenRefresher>,
 }
@@ -167,7 +168,7 @@ impl CodexCentralRefresher {
     /// `CODEX_APP_SERVER_LOGIN_CLIENT_ID` overrides codex-rs and
     /// `scripts/codex-token-refresh` do, so this and a real `codex` CLI
     /// agree on where to refresh against without inventing new knobs.
-    pub(crate) fn new(auth_path: PathBuf, env: &dyn EnvVars) -> Self {
+    pub fn new(auth_path: PathBuf, env: &dyn EnvVars) -> Self {
         let token_url =
             env.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE").filter(|value| !value.is_empty()).unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string());
         let client_id = env
@@ -185,14 +186,16 @@ impl CodexCentralRefresher {
         Self { auth_path, refresher }
     }
 
-    pub(crate) async fn refresh_once(&self) -> Result<CodexRefreshSuccess, CodexRefreshFailure> {
-        let mut auth = load_auth(&self.auth_path).await?;
-        let refresh_token = extract_refresh_token(&auth)?;
-        let response = self.refresher.refresh(&refresh_token).await?;
-        let rotated_fields = apply_refresh(&mut auth, &response)?;
-        write_auth_atomic(&self.auth_path, &auth).await?;
-        let access_token_expires_at = response.access_token.as_deref().and_then(decode_jwt_exp);
-        Ok(CodexRefreshSuccess { rotated_fields, access_token_expires_at })
+    pub fn refresh_once(&self) -> BoxFuture<'_, Result<CodexRefreshSuccess, CodexRefreshFailure>> {
+        Box::pin(async move {
+            let mut auth = load_auth(&self.auth_path).await?;
+            let refresh_token = extract_refresh_token(&auth)?;
+            let response = self.refresher.refresh(&refresh_token).await?;
+            let rotated_fields = apply_refresh(&mut auth, &response)?;
+            write_auth_atomic(&self.auth_path, &auth).await?;
+            let access_token_expires_at = response.access_token.as_deref().and_then(decode_jwt_exp);
+            Ok(CodexRefreshSuccess { rotated_fields, access_token_expires_at })
+        })
     }
 }
 

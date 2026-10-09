@@ -13,6 +13,8 @@ members = [
     "crates/flotilla-controllers",
     "crates/flotilla-transport",
     "crates/flotilla-daemon",
+    "crates/flotilla-credentials",
+    "crates/flotilla-aggregator",
     "crates/flotilla-tui",
     "crates/flotilla-test-support",
     "crates/tender",

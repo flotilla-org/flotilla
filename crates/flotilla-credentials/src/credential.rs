@@ -18,6 +18,7 @@ use flotilla_resources::{
     CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError,
     SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
+use futures::future::BoxFuture;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OnceCell, RwLock};
@@ -286,7 +287,7 @@ struct AmbientClaudeOauthMetadata {
 type LedgerDeliveryRecord = BTreeMap<String, BTreeMap<String, String>>;
 type GithubAppDeliveryLocks = BTreeMap<(String, String), Weak<Mutex<()>>>;
 
-pub(crate) struct CredentialStore {
+pub struct CredentialStore {
     backend: ResourceBackend,
     namespace: String,
     env: Arc<dyn EnvVars>,
@@ -357,18 +358,18 @@ impl GithubAppDelivery {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GithubAppScope {
-    pub(crate) fixed_repositories: BTreeSet<RepositoryKey>,
-    pub(crate) projects: BTreeSet<String>,
-    pub(crate) permissions: Option<BTreeMap<String, String>>,
+pub struct GithubAppScope {
+    pub fixed_repositories: BTreeSet<RepositoryKey>,
+    pub projects: BTreeSet<String>,
+    pub permissions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
-pub(crate) struct CredentialRefreshError {
-    pub(crate) environment_ref: String,
-    pub(crate) credential_name: Option<String>,
-    pub(crate) message: String,
-    pub(crate) should_surface: bool,
+pub struct CredentialRefreshError {
+    pub environment_ref: String,
+    pub credential_name: Option<String>,
+    pub message: String,
+    pub should_surface: bool,
 }
 
 const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
@@ -504,27 +505,29 @@ impl CredentialStore {
     /// Remove staging files left by a previous daemon process. The current
     /// config base can differ from the previous one when XDG_RUNTIME_DIR
     /// becomes available, so inspect the state fallback as well.
-    pub(crate) async fn cleanup_stale_github_app_token_files(&self) -> Result<(), String> {
-        let mut errors = Vec::new();
-        if let Err(error) = cleanup_stale_github_app_token_files_in(&self.state_dir).await {
-            errors.push(error);
-        }
-        match self.delivery_paths(&*self.host_runner).await {
-            Ok(paths) if paths.base != self.state_dir => {
-                if let Err(error) = cleanup_stale_github_app_token_files_in(&paths.base).await {
-                    errors.push(error);
-                }
+    pub fn cleanup_stale_github_app_token_files(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let mut errors = Vec::new();
+            if let Err(error) = cleanup_stale_github_app_token_files_in(&self.state_dir).await {
+                errors.push(error);
             }
-            Err(error) => errors.push(error),
-            Ok(_) => {}
-        }
-        if !errors.is_empty() {
-            return Err(errors.join("; "));
-        }
-        Ok(())
+            match self.delivery_paths(&*self.host_runner).await {
+                Ok(paths) if paths.base != self.state_dir => {
+                    if let Err(error) = cleanup_stale_github_app_token_files_in(&paths.base).await {
+                        errors.push(error);
+                    }
+                }
+                Err(error) => errors.push(error),
+                Ok(_) => {}
+            }
+            if !errors.is_empty() {
+                return Err(errors.join("; "));
+            }
+            Ok(())
+        })
     }
 
-    pub(crate) fn new(
+    pub fn new(
         backend: ResourceBackend,
         namespace: &str,
         env: Arc<dyn EnvVars>,
@@ -535,7 +538,7 @@ impl CredentialStore {
         Self::new_with_http(backend, namespace, env, host_bag, host_runner, Arc::new(ReqwestHttpClient::new()), state_dir)
     }
 
-    pub(crate) fn new_with_http(
+    pub fn new_with_http(
         backend: ResourceBackend,
         namespace: &str,
         env: Arc<dyn EnvVars>,
@@ -592,62 +595,68 @@ impl CredentialStore {
         }
     }
 
-    pub(crate) async fn vessel_config_fragments(
-        &self,
-        credential_refs: &BTreeSet<String>,
-        environment: &BTreeMap<String, String>,
-    ) -> Result<Vec<Fragment>, String> {
-        let mut fragments = Vec::new();
-        for name in credential_refs {
-            let spec = self.spec(name).await?;
-            match spec.consumer {
-                CredentialConsumer::Codex if !environment.contains_key("CODEX_HOME") => {
-                    fragments.push(codex_home_fragment(name, format!("credential-delivery-pending:{name}")))
+    pub fn vessel_config_fragments<'a>(
+        &'a self,
+        credential_refs: &'a BTreeSet<String>,
+        environment: &'a BTreeMap<String, String>,
+    ) -> BoxFuture<'a, Result<Vec<Fragment>, String>> {
+        Box::pin(async move {
+            let mut fragments = Vec::new();
+            for name in credential_refs {
+                let spec = self.spec(name).await?;
+                match spec.consumer {
+                    CredentialConsumer::Codex if !environment.contains_key("CODEX_HOME") => {
+                        fragments.push(codex_home_fragment(name, format!("credential-delivery-pending:{name}")))
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        Ok(fragments)
+            Ok(fragments)
+        })
     }
 
-    pub(crate) async fn vessel_config_fragments_for_runner(
-        &self,
-        credential_refs: &BTreeSet<String>,
-        environment: &BTreeMap<String, String>,
-        runner: &dyn CommandRunner,
-    ) -> Result<Vec<Fragment>, String> {
-        let mut codex_credentials = Vec::new();
-        for name in credential_refs {
-            let spec = self.spec(name).await?;
-            if matches!(spec.consumer, CredentialConsumer::Codex) && !environment.contains_key("CODEX_HOME") {
-                codex_credentials.push(name);
+    pub fn vessel_config_fragments_for_runner<'a>(
+        &'a self,
+        credential_refs: &'a BTreeSet<String>,
+        environment: &'a BTreeMap<String, String>,
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<Vec<Fragment>, String>> {
+        Box::pin(async move {
+            let mut codex_credentials = Vec::new();
+            for name in credential_refs {
+                let spec = self.spec(name).await?;
+                if matches!(spec.consumer, CredentialConsumer::Codex) && !environment.contains_key("CODEX_HOME") {
+                    codex_credentials.push(name);
+                }
             }
-        }
-        if codex_credentials.is_empty() {
-            return Ok(Vec::new());
-        }
-        let paths = self.delivery_paths(runner).await?;
-        Ok(codex_credentials
-            .into_iter()
-            .map(|name| codex_home_fragment(name, paths.credential_dir(name).join("codex").to_string_lossy()))
-            .collect())
+            if codex_credentials.is_empty() {
+                return Ok(Vec::new());
+            }
+            let paths = self.delivery_paths(runner).await?;
+            Ok(codex_credentials
+                .into_iter()
+                .map(|name| codex_home_fragment(name, paths.credential_dir(name).join("codex").to_string_lossy()))
+                .collect())
+        })
     }
 
-    pub(crate) async fn held_credentials(&self) -> Result<BTreeSet<String>, String> {
-        let specs = self
-            .backend
-            .clone()
-            .definitions::<CredentialSpec>(&self.namespace)
-            .list()
-            .await
-            .map_err(|error| format!("list credential declarations: {error}"))?;
-        let mut held = BTreeSet::new();
-        for spec in specs {
-            if self.source_is_available(&spec.spec).await {
-                held.insert(spec.metadata.name);
+    pub fn held_credentials(&self) -> BoxFuture<'_, Result<BTreeSet<String>, String>> {
+        Box::pin(async move {
+            let specs = self
+                .backend
+                .clone()
+                .definitions::<CredentialSpec>(&self.namespace)
+                .list()
+                .await
+                .map_err(|error| format!("list credential declarations: {error}"))?;
+            let mut held = BTreeSet::new();
+            for spec in specs {
+                if self.source_is_available(&spec.spec).await {
+                    held.insert(spec.metadata.name);
+                }
             }
-        }
-        Ok(held)
+            Ok(held)
+        })
     }
 
     /// Expiry metadata for held material, keyed by scope name. Timestamps
@@ -655,12 +664,14 @@ impl CredentialStore {
     /// `CredentialSpec`s contribute here once an adapter can express expiry
     /// without touching material; today none of the declared sources carry
     /// such metadata, so the map holds only the ambient claude login.
-    pub(crate) async fn credential_expiry(&self) -> BTreeMap<String, CredentialExpiry> {
-        let mut expiry = BTreeMap::new();
-        if let Some(ambient) = self.ambient_claude_expiry().await {
-            expiry.insert(AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), ambient);
-        }
-        expiry
+    pub fn credential_expiry(&self) -> BoxFuture<'_, BTreeMap<String, CredentialExpiry>> {
+        Box::pin(async move {
+            let mut expiry = BTreeMap::new();
+            if let Some(ambient) = self.ambient_claude_expiry().await {
+                expiry.insert(AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), ambient);
+            }
+            expiry
+        })
     }
 
     async fn ambient_claude_expiry(&self) -> Option<CredentialExpiry> {
@@ -672,13 +683,18 @@ impl CredentialStore {
         parse_ambient_claude_expiry(&contents, &path)
     }
 
-    pub(crate) async fn remote_ambient_claude_expiry(host_bag: &EnvironmentBag, runner: &dyn CommandRunner) -> Option<CredentialExpiry> {
-        let path = match host_bag.find_env_var("CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty()) {
-            Some(dir) => PathBuf::from(dir).join(".credentials.json"),
-            None => PathBuf::from(host_bag.find_env_var("HOME")?).join(".claude/.credentials.json"),
-        };
-        let contents = runner.run("cat", &[path.to_str()?], Path::new("/"), &ChannelLabel::Default).await.ok()?;
-        parse_ambient_claude_expiry(contents.as_bytes(), &path)
+    pub fn remote_ambient_claude_expiry<'a>(
+        host_bag: &'a EnvironmentBag,
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Option<CredentialExpiry>> {
+        Box::pin(async move {
+            let path = match host_bag.find_env_var("CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty()) {
+                Some(dir) => PathBuf::from(dir).join(".credentials.json"),
+                None => PathBuf::from(host_bag.find_env_var("HOME")?).join(".claude/.credentials.json"),
+            };
+            let contents = runner.run("cat", &[path.to_str()?], Path::new("/"), &ChannelLabel::Default).await.ok()?;
+            parse_ambient_claude_expiry(contents.as_bytes(), &path)
+        })
     }
 }
 
@@ -732,15 +748,17 @@ impl CredentialStore {
         self.prepare_scoped_with_permissions(environment_ref, credential_refs, credential_scopes, &BTreeMap::new(), runner).await
     }
 
-    pub(crate) async fn prepare_scoped_with_permissions(
-        &self,
-        environment_ref: &str,
-        credential_refs: &BTreeSet<String>,
-        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
-        credential_permissions: &BTreeMap<String, BTreeMap<String, String>>,
+    pub fn prepare_scoped_with_permissions<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        credential_refs: &'a BTreeSet<String>,
+        credential_scopes: &'a BTreeMap<String, BTreeSet<RepositoryKey>>,
+        credential_permissions: &'a BTreeMap<String, BTreeMap<String, String>>,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Vec<(String, String)>, String> {
-        self.prepare_scoped_inner(environment_ref, credential_refs, credential_scopes, credential_permissions, runner).await
+    ) -> BoxFuture<'a, Result<Vec<(String, String)>, String>> {
+        Box::pin(async move {
+            self.prepare_scoped_inner(environment_ref, credential_refs, credential_scopes, credential_permissions, runner).await
+        })
     }
 
     async fn prepare_scoped_inner(
@@ -982,19 +1000,21 @@ impl CredentialStore {
         Ok(env.into_iter().collect())
     }
 
-    pub(crate) async fn ledger_delivery_environment(&self, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
-        let records = self.ledger_delivery_environment.lock().await;
-        let mut env = BTreeMap::new();
-        if let Some(deliveries) = records.get(environment_ref) {
-            for (name, delivery) in deliveries {
-                for (key, value) in delivery {
-                    if env.insert(key.clone(), value.clone()).is_some() {
-                        return Err(format!("multiple credentials supplied {key} for environment {environment_ref}, including {name}"));
+    pub fn ledger_delivery_environment<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, Result<BTreeMap<String, String>, String>> {
+        Box::pin(async move {
+            let records = self.ledger_delivery_environment.lock().await;
+            let mut env = BTreeMap::new();
+            if let Some(deliveries) = records.get(environment_ref) {
+                for (name, delivery) in deliveries {
+                    for (key, value) in delivery {
+                        if env.insert(key.clone(), value.clone()).is_some() {
+                            return Err(format!("multiple credentials supplied {key} for environment {environment_ref}, including {name}"));
+                        }
                     }
                 }
             }
-        }
-        Ok(env)
+            Ok(env)
+        })
     }
 
     /// Rebuild refresh registrations for an already-running environment from
@@ -1012,44 +1032,46 @@ impl CredentialStore {
             .await
     }
 
-    pub(crate) async fn adopt_github_app_deliveries_with_permissions(
-        &self,
-        environment_ref: &str,
-        credential_refs: &BTreeSet<String>,
-        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
-        credential_permissions: &BTreeMap<String, BTreeMap<String, String>>,
+    pub fn adopt_github_app_deliveries_with_permissions<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        credential_refs: &'a BTreeSet<String>,
+        credential_scopes: &'a BTreeMap<String, BTreeSet<RepositoryKey>>,
+        credential_permissions: &'a BTreeMap<String, BTreeMap<String, String>>,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<(), CredentialRefreshError> {
-        let mut github_app_refs = BTreeSet::new();
-        for name in credential_refs {
-            let spec = match self.spec(name).await {
-                Ok(spec) => spec,
-                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
-            };
-            if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
-                github_app_refs.insert(name.clone());
+    ) -> BoxFuture<'a, Result<(), CredentialRefreshError>> {
+        Box::pin(async move {
+            let mut github_app_refs = BTreeSet::new();
+            for name in credential_refs {
+                let spec = match self.spec(name).await {
+                    Ok(spec) => spec,
+                    Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+                };
+                if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                    github_app_refs.insert(name.clone());
+                }
             }
-        }
-        let deliveries = self.github_app_deliveries.lock().await;
-        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
-        drop(deliveries);
-        if github_app_refs.is_empty() || already_adopted {
+            let deliveries = self.github_app_deliveries.lock().await;
+            let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
+            drop(deliveries);
+            if github_app_refs.is_empty() || already_adopted {
+                self.github_app_adoption_failures.lock().await.remove(environment_ref);
+                return Ok(());
+            }
+            let github_app_scopes = credential_scopes
+                .iter()
+                .filter(|(name, _)| github_app_refs.contains(*name))
+                .map(|(name, scopes)| (name.clone(), scopes.clone()))
+                .collect();
+            if let Err(message) = self
+                .prepare_scoped_with_permissions(environment_ref, &github_app_refs, &github_app_scopes, credential_permissions, runner)
+                .await
+            {
+                return Err(self.record_adoption_failure(environment_ref, message).await);
+            }
             self.github_app_adoption_failures.lock().await.remove(environment_ref);
-            return Ok(());
-        }
-        let github_app_scopes = credential_scopes
-            .iter()
-            .filter(|(name, _)| github_app_refs.contains(*name))
-            .map(|(name, scopes)| (name.clone(), scopes.clone()))
-            .collect();
-        if let Err(message) = self
-            .prepare_scoped_with_permissions(environment_ref, &github_app_refs, &github_app_scopes, credential_permissions, runner)
-            .await
-        {
-            return Err(self.record_adoption_failure(environment_ref, message).await);
-        }
-        self.github_app_adoption_failures.lock().await.remove(environment_ref);
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn record_adoption_failure(&self, environment_ref: &str, message: String) -> CredentialRefreshError {
@@ -1066,278 +1088,297 @@ impl CredentialStore {
 
     /// Registry host actions resolve only declared material and own their private
     /// Docker configuration for this operation, including error/cancellation cleanup.
-    pub(crate) async fn image_registry_operation(
-        &self,
-        host: &str,
+    pub fn image_registry_operation<'a>(
+        &'a self,
+        host: &'a str,
         action: flotilla_resources::HostImageAction,
-        credential: &str,
-        repository: &str,
-        arguments: &[&str],
-    ) -> Result<String, String> {
-        use flotilla_resources::{CredentialGrant, Host, HostImageAction, ImageBuildCapacity};
-        let verb = match action {
-            HostImageAction::ImagePush => "push",
-            HostImageAction::ImagePull => "pull",
-        };
-        if arguments.len() != 2 || arguments[0] != verb || !image_registry_matches(arguments[1], repository.split('/').next().unwrap_or(""))
-        {
-            return Err("host image action requires its declared registry operation".into());
-        }
-        if !arguments[1].strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
-            return Err("host image operation does not target the declared repository".into());
-        }
-        if action == HostImageAction::ImagePull
-            && !arguments[1].rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
-        {
-            return Err("host image pull requires a manifest digest".into());
-        }
-        let hosts = self.backend.including_replicas::<Host>(&self.namespace).list().await.map_err(|error| error.to_string())?;
-        let declared_builder = hosts.items.iter().any(|source| {
-            source.object.metadata.name == host
-                && matches!(source.object.spec.image_build_capacity, Some(ImageBuildCapacity::Builder { slots, .. }) if slots > 0)
-        });
-        let grants = self.backend.definitions::<CredentialGrant>(&self.namespace).list().await.map_err(|error| error.to_string())?;
-        if !grants.iter().any(|grant| {
-            grant.spec.credentials.contains(credential) && grant.spec.selector.matches_host_action(host, action, declared_builder)
-        }) {
-            return Err(format!("host {host} has no {action:?} grant for credential {credential}"));
-        }
-        let spec = self.spec(credential).await?;
-        let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
-            return Err("image cache credential must use the docker-registry adapter".into());
-        };
-        if !image_registry_matches(repository, registry) {
-            return Err("image cache credential does not match declared registry".into());
-        }
-        let material = self.resolve_for_adapter(credential, &spec, None, None).await?;
-        let material = material.value.trim_end();
-        validate_scalar_material(credential, "docker-registry", material)?;
-        let root = self.state_dir.join("image-registry-operations");
-        tokio::fs::create_dir_all(&root).await.map_err(|error| error.to_string())?;
-        // TempDir removes the config on cancellation as well as every return path.
-        let config = tempfile::Builder::new().prefix("operation-").tempdir_in(root).map_err(|error| error.to_string())?;
-        tokio::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;
-        let directory = config.path().to_string_lossy();
-        let operation = async {
-            self.host_runner
-                .run_with_input(
-                    "docker",
-                    &["--config", &directory, "login", "--username", username, "--password-stdin", registry],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                    material.as_bytes(),
-                )
-                .await?;
-            let mut args = vec!["--config", directory.as_ref()];
-            args.extend_from_slice(arguments);
-            self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
-        };
-        let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), operation)
-            .await
-            .map_err(|_| "image registry operation timed out".to_string())?
-            .map_err(|error| bounded_adapter_error(credential, "docker-registry", &error.replace(material, "[redacted]")))?;
-        // Return only Docker's non-secret operation output, never login output.
-        Ok(output.replace(material, "[redacted]"))
-    }
-
-    pub(crate) async fn prepare_registry_pull(
-        &self,
-        environment_ref: &str,
-        credential_refs: &BTreeSet<String>,
-        image: &str,
-    ) -> Result<PreparedEnvironmentAuth, String> {
-        let mut matching = Vec::new();
-        for name in credential_refs {
-            let spec = self.spec(name).await?;
-            let CredentialConsumer::DockerRegistry { registry, .. } = &spec.consumer else {
-                continue;
+        credential: &'a str,
+        repository: &'a str,
+        arguments: &'a [&'a str],
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            use flotilla_resources::{CredentialGrant, Host, HostImageAction, ImageBuildCapacity};
+            let verb = match action {
+                HostImageAction::ImagePush => "push",
+                HostImageAction::ImagePull => "pull",
             };
-            if image_registry_matches(image, registry) {
-                matching.push((name.clone(), spec));
+            if arguments.len() != 2
+                || arguments[0] != verb
+                || !image_registry_matches(arguments[1], repository.split('/').next().unwrap_or(""))
+            {
+                return Err("host image action requires its declared registry operation".into());
             }
-        }
-        let Some((name, spec)) = matching.pop() else {
-            return Ok(PreparedEnvironmentAuth::NoRegistryCredential);
-        };
-        if !matching.is_empty() {
-            return Err(bounded_adapter_error(&name, "docker-registry", "multiple granted credentials match the image registry"));
-        }
-        let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
-            unreachable!("matching credentials are docker-registry consumers");
-        };
-        // Keep creation, preflight, and registration in the same critical section
-        // as sweeping: a fresh cache must not look orphaned before it is indexed.
-        let _maintenance = self.registry_cache_maintenance.read().await;
-        let previous = self.registry_configs.lock().await.remove(environment_ref);
-        if let Some(previous) = previous {
-            remove_registry_config(&previous)
-                .await
-                .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
-        }
-        let material = self.resolve_for_adapter(&name, &spec, None, None).await?;
-        let material = material.value.trim_end();
-        validate_scalar_material(&name, "docker-registry", material)?;
-        let config_dir = self
-            .state_dir
-            .join("credential-runtime")
-            .join(registry_environment_dir(environment_ref))
-            .join(uuid::Uuid::new_v4().to_string());
-        tokio::fs::create_dir_all(&config_dir)
-            .await
-            .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("create cache directory: {error}")))?;
-        tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
-            .await
-            .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("protect cache directory: {error}")))?;
-        let config = config_dir.to_string_lossy();
-        let operation = async {
-            self.host_runner
-                .run_with_input(
-                    "docker",
-                    &["--config", &config, "login", "--username", username, "--password-stdin", registry],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                    material.as_bytes(),
-                )
-                .await
-                .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
-            self.host_runner
-                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
-        }
-        .await;
-        if let Err(operation_error) = operation {
-            let cleanup_result = remove_registry_config(&config_dir).await;
-            let detail = match cleanup_result {
-                Ok(()) => operation_error,
-                Err(cleanup_error) => format!("{operation_error}; additionally failed to remove writable cache: {cleanup_error}"),
+            if !arguments[1].strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
+                return Err("host image operation does not target the declared repository".into());
+            }
+            if action == HostImageAction::ImagePull
+                && !arguments[1].rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
+            {
+                return Err("host image pull requires a manifest digest".into());
+            }
+            let hosts = self.backend.including_replicas::<Host>(&self.namespace).list().await.map_err(|error| error.to_string())?;
+            let declared_builder = hosts.items.iter().any(|source| {
+                source.object.metadata.name == host
+                    && matches!(source.object.spec.image_build_capacity, Some(ImageBuildCapacity::Builder { slots, .. }) if slots > 0)
+            });
+            let grants = self.backend.definitions::<CredentialGrant>(&self.namespace).list().await.map_err(|error| error.to_string())?;
+            if !grants.iter().any(|grant| {
+                grant.spec.credentials.contains(credential) && grant.spec.selector.matches_host_action(host, action, declared_builder)
+            }) {
+                return Err(format!("host {host} has no {action:?} grant for credential {credential}"));
+            }
+            let spec = self.spec(credential).await?;
+            let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
+                return Err("image cache credential must use the docker-registry adapter".into());
             };
-            return Err(bounded_adapter_error(&name, "docker-registry", &detail));
-        }
-        self.registry_configs.lock().await.insert(environment_ref.to_string(), config_dir.clone());
-        Ok(PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new(config_dir) })
-    }
-
-    pub(crate) async fn prepare_skill_source(
-        &self,
-        credential_name: &str,
-        repository: &str,
-        runner: &dyn CommandRunner,
-    ) -> Result<PathBuf, String> {
-        let spec = self.spec(credential_name).await?;
-        let repository_name = skill_source_repository(credential_name, &spec, repository)?;
-        let (
-            CredentialConsumer::GithubApp { installation_id, installation_repository, permissions, .. },
-            CredentialSource::GithubApp { app_id_path, private_key_path },
-        ) = (&spec.consumer, &spec.source)
-        else {
-            return Err(bounded_adapter_error(credential_name, "github-app", "skill source requires a GitHub App consumer and source"));
-        };
-        let installation_id = match (installation_id, installation_repository) {
-            (Some(id), None) => *id,
-            (None, Some(installation_repository)) => {
-                self.resolve_github_app_installation(installation_repository, app_id_path, private_key_path).await?
+            if !image_registry_matches(repository, registry) {
+                return Err("image cache credential does not match declared registry".into());
             }
-            (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".to_string()),
-            (None, None) => return Err("declare either `installation_id` or `installation_repository`".to_string()),
-        };
-        let mut request = GithubAppMintRequest {
-            installation_id,
-            app_id_path: app_id_path.clone(),
-            private_key_path: private_key_path.clone(),
-            repositories: vec![repository_name],
-            permissions: permissions.clone(),
-        };
-        let token = self
-            .mint_github_app(&mut request, installation_repository.as_deref())
-            .await
-            .map_err(|error| bounded_adapter_error(credential_name, "github-app", &error.to_string()))?;
-        if token.value.trim().is_empty() {
-            return Err(bounded_adapter_error(credential_name, "github-app", "installation token response was empty"));
-        }
-        let paths = self.delivery_paths(runner).await?;
-        prune_abandoned_skill_source_tokens(runner, &paths.base.join("skill-sources")).await?;
-        // Each staging owns its token. A concurrent staging must not replace or
-        // delete a token while another Git process is still reading it.
-        let token_file =
-            paths.base.join("skill-sources").join(safe_component(credential_name)).join(format!("token-{}", uuid::Uuid::new_v4()));
-        write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
-        Ok(token_file)
+            let material = self.resolve_for_adapter(credential, &spec, None, None).await?;
+            let material = material.value.trim_end();
+            validate_scalar_material(credential, "docker-registry", material)?;
+            let root = self.state_dir.join("image-registry-operations");
+            tokio::fs::create_dir_all(&root).await.map_err(|error| error.to_string())?;
+            // TempDir removes the config on cancellation as well as every return path.
+            let config = tempfile::Builder::new().prefix("operation-").tempdir_in(root).map_err(|error| error.to_string())?;
+            tokio::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;
+            let directory = config.path().to_string_lossy();
+            let operation = async {
+                self.host_runner
+                    .run_with_input(
+                        "docker",
+                        &["--config", &directory, "login", "--username", username, "--password-stdin", registry],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                        material.as_bytes(),
+                    )
+                    .await?;
+                let mut args = vec!["--config", directory.as_ref()];
+                args.extend_from_slice(arguments);
+                self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
+            };
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), operation)
+                .await
+                .map_err(|_| "image registry operation timed out".to_string())?
+                .map_err(|error| bounded_adapter_error(credential, "docker-registry", &error.replace(material, "[redacted]")))?;
+            // Return only Docker's non-secret operation output, never login output.
+            Ok(output.replace(material, "[redacted]"))
+        })
     }
 
-    pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
-        self.work_deliveries.lock().await.remove(environment_ref);
-        self.ledger_delivery_environment.lock().await.remove(environment_ref);
-        self.capability_endpoints.lock().await.retain(|(environment, _), _| environment != environment_ref);
-        self.capability_scopes.lock().await.retain(|(environment, _), _| environment != environment_ref);
-        self.cleaned_delivery_environments.lock().await.remove(environment_ref);
-        self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
-        self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
-        self.git_config_fragments.lock().await.remove(environment_ref);
-        self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
-        self.github_app_adoption_failures.lock().await.remove(environment_ref);
-        let config_dir = self.registry_configs.lock().await.remove(environment_ref);
-        if let Some(config_dir) = config_dir {
-            remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
-        }
-        Ok(())
+    pub fn prepare_registry_pull<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        credential_refs: &'a BTreeSet<String>,
+        image: &'a str,
+    ) -> BoxFuture<'a, Result<PreparedEnvironmentAuth, String>> {
+        Box::pin(async move {
+            let mut matching = Vec::new();
+            for name in credential_refs {
+                let spec = self.spec(name).await?;
+                let CredentialConsumer::DockerRegistry { registry, .. } = &spec.consumer else {
+                    continue;
+                };
+                if image_registry_matches(image, registry) {
+                    matching.push((name.clone(), spec));
+                }
+            }
+            let Some((name, spec)) = matching.pop() else {
+                return Ok(PreparedEnvironmentAuth::NoRegistryCredential);
+            };
+            if !matching.is_empty() {
+                return Err(bounded_adapter_error(&name, "docker-registry", "multiple granted credentials match the image registry"));
+            }
+            let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
+                unreachable!("matching credentials are docker-registry consumers");
+            };
+            // Keep creation, preflight, and registration in the same critical section
+            // as sweeping: a fresh cache must not look orphaned before it is indexed.
+            let _maintenance = self.registry_cache_maintenance.read().await;
+            let previous = self.registry_configs.lock().await.remove(environment_ref);
+            if let Some(previous) = previous {
+                remove_registry_config(&previous)
+                    .await
+                    .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
+            }
+            let material = self.resolve_for_adapter(&name, &spec, None, None).await?;
+            let material = material.value.trim_end();
+            validate_scalar_material(&name, "docker-registry", material)?;
+            let config_dir = self
+                .state_dir
+                .join("credential-runtime")
+                .join(registry_environment_dir(environment_ref))
+                .join(uuid::Uuid::new_v4().to_string());
+            tokio::fs::create_dir_all(&config_dir)
+                .await
+                .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("create cache directory: {error}")))?;
+            tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("protect cache directory: {error}")))?;
+            let config = config_dir.to_string_lossy();
+            let operation = async {
+                self.host_runner
+                    .run_with_input(
+                        "docker",
+                        &["--config", &config, "login", "--username", username, "--password-stdin", registry],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                        material.as_bytes(),
+                    )
+                    .await
+                    .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
+                self.host_runner
+                    .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
+            }
+            .await;
+            if let Err(operation_error) = operation {
+                let cleanup_result = remove_registry_config(&config_dir).await;
+                let detail = match cleanup_result {
+                    Ok(()) => operation_error,
+                    Err(cleanup_error) => format!("{operation_error}; additionally failed to remove writable cache: {cleanup_error}"),
+                };
+                return Err(bounded_adapter_error(&name, "docker-registry", &detail));
+            }
+            self.registry_configs.lock().await.insert(environment_ref.to_string(), config_dir.clone());
+            Ok(PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new(config_dir) })
+        })
+    }
+
+    pub fn prepare_skill_source<'a>(
+        &'a self,
+        credential_name: &'a str,
+        repository: &'a str,
+        runner: &'a dyn CommandRunner,
+    ) -> BoxFuture<'a, Result<PathBuf, String>> {
+        Box::pin(async move {
+            let spec = self.spec(credential_name).await?;
+            let repository_name = skill_source_repository(credential_name, &spec, repository)?;
+            let (
+                CredentialConsumer::GithubApp { installation_id, installation_repository, permissions, .. },
+                CredentialSource::GithubApp { app_id_path, private_key_path },
+            ) = (&spec.consumer, &spec.source)
+            else {
+                return Err(bounded_adapter_error(credential_name, "github-app", "skill source requires a GitHub App consumer and source"));
+            };
+            let installation_id = match (installation_id, installation_repository) {
+                (Some(id), None) => *id,
+                (None, Some(installation_repository)) => {
+                    self.resolve_github_app_installation(installation_repository, app_id_path, private_key_path).await?
+                }
+                (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".to_string()),
+                (None, None) => return Err("declare either `installation_id` or `installation_repository`".to_string()),
+            };
+            let mut request = GithubAppMintRequest {
+                installation_id,
+                app_id_path: app_id_path.clone(),
+                private_key_path: private_key_path.clone(),
+                repositories: vec![repository_name],
+                permissions: permissions.clone(),
+            };
+            let token = self
+                .mint_github_app(&mut request, installation_repository.as_deref())
+                .await
+                .map_err(|error| bounded_adapter_error(credential_name, "github-app", &error.to_string()))?;
+            if token.value.trim().is_empty() {
+                return Err(bounded_adapter_error(credential_name, "github-app", "installation token response was empty"));
+            }
+            let paths = self.delivery_paths(runner).await?;
+            prune_abandoned_skill_source_tokens(runner, &paths.base.join("skill-sources")).await?;
+            // Each staging owns its token. A concurrent staging must not replace or
+            // delete a token while another Git process is still reading it.
+            let token_file =
+                paths.base.join("skill-sources").join(safe_component(credential_name)).join(format!("token-{}", uuid::Uuid::new_v4()));
+            write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
+            Ok(token_file)
+        })
+    }
+
+    pub fn forget_environment<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.work_deliveries.lock().await.remove(environment_ref);
+            self.ledger_delivery_environment.lock().await.remove(environment_ref);
+            self.capability_endpoints.lock().await.retain(|(environment, _), _| environment != environment_ref);
+            self.capability_scopes.lock().await.retain(|(environment, _), _| environment != environment_ref);
+            self.cleaned_delivery_environments.lock().await.remove(environment_ref);
+            self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
+            self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+            self.git_config_fragments.lock().await.remove(environment_ref);
+            self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+            self.github_app_adoption_failures.lock().await.remove(environment_ref);
+            let config_dir = self.registry_configs.lock().await.remove(environment_ref);
+            if let Some(config_dir) = config_dir {
+                remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
+            }
+            Ok(())
+        })
     }
 
     /// Remove Docker login caches left by environments which no longer have
     /// either a resource record or a running backing. Legacy flat directories
     /// have no environment identity, so they are removed only when no live
     /// environment or backing could own one.
-    pub(crate) async fn sweep_orphaned_registry_configs(
-        &self,
-        live_environments: &BTreeSet<String>,
-        running_backings: &BTreeSet<String>,
-    ) -> Result<(), String> {
-        // Clients may begin preparing caches after the live/backing snapshots.
-        // Holding this through deletion serializes sweeping with preparation,
-        // including the interval before Docker preflight registers its cache.
-        let _maintenance = self.registry_cache_maintenance.write().await;
-        let root = self.state_dir.join("credential-runtime");
-        let mut entries = match tokio::fs::read_dir(&root).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("list Docker credential caches {}: {error}", root.display())),
-        };
-        let protected =
-            live_environments.iter().chain(running_backings).map(|name| registry_environment_dir(name)).collect::<BTreeSet<_>>();
-        let active_paths = self.registry_configs.lock().await.values().cloned().collect::<BTreeSet<_>>();
-        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list Docker credential cache: {error}"))? {
-            let kind = entry.file_type().await.map_err(|error| format!("inspect Docker credential cache: {error}"))?;
-            if !kind.is_dir() {
-                continue;
+    pub fn sweep_orphaned_registry_configs<'a>(
+        &'a self,
+        live_environments: &'a BTreeSet<String>,
+        running_backings: &'a BTreeSet<String>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            // Clients may begin preparing caches after the live/backing snapshots.
+            // Holding this through deletion serializes sweeping with preparation,
+            // including the interval before Docker preflight registers its cache.
+            let _maintenance = self.registry_cache_maintenance.write().await;
+            let root = self.state_dir.join("credential-runtime");
+            let mut entries = match tokio::fs::read_dir(&root).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("list Docker credential caches {}: {error}", root.display())),
+            };
+            let protected =
+                live_environments.iter().chain(running_backings).map(|name| registry_environment_dir(name)).collect::<BTreeSet<_>>();
+            let active_paths = self.registry_configs.lock().await.values().cloned().collect::<BTreeSet<_>>();
+            while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list Docker credential cache: {error}"))? {
+                let kind = entry.file_type().await.map_err(|error| format!("inspect Docker credential cache: {error}"))?;
+                if !kind.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let owned = name
+                    .strip_prefix("env-")
+                    .is_some_and(|hex| !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+                let legacy =
+                    name.len() > 37 && name.as_bytes()[name.len() - 37] == b'-' && uuid::Uuid::parse_str(&name[name.len() - 36..]).is_ok();
+                if owned && !protected.contains(&name) && !active_paths.iter().any(|path| path.starts_with(entry.path())) {
+                    remove_registry_config(&entry.path())
+                        .await
+                        .map_err(|error| format!("remove orphaned Docker credential cache {}: {error}", entry.path().display()))?;
+                    tracing::info!(path = %entry.path().display(), "removed orphaned Docker credential cache");
+                } else if legacy && live_environments.is_empty() && running_backings.is_empty() && !active_paths.contains(&entry.path()) {
+                    remove_registry_config(&entry.path())
+                        .await
+                        .map_err(|error| format!("remove legacy Docker credential cache {}: {error}", entry.path().display()))?;
+                    tracing::info!(path = %entry.path().display(), "removed legacy orphaned Docker credential cache");
+                }
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let owned = name
-                .strip_prefix("env-")
-                .is_some_and(|hex| !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
-            let legacy =
-                name.len() > 37 && name.as_bytes()[name.len() - 37] == b'-' && uuid::Uuid::parse_str(&name[name.len() - 36..]).is_ok();
-            if owned && !protected.contains(&name) && !active_paths.iter().any(|path| path.starts_with(entry.path())) {
-                remove_registry_config(&entry.path())
-                    .await
-                    .map_err(|error| format!("remove orphaned Docker credential cache {}: {error}", entry.path().display()))?;
-                tracing::info!(path = %entry.path().display(), "removed orphaned Docker credential cache");
-            } else if legacy && live_environments.is_empty() && running_backings.is_empty() && !active_paths.contains(&entry.path()) {
-                remove_registry_config(&entry.path())
-                    .await
-                    .map_err(|error| format!("remove legacy Docker credential cache {}: {error}", entry.path().display()))?;
-                tracing::info!(path = %entry.path().display(), "removed legacy orphaned Docker credential cache");
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
-    pub(crate) async fn record_capability_endpoints(&self, environment: &str, session: &str, env: &[(String, String)]) {
-        let endpoints = env.iter().filter_map(|(key, value)| flotilla_core::crew_capabilities::endpoint_for_env(key, value)).collect();
-        self.capability_endpoints.lock().await.insert((environment.to_string(), session.to_string()), endpoints);
+    pub fn record_capability_endpoints<'a>(
+        &'a self,
+        environment: &'a str,
+        session: &'a str,
+        env: &'a [(String, String)],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let endpoints = env.iter().filter_map(|(key, value)| flotilla_core::crew_capabilities::endpoint_for_env(key, value)).collect();
+            self.capability_endpoints.lock().await.insert((environment.to_string(), session.to_string()), endpoints);
+        })
     }
 
-    pub(crate) async fn tracked_work_deliveries(&self) -> BTreeMap<String, BTreeSet<String>> {
-        self.work_deliveries.lock().await.clone()
+    pub fn tracked_work_deliveries(&self) -> BoxFuture<'_, BTreeMap<String, BTreeSet<String>>> {
+        Box::pin(async move { self.work_deliveries.lock().await.clone() })
     }
 
     /// Reconcile the files and cached material for one work environment. The
@@ -1355,94 +1396,127 @@ impl CredentialStore {
         self.reconcile_work_delivery_with_permissions(environment_ref, granted, running, scopes, &BTreeMap::new(), runner).await
     }
 
-    pub(crate) async fn reconcile_work_delivery_with_permissions(
-        &self,
-        environment_ref: &str,
-        granted: &BTreeSet<String>,
-        running: &BTreeSet<String>,
-        scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
-        permissions: &BTreeMap<String, BTreeMap<String, String>>,
+    pub fn reconcile_work_delivery_with_permissions<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        granted: &'a BTreeSet<String>,
+        running: &'a BTreeSet<String>,
+        scopes: &'a BTreeMap<String, BTreeSet<RepositoryKey>>,
+        permissions: &'a BTreeMap<String, BTreeMap<String, String>>,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<(), String> {
-        let mut delivered = BTreeSet::new();
-        for name in granted {
-            if !matches!(self.spec(name).await?.consumer, CredentialConsumer::DockerRegistry { .. }) {
-                delivered.insert(name.clone());
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let mut delivered = BTreeSet::new();
+            for name in granted {
+                if !matches!(self.spec(name).await?.consumer, CredentialConsumer::DockerRegistry { .. }) {
+                    delivered.insert(name.clone());
+                }
             }
-        }
-        if delivered.is_empty() {
-            self.work_deliveries.lock().await.remove(environment_ref);
-            self.ledger_delivery_environment.lock().await.remove(environment_ref);
-            return Ok(());
-        }
-        let paths = self.delivery_paths(&*runner).await?;
-        for name in delivered.difference(running) {
-            let directory = paths.credential_dir(name);
-            runner
-                .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("revoke credential `{name}`: {error}"))?;
-            if let Some(record) = self.ledger_delivery_environment.lock().await.get_mut(environment_ref) {
-                record.remove(name);
+            if delivered.is_empty() {
+                self.work_deliveries.lock().await.remove(environment_ref);
+                self.ledger_delivery_environment.lock().await.remove(environment_ref);
+                return Ok(());
             }
-            let key = (environment_ref.to_string(), name.clone());
-            self.prepared.lock().await.remove(&key);
-            self.materials.lock().await.remove(&key);
-            self.github_app_deliveries.lock().await.remove(&key);
-            self.git_config_fragments.lock().await.entry(environment_ref.to_string()).and_modify(|fragments| {
-                fragments.remove(name);
-            });
-        }
-        let missing = {
-            let prepared = self.prepared.lock().await;
-            running
-                .iter()
-                .filter(|name| delivered.contains(*name) && !prepared.contains(&(environment_ref.to_string(), (*name).clone())))
-                .cloned()
-                .collect::<BTreeSet<_>>()
-        };
-        if !missing.is_empty() {
-            let missing_scopes =
-                scopes.iter().filter(|(name, _)| missing.contains(*name)).map(|(name, scope)| (name.clone(), scope.clone())).collect();
-            self.prepare_scoped_with_permissions(environment_ref, &missing, &missing_scopes, permissions, runner.clone()).await?;
-        }
-        let fragments = self.git_config_fragments.lock().await.get(environment_ref).cloned().unwrap_or_default();
-        if fragments.is_empty() {
-            runner
-                .run("rm", &["-f", "--", &paths.git_config.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("remove settled Git credential configuration: {error}"))?;
-        } else {
-            let gitconfig = compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(fragments.values().cloned()))
-                .map_err(|error| format!("compose active Git credential configuration: {error}"))?;
-            runner
-                .write_file(&paths.git_config, &gitconfig.contents)
-                .await
-                .map_err(|error| format!("stage active Git credential configuration: {error}"))?;
-        }
-        let mut tracked = self.work_deliveries.lock().await;
-        let running_delivered = running.intersection(&delivered).cloned().collect::<BTreeSet<_>>();
-        if running_delivered.is_empty() {
-            tracked.remove(environment_ref);
-        } else {
-            tracked.insert(environment_ref.to_string(), running_delivered);
-        }
-        Ok(())
+            let paths = self.delivery_paths(&*runner).await?;
+            for name in delivered.difference(running) {
+                let directory = paths.credential_dir(name);
+                runner
+                    .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .map_err(|error| format!("revoke credential `{name}`: {error}"))?;
+                if let Some(record) = self.ledger_delivery_environment.lock().await.get_mut(environment_ref) {
+                    record.remove(name);
+                }
+                let key = (environment_ref.to_string(), name.clone());
+                self.prepared.lock().await.remove(&key);
+                self.materials.lock().await.remove(&key);
+                self.github_app_deliveries.lock().await.remove(&key);
+                self.git_config_fragments.lock().await.entry(environment_ref.to_string()).and_modify(|fragments| {
+                    fragments.remove(name);
+                });
+            }
+            let missing = {
+                let prepared = self.prepared.lock().await;
+                running
+                    .iter()
+                    .filter(|name| delivered.contains(*name) && !prepared.contains(&(environment_ref.to_string(), (*name).clone())))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            };
+            if !missing.is_empty() {
+                let missing_scopes =
+                    scopes.iter().filter(|(name, _)| missing.contains(*name)).map(|(name, scope)| (name.clone(), scope.clone())).collect();
+                self.prepare_scoped_with_permissions(environment_ref, &missing, &missing_scopes, permissions, runner.clone()).await?;
+            }
+            let fragments = self.git_config_fragments.lock().await.get(environment_ref).cloned().unwrap_or_default();
+            if fragments.is_empty() {
+                runner
+                    .run("rm", &["-f", "--", &paths.git_config.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
+                    .await
+                    .map_err(|error| format!("remove settled Git credential configuration: {error}"))?;
+            } else {
+                let gitconfig = compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(fragments.values().cloned()))
+                    .map_err(|error| format!("compose active Git credential configuration: {error}"))?;
+                runner
+                    .write_file(&paths.git_config, &gitconfig.contents)
+                    .await
+                    .map_err(|error| format!("stage active Git credential configuration: {error}"))?;
+            }
+            let mut tracked = self.work_deliveries.lock().await;
+            let running_delivered = running.intersection(&delivered).cloned().collect::<BTreeSet<_>>();
+            if running_delivered.is_empty() {
+                tracked.remove(environment_ref);
+            } else {
+                tracked.insert(environment_ref.to_string(), running_delivered);
+            }
+            Ok(())
+        })
     }
 
     /// Re-mint and atomically replace GitHub App files that are approaching
     /// expiry. The daemon calls this from its host-side periodic loop; vessels
     /// receive only the resulting file and never the App signing material.
-    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
-        let now = self.clock.now();
-        let deliveries =
-            self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
-        let mut errors = Vec::new();
-        for (key, delivery) in deliveries {
-            let mut request = delivery.request.clone();
-            if let Some(scope) = &delivery.scope {
-                let repositories = match self.resolve_github_app_scope(scope).await {
-                    Ok(repositories) => repositories,
+    pub fn refresh_due_github_app_tokens(&self) -> BoxFuture<'_, Vec<CredentialRefreshError>> {
+        Box::pin(async move {
+            let now = self.clock.now();
+            let deliveries =
+                self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
+            let mut errors = Vec::new();
+            for (key, delivery) in deliveries {
+                let mut request = delivery.request.clone();
+                if let Some(scope) = &delivery.scope {
+                    let repositories = match self.resolve_github_app_scope(scope).await {
+                        Ok(repositories) => repositories,
+                        Err(error) => {
+                            let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                            errors.push(CredentialRefreshError {
+                                environment_ref: key.0.clone(),
+                                credential_name: Some(key.1.clone()),
+                                message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
+                                should_surface,
+                            });
+                            continue;
+                        }
+                    };
+                    request.repositories = repositories;
+                    request.permissions = scope.permissions.clone().or_else(|| delivery.request.permissions.clone());
+                }
+                let refresh_at = github_app_refresh_at(delivery.issued_at, delivery.expires_at);
+                if now < refresh_at
+                    && request.repositories == delivery.request.repositories
+                    && request.permissions == delivery.request.permissions
+                {
+                    continue;
+                }
+                if request.repositories == delivery.request.repositories
+                    && request.permissions == delivery.request.permissions
+                    && now + GITHUB_APP_REFRESH_MARGIN < delivery.expires_at
+                    && delivery.next_refresh_attempt_at.is_some_and(|next| now < next)
+                {
+                    continue;
+                }
+                let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
+                    Ok(token) => token,
                     Err(error) => {
                         let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                         errors.push(CredentialRefreshError {
@@ -1454,26 +1528,7 @@ impl CredentialStore {
                         continue;
                     }
                 };
-                request.repositories = repositories;
-                request.permissions = scope.permissions.clone().or_else(|| delivery.request.permissions.clone());
-            }
-            let refresh_at = github_app_refresh_at(delivery.issued_at, delivery.expires_at);
-            if now < refresh_at
-                && request.repositories == delivery.request.repositories
-                && request.permissions == delivery.request.permissions
-            {
-                continue;
-            }
-            if request.repositories == delivery.request.repositories
-                && request.permissions == delivery.request.permissions
-                && now + GITHUB_APP_REFRESH_MARGIN < delivery.expires_at
-                && delivery.next_refresh_attempt_at.is_some_and(|next| now < next)
-            {
-                continue;
-            }
-            let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
-                Ok(token) => token,
-                Err(error) => {
+                if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
                     let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                     errors.push(CredentialRefreshError {
                         environment_ref: key.0.clone(),
@@ -1483,54 +1538,45 @@ impl CredentialStore {
                     });
                     continue;
                 }
-            };
-            if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                errors.push(CredentialRefreshError {
-                    environment_ref: key.0.clone(),
-                    credential_name: Some(key.1.clone()),
-                    message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
-                    should_surface,
-                });
-                continue;
+                let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
+                let current = {
+                    self.github_app_deliveries.lock().await.get(&key).filter(|current| current.generation == delivery.generation).cloned()
+                };
+                let Some(current) = current else {
+                    continue;
+                };
+                if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
+                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                    errors.push(CredentialRefreshError {
+                        environment_ref: key.0.clone(),
+                        credential_name: Some(key.1.clone()),
+                        message: self.refresh_failure_message(&key.1, current.expires_at, &error),
+                        should_surface,
+                    });
+                    continue;
+                }
+                if self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at {
+                    errors.push(CredentialRefreshError {
+                        environment_ref: key.0.clone(),
+                        credential_name: Some(key.1.clone()),
+                        message: self.refresh_failure_message(&key.1, current.expires_at, "refresh started inside the expiry margin"),
+                        should_surface: true,
+                    });
+                }
+                let mut deliveries = self.github_app_deliveries.lock().await;
+                if let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) {
+                    current.expires_at = token.expires_at;
+                    current.issued_at = self.clock.now();
+                    current.refresh_failures = 0;
+                    current.next_refresh_attempt_at = None;
+                    // Successful remints accept the explicit request when the response omits it;
+                    // no request and no response still means unknown.
+                    current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
+                    current.request = request;
+                }
             }
-            let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
-            let current =
-                { self.github_app_deliveries.lock().await.get(&key).filter(|current| current.generation == delivery.generation).cloned() };
-            let Some(current) = current else {
-                continue;
-            };
-            if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                errors.push(CredentialRefreshError {
-                    environment_ref: key.0.clone(),
-                    credential_name: Some(key.1.clone()),
-                    message: self.refresh_failure_message(&key.1, current.expires_at, &error),
-                    should_surface,
-                });
-                continue;
-            }
-            if self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at {
-                errors.push(CredentialRefreshError {
-                    environment_ref: key.0.clone(),
-                    credential_name: Some(key.1.clone()),
-                    message: self.refresh_failure_message(&key.1, current.expires_at, "refresh started inside the expiry margin"),
-                    should_surface: true,
-                });
-            }
-            let mut deliveries = self.github_app_deliveries.lock().await;
-            if let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) {
-                current.expires_at = token.expires_at;
-                current.issued_at = self.clock.now();
-                current.refresh_failures = 0;
-                current.next_refresh_attempt_at = None;
-                // Successful remints accept the explicit request when the response omits it;
-                // no request and no response still means unknown.
-                current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
-                current.request = request;
-            }
-        }
-        errors
+            errors
+        })
     }
 
     fn refresh_failure_message(&self, name: &str, expires_at: DateTime<Utc>, error: &str) -> String {
@@ -1545,13 +1591,19 @@ impl CredentialStore {
         format!("{}; {expiry}", bounded_adapter_error(name, "github-app", detail))
     }
 
-    pub(crate) async fn set_github_app_scopes(&self, environment_ref: &str, scopes: &BTreeMap<String, GithubAppScope>) {
-        let mut deliveries = self.github_app_deliveries.lock().await;
-        for (name, scope) in scopes {
-            if let Some(delivery) = deliveries.get_mut(&(environment_ref.to_string(), name.clone())) {
-                delivery.scope = Some(scope.clone());
+    pub fn set_github_app_scopes<'a>(
+        &'a self,
+        environment_ref: &'a str,
+        scopes: &'a BTreeMap<String, GithubAppScope>,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut deliveries = self.github_app_deliveries.lock().await;
+            for (name, scope) in scopes {
+                if let Some(delivery) = deliveries.get_mut(&(environment_ref.to_string(), name.clone())) {
+                    delivery.scope = Some(scope.clone());
+                }
             }
-        }
+        })
     }
 
     async fn resolve_github_app_scope(&self, scope: &GithubAppScope) -> Result<Vec<String>, String> {

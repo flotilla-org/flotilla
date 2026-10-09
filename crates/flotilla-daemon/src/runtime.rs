@@ -12,6 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_aggregator::IssuePollingHealth;
 use flotilla_controllers::reconcilers::{
     checkout::managed_checkout_reason, checkout_path_component, convoy_ensure::EnsureReconciler, vessel::WorktreeMetadataResolver,
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
@@ -29,7 +30,6 @@ use flotilla_core::{
     },
     config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
     crew_capabilities::{CredentialCapability, SessionCapabilitySource},
-    daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -43,6 +43,10 @@ use flotilla_core::{
     },
     vcs::{CheckoutMaterialisationError, CheckoutRegistration, WorktreeMetadata, REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT},
 };
+use flotilla_credentials::{
+    codex_central_auth_path, compose_agent_environment, crew_git_identity_environment, AgentMaterialRegistry, CodexCentralRefresher,
+    CredentialRefreshError, CredentialStore, GithubAppScope,
+};
 use flotilla_protocol::{
     CanonicalHostId, ConfiguredResourceLimits, EnvironmentId, HostSummary, NodeId, RepoSelector, Rows, TerminalStatus,
 };
@@ -55,9 +59,9 @@ use flotilla_resources::{
     EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
     Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     HostSpec, HostStatus, HostStatusPatch, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec, Platform,
-    Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError,
-    ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch, WorkflowTemplate, AGENTLESS_CAPABILITY,
+    ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject,
+    RetryBackoff, SystemClock, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch, WorkflowTemplate, AGENTLESS_CAPABILITY,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG,
     CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
     MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS,
@@ -77,23 +81,18 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 use crate::resource_manifest::materialize_manifest_root;
+
 use crate::{
-    agent_material::AgentMaterialRegistry,
     blob_store::{BlobDigest, BlobStore, TieredBlobStore},
-    codex_central::{codex_central_auth_path, CodexCentralRefresher},
-    credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::{
         stage_local_rustc_wrapper_async, EnvironmentToolContext, EnvironmentToolProvisioner, DOCKER_PROVIDER_KIND, RUSTC_LINKER_WRAPPER,
     },
-    issue_materializer::IssuePollingHealth,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::{manifest_root_name, materialize_bound_manifest_root, ResourceManifestReconciler},
     sleep_inhibitor,
     startup::phase,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
-    vessel_config::{compose, crew_git_identity_environment_fragments, ComposedFile, Fragment, TargetId},
-    Aggregator, AggregatorResolvers,
 };
 
 /// Cadence of the liveness marker (see `spawn_liveness_watchdog_task`). Long
@@ -110,11 +109,6 @@ const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
-
-fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> Result<ComposedFile, String> {
-    let fragments = crew_git_identity_environment_fragments().into_iter().chain(fragments).collect::<Vec<_>>();
-    compose(TargetId::AgentEnvironment, fragments).map_err(|error| format!("compose shared agent environment: {error}"))
-}
 
 /// Staging and launch resolve the same adapter defaults, delivered values, and
 /// explicit home overrides. Selection metadata is carried only for staging.
@@ -4828,47 +4822,14 @@ fn spawn_aggregator_task(
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
-    let durable = daemon.resource_backend();
-    let observed = daemon.observed_resource_backend();
     let issue_polling = runtime_health.issue_polling.clone();
     tokio::spawn(async move {
         supervise_controller("aggregator", supervision, runtime_health, move || {
             let daemon = Arc::clone(&daemon);
-            let durable = durable.clone();
-            let observed = observed.clone();
             let namespace = namespace.clone();
             let state = state.clone();
             let issue_polling = issue_polling.clone();
-            async move {
-                let aggregator = Aggregator::with_events(state, daemon.host_name().clone(), daemon.event_sink(), daemon.subscribe())
-                    .with_attach_resolver(Arc::clone(&daemon))
-                    .with_change_request_resolver(Arc::clone(&daemon))
-                    .with_issue_resolver(Arc::clone(&daemon))
-                    .with_issue_polling_health(issue_polling);
-                aggregator
-                    .run(
-                        AggregatorResolvers::builder()
-                            .durable_convoys(durable.including_replicas::<Convoy>(&namespace))
-                            .durable_convoy_ensures(durable.including_replicas::<flotilla_resources::ConvoyEnsure>(&namespace))
-                            .durable_demands(durable.clone().using::<Demand>(&namespace))
-                            .durable_environments(durable.clone().using::<Environment>(&namespace))
-                            .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
-                            .durable_projects(durable.including_replicas::<Project>(&namespace))
-                            .durable_fleet_designation(durable.including_replicas::<flotilla_resources::FleetDesignation>(&namespace))
-                            .durable_repositories(durable.including_replicas::<Repository>(&namespace))
-                            .durable_regards(durable.using::<Regard>(&namespace))
-                            .durable_vessels(durable.including_replicas::<flotilla_resources::Vessel>(&namespace))
-                            .durable_checkouts(durable.including_replicas::<Checkout>(&namespace))
-                            // Clone has no replication contract; remote failures arrive through Checkout status.
-                            .durable_clones(durable.using::<flotilla_resources::Clone>(&namespace))
-                            .observed_convoys(observed.clone().using::<Convoy>(&namespace))
-                            .observed_sessions(observed.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
-                            .observed_checkouts(observed.using::<Checkout>(&namespace))
-                            .observed_checkout_replicas(observed.including_replicas::<Checkout>(&namespace))
-                            .build(),
-                    )
-                    .await
-            }
+            async move { flotilla_aggregator::run(daemon, &namespace, state, issue_polling).await }
         })
         .await;
     })
@@ -7091,9 +7052,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .stance(plan.stance)
                     .build();
                 let mut env = plan.env;
-                let git_identity = compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments())
-                    .expect("crew Git identity environment must compose")
-                    .environment;
+                let git_identity = crew_git_identity_environment();
                 env.retain(|(key, _)| !git_identity.iter().any(|(identity_key, _)| identity_key == key));
                 env.extend(git_identity);
                 env.extend([
@@ -7502,6 +7461,7 @@ mod tests {
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
     };
+    use flotilla_credentials::{test_support::GITHUB_APP_TEST_PRIVATE_KEY, CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV};
     use flotilla_protocol::{
         Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, HostName, ImageId, NodeInfo, PeerConnectionState,
         PlacementDecision, PlacementTargetHost,
@@ -7514,7 +7474,7 @@ mod tests {
         ConvoyEnsureSpec, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
         CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
         InMemoryBackend, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus,
-        RepositoryKey, RepositorySpec, Resource, ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState,
+        Project, RepositoryKey, RepositorySpec, Resource, ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState,
         TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement,
         VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
     };
@@ -7524,7 +7484,6 @@ mod tests {
 
     use super::{test_git_repo::TestGitRepo, *};
     use crate::{
-        agent_material::{CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV},
         blob_store::{BlobStore, MemoryBlobStore},
         environment_tools::{
             tests::with_fourth_tool, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH, CONTAINED_RUSTC_WRAPPER_PATH,
@@ -9995,7 +9954,7 @@ mod tests {
         assert!(opts.provisioned_mounts.is_empty(), "tool assets remain provider-neutral until the environment provider delivers them");
         assert_eq!(
             opts.tokens,
-            compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment,
+            crew_git_identity_environment(),
             "tool environment belongs to the tool description; crew Git identity is a container baseline"
         );
         assert_eq!(
@@ -10112,7 +10071,7 @@ mod tests {
         let app_id_path = temp.path().join("github-app.id");
         let private_key_path = temp.path().join("github-app.pem");
         fs::write(&app_id_path, "12345\n").expect("write App id");
-        fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).expect("write App private key");
+        fs::write(&private_key_path, GITHUB_APP_TEST_PRIVATE_KEY).expect("write App private key");
         for (name, consumer, source) in [
             ("claude-max", CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() }, "TEST_CLAUDE_TOKEN"),
             ("github-crew-pr", CredentialConsumer::Gh, "TEST_GITHUB_TOKEN"),
@@ -10329,8 +10288,7 @@ mod tests {
             ProvisionedMountMode::Rw,
         )));
         let mut expected_tokens = vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())];
-        expected_tokens
-            .extend(compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment);
+        expected_tokens.extend(crew_git_identity_environment());
         assert_eq!(opts.tokens, expected_tokens);
 
         let mut preconfigured = spec;
@@ -10341,8 +10299,7 @@ mod tests {
             .expect_err("capture provider should stop provision");
         let opts = provider.create_opts.lock().await.take().expect("captured preconfigured create options");
         let mut expected_tokens = vec![("CODEX_HOME".to_string(), "/image/codex".to_string())];
-        expected_tokens
-            .extend(compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment);
+        expected_tokens.extend(crew_git_identity_environment());
         assert_eq!(opts.tokens, expected_tokens);
         assert!(
             opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
