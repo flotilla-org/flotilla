@@ -11,9 +11,9 @@ def violations(metadata):
     packages = {package["name"]: package for package in metadata["packages"]}
     members = set(metadata["workspace_members"])
     packages = {name: package for name, package in packages.items() if package["id"] in members}
-    normal = {
+    production = {
         name: {dependency["name"] for dependency in package["dependencies"]
-               if dependency["kind"] is None and dependency["name"] in packages}
+               if dependency["kind"] in (None, "build") and dependency["name"] in packages}
         for name, package in packages.items()
     }
 
@@ -25,7 +25,7 @@ def violations(metadata):
                 return True
             if node not in seen:
                 seen.add(node)
-                pending.extend(normal[node])
+                pending.extend(production[node])
         return False
 
     errors = []
@@ -55,21 +55,29 @@ def tree_features(output):
         if "|" not in line:
             continue
         package, features = line.split("|", 1)
-        # Cargo can print the same package in several host/target contexts.
-        result.setdefault(package, set()).update(filter(None, features.removesuffix(" (*)").split(",")))
+        # Preserve distinct host/target feature selections instead of unioning them.
+        # A selected command may omit contexts, but may not invent a different set.
+        result.setdefault(package, set()).add(frozenset(filter(None, features.removesuffix(" (*)").split(","))))
     return result
 
 
 def feature_differences(workspace, selected):
-    return [f"{package}: selected {sorted(features)}, workspace {sorted(workspace[package])}"
-            for package, features in sorted(selected.items()) if features != workspace[package]]
+    errors = []
+    for package, contexts in sorted(selected.items()):
+        expected = workspace.get(package)
+        if expected is None:
+            errors.append(f"{package}: selected package absent from workspace tree")
+        elif not contexts.issubset(expected):
+            describe = lambda variants: sorted(sorted(features) for features in variants)
+            errors.append(f"{package}: selected contexts {describe(contexts)}, workspace contexts {describe(expected)}")
+    return errors
 
 
 def main():
     root = Path(__file__).resolve().parents[2]
 
     def cargo(*arguments):
-        return subprocess.run(["cargo", *arguments], cwd=root, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["cargo", "--color", "never", *arguments], cwd=root, check=True, capture_output=True, text=True).stdout
 
     metadata = json.loads(cargo("metadata", "--no-deps", "--locked", "--format-version", "1"))
     errors = violations(metadata)

@@ -3,11 +3,11 @@ import unittest
 from check import feature_differences, tree_features, violations
 
 
-def package(name, normal=(), dev=(), features=None):
+def package(name, normal=(), dev=(), build=(), features=None):
     return {
         "id": name, "name": name, "features": features or {},
         "dependencies": [{"name": target, "kind": kind}
-                         for kind, targets in ((None, normal), ("dev", dev)) for target in targets],
+                         for kind, targets in ((None, normal), ("dev", dev), ("build", build)) for target in targets],
     }
 
 
@@ -38,6 +38,13 @@ class BuildGraphContract(unittest.TestCase):
                 self.assertEqual(len(errors), 1)
                 self.assertIn(f"upward dev-dependency on {target}", errors[0])
 
+    def test_upward_path_through_build_dependency_is_rejected(self):
+        # Build scripts also put a higher crate above the lower library.
+        self.assertEqual(len(violations(graph(
+            package("lower", dev=("higher",)), package("higher", build=("middle",)),
+            package("middle", normal=("lower",)),
+        ))), 1)
+
     def test_non_workspace_dependencies_do_not_define_layers(self):
         # External test frameworks are outside workspace ownership constraints.
         self.assertEqual(violations(graph(package("core", dev=("hegeltest",)))), [])
@@ -59,18 +66,29 @@ class BuildGraphContract(unittest.TestCase):
 
 
 class FeatureContract(unittest.TestCase):
-    def test_tree_preserves_versions_and_unions_duplicate_contexts(self):
+    def test_tree_preserves_versions_and_distinct_contexts(self):
         # Cargo may repeat a crate for host and target edges; distinct locked
         # versions remain separate rather than accidentally masking drift.
         parsed = tree_features("foo v1.0.0|default,std\nfoo v1.0.0|std,derive (*)\nfoo v2.0.0|\n")
-        self.assertEqual(parsed, {"foo v1.0.0": {"default", "std", "derive"}, "foo v2.0.0": set()})
+        self.assertEqual(parsed, {"foo v1.0.0": {frozenset({"default", "std"}), frozenset({"std", "derive"})}, "foo v2.0.0": {frozenset()}})
 
     def test_only_present_packages_must_match_the_workspace_feature_union(self):
         # Package-local commands need not build unrelated crates, but every
         # shared crate must select the same features as workspace tests.
-        workspace = {"core": {"default", "test-support"}, "unrelated": {"default"}}
-        self.assertEqual(feature_differences(workspace, {"core": {"test-support", "default"}}), [])
-        self.assertEqual(len(feature_differences(workspace, {"core": {"default"}})), 1)
+        workspace = tree_features("core|default,test-support\nunrelated|default")
+        self.assertEqual(feature_differences(workspace, tree_features("core|test-support,default")), [])
+        self.assertEqual(len(feature_differences(workspace, tree_features("core|default"))), 1)
+
+    def test_missing_workspace_package_is_reported(self):
+        # An unexpected selection produces a diagnostic, not a KeyError.
+        self.assertIn("absent from workspace", feature_differences({}, tree_features("new|std"))[0])
+
+    def test_equal_unions_do_not_mask_different_contexts(self):
+        # Host and target variants may share a union while each diverges.
+        workspace = tree_features("shared|derive\nshared|std")
+        selected = tree_features("shared|derive,std\nshared|")
+        self.assertEqual(len(feature_differences(workspace, selected)), 1)
+        self.assertEqual(feature_differences(workspace, tree_features("shared|derive")), [])
 
 
 if __name__ == "__main__":

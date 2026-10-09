@@ -4,7 +4,13 @@ fn check(arguments: &[&str]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(Path::parent).expect("workspace root");
     let python = if cfg!(windows) { "python" } else { "python3" };
     // Process boundary: exercise the real Cargo-metadata checker through its CLI.
-    let output = Command::new(python).args(arguments).current_dir(root).output().expect("run build graph check with Python 3");
+    // CI forces Cargo colors; machine-readable tree output must still be uncolored.
+    let output = Command::new(python)
+        .args(arguments)
+        .env("CARGO_TERM_COLOR", "always")
+        .current_dir(root)
+        .output()
+        .expect("run build graph check with Python 3");
     assert!(
         output.status.success(),
         "build graph check failed:\n{}\n{}",

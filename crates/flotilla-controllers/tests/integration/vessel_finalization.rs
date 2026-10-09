@@ -19,10 +19,6 @@ use crate::resources_common::{
 };
 
 async fn vessel_finalizer_contract(backend: ResourceBackend) {
-    use flotilla_resources::{
-        controller::ControllerLoop, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, VESSEL_REF_LABEL,
-    };
-
     create(&backend, meta("convoy-surrogate", None)).await;
     let vessels = backend.using::<Vessel>(NS);
     vessels
@@ -61,11 +57,14 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
     backend.using::<Host>(NS).delete("convoy-surrogate").await.expect("delete owner");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if matches!(vessel_watch.next().await.expect("watch open").expect("event"), WatchEvent::Modified(vessel) if vessel.metadata.is_pending_finalization()) {
+            let event = vessel_watch.next().await.expect("watch open").expect("event");
+            if matches!(event, WatchEvent::Modified(vessel) if vessel.metadata.is_pending_finalization()) {
                 break;
             }
         }
-    }).await.expect("cascade requests finalization");
+    })
+    .await
+    .expect("cascade requests finalization");
     assert!(terminals.get("running-terminal").await.is_ok());
     let controller = tokio::spawn(
         ControllerLoop {
