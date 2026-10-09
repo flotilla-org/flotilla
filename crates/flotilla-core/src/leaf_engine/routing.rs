@@ -15,7 +15,7 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::subscriptions::LeafWatchRecovery;
 use super::{LeafSubscriptionRow, LeafSubscriptionTable, LeafSubscriptionTableInner, LeafWatcher};
-use crate::{change_request_observer::ChangeRequestRef, issue_observer::IssueRef};
+use crate::{issue_observer::IssueRef, providers::change_request::observation::ChangeRequestRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ObjectKind {
