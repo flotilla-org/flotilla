@@ -19,7 +19,11 @@ Before: `agent_adapter`, `branch_lookup_observer`, `change_request_observer`,
 
 After: `agent_adapter`, `charter_store`, `forge_budget`, `providers`, `vcs`.
 The charter/VCS relationship remains because removing `charter_snapshot` is
-explicitly deferred. The forge-budget module contains shared provider accounting.
+explicitly deferred to [#2967](https://github.com/flotilla-org/flotilla/issues/2967),
+which removes the VCS-to-charter edge. The remaining provider/VCS/agent-adapter
+and shared-accounting dependencies belong to the component extraction work
+tracked by [#2749](https://github.com/flotilla-org/flotilla/issues/2749) under
+ADR 0060. The forge-budget module contains shared provider accounting.
 
 ## Reproduce
 

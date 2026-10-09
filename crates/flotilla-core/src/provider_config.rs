@@ -87,6 +87,9 @@ pub trait ProviderConfigView: Send + Sync {
     async fn load_config_for_probe(&self) -> Result<ProviderConfig, String>;
 }
 
+/// Forward the view through shared ownership so discovery callers can keep
+/// passing their existing `Arc<ConfigStore>` without depending on the concrete
+/// store or changing how the composition root shares it.
 #[async_trait]
 impl<T: ProviderConfigView + ?Sized> ProviderConfigView for std::sync::Arc<T> {
     fn base_path(&self) -> &DaemonHostPath {
