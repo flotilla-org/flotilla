@@ -8,7 +8,7 @@ use std::{
 use flotilla_resources::CharterSource;
 use sha2::{Digest, Sha256};
 
-use crate::vcs::{TreeEntry, Vcs};
+use crate::vcs::{TreeEntry, Vcs, REVISION_FETCH_TIMEOUT};
 
 /// Bound source I/O while namespace authoring is excluded. This applies to
 /// injected inspectors too, rather than relying on a particular VCS timeout.
@@ -86,18 +86,11 @@ pub struct GitRevisionedTree<'a> {
 #[async_trait::async_trait]
 impl RevisionedTree for GitRevisionedTree<'_> {
     async fn resolve(&self, reference: &str) -> Result<String, String> {
-        tokio::time::timeout(std::time::Duration::from_secs(60), self.vcs.fetch_revision(self.cache, self.repo, reference))
-            .await
-            .map_err(|_| format!("fetch charter branch {reference}: timed out after 60s"))?
-            .map_err(
-                |error| {
-                    if error == "revision fetching is unavailable" {
-                        "bound charter inspection is unavailable".into()
-                    } else {
-                        error
-                    }
-                },
-            )
+        self.vcs.fetch_revision(self.cache, self.repo, reference).await.map_err(|error| match error.as_str() {
+            REVISION_FETCH_TIMEOUT => format!("fetch charter branch {reference}: timed out after 60s"),
+            "revision fetching is unavailable" => "bound charter inspection is unavailable".into(),
+            _ => error,
+        })
     }
 
     async fn read_files(&self, revision: &str, path: &str) -> Result<BTreeMap<String, String>, String> {
@@ -172,11 +165,6 @@ pub fn is_charter_file(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| {
         matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown" | "yaml" | "yml" | "json" | "toml" | "txt")
     })
-}
-
-#[cfg(test)]
-fn local_snapshot(root: &Path) -> Result<CharterSnapshot, String> {
-    local_tree_snapshot(root).map(|local| local.snapshot)
 }
 
 struct LocalRevision {
@@ -586,17 +574,17 @@ mod tests {
         let text = if tc.draw(gs::booleans()) { "é\0\n" } else { "a" }.repeat(length);
         let dir = tempfile::tempdir().expect("local source");
         std::fs::write(dir.path().join("input.yaml"), &text).expect("write source");
-        let first = local_snapshot(dir.path()).expect("snapshot");
+        let first = local_tree_snapshot(dir.path()).expect("snapshot").snapshot;
         assert_eq!(first.files["input.yaml"], text);
-        assert_eq!(local_snapshot(dir.path()).expect("reread"), first);
+        assert_eq!(local_tree_snapshot(dir.path()).expect("reread").snapshot, first);
         // Equal-length edits must change provenance, too.
         std::fs::write(dir.path().join("input.yaml"), format!("{text}x")).expect("edit source");
-        let edited = local_snapshot(dir.path()).expect("edited snapshot");
+        let edited = local_tree_snapshot(dir.path()).expect("edited snapshot").snapshot;
         std::fs::write(dir.path().join("input.yaml"), format!("{text}y")).expect("same-length edit");
-        assert_ne!(local_snapshot(dir.path()).expect("same-length snapshot").revision, edited.revision);
-        assert_ne!(local_snapshot(dir.path()).expect("changed snapshot").revision, first.revision);
+        assert_ne!(local_tree_snapshot(dir.path()).expect("same-length snapshot").snapshot.revision, edited.revision);
+        assert_ne!(local_tree_snapshot(dir.path()).expect("changed snapshot").snapshot.revision, first.revision);
         std::fs::write(dir.path().join("input.yaml"), &text).expect("restore contents");
         std::fs::rename(dir.path().join("input.yaml"), dir.path().join("renamed.yaml")).expect("rename source");
-        assert_ne!(local_snapshot(dir.path()).expect("renamed snapshot").revision, first.revision);
+        assert_ne!(local_tree_snapshot(dir.path()).expect("renamed snapshot").snapshot.revision, first.revision);
     }
 }

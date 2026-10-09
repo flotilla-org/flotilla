@@ -702,6 +702,9 @@ pub enum CheckoutRegistration<'a> {
     Release,
 }
 
+/// Generic timeout marker; callers add their own source context.
+pub const REVISION_FETCH_TIMEOUT: &str = "revision fetch exceeded 60 seconds";
+
 /// A file in an immutable tree. Blob I/O is deferred until the consumer asks
 /// for it, so generic tree enumeration does not force reads of unrelated files.
 #[async_trait]
@@ -729,6 +732,8 @@ impl RevisionedFile for GitRevisionedFile {
     async fn read(&self) -> Result<Vec<u8>, String> {
         let lock = object_cache_lock(&self.directory);
         let _guard = lock.lock().await;
+        // The cache guard protects this shared scratch path through write,
+        // read and cleanup. Keep all blob I/O inside its lifetime.
         let output = self.directory.join("flotilla-tree-blob");
         let contents = async {
             self.runner.run_to_file("git", &["show", &format!("{}:{}", self.revision, self.name)], &self.directory, &output).await?;
@@ -749,6 +754,7 @@ pub trait Vcs: Send + Sync {
     }
 
     /// Fetch a branch into an object cache and resolve it to an immutable commit.
+    /// The fetch itself has a 60-second deadline; cache lock wait is excluded.
     async fn fetch_revision(&self, _cache: &Path, _repo: &str, _branch: &str) -> Result<String, String> {
         Err("revision fetching is unavailable".into())
     }
@@ -998,7 +1004,9 @@ impl Vcs for FlotillaVcs {
         let backend = GitCliBackend::new(&directory, &*self.runner);
         backend.run(&["init", "--bare", "."]).await?;
         backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
-        backend.run(&["fetch", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]).await?;
+        tokio::time::timeout(Duration::from_secs(60), backend.run(&["fetch", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]))
+            .await
+            .map_err(|_| REVISION_FETCH_TIMEOUT.to_string())??;
         Ok(backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string())
     }
 
@@ -2273,6 +2281,61 @@ mod tests {
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::TimeoutOnlyRunner;
+
+    // A subprocess double holds fetch open. Cache contention must not consume
+    // its 60-second deadline; the fetch itself still expires after exactly 60s.
+    #[tokio::test]
+    async fn revision_fetch_deadline_excludes_cache_lock_wait() {
+        struct HeldFetch {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl CommandRunner for HeldFetch {
+            async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                if args.contains(&"fetch") {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok("commit".into())
+            }
+            async fn run_output(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _cwd: &Path,
+                _label: &crate::providers::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                unreachable!("fetch uses run")
+            }
+            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+                true
+            }
+        }
+        let cache = tempfile::tempdir().expect("cache");
+        let repo = "https://example.test/repository";
+        let directory = revision_cache(cache.path(), repo);
+        tokio::fs::create_dir_all(&directory).await.expect("cache directory");
+        let lock = object_cache_lock(&directory);
+        let guard = lock.lock().await;
+        let runner = Arc::new(HeldFetch { started: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+        let vcs = test_fl(cache.path(), runner.clone(), true);
+        let cache_path = cache.path().to_path_buf();
+        tokio::time::pause();
+        let task = tokio::spawn(async move { vcs.fetch_revision(&cache_path, repo, "main").await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(!task.is_finished(), "lock contention is outside the fetch deadline");
+        drop(guard);
+        runner.started.notified().await;
+        tokio::time::advance(Duration::from_secs(59) + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "fetch retains its full 60-second budget");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "fetch itself must expire after 60 seconds");
+        assert_eq!(task.await.expect("fetch task").expect_err("fetch deadline"), "revision fetch exceeded 60 seconds");
+    }
 
     fn git(cwd: &Path, args: &[&str]) {
         let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");
