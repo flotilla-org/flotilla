@@ -28,7 +28,7 @@ use crate::{change_request_observer::ChangeRequestRef, issue_observer::IssueRef}
 #[derive(Clone)]
 pub(super) struct ReconcilerWake {
     pub(super) subscriptions: LeafSubscriptionTable,
-    pub(super) _marker: PhantomData<Convoy>,
+    _marker: PhantomData<Convoy>,
 }
 
 impl SecondaryWatch for ReconcilerWake {
@@ -49,6 +49,10 @@ impl SecondaryWatch for ReconcilerWake {
 }
 
 impl ReconcilerWake {
+    pub(super) fn new(subscriptions: LeafSubscriptionTable) -> Self {
+        Self { subscriptions, _marker: PhantomData }
+    }
+
     pub(super) async fn report_stale_attention(&self, row: &LeafSubscriptionRow, source: TerminalAttentionSource) {
         if self.subscriptions.inner.stale_attention_reported.lock().await.insert(row.id) {
             tracing::warn!(subscription_id = %row.id, ?source, maker = ?row.maker, "terminal attention evidence stale");

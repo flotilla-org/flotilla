@@ -1101,10 +1101,7 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
         Arc::new(UnavailableChangeRequests),
         crate::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let wake = ReconcilerWake {
-        subscriptions: LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher),
-        _marker: PhantomData,
-    };
+    let wake = ReconcilerWake::new(LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher));
     create_convoy(
         &backend,
         "delivery",
@@ -1199,10 +1196,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
         Arc::new(UnavailableChangeRequests),
         crate::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    let wake = ReconcilerWake {
-        subscriptions: LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher),
-        _marker: PhantomData,
-    };
+    let wake = ReconcilerWake::new(LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher));
     create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let vessels = backend.using::<Vessel>("flotilla");
     let vessel = vessels
@@ -1381,7 +1375,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
             episode_key: EpisodeKeyFields::default(),
         },
     );
-    let wake = ReconcilerWake { subscriptions: table, _marker: PhantomData };
+    let wake = ReconcilerWake::new(table);
     for at in [now, retry_at - chrono::Duration::nanoseconds(1), retry_at] {
         let convoy = convoys.get("cooldown").await.expect("convoy");
         wake.judge_stalls_at("flotilla", &HashMap::from([("cooldown".into(), convoy)]), at).await.expect("judge");

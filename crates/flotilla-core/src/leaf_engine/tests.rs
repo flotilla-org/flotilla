@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
-use std::{collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -239,10 +239,7 @@ fn supervision_wake_with_limit(backend: &ResourceBackend, limit: u32) -> Reconci
         Arc::new(UnavailableChangeRequests),
         crate::change_request_observer::ChangeRequestRefreshCadence::default(),
     );
-    ReconcilerWake {
-        subscriptions: LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit),
-        _marker: PhantomData,
-    }
+    ReconcilerWake::new(LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit))
 }
 
 async fn project_supervision_case(governors: &[(&str, u64, ConvoyPhase)]) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {

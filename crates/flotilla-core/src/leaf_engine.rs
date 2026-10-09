@@ -2,7 +2,6 @@
 use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{HashMap, HashSet},
-    marker::PhantomData,
     sync::Arc,
     time::Duration,
 };
@@ -241,7 +240,7 @@ impl LeafSubscriptionTable {
             .into_iter()
             .map(|convoy| (convoy.metadata.name.clone(), convoy))
             .collect();
-        let wake = ReconcilerWake { subscriptions: self.clone(), _marker: PhantomData };
+        let wake = ReconcilerWake::new(self.clone());
         wake.sync_rows(namespace, &convoys).await?;
         wake.judge_stalls(namespace, &convoys).await
     }
@@ -251,7 +250,7 @@ impl LeafSubscriptionTable {
     }
 
     pub fn reconciler_wake_watch(&self) -> Box<dyn SecondaryWatch<Primary = Convoy>> {
-        Box::new(ReconcilerWake { subscriptions: self.clone(), _marker: PhantomData })
+        Box::new(ReconcilerWake::new(self.clone()))
     }
 
     pub fn change_request_stale_after(&self) -> Duration {
