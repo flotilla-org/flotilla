@@ -23,3 +23,6 @@ pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};
 
 pub mod image_build;
 pub use image_build::{ImageBuildReconciler, ImageBuildResult, ImageBuildRunner};
+
+#[cfg(test)]
+mod runtime_tests;
