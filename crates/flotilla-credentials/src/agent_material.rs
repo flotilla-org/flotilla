@@ -113,8 +113,9 @@ impl AgentMaterialRegistry {
     }
 
     /// Supply the placement host's Codex delivery capability explicitly.
-    /// Tests can model Linux delivery on any host; production callers use
-    /// [`Self::new`] to retain the Linux-only platform policy.
+    /// This seam is intended for tests and platform composition. Tests can model
+    /// Linux delivery on any host; production composition must retain the
+    /// Linux-only policy and should use [`Self::new`].
     pub fn with_codex_delivery_support(env: Arc<dyn EnvVars>, codex_delivery_supported: bool) -> Self {
         let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"));
         let homes_dir = home.join(".local/share/flotilla/agent-homes");
