@@ -4,3 +4,6 @@
 
 pub mod actuators;
 pub mod reconcilers;
+
+#[cfg(test)]
+mod test_git_repo;
