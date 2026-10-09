@@ -23,7 +23,6 @@ use super::sources::{change_request_sources, freshest_change_requests};
 use super::stalls::{is_active_change_request_probe, is_merged_settlement_probe};
 use super::turn_delivery::{queued_turn_evidence, queued_turn_session};
 use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher, UnableEvidenceKey};
-use crate::{change_request_observer::ChangeRequestRef, issue_observer::IssueRef};
 
 #[derive(Clone)]
 pub(super) struct ReconcilerWake {
@@ -517,10 +516,11 @@ impl ReconcilerWake {
                 continue;
             }
             self.subscriptions.inner.rows.lock().await.remove(&row.id);
-            self.subscriptions.forget_firings(row.id).await;
             if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(&row.id) {
                 task.abort();
             }
+            self.subscriptions.remove_routing(row.id).await;
+            self.subscriptions.forget_firings(row.id).await;
             self.subscriptions.inner.change_requests.release(row.id).await;
             self.subscriptions.inner.issues.release(row.id).await;
         }
@@ -538,24 +538,10 @@ impl ReconcilerWake {
             let id = uuid::Uuid::new_v4();
             row.id = id;
             self.subscriptions.inner.rows.lock().await.insert(id, row.clone());
-            for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(namespace, &leaf.address)) {
-                if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, row.freshness_demand).await {
-                    self.subscriptions.inner.rows.lock().await.remove(&id);
-                    self.subscriptions.forget_firings(id).await;
-                    self.subscriptions.inner.change_requests.release(id).await;
-                    tracing::warn!(watcher = ?row.watcher, %error, "arm standing leaf subscription failed");
-                    continue 'desired_rows;
-                }
-            }
-            for subject in row.leaves.iter().filter_map(|leaf| IssueRef::from_address(namespace, &leaf.address)) {
-                if let Err(error) = self.subscriptions.inner.issues.demand(id, subject, row.freshness_demand).await {
-                    self.subscriptions.inner.rows.lock().await.remove(&id);
-                    self.subscriptions.forget_firings(id).await;
-                    self.subscriptions.inner.change_requests.release(id).await;
-                    self.subscriptions.inner.issues.release(id).await;
-                    tracing::warn!(watcher = ?row.watcher, %error, "arm standing issue leaf subscription failed");
-                    continue 'desired_rows;
-                }
+            if let Err(error) = self.subscriptions.arm_dependencies(&row).await {
+                self.subscriptions.finish(id).await;
+                tracing::warn!(watcher = ?row.watcher, %error, "arm standing leaf subscription failed");
+                continue 'desired_rows;
             }
             let subscriptions = self.subscriptions.clone();
             let task = tokio::spawn(async move {

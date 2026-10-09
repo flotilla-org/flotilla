@@ -1,7 +1,8 @@
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{HashMap, HashSet},
+    future::Future,
     time::Duration,
 };
 
@@ -9,17 +10,13 @@ use chrono::Utc;
 use flotilla_protocol::{DaemonEvent, LeafAddress, LeafFire, WaitSubscriptionRequest};
 use flotilla_resources::{
     admit_leaf, evaluate_leaf, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Convoy, ConvoyLeafSubject, Issue,
-    IssueLeafSubject, LeafMaker, ReadWatchEvent, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel,
-    VesselLeafSubject, WorkLeafSubject,
+    IssueLeafSubject, LeafMaker, ResourceError, ResourceObject, ThreeValue, Usage, UsageLeafSubject, Vessel, VesselLeafSubject,
+    WorkLeafSubject,
 };
-use futures::StreamExt;
 
-use super::sources::{
-    apply_read_event, change_request_sources, freshest_change_requests, freshest_issues, issue_sources, resource_source,
-    update_freshest_change_request, update_freshest_issue, LeafObservationStaleness,
-};
+use super::routing::{ObjectAddress, ObjectKind, RowDependencies};
+use super::sources::{change_request_sources, freshest_change_requests, freshest_issues, issue_sources, LeafObservationStaleness};
 use super::{EpisodeKeyFields, LeafFiringRecord, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher};
-use crate::{change_request_observer::ChangeRequestRef, issue_observer::IssueRef};
 
 pub(super) const LEAF_WATCH_RECOVERY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 pub(super) const LEAF_WATCH_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(1);
@@ -33,6 +30,15 @@ pub(super) struct LeafWatchRecovery {
 }
 
 impl LeafWatchRecovery {
+    pub(super) async fn wait_before_retry(&mut self, healthy_for: Duration) {
+        let delay = self.expired(healthy_for);
+        if delay.is_zero() {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     pub(super) fn expired(&mut self, healthy_for: Duration) -> Duration {
         // Require sustained healthy consumption so intermittent lag cannot
         // repeatedly restore immediate retries and trigger snapshot bursts.
@@ -69,22 +75,9 @@ impl LeafSubscriptionTable {
             episode_key: EpisodeKeyFields::default(),
         };
         self.inner.rows.lock().await.insert(id, row.clone());
-        for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(&row.namespace, &leaf.address)) {
-            if let Err(error) = self.inner.change_requests.demand(id, subject, row.freshness_demand).await {
-                self.inner.rows.lock().await.remove(&id);
-                self.forget_firings(id).await;
-                self.inner.change_requests.release(id).await;
-                return Err(error);
-            }
-        }
-        for subject in row.leaves.iter().filter_map(|leaf| IssueRef::from_address(&row.namespace, &leaf.address)) {
-            if let Err(error) = self.inner.issues.demand(id, subject, row.freshness_demand).await {
-                self.inner.rows.lock().await.remove(&id);
-                self.forget_firings(id).await;
-                self.inner.change_requests.release(id).await;
-                self.inner.issues.release(id).await;
-                return Err(error);
-            }
+        if let Err(error) = self.arm_dependencies(&row).await {
+            self.finish(id).await;
+            return Err(error);
         }
         let table = self.clone();
         let task = tokio::spawn(async move {
@@ -111,10 +104,12 @@ impl LeafSubscriptionTable {
             .collect::<Vec<_>>();
         for id in ids {
             self.inner.rows.lock().await.remove(&id);
-            self.forget_firings(id).await;
+            // Stop the evaluator before releasing its routing registration.
             if let Some(task) = self.inner.tasks.lock().await.remove(&id) {
                 task.abort();
             }
+            self.remove_routing(id).await;
+            self.forget_firings(id).await;
             self.inner.change_requests.release(id).await;
             self.inner.issues.release(id).await;
         }
@@ -122,6 +117,7 @@ impl LeafSubscriptionTable {
 
     pub(super) async fn finish(&self, id: uuid::Uuid) {
         self.inner.rows.lock().await.remove(&id);
+        self.remove_routing(id).await;
         self.forget_firings(id).await;
         self.inner.tasks.lock().await.remove(&id);
         self.inner.change_requests.release(id).await;
@@ -134,110 +130,76 @@ impl LeafSubscriptionTable {
         self.inner.stale_attention_reported.lock().await.remove(&id);
     }
 
-    pub(super) async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
-        let mut recovery = LeafWatchRecovery::default();
-        loop {
-            if !self.inner.rows.lock().await.contains_key(&row.id) {
-                return Ok(());
-            }
-            // Attempt time includes opening watches and loading snapshots.
-            // A slow relist already bounds snapshot work, so it may reset backoff.
-            let started = tokio::time::Instant::now();
-            match self.watch_row_once(row.clone()).await {
-                Err(ResourceError::WatchExpired { .. }) => {
-                    if !self.inner.rows.lock().await.contains_key(&row.id) {
-                        return Ok(());
-                    }
-                    // Level-triggered leaves recover from the current snapshot;
-                    // keep the same subscription and firing/episode accounting.
-                    let delay = recovery.expired(started.elapsed());
-                    if delay.is_zero() {
-                        tokio::task::yield_now().await;
-                    } else {
-                        // unsubscribe_connection and row replacement abort this
-                        // task, including its sleep, releasing demands immediately.
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-                result => return result.map_err(|error| error.to_string()),
-            }
+    // One dependency pass supplies both the store index and observation demand.
+    pub(super) async fn arm_dependencies(&self, row: &LeafSubscriptionRow) -> Result<(), String> {
+        let dependencies = RowDependencies::derive(row);
+        for subject in &dependencies.change_requests {
+            self.inner.change_requests.demand(row.id, subject.clone(), row.freshness_demand).await?;
         }
+        for subject in &dependencies.issues {
+            self.inner.issues.demand(row.id, subject.clone(), row.freshness_demand).await?;
+        }
+        self.inner.routing.lock().await.dependencies.insert(row.id, dependencies);
+        Ok(())
+    }
+
+    pub(super) async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
+        let id = row.id;
+        let result = self.watch_row_once(row).await.map_err(|error| error.to_string());
+        self.remove_routing(id).await;
+        result
     }
 
     pub(super) async fn watch_row_once(&self, row: LeafSubscriptionRow) -> Result<(), ResourceError> {
-        let convoys = self.inner.backend.including_replicas::<Convoy>(&row.namespace);
-        let vessels = self.inner.backend.including_replicas::<Vessel>(&row.namespace);
-        let change_requests = self.inner.backend.including_replicas::<ChangeRequest>(&row.namespace);
-        let usages = self.inner.backend.including_replicas::<Usage>(&row.namespace);
-        let issues = self.inner.backend.including_replicas::<Issue>(&row.namespace);
-        let artifacts = self.inner.backend.including_replicas::<Artifact>(&row.namespace);
-        // Open watches before taking the level-triggered snapshots. Writes
-        // racing the lists are then buffered by the streams and replayed by
-        // the loop instead of falling through a list-then-watch gap.
-        let mut convoy_watch = convoys.watch().await?;
-        let mut vessel_watch = vessels.watch().await?;
-        let mut change_request_watch = change_requests.watch().await?;
-        let mut usage_watch = usages.watch().await?;
-        let mut issue_watch = issues.watch().await?;
-        let mut artifact_watch = artifacts.watch().await?;
-        let convoy_list = convoys.list().await?;
-        let vessel_list = vessels.list().await?;
-        let change_request_list = change_requests.list().await?;
-        let usage_list = usages.list().await?;
-        let issue_list = issues.list().await?;
-        let artifact_list = artifacts.list().await?;
-        #[cfg(test)]
-        self.inner.snapshot_loads.fetch_add(1, Ordering::SeqCst);
-        let mut convoy_objects = convoy_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
-            objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
-            objects
-        });
-        let mut vessel_objects = vessel_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
-            objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
-            objects
-        });
-        let mut change_request_sources = change_request_sources(change_request_list);
-        let mut change_request_objects = freshest_change_requests(&change_request_sources);
-        let mut usage_objects = usage_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
-            objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
-            objects
-        });
+        let (dependencies, changes) = self.register_routing(&row).await?;
+        let namespace = row.namespace.clone();
+        self.watch_registered_row(row, changes, || self.load_subjects(&namespace, &dependencies.objects)).await
+    }
 
-        let mut issue_sources = issue_sources(issue_list);
-        let mut issue_objects = freshest_issues(&issue_sources);
-        let mut artifact_objects = artifact_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
-            objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
-            objects
-        });
+    // Internal store-read seam; retry whole addressed reads after transient I/O
+    // so partially loaded evidence cannot fire a condition.
+    pub(super) async fn watch_registered_row<F, Fut>(
+        &self,
+        row: LeafSubscriptionRow,
+        mut changes: tokio::sync::watch::Receiver<()>,
+        mut load: F,
+    ) -> Result<(), ResourceError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<OwnedLeafSubjects, ResourceError>>,
+    {
         let staleness = LeafObservationStaleness { change_request: self.change_request_stale_after(), issue: self.issue_stale_after() };
-
-        let current_row = self.inner.rows.lock().await.get(&row.id).cloned().unwrap_or_else(|| row.clone());
-        if let Some(fire) = evaluate_row(
-            &current_row,
-            &LeafSubjects {
-                convoys: &convoy_objects,
-                vessels: &vessel_objects,
-                change_requests: &change_request_objects,
-                usages: &usage_objects,
-                issues: &issue_objects,
-                artifacts: &artifact_objects,
-            },
-            staleness,
-        )
-        .map_err(ResourceError::other)?
-        {
-            self.fire(row.id, fire).await;
-            if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
-                return Ok(());
-            }
-        }
-
         let mut last_retry_deadline = None;
+        let mut recovery = LeafWatchRecovery::default();
+        let mut started = tokio::time::Instant::now();
         loop {
-            // A level-triggered delivery must retry even if no resource changes
-            // after the failed attempt. The durable deadline survives restart.
+            changes.borrow_and_update();
+            let Some(current_row) = self.inner.rows.lock().await.get(&row.id).cloned() else { return Ok(()) };
+            let subjects = match load().await {
+                Ok(subjects) => subjects,
+                Err(error @ (ResourceError::Other { .. } | ResourceError::Conflict { .. } | ResourceError::WatchExpired { .. })) => {
+                    tracing::warn!(subscription_id = %row.id, %error, "leaf addressed read failed; retrying");
+                    recovery.wait_before_retry(started.elapsed()).await;
+                    // Include the next read's latency in its healthy interval,
+                    // while excluding time spent waiting in recovery backoff.
+                    started = tokio::time::Instant::now();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(test)]
+            self.inner.evaluations.fetch_add(1, Ordering::SeqCst);
+            if let Some(fire) = evaluate_row(&current_row, &subjects.borrowed(), staleness).map_err(ResourceError::other)? {
+                self.fire(row.id, fire).await;
+                if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
+                    return Ok(());
+                }
+            }
+            // Delivery retry deadlines live in the convoy, an implicit dependency
+            // indexed alongside the condition's concrete addresses.
             let retry_at = match &row.watcher {
-                LeafWatcher::TurnDelivery { convoy, source, .. } => convoy_objects
+                LeafWatcher::TurnDelivery { convoy, source, .. } => subjects
+                    .convoys
                     .get(convoy)
                     .and_then(|convoy| convoy.status.as_ref())
                     .and_then(|status| status.turn_deliveries.get(source))
@@ -249,88 +211,52 @@ impl LeafSubscriptionTable {
             };
             let retry_delay = retry_at.map_or(Duration::from_secs(86400), |at| (at - Utc::now()).to_std().unwrap_or_default());
             tokio::select! {
-                _ = tokio::time::sleep(retry_delay), if retry_at.is_some() => {
-                    // If evidence no longer fires, await its next change rather
-                    // than spinning on the already expired durable deadline.
-                    last_retry_deadline = retry_at;
-                }
-                event = convoy_watch.next() => {
-                    let event = event.ok_or_else(|| ResourceError::other("convoy resource watch closed"))??;
-                    apply_read_event(event, &mut convoy_objects);
-                }
-                event = vessel_watch.next() => {
-                    let event = event.ok_or_else(|| ResourceError::other("vessel resource watch closed"))??;
-                    apply_read_event(event, &mut vessel_objects);
-                }
-                event = change_request_watch.next() => {
-                    let event = event.ok_or_else(|| ResourceError::other("change request resource watch closed"))??;
-                    let name = match event {
-                        ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => item.object.metadata.name,
-                        ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
-                    };
-                    // A buffered event may precede the initial list snapshot, and a
-                    // deletion may expose a suppressed self-origin copy. Refresh
-                    // only this name from the current store on either transition.
-                    let copies = change_requests.get_all(&name).await?;
-                    let mut by_source = BTreeMap::new();
-                    for item in copies.items {
-                        by_source.insert(resource_source(&item.provenance), item.object);
-                    }
-                    if by_source.is_empty() {
-                        change_request_sources.remove(&name);
-                    } else {
-                        change_request_sources.insert(name.clone(), by_source);
-                    }
-                    update_freshest_change_request(&name, &change_request_sources, &mut change_request_objects);
-                }
-                event = issue_watch.next() => {
-                    let event = event.ok_or_else(|| ResourceError::other("issue resource watch closed"))??;
-                    let name = match event {
-                        ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => item.object.metadata.name,
-                        ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
-                    };
-                    let copies = issues.get_all(&name).await?;
-                    let mut by_source = BTreeMap::new();
-                    for item in copies.items {
-                        by_source.insert(resource_source(&item.provenance), item.object);
-                    }
-                    if by_source.is_empty() {
-                        issue_sources.remove(&name);
-                    } else {
-                        issue_sources.insert(name.clone(), by_source);
-                    }
-                    update_freshest_issue(&name, &issue_sources, &mut issue_objects);
-                }
-                event = usage_watch.next() => {
-                    let event = event.ok_or_else(|| ResourceError::other("usage resource watch closed"))??;
-                    apply_read_event(event, &mut usage_objects);
-                }
-                event = artifact_watch.next() => {
-                    let event = event.ok_or_else(|| ResourceError::other("artifact resource watch closed"))??;
-                    apply_read_event(event, &mut artifact_objects);
-                }
-            }
-            let current_row = self.inner.rows.lock().await.get(&row.id).cloned().unwrap_or_else(|| row.clone());
-            if let Some(fire) = evaluate_row(
-                &current_row,
-                &LeafSubjects {
-                    convoys: &convoy_objects,
-                    vessels: &vessel_objects,
-                    change_requests: &change_request_objects,
-                    usages: &usage_objects,
-                    issues: &issue_objects,
-                    artifacts: &artifact_objects,
-                },
-                staleness,
-            )
-            .map_err(ResourceError::other)?
-            {
-                self.fire(row.id, fire).await;
-                if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
-                    return Ok(());
+                _ = tokio::time::sleep(retry_delay), if retry_at.is_some() => { last_retry_deadline = retry_at; }
+                result = changes.changed() => {
+                    if result.is_err() { return Ok(()) }
                 }
             }
         }
+    }
+
+    pub(super) async fn load_subjects(
+        &self,
+        namespace: &str,
+        objects: &HashSet<ObjectAddress>,
+    ) -> Result<OwnedLeafSubjects, ResourceError> {
+        let mut subjects = OwnedLeafSubjects::default();
+        #[cfg(test)]
+        self.inner.snapshot_loads.fetch_add(1, Ordering::SeqCst);
+        for address in objects {
+            #[cfg(test)]
+            self.inner.store_reads.fetch_add(1, Ordering::SeqCst);
+            macro_rules! load {
+                ($kind:ty, $field:ident) => {
+                    match self.inner.backend.including_replicas::<$kind>(namespace).get(&address.name).await {
+                        Ok(item) => {
+                            subjects.$field.insert(address.name.clone(), item.object);
+                        }
+                        Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                };
+            }
+            match address.kind {
+                ObjectKind::Convoy => load!(Convoy, convoys),
+                ObjectKind::Vessel => load!(Vessel, vessels),
+                ObjectKind::Usage => load!(Usage, usages),
+                ObjectKind::Artifact => load!(Artifact, artifacts),
+                ObjectKind::ChangeRequest => {
+                    let copies = self.inner.backend.including_replicas::<ChangeRequest>(namespace).get_all(&address.name).await?;
+                    subjects.change_requests.extend(freshest_change_requests(&change_request_sources(copies)));
+                }
+                ObjectKind::Issue => {
+                    let copies = self.inner.backend.including_replicas::<Issue>(namespace).get_all(&address.name).await?;
+                    subjects.issues.extend(freshest_issues(&issue_sources(copies)));
+                }
+            }
+        }
+        Ok(subjects)
     }
 
     pub(super) async fn fire(&self, subscription_id: uuid::Uuid, mut fire: LeafFire) {
@@ -367,6 +293,29 @@ impl LeafSubscriptionTable {
         }
     }
 }
+#[derive(Default)]
+pub(super) struct OwnedLeafSubjects {
+    convoys: HashMap<String, ResourceObject<Convoy>>,
+    vessels: HashMap<String, ResourceObject<Vessel>>,
+    change_requests: HashMap<String, ResourceObject<ChangeRequest>>,
+    usages: HashMap<String, ResourceObject<Usage>>,
+    issues: HashMap<String, ResourceObject<Issue>>,
+    artifacts: HashMap<String, ResourceObject<Artifact>>,
+}
+
+impl OwnedLeafSubjects {
+    fn borrowed(&self) -> LeafSubjects<'_> {
+        LeafSubjects {
+            convoys: &self.convoys,
+            vessels: &self.vessels,
+            change_requests: &self.change_requests,
+            usages: &self.usages,
+            issues: &self.issues,
+            artifacts: &self.artifacts,
+        }
+    }
+}
+
 pub(super) struct LeafSubjects<'a> {
     pub(super) convoys: &'a HashMap<String, ResourceObject<Convoy>>,
     pub(super) vessels: &'a HashMap<String, ResourceObject<Vessel>>,

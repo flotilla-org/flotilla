@@ -141,6 +141,7 @@ struct LeafSubscriptionTableInner {
     unable_since: Mutex<HashMap<uuid::Uuid, (UnableEvidenceKey, DateTime<Utc>)>>,
     stale_attention_reported: Mutex<HashSet<uuid::Uuid>>,
     tasks: Mutex<HashMap<uuid::Uuid, JoinHandle<()>>>,
+    routing: Mutex<routing::SubscriptionRouting>,
     change_requests: ChangeRequestRefresher,
     issues: IssueRefresher,
     reconciler_tx: broadcast::Sender<String>,
@@ -150,6 +151,10 @@ struct LeafSubscriptionTableInner {
     supervisor_context: Mutex<HashMap<(String, String), String>>,
     #[cfg(test)]
     snapshot_loads: AtomicUsize,
+    #[cfg(test)]
+    evaluations: AtomicUsize,
+    #[cfg(test)]
+    store_reads: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +217,7 @@ impl LeafSubscriptionTable {
                 unable_since: Mutex::new(HashMap::new()),
                 stale_attention_reported: Mutex::new(HashSet::new()),
                 tasks: Mutex::new(HashMap::new()),
+                routing: Default::default(),
                 change_requests,
                 issues,
                 reconciler_tx,
@@ -221,6 +227,10 @@ impl LeafSubscriptionTable {
                 supervisor_context: Default::default(),
                 #[cfg(test)]
                 snapshot_loads: AtomicUsize::new(0),
+                #[cfg(test)]
+                evaluations: AtomicUsize::new(0),
+                #[cfg(test)]
+                store_reads: AtomicUsize::new(0),
             }),
         }
     }
@@ -303,6 +313,7 @@ impl LeafSubscriptionTable {
     }
 }
 
+mod routing;
 mod sources;
 mod stalls;
 mod subscriptions;
