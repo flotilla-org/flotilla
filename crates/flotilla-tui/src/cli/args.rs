@@ -1549,11 +1549,12 @@ mod tests {
         .is_err());
     }
 
+    // Help content must match the preserved snapshot with either LF or Windows-checkout CRLF endings.
     #[test]
     fn artifact_put_help_snapshot() {
         let help = Cli::try_parse_from(["flotilla", "artifact", "put", "--help"]).err().expect("help exits parsing").to_string();
         let normalized = help.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") + "\n";
-        assert_eq!(normalized, include_str!("snapshots/artifact_put_help.txt"));
+        assert_eq!(normalized, include_str!("snapshots/artifact_put_help.txt").replace("\r\n", "\n"));
     }
 
     #[test]
