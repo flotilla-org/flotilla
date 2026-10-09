@@ -88,7 +88,6 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
         tokio::time::advance(Duration::from_millis(20)).await;
     }
     let snapshots = table.inner.snapshot_loads.load(Ordering::SeqCst);
-    eprintln!("overload: 30000 writes/2s, {snapshots} addressed snapshots");
     let resyncs = table.inner.routing.lock().await.resyncs;
     assert!(resyncs <= 10, "repeated expiry must throttle shared resyncs: {resyncs}");
     assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), snapshots, "recovery reads only the addressed convoy");
@@ -127,17 +126,40 @@ async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
     let watching_table = table.clone();
     let mut watching = Box::pin(async move { watching_table.watch_row(row).await });
     assert!(watching.as_mut().now_or_never().is_none());
-    overload_convoy(&backend).await;
+    // Disable cooperative yielding so the burst deterministically overruns the ring.
+    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(table.inner.routing.lock().await.watch_losses, 1);
+    assert_eq!(table.inner.routing.lock().await.resyncs, 1, "first expiry resyncs without advancing time");
     assert!(watching.as_mut().now_or_never().is_none());
+    // Disable cooperative yielding so the burst deterministically overruns the ring.
+    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(table.inner.routing.lock().await.watch_losses, 2);
+    assert_eq!(table.inner.routing.lock().await.resyncs, 1, "second expiry enters backoff");
+    tokio::time::advance(Duration::from_millis(24)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(table.inner.routing.lock().await.resyncs, 1, "25ms backoff has not elapsed");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(table.inner.routing.lock().await.resyncs, 2, "second expiry resyncs at 25ms");
     assert!(watching.as_mut().now_or_never().is_none());
-    tokio::task::yield_now().await;
-    assert!(watching.as_mut().now_or_never().is_none());
+    // Disable cooperative yielding so the burst deterministically overruns the ring.
+    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(table.inner.routing.lock().await.watch_losses, 3);
+    assert_eq!(table.inner.routing.lock().await.resyncs, 2, "third expiry sleeps until cancellation");
     let snapshots = table.inner.snapshot_loads.load(Ordering::SeqCst);
-    overload_convoy(&backend).await;
-    assert!(watching.as_mut().now_or_never().is_none());
-    tokio::task::yield_now().await;
-    assert!(watching.as_mut().now_or_never().is_none());
-    let snapshots = snapshots.max(table.inner.snapshot_loads.load(Ordering::SeqCst));
     let task = tokio::spawn(async move {
         watching.await.expect("watch succeeds");
     });
@@ -599,8 +621,8 @@ async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
     }
     assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 2);
     // No task can consume the store's bounded watch ring during this burst.
-    overload_convoy(&backend).await;
-    overload_convoy(&backend).await;
+    tokio::task::unconstrained(overload_convoy(&backend)).await;
+    tokio::task::unconstrained(overload_convoy(&backend)).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         while table.inner.routing.lock().await.resyncs == 0 {
             tokio::task::yield_now().await;
@@ -713,4 +735,91 @@ async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
     assert!(sibling_changes.has_changed().is_err());
     assert_eq!(table.inner.routing.lock().await.removal_visits, 2, "cleanup visits only each row's dependencies");
     assert!(table.inner.routing.lock().await.dependencies.is_empty());
+}
+
+// Transient addressed-read errors retain the row, demand and firing identity;
+// retries back off without new object events and use fresh evidence on success.
+#[tokio::test(start_paused = true)]
+async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
+    use futures::FutureExt;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() }).await;
+    let table = supervision_wake(&backend).subscriptions;
+    let row = overload_row(uuid::Uuid::new_v4());
+    let id = row.id;
+    overload_demand(&table, id).await;
+    table.inner.rows.lock().await.insert(id, row.clone());
+    let (dependencies, changes) = table.register_routing(&row).await.expect("register");
+    let attempts = AtomicUsize::new(0);
+    // Store-I/O seam: inject two transient read failures, then use the real store.
+    let mut watching = Box::pin(table.watch_registered_row(row, changes, || {
+        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+        let table = &table;
+        let dependencies = &dependencies;
+        async move {
+            match attempt {
+                0 => Err(ResourceError::other("temporary store read failure")),
+                1 => Err(ResourceError::conflict("busy", "temporary replica view conflict")),
+                _ => table.load_subjects("flotilla", &dependencies.objects).await,
+            }
+        }
+    }));
+    assert!(watching.as_mut().now_or_never().is_none());
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        assert!(watching.as_mut().now_or_never().is_none());
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "one immediate retry, then backoff");
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 0, "failed reads do not evaluate partial evidence");
+    assert_eq!(table.rows().await[0].id, id);
+    assert_eq!(table.inner.change_requests.active_demands().await, 1);
+    tokio::time::advance(Duration::from_millis(24)).await;
+    assert!(watching.as_mut().now_or_never().is_none());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    watching.await.expect("fresh evidence fires original wait");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 1);
+    assert!(table.rows().await.is_empty());
+    assert_eq!(table.inner.change_requests.active_demands().await, 0);
+}
+
+// Disconnect aborts a row sleeping after transient read errors and releases
+// demand immediately; no read retries occur after cancellation.
+#[tokio::test(start_paused = true)]
+async fn leaf_read_backoff_is_cancelled_by_disconnect() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let table = supervision_wake(&backend).subscriptions;
+    let connection = uuid::Uuid::new_v4();
+    let row = overload_row(connection);
+    let id = row.id;
+    overload_demand(&table, id).await;
+    table.inner.rows.lock().await.insert(id, row.clone());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let watching_table = table.clone();
+    let reading_attempts = attempts.clone();
+    let task = tokio::spawn(async move {
+        let (_, changes) = watching_table.register_routing(&row).await.expect("register");
+        // Store-I/O seam: hold the store in a transient failure state.
+        watching_table
+            .watch_registered_row(row, changes, || {
+                reading_attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(ResourceError::other("store temporarily unavailable")) }
+            })
+            .await
+            .expect("watch");
+    });
+    let abort = task.abort_handle();
+    table.inner.tasks.lock().await.insert(id, task);
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "read retry is sleeping in backoff");
+    table.unsubscribe_connection(connection).await;
+    tokio::task::yield_now().await;
+    assert!(abort.is_finished());
+    assert!(table.rows().await.is_empty());
+    assert_eq!(table.inner.change_requests.active_demands().await, 0);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }

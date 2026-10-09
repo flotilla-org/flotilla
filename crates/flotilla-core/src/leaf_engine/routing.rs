@@ -1,6 +1,6 @@
 //! Object routing is shared by a namespace; rows retain only their dependencies.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     future::Future,
     sync::Weak,
 };
@@ -103,6 +103,8 @@ pub(super) struct SubscriptionRouting {
     #[cfg(test)]
     pub(super) resyncs: usize,
     #[cfg(test)]
+    pub(super) watch_losses: usize,
+    #[cfg(test)]
     pub(super) removal_visits: usize,
 }
 
@@ -177,10 +179,13 @@ async fn route_events(inner: Weak<LeafSubscriptionTableInner>, backend: Resource
                 }
             }
             error => {
+                #[cfg(test)]
+                if let Some(inner) = inner.upgrade() {
+                    inner.routing.lock().await.watch_losses += 1;
+                }
                 tracing::warn!(?error, %namespace, "leaf object watch lost; resynchronizing");
                 loop {
-                    let delay = recovery.expired(started.elapsed());
-                    tokio::time::sleep(delay).await;
+                    recovery.wait_before_retry(started.elapsed()).await;
                     // Include watch-open latency in the healthy interval, as
                     // slow store I/O already bounds repeated recovery work.
                     started = tokio::time::Instant::now();
@@ -217,7 +222,7 @@ impl LeafSubscriptionTable {
                 match open_watches(&self.inner.backend, &row.namespace).await {
                     Ok(streams) => return Ok(streams),
                     Err(ResourceError::WatchExpired { .. }) => {
-                        tokio::time::sleep(recovery.expired(started.elapsed())).await;
+                        recovery.wait_before_retry(started.elapsed()).await;
                     }
                     Err(error) => return Err(error),
                 }
@@ -241,8 +246,8 @@ impl LeafSubscriptionTable {
         loop {
             let mut routing = self.inner.routing.lock().await;
             let namespace = match routing.namespaces.entry(row.namespace.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
                     let Some(streams) = streams.take() else {
                         drop(routing);
                         // No table lock is held across I/O or recovery backoff.
@@ -277,7 +282,7 @@ impl LeafSubscriptionTable {
         }
         if let Some(namespace) = routing.namespaces.get_mut(&dependencies.namespace) {
             for address in &dependencies.objects {
-                if let std::collections::hash_map::Entry::Occupied(mut entry) = namespace.index.entry(address.clone()) {
+                if let Entry::Occupied(mut entry) = namespace.index.entry(address.clone()) {
                     entry.get_mut().remove(&id);
                     if entry.get().is_empty() {
                         entry.remove();

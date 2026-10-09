@@ -2,6 +2,7 @@
 use std::sync::atomic::Ordering;
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     time::Duration,
 };
 
@@ -29,6 +30,15 @@ pub(super) struct LeafWatchRecovery {
 }
 
 impl LeafWatchRecovery {
+    pub(super) async fn wait_before_retry(&mut self, healthy_for: Duration) {
+        let delay = self.expired(healthy_for);
+        if delay.is_zero() {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     pub(super) fn expired(&mut self, healthy_for: Duration) -> Duration {
         // Require sustained healthy consumption so intermittent lag cannot
         // repeatedly restore immediate retries and trigger snapshot bursts.
@@ -141,13 +151,42 @@ impl LeafSubscriptionTable {
     }
 
     pub(super) async fn watch_row_once(&self, row: LeafSubscriptionRow) -> Result<(), ResourceError> {
-        let (dependencies, mut changes) = self.register_routing(&row).await?;
+        let (dependencies, changes) = self.register_routing(&row).await?;
+        let namespace = row.namespace.clone();
+        self.watch_registered_row(row, changes, || self.load_subjects(&namespace, &dependencies.objects)).await
+    }
+
+    // Internal store-read seam; retry whole addressed reads after transient I/O
+    // so partially loaded evidence cannot fire a condition.
+    pub(super) async fn watch_registered_row<F, Fut>(
+        &self,
+        row: LeafSubscriptionRow,
+        mut changes: tokio::sync::watch::Receiver<()>,
+        mut load: F,
+    ) -> Result<(), ResourceError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<OwnedLeafSubjects, ResourceError>>,
+    {
         let staleness = LeafObservationStaleness { change_request: self.change_request_stale_after(), issue: self.issue_stale_after() };
         let mut last_retry_deadline = None;
+        let mut recovery = LeafWatchRecovery::default();
+        let mut started = tokio::time::Instant::now();
         loop {
             changes.borrow_and_update();
             let Some(current_row) = self.inner.rows.lock().await.get(&row.id).cloned() else { return Ok(()) };
-            let subjects = self.load_subjects(&row.namespace, &dependencies.objects).await?;
+            let subjects = match load().await {
+                Ok(subjects) => subjects,
+                Err(error @ (ResourceError::Other { .. } | ResourceError::Conflict { .. } | ResourceError::WatchExpired { .. })) => {
+                    tracing::warn!(subscription_id = %row.id, %error, "leaf addressed read failed; retrying");
+                    recovery.wait_before_retry(started.elapsed()).await;
+                    // Include the next read's latency in its healthy interval,
+                    // while excluding time spent waiting in recovery backoff.
+                    started = tokio::time::Instant::now();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             #[cfg(test)]
             self.inner.evaluations.fetch_add(1, Ordering::SeqCst);
             if let Some(fire) = evaluate_row(&current_row, &subjects.borrowed(), staleness).map_err(ResourceError::other)? {
@@ -180,7 +219,11 @@ impl LeafSubscriptionTable {
         }
     }
 
-    async fn load_subjects(&self, namespace: &str, objects: &HashSet<ObjectAddress>) -> Result<OwnedLeafSubjects, ResourceError> {
+    pub(super) async fn load_subjects(
+        &self,
+        namespace: &str,
+        objects: &HashSet<ObjectAddress>,
+    ) -> Result<OwnedLeafSubjects, ResourceError> {
         let mut subjects = OwnedLeafSubjects::default();
         #[cfg(test)]
         self.inner.snapshot_loads.fetch_add(1, Ordering::SeqCst);
@@ -251,7 +294,7 @@ impl LeafSubscriptionTable {
     }
 }
 #[derive(Default)]
-struct OwnedLeafSubjects {
+pub(super) struct OwnedLeafSubjects {
     convoys: HashMap<String, ResourceObject<Convoy>>,
     vessels: HashMap<String, ResourceObject<Vessel>>,
     change_requests: HashMap<String, ResourceObject<ChangeRequest>>,
