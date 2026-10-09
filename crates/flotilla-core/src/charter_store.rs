@@ -8,7 +8,7 @@ use std::{
 use flotilla_resources::CharterSource;
 use sha2::{Digest, Sha256};
 
-use crate::vcs::{TreeEntry, Vcs, REVISION_FETCH_TIMEOUT};
+use crate::vcs::{TreeEntry, Vcs, REVISION_FETCH_TIMEOUT, REVISION_FETCH_UNAVAILABLE};
 
 /// Bound source I/O while namespace authoring is excluded. This applies to
 /// injected inspectors too, rather than relying on a particular VCS timeout.
@@ -34,6 +34,8 @@ pub trait RevisionedTree: Send + Sync {
 /// A local reference names the current directory contents (its spelling is ignored).
 /// Resolution captures charter files and preserves their content-derived revision;
 /// subsequent reads of that revision use the captured contents.
+/// Captured revisions are retained for the tree lifetime. Construct a fresh tree
+/// per source read, as read_charter_source does, to bound retained snapshots.
 pub struct LocalDirectoryTree {
     directory: PathBuf,
     snapshots: Mutex<HashMap<String, LocalRevision>>,
@@ -88,7 +90,7 @@ impl RevisionedTree for GitRevisionedTree<'_> {
     async fn resolve(&self, reference: &str) -> Result<String, String> {
         self.vcs.fetch_revision(self.cache, self.repo, reference).await.map_err(|error| match error.as_str() {
             REVISION_FETCH_TIMEOUT => format!("fetch charter branch {reference}: timed out after 60s"),
-            "revision fetching is unavailable" => "bound charter inspection is unavailable".into(),
+            REVISION_FETCH_UNAVAILABLE => "bound charter inspection is unavailable".into(),
             _ => error,
         })
     }

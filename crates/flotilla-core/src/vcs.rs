@@ -702,6 +702,9 @@ pub enum CheckoutRegistration<'a> {
     Release,
 }
 
+/// Generic marker for providers without revision fetching.
+pub const REVISION_FETCH_UNAVAILABLE: &str = "revision fetching is unavailable";
+
 /// Generic timeout marker; callers add their own source context.
 pub const REVISION_FETCH_TIMEOUT: &str = "revision fetch exceeded 60 seconds";
 
@@ -756,7 +759,7 @@ pub trait Vcs: Send + Sync {
     /// Fetch a branch into an object cache and resolve it to an immutable commit.
     /// The fetch itself has a 60-second deadline; cache lock wait is excluded.
     async fn fetch_revision(&self, _cache: &Path, _repo: &str, _branch: &str) -> Result<String, String> {
-        Err("revision fetching is unavailable".into())
+        Err(REVISION_FETCH_UNAVAILABLE.into())
     }
 
     /// Read every entry under a path at an immutable revision, relative to that path.
