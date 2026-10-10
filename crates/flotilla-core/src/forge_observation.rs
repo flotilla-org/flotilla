@@ -30,8 +30,9 @@ use crate::providers::{
 
 pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 
-// Leave room inside the client's 30-second interactive request deadline.
-pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+// Leave three seconds for store/routing work inside the daemon's five-second
+// interactive request deadline (server/request_dispatch.rs).
+pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
@@ -721,10 +722,15 @@ mod tests {
         let before = counted.read_counts();
         let reads = ForgeReads::new(peer, "flotilla".into());
         let started = tokio::time::Instant::now();
-        let error = reads
-            .read::<u64, _, _>(&source(), ForgeReadRequest::Board, || async { panic!("peer loader") })
-            .await
-            .expect_err("unreachable owner");
+        // Model the daemon's outer interactive deadline: the observation must
+        // return its pending error before request dispatch cancels it as busy.
+        let error = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            reads.read::<u64, _, _>(&source(), ForgeReadRequest::Board, || async { panic!("peer loader") }),
+        )
+        .await
+        .expect("pending before the daemon interactive deadline")
+        .expect_err("unreachable owner");
         assert_eq!(error, "forge observation pending at source owner");
         assert_eq!(started.elapsed(), REMOTE_READ_TIMEOUT);
         // Empty named reads return no counted records. The parent is returned
