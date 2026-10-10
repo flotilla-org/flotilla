@@ -12,7 +12,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resolve_message_receiver, Convoy, Project, ProjectHierarchy, ReadResourceObject, ResolvedCascade, ResourceBackend, ResourceError,
+    Convoy, MessageReceiverSnapshot, Project, ProjectHierarchy, ReadResourceObject, ResolvedCascade, ResourceBackend, ResourceError,
     TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
@@ -96,6 +96,16 @@ pub async fn topic_contacts(
     namespace: &str,
     routing: TopicRouting<'_>,
 ) -> Result<Vec<RoleContact>, ResourceError> {
+    let receivers = MessageReceiverSnapshot::load(backend, namespace).await?;
+    topic_contacts_in_snapshot(backend, namespace, routing, &receivers).await
+}
+
+async fn topic_contacts_in_snapshot(
+    backend: &ResourceBackend,
+    namespace: &str,
+    routing: TopicRouting<'_>,
+    receivers: &MessageReceiverSnapshot,
+) -> Result<Vec<RoleContact>, ResourceError> {
     let TopicRouting { project, topic, sender, reach } = routing;
     let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
     let projects = backend.definitions::<Project>(namespace).list().await?;
@@ -123,8 +133,7 @@ pub async fn topic_contacts(
                     continue;
                 }
                 let address = definition.principal.clone().unwrap_or_else(|| format!("{name}/{role}"));
-                let holder =
-                    if definition.principal.is_some() { None } else { resolve_message_receiver(backend, namespace, &address).await? };
+                let holder = if definition.principal.is_some() { None } else { receivers.resolve(&address)? };
                 // Principal roles are declared terminal recipients. Automated roles
                 // exist only with current holders, not merely inherited definitions.
                 if holder.is_none() && definition.principal.is_none() {
@@ -165,9 +174,16 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
     crate::validate_message_address(own_address)?;
     let parts: Vec<_> = own_address.split('/').collect();
     let project = parts.first().copied().ok_or_else(|| ResourceError::invalid("crew address requires a Project"))?;
-    let supervision = supervision_path(backend, namespace, project, own_address).await?;
+    let receivers = MessageReceiverSnapshot::load(backend, namespace).await?;
+    let supervision = topic_contacts_in_snapshot(
+        backend,
+        namespace,
+        TopicRouting::builder().project(project).topic("supervision").sender(own_address).reach(TopicReach::Ancestors).build(),
+        &receivers,
+    )
+    .await?;
     let mut contacts = Vec::new();
-    let convoys = backend.including_replicas::<Convoy>(namespace).list().await?.items;
+    let convoys = receivers.convoys();
     let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
     let projects = backend.definitions::<Project>(namespace).list().await?;
     let subtree = if let Some(object) = projects.iter().find(|object| object.metadata.name == project) {
@@ -184,7 +200,7 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
         visible_projects.extend(hierarchy.descendants(project)?);
     }
     for source in convoys {
-        let convoy = source.object;
+        let convoy = &source.object;
         let candidate_project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
         if !visible_projects.contains(candidate_project) || convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             continue;
@@ -197,7 +213,7 @@ pub async fn crew_address_book(backend: &ResourceBackend, namespace: &str, own_a
                 for role in crew.keys() {
                     let address = format!("{candidate_project}/{}/{vessel}/{role}", convoy.metadata.name);
                     if address != own_address {
-                        let holder = resolve_message_receiver(backend, namespace, &address).await?;
+                        let holder = receivers.resolve(&address)?;
                         contacts.push(RoleContact {
                             address,
                             relation: crate::MessageRelation::Peer,
@@ -222,13 +238,28 @@ pub async fn resolve_topic_receiver(
     address: &str,
     sender: &str,
 ) -> Result<Option<ReadResourceObject<TerminalSession>>, ResourceError> {
+    let receivers = MessageReceiverSnapshot::load(backend, namespace).await?;
+    resolve_topic_receiver_in_snapshot(backend, namespace, address, sender, &receivers).await
+}
+
+pub(crate) async fn resolve_topic_receiver_in_snapshot(
+    backend: &ResourceBackend,
+    namespace: &str,
+    address: &str,
+    sender: &str,
+    receivers: &MessageReceiverSnapshot,
+) -> Result<Option<ReadResourceObject<TerminalSession>>, ResourceError> {
     let (project, topic) = parse_topic_address(address).ok_or_else(|| ResourceError::invalid("invalid topic address"))?;
     let reach = if topic == "supervision" { TopicReach::Ancestors } else { TopicReach::SubtreeSubscriptions };
-    let contacts =
-        topic_contacts(backend, namespace, TopicRouting::builder().project(project).topic(topic).sender(sender).reach(reach).build())
-            .await?;
+    let contacts = topic_contacts_in_snapshot(
+        backend,
+        namespace,
+        TopicRouting::builder().project(project).topic(topic).sender(sender).reach(reach).build(),
+        receivers,
+    )
+    .await?;
     if let Some(contact) = contacts.first() {
-        resolve_message_receiver(backend, namespace, &contact.address).await
+        receivers.resolve(&contact.address)
     } else {
         Ok(None)
     }
@@ -290,10 +321,11 @@ pub async fn reconcile_charter_notifications_with_renderer(
     let _charter_pass = inbox.charter_notifications.lock().await;
     let backend = &inbox.backend;
     let namespace = inbox.namespace.as_str();
+    let receivers = MessageReceiverSnapshot::load(backend, namespace).await?;
     let projects = backend.definitions::<Project>(namespace).list().await?;
-    let convoys = backend.including_replicas::<Convoy>(namespace).list().await?.items;
+    let convoys = receivers.convoys();
     let mut cascades = BTreeMap::new();
-    for holder in backend.including_replicas::<TerminalSession>(namespace).list().await?.items {
+    for holder in receivers.terminals() {
         if !matches!(holder.provenance, ResourceProvenance::Local) {
             continue;
         }
@@ -311,7 +343,7 @@ pub async fn reconcile_charter_notifications_with_renderer(
                 tracing::warn!(terminal = %holder.object.metadata.name, claim = %address, "ignoring malformed adopted role claim");
                 continue;
             }
-            let current = match resolve_message_receiver(backend, namespace, address).await {
+            let current = match receivers.resolve(address) {
                 Ok(Some(current)) => current,
                 Ok(None) => continue,
                 Err(error @ (ResourceError::Invalid { .. } | ResourceError::NotFound { .. })) => {

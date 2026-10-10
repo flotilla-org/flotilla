@@ -10,8 +10,8 @@ use crate::{
         delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
         DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
     },
-    message_expectation_open, message_supersedes, resolve_message_receiver, ControllerRetry, ControllerRetryDisposition, Demand,
-    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageQuery, MessageReference, MessageRelation,
+    message_expectation_open, message_supersedes, ControllerRetry, ControllerRetryDisposition, Demand, DemandStatusPatch, InputMeta,
+    Message, MessageExpectation, MessageInbox, MessagePhase, MessageQuery, MessageReceiverSnapshot, MessageReference, MessageRelation,
     MessageSpec, MessageStatus, MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError,
     ResourceObject, ResourceProvenance, StatusPatch, TerminalSession, TerminalSessionPhase,
 };
@@ -44,6 +44,13 @@ pub struct MessageBatch {
     pub text: String,
 }
 
+/// Evidence and members for one transport attempt, shared by initial and held outcomes.
+struct DeliveryAttempt<'a> {
+    members: &'a [ResourceObject<Message>],
+    holder: &'a ResourceObject<TerminalSession>,
+    submission: &'a MessageSubmission,
+}
+
 /// The transport owns readiness and evidence. Polling an existing submission
 /// must never type its text again, even after adapter or daemon restart.
 #[async_trait]
@@ -64,8 +71,14 @@ pub trait MessageTransport: Send + Sync {
 }
 
 impl MessageInbox {
-    /// A pass always observes holders, including held submissions. Admission and
+    /// A pass with active Messages observes holders, including held submissions.
+    /// Idle passes skip receiver reads but still repair abandoned gates. Admission and
     /// delivery serialize separately; admission never waits on transport I/O.
+    /// Holder evidence is frozen after admission repair for this entire pass,
+    /// including gate cleanup. Transport calls are bounded individually, but a
+    /// pass may contain many groups: holder changes refresh on the next pass.
+    /// Cleanup may temporarily retain or remove a gate using that older evidence;
+    /// the next pass repairs it from current holders and active Messages.
     pub async fn reconcile_delivery(&self, transport: &dyn MessageTransport, now: DateTime<Utc>) -> Result<(), ResourceError> {
         let _delivery = self.delivery.lock().await;
         {
@@ -77,6 +90,13 @@ impl MessageInbox {
             }
         }
         let mut messages = self.messages.query(&MessageQuery::active()).await?;
+        if messages.is_empty() {
+            self.cleanup_delivery_gates(None, now).await?;
+            tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&messages)).await.ok();
+            return Ok(());
+        }
+        let snapshot = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+        let receivers = &snapshot;
         messages.sort_by_key(|message| {
             (
                 message.metadata.creation_timestamp,
@@ -87,7 +107,7 @@ impl MessageInbox {
         let mut groups: BTreeMap<String, (ResourceObject<TerminalSession>, Vec<ResourceObject<Message>>)> = BTreeMap::new();
         // Reuse a receiver lookup within this pass, never across passes: holder
         // evidence must refresh even while a submission is held.
-        let mut receivers: BTreeMap<(String, String), Option<ReadResourceObject<TerminalSession>>> = BTreeMap::new();
+        let mut resolved_receivers: BTreeMap<(String, String), Option<ReadResourceObject<TerminalSession>>> = BTreeMap::new();
         for message in &messages {
             let phase = message.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
             if phase.is_terminal() {
@@ -139,7 +159,7 @@ impl MessageInbox {
                     {
                         if reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
                             && reply.object.spec.receiver == message.spec.sender
-                            && self.reply_sender_matches(message, &reply.object.spec.sender).await?
+                            && Self::reply_sender_matches(receivers, message, &reply.object.spec.sender)?
                         {
                             answered = true;
                             break;
@@ -184,11 +204,11 @@ impl MessageInbox {
                 continue;
             }
             let receiver_key = (message.spec.receiver.clone(), message.spec.sender.clone());
-            let holder = if let Some(holder) = receivers.get(&receiver_key) {
+            let holder = if let Some(holder) = resolved_receivers.get(&receiver_key) {
                 holder.clone()
             } else {
-                let holder = self.resolve_receiver(message).await?;
-                receivers.insert(receiver_key, holder.clone());
+                let holder = self.resolve_receiver(receivers, message).await?;
+                resolved_receivers.insert(receiver_key, holder.clone());
                 holder
             };
             match holder {
@@ -220,9 +240,9 @@ impl MessageInbox {
             }
         }
         for (_, (holder, pending)) in groups {
-            self.deliver_group(transport, &holder, &pending, &messages, now).await?;
+            self.deliver_group(receivers, transport, &holder, &pending, &messages, now).await?;
         }
-        self.cleanup_delivery_gates(now).await?;
+        self.cleanup_delivery_gates(Some(receivers), now).await?;
         let current = self.messages.query(&MessageQuery::active()).await?;
         tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&current)).await.ok();
         Ok(())
@@ -265,11 +285,12 @@ impl MessageInbox {
             )
             .await?;
         }
-        self.clear_signal(&message).await
+        let snapshot = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+        self.clear_signal(&snapshot, &message).await
     }
 
-    async fn delivered_role_address(
-        &self,
+    fn delivered_role_address(
+        receivers: &MessageReceiverSnapshot,
         message: &ResourceObject<Message>,
         holder: &ResourceObject<TerminalSession>,
     ) -> Result<Option<String>, ResourceError> {
@@ -283,7 +304,15 @@ impl MessageInbox {
             return Ok(None);
         };
         let project = if message.spec.receiver.starts_with("topic:") {
-            self.backend.including_replicas::<crate::Convoy>(&self.namespace).get(convoy).await?.object.spec.project_ref
+            receivers
+                .convoys()
+                .iter()
+                .find(|source| source.object.metadata.name == *convoy)
+                .ok_or_else(|| ResourceError::not_found(convoy))?
+                .object
+                .spec
+                .project_ref
+                .clone()
         } else {
             message.spec.receiver.split('/').next().map(str::to_string)
         };
@@ -292,16 +321,28 @@ impl MessageInbox {
 
     async fn resolve_receiver(
         &self,
+        receivers: &MessageReceiverSnapshot,
         message: &ResourceObject<Message>,
     ) -> Result<Option<ReadResourceObject<TerminalSession>>, ResourceError> {
         if message.spec.receiver.starts_with("topic:") {
-            crate::resolve_topic_receiver(&self.backend, &self.namespace, &message.spec.receiver, &message.spec.sender).await
+            crate::role_routing::resolve_topic_receiver_in_snapshot(
+                &self.backend,
+                &self.namespace,
+                &message.spec.receiver,
+                &message.spec.sender,
+                receivers,
+            )
+            .await
         } else {
-            resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await
+            receivers.resolve(&message.spec.receiver)
         }
     }
 
-    async fn reply_sender_matches(&self, message: &ResourceObject<Message>, sender: &str) -> Result<bool, ResourceError> {
+    fn reply_sender_matches(
+        receivers: &MessageReceiverSnapshot,
+        message: &ResourceObject<Message>,
+        sender: &str,
+    ) -> Result<bool, ResourceError> {
         if sender == message.spec.receiver {
             return Ok(true);
         }
@@ -326,7 +367,7 @@ impl MessageInbox {
         }
         // N→N+1 fallback: find the recorded incarnation directly, without
         // requiring its old convoy to remain the current project-role holder.
-        let holders = self.backend.including_replicas::<TerminalSession>(&self.namespace).list().await?.items;
+        let holders = receivers.terminals();
         Ok(holders.iter().any(|holder| {
             let labels = &holder.object.metadata.labels;
             holder.object.status.as_ref().is_some_and(|status| {
@@ -340,6 +381,7 @@ impl MessageInbox {
 
     async fn deliver_group(
         &self,
+        receivers: &MessageReceiverSnapshot,
         transport: &dyn MessageTransport,
         holder: &ResourceObject<TerminalSession>,
         pending: &[ResourceObject<Message>],
@@ -368,14 +410,14 @@ impl MessageInbox {
                     let held: Vec<_> =
                         pending.iter().filter(|message| submission.members.contains(&message.metadata.name)).cloned().collect();
                     if now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR {
-                        self.failed(&held, &error, true, now).await?;
+                        self.failed(receivers, &held, &error, true, now).await?;
                         return Ok(());
                     }
                     for message in pending {
                         self.wait(message, MessagePhase::Deliverable, &format!("held while observing acceptance: {error}"), now).await?;
                     }
                 } else {
-                    self.failed(pending, &error, false, now).await?;
+                    self.failed(receivers, pending, &error, false, now).await?;
                 }
                 return Ok(());
             }
@@ -400,9 +442,9 @@ impl MessageInbox {
                 members.iter().find_map(|message| message.status.as_ref().and_then(|status| status.resolved_receiver.clone()))
             {
                 // Recover a partially persisted batch receipt without polling or resubmitting.
-                self.accepted(&members, &receiver).await?;
+                self.accepted(receivers, &members, &receiver).await?;
                 release(transport, &batch(holder, &members, submission.clone())).await;
-                self.clear_signal(&members[0]).await?;
+                self.clear_signal(receivers, &members[0]).await?;
                 return Ok(());
             }
             let receiver = holder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.id.as_str());
@@ -431,9 +473,10 @@ impl MessageInbox {
             if same_holder {
                 if let Some(evidence) = evidence {
                     self.accepted(
+                        receivers,
                         &members,
                         &ResolvedMessageReceiver::builder()
-                            .maybe_role_address(self.delivered_role_address(&members[0], holder).await?)
+                            .maybe_role_address(Self::delivered_role_address(receivers, &members[0], holder)?)
                             .crew_id(submission.crew_id.clone())
                             .session(submission.session.clone())
                             .delivered_at(now)
@@ -442,7 +485,7 @@ impl MessageInbox {
                     )
                     .await?;
                     release(transport, &batch(holder, &members, submission.clone())).await;
-                    self.clear_signal(&members[0]).await?;
+                    self.clear_signal(receivers, &members[0]).await?;
                     return Ok(());
                 }
             }
@@ -455,7 +498,7 @@ impl MessageInbox {
                 self.write(message, &status).await?;
             }
             if !same_holder {
-                self.failed(&members, "recorded receiver session changed before acceptance was established", true, now).await?;
+                self.failed(receivers, &members, "recorded receiver session changed before acceptance was established", true, now).await?;
                 return Ok(());
             }
             let batch = batch(holder, &members, submission.clone());
@@ -465,9 +508,10 @@ impl MessageInbox {
             if matches!(outcome, MessageTransportOutcome::Pending | MessageTransportOutcome::Unconfirmed { .. })
                 && now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR
             {
-                self.failed(&members, "submission acceptance remained unresolved past the hold bound", true, now).await?;
+                self.failed(receivers, &members, "submission acceptance remained unresolved past the hold bound", true, now).await?;
             } else {
-                self.outcome(&members, holder, &submission, transport, outcome, now).await?;
+                self.outcome(receivers, DeliveryAttempt { members: &members, holder, submission: &submission }, transport, outcome, now)
+                    .await?;
             }
             return Ok(());
         }
@@ -480,7 +524,7 @@ impl MessageInbox {
                 .and_then(|status| status.retry.as_ref())
                 .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
         }) {
-            self.signal(held, now).await?;
+            self.signal(receivers, held, now).await?;
         }
         if pending.iter().any(|message| {
             message.status.as_ref().and_then(|status| status.retry.as_ref()).is_some_and(|retry| match &retry.disposition {
@@ -542,24 +586,25 @@ impl MessageInbox {
         let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.submit(&batch)).await.unwrap_or_else(|_| {
             MessageTransportOutcome::Unconfirmed { reason: "transport submission timed out; input may have been accepted".into() }
         });
-        self.outcome(pending, holder, &submission, transport, outcome, now).await
+        self.outcome(receivers, DeliveryAttempt { members: pending, holder, submission: &submission }, transport, outcome, now).await
     }
 
     async fn outcome(
         &self,
-        members: &[ResourceObject<Message>],
-        holder: &ResourceObject<TerminalSession>,
-        submission: &MessageSubmission,
+        receivers: &MessageReceiverSnapshot,
+        attempt: DeliveryAttempt<'_>,
         transport: &dyn MessageTransport,
         outcome: MessageTransportOutcome,
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        let DeliveryAttempt { members, holder, submission } = attempt;
         match outcome {
             MessageTransportOutcome::Accepted { evidence } if !evidence.is_empty() => {
                 self.accepted(
+                    receivers,
                     members,
                     &ResolvedMessageReceiver::builder()
-                        .maybe_role_address(self.delivered_role_address(&members[0], holder).await?)
+                        .maybe_role_address(Self::delivered_role_address(receivers, &members[0], holder)?)
                         .crew_id(submission.crew_id.clone())
                         .session(submission.session.clone())
                         .delivered_at(now)
@@ -568,20 +613,25 @@ impl MessageInbox {
                 )
                 .await?;
                 release(transport, &batch(holder, members, submission.clone())).await;
-                self.clear_signal(&members[0]).await
+                self.clear_signal(receivers, &members[0]).await
             }
-            MessageTransportOutcome::NotSubmitted { reason } => self.failed(members, &reason, false, now).await,
+            MessageTransportOutcome::NotSubmitted { reason } => self.failed(receivers, members, &reason, false, now).await,
             MessageTransportOutcome::Unconfirmed { reason } => {
-                self.failed(members, &format!("held pending acceptance evidence: {reason}"), true, now).await
+                self.failed(receivers, members, &format!("held pending acceptance evidence: {reason}"), true, now).await
             }
             MessageTransportOutcome::Pending => Ok(()),
             MessageTransportOutcome::Accepted { .. } => {
-                self.failed(members, "transport supplied an empty acceptance receipt", true, now).await
+                self.failed(receivers, members, "transport supplied an empty acceptance receipt", true, now).await
             }
         }
     }
 
-    async fn accepted(&self, members: &[ResourceObject<Message>], receiver: &ResolvedMessageReceiver) -> Result<(), ResourceError> {
+    async fn accepted(
+        &self,
+        receivers: &MessageReceiverSnapshot,
+        members: &[ResourceObject<Message>],
+        receiver: &ResolvedMessageReceiver,
+    ) -> Result<(), ResourceError> {
         for member in members {
             apply_status_patch(
                 &self.messages,
@@ -589,13 +639,14 @@ impl MessageInbox {
                 &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
             )
             .await?;
-            self.clear_signal(member).await?;
+            self.clear_signal(receivers, member).await?;
         }
         Ok(())
     }
 
     async fn failed(
         &self,
+        receivers: &MessageReceiverSnapshot,
         members: &[ResourceObject<Message>],
         reason: &str,
         ambiguous: bool,
@@ -615,7 +666,7 @@ impl MessageInbox {
                         .is_some_and(|submission| crate::delivery_hold::delivery_hold_overdue(submission.started_at, now))
                     && member.metadata.name == members[0].metadata.name
                 {
-                    self.signal(&current, now).await?;
+                    self.signal(receivers, &current, now).await?;
                 }
                 continue;
             }
@@ -647,7 +698,7 @@ impl MessageInbox {
                 .as_ref()
                 .is_some_and(|submission| crate::delivery_hold::delivery_hold_overdue(submission.started_at, now));
             if held && (!ambiguous || overdue) && member.metadata.name == members[0].metadata.name {
-                self.signal(&current, now).await?;
+                self.signal(receivers, &current, now).await?;
             }
         }
         Ok(())
@@ -679,7 +730,7 @@ impl MessageInbox {
 
     // Repair a crash between terminal closure/receipt and gate deletion. Only
     // actual receiver gates are checked; historical Messages cause no deletes.
-    async fn cleanup_delivery_gates(&self, _now: DateTime<Utc>) -> Result<(), ResourceError> {
+    async fn cleanup_delivery_gates(&self, receivers: Option<&MessageReceiverSnapshot>, _now: DateTime<Utc>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
         let gates: Vec<_> = demands
             .list()
@@ -711,9 +762,21 @@ impl MessageInbox {
             })
             .collect();
         let mut retained = std::collections::BTreeSet::new();
-        for message in active {
-            if let Some(holder) = self.resolve_receiver(&message).await? {
-                retained.insert(delivery_demand_name(&holder.object));
+        if !active.is_empty() {
+            let loaded;
+            let receivers = match receivers {
+                Some(receivers) => receivers,
+                None => {
+                    // The idle caller saw no active Messages; this query can
+                    // find one only if admission raced with gate cleanup.
+                    loaded = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+                    &loaded
+                }
+            };
+            for message in active {
+                if let Some(holder) = self.resolve_receiver(receivers, &message).await? {
+                    retained.insert(delivery_demand_name(&holder.object));
+                }
             }
         }
         for gate in gates {
@@ -728,8 +791,13 @@ impl MessageInbox {
         Ok(())
     }
 
-    async fn signal(&self, message: &ResourceObject<Message>, now: DateTime<Utc>) -> Result<(), ResourceError> {
-        let Some(holder) = self.resolve_receiver(message).await? else {
+    async fn signal(
+        &self,
+        receivers: &MessageReceiverSnapshot,
+        message: &ResourceObject<Message>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let Some(holder) = self.resolve_receiver(receivers, message).await? else {
             return Ok(());
         };
         let demands = self.backend.using::<Demand>(&self.namespace);
@@ -744,8 +812,8 @@ impl MessageInbox {
         Ok(())
     }
 
-    async fn clear_signal(&self, message: &ResourceObject<Message>) -> Result<(), ResourceError> {
-        let Some(holder) = self.resolve_receiver(message).await? else {
+    async fn clear_signal(&self, receivers: &MessageReceiverSnapshot, message: &ResourceObject<Message>) -> Result<(), ResourceError> {
+        let Some(holder) = self.resolve_receiver(receivers, message).await? else {
             return Ok(());
         };
         let demands = self.backend.using::<Demand>(&self.namespace);
@@ -872,6 +940,56 @@ mod framing_tests {
                 .expectation(MessageExpectation::Reply)
                 .build(),
         ]
+    }
+
+    // A topic receipt uses this pass's convoy evidence. A missing convoy refuses
+    // receipt identity even if that convoy appears later; only a fresh pass sees it.
+    #[tokio::test]
+    async fn topic_receipt_requires_convoy_in_snapshot() {
+        let backend = crate::ResourceBackend::InMemory(crate::InMemoryBackend::default());
+        let mut intent = messages().remove(0);
+        intent.receiver = "topic:project/supervision".into();
+        let message = backend
+            .using::<Message>("project")
+            .create(&InputMeta::builder().name("message".into()).build(), &intent)
+            .await
+            .expect("message");
+        let holder = backend
+            .using::<TerminalSession>("project")
+            .create(
+                &InputMeta::builder()
+                    .name("terminal".into())
+                    .labels(std::collections::BTreeMap::from([
+                        (crate::CONVOY_LABEL.into(), "convoy".into()),
+                        (crate::VESSEL_LABEL.into(), "work".into()),
+                        (crate::ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &crate::TerminalSessionSpec::builder()
+                    .env_ref("environment".into())
+                    .role("coder".into())
+                    .source(crate::TerminalSessionSource::Tool { command: "sh".into() })
+                    .cwd("/repo".into())
+                    .pool("cleat".into())
+                    .build(),
+            )
+            .await
+            .expect("holder");
+        let old = MessageReceiverSnapshot::load(&backend, "project").await.expect("snapshot");
+        backend
+            .using::<crate::Convoy>("project")
+            .create(
+                &InputMeta::builder().name("convoy".into()).build(),
+                &crate::ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("project".into()).build(),
+            )
+            .await
+            .expect("convoy created after snapshot");
+        assert!(matches!(MessageInbox::delivered_role_address(&old, &message, &holder), Err(ResourceError::NotFound { .. })));
+        let fresh = MessageReceiverSnapshot::load(&backend, "project").await.expect("fresh snapshot");
+        assert_eq!(
+            MessageInbox::delivered_role_address(&fresh, &message, &holder).expect("receipt identity"),
+            Some("project/convoy/work/coder".into())
+        );
     }
 
     // Header fields stay on one line; bodies (including empty bodies) are preserved exactly.
