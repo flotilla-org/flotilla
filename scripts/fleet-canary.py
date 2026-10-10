@@ -108,11 +108,49 @@ def verify_baseline(report):
             raise CanaryFailure(f'credential-free canary received {key}')
 
 
+REGISTRY_CREDENTIAL = 'lab-forgejo-registry-pull'
+
+
+def registry_credential(host_home, live_spec=None):
+    """Resolve host-only registry material without reading or copying the token."""
+    spec = live_spec if live_spec is not None else {
+        'consumer': {'adapter': 'docker-registry', 'registry': 'forgejo.lab.flotilla.work',
+                     'username': 'flotilla-crew'},
+        'source': {'kind': 'file', 'path': '~/.config/flotilla/credentials/lab-forgejo-registry-pull.token'},
+        'lifecycle': 'static'}
+    if (spec.get('consumer', {}).get('adapter') != 'docker-registry'
+            or spec.get('source', {}).get('kind') != 'file'):
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: expected docker-registry with a file source')
+    path = spec['source']['path']
+    if path.startswith('~/'):
+        path = host_home / path[2:]
+    else:
+        path = Path(path)
+    if not path.is_absolute():
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: token path must be absolute: {path}')
+    if not path.is_file():
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: missing token file: {path}')
+    return {'consumer': dict(spec['consumer']), 'source': {'kind': 'file', 'path': str(path)},
+            'lifecycle': spec['lifecycle']}
+
+
+def live_registry_spec(log):
+    """Read the host declaration; command/decoding failures must not select defaults."""
+    # Use the installed client matching the live daemon, and forbid auto-spawn.
+    commands = Commands({**os.environ, 'FLOTILLA_CONTAINED_HOST_DAEMON': '1'}, log)
+    records = objects(json.loads(commands.run([
+        'flotilla', '--json', 'resource', 'list', 'credentialspecs', '--local-only'])))
+    return next((item['spec'] for item in records
+                 if item['metadata']['name'] == REGISTRY_CREDENTIAL), None)
+
+
 class Canary:
-    def __init__(self, release, root, commands, timeout=180):
+    def __init__(self, release, root, commands, timeout=180, *, host_home=None, live_spec=None):
         self.release = Path(release)
         self.root = Path(root)
         self.commands = commands
+        self.host_home = Path.home() if host_home is None else Path(host_home)
+        self.live_spec = live_spec
         self.timeout = timeout
         self.socket = self.root / 'config/run/flotilla.sock'
         self.containers = set()
@@ -151,6 +189,7 @@ class Canary:
 
     def prepare(self):
         """Start the isolated daemon and admit the probe, before observing Docker."""
+        self.registry_spec = registry_credential(self.host_home, self.live_spec)
         for directory in ('config/run', 'state', 'home', 'cleat'):
             (self.root / directory).mkdir(parents=True)
         with (self.root / 'daemon.log').open('w') as log:
@@ -184,6 +223,9 @@ class Canary:
         self.commands.run([*git, 'config', 'branch.fleet-canary.remote', '.'])
         self.commands.run([*git, 'config', 'branch.fleet-canary.merge', 'refs/heads/main'])
         self.cli('project', 'add', str(repo), '--name', 'fleet-canary')
+        self.apply('CredentialSpec', REGISTRY_CREDENTIAL, self.registry_spec)
+        self.apply('CredentialGrant', 'fleet-canary-registry', {
+            'selector': {'projects': ['fleet-canary']}, 'credentials': [REGISTRY_CREDENTIAL]})
         self.cli('resource', 'apply', '--file', str(self.release / 'crew-image-baseline.yaml'))
         self.apply('PlacementPolicy', 'fleet-canary', {
             'pool': 'cleat', 'docker_per_vessel': {
@@ -196,6 +238,9 @@ class Canary:
         self.apply('FulfilmentKind', 'fleet-canary', {
             'host_ref': host, 'pool': 'cleat', 'realisation': 'docker_per_vessel',
             'image': {'image_baseline_ref': 'fleet-crew'}})
+        self.wait('host observes registry credential', lambda: any(
+            REGISTRY_CREDENTIAL in item.get('status', {}).get('capabilities', {}).get('held_credentials', [])
+            for item in self.list('hosts')))
         self.apply('WorkflowTemplate', 'fleet-canary', {
             'exit': 'claim', 'vessels': [{'name': 'work', 'crew': [
                 {'role': 'probe', 'selector': {'capability': 'code'}, 'completion_conditions': []}]}]})
@@ -251,9 +296,6 @@ def isolated_environment(release, root):
                    'CLEAT_RUNTIME_DIR': str(root / 'cleat'), 'FLOTILLA_FLEET_CANARY': '1',
                    'FLOTILLA_SKILLS_DIR': str(release / 'share/flotilla/skills'),
                    'FLOTILLA_CODEX_HOME_TEMPLATE': str(release / 'share/flotilla/codex-home')}
-    # Registry authentication belongs to the host Docker client, never the crew.
-    # Keep its existing config while isolating model and forge credentials.
-    environment['DOCKER_CONFIG'] = os.environ.get('DOCKER_CONFIG', str(Path.home() / '.docker'))
     return environment
 
 
@@ -272,6 +314,7 @@ def main(argv=None):
         commands = Commands(environment, log)
         canary = Canary(args.release, root, commands, args.timeout)
         try:
+            canary.live_spec = live_registry_spec(log)
             canary.exercise()
             success = True
         except (CanaryFailure, OSError, ValueError, subprocess.SubprocessError) as error:

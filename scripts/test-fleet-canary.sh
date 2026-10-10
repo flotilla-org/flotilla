@@ -89,6 +89,7 @@ cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin flotilla --bi
 # Cargo reports the actual executables, including target/profile subdirectories.
 python3 - "$repo_root" "$root/cargo-artifacts.jsonl" <<'PYTHON'
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -101,7 +102,13 @@ for line in Path(sys.argv[2]).read_text().splitlines():
 for name in ('flotilla', 'flotillad'):
     if name not in artifacts:
         raise SystemExit(f'missing cargo artifact: {name}')
+# A temporary host home supplies only a fake registry token path. The real
+# admission test never reads an operator credential or launches Docker.
+host_home = Path(sys.argv[2]).parent / 'host-home'
+token = host_home / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'
+token.parent.mkdir(parents=True)
+token.write_text('test-registry-token\n')
 subprocess.run(['python3', str(Path(sys.argv[1]) / 'scripts/test-fleet-canary-real.py'),
-                artifacts['flotilla'], artifacts['flotillad']], check=True)
+                artifacts['flotilla'], artifacts['flotillad']], check=True, env={**os.environ, 'HOME': str(host_home)})
 PYTHON
 echo 'fleet canary contract passed'
