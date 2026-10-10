@@ -25,6 +25,8 @@ use crate::providers::{
     types::ChangeRequest,
 };
 
+pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
+
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
@@ -274,7 +276,7 @@ impl ForgeReads {
         // materialization loop. Never persist or replicate one record per cursor.
         if matches!(request, ForgeReadRequest::Changes { .. }) {
             if !owns_source(&self.backend, &self.namespace, &source).await? {
-                return Err("incremental forge reads are owner-local".into());
+                return Err(OWNER_LOCAL_INCREMENTAL_READ_ERROR.into());
             }
             let result = tokio::time::timeout(LOAD_TIMEOUT, load()).await.unwrap_or_else(|_| Err("forge observation timed out".into()));
             if !owns_source(&self.backend, &self.namespace, &source).await? {
@@ -695,7 +697,7 @@ mod tests {
                 })
                 .await
                 .expect_err("nonowner refusal"),
-            "incremental forge reads are owner-local"
+            OWNER_LOCAL_INCREMENTAL_READ_ERROR
         );
         assert!(reads.backend.using::<ForgeRead>("flotilla").list().await.expect("list records").items.is_empty());
         assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").list().await.expect("list records").items.is_empty());

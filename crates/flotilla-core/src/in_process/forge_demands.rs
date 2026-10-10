@@ -19,6 +19,7 @@ impl crate::in_process::InProcessDaemon {
         for record in backend.including_replicas::<ForgeRead>(&namespace).list().await.map_err(|e| e.to_string())?.items {
             // Previous-generation incremental demands remain decodable but are
             // no longer serviced or renewed. Idle retention reaps their pairs.
+            // Remove this servicing shim one fleet roll after #2997 ships.
             if matches!(record.object.spec.request, ForgeReadRequest::Changes { .. }) {
                 continue;
             }

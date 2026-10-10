@@ -12,6 +12,7 @@ use flotilla_resources::{
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};
 use crate::config::ConfigStore;
+use crate::forge_observation::OWNER_LOCAL_INCREMENTAL_READ_ERROR;
 use crate::in_process::InProcessDaemon;
 use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::providers::change_request::ChangeRequestTracker;
@@ -228,7 +229,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         if index == 0 {
             assert_eq!(changes.unwrap().updated.len(), 1);
         } else {
-            assert_eq!(changes.unwrap_err(), "incremental forge reads are owner-local");
+            assert_eq!(changes.unwrap_err(), OWNER_LOCAL_INCREMENTAL_READ_ERROR);
         }
     }
     assert_eq!(providers.iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 4);
