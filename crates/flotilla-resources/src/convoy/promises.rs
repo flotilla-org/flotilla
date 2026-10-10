@@ -153,9 +153,9 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
     if status.phase.is_terminal() {
         return;
     }
-    let promises = status.promises.entry(vessel.to_string()).or_default().entry(role.to_string()).or_default();
     match operation {
         PromiseOperation::Declare { id, kind, source } | PromiseOperation::Submit { id, kind, source, .. } => {
+            let promises = status.promises.entry(vessel.to_string()).or_default().entry(role.to_string()).or_default();
             if !promises.iter().any(|p| p.id == *id) {
                 promises.push(Promise {
                     id: id.clone(),
@@ -176,6 +176,9 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
                     }
                     return;
                 }
+                // Optimistic patches may have outlived command validation.
+                // The command checks effect_present on the persisted result;
+                // mismatched kinds and terminal states must remain untouched.
                 if promise.kind != *kind || promise.state.terminal() {
                     return;
                 }
@@ -191,12 +194,18 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
             }
         }
         PromiseOperation::Retract { id, reason } => {
+            let Some(promises) = status.promises.get_mut(vessel).and_then(|crew| crew.get_mut(role)) else {
+                return;
+            };
             if let Some(promise) = promises.iter_mut().find(|p| p.id == *id && !p.state.terminal() && p.source == PromiseSource::Crew) {
                 promise.state = PromiseState::Retracted;
                 promise.retraction_reason = Some(reason.clone());
             }
         }
         PromiseOperation::Verdict { id, reference, submitted_at, verdict } => {
+            let Some(promises) = status.promises.get_mut(vessel).and_then(|crew| crew.get_mut(role)) else {
+                return;
+            };
             if let Some(promise) = promises.iter_mut().find(|p| p.id == *id && p.state == PromiseState::Submitted) {
                 if let Some(submission) = promise
                     .submissions
@@ -782,5 +791,24 @@ mod tests {
             std::time::Duration::from_secs(180)
         )
         .is_some());
+    }
+    // ADR 0061: unknown retractions/verdicts and stale replay are true no-ops,
+    // preserving status equality for optimistic write suppression.
+    #[hegel::test]
+    fn unknown_and_stale_operations_preserve_status(tc: hegel::TestCase) {
+        let target = tc.draw(hegel::generators::integers::<usize>().max_value(2));
+        let retract = tc.draw(hegel::generators::booleans());
+        let mut status = ConvoyStatus::default();
+        apply(&mut status, "work", "coder", &submit("feature", 1));
+        let (vessel, role) = [("unknown", "coder"), ("work", "unknown"), ("work", "coder")][target];
+        let before = status.clone();
+        let operation =
+            if retract { PromiseOperation::Retract { id: "unknown".into(), reason: "unused".into() } } else { verdict("unknown", 1, true) };
+        apply(&mut status, vessel, role, &operation);
+        assert_eq!(status, before);
+        apply(&mut status, "work", "coder", &verdict("feature", 1, true));
+        let before = status.clone();
+        apply(&mut status, "work", "coder", &verdict("feature", 1, true));
+        assert_eq!(status, before);
     }
 }
