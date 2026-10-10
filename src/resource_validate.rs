@@ -21,6 +21,7 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 #[cfg(unix)]
 use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject};
 use flotilla_store::validate_resource_document;
+#[cfg(unix)]
 use flotilla_store::{validate_message_migration_complete, REGISTERED_RESOURCE_KINDS};
 use serde::Deserialize;
 use serde_json::Value;
