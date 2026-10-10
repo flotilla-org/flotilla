@@ -3,3 +3,7 @@ members:
   - alias: flotilla
     url: https://github.com/flotilla-org/flotilla
     roles: [code, ops, knowledge]
+skills:
+  '*':
+    - flotilla-org/flotilla@flotilla-commands
+    - flotilla-org/flotilla@crew-review

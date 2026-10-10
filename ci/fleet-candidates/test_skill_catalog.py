@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -44,6 +45,31 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(entry["revision"], "1" * 40)
             self.assertEqual(entry["repository"], f"owner/{entry['source']}")
             self.assertEqual(entry["path"], "skills/directory-is-not-the-name")
+
+    def test_flotilla_stock_skill_catalog_includes_both_skills(self):
+        # Issue #2982: the pinned Flotilla skills root supplies both stock skills,
+        # through the same catalog production used by the candidate bundle.
+        root = Path(__file__).resolve().parents[2]
+        manifest = {"schema_version": 5, "sources": [
+            {"name": name, "repository": f"https://github.com/flotilla-org/{name}.git",
+             "revision": "1" * 40, "paths": ["skills"]}
+            for name in validation.SOURCE_NAMES
+        ]}
+
+        def git_process(command, **kwargs):
+            # Process-boundary fake: supply the real local stock payload in place
+            # of fetching a future commit from the forge.
+            checkout = Path(command[command.index("-C") + 1])
+            if "checkout" in command:
+                shutil.copytree(root / "skills", checkout / "skills")
+            return subprocess.CompletedProcess(command, 0, "1" * 40 if "rev-parse" in command else "", "")
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(validation.subprocess, "run", git_process):
+            output = Path(temporary) / "catalog.json"
+            validation.validate_skill_source_paths(manifest, output)
+            catalog = [entry for entry in json.loads(output.read_text()) if entry["source"] == "flotilla"]
+        self.assertEqual({entry["name"] for entry in catalog}, {"crew-review", "flotilla-commands"})
+        self.assertEqual({entry["path"] for entry in catalog}, {"skills/crew-review", "skills/flotilla-commands"})
 
     def test_invalid_frontmatter_cannot_produce_a_catalog(self):
         # Intended: absent names, unsafe names, and duplicate names refuse catalog
