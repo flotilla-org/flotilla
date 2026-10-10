@@ -403,10 +403,11 @@ pub struct CrewSpec {
     pub needs: BTreeSet<CapabilityNeed>,
     #[serde(flatten)]
     pub source: CrewSource,
+    // Lossless carry-forward for historical custom leaves that have no kind rule.
+    // The Rust name is retained for callers; the stored name is `legacy_checks`.
+    // These are not new template promises; stock templates never author them.
     #[builder(default)]
     #[serde(default, rename = "legacy_checks", skip_serializing_if = "Vec::is_empty")]
-    // Lossless carry-forward for historical custom leaves that have no kind rule.
-    // These are not new template promises; stock templates never author them.
     pub completion_conditions: Vec<CrewCompletionExpectation>,
     /// Template obligations owned by this role. Admission freezes the declarations
     /// and exclusions together; excluded obligations are never seeded into status.
@@ -1659,7 +1660,10 @@ mod promise_template_tests {
                     .build()])
                 .build()])
             .build();
+        // Authored roles and matching vessel hints must receive the same choice.
+        workflow.roles = workflow.vessels[0].crew.clone();
         workflow.exclude_template_promises(&exclusions).expect("known exclusions");
+        assert_eq!(workflow.roles[0].promise_exclusions, workflow.vessels[0].crew[0].promise_exclusions);
         let once = workflow.clone();
         workflow.exclude_template_promises(&exclusions).expect("repeat exclusions");
         assert_eq!(workflow, once);

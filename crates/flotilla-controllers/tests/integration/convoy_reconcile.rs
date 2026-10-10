@@ -317,6 +317,52 @@ fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::T
                 service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42,
             }]
     )));
+    // ADR 0061: a selected PR declaration gates readiness for any role. An
+    // explicit exclusion suppresses the gate, including on a deliverer. Stock
+    // deliverers still check discovered PRs without requiring a PR declaration.
+    for deliverer in [false, true] {
+        for declares_pr in [false, true] {
+            for excluded in [false, true].into_iter().filter(|excluded| !excluded || declares_pr) {
+                for ready in [false, true] {
+                    let mut selected = convoy.clone();
+                    let crew =
+                        &mut selected.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").vessels[0].crew[1];
+                    crew.deliverer = deliverer;
+                    if declares_pr {
+                        crew.promises.push(flotilla_resources::TemplatePromise {
+                            kind: flotilla_resources::promises::PromiseKind::Pr,
+                            owner: "reviewer".into(),
+                        });
+                    }
+                    if excluded {
+                        crew.promise_exclusions.push(flotilla_resources::promises::PromiseKind::Pr);
+                    }
+                    let records = BTreeMap::from([(
+                        record_name.clone(),
+                        record(
+                            if ready { ObservedChangeRequestState::Open } else { ObservedChangeRequestState::Draft },
+                            ObservedChecks::Pass,
+                        ),
+                    )]);
+                    let unmet = evaluate_crew_completion(
+                        &selected,
+                        flotilla_resources::CrewCompletionClaim { vessel: "work", role: "reviewer" },
+                        &checkouts,
+                        &records,
+                        &artifacts,
+                        Duration::from_secs(300),
+                        now,
+                    )
+                    .expect("selected PR readiness");
+                    assert_eq!(
+                        unmet.is_empty(),
+                        ready || excluded || !(deliverer || declares_pr),
+                        "deliverer={deliverer}, declares_pr={declares_pr}, excluded={excluded}, ready={ready}"
+                    );
+                }
+            }
+        }
+    }
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Merged, ObservedChecks::Pending));
     assert!(evaluate("coder", &change_requests, &artifacts).is_empty());
 }

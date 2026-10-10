@@ -14,7 +14,17 @@ pub enum PromiseKind {
 }
 
 impl PromiseKind {
-    /// Readiness belongs to the kind, never to a template promise declaration.
+    /// Canonical stored spelling, shared by template promise identifiers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pr => "pr",
+            Self::DecisionLedger => "decision-ledger",
+        }
+    }
+
+    /// The kind defines readiness; declarations never author their own checks.
+    /// Crew completion applies this rule to selected PR declarations and to
+    /// stock deliverers' discovered PRs. An explicit PR exclusion disables it.
     /// Keeping a PR still requires a merge; readiness alone does not keep it.
     pub fn readiness_condition(self) -> Option<crate::CompletionCondition> {
         match self {
@@ -32,11 +42,10 @@ impl PromiseKind {
 impl std::str::FromStr for PromiseKind {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, String> {
-        match value {
-            "pr" => Ok(Self::Pr),
-            "decision-ledger" => Ok(Self::DecisionLedger),
-            _ => Err(format!("unknown promise kind `{value}`; expected pr or decision-ledger")),
-        }
+        [Self::Pr, Self::DecisionLedger]
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| format!("unknown promise kind `{value}`; expected pr or decision-ledger"))
     }
 }
 
@@ -317,10 +326,7 @@ pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, Prom
                             return None;
                         }
                         let kind = promise.kind;
-                        let name = match kind {
-                            PromiseKind::Pr => "pr",
-                            PromiseKind::DecisionLedger => "decision-ledger",
-                        };
+                        let name = kind.as_str();
                         let id = format!("template/{name}");
                         if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
                             return None;

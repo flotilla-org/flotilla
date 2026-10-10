@@ -184,7 +184,8 @@ spec:
                               items:
                                 type: object
                                 x-kubernetes-preserve-unknown-fields: true
-                            # ADR 0047: remove after the roll following #2986.
+                            # ADR 0047: decode-only completion_expectations and completion_conditions;
+                            # remove both legacy keys after the roll following #2986.
                             completion_expectations:
                               type: array
                               items:

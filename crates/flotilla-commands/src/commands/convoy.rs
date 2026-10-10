@@ -158,7 +158,7 @@ pub struct ConvoyStartArgs {
     #[arg(long = "agent", value_parser = parse_agent_override)]
     pub agent_overrides: Vec<AgentOverride>,
     /// Exclude a template promise at admission (repeatable): --exclude-promise role=kind
-    #[arg(long = "exclude-promise", value_parser = parse_input_kv)]
+    #[arg(long = "exclude-promise", value_parser = parse_promise_exclusion)]
     pub promise_exclusions: Vec<(String, String)>,
     /// Explicit skill import or -name removal (repeatable)
     #[arg(long = "skill", allow_hyphen_values = true)]
@@ -194,6 +194,14 @@ pub struct ConvoyCreateArgs {
     /// Existing local checkout/worktree to adopt as the convoy vessel
     #[arg(long = "adopt-checkout")]
     pub adopted_checkout: Option<PathBuf>,
+}
+
+fn parse_promise_exclusion(raw: &str) -> Result<(String, String), String> {
+    let (role, kind) = raw
+        .split_once('=')
+        .filter(|(role, kind)| !role.is_empty() && !kind.is_empty())
+        .ok_or_else(|| format!("promise exclusion must be role=kind: {raw}"))?;
+    Ok((role.to_string(), kind.to_string()))
 }
 
 fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
@@ -914,6 +922,17 @@ mod tests {
             intent.promise_exclusions,
             vec![("coder".into(), "decision-ledger".into()), ("reviewer".into(), "decision-ledger".into())]
         );
+    }
+
+    // Glue: malformed exclusions explain the required authoring syntax. Kind
+    // and owner validity depend on the admitted template, covered at that seam.
+    #[test]
+    fn malformed_promise_exclusions_explain_role_kind_syntax() {
+        for malformed in ["foo", "=pr", "coder="] {
+            let error = ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--exclude-promise", malformed])
+                .expect_err("malformed promise exclusion");
+            assert!(error.to_string().contains("role=kind"));
+        }
     }
 
     #[test]
