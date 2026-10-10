@@ -208,18 +208,42 @@ class Contract(unittest.TestCase):
                         self.assertEqual(resolved['source']['path'], str(token))
                         self.assertEqual(live['source']['path'], path)
 
-    # A present but unsuitable declaration must fail rather than quietly use
-    # defaults. Relative paths and directories cannot name host token files.
+    # A present but unsuitable declaration must fail with a named diagnostic
+    # instead of a traceback or defaults. Cover missing/invalid shape and paths.
     def test_invalid_registry_declarations(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            for live, diagnostic in [({}, 'expected docker-registry'),
-                    ({'consumer': {'adapter': 'gh'}, 'source': {'kind': 'file'}}, 'expected docker-registry'),
-                    ({'consumer': {'adapter': 'docker-registry'}, 'source': {'kind': 'env'}}, 'expected docker-registry'),
-                    ({'consumer': {'adapter': 'docker-registry'}, 'source': {'kind': 'file', 'path': 'relative'}}, 'absolute'),
-                    ({'consumer': {'adapter': 'docker-registry'}, 'source': {'kind': 'file', 'path': str(home)}}, 'missing token file')]:
-                with self.subTest(live=live), self.assertRaisesRegex(canary.CanaryFailure, diagnostic):
+            valid = {'consumer': {'adapter': 'docker-registry'},
+                     'source': {'kind': 'file', 'path': str(home)}, 'lifecycle': 'static'}
+            cases = [({}, 'expected docker-registry'),
+                     ([], 'invalid credential declaration'),
+                     ({**valid, 'consumer': {'adapter': 'gh'}}, 'expected docker-registry'),
+                     ({**valid, 'source': {'kind': 'env'}}, 'expected docker-registry'),
+                     ({**valid, 'source': {'kind': 'file'}}, 'token path'),
+                     ({**valid, 'source': None}, 'expected docker-registry'),
+                     ({key: value for key, value in valid.items() if key != 'lifecycle'}, 'lifecycle'),
+                     ({**valid, 'lifecycle': []}, 'lifecycle')]
+            for path in ('', None, 42, 'relative', '~', '~other/token', str(home)):
+                diagnostic = ('token path' if not isinstance(path, str) or not path
+                              else 'missing token file' if path == str(home) else 'absolute')
+                cases.append(({**valid, 'source': {'kind': 'file', 'path': path}}, diagnostic))
+            for live, diagnostic in cases:
+                with self.subTest(live=live), self.assertRaisesRegex(
+                        canary.CanaryFailure, canary.REGISTRY_CREDENTIAL + '.*' + diagnostic):
                     canary.registry_credential(home, live)
+
+    # Malformed host list records must retain named canary diagnostics, including
+    # absent metadata/spec and invalid JSON, rather than leak a raw traceback.
+    def test_invalid_host_registry_records(self):
+        records = [{}, {'metadata': None}, {'metadata': {}}, {'metadata': {'name': None}},
+                   {'metadata': {'name': canary.REGISTRY_CREDENTIAL}},
+                   {'metadata': {'name': canary.REGISTRY_CREDENTIAL}, 'spec': None}]
+        responses = [json.dumps({'records': [{'object': record}]}) for record in records]
+        responses.extend(('invalid-json', '{}', '{"records": null}'))
+        for response in responses:
+            with self.subTest(response=response), patch.object(canary.Commands, 'run', return_value=response):
+                with self.assertRaisesRegex(canary.CanaryFailure, canary.REGISTRY_CREDENTIAL + '.*invalid host'):
+                    canary.live_registry_spec(io.StringIO())
 
     # Missing host material fails before starting a daemon or admitting a convoy.
     def test_missing_registry_token_fails_before_admission(self):

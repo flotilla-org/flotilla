@@ -113,15 +113,25 @@ REGISTRY_CREDENTIAL = 'lab-forgejo-registry-pull'
 
 def registry_credential(host_home, live_spec=None):
     """Resolve host-only registry material without reading or copying the token."""
+    # Lab defaults mirror the host lab-forgejo-registry-pull declaration.
+    # Prefer its live values so registry/account/path changes follow the fleet.
     spec = live_spec if live_spec is not None else {
         'consumer': {'adapter': 'docker-registry', 'registry': 'forgejo.lab.flotilla.work',
                      'username': 'flotilla-crew'},
         'source': {'kind': 'file', 'path': '~/.config/flotilla/credentials/lab-forgejo-registry-pull.token'},
         'lifecycle': 'static'}
-    if (spec.get('consumer', {}).get('adapter') != 'docker-registry'
-            or spec.get('source', {}).get('kind') != 'file'):
+    if not isinstance(spec, dict):
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: invalid credential declaration')
+    consumer, source = spec.get('consumer'), spec.get('source')
+    if (not isinstance(consumer, dict) or consumer.get('adapter') != 'docker-registry'
+            or not isinstance(source, dict) or source.get('kind') != 'file'):
         raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: expected docker-registry with a file source')
-    path = spec['source']['path']
+    path, lifecycle = source.get('path'), spec.get('lifecycle')
+    if not isinstance(path, str) or not path:
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: missing or invalid token path')
+    if lifecycle not in ('static', 'refreshable', 'issued'):
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: missing or invalid lifecycle')
+    # Only ~/ denotes the captured host home; bare ~ and ~user fail closed.
     if path.startswith('~/'):
         path = host_home / path[2:]
     else:
@@ -131,17 +141,28 @@ def registry_credential(host_home, live_spec=None):
     if not path.is_file():
         raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: missing token file: {path}')
     return {'consumer': dict(spec['consumer']), 'source': {'kind': 'file', 'path': str(path)},
-            'lifecycle': spec['lifecycle']}
+            'lifecycle': lifecycle}
 
 
 def live_registry_spec(log):
     """Read the host declaration; command/decoding failures must not select defaults."""
     # Use the installed client matching the live daemon, and forbid auto-spawn.
     commands = Commands({**os.environ, 'FLOTILLA_CONTAINED_HOST_DAEMON': '1'}, log)
-    records = objects(json.loads(commands.run([
-        'flotilla', '--json', 'resource', 'list', 'credentialspecs', '--local-only'])))
-    return next((item['spec'] for item in records
-                 if item['metadata']['name'] == REGISTRY_CREDENTIAL), None)
+    try:
+        records = objects(json.loads(commands.run([
+            'flotilla', '--json', 'resource', 'list', 'credentialspecs', '--local-only'])))
+        for item in records:
+            name = item['metadata']['name']
+            if not isinstance(name, str) or not name:
+                raise ValueError('missing or invalid metadata name')
+            if name == REGISTRY_CREDENTIAL:
+                spec = item['spec']
+                if not isinstance(spec, dict):
+                    raise ValueError('missing or invalid spec')
+                return spec
+    except (CanaryFailure, KeyError, TypeError, ValueError) as error:
+        raise CanaryFailure(f'{REGISTRY_CREDENTIAL}: invalid host credential declarations: {error}') from error
+    return None
 
 
 class Canary:
