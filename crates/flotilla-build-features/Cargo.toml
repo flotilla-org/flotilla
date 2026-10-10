@@ -1,3 +1,4 @@
+# Maintenance: see docs/measurements/2747-build-graph.md (Maintaining the feature anchors).
 [package]
 name = "flotilla-build-features"
 version = "0.1.0"
@@ -5,70 +6,11 @@ edition = "2021"
 license.workspace = true
 publish = false
 
-# Feature-only anchors for default native builds. Keep these aligned with the
-# workspace's existing dependency union; do not enable opt-in TLS providers or
-# operational features here. ci/build-graph/check.py checks command switching.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-bitflags = { version = "2", default-features = false, features = ["std"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-der = { version = "0.7", default-features = false, features = ["alloc", "oid", "pem", "std", "zeroize"] }
-digest = { version = "0.10", features = ["mac", "oid", "std"] }
-ed25519 = { version = "2", default-features = false, features = ["alloc", "pkcs8", "std"] }
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
-form_urlencoded = { version = "1" }
-futures-channel = { version = "0.3", features = ["sink"] }
-futures-task = { version = "0.3", default-features = false, features = ["std"] }
-futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
-getrandom = { version = "0.2", default-features = false, features = ["std"] }
-hashbrown = { version = "0.16", features = ["raw-entry"] }
-hmac = { version = "0.12", default-features = false, features = ["reset"] }
-hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy-system", "http1", "http2", "server", "service", "tokio"] }
-indexmap = { version = "2", features = ["serde"] }
-lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
-log = { version = "0.4", default-features = false, features = ["std"] }
-memchr = { version = "2" }
-mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
-num-traits = { version = "0.2", default-features = false, features = ["i128", "libm"] }
-pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
-rand = { version = "0.9", features = ["small_rng"] }
-rand_core = { version = "0.6", default-features = false, features = ["std"] }
-regex-automata = { version = "0.4", default-features = false, features = ["alloc", "dfa-build", "dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "nfa-pikevm", "nfa-thompson", "perf-inline", "perf-literal", "perf-literal-multisubstring", "perf-literal-substring", "std", "syntax", "unicode", "unicode-age", "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment", "unicode-word-boundary"] }
-regex-syntax = { version = "0.8" }
-reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "json", "query", "rustls-no-provider", "stream", "system-proxy"] }
-ring = { version = "0.17", features = ["std"] }
-rusqlite = { version = "0.37", default-features = false, features = ["bundled", "functions"] }
-rustix = { version = "1", features = ["fs", "stdio", "system", "termios"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
-serde = { version = "1", features = ["derive"] }
-serde_core = { version = "1", features = ["alloc"] }
-serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.10", features = ["oid"] }
-signature = { version = "2", default-features = false, features = ["alloc", "digest", "rand_core", "std"] }
-spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
-subtle = { version = "2" }
-time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing"] }
-tokio = { version = "1", features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
-tower = { version = "0.5", default-features = false, features = ["make", "retry", "timeout", "util"] }
-tracing = { version = "0.1" }
-tracing-core = { version = "0.1" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-zeroize = { version = "1", features = ["derive"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "system"] }
-
+# Host proc-macro features shared by the static layer anchors.
 [build-dependencies]
+proc-macro2 = "1"
+quote = "1"
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

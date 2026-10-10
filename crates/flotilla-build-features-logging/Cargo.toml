@@ -1,0 +1,29 @@
+# Maintenance: see docs/measurements/2747-build-graph.md (Maintaining the feature anchors).
+[package]
+name = "flotilla-build-features-logging"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Static feature selections only; every consumer already uses these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+memchr = { version = "2" }
+once_cell = { version = "1", features = ["std"] }
+regex-automata = { version = "0.4", default-features = false, features = ["alloc", "dfa-build", "dfa-onepass", "dfa-search", "hybrid", "meta", "nfa-backtrack", "nfa-pikevm", "nfa-thompson", "perf-inline", "perf-literal", "perf-literal-multisubstring", "perf-literal-substring", "std", "syntax", "unicode", "unicode-age", "unicode-bool", "unicode-case", "unicode-gencat", "unicode-perl", "unicode-script", "unicode-segment", "unicode-word-boundary"] }
+regex-syntax = { version = "0.8" }
+serde = { version = "1", features = ["derive"] }
+serde_core = { version = "1", features = ["alloc"] }
+serde_json = { version = "1", features = ["raw_value"] }
+smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
+tracing = { version = "0.1" }
+tracing-core = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+
+[lints]
+workspace = true

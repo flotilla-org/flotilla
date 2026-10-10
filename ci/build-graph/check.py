@@ -7,6 +7,37 @@ import subprocess
 import sys
 
 
+# ADR 0060 step 2: these isolated production graphs must remain C-free.
+C_FREE_BASE = frozenset({
+    "flotilla-protocol", "flotilla-transport", "flotilla-paths",
+    "flotilla-daemon-api", "flotilla-relay-protocol",
+})
+# Shrink this explicit exemption list with the ADR 0060 step 3 store split.
+# These crates genuinely depend on resources' SQLite and ring implementations.
+RESOURCE_EXEMPTIONS = frozenset({
+    "flotilla-client", "flotilla-manifest", "flotilla-tui", "flotilla",
+})
+# Known C packages and compiler drivers catch new anchors that reach them.
+# This is a metadata deny list, not build-script analysis: crates invoking a
+# compiler without these drivers need an explicit entry when introduced.
+C_BUILD_PACKAGES = frozenset({
+    "rusqlite", "libsqlite3-sys", "ring", "cc", "cmake", "autotools",
+    "aws-lc-sys", "openssl-sys", "libgit2-sys", "zstd-sys",
+})
+
+
+def c_free_violations(name, tree):
+    if name not in C_FREE_BASE:
+        return []
+    dependencies = {package.split()[0] for package in tree}
+    return [f"{name}: Windows production graph compiles C through {dependency}"
+            for dependency in sorted(dependencies & C_BUILD_PACKAGES)]
+
+
+def layer(name):
+    return "base" if name in C_FREE_BASE else "native"
+
+
 def is_testkit(name):
     return name.endswith("-testkit") or name == "flotilla-test-support"
 
@@ -95,11 +126,24 @@ def main():
     metadata = json.loads(cargo("metadata", "--no-deps", "--locked", "--format-version", "1"))
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
-    workspace = {edges: tree_features(cargo(*tree_arguments, "--workspace", "--edges", edges))
-                 for edges in ("normal,build", "normal,build,dev")}
+    members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
+    # Resolver 2 unifies dependency features within a command. Compare to
+    # the union of consumers in the same layer, not the unrelated native stack.
+    workspace = {}
+    for group in ("base", "native"):
+        selection = [argument for package in members if layer(package["name"]) == group
+                     for argument in ("-p", package["name"])]
+        if selection:
+            for edges in ("normal,build", "normal,build,dev"):
+                workspace[group, edges] = tree_features(cargo(*tree_arguments, *selection, "--edges", edges))
     for package in metadata["packages"]:
         if package["id"] not in metadata["workspace_members"]:
             continue
+        if package["name"] in C_FREE_BASE:
+            # cargo tree resolves metadata only: Windows std need not be installed.
+            windows = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", "normal,build",
+                                          "--target", "x86_64-pc-windows-gnu"))
+            errors.extend(c_free_violations(package["name"], windows))
         for edges in ("normal,build", "normal,build,dev"):
             if edges == "normal,build" and is_testkit(package["name"]):
                 continue
@@ -109,11 +153,11 @@ def main():
                     if dependency.startswith("tokio v") and any("test-util" in features for features in contexts):
                         errors.append(f"{package['name']}: production graph activates tokio test-util")
             errors.extend(f"{package['name']} ({edges}): {difference}"
-                          for difference in feature_differences(workspace[edges], selected))
+                          for difference in feature_differences(workspace[layer(package["name"]), edges], selected))
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("Workspace build graph: production excludes testkits and test-util; package-local build/test features reusable")
+    print("Workspace build graph: C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable")
     return 0
 
 

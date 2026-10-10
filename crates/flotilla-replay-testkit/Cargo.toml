@@ -25,6 +25,7 @@ flotilla-core = { path = "../flotilla-core" }
 workspace = true
 
 [dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-paths = { path = "../flotilla-paths" }
 hegeltest = "=0.48.1"
 tempfile = "3"

@@ -1,6 +1,20 @@
+import contextlib
+import io
+import json
+import subprocess
 import unittest
+from unittest.mock import patch
 
-from check import feature_differences, is_testkit, tree_features, violations
+from check import (C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
+                   feature_differences, is_testkit, layer, main, tree_features, violations)
+
+
+# Explicit finite generator: the five names are fixed by the amended contract,
+# independent of the implementation's policy set (which might regress).
+BASE_CRATES = (
+    "flotilla-protocol", "flotilla-transport", "flotilla-paths",
+    "flotilla-daemon-api", "flotilla-relay-protocol",
+)
 
 
 def package(name, normal=(), dev=(), build=(), features=None):
@@ -112,6 +126,95 @@ class BuildGraphContract(unittest.TestCase):
                 self.assertIn("production feature", violations(graph(core))[0])
 
 
+class LayerContract(unittest.TestCase):
+    def test_named_base_graphs_reject_c_dependencies(self):
+        # Contract 1: exhaust the five base crates and representative SQLite,
+        # TLS and future C compiler drivers, including duplicate tree contexts.
+        for name in BASE_CRATES:
+            for dependency in ("rusqlite", "libsqlite3-sys", "ring", "cc", "cmake", "autotools", "aws-lc-sys"):
+                with self.subTest(name=name, dependency=dependency):
+                    tree = tree_features(f"{name} v0.1|\nnew-anchor v1|\n{dependency} v1|std\n{dependency} v1|std (*)")
+                    errors = c_free_violations(name, tree)
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn(dependency, errors[0])
+
+    def test_cli_checks_each_windows_base_graph_for_transitive_c(self):
+        # Process-boundary fake: Cargo returns a Rust-only Linux graph, but a
+        # future anchor brings a C compiler only into the Windows graph. The CLI
+        # must reject it for every contracted base crate, not merely test a helper.
+        for name in BASE_CRATES:
+            for dependency in ("ring", "cc"):
+                with self.subTest(name=name, dependency=dependency):
+                    metadata = graph(package(name, normal=("future-anchor",)), package("future-anchor"))
+
+                    def cargo_result(arguments, **kwargs):
+                        if "metadata" in arguments:
+                            output = json.dumps(metadata)
+                        else:
+                            selected = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-p"]
+                            packages = set(selected)
+                            if name in packages:
+                                packages.add("future-anchor")
+                            if "--target" in arguments:
+                                packages.add(dependency)
+                            output = "\n".join(f"{package} v1|" for package in sorted(packages))
+                        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+                    diagnostic = io.StringIO()
+                    with patch("check.subprocess.run", side_effect=cargo_result), contextlib.redirect_stderr(diagnostic):
+                        self.assertEqual(main(), 1)
+                    self.assertIn(f"{name}: Windows production graph compiles C through {dependency}", diagnostic.getvalue())
+
+    def test_cli_anchor_test_util_stays_on_dev_edges(self):
+        # Cargo boundary scenario: a consumer reaches Tokio through either
+        # anchor. Dev trees may enable test-util; production trees must not,
+        # even if an indirect activation escapes manifest-level validation.
+        for anchor in ("flotilla-build-features-async", "flotilla-build-features-http-server"):
+            for leak in (False, True):
+                with self.subTest(anchor=anchor, leak=leak):
+                    metadata = graph(package("consumer", normal=(anchor,)), package(anchor, dev=("tokio",)))
+
+                    def cargo_result(arguments, **kwargs):
+                        if "metadata" in arguments:
+                            output = json.dumps(metadata)
+                        else:
+                            selected = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-p"]
+                            packages = set(selected) | {anchor}
+                            edges = arguments[arguments.index("--edges") + 1]
+                            features = "full,test-util" if leak or "dev" in edges else "full"
+                            output = "\n".join(f"{name} v1|" for name in sorted(packages)) + f"\ntokio v1|{features}"
+                        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+                    diagnostic = io.StringIO()
+                    with patch("check.subprocess.run", side_effect=cargo_result), contextlib.redirect_stderr(diagnostic), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(main(), int(leak))
+                    if leak:
+                        self.assertIn("production graph activates tokio test-util", diagnostic.getvalue())
+                    else:
+                        self.assertEqual(diagnostic.getvalue(), "")
+
+    def test_c_free_empty_and_rust_only_graphs_are_valid(self):
+        # A Rust build script/proc macro is legal; the rule bans C compilation,
+        # rather than all host build dependencies or unrelated native consumers.
+        for name in BASE_CRATES:
+            for output in ("", "syn v2 (proc-macro)|full\nsha2 v0.10|std\ntokio v1|full"):
+                self.assertEqual(c_free_violations(name, tree_features(output)), [])
+        self.assertEqual(c_free_violations("flotilla-core", tree_features("ring v1|std")), [])
+
+    def test_resources_exemptions_remain_native(self):
+        self.assertTrue(RESOURCE_EXEMPTIONS.isdisjoint(C_FREE_BASE))
+        # The amendment explicitly keeps real resources consumers exempt until
+        # the step 3 store split; they must still get native feature checks.
+        for name in ("flotilla-client", "flotilla-manifest", "flotilla-tui", "flotilla"):
+            self.assertIn(name, RESOURCE_EXEMPTIONS)
+            self.assertEqual(layer(name), "native")
+            self.assertEqual(c_free_violations(name, tree_features("ring v1|std\nlibsqlite3-sys v1|bundled")), [])
+        for name in BASE_CRATES:
+            self.assertIn(name, C_FREE_BASE)
+            self.assertNotIn(name, RESOURCE_EXEMPTIONS)
+            self.assertEqual(layer(name), "base")
+
+
 class FeatureContract(unittest.TestCase):
     def test_tree_preserves_versions_and_distinct_contexts(self):
         # Cargo may repeat a crate for host and target edges; distinct locked
@@ -125,6 +228,15 @@ class FeatureContract(unittest.TestCase):
         workspace = tree_features("core|default,test-support\nunrelated|default")
         self.assertEqual(feature_differences(workspace, tree_features("core|test-support,default")), [])
         self.assertEqual(len(feature_differences(workspace, tree_features("core|default"))), 1)
+
+    def test_anchor_contexts_are_checked_like_runtime_dependencies(self):
+        # Empty static anchors still affect Cargo artifact identity; the guard
+        # must reject drift in their own contexts as well as their dependencies.
+        reference = tree_features("flotilla-build-features v0.1|std\nserde v1|derive,std")
+        selected = tree_features("flotilla-build-features v0.1|\nserde v1|std")
+        errors = feature_differences(reference, selected)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(errors[0].startswith("flotilla-build-features v0.1:"))
 
     def test_missing_workspace_package_is_reported(self):
         # An unexpected selection produces a diagnostic, not a KeyError.

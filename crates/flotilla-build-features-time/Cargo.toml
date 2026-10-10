@@ -1,0 +1,19 @@
+# Maintenance: see docs/measurements/2747-build-graph.md (Maintaining the feature anchors).
+[package]
+name = "flotilla-build-features-time"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Static feature selections only; every consumer already uses these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
+libc = { version = "0.2" }
+time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing"] }
+
+[dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+
+[lints]
+workspace = true
