@@ -282,7 +282,6 @@ Review regression: both async and HTTP-server anchor scenarios allow Tokio
 `test-util` on dev edges and reject transitive production activation. Disabling
 that production check makes both negative scenarios fail.
 
-
 ## #2994: target-specific feature contexts (2026-10-10 UTC)
 
 The macOS graph at `cbb6221f6` reproduced all ten reported differences when
