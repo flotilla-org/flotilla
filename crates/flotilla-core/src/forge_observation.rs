@@ -1,5 +1,5 @@
 //! Source-scoped forge ownership and replicated reads (ADR 0057).
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration as StdDuration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -9,11 +9,12 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
-    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, Repository, ResourceError,
-    ResourceProvenance, SystemClock,
+    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, ReadWatchEvent, Repository,
+    ResourceError, ResourceProvenance, SystemClock,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
+use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
@@ -29,6 +30,9 @@ use crate::providers::{
 
 pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 
+// Leave three seconds for store/routing work inside the daemon's five-second
+// interactive request deadline (server/request_dispatch.rs).
+pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
@@ -316,7 +320,12 @@ impl ForgeReads {
             now.signed_duration_since(status.attempted_at) < READ_FRESHNESS || status.retry_at.is_some_and(|at| at > now)
         });
         if !owner || fresh {
-            let previous = if owner { previous } else { expire_status(previous, now) };
+            let previous = if !owner && previous.is_none() {
+                tokio::time::timeout(REMOTE_READ_TIMEOUT, self.wait_for_status(&name)).await.unwrap_or(Ok(None))?
+            } else {
+                previous
+            };
+            let previous = if owner { previous } else { expire_status(previous, self.clock.now()) };
             return previous
                 .ok_or_else(|| "forge observation pending at source owner".to_string())
                 .and_then(|status| decode(status, self.allow_stale, &request));
@@ -357,6 +366,32 @@ impl ForgeReads {
         self.publish_heartbeat(&name, content_at, &status, changed).await?;
         *local = Some(LocalRead { status: status.clone(), content_at });
         decode(status, self.allow_stale, &request)
+    }
+    async fn wait_for_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
+        // Subscribe before rechecking status. Answers published before the
+        // subscription are read below; later answers arrive on the watch.
+        let answers = self.backend.including_replicas::<ForgeRead>(&self.namespace).watch().await.map_err(|e| e.to_string())?;
+        self.wait_for_status_on(name, answers).await
+    }
+    async fn wait_for_status_on(
+        &self,
+        name: &str,
+        mut answers: futures::stream::BoxStream<'static, Result<ReadWatchEvent<ForgeRead>, ResourceError>>,
+    ) -> Result<Option<ForgeReadStatus>, String> {
+        if let Some(status) = self.published_status(name).await? {
+            return self.with_heartbeat(name, Some(status)).await;
+        }
+        while let Some(event) = answers.next().await {
+            match event.map_err(|e| e.to_string())? {
+                ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) if record.object.metadata.name == name => {
+                    if let Some(status) = self.published_status(name).await? {
+                        return self.with_heartbeat(name, Some(status)).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err("ForgeRead answer watch closed".into())
     }
     async fn published_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
         let statuses = self.backend.including_replicas::<ForgeRead>(&self.namespace).get_all(name).await.map_err(|e| e.to_string())?;
@@ -644,6 +679,113 @@ mod tests {
         let mut reads = ForgeReads::new(backend(root), "flotilla".into());
         reads.clock = clock.clone();
         (reads, clock)
+    }
+
+    // An unreachable owner returns the existing pending error at the bound.
+    // Unrelated demands must not add store reads while waiting (no polling).
+    #[tokio::test(start_paused = true)]
+    async fn remote_wait_is_bounded_without_scanning_demands() {
+        use flotilla_store_testkit::ReadCountsBackendExt;
+        let owner = backend("owner");
+        let counted = InMemoryBackend::default().with_read_counts();
+        let peer = ResourceBackend::InMemory(counted.clone()).with_local_root(NodeId::new("peer"));
+        owner
+            .using::<Project>("flotilla")
+            .create(
+                &meta("shared"),
+                &ProjectSpec::builder()
+                    .display_name("Shared".into())
+                    .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
+                    .build(),
+            )
+            .await
+            .expect("owner declaration");
+        replicate::<Project>(&owner, &peer).await;
+        for index in 0..200 {
+            let name = format!("unrelated-{index}");
+            peer.using::<ForgeRead>("flotilla")
+                .create(
+                    &meta(&name),
+                    &ForgeReadSpec {
+                        source: source(),
+                        request: ForgeReadRequest::Issue { id: index.to_string() },
+                        demanded_at: Utc::now(),
+                    },
+                )
+                .await
+                .expect("unrelated demand");
+            peer.using::<ForgeReadHeartbeat>("flotilla")
+                .create(&meta(&name), &ForgeReadHeartbeatSpec { demanded_at: Utc::now() })
+                .await
+                .expect("unrelated pulse");
+        }
+        let before = counted.read_counts();
+        let reads = ForgeReads::new(peer, "flotilla".into());
+        let started = tokio::time::Instant::now();
+        // Model the daemon's outer interactive deadline: the observation must
+        // return its pending error before request dispatch cancels it as busy.
+        let error = tokio::time::timeout(
+            StdDuration::from_secs(5),
+            reads.read::<u64, _, _>(&source(), ForgeReadRequest::Board, || async { panic!("peer loader") }),
+        )
+        .await
+        .expect("pending before the daemon interactive deadline")
+        .expect_err("unreachable owner");
+        assert_eq!(error, "forge observation pending at source owner");
+        assert_eq!(started.elapsed(), REMOTE_READ_TIMEOUT);
+        // Empty named reads return no counted records. The parent is returned
+        // exactly once by the initial status lookup and once by the recheck.
+        for (kind, expected) in [(ForgeRead::API_PATHS.kind, 2), (ForgeReadHeartbeat::API_PATHS.kind, 0)] {
+            assert_eq!(
+                counted.read_counts().get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default(),
+                expected,
+                "waiting reads only the named demand pair"
+            );
+        }
+    }
+
+    // A lost answer channel is a transport error, not a premature pending result.
+    #[tokio::test]
+    async fn remote_wait_reports_closed_answer_watch() {
+        let reads = ForgeReads::new(backend("peer"), "flotilla".into());
+        let error = reads.wait_for_status_on("missing", futures::stream::empty().boxed()).await.unwrap_err();
+        assert_eq!(error, "ForgeRead answer watch closed");
+    }
+
+    // Waiting peers receive a published owner error immediately; a failed forge
+    // request must not leave the interactive read waiting for a value forever.
+    #[tokio::test(start_paused = true)]
+    async fn remote_wait_returns_published_owner_error() {
+        let owner = backend("owner");
+        let peer = backend("peer");
+        owner
+            .using::<Project>("flotilla")
+            .create(
+                &meta("shared"),
+                &ProjectSpec::builder()
+                    .display_name("Shared".into())
+                    .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
+                    .build(),
+            )
+            .await
+            .expect("owner declaration");
+        replicate::<Project>(&owner, &peer).await;
+        let owner_reads = ForgeReads::new(owner.clone(), "flotilla".into());
+        let peer_reads = ForgeReads::new(peer.clone(), "flotilla".into());
+        let source = source();
+        let started = tokio::time::Instant::now();
+        let read = peer_reads.read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { panic!("peer loader") });
+        let publish = async {
+            // The loader stands in for the failing external forge boundary.
+            owner_reads
+                .read::<u64, _, _>(&source, ForgeReadRequest::Board, || async { Err("owner forge unavailable".into()) })
+                .await
+                .expect_err("forge error");
+            replicate::<ForgeRead>(&owner, &peer).await;
+        };
+        let (result, ()) = tokio::join!(read, publish);
+        assert_eq!(result.expect_err("owner error"), "owner forge unavailable");
+        assert!(started.elapsed() < REMOTE_READ_TIMEOUT);
     }
 
     // Incremental cursors are owner-local: any sequence of cursors, limits and
