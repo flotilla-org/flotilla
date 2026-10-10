@@ -31,7 +31,7 @@ impl Drop for AnonymousConfig {
     fn drop(&mut self) {
         // Only registry/Buildx operations own these paths. Keep cleanup in Drop
         // so cancellation cannot leave state for a detached async cleanup task.
-        // Buildx may create non-secret state beneath an initially absent config.
+        // Buildx may create non-secret state beneath this private empty config.
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -97,6 +97,16 @@ impl RegistryAuth {
             // Authenticated files have exactly one construction site in CredentialStore.
             None => {
                 let path = std::env::temp_dir().join(format!("flotilla-anonymous-{}", uuid::Uuid::new_v4()));
+                // Establish privacy before a tool can create non-secret state.
+                // Credential files still have only the CredentialStore helper.
+                #[cfg(unix)]
+                let created = {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new().mode(0o700).create(&path)
+                };
+                #[cfg(not(unix))]
+                let created = std::fs::create_dir(&path);
+                created.map_err(|error| error.to_string())?;
                 Ok(RegistryConfig::new(path.clone(), AnonymousConfig(path)))
             }
         }
@@ -117,6 +127,21 @@ mod tests {
         fn authorize(&self, _: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
             panic!("claim must not contact a service")
         }
+    }
+
+    // Anonymous tool state starts empty and private before the subprocess can
+    // write it, and its owned guard removes even tool-created files on drop.
+    #[cfg(unix)]
+    #[test]
+    fn anonymous_config_owns_private_empty_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let config = RegistryAuth::config(None).expect("anonymous config");
+        let path = config.path().to_path_buf();
+        assert_eq!(std::fs::metadata(&path).expect("created directory").permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(&path).expect("directory").count(), 0);
+        std::fs::write(path.join("tool-state"), "non-secret").expect("tool state");
+        drop(config);
+        assert!(!path.exists(), "owned state is removed");
     }
 
     // Every clone shares a single operation claim, including concurrent attempts.
