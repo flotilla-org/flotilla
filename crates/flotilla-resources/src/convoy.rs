@@ -1602,6 +1602,12 @@ pub enum ConvoyStatusPatch {
         role: String,
         operation: promises::PromiseOperation,
     },
+    /// World observations remain valid after a crew claim, until convoy settlement.
+    ObservePromise {
+        vessel: String,
+        role: String,
+        operation: promises::PromiseOperation,
+    },
     HoldTurnDelivery {
         source: String,
         hold: ConvoyAttention,
@@ -1899,6 +1905,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.ensure_admission.get_or_insert_with(|| config.clone());
             }
             Self::Promise { vessel, role, operation } => {
+                if status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_none_or(|work| work.phase != CrewWorkPhase::Done) {
+                    promises::apply(status, vessel, role, operation);
+                }
+            }
+            Self::ObservePromise { vessel, role, operation } => {
                 promises::apply(status, vessel, role, operation);
             }
             Self::DiscoverSubjects { subjects, source, at } => {

@@ -59,10 +59,73 @@ pub struct Promise {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
     pub reference: String,
+    /// ADR 0047: one-roll decoder shim for optional submission evidence.
+    #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     pub submitted_at: DateTime<Utc>,
+    #[serde(default)]
     pub verdict: Option<SubmissionVerdict>,
 }
+impl Submission {
+    pub fn subject(&self) -> &str {
+        self.metadata.get("subject").map(String::as_str).unwrap_or(&self.reference)
+    }
+}
+
+/// Commands check the persisted effect after an optimistic patch, because a
+/// concurrent verdict, completion or retraction can make the operation stale.
+pub fn effect_present(status: &ConvoyStatus, vessel: &str, role: &str, operation: &PromiseOperation) -> bool {
+    let id = match operation {
+        PromiseOperation::Declare { id, .. }
+        | PromiseOperation::Submit { id, .. }
+        | PromiseOperation::Retract { id, .. }
+        | PromiseOperation::Verdict { id, .. } => id,
+    };
+    let Some(promise) = owned(status, vessel, role).iter().find(|p| &p.id == id) else {
+        return false;
+    };
+    match operation {
+        PromiseOperation::Declare { kind, source, .. } => promise.kind == *kind && promise.source == *source,
+        PromiseOperation::Submit { kind, submission, .. } => {
+            promise.kind == *kind
+                && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept)
+                && promise.submissions.last().is_some_and(|prior| {
+                    prior.subject() == submission.subject()
+                        && submission.metadata.iter().all(|(key, value)| prior.metadata.get(key) == Some(value))
+                })
+        }
+        PromiseOperation::Retract { reason, .. } => {
+            promise.state == PromiseState::Retracted && promise.retraction_reason.as_ref() == Some(reason)
+        }
+        PromiseOperation::Verdict { reference, submitted_at, verdict, .. } => promise
+            .submissions
+            .last()
+            .is_some_and(|s| s.reference == *reference && s.submitted_at == *submitted_at && s.verdict.as_ref() == Some(verdict)),
+    }
+}
+
+/// Include produced subjects that have not yet entered the state machine, even
+/// when the owner has not declared any promises. Finished history needs no IO.
+pub fn needs_observation(status: &ConvoyStatus, kind: PromiseKind) -> bool {
+    if status.phase.is_terminal() {
+        return false;
+    }
+    status.promises.values().any(|crew| crew.values().any(|ps| ps.iter().any(|p| p.kind == kind && !p.state.terminal())))
+        || (kind == PromiseKind::Pr
+            && status.subjects.iter().any(|subject| {
+                subject.relationship == flotilla_protocol::Relationship::Produces
+                    && subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                    && subject.subject.internal().is_ok_and(|reference| {
+                        !status
+                            .promises
+                            .values()
+                            .flat_map(BTreeMap::values)
+                            .flatten()
+                            .any(|p| p.submissions.iter().any(|s| s.subject() == reference))
+                    })
+            }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmissionVerdict {
     pub accepted: bool,
@@ -87,6 +150,9 @@ pub fn pending(status: &ConvoyStatus, vessel: &str, role: &str) -> Vec<String> {
 }
 
 pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &PromiseOperation) {
+    if status.phase.is_terminal() {
+        return;
+    }
     let promises = status.promises.entry(vessel.to_string()).or_default().entry(role.to_string()).or_default();
     match operation {
         PromiseOperation::Declare { id, kind, source } | PromiseOperation::Submit { id, kind, source, .. } => {
@@ -105,10 +171,7 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
             let promise = promises.iter_mut().find(|p| p.id == *id).expect("inserted promise");
             if let PromiseOperation::Submit { submission, .. } = operation {
                 if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
-                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| {
-                        prior.metadata.get("subject").unwrap_or(&prior.reference)
-                            == submission.metadata.get("subject").unwrap_or(&submission.reference)
-                    }) {
+                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.subject() == submission.subject()) {
                         prior.metadata.extend(submission.metadata.clone());
                     }
                     return;
@@ -147,7 +210,7 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
         }
     }
     if let PromiseOperation::Submit { kind: PromiseKind::Pr, submission, .. } = operation {
-        if let Ok(address) = submission.metadata.get("subject").unwrap_or(&submission.reference).parse::<flotilla_protocol::LeafAddress>() {
+        if let Ok(address) = submission.subject().parse::<flotilla_protocol::LeafAddress>() {
             if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
                 if !status.produces(&subject) {
                     status.discover_subject(
@@ -226,19 +289,11 @@ pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, Prom
                 })
                 .flat_map(move |crew| {
                     crew.completion_conditions.iter().filter_map(move |expectation| {
-                        let kind = match expectation {
-                            CrewCompletionExpectation::Condition(CompletionCondition::Artifact { kind, .. })
-                                if kind == "decision-ledger" =>
-                            {
-                                PromiseKind::DecisionLedger
-                            }
-                            _ => return None,
-                        };
-                        let id = match kind {
-                            PromiseKind::Pr => "template/pr",
-                            PromiseKind::DecisionLedger => "template/decision-ledger",
+                        if !matches!(expectation, CrewCompletionExpectation::Condition(CompletionCondition::Artifact { kind, .. }) if kind == "decision-ledger") {
+                            return None;
                         }
-                        .to_string();
+                        let kind = PromiseKind::DecisionLedger;
+                        let id = "template/decision-ledger".to_string();
                         if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
                             return None;
                         }
@@ -262,13 +317,7 @@ pub fn discovered_submission(
     now: DateTime<Utc>,
 ) -> Option<PromiseOperation> {
     let reference = subject.internal().ok()?;
-    if status
-        .promises
-        .values()
-        .flat_map(BTreeMap::values)
-        .flatten()
-        .any(|p| p.submissions.iter().any(|s| s.metadata.get("subject").unwrap_or(&s.reference) == &reference))
-    {
+    if status.promises.values().flat_map(BTreeMap::values).flatten().any(|p| p.submissions.iter().any(|s| s.subject() == reference)) {
         return None;
     }
     let open =
@@ -297,94 +346,131 @@ pub fn next_observation(
     if status.phase.is_terminal() {
         return None;
     }
-    let patch =
-        |vessel: &str, role: &str, operation| super::ConvoyStatusPatch::Promise { vessel: vessel.into(), role: role.into(), operation };
+    let patch = |vessel: &str, role: &str, operation| super::ConvoyStatusPatch::ObservePromise {
+        vessel: vessel.into(),
+        role: role.into(),
+        operation,
+    };
     for (vessel, crew) in &status.promises {
         for (role, promises) in crew {
             for promise in promises {
-                if promise.kind == PromiseKind::DecisionLedger && promise.state == PromiseState::Open {
-                    let name = crate::artifact_record_name(convoy, role, "decision-ledger", convoy);
-                    if let Some(artifact) = artifacts.get(&name) {
-                        return Some(patch(
-                            vessel,
-                            role,
-                            PromiseOperation::Submit {
-                                id: promise.id.clone(),
-                                kind: promise.kind,
-                                source: promise.source,
-                                submission: Submission {
-                                    reference: name,
-                                    metadata: BTreeMap::from([("digest".into(), artifact.spec.digest.clone())]),
-                                    submitted_at: now,
-                                    verdict: None,
-                                },
-                            },
-                        ));
-                    }
+                if let Some(operation) = ledger_submission(promise, convoy, role, artifacts, now) {
+                    return Some(patch(vessel, role, operation));
                 }
-                if promise.state != PromiseState::Submitted {
-                    continue;
-                }
-                let Some(submission) = promise.submissions.last() else {
-                    continue;
-                };
-                let verdict = match promise.kind {
-                    PromiseKind::DecisionLedger => artifacts
-                        .get(
-                            submission
-                                .reference
-                                .strip_prefix("artifact/")
-                                .map(|reference| reference.rsplit('/').next().unwrap_or(reference))
-                                .unwrap_or(&submission.reference),
-                        )
-                        .filter(|artifact| {
-                            artifact.spec.kind == "decision-ledger"
-                                && artifact.spec.producer == *submission.metadata.get("producer").unwrap_or(role)
-                                && submission.metadata.get("digest").is_none_or(|digest| *digest == artifact.spec.digest)
-                        })
-                        .map(|_| (true, "artifact", "decision ledger artifact exists")),
-                    PromiseKind::Pr => {
-                        let reference = submission.metadata.get("subject").unwrap_or(&submission.reference);
-                        let Ok(address) = reference.parse::<flotilla_protocol::LeafAddress>() else {
-                            continue;
-                        };
-                        let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = address else {
-                            continue;
-                        };
-                        let Some(record) = change_requests
-                            .get(&crate::change_request_record_name(&service, &scope, number))
-                            .and_then(|record| record.status.as_ref())
-                        else {
-                            continue;
-                        };
-                        let observation = &record.state;
-                        if now.signed_duration_since(observation.observed_at).to_std().is_ok_and(|age| age > stale_after) {
-                            continue;
-                        }
-                        match observation.value {
-                            Some(crate::ObservedChangeRequestState::Merged) => Some((true, "forge", "PR merged")),
-                            Some(crate::ObservedChangeRequestState::Closed) => Some((false, "forge", "PR closed without merging")),
-                            _ => None,
-                        }
-                    }
-                };
-                if let Some((accepted, who, why)) = verdict {
-                    return Some(patch(
-                        vessel,
-                        role,
-                        PromiseOperation::Verdict {
-                            id: promise.id.clone(),
-                            reference: submission.reference.clone(),
-                            submitted_at: submission.submitted_at,
-                            verdict: SubmissionVerdict { accepted, who: who.into(), at: now, why: why.into() },
-                        },
-                    ));
+                if let Some(operation) = observed_verdict(promise, role, change_requests, artifacts, now, stale_after) {
+                    return Some(patch(vessel, role, operation));
                 }
             }
         }
     }
     // Every produced PR participates. Explicit submissions retain their owner;
     // branch discovery uses the workflow's PR owner when it is unambiguous.
+    let (vessel, role) = discovery_owner(status)?;
+    for subject in status.subjects.iter().filter(|s| {
+        s.relationship == flotilla_protocol::Relationship::Produces && s.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+    }) {
+        if let Some(mut operation) = discovered_submission(status, vessel, role, &subject.subject, now) {
+            if let PromiseOperation::Submit { submission, .. } = &mut operation {
+                if let Ok(flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number }) = subject.subject.leaf() {
+                    if let Some(commit) = change_requests
+                        .get(&crate::change_request_record_name(&service, &scope, number))
+                        .and_then(|record| record.status.as_ref())
+                        .and_then(|status| status.head_sha.value.as_ref())
+                    {
+                        submission.metadata.insert("commit".into(), commit.clone());
+                    }
+                }
+            }
+            return Some(patch(vessel, role, operation));
+        }
+    }
+    None
+}
+
+fn ledger_submission(
+    promise: &Promise,
+    convoy: &str,
+    role: &str,
+    artifacts: &BTreeMap<String, crate::ResourceObject<crate::Artifact>>,
+    now: DateTime<Utc>,
+) -> Option<PromiseOperation> {
+    if promise.kind != PromiseKind::DecisionLedger || promise.state != PromiseState::Open {
+        return None;
+    }
+    let name = crate::artifact_record_name(convoy, role, "decision-ledger", convoy);
+    let artifact = artifacts.get(&name)?;
+    Some(PromiseOperation::Submit {
+        id: promise.id.clone(),
+        kind: promise.kind,
+        source: promise.source,
+        submission: Submission {
+            reference: name,
+            metadata: BTreeMap::from([("digest".into(), artifact.spec.digest.clone())]),
+            submitted_at: now,
+            verdict: None,
+        },
+    })
+}
+
+fn observed_verdict(
+    promise: &Promise,
+    role: &str,
+    change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
+    artifacts: &BTreeMap<String, crate::ResourceObject<crate::Artifact>>,
+    now: DateTime<Utc>,
+    stale_after: std::time::Duration,
+) -> Option<PromiseOperation> {
+    if promise.state != PromiseState::Submitted {
+        return None;
+    }
+    let submission = promise.submissions.last()?;
+    let (accepted, who, why) = match promise.kind {
+        // Kept verifies artifact existence/provenance, not the quality of its
+        // decisions. Ledger validation remains the artifact intake boundary.
+        PromiseKind::DecisionLedger => {
+            let name = submission
+                .reference
+                .strip_prefix("artifact/")
+                .map(|reference| reference.rsplit('/').next().unwrap_or(reference))
+                .unwrap_or(&submission.reference);
+            let artifact = artifacts.get(name)?;
+            if artifact.spec.kind != "decision-ledger"
+                || artifact.spec.producer != submission.metadata.get("producer").map(String::as_str).unwrap_or(role)
+                || submission.metadata.get("digest").is_some_and(|digest| *digest != artifact.spec.digest)
+            {
+                return None;
+            }
+            (true, "artifact", "decision ledger artifact exists")
+        }
+        PromiseKind::Pr => {
+            let address = match submission.subject().parse::<flotilla_protocol::LeafAddress>() {
+                Ok(flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number }) => (service, scope, number),
+                other => {
+                    tracing::debug!(promise = %promise.id, reference = %submission.subject(), parsed = ?other, "promise submission does not name a PR");
+                    return None;
+                }
+            };
+            let record = change_requests.get(&crate::change_request_record_name(&address.0, &address.1, address.2))?.status.as_ref()?;
+            let observation = &record.state;
+            if now.signed_duration_since(observation.observed_at).to_std().is_ok_and(|age| age > stale_after) {
+                return None;
+            }
+            match observation.value {
+                Some(crate::ObservedChangeRequestState::Merged) => (true, "forge", "PR merged"),
+                Some(crate::ObservedChangeRequestState::Closed) => (false, "forge", "PR closed without merging"),
+                _ => return None,
+            }
+        }
+    };
+    Some(PromiseOperation::Verdict {
+        id: promise.id.clone(),
+        reference: submission.reference.clone(),
+        submitted_at: submission.submitted_at,
+        verdict: SubmissionVerdict { accepted, who: who.into(), at: now, why: why.into() },
+    })
+}
+
+fn discovery_owner(status: &ConvoyStatus) -> Option<(&str, &str)> {
     let candidates = status
         .promises
         .iter()
@@ -416,28 +502,11 @@ pub fn next_observation(
     } else {
         &fallback
     };
-    for subject in status.subjects.iter().filter(|s| {
-        s.relationship == flotilla_protocol::Relationship::Produces && s.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
-    }) {
-        let Some((vessel, role)) = owners.iter().find(|(_, role)| role.as_str() == "coder").or_else(|| owners.first()) else {
-            continue;
-        };
-        if let Some(mut operation) = discovered_submission(status, vessel, role, &subject.subject, now) {
-            if let PromiseOperation::Submit { submission, .. } = &mut operation {
-                if let Ok(flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number }) = subject.subject.leaf() {
-                    if let Some(commit) = change_requests
-                        .get(&crate::change_request_record_name(&service, &scope, number))
-                        .and_then(|record| record.status.as_ref())
-                        .and_then(|status| status.head_sha.value.as_ref())
-                    {
-                        submission.metadata.insert("commit".into(), commit.clone());
-                    }
-                }
-            }
-            return Some(patch(vessel, role, operation));
-        }
-    }
-    None
+    owners
+        .iter()
+        .find(|(_, role)| role.as_str() == "coder")
+        .or_else(|| owners.first())
+        .map(|(vessel, role)| (vessel.as_str(), role.as_str()))
 }
 
 #[cfg(test)]
@@ -450,7 +519,7 @@ mod tests {
             kind: PromiseKind::Pr,
             source: PromiseSource::Crew,
             submission: Submission {
-                reference: format!("pr:github.com:org/repo:{attempt}"),
+                reference: format!("cr/github.com/org/repo/{attempt}"),
                 metadata: BTreeMap::new(),
                 submitted_at: DateTime::from_timestamp(attempt, 0).unwrap(),
                 verdict: None,
@@ -460,7 +529,7 @@ mod tests {
     fn verdict(id: &str, attempt: i64, accepted: bool) -> PromiseOperation {
         PromiseOperation::Verdict {
             id: id.into(),
-            reference: format!("pr:github.com:org/repo:{attempt}"),
+            reference: format!("cr/github.com/org/repo/{attempt}"),
             submitted_at: DateTime::from_timestamp(attempt, 0).unwrap(),
             verdict: SubmissionVerdict {
                 accepted,
@@ -538,12 +607,14 @@ mod tests {
         let mut status = ConvoyStatus::default();
         apply(&mut status, "work", "coder", &submit("feature", 1));
         apply(&mut status, "work", "reviewer", &submit("feature", 2));
+        apply(&mut status, "work", "reviewer", &submit("handoff/coder/feature/1", 4));
         apply(&mut status, "work", "coder", &submit("finished", 3));
         apply(&mut status, "work", "coder", &verdict("finished", 3, true));
         handoff(&mut status, "work", "coder", "reviewer");
         assert_eq!(owned(&status, "work", "coder").len(), 1);
         assert_eq!(owned(&status, "work", "coder")[0].state, PromiseState::Kept);
-        let moved = &owned(&status, "work", "reviewer")[1];
+        let moved = &owned(&status, "work", "reviewer")[2];
+        assert_eq!(moved.id, "handoff/coder/feature/2");
         assert_eq!(moved.role, "reviewer");
         assert_eq!(moved.state, PromiseState::Submitted);
         assert_eq!(moved.submissions.len(), 1);
@@ -574,6 +645,12 @@ mod tests {
         let mut value = serde_json::to_value(ConvoyStatus::default()).unwrap();
         value.as_object_mut().unwrap().remove("promises");
         assert!(serde_json::from_value::<ConvoyStatus>(value).unwrap().promises.is_empty());
+        let evaluation = serde_json::json!({"mode":"claim_exit", "satisfied": true, "unmet": []});
+        assert!(serde_json::from_value::<crate::SettlementEvaluation>(evaluation).unwrap().promises.is_empty());
+        let submission = serde_json::json!({"reference":"cr/github.com/org/repo/1", "submitted_at":"2026-01-01T00:00:00Z"});
+        let decoded: Submission = serde_json::from_value(submission).unwrap();
+        assert!(decoded.metadata.is_empty());
+        assert!(decoded.verdict.is_none());
     }
     // ADR 0061: direct completion and landing patches cannot bypass unfinished
     // promises, even if preparation happened before the promise was declared.
@@ -583,5 +660,127 @@ mod tests {
         apply(&mut status, "work", "coder", &submit("feature", 1));
         super::super::controller_patches::settle_with_evidence("merged".into(), Vec::new(), Utc::now(), None).apply(&mut status);
         assert_ne!(status.phase, super::super::ConvoyPhase::Landed);
+    }
+    // ADR 0061: ambiguous branch discovery cannot guess which declaration was
+    // fulfilled. The owner explicitly binds a submission to each declared ID.
+    #[test]
+    fn ambiguous_discovery_keeps_declared_obligations_open() {
+        let mut status = ConvoyStatus::default();
+        for id in ["a", "b"] {
+            apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
+            );
+        }
+        let subject = flotilla_protocol::Subject::from_leaf(&"cr/github.com/org/repo/1".parse().unwrap()).unwrap();
+        let operation = discovered_submission(&status, "work", "coder", &subject, Utc::now()).unwrap();
+        apply(&mut status, "work", "coder", &operation);
+        assert_eq!(pending(&status, "work", "coder").len(), 3);
+        assert!(owned(&status, "work", "coder").iter().filter(|p| p.id == "a" || p.id == "b").all(|p| p.state == PromiseState::Open));
+        for id in ["a", "b"] {
+            apply(&mut status, "work", "coder", &submit(id, 1));
+        }
+        assert!(owned(&status, "work", "coder").iter().all(|p| p.state == PromiseState::Submitted));
+    }
+
+    // ADR 0061: optimistic preparation never admits completion over a promise,
+    // and a previously prepared command cannot add work after completion won.
+    #[hegel::test]
+    fn promise_completion_patch_races(tc: hegel::TestCase) {
+        let complete_first = tc.draw(hegel::generators::booleans());
+        let mut status = ConvoyStatus::default();
+        status.crew_work.insert(
+            "work".into(),
+            BTreeMap::from([("coder".into(), crate::CrewWorkState::builder().phase(super::super::CrewWorkPhase::Working).build())]),
+        );
+        let completion = super::super::external_patches::mark_crew_completed("work".into(), "coder".into(), Utc::now(), None, None, None);
+        let submission = submit("feature", 1);
+        if complete_first {
+            completion.apply(&mut status);
+        }
+        let command =
+            super::super::ConvoyStatusPatch::Promise { vessel: "work".into(), role: "coder".into(), operation: submission.clone() };
+        command.apply(&mut status);
+        completion.apply(&mut status);
+        assert_eq!(effect_present(&status, "work", "coder", &submission), !complete_first);
+        assert_eq!(status.crew_work["work"]["coder"].phase == super::super::CrewWorkPhase::Done, complete_first);
+        if !complete_first {
+            apply(&mut status, "work", "coder", &verdict("feature", 1, true));
+            completion.apply(&mut status);
+            assert_eq!(status.crew_work["work"]["coder"].phase, super::super::CrewWorkPhase::Done);
+        }
+        let mut retracted = ConvoyStatus::default();
+        apply(&mut retracted, "work", "coder", &submission);
+        apply(&mut retracted, "work", "coder", &PromiseOperation::Retract { id: "feature".into(), reason: "reduced".into() });
+        apply(&mut retracted, "work", "coder", &submission);
+        assert!(!effect_present(&retracted, "work", "coder", &submission));
+    }
+
+    // ADR 0061: stale forge evidence neither keeps nor rejects a submission;
+    // refreshing the same resource is sufficient to produce the next verdict.
+    #[hegel::test]
+    fn stale_observation_has_no_verdict(tc: hegel::TestCase) {
+        let state = if tc.draw(hegel::generators::booleans()) {
+            crate::ObservedChangeRequestState::Merged
+        } else {
+            crate::ObservedChangeRequestState::Closed
+        };
+        let mut status = ConvoyStatus::default();
+        apply(&mut status, "work", "coder", &submit("feature", 1));
+        let now = Utc::now();
+        let name = crate::change_request_record_name("github.com", "org/repo", 1);
+        let mut record = crate::ResourceObject::<crate::ChangeRequest> {
+            metadata: crate::ObjectMeta {
+                name: name.clone(),
+                namespace: "test".into(),
+                resource_version: "1".into(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: now,
+                merge: None,
+            },
+            spec: crate::ChangeRequestSpec::builder()
+                .service("github.com".into())
+                .scope("org/repo".into())
+                .number(1)
+                .observing_authority("test".into())
+                .build(),
+            status: Some(crate::ChangeRequestStatus {
+                state: crate::Observation::known(state, now - chrono::Duration::seconds(181)),
+                head_sha: Default::default(),
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                checks: Default::default(),
+                mergeable: Default::default(),
+                review: crate::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+            }),
+        };
+        let promise = &owned(&status, "work", "coder")[0];
+        assert!(observed_verdict(
+            promise,
+            "coder",
+            &BTreeMap::from([(name.clone(), record.clone())]),
+            &BTreeMap::new(),
+            now,
+            std::time::Duration::from_secs(180)
+        )
+        .is_none());
+        record.status.as_mut().unwrap().state.observed_at = now;
+        assert!(observed_verdict(
+            promise,
+            "coder",
+            &BTreeMap::from([(name, record)]),
+            &BTreeMap::new(),
+            now,
+            std::time::Duration::from_secs(180)
+        )
+        .is_some());
     }
 }

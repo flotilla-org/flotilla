@@ -3300,9 +3300,6 @@ fn settlement_transition(patch: Option<ConvoyStatusPatch>) -> Option<ConvoyStatu
     })
 }
 
-// Landing still follows today's bound subjects: a first merged PR suffices even
-// though the assignment mentions a later unopened PR. Record why, then retain
-// that evidence after live observations and delivery latches disappear.
 // ADR 0061 / #2979: the first merged PR must not settle a three-PR crew.
 // Duplicate claims remain refused after each partial merge; landing retains all
 // promise states and submission evidence, even when observations are collected.

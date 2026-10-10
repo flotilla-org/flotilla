@@ -178,7 +178,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
-        ConvoyStatusPatch::Promise { .. } => PatchKind::ConvoyPromise,
+        ConvoyStatusPatch::Promise { .. } | ConvoyStatusPatch::ObservePromise { .. } => PatchKind::ConvoyPromise,
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
         ConvoyStatusPatch::RefuseCrewCompletion { .. } => PatchKind::ConvoyRefuseCrewCompletion,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,

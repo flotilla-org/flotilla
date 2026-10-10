@@ -822,7 +822,8 @@ impl CrewService {
         let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
         let status = convoy.status.as_ref().ok_or("convoy has no status")?;
-        if status.phase.is_terminal() || status.crew_work[&context.vessel][&context.caller_role].phase == CrewWorkPhase::Done {
+        let work = status.crew_work.get(&context.vessel).and_then(|crew| crew.get(&context.caller_role)).ok_or("crew work is missing")?;
+        if status.phase.is_terminal() || work.phase == CrewWorkPhase::Done {
             return Err("cannot change promises after completion".into());
         }
         let promises = owned(status, &context.vessel, &context.caller_role);
@@ -865,7 +866,7 @@ impl CrewService {
                         if let Some(existing) = promises.iter().find(|p| {
                             p.kind == kind
                                 && p.state != PromiseState::Retracted
-                                && p.submissions.last().is_some_and(|s| s.metadata.get("subject").unwrap_or(&s.reference) == canonical)
+                                && p.submissions.last().is_some_and(|s| s.subject() == canonical)
                         }) {
                             existing.id.clone()
                         } else {
@@ -879,9 +880,7 @@ impl CrewService {
                     }
                 };
                 if let Some(p) = promises.iter().find(|p| p.id == id) {
-                    let same = p.submissions.last().is_some_and(|s| {
-                        s.metadata.get("subject").unwrap_or(&s.reference) == metadata.get("subject").unwrap_or(&reference)
-                    });
+                    let same = p.submissions.last().is_some_and(|s| s.subject() == metadata.get("subject").unwrap_or(&reference));
                     if p.kind != kind
                         || (p.state != PromiseState::Open && !(same && matches!(p.state, PromiseState::Submitted | PromiseState::Kept)))
                     {
@@ -924,13 +923,20 @@ impl CrewService {
                 PromiseOperation::Retract { id, reason }
             }
         };
-        apply_resource_status_patch(
+        let updated = apply_resource_status_patch(
             &convoys,
             name,
-            &ConvoyStatusPatch::Promise { vessel: context.vessel, role: context.caller_role, operation },
+            &ConvoyStatusPatch::Promise { vessel: context.vessel.clone(), role: context.caller_role.clone(), operation: operation.clone() },
         )
         .await
         .map_err(|e| e.to_string())?;
+        if updated
+            .status
+            .as_ref()
+            .is_none_or(|status| !flotilla_resources::promises::effect_present(status, &context.vessel, &context.caller_role, &operation))
+        {
+            return Err("promise changed concurrently; inspect convoy explain and retry".into());
+        }
         Ok(())
     }
 
@@ -1296,12 +1302,12 @@ impl CrewService {
                 return Ok(flotilla_protocol::CommandValue::CrewFollowUpDelivered);
             }
         }
-        apply_resource_status_patch(
+        let updated = apply_resource_status_patch(
             &convoys,
             convoy_name,
             &convoy_external_patches::mark_crew_completed_with_context(
-                context.vessel,
-                context.caller_role,
+                context.vessel.clone(),
+                context.caller_role.clone(),
                 chrono::Utc::now(),
                 message,
                 disposition,
@@ -1313,6 +1319,15 @@ impl CrewService {
         )
         .await
         .map_err(|err| err.to_string())?;
+        if updated
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .and_then(|crew| crew.get(&context.caller_role))
+            .is_none_or(|work| work.phase != CrewWorkPhase::Done)
+        {
+            return Err("crew completion changed concurrently; inspect pending promises and retry".into());
+        }
         if let Some(session_name) = routing.session_name {
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }

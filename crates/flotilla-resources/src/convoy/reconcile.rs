@@ -48,6 +48,10 @@ pub trait ConvoyTeardownRuntime: Send + Sync {
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String>;
 }
 
+// Convoy secondary watches cover work/checkouts, not arbitrary PR or artifact
+// records. A bounded retry also handles observation freshness without an event.
+const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
     pub patch: Option<ConvoyStatusPatch>,
@@ -1015,8 +1019,14 @@ impl Reconciler for ConvoyReconciler {
         };
         let observed_subjects = observed_change_request_subjects(obj, &checkouts, &forges).map_err(ResourceError::other)?;
         let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
+        let needs_pr = is_landing
+            || obj.status.as_ref().is_some_and(|status| super::promises::needs_observation(status, super::promises::PromiseKind::Pr));
+        let needs_ledger = obj
+            .status
+            .as_ref()
+            .is_some_and(|status| super::promises::needs_observation(status, super::promises::PromiseKind::DecisionLedger));
         let change_requests = match &self.change_requests {
-            Some(change_requests) => {
+            Some(change_requests) if needs_pr => {
                 let sources = change_requests.list().await?.items;
                 crate::select_change_requests(sources.iter().map(|source| &source.object))
                     .into_values()
@@ -1026,10 +1036,10 @@ impl Reconciler for ConvoyReconciler {
             _ => BTreeMap::new(),
         };
         let artifacts = match &self.artifacts {
-            Some(artifacts) => {
+            Some(artifacts) if needs_ledger => {
                 artifacts.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
             }
-            None => BTreeMap::new(),
+            _ => BTreeMap::new(),
         };
         let promise_patch = obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
             super::promises::next_observation(
@@ -1265,8 +1275,12 @@ impl Reconciler for ConvoyReconciler {
                         .values()
                         .flat_map(BTreeMap::values)
                         .flatten()
-                        .any(|p| !p.state.terminal())
-                        .then_some(std::time::Duration::from_secs(30))
+                        .any(|p| {
+                            p.state == super::promises::PromiseState::Submitted
+                                || (p.kind == super::promises::PromiseKind::DecisionLedger
+                                    && p.state == super::promises::PromiseState::Open)
+                        })
+                        .then_some(PROMISE_OBSERVATION_RETRY)
                 })
             }),
         }
