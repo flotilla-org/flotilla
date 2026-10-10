@@ -965,20 +965,29 @@ pub struct ConvoyStatus {
 /// Frozen completion claims that triggered the existing Active → Landing rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct LandingEntry {
+    /// Timestamp supplied by the completion patch that entered Landing, not
+    /// the later controller pass that publishes its event.
     pub entered_at: DateTime<Utc>,
     pub claims: Vec<LandingClaim>,
-    /// The reconciler publishes the entry event once, including when settlement
-    /// happens on its first pass after the completion patch.
+    /// Successful reconciliation acknowledges publication, including when
+    /// settlement happens on the first pass. A conflicting patch may retry the
+    /// event: publication is at-least-once, like other controller events.
     pub event_emitted: bool,
 }
+
+/// Display role used for completion through work-level override.
+pub const WORK_OVERRIDE_ROLE: &str = "work override";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct LandingClaim {
     pub vessel: String,
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub completed_while_crew_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preceding_turn: Option<LandingTurn>,
 }
 
@@ -997,10 +1006,12 @@ impl LandingEntry {
                     .message
                     .as_deref()
                     .and_then(|message| {
-                        message.split_whitespace().find_map(|word| {
-                            let (_, number) = word.rsplit_once("/pull/")?;
-                            number.parse::<u64>().ok().map(|number| format!(" (#{number})"))
-                        })
+                        let url = message.trim();
+                        if !url.starts_with("https://") || url.split_whitespace().count() != 1 {
+                            return None;
+                        }
+                        let (_, number) = url.rsplit_once("/pull/")?;
+                        number.parse::<u64>().ok().map(|number| format!(" (#{number})"))
                     })
                     .unwrap_or_default();
                 let after = claim.preceding_turn.as_ref().map(|turn| format!(" after {}", turn.source)).unwrap_or_default();
@@ -2547,7 +2558,16 @@ pub mod controller_patches {
     }
 
     pub fn settle(disposition: String, target_mismatches: Vec<TargetMismatch>, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::Settle { disposition, target_mismatches, finished_at, evidence: None }
+        settle_with_evidence(disposition, target_mismatches, finished_at, None)
+    }
+
+    pub fn settle_with_evidence(
+        disposition: String,
+        target_mismatches: Vec<TargetMismatch>,
+        finished_at: DateTime<Utc>,
+        evidence: Option<reconcile::SettlementEvaluation>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::Settle { disposition, target_mismatches, finished_at, evidence }
     }
 
     pub fn roll_up_work(work: String, phase: WorkPhase, transitioned_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
@@ -2608,6 +2628,8 @@ fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus, entered
                     .is_some_and(|crew| !crew.is_empty() && crew.values().all(|member| member.phase == CrewWorkPhase::Done)))
     });
     if all_work_claimed_complete {
+        // Preserve the prior entry while work is reopened; a new completion
+        // edge replaces it and starts a fresh event/settlement receipt.
         status.landing_entry = Some(LandingEntry {
             entered_at,
             claims: status
@@ -2632,7 +2654,7 @@ fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus, entered
                     if claims.is_empty() {
                         claims.push(LandingClaim {
                             vessel: vessel.clone(),
-                            role: "work override".to_string(),
+                            role: WORK_OVERRIDE_ROLE.to_string(),
                             claimed_at: work.finished_at,
                             message: work.message.clone(),
                             completed_while_crew_active: false,

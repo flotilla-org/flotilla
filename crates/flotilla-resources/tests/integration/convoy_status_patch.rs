@@ -1522,6 +1522,22 @@ fn landing_claims_wait_for_every_crew_and_remain_frozen(tc: hegel::TestCase) {
     }
     let entry = status.landing_entry.clone().expect("entry");
     assert_eq!(entry.claims.len(), count);
+    let mut prose_entry = entry.clone();
+    prose_entry.claims[0].message = Some("See unrelated https://github.com/other/repo/pull/999 for context".into());
+    assert!(!prose_entry.reason().contains("(#999)"));
+    let mut minimal_entry = serde_json::to_value(&entry).expect("encode entry");
+    for claim in minimal_entry["claims"].as_array_mut().expect("claims") {
+        let claim = claim.as_object_mut().expect("claim");
+        claim.remove("claimed_at");
+        claim.remove("message");
+        claim.remove("preceding_turn");
+    }
+    let minimal_entry: flotilla_resources::LandingEntry = serde_json::from_value(minimal_entry).expect("optional claim evidence defaults");
+    assert!(minimal_entry
+        .claims
+        .iter()
+        .all(|claim| claim.claimed_at.is_none() && claim.message.is_none() && claim.preceding_turn.is_none()));
+
     for claim in &entry.claims {
         assert!(roles.contains(&claim.role));
         assert!(claim.preceding_turn.is_none(), "absence of a delivery is explicit");
@@ -1549,6 +1565,27 @@ fn landing_claims_wait_for_every_crew_and_remain_frozen(tc: hegel::TestCase) {
     let decoded: ConvoyStatus = serde_json::from_value(legacy).expect("previous-generation status");
     assert_eq!(decoded.phase, ConvoyPhase::Landing);
     assert!(decoded.landing_entry.is_none() && decoded.landing_settlement.is_none());
+
+    external_patches::resume_crew_work("work".into(), roles[0].clone(), ts(110), "review follow-up".into(), None).apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.landing_entry.as_ref(), Some(&entry), "historical evidence survives reopening");
+    external_patches::mark_crew_completed_with_context(
+        "work".into(),
+        roles[0].clone(),
+        ts(120),
+        Some("review addressed".into()),
+        None,
+        None,
+        Some("fresh-digest".into()),
+        false,
+        None,
+    )
+    .apply(&mut status);
+    let fresh = status.landing_entry.as_ref().expect("fresh entry");
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+    assert_eq!(fresh.entered_at, ts(120));
+    assert!(!fresh.event_emitted);
+    assert_ne!(fresh, &entry, "re-entry replaces the earlier trigger");
 }
 
 // A claim names only a preceding turn for its own role. Future, queued,

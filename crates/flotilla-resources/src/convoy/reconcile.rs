@@ -33,9 +33,9 @@ use crate::{
         ValidationError, WorkflowTemplate,
     },
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
-    InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError,
-    RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue, TypedResolver,
-    ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
+    InputValue, LeafMaker, ObservedChangeRequestState, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector,
+    ReplicaReadResolver, Resource, ResourceError, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition,
+    SystemClock, ThreeValue, TypedResolver, ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
 };
 
 fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
@@ -65,6 +65,7 @@ struct InternalReconcileOutcome {
 struct LifecycleConditions {
     exit_disposition: Option<String>,
     reclaim_eligible: bool,
+    settlement_evidence: Option<SettlementEvaluation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,8 +504,8 @@ pub struct SettlementEvaluation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementSubject {
-    pub address: flotilla_protocol::LeafAddress,
-    pub state: Option<crate::ObservedChangeRequestState>,
+    pub address: LeafAddress,
+    pub state: Option<ObservedChangeRequestState>,
     pub observed_at: Option<DateTime<Utc>>,
 }
 
@@ -651,8 +652,8 @@ fn evaluate_landing_settlement_with_disposition(
         InstantiatedExit::Table(entries) => entries,
     };
 
-    let evaluate_terminal = |leaf: &flotilla_protocol::Leaf| {
-        let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+    let evaluate_terminal = |leaf: &Leaf| {
+        let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
             return Err(UnmetSettlementExpectation::InvalidCondition {
                 subject: convoy.metadata.name.clone(),
                 message: "exit table leaf did not address a change request".to_string(),
@@ -754,7 +755,7 @@ fn evaluate_landing_settlement_with_disposition(
         .into_iter()
         .map(|address| {
             let record = match &address {
-                flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
+                LeafAddress::ChangeRequest { service, scope, number } => {
                     change_requests.get(&crate::change_request_record_name(service, scope, *number))
                 }
                 _ => None,
@@ -1135,15 +1136,13 @@ impl Reconciler for ConvoyReconciler {
             prepared.template.as_ref(),
             &prepared.vessels,
             &prepared.checkouts,
-            LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
+            LifecycleConditions {
+                exit_disposition: prepared.exit_disposition.clone(),
+                reclaim_eligible: prepared.reclaim_eligible,
+                settlement_evidence: prepared.settlement_evidence.clone(),
+            },
             now,
         );
-        if let Some(ConvoyStatusPatch::Settle { evidence, .. }) = outcome.patch.as_mut().map(|patch| match patch {
-            ConvoyStatusPatch::RecordLandingEvent { transition: Some(transition) } => transition.as_mut(),
-            other => other,
-        }) {
-            *evidence = prepared.settlement_evidence.clone();
-        }
         // Landed convoy records are retained, so their deletion finalizer may
         // never run. Sweep sessions here too: a missing vessel must not strand
         // an orphan session after the independently verified reclaim gate.
@@ -1288,7 +1287,7 @@ pub fn reconcile(
         template,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        LifecycleConditions { exit_disposition, reclaim_eligible: false },
+        LifecycleConditions { exit_disposition, reclaim_eligible: false, settlement_evidence: None },
         now,
     );
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }
@@ -1409,7 +1408,7 @@ fn reconcile_internal_without_landing_event(
         );
     }
 
-    if let Some(outcome) = roll_up_phase_outcome(convoy, &status, checkouts, conditions.exit_disposition.as_deref(), now) {
+    if let Some(outcome) = roll_up_phase_outcome(convoy, &status, checkouts, &conditions, now) {
         return with_cleanup(
             convoy,
             &status,
@@ -1742,11 +1741,11 @@ fn roll_up_phase_outcome(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
-    exit_disposition: Option<&str>,
+    conditions: &LifecycleConditions,
     now: DateTime<Utc>,
 ) -> Option<ReconcileOutcome> {
     let all_complete = !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete);
-    if let (ConvoyPhase::Landing, true, Some(exit_disposition)) = (status.phase, all_complete, exit_disposition) {
+    if let (ConvoyPhase::Landing, true, Some(exit_disposition)) = (status.phase, all_complete, conditions.exit_disposition.as_deref()) {
         let target_mismatches = convoy
             .spec
             .repositories
@@ -1769,7 +1768,12 @@ fn roll_up_phase_outcome(
             })
             .collect();
         return Some(ReconcileOutcome {
-            patch: Some(controller_patches::settle(exit_disposition.to_string(), target_mismatches, now)),
+            patch: Some(controller_patches::settle_with_evidence(
+                exit_disposition.to_string(),
+                target_mismatches,
+                now,
+                conditions.settlement_evidence.clone(),
+            )),
             events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Landing, to: ConvoyPhase::Landed }],
         });
     }
