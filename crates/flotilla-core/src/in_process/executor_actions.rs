@@ -98,7 +98,7 @@ pub(super) struct ExecutorActions<'a> {
 
 impl ExecutorActions<'_> {
     async fn provisioning_namespace(&self) -> String {
-        self.namespace.read().expect("provisioning namespace lock poisoned").clone()
+        super::action_namespace::provisioning_namespace(self.namespace)
     }
     pub(super) async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceApply { namespace, document } = &command.action {

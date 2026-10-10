@@ -5,6 +5,8 @@
 
 use flotilla_store::ResolvedCascadeStoreExt;
 
+mod action_events;
+mod action_namespace;
 mod admission_actions;
 #[path = "attach.rs"]
 mod attach;
@@ -42,6 +44,8 @@ use async_trait::async_trait;
 use attach::AttachResolver;
 pub use attach::ResolvedAttach;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(test)]
+use convoy_admission::PlacementResolution;
 use convoy_admission::{
     convoy_address, convoy_ensure_name, discover_repository_change_request_with, project_not_ready_error, resolve_convoy_candidate_indices,
     ConvoyAddressIdentity, ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider,
@@ -300,7 +304,7 @@ struct ProviderIssueQueryPort {
 #[async_trait]
 impl IssueQueryPort for ProviderIssueQueryPort {
     async fn provider_for_source(&self, source: &flotilla_protocol::IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
-        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        let namespace = action_namespace::provisioning_namespace(&self.provisioning_namespace);
         let source = flotilla_resources::normalize_issue_source(source);
         let repositories = self.backend.including_replicas::<Repository>(&namespace);
         // Project bindings choose portable sources; local checkout presence never
@@ -1555,6 +1559,38 @@ fn rewrite_repository_set(keys: &mut BTreeSet<RepositoryKey>, replacements: &BTr
 }
 
 impl InProcessDaemon {
+    fn executor_actions(&self) -> executor_actions::ExecutorActions<'_> {
+        executor_actions::ExecutorActions {
+            namespace: &self.provisioning_namespace,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            config: &self.config,
+            active_commands: &self.active_commands,
+            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
+            environment_manager: &self.environment_manager,
+            runner: &self.discovery.runner,
+            env: &self.discovery.env,
+            daemon_socket_path: &self.daemon_socket_path,
+            host_name: &self.host_name,
+            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
+        }
+    }
+
+    fn projections_actions(&self) -> projections_actions::ProjectionsActions<'_> {
+        projections_actions::ProjectionsActions {
+            crew: &self.crew_ops,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            event_sink: &self.event_sink,
+            node_id: &self.node_id,
+            clock: &self.clock,
+            config: &self.config,
+            active_commands: &self.active_commands,
+        }
+    }
+
     /// Create a new in-process daemon tracking the given repo paths.
     ///
     /// Returns `Arc<Self>` because daemon-owned background controllers retain
@@ -2693,7 +2729,7 @@ impl InProcessDaemon {
     }
 
     pub async fn provisioning_namespace(&self) -> String {
-        self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
+        action_namespace::provisioning_namespace(&self.provisioning_namespace)
     }
 
     fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
@@ -5848,32 +5884,8 @@ impl InProcessDaemon {
             clock: &self.clock,
             events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
         };
-        let projections = projections_actions::ProjectionsActions {
-            crew: &self.crew_ops,
-            port: self,
-            resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
-            event_sink: &self.event_sink,
-            node_id: &self.node_id,
-            clock: &self.clock,
-            config: &self.config,
-            active_commands: &self.active_commands,
-        };
-        let executor = executor_actions::ExecutorActions {
-            namespace: &self.provisioning_namespace,
-            port: self,
-            resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
-            config: &self.config,
-            active_commands: &self.active_commands,
-            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
-            environment_manager: &self.environment_manager,
-            runner: &self.discovery.runner,
-            env: &self.discovery.env,
-            daemon_socket_path: &self.daemon_socket_path,
-            host_name: &self.host_name,
-            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
-        };
+        let projections = self.projections_actions();
+        let executor = self.executor_actions();
         match &command.action {
             CommandAction::ArtifactReserveLedgerComment { .. } => {
                 return boxed_action!(crew.execute_action_artifact_reserve_ledger_comment(id, &command))
@@ -5948,23 +5960,7 @@ impl InProcessDaemon {
             _ => {}
         }
 
-        executor_actions::ExecutorActions {
-            namespace: &self.provisioning_namespace,
-            port: self,
-            resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
-            config: &self.config,
-            active_commands: &self.active_commands,
-            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
-            environment_manager: &self.environment_manager,
-            runner: &self.discovery.runner,
-            env: &self.discovery.env,
-            daemon_socket_path: &self.daemon_socket_path,
-            host_name: &self.host_name,
-            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
-        }
-        .execute_provider_action(id, command, command_node_id, remote_executor)
-        .await
+        self.executor_actions().execute_provider_action(id, command, command_node_id, remote_executor).await
     }
 }
 
@@ -6057,7 +6053,7 @@ impl DaemonHandle for InProcessDaemon {
 
     fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
         let state = self.aggregator_projection_state.clone();
-        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        let namespace = action_namespace::provisioning_namespace(&self.provisioning_namespace);
         self.connect_surface(subscriber_id, SurfaceDeclaration::focal_for_namespace(namespace));
         let daemon = self.self_weak.clone();
         QuerySubscription::new(move || {
@@ -6098,19 +6094,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
-        projections_actions::ProjectionsActions {
-            crew: &self.crew_ops,
-            port: self,
-            resource_backend: &self.resource_backend,
-            observed_resource_backend: &self.observed_resource_backend,
-            event_sink: &self.event_sink,
-            node_id: &self.node_id,
-            clock: &self.clock,
-            config: &self.config,
-            active_commands: &self.active_commands,
-        }
-        .execute_query(command, session_id)
-        .await
+        self.projections_actions().execute_query(command, session_id).await
     }
 
     async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
@@ -6315,9 +6299,6 @@ impl InProcessDaemon {
         &self.environment_manager
     }
 }
-mod action_events;
-#[cfg(test)]
-use convoy_admission::PlacementResolution;
 mod forge_demands;
 
 #[async_trait]

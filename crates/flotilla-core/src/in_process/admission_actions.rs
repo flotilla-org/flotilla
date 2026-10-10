@@ -79,7 +79,7 @@ pub(super) struct AdmissionActions<'a> {
 
 impl AdmissionActions<'_> {
     async fn provisioning_namespace(&self) -> String {
-        self.namespace.read().expect("provisioning namespace lock poisoned").clone()
+        super::action_namespace::provisioning_namespace(self.namespace)
     }
     pub(super) async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ConvoyEnsureRoll { namespace, name } = &command.action else {
@@ -169,24 +169,12 @@ impl AdmissionActions<'_> {
             let project_identity = project_ref.as_deref();
             if let Err(message) = validate_convoy_name(&role) {
                 let result = CommandValue::Error { message };
-                self.events.sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.events.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
+                self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
             if let Err(message) = self.convoy_admission.check_local_free_space_floor().await {
                 let result = CommandValue::Error { message };
-                self.events.sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.events.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
+                self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
             // Use the admission transaction before checking identity or writing
@@ -194,13 +182,7 @@ impl AdmissionActions<'_> {
             let admission_guard = self.convoy_admission.lock().await;
             if let Err(message) = allocate_convoy_generation(self.resource_backend, &namespace, project_identity, &role).await {
                 let result = CommandValue::Error { message };
-                self.events.sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.events.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
+                self.events.finish(id, empty_identity, result);
                 return Ok(id);
             }
             let record_name = convoy_record_name();
@@ -216,13 +198,7 @@ impl AdmissionActions<'_> {
             {
                 Ok(workflow) => workflow,
                 Err(message) => {
-                    self.events.sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.events.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: CommandValue::Error { message },
-                    });
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -232,13 +208,7 @@ impl AdmissionActions<'_> {
                 {
                     Ok(repositories) => Some(repositories),
                     Err(message) => {
-                        self.events.sink.emit(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.events.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: CommandValue::Error { message },
-                        });
+                        self.events.finish(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 }
@@ -247,13 +217,7 @@ impl AdmissionActions<'_> {
             };
             if project_repositories.is_some() && repository_url.is_some() {
                 let message = "convoy repository selection is not allowed when a project is supplied".to_string();
-                self.events.sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.events.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: CommandValue::Error { message },
-                });
+                self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let mut direct_repository_url = repository_url.clone();
@@ -297,13 +261,7 @@ impl AdmissionActions<'_> {
                         }
                         Err(message) => {
                             let result = CommandValue::Error { message };
-                            self.events.sink.emit(DaemonEvent::CommandFinished {
-                                command_id: id,
-                                node_id: self.events.node_id.clone(),
-                                repo_identity: empty_identity,
-                                repo: None,
-                                result,
-                            });
+                            self.events.finish(id, empty_identity, result);
                             return Ok(id);
                         }
                     }
@@ -348,13 +306,7 @@ impl AdmissionActions<'_> {
                 match resolved {
                     Ok(repositories) => repositories,
                     Err(message) => {
-                        self.events.sink.emit(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.events.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: CommandValue::Error { message },
-                        });
+                        self.events.finish(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 }
@@ -367,13 +319,7 @@ impl AdmissionActions<'_> {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
                     let message =
                         format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
-                    self.events.sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.events.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: CommandValue::Error { message },
-                    });
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
@@ -392,13 +338,7 @@ impl AdmissionActions<'_> {
             {
                 Ok(placement) => placement,
                 Err(message) => {
-                    self.events.sink.emit(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.events.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: CommandValue::Error { message },
-                    });
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
@@ -412,13 +352,7 @@ impl AdmissionActions<'_> {
             )
             .await;
             if let Err(message) = credential_result {
-                self.events.sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.events.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: CommandValue::Error { message },
-                });
+                self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let placement_decision = match placement.selected.as_ref() {
@@ -433,13 +367,7 @@ impl AdmissionActions<'_> {
                         allocation: placement.allocation.clone(),
                     }),
                     Err(message) => {
-                        self.events.sink.emit(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.events.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result: CommandValue::Error { message },
-                        });
+                        self.events.finish(id, empty_identity, CommandValue::Error { message });
                         return Ok(id);
                     }
                 },
@@ -448,13 +376,7 @@ impl AdmissionActions<'_> {
             if let Err(message) =
                 self.convoy_admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await
             {
-                self.events.sink.emit(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.events.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: CommandValue::Error { message },
-                });
+                self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
             let result = self
@@ -479,13 +401,7 @@ impl AdmissionActions<'_> {
                     admission_guard,
                 )
                 .await;
-            self.events.sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.events.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ConvoyCreate action selected the wrong handler".to_string())
@@ -518,13 +434,7 @@ impl AdmissionActions<'_> {
                 }
                 Err(err) => CommandValue::Error { message: err },
             };
-            self.events.sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.events.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("WorkflowTemplateApply action selected the wrong handler".to_string())
@@ -544,13 +454,7 @@ impl AdmissionActions<'_> {
                 Ok(name) => CommandValue::ProjectAdded { name },
                 Err(message) => CommandValue::Error { message },
             };
-            self.events.sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.events.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ProjectAdd action selected the wrong handler".to_string())
@@ -604,13 +508,7 @@ impl AdmissionActions<'_> {
                 },
                 Err(err) => CommandValue::Error { message: err },
             };
-            self.events.sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.events.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ProjectApply action selected the wrong handler".to_string())
@@ -630,13 +528,7 @@ impl AdmissionActions<'_> {
                 Ok((name, members)) => CommandValue::ProjectRegistered { name, members },
                 Err(message) => CommandValue::Error { message },
             };
-            self.events.sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.events.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ProjectRegister action selected the wrong handler".to_string())
@@ -658,13 +550,7 @@ impl AdmissionActions<'_> {
                 }
                 Err(message) => CommandValue::Error { message },
             };
-            self.events.sink.emit(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.events.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ProjectRefresh action selected the wrong handler".to_string())
