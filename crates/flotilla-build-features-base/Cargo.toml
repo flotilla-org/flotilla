@@ -1,0 +1,24 @@
+[package]
+name = "flotilla-build-features-base"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Static feature selections only; every consumer already uses these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+digest = { version = "0.10", features = ["mac", "oid", "std"] }
+generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+memchr = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_core = { version = "1", features = ["alloc"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = { version = "0.10", features = ["oid"] }
+subtle = { version = "2" }
+zeroize = { version = "1", features = ["derive"] }
+
+[dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+
+[lints]
+workspace = true

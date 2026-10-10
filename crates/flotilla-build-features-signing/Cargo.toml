@@ -1,0 +1,29 @@
+[package]
+name = "flotilla-build-features-signing"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Static feature selections only; every consumer already uses these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+der = { version = "0.7", default-features = false, features = ["alloc", "oid", "pem", "std", "zeroize"] }
+digest = { version = "0.10", features = ["mac", "oid", "std"] }
+ed25519 = { version = "2", default-features = false, features = ["alloc", "pkcs8", "std"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
+generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
+getrandom = { version = "0.2", default-features = false, features = ["std"] }
+libc = { version = "0.2" }
+pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
+rand_core = { version = "0.6", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", features = ["oid"] }
+signature = { version = "2", default-features = false, features = ["alloc", "digest", "rand_core", "std"] }
+spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
+subtle = { version = "2" }
+zeroize = { version = "1", features = ["derive"] }
+
+[dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+
+[lints]
+workspace = true

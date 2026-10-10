@@ -1,0 +1,18 @@
+[package]
+name = "flotilla-build-features-sqlite"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Static feature selections only; every consumer already uses these dependencies.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bitflags = { version = "2", default-features = false, features = ["std"] }
+rusqlite = { version = "0.37", default-features = false, features = ["bundled", "functions"] }
+smallvec = { version = "1", default-features = false, features = ["const_generics", "const_new"] }
+
+[dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+
+[lints]
+workspace = true

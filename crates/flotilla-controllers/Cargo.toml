@@ -22,6 +22,7 @@ sha2 = "0.10"
 serde_json = { workspace = true }
 
 [dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
@@ -48,3 +49,12 @@ test = false
 # Keep native library features stable across build and test commands.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

@@ -21,3 +21,8 @@ workspace = true
 # Keep native library features stable across build and test commands.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

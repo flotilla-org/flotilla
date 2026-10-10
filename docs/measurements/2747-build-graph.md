@@ -1,5 +1,10 @@
 # #2747: stable build graph and command switching
 
+The original measurements and release trade-off below describe the historical
+#2747 revision. #2948 subsequently removed production test helpers and default
+replay features. The current #2978 layer policy and measurements are recorded
+at the end of this document.
+
 Measured on 2026-10-09 in the contained Linux x86_64 crew vessel, with Rust
 1.99.0, 32 visible CPUs, `CARGO_INCREMENTAL=0` and
 `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. Both runs use the default TMPDIR;
@@ -112,51 +117,157 @@ by in-memory harnesses. The configuration regression test and existing
 federation/overlay coverage exercise that distinction. This is a reversible
 build-policy choice within the clean-up window, not a new peer protocol.
 
-## Maintaining the feature anchors
+## Maintaining the feature anchors (current policy, #2978)
 
-The contributor changing a dependency owns the corresponding anchor update in
-`crates/flotilla-build-features/Cargo.toml`. After a dependency edit or locked
-version update, run:
+`flotilla-build-features` now anchors only host proc-macro features (`syn`, plus
+`proc-macro2` and `quote` defaults to match their existing workspace contexts).
+Twelve static, empty sibling anchor crates cover:
+
+| Anchor | Dependency family |
+| --- | --- |
+| `base` | Serde/JSON and pure hashing |
+| `types` | Chrono, URL encoding and collections |
+| `os` | Rustix, native OS types and shared initialization |
+| `async` | Tokio, Mio and their shared logging/value features |
+| `tracing` | Tracing and tracing-core |
+| `signing` | Ed25519, DER/PKCS and signing randomness |
+| `http` | HTTP clients, TLS and transport utilities |
+| `hmac` | HMAC and pure digest dependencies |
+| `sqlite` | Bundled SQLite and its shared types |
+| `logging` | Subscriber filtering and structured logging |
+| `time` | Time formatting/local offset and shared initialization |
+| `http-server` | Axum and HTTP serving |
+
+Consumers select only anchors whose dependencies are reachable through their
+real normal/build graph at the same locked versions. Selections needed only by
+tests go in dev-dependencies. Each anchor also normalizes the existing features
+of its own reachable transitive dependencies, so its standalone package commands
+pass the same guard. Some declarations intentionally overlap (for example
+bitflags in OS and SQLite); they select identical features without adding a
+new dependency to either consumer graph. Native and Linux target conditions
+remain in the anchor manifests; WebAssembly omits the native dependencies.
+No optional TLS provider or operational/sandbox flag is anchored. The twelve
+new crates become workspace members through path dependencies; the root
+workspace manifest does not change.
+
+The anchors have **no optional feature switches**: their own Cargo artifact
+identities stay stable across package selections. A single optional-dependency
+anchor would change its own identity even when external feature contexts match,
+invalidating downstream consumers. Every anchor's own contexts are checked;
+there is no special-case exemption in the feature comparison. The guard compares
+each package's production and test graphs with the union of consumers **in its
+layer**, rather than imposing the native workspace union on base-only commands.
+The base layer consists of protocol, transport, paths, daemon-api and
+relay-protocol; other workspace packages use the native layer. A native layer
+comparison still checks base dependencies reached by that native consumer.
+Production dependencies on testkits, upward dev edges and production Tokio
+test-util remain forbidden. Anchor packages needing Tokio select test-util only
+in their dev-dependencies.
+
+The guard also checks each named base crate's isolated **Windows GNU
+normal/build tree** for SQLite, ring, other known C libraries and compiler-driver
+dependencies (`cc`, `cmake`, `autotools`). This catches future C-building anchors
+without relying on their names. Rust-only build scripts and proc macros remain
+legal. Client, manifest, TUI and the root crate are explicitly exempt because
+their real resources dependency still includes SQLite and ring. Shrink that list
+with ADR 0060 step 3's store split. The issue amendment withdraws the Windows CI
+change: the current cross-check scope and MinGW installation remain unchanged.
+
+After changing dependencies or the lockfile, run:
 
 ```sh
 python3 ci/build-graph/check.py 2> /tmp/flotilla-feature-diff.txt
 cat /tmp/flotilla-feature-diff.txt
 cargo tree --workspace --locked --edges normal,build,dev --prefix none --format '{p}|{f}'
+python3 -m unittest discover -s ci/build-graph -p test_check.py
 ```
 
-The checker prints the package/command, selected feature contexts and workspace
-feature contexts for every mismatch. Use these as the regeneration input:
-add or update anchors for the affected locked versions to select the workspace
-union; prefer public umbrella features over private implementation features.
-Preserve separate host build-dependency anchors (such as `syn`) and native/OS
-target conditions. Do not add optional TLS providers or sandbox switches to the
-union. Cargo's feature graph is not invertible to a unique minimal manifest,
-so regeneration deliberately requires contributor judgment rather than blindly
-copying every transitive feature into a generated manifest. Repeat the checker,
-its ten unit tests and the workspace tests until they pass. Removing an anchor
-requires the same checks to prove command switching remains uniform.
+The contributor owns the static anchor declarations and affected consumers'
+production/dev selections. Reconcile reported dependency contexts within the
+corresponding layer; do not add an unrelated native anchor merely to match a
+workspace-wide union. Cargo's feature graph is not invertible to one minimal
+manifest, so this remains a deliberate contributor decision. Run the documented
+format, Clippy, test and Git boundary gates before pushing.
 
-The checker retains distinct feature sets printed for duplicate host/target
-contexts rather than merging their union. A package-local command may omit a
-workspace context but may not introduce a different feature set. Cargo tree
-does not label context identities in this format, so identical sets remain
-indistinguishable; this is a feature-selection guard, not a profile or target
-identity verifier. The dependency rule follows both normal and build edges.
+The checker retains versions and distinct host/target feature sets instead of
+merging their union. A selected command may omit a layer context but may not
+invent a different set. Cargo tree does not label context identities in this
+format, so identical sets remain indistinguishable; this is a feature-selection
+guard, not a profile or target identity verifier. Metadata/tree commands use
+`--locked` and `--color never`. The guard needs Python 3.9+ and Cargo, does not
+build dependencies or bind sockets, and requires no TMPDIR override. It remains
+registered in the existing workspace-test job; no CI topology changes.
 
-The registered guard deliberately fails if Python or Cargo is unavailable,
-rather than silently giving a false CI pass. Python 3.9+ and Cargo on PATH are
-workspace-test prerequisites, including sandbox-safe invocations. It uses only
-Cargo metadata/tree, not builds, socket binding or temporary-path overrides;
-Cargo may serialize metadata access behind another process's package-cache
-lock. The measured full workspace run includes this guard's subprocess cost.
+## #2978: static layer anchors (2026-10-09–10 UTC)
 
-The checker explicitly requests `cargo --color never` for machine-readable
-output. Its registered integration test forces `CARGO_TERM_COLOR=always`,
-matching CI, to prevent ANSI duplicate markers being parsed as feature names.
+Baseline: `f2daa69a1bbf83572a9532bc82092a0b135df937`. Measured on the same
+contained Linux x86_64 vessel with Rust 1.99.0, 32 visible CPUs, eight Cargo
+jobs, `CARGO_INCREMENTAL=0` and the inherited line-tables-only dev debug
+setting. Both revisions use the default TMPDIR without sandbox feature or
+explicit debug overrides. These are single observations, not statistical
+performance estimates.
 
-Contributors adding behavior-changing hooks under default helper/replay features
-must update the release-build trade-off section above in the same change.
-The checker launches one metadata process and one workspace tree plus two trees
-per workspace member. A single metadata resolve graph does not describe each
-package selection under resolver 2; replacing these calls requires preserving
-that per-selection evidence. Revisit the cost if workspace membership grows.
+Count unique `{p}` identities in each isolated normal/build Windows GNU tree:
+
+```sh
+cargo tree --locked -p <package> --target x86_64-pc-windows-gnu \
+  --edges normal,build --prefix none --format '{p}'
+```
+
+Include the selected package and anchor crates, retain distinct versions and
+proc-macro labels, and collapse Cargo's `(*)` duplicates.
+
+| Package | Before | After |
+| --- | ---: | ---: |
+| `flotilla-protocol` | 199 | 102 |
+| `flotilla-transport` | 200 | 103 |
+| `flotilla-paths` | 203 | 106 |
+| `flotilla-daemon-api` | 202 | 105 |
+| `flotilla-relay-protocol` | 188 | 30 |
+| `flotilla-client` | 231 | 205 |
+
+All five named base graphs now exclude SQLite, ring and C compiler drivers.
+The client still reaches those dependencies through its real resources edge;
+it has fewer unrelated anchors, but remains exempt pending the store split.
+
+For the cold client check, use separate initially empty Cargo target directories
+with the same already-downloaded registry sources and toolchain. Run
+`cargo check -p flotilla-client --locked` once in each revision. The baseline
+uses an archive outside the vessel checkout; the after run uses the working
+branch. Cold elapsed time is **21.71 s → 22.52 s**. This small
+difference is within ordinary single-run variation; base graph isolation is
+the substantive result.
+
+For switching, warm both exact documented commands in the same default target
+directory, then run Clippy immediately after tests and tests immediately after
+Clippy, without an intervening edit. Count `Compiling` and `Checking` lines as
+recompiled packages. Test elapsed time includes execution and the registered
+Cargo/Python graph guard. The first test run after warming Clippy took
+327.32 s before and
+320.81 s after, including initial code generation; that setup
+cost is distinct from the warm switches below.
+
+| Warm command switch | Before | After | Recompiled packages before → after |
+| --- | ---: | ---: | ---: |
+| Tests → `cargo clippy --workspace --all-targets --locked -- -D warnings` | 0.38 s | 1.75 s | 0 → 1 |
+| Clippy → `cargo test --workspace --locked` | 91.23 s | 97.92 s | 0 → 1 |
+
+The #2747 trade-off is narrower: dependency features are reusable within each
+layer, while isolated base commands avoid compiling unrelated server/store
+libraries. Native consumers still select their real HTTP/store dependencies.
+Twelve small empty anchor crates add package identities and Cargo-tree queries;
+static identities avoid invalidating consumers when command selection changes.
+Only the root package rebuilt in both warm after switches; library packages
+stayed cached.
+Cross-layer command reuse is not promised. Release profiles and runtime source
+code are unchanged, and no test helpers are added to production.
+
+The updated guard's 20 tests cover all five names independently of the policy
+implementation, compiler-driver dependencies, duplicates, empty/Rust-only
+graphs, the four resources exemptions, anchor contexts and CLI Windows wiring.
+The new C rule rejects all five baseline trees (cc, SQLite and ring). Five
+mutants were caught and reverted in isolated copies: remove the C ban (45
+failures), ignore feature drift (3), omit transport (10), bypass Windows
+validation (10), and skip anchor contexts (1). No fixtures or stored-record
+corpus were regenerated. The registered integration target runs these checks
+in the existing workspace CI job; no workflow change is made.

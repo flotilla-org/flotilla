@@ -13,4 +13,5 @@ workspace = true
 
 [dev-dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
 tokio = { workspace = true, features = ["test-util"] }

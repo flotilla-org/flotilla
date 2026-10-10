@@ -1087,6 +1087,15 @@ dependencies = [
  "bon",
  "chrono",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-core",
  "flotilla-daemon-api",
  "flotilla-protocol",
@@ -1106,59 +1115,217 @@ dependencies = [
 name = "flotilla-build-features"
 version = "0.1.0"
 dependencies = [
- "axum",
- "bitflags 2.11.0",
- "chrono",
- "der",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "flotilla-build-features-async"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "libc",
+ "log",
+ "mio",
+ "smallvec",
+ "tokio",
+]
+
+[[package]]
+name = "flotilla-build-features-base"
+version = "0.1.0"
+dependencies = [
  "digest",
- "ed25519",
- "ed25519-dalek",
+ "flotilla-build-features",
+ "generic-array",
+ "memchr",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "flotilla-build-features-hmac"
+version = "0.1.0"
+dependencies = [
+ "digest",
+ "flotilla-build-features",
+ "generic-array",
+ "hmac",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "flotilla-build-features-http"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "flotilla-build-features",
  "form_urlencoded",
  "futures-channel",
  "futures-task",
  "futures-util",
- "generic-array",
  "getrandom 0.2.17",
  "hashbrown 0.16.1",
- "hmac",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "indexmap",
- "lazy_static",
- "linux-raw-sys",
+ "libc",
  "log",
  "memchr",
  "mio",
- "num-traits",
- "pkcs8",
+ "once_cell",
+ "percent-encoding",
  "rand 0.9.2",
- "rand_core 0.6.4",
- "regex-automata",
- "regex-syntax",
  "reqwest 0.13.2",
  "ring",
- "rusqlite",
- "rustix",
  "rustls",
  "rustls-webpki",
  "serde",
  "serde_core",
  "serde_json",
- "sha2",
- "signature",
- "spki",
+ "smallvec",
  "subtle",
- "syn 2.0.117",
- "time",
  "tokio",
  "tokio-rustls",
  "tokio-util",
  "tower",
  "tracing",
  "tracing-core",
- "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "flotilla-build-features-http-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "flotilla-build-features",
+ "futures-channel",
+ "futures-task",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "libc",
+ "log",
+ "memchr",
+ "mio",
+ "once_cell",
+ "percent-encoding",
+ "serde_core",
+ "serde_json",
+ "smallvec",
+ "sync_wrapper",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-core",
+]
+
+[[package]]
+name = "flotilla-build-features-logging"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "lazy_static",
+ "log",
+ "memchr",
+ "once_cell",
+ "regex-automata",
+ "regex-syntax",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "flotilla-build-features-os"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "flotilla-build-features",
+ "linux-raw-sys",
+ "once_cell",
+ "rustix",
+]
+
+[[package]]
+name = "flotilla-build-features-signing"
+version = "0.1.0"
+dependencies = [
+ "der",
+ "digest",
+ "ed25519",
+ "ed25519-dalek",
+ "flotilla-build-features",
+ "generic-array",
+ "getrandom 0.2.17",
+ "libc",
+ "pkcs8",
+ "rand_core 0.6.4",
+ "sha2",
+ "signature",
+ "spki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "flotilla-build-features-sqlite"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "flotilla-build-features",
+ "rusqlite",
+ "smallvec",
+]
+
+[[package]]
+name = "flotilla-build-features-time"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "lazy_static",
+ "libc",
+ "time",
+]
+
+[[package]]
+name = "flotilla-build-features-tracing"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "once_cell",
+ "tracing",
+ "tracing-core",
+]
+
+[[package]]
+name = "flotilla-build-features-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flotilla-build-features",
+ "form_urlencoded",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "num-traits",
+ "percent-encoding",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -1168,6 +1335,14 @@ dependencies = [
  "async-trait",
  "bon",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-os",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-daemon-api",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1189,6 +1364,11 @@ dependencies = [
  "bon",
  "clap",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-protocol",
  "hegeltest",
  "serde_json",
@@ -1205,6 +1385,16 @@ dependencies = [
  "chrono",
  "dirs",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-core",
  "flotilla-daemon-api",
  "flotilla-discovery-testkit",
@@ -1242,6 +1432,17 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-daemon-api",
  "flotilla-discovery-testkit",
  "flotilla-manifest",
@@ -1289,6 +1490,18 @@ dependencies = [
  "bytes",
  "chrono",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-time",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-core",
  "flotilla-credentials-testkit",
  "flotilla-discovery-testkit",
@@ -1316,6 +1529,7 @@ name = "flotilla-credentials-testkit"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "flotilla-build-features-async",
  "tokio",
 ]
 
@@ -1331,6 +1545,18 @@ dependencies = [
  "chrono",
  "flotilla-aggregator",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-time",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-client",
  "flotilla-controllers",
  "flotilla-core",
@@ -1377,6 +1603,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-protocol",
  "tokio",
  "uuid",
@@ -1420,6 +1651,15 @@ dependencies = [
  "axum",
  "bon",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-os",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-test-support",
@@ -1456,6 +1696,11 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-protocol",
  "tokio",
 ]
@@ -1468,6 +1713,11 @@ dependencies = [
  "bon",
  "chrono",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "gethostname",
  "indexmap",
  "percent-encoding",
@@ -1495,6 +1745,10 @@ name = "flotilla-relay"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-sqlite",
  "flotilla-relay-protocol",
  "futures",
  "getrandom 0.2.17",
@@ -1514,6 +1768,9 @@ name = "flotilla-relay-protocol"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
  "hex",
  "hmac",
  "serde",
@@ -1530,6 +1787,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "flotilla-build-features-logging",
  "flotilla-core",
  "flotilla-paths",
  "hegeltest",
@@ -1556,6 +1814,15 @@ dependencies = [
  "bytes",
  "chrono",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-protocol",
  "flotilla-relay-protocol",
  "flotilla-store-testkit",
@@ -1600,6 +1867,8 @@ name = "flotilla-test-support"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-os",
  "tempfile",
  "tokio",
 ]
@@ -1609,6 +1878,11 @@ name = "flotilla-transport"
 version = "0.1.0"
 dependencies = [
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-protocol",
  "serde_json",
  "tokio",
@@ -1629,6 +1903,17 @@ dependencies = [
  "crossterm",
  "dirs",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-sqlite",
+ "flotilla-build-features-time",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
  "flotilla-client",
  "flotilla-commands",
  "flotilla-core",
@@ -4257,6 +4542,11 @@ dependencies = [
  "async-trait",
  "ed25519-dalek",
  "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-os",
+ "flotilla-build-features-signing",
+ "flotilla-build-features-tracing",
  "hegeltest",
  "libc",
  "rand_core 0.6.4",

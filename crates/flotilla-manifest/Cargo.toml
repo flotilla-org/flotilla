@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"
 tracing = { workspace = true }
 
 [dev-dependencies]
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 flotilla-test-support = { path = "../flotilla-test-support" }
@@ -28,3 +29,11 @@ workspace = true
 # Keep native library features stable across build and test commands.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

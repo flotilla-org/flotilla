@@ -35,6 +35,7 @@ object_store = { version = "0.12", features = ["aws"] }
 serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = "=0.48.1"
@@ -60,3 +61,11 @@ workspace = true
 # Keep native library features stable across build and test commands.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
