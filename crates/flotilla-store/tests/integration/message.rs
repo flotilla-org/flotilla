@@ -563,6 +563,99 @@ async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
     assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/absent").await.unwrap().is_none());
 }
 
+// #3005: a delivery pass reads receiver evidence once across distinct addresses,
+// including an empty batch; unresolved roles wait without submitting input.
+#[tokio::test]
+async fn delivery_receiver_reads_are_bounded() {
+    use flotilla_resources::{Convoy, ConvoySpec};
+    use flotilla_store::MessageInbox;
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    let mut counts = Vec::new();
+    for n in [0, 10, 200] {
+        let memory = InMemoryBackend::default().with_read_counts();
+        let backend = ResourceBackend::InMemory(memory.clone());
+        backend
+            .using::<Convoy>("flotilla")
+            .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .await
+            .expect("convoy");
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        for index in 0..n {
+            let mut intent = spec(None, MessageExpectation::Reply);
+            intent.receiver = format!("flotilla/convoy/work/role-{index}");
+            inbox.accept(&InputMeta::builder().name(format!("message-{index}")).build(), &intent, at(10)).await.expect("admit");
+        }
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: flotilla_store::MessageTransportOutcome::NotSubmitted { reason: "unused".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        let before = memory.read_calls();
+        inbox.reconcile_delivery(&transport, at(20)).await.expect("delivery pass");
+        let after = memory.read_calls();
+        counts.push(
+            ["Convoy", "TerminalSession", "ConvoyEnsure"]
+                .map(|kind| after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default()),
+        );
+        assert!(transport.submissions.lock().expect("submissions").is_empty());
+        for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
+            assert_eq!(message.status.expect("waiting status").phase, MessagePhase::Accepted);
+        }
+    }
+    assert_eq!(counts[0], counts[1]);
+    assert_eq!(counts[1], counts[2]);
+}
+
+// A snapshot is stable within its batch and a new batch sees holder changes.
+// Repeated pure resolutions, including non-agent and invalid addresses, do no reads.
+#[hegel::test]
+fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
+    use flotilla_resources::{Convoy, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
+    use flotilla_store::MessageReceiverSnapshot;
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    // Empty through many lookups; every case pins missing, invalid, system and principal addresses.
+    let repetitions = tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let memory = InMemoryBackend::default().with_read_counts();
+        let backend = ResourceBackend::InMemory(memory.clone());
+        backend
+            .using::<Convoy>("flotilla")
+            .create(&InputMeta::builder().name("convoy".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .await
+            .expect("convoy");
+        let old = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("snapshot");
+        let address = "flotilla/convoy/work/coder";
+        let before = memory.read_calls();
+        for _ in 0..=repetitions {
+            assert!(old.resolve(address).expect("absent").is_none());
+            assert!(old.resolve("system:test").expect("system").is_none());
+            assert!(old.resolve("principal:test").expect("principal").is_none());
+            assert!(old.resolve("invalid").is_err());
+        }
+        assert_eq!(before, memory.read_calls());
+        backend
+            .using::<TerminalSession>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name("holder".into())
+                    .labels(std::collections::BTreeMap::from([
+                        (CONVOY_LABEL.into(), "convoy".into()),
+                        (ROLE_LABEL.into(), "coder".into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                    ]))
+                    .build(),
+                &holder_spec("convoy"),
+            )
+            .await
+            .expect("holder");
+        assert!(old.resolve(address).expect("old snapshot").is_none());
+        let fresh = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("new snapshot");
+        assert_eq!(fresh.resolve(address).expect("resolve").expect("holder").object.metadata.name, "holder");
+    });
+}
+
 // Boundary fake for terminal submission and externally observed acceptance.
 struct FakeMessageTransport {
     submissions: std::sync::Mutex<Vec<String>>,
@@ -1786,7 +1879,9 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
     let parent = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         use flotilla_store::*;
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        use flotilla_store_testkit::ReadCountsBackendExt;
+        let memory = InMemoryBackend::default().with_read_counts();
+        let backend = ResourceBackend::InMemory(memory.clone());
         routing_project(&backend, "root", None).await;
         routing_project(&backend, "parent", Some("root")).await;
         routing_project(&backend, "child", Some("parent")).await;
@@ -1808,8 +1903,19 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
         assert_eq!(path[0].address, expected);
         let path = supervision_path(&backend, "flotilla", "child", "child/child-one/work/guide").await.expect("exclude sender");
         assert!(!path.iter().any(|contact| contact.address == "child/guide"));
+        let before = memory.read_calls();
         let book = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("contacts");
         assert_eq!(book.supervision[0].address, expected);
+        // Every presence combination shares one local-plus-replica snapshot,
+        // even when supervision and peer contacts resolve several addresses.
+        let after = memory.read_calls();
+        for kind in ["Convoy", "TerminalSession", "ConvoyEnsure"] {
+            assert_eq!(
+                after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default(),
+                2,
+                "one snapshot for {kind}"
+            );
+        }
         routing_holder(&backend, "root", "two").await;
         let next = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("refreshed contacts");
         assert_eq!(next.supervision.last().expect("root").terminal.as_deref(), Some("terminal-root-two"));

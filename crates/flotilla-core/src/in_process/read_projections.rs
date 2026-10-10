@@ -1071,8 +1071,17 @@ impl ReadProjections<'_> {
 
         let terminal_sessions =
             self.backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), &terminal_sessions, name);
-        let selected_sessions = flotilla_resources::select_convoy_children(&convoy, &terminal_sessions);
+        let receivers = flotilla_store::MessageReceiverSnapshot::load_from_observations(
+            self.backend,
+            namespace,
+            convoy_sources.items,
+            terminal_sessions,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let terminal_sessions = receivers.terminals();
+        let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), terminal_sessions, name);
+        let selected_sessions = flotilla_resources::select_convoy_children(&convoy, terminal_sessions);
         let queued_turns = convoy
             .status
             .as_ref()
@@ -1108,8 +1117,9 @@ impl ReadProjections<'_> {
             })
             .collect();
         let mut crew_deliveries = terminal_sessions
-            .into_iter()
+            .iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
+            .cloned()
             .map(|source| ExplainedCrewDelivery {
                 terminal_condition: source.object.status.as_ref().and_then(crate::terminal_health::condition),
                 session: source.object.metadata.name,
@@ -1203,14 +1213,7 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
-        let messages = crew_message_views(self.backend, namespace)
-            .await?
-            .into_iter()
-            .filter(|message| {
-                message.receiver.split('/').nth(1) == Some(name)
-                    || message.current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(name))
-            })
-            .collect();
+        let messages = message_views(self.backend, namespace, &receivers, Some(&convoy)).await?;
         Ok(ConvoyExplanation {
             landing_entry: convoy
                 .status
@@ -1498,27 +1501,54 @@ fn explain_subject_observation(
 /// Project durable inbox state without inferring delivery from terminal phases.
 /// Convoy explanation still scans namespace history here (tracked in #2953).
 /// Crew orientation deliberately avoids this projection (#2952).
+#[cfg(test)]
 pub(super) async fn crew_message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
 ) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
+    let receivers = flotilla_store::MessageReceiverSnapshot::load(backend, namespace).await.map_err(|error| error.to_string())?;
+    message_views(backend, namespace, &receivers, None).await
+}
+
+async fn message_views(
+    backend: &flotilla_store::ResourceBackend,
+    namespace: &str,
+    receivers: &flotilla_store::MessageReceiverSnapshot,
+    convoy: Option<&flotilla_resources::ResourceObject<ResourceConvoy>>,
+) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
     let mut records =
         backend.including_replicas::<flotilla_resources::Message>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    if let Some(convoy) = convoy {
+        records.retain(|record| {
+            receivers.may_address_convoy(
+                &record.object.spec.receiver,
+                convoy.spec.project_ref.as_deref().unwrap_or(namespace),
+                &convoy.metadata.name,
+            )
+        });
+    }
     records.sort_by_key(|record| {
         (record.object.metadata.creation_timestamp, record.object.status.as_ref().and_then(|status| status.accepted_sequence))
     });
     let mut views = Vec::new();
     for source in records {
         let message = source.object;
-        let holder = flotilla_store::resolve_message_receiver(backend, namespace, &message.spec.receiver)
-            .await
-            .map_err(|error| error.to_string())?;
+        let holder = receivers.resolve(&message.spec.receiver).map_err(|error| error.to_string())?;
         let current_receiver = holder.and_then(|holder| {
             let terminal = holder.object;
             let convoy = terminal.metadata.labels.get(flotilla_resources::CONVOY_LABEL)?;
             let vessel = terminal.metadata.labels.get(flotilla_resources::VESSEL_LABEL)?;
             Some(format!("{}/{convoy}/{vessel}/{}", message.spec.receiver.split('/').next()?, terminal.spec.role))
         });
+        if let Some(convoy) = convoy {
+            let direct = message.spec.receiver.split('/').collect::<Vec<_>>();
+            let is_direct = matches!(direct.as_slice(), [_, name, _, _] if *name == convoy.metadata.name);
+            if !is_direct
+                && !current_receiver.as_deref().is_some_and(|receiver| receiver.split('/').nth(1) == Some(convoy.metadata.name.as_str()))
+            {
+                continue;
+            }
+        }
         let status = message.status.unwrap_or_default();
         let receiver = status.resolved_receiver.as_ref();
         views.push(flotilla_protocol::query::CrewMessageView {
@@ -2773,6 +2803,165 @@ mod tests {
             .entries
             .is_empty());
     }
+    // #3005: unrelated message history must not add store reads to explain;
+    // its messages are exactly the target's, including a standing-role alias.
+    #[tokio::test]
+    async fn explain_message_reads_are_bounded() {
+        use flotilla_resources::{
+            ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Message, MessageRelation, MessageSpec, Selector, TerminalBrief,
+            TerminalCrewContext,
+        };
+        use flotilla_store_testkit::ReadCountsBackendExt;
+        let mut counts = Vec::new();
+        for n in [10, 200] {
+            let mut fixture = ProjectionFixture::new();
+            let memory = InMemoryBackend::default().with_read_counts();
+            fixture.backend = ResourceBackend::InMemory(memory.clone());
+            fixture
+                .backend
+                .using::<ResourceConvoy>("flotilla")
+                .create(
+                    &InputMeta::builder()
+                        .name("target".into())
+                        .labels(BTreeMap::from([(PROJECT_LABEL.into(), "flotilla".into()), (ROLE_LABEL.into(), "guide".into())]))
+                        .build(),
+                    &ConvoySpec::builder().workflow_ref("scratch".into()).build(),
+                )
+                .await
+                .expect("convoy");
+            let ensures = fixture.backend.using::<ConvoyEnsure>("flotilla");
+            let ensure = ensures
+                .create(
+                    &InputMeta::builder().name("guide".into()).build(),
+                    &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("guide".into()).repositories(Vec::new()).build(),
+                )
+                .await
+                .expect("ensure");
+            let ensure = ensures.get(&ensure.metadata.name).await.expect("current ensure");
+            ensures
+                .update_status(
+                    "guide",
+                    &ensure.metadata.resource_version,
+                    &ConvoyEnsureStatus { convoy_ref: Some("target".into()), ..Default::default() },
+                )
+                .await
+                .expect("holder declaration");
+            fixture
+                .backend
+                .using::<ResourceTerminalSession>("flotilla")
+                .create(
+                    &InputMeta::builder()
+                        .name("holder".into())
+                        .labels(BTreeMap::from([
+                            (CONVOY_LABEL.into(), "target".into()),
+                            (VESSEL_LABEL.into(), "work".into()),
+                            (ROLE_LABEL.into(), "coder".into()),
+                        ]))
+                        .build(),
+                    &TerminalSessionSpec::builder()
+                        .env_ref("host-direct".into())
+                        .role("coder".into())
+                        .cwd("/workspace".into())
+                        .pool("cleat".into())
+                        .source(TerminalSessionSource::Agent {
+                            selector: Selector::for_capability("coding"),
+                            brief: TerminalBrief {
+                                path: "brief.md".into(),
+                                content: "test".into(),
+                                artifact_digest: None,
+                                copies: Vec::new(),
+                            },
+                            context: Box::new(TerminalCrewContext {
+                                namespace: "flotilla".into(),
+                                convoy: "target".into(),
+                                vessel_ref: "target-work".into(),
+                            }),
+                            message: None,
+                        })
+                        .build(),
+                )
+                .await
+                .expect("holder");
+            fixture
+                .backend
+                .using::<Message>("flotilla")
+                .create(
+                    &InputMeta::builder().name("alias".into()).build(),
+                    &MessageSpec::builder()
+                        .sender("system:test".into())
+                        .receiver("flotilla/guide".into())
+                        .relation(MessageRelation::System)
+                        .body("test".into())
+                        .build(),
+                )
+                .await
+                .expect("role message");
+            for index in 0..=n {
+                let receiver =
+                    if index == n { "flotilla/target/work/coder".into() } else { format!("flotilla/elsewhere-{index}/work/coder") };
+                fixture
+                    .backend
+                    .using::<Message>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(format!("message-{index}")).build(),
+                        &MessageSpec::builder()
+                            .sender("system:test".into())
+                            .receiver(receiver)
+                            .relation(MessageRelation::System)
+                            .body("test".into())
+                            .build(),
+                    )
+                    .await
+                    .expect("message");
+            }
+            for (index, receiver) in
+                ["other/target/work/coder", "flotilla/target", "principal:target", "topic:flotilla/target"].into_iter().enumerate()
+            {
+                fixture
+                    .backend
+                    .using::<Message>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(format!("collision-{index}")).build(),
+                        &MessageSpec::builder()
+                            .sender("system:test".into())
+                            .receiver(receiver.into())
+                            .relation(MessageRelation::System)
+                            .body("unrelated".into())
+                            .build(),
+                    )
+                    .await
+                    .expect("unrelated address form");
+            }
+            let objects_before = memory.read_counts();
+            let before = memory.read_calls();
+            let explanation = fixture.projections().explain_convoy("flotilla", "guide@flotilla").await.expect("explain");
+            assert_eq!(
+                explanation.messages.iter().map(|message| message.name.as_str()).collect::<Vec<_>>(),
+                vec!["alias".to_string(), format!("message-{n}")]
+            );
+            assert!(
+                memory.read_counts().get("Convoy").copied().unwrap_or_default() - objects_before.get("Convoy").copied().unwrap_or_default()
+                    <= 4,
+                "convoys decoded a bounded number of times"
+            );
+            let delta = memory
+                .read_calls()
+                .into_iter()
+                .map(|(kind, count)| {
+                    let count = count - before.get(&kind).copied().unwrap_or_default();
+                    (kind, count)
+                })
+                .collect::<BTreeMap<_, _>>();
+            // One local and one replica read per kind, even for several target
+            // addresses: resolving each filtered Message must not reload evidence.
+            for kind in ["Convoy", "TerminalSession", "ConvoyEnsure"] {
+                assert_eq!(delta.get(kind), Some(&2), "one receiver snapshot for {kind}");
+            }
+            counts.push(delta);
+        }
+        assert_eq!(counts[0], counts[1], "namespace history must not multiply reads");
+    }
+
     // Both crew and convoy surfaces share the durable projection. Waiting
     // reasons survive reads, and delivery identity comes only from evidence.
     #[tokio::test]
