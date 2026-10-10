@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
-use clap::{error::ErrorKind, CommandFactory};
+use clap::{error::ErrorKind, CommandFactory, FromArgMatches};
 use flotilla_tui::cli::args::{Cli, SubCommand};
 
 fn check_file(path: &Path) -> usize {
@@ -17,7 +17,7 @@ fn check_file(path: &Path) -> usize {
         let result = Cli::command().try_get_matches_from(args);
         match result {
             Ok(matches) => {
-                use clap::FromArgMatches;
+                count += 1;
                 let cli = Cli::from_arg_matches(&matches).expect("construct parsed CLI");
                 if let Some(SubCommand::Domain(noun)) = cli.command {
                     noun.resolve().unwrap_or_else(|error| panic!("{}:{}: {line}: {error}", path.display(), index + 1));
@@ -26,7 +26,6 @@ fn check_file(path: &Path) -> usize {
             Err(error) if error.kind() == ErrorKind::DisplayHelp => {}
             Err(error) => panic!("{}:{}: {line}: {error}", path.display(), index + 1),
         }
-        count += 1;
     }
     count
 }
@@ -34,6 +33,8 @@ fn check_file(path: &Path) -> usize {
 // Issue #2982: every stock command example must agree with the real clap tree,
 // including required arguments and value parsers. Check every area on disk so
 // adding a reference extends coverage without maintaining a second command list.
+// Keep examples as single-line commands in unindented fenced blocks, without
+// list prefixes or shell continuations; this scanner does not join shell lines.
 #[test]
 fn stock_skill_commands_match_clap_tree() {
     let skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/flotilla-commands");
@@ -68,7 +69,13 @@ fn project_selects_stock_skills_for_crews_and_governors() {
         .map(|entry| {
             let path = entry.expect("skill directory").path();
             let source = fs::read_to_string(path.join("SKILL.md")).expect("stock skill entrypoint");
-            let name = source.lines().find_map(|line| line.strip_prefix("name: ")).expect("skill name").to_string();
+            let mut lines = source.lines();
+            assert_eq!(lines.next(), Some("---"), "stock skill has frontmatter");
+            let name = lines
+                .take_while(|line| *line != "---")
+                .find_map(|line| line.strip_prefix("name: "))
+                .expect("skill name in frontmatter")
+                .to_string();
             SkillCatalogEntry {
                 source: "flotilla".into(),
                 repository: "flotilla-org/flotilla".into(),
