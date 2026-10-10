@@ -78,6 +78,13 @@ async fn assert_nonowner_issue_demand_returns_owner_value(heartbeat_only: bool) 
     let issue = tokio::time::timeout(Duration::from_secs(5), read()).await.expect("answer within interactive bound").expect("owner answer");
     assert_eq!(issue.title, "Dispatch this issue");
     assert_eq!(issue.reference.id, "327");
+    // A retransmitted renewal (or dedup eviction) re-enters the owner read,
+    // whose shared freshness cache must keep it to the same provider fetch.
+    let name = forge_read_name(&source, &request);
+    let (first, second) =
+        tokio::join!(owner.service_forge_read_demand("flotilla", &name), owner.service_forge_read_demand("flotilla", &name),);
+    first.expect("cached service");
+    second.expect("coalesced service");
     service.abort();
     assert_eq!(*provider.fetched_by_id.lock().await, vec![vec!["327".to_string()]]);
     drop(mesh);

@@ -23,3 +23,6 @@ all| -p flotilla-core --locked --lib remote_wait_is_bounded_without_scanning_dem
 all| -p flotilla-core --locked --lib named_service_has_bounded_reads_and_ignores_idle_requests
 all| -p flotilla-daemon --locked --test request_session_pair forge_reads::
 all| -p flotilla-core --locked --lib remote_wait_returns_published_owner_error
+all| -p flotilla-daemon --locked --lib forge_demand_tests
+all| -p flotilla-core --locked --lib live_demand_uses_renewals_and_rejects_legacy_cursors
+all| -p flotilla-core --locked --lib remote_wait_reports_closed_answer_watch

@@ -1,14 +1,14 @@
 //! Background task ownership, supervision, retention, and watch loops.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use flotilla_controllers::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
 use flotilla_core::{
@@ -16,9 +16,10 @@ use flotilla_core::{
     vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
 };
 use flotilla_credentials::CredentialStore;
-use flotilla_protocol::CanonicalHostId;
+use flotilla_protocol::{CanonicalHostId, NodeId};
 use flotilla_resources::{
-    Checkout, Clone, Convoy, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, SystemClock, TerminalSession, Vessel,
+    Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, Host, HostStatusPatch, ReadWatchEvent, Resource, ResourceError,
+    ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
 };
 use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
 use futures::stream::{BoxStream, SelectAll};
@@ -916,48 +917,94 @@ pub(super) fn spawn_startup_restoration(restoration: StartupRestoration) -> Join
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DemandKind {
+    Read,
+    Heartbeat,
+}
+
+struct DemandEvent {
+    kind: DemandKind,
+    provenance: ResourceProvenance,
+    name: String,
+    demanded_at: Option<DateTime<Utc>>,
+}
+
+fn demand_event<R: Resource>(event: ReadWatchEvent<R>, kind: DemandKind, timestamp: impl FnOnce(&R::Spec) -> DateTime<Utc>) -> DemandEvent {
+    match event {
+        ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) => DemandEvent {
+            kind,
+            demanded_at: Some(timestamp(&record.object.spec)),
+            provenance: record.provenance,
+            name: record.object.metadata.name,
+        },
+        ReadWatchEvent::Deleted(record) => {
+            DemandEvent { kind, provenance: record.provenance, name: record.object.metadata.name, demanded_at: None }
+        }
+        ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+            DemandEvent { kind, provenance, name: tombstone.name, demanded_at: None }
+        }
+    }
+}
+
+#[derive(Default)]
+struct DemandDedup {
+    seen: BTreeMap<(DemandKind, NodeId, String), DateTime<Utc>>,
+}
+
+impl DemandDedup {
+    fn accept(&mut self, event: DemandEvent) -> Option<String> {
+        let ResourceProvenance::Replica { origin_root, .. } = event.provenance else { return None };
+        let key = (event.kind, origin_root, event.name.clone());
+        let Some(demanded_at) = event.demanded_at else {
+            self.seen.remove(&key);
+            return None;
+        };
+        if self.seen.get(&key).is_some_and(|previous| *previous >= demanded_at) {
+            return None;
+        }
+        self.seen.insert(key, demanded_at);
+        // Replayed demand after eviction may retry servicing. ForgeReads' shared
+        // request lock and 60-second freshness cache coalesce provider calls.
+        if self.seen.len() > 4096 {
+            self.seen.clear();
+        }
+        Some(event.name)
+    }
+}
+
+async fn forge_demand_events(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<BoxStream<'static, Result<DemandEvent, ResourceError>>, ResourceError> {
+    let reads = backend.including_replicas::<ForgeRead>(namespace).watch().await?;
+    let pulses = backend.including_replicas::<ForgeReadHeartbeat>(namespace).watch().await?;
+    let reads = reads
+        .chain(futures::stream::once(async { Err(ResourceError::other("ForgeRead watch closed")) }))
+        .map(|event| event.map(|event| demand_event(event, DemandKind::Read, |spec| spec.demanded_at)));
+    let pulses = pulses
+        .chain(futures::stream::once(async { Err(ResourceError::other("ForgeReadHeartbeat watch closed")) }))
+        .map(|event| event.map(|event| demand_event(event, DemandKind::Heartbeat, |spec| spec.demanded_at)));
+    Ok(futures::stream::select(reads, pulses).boxed())
+}
+
 /// Watch-driven forge demand service. The board tick retains periodic recovery.
 /// Readiness means both replicated-record watches are subscribed.
 pub fn spawn_forge_read_demand_task(daemon: Arc<InProcessDaemon>, namespace: String) -> (JoinHandle<()>, oneshot::Receiver<()>) {
-    use flotilla_resources::{ForgeRead, ForgeReadHeartbeat, ReadWatchEvent, ResourceProvenance};
     let (ready_tx, ready_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let mut ready_tx = Some(ready_tx);
         loop {
             let backend = daemon.resource_backend();
-            let subscribed = async {
-                let reads = backend.including_replicas::<ForgeRead>(&namespace).watch().await?;
-                let pulses = backend.including_replicas::<ForgeReadHeartbeat>(&namespace).watch().await?;
-                let reads =
-                    reads.chain(futures::stream::once(async { Err(ResourceError::other("ForgeRead watch closed")) })).map(|event| {
-                        event.map(|event| match event {
-                            ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) => {
-                                Some((false, record.provenance, record.object.metadata.name, Some(record.object.spec.demanded_at)))
-                            }
-                            ReadWatchEvent::Deleted(record) => Some((false, record.provenance, record.object.metadata.name, None)),
-                            ReadWatchEvent::DeletedByName { tombstone, provenance } => Some((false, provenance, tombstone.name, None)),
-                        })
-                    });
-                let pulses = pulses
-                    .chain(futures::stream::once(async { Err(ResourceError::other("ForgeReadHeartbeat watch closed")) }))
-                    .map(|event| {
-                        event.map(|event| match event {
-                            ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) => {
-                                Some((true, record.provenance, record.object.metadata.name, Some(record.object.spec.demanded_at)))
-                            }
-                            ReadWatchEvent::Deleted(record) => Some((true, record.provenance, record.object.metadata.name, None)),
-                            ReadWatchEvent::DeletedByName { tombstone, provenance } => Some((true, provenance, tombstone.name, None)),
-                        })
-                    });
-                Ok::<_, ResourceError>(futures::stream::select(reads, pulses))
-            }
-            .await;
-            match subscribed {
+            match forge_demand_events(&backend, &namespace).await {
                 Ok(events) => {
                     if let Some(ready) = ready_tx.take() {
                         let _ = ready.send(());
                     }
-                    let mut seen = std::collections::BTreeMap::new();
+                    // Watches start at now, without an initial kind replay. Reset
+                    // on resubscribe so a retransmitted demand can retry; missed
+                    // events retain the periodic board tick as recovery.
+                    let mut dedup = DemandDedup::default();
                     let demands = events
                         .take_while(|event| {
                             if let Err(error) = event {
@@ -965,32 +1012,15 @@ pub fn spawn_forge_read_demand_task(daemon: Arc<InProcessDaemon>, namespace: Str
                             }
                             futures::future::ready(event.is_ok())
                         })
-                        .filter_map(|event| {
-                            let name = event.ok().flatten().and_then(|(pulse, provenance, name, demanded_at)| {
-                                let ResourceProvenance::Replica { origin_root, .. } = provenance else { return None };
-                                let key = (pulse, origin_root, name.clone());
-                                let Some(demanded_at) = demanded_at else {
-                                    seen.remove(&key);
-                                    return None;
-                                };
-                                if seen.get(&key).is_some_and(|previous| *previous >= demanded_at) {
-                                    return None;
-                                }
-                                seen.insert(key, demanded_at);
-                                // Bound deduplication memory; eviction only causes a harmless cache hit.
-                                if seen.len() > 4096 {
-                                    seen.clear();
-                                }
-                                Some(name)
-                            });
-                            futures::future::ready(name)
-                        });
+                        .filter_map(|event| futures::future::ready(event.ok().and_then(|event| dedup.accept(event))));
                     demands
                         .for_each_concurrent(8, |name| {
                             let daemon = daemon.clone();
                             let namespace = namespace.clone();
                             async move {
                                 if let Err(error) = daemon.service_forge_read_demand(&namespace, &name).await {
+                                    // Identical timestamps remain deduplicated;
+                                    // renewal, resubscribe or the board tick retries.
                                     debug!(%error, %name, "forge demand unavailable");
                                 }
                             }
@@ -1003,4 +1033,104 @@ pub fn spawn_forge_read_demand_task(daemon: Arc<InProcessDaemon>, namespace: Str
         }
     });
     (task, ready_rx)
+}
+
+#[cfg(test)]
+mod forge_demand_tests {
+    use flotilla_protocol::IssueSource;
+    use flotilla_resources::{ForgeReadRequest, ForgeReadSpec, InputMeta, ReadResourceObject, ResourceTombstone};
+
+    use super::*;
+
+    // Eviction caps memory and permits servicing again rather than dropping work.
+    #[test]
+    fn demand_dedup_eviction_preserves_service() {
+        let now = Utc::now();
+        let event = |name: String| DemandEvent {
+            kind: DemandKind::Read,
+            provenance: ResourceProvenance::Replica { origin_root: NodeId::new("origin"), last_synced_at: now },
+            name,
+            demanded_at: Some(now),
+        };
+        let mut dedup = DemandDedup::default();
+        for index in 0..4097 {
+            let name = format!("read-{index}");
+            assert_eq!(dedup.accept(event(name.clone())), Some(name));
+            assert!(dedup.seen.len() <= 4096);
+        }
+        assert_eq!(dedup.accept(event("read-0".into())), Some("read-0".into()));
+    }
+
+    // Both deletion representations release the same replica dedup key.
+    #[tokio::test]
+    async fn demand_deletion_events_release_key() {
+        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let now = Utc::now();
+        let object = backend
+            .using::<ForgeRead>("flotilla")
+            .create(
+                &InputMeta::builder().name("read".into()).build(),
+                &ForgeReadSpec {
+                    source: IssueSource { service: "github".into(), scope: "shared".into() },
+                    request: ForgeReadRequest::Board,
+                    demanded_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        let provenance = ResourceProvenance::Replica { origin_root: NodeId::new("origin"), last_synced_at: now };
+        let record = ReadResourceObject { object, provenance: provenance.clone() };
+        let mut dedup = DemandDedup::default();
+        for deleted in [
+            ReadWatchEvent::Deleted(record.clone()),
+            ReadWatchEvent::DeletedByName {
+                tombstone: ResourceTombstone {
+                    name: "read".into(),
+                    namespace: "flotilla".into(),
+                    resource_version: "2".into(),
+                    annotations: BTreeMap::new(),
+                },
+                provenance,
+            },
+        ] {
+            let added = || demand_event(ReadWatchEvent::Added(record.clone()), DemandKind::Read, |spec| spec.demanded_at);
+            assert_eq!(dedup.accept(added()), Some("read".into()));
+            assert_eq!(dedup.accept(added()), None);
+            assert_eq!(dedup.accept(demand_event(deleted, DemandKind::Read, |spec| spec.demanded_at)), None);
+        }
+        assert_eq!(
+            dedup.accept(demand_event(ReadWatchEvent::Modified(record), DemandKind::Read, |spec| spec.demanded_at)),
+            Some("read".into())
+        );
+    }
+
+    // Duplicate status events do not service again. Renewals, independent
+    // origins/kinds, deletion and retransmission after a new subscription do.
+    #[test]
+    fn demand_dedup_tracks_renewal_deletion_and_retransmission() {
+        let now = Utc::now();
+        let origin = NodeId::new("origin");
+        let event = |kind, demanded_at| DemandEvent {
+            kind,
+            provenance: ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: now },
+            name: "read".into(),
+            demanded_at,
+        };
+        let mut dedup = DemandDedup::default();
+        assert_eq!(dedup.accept(event(DemandKind::Read, Some(now))), Some("read".into()));
+        assert_eq!(dedup.accept(event(DemandKind::Read, Some(now))), None);
+        assert_eq!(dedup.accept(event(DemandKind::Read, Some(now - chrono::Duration::seconds(1)))), None);
+        assert_eq!(dedup.accept(event(DemandKind::Heartbeat, Some(now))), Some("read".into()));
+        assert_eq!(dedup.accept(event(DemandKind::Read, Some(now + chrono::Duration::seconds(1)))), Some("read".into()));
+        assert_eq!(dedup.accept(event(DemandKind::Read, None)), None);
+        assert_eq!(dedup.accept(event(DemandKind::Read, Some(now))), Some("read".into()));
+        let mut other_origin = event(DemandKind::Read, Some(now));
+        other_origin.provenance = ResourceProvenance::Replica { origin_root: NodeId::new("other-origin"), last_synced_at: now };
+        assert_eq!(dedup.accept(other_origin), Some("read".into()));
+        let mut local = event(DemandKind::Read, Some(now));
+        local.provenance = ResourceProvenance::Local;
+        assert_eq!(dedup.accept(local), None);
+        let mut resubscribed = DemandDedup::default();
+        assert_eq!(resubscribed.accept(event(DemandKind::Read, Some(now))), Some("read".into()));
+    }
 }

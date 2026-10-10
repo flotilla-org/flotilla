@@ -1,5 +1,5 @@
 //! Source-scoped forge ownership and replicated reads (ADR 0057).
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration as StdDuration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -9,11 +9,12 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
-    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, Repository, ResourceError,
-    ResourceProvenance, SystemClock,
+    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, ReadWatchEvent, Repository,
+    ResourceError, ResourceProvenance, SystemClock,
 };
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::ResourceBackend;
+use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
@@ -30,7 +31,7 @@ use crate::providers::{
 pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 
 // Leave room inside the client's 30-second interactive request deadline.
-pub const REMOTE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const REMOTE_READ_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
 const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
 const READ_FRESHNESS: Duration = Duration::seconds(60);
@@ -366,12 +367,16 @@ impl ForgeReads {
         decode(status, self.allow_stale, &request)
     }
     async fn wait_for_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
-        use flotilla_resources::ReadWatchEvent;
-        use futures::StreamExt;
-
         // Subscribe before rechecking status. Answers published before the
         // subscription are read below; later answers arrive on the watch.
-        let mut answers = self.backend.including_replicas::<ForgeRead>(&self.namespace).watch().await.map_err(|e| e.to_string())?;
+        let answers = self.backend.including_replicas::<ForgeRead>(&self.namespace).watch().await.map_err(|e| e.to_string())?;
+        self.wait_for_status_on(name, answers).await
+    }
+    async fn wait_for_status_on(
+        &self,
+        name: &str,
+        mut answers: futures::stream::BoxStream<'static, Result<ReadWatchEvent<ForgeRead>, ResourceError>>,
+    ) -> Result<Option<ForgeReadStatus>, String> {
         if let Some(status) = self.published_status(name).await? {
             return self.with_heartbeat(name, Some(status)).await;
         }
@@ -385,7 +390,7 @@ impl ForgeReads {
                 _ => {}
             }
         }
-        Ok(None)
+        Err("ForgeRead answer watch closed".into())
     }
     async fn published_status(&self, name: &str) -> Result<Option<ForgeReadStatus>, String> {
         let statuses = self.backend.including_replicas::<ForgeRead>(&self.namespace).get_all(name).await.map_err(|e| e.to_string())?;
@@ -722,12 +727,23 @@ mod tests {
             .expect_err("unreachable owner");
         assert_eq!(error, "forge observation pending at source owner");
         assert_eq!(started.elapsed(), REMOTE_READ_TIMEOUT);
-        for kind in [ForgeRead::API_PATHS.kind, ForgeReadHeartbeat::API_PATHS.kind] {
-            assert!(
-                counted.read_counts().get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default() <= 4,
+        // Empty named reads return no counted records. The parent is returned
+        // exactly once by the initial status lookup and once by the recheck.
+        for (kind, expected) in [(ForgeRead::API_PATHS.kind, 2), (ForgeReadHeartbeat::API_PATHS.kind, 0)] {
+            assert_eq!(
+                counted.read_counts().get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default(),
+                expected,
                 "waiting reads only the named demand pair"
             );
         }
+    }
+
+    // A lost answer channel is a transport error, not a premature pending result.
+    #[tokio::test]
+    async fn remote_wait_reports_closed_answer_watch() {
+        let reads = ForgeReads::new(backend("peer"), "flotilla".into());
+        let error = reads.wait_for_status_on("missing", futures::stream::empty().boxed()).await.unwrap_err();
+        assert_eq!(error, "ForgeRead answer watch closed");
     }
 
     // Waiting peers receive a published owner error immediately; a failed forge
