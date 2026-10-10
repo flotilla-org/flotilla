@@ -290,6 +290,11 @@ pub trait EnvironmentProvider: Send + Sync {
     fn image_builder(&self) -> Option<Arc<dyn ImageBuilder>> {
         None
     }
+    /// Read-only detection before provisioning. Image-backed providers run in
+    /// an ephemeral environment without pulling or changing the local cache.
+    async fn detect(&self, _image: Option<&str>, _binary: &str, _args: &[&str], _scratch: &Path) -> Result<super::CommandOutput, String> {
+        Err("environment provider does not support detection".into())
+    }
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String>;
     async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String>;
     async fn inspect(&self, id: &EnvironmentId) -> Result<Option<EnvironmentHandle>, String> {
@@ -376,3 +381,12 @@ mod registry_client_tests;
 
 #[cfg(test)]
 mod image_tests;
+
+/// Compose the built-in provider for a known command endpoint. Callers with a
+/// discovered registry must select its existing instance instead.
+pub fn command_provider(kind: EnvironmentKind, runner: Arc<dyn CommandRunner>) -> Arc<dyn EnvironmentProvider> {
+    match kind {
+        EnvironmentKind::Docker => Arc::new(docker::DockerEnvironmentProvider::new(runner)),
+        EnvironmentKind::HostDirect => Arc::new(host_direct::HostDirectEnvironmentProvider::new(runner, HashMap::new())),
+    }
+}

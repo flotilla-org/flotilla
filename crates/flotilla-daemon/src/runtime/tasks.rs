@@ -317,12 +317,14 @@ pub(super) fn spawn_local_fulfilment_probe_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
     profile: LocalProvisioningProfile,
+    providers: Arc<flotilla_core::providers::registry::ProviderRegistry>,
     scratch: PathBuf,
 ) -> JoinHandle<()> {
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let profile = profile.clone();
+        let providers = Arc::clone(&providers);
         let scratch = scratch.clone();
         async move {
             let discovery = daemon.discovery_runtime();
@@ -336,7 +338,12 @@ pub(super) fn spawn_local_fulfilment_probe_task(
                 &profile.host_id,
                 &profile.available_pools,
                 &previous,
-                FulfilmentProbeContext { runner: discovery.runner.as_ref(), env: discovery.env.as_ref(), scratch: &scratch },
+                FulfilmentProbeContext {
+                    providers: &providers,
+                    runner: discovery.runner.as_ref(),
+                    env: discovery.env.as_ref(),
+                    scratch: &scratch,
+                },
                 &mut model_probes,
             )
             .await
@@ -376,13 +383,31 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     return;
                 }
             };
+            // SSH fulfilment is host-direct: compose against that remote endpoint.
+            let mut providers = flotilla_core::providers::registry::ProviderRegistry::new();
+            providers.environment_providers.insert(
+                "host-direct",
+                flotilla_core::providers::discovery::ProviderDescriptor::named(
+                    flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                    "host-direct",
+                ),
+                flotilla_core::providers::environment::command_provider(
+                    flotilla_core::providers::environment::EnvironmentKind::HostDirect,
+                    Arc::clone(&ssh.runner),
+                ),
+            );
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
                 &ssh.provisioning.host_id,
                 &ssh.provisioning.available_pools,
                 &previous,
-                FulfilmentProbeContext { runner: ssh.runner.as_ref(), env: &BagEnvVars(&ssh.env_bag), scratch: &scratch },
+                FulfilmentProbeContext {
+                    providers: &providers,
+                    runner: ssh.runner.as_ref(),
+                    env: &BagEnvVars(&ssh.env_bag),
+                    scratch: &scratch,
+                },
                 &mut model_probes,
             )
             .await

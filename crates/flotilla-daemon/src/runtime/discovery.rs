@@ -333,6 +333,7 @@ pub(super) fn build_local_profile(
 }
 
 pub(super) struct FulfilmentProbeContext<'a> {
+    pub(super) providers: &'a ProviderRegistry,
     pub(super) runner: &'a dyn CommandRunner,
     pub(super) env: &'a dyn EnvVars,
     pub(super) scratch: &'a Path,
@@ -379,6 +380,13 @@ pub(super) async fn observe_fulfilment_facts(
             },
             FulfilmentRealisation::HostDirect => None,
         };
+        let provider_kind = match kind.spec.realisation {
+            FulfilmentRealisation::HostDirect => flotilla_core::providers::environment::EnvironmentKind::HostDirect,
+            FulfilmentRealisation::DockerPerVessel { .. } => flotilla_core::providers::environment::EnvironmentKind::Docker,
+        };
+        let Some((_, provider)) = probe.providers.environment_providers.for_kind(provider_kind) else {
+            continue;
+        };
         let pool_available = available_pools.contains(&kind.spec.pool);
         let name = kind.metadata.name;
         let current = previous
@@ -395,7 +403,7 @@ pub(super) async fn observe_fulfilment_facts(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(45)),
                 crate::fulfilment_probe::probe_kind(
                     &kind.spec,
-                    image.as_deref(),
+                    crate::fulfilment_probe::DetectionTarget { image: image.as_deref(), provider: provider.as_ref() },
                     pool_available,
                     probe.runner,
                     probe.env,

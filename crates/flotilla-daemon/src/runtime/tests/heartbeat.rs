@@ -93,7 +93,13 @@ async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
     let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
     assert!(hosts.get(&host_id).await.expect("host").status.expect("status").fulfilment_facts.is_empty());
 
-    let task = spawn_local_fulfilment_probe_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, temp.path().join("probe-cwd"));
+    let task = spawn_local_fulfilment_probe_task(
+        Arc::clone(&daemon),
+        NAMESPACE.to_string(),
+        profile,
+        detection_registry(daemon.discovery_runtime().runner.clone()),
+        temp.path().join("probe-cwd"),
+    );
     wait_until_with_timeout(Duration::from_secs(5), || {
         let hosts = hosts.clone();
         let host_id = host_id.clone();
@@ -166,7 +172,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     let backend = daemon.resource_backend();
     let probe_host = host_id.clone();
     let probe_pools = profile.available_pools.clone();
-    let probe_runner = GatedProbeRunner { entered: Arc::clone(&entered), release: Arc::clone(&release) };
+    let probe_runner = Arc::new(GatedProbeRunner { entered: Arc::clone(&entered), release: Arc::clone(&release) });
     let probe = tokio::spawn(async move {
         observe_fulfilment_facts(
             &backend,
@@ -175,7 +181,8 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
             &probe_pools,
             &BTreeMap::new(),
             FulfilmentProbeContext {
-                runner: &probe_runner,
+                providers: &detection_registry(probe_runner.clone()),
+                runner: probe_runner.as_ref(),
                 env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                 scratch: Path::new("/tmp/flotilla-probe-test"),
             },
@@ -228,7 +235,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
 
     let mut previous = status.fulfilment_facts;
     previous.get_mut("host-direct-async-facts-test").expect("prior fact").observed_at = Utc::now() - chrono::Duration::minutes(10);
-    let failing_runner = DiscoveryMockRunner::builder().build();
+    let failing_runner = Arc::new(DiscoveryMockRunner::builder().build());
     let after_failure = observe_fulfilment_facts(
         &daemon.resource_backend(),
         NAMESPACE,
@@ -236,7 +243,8 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
         &profile.available_pools,
         &previous,
         FulfilmentProbeContext {
-            runner: &failing_runner,
+            providers: &detection_registry(failing_runner.clone()),
+            runner: failing_runner.as_ref(),
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
         },

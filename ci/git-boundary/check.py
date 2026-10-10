@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject literal Git invocations outside the checkout-scoped VCS boundary."""
+"""Enforce the VCS and environment runtime implementation boundaries."""
 import argparse
 import os
 from pathlib import Path
@@ -12,6 +12,23 @@ from ast_grep_py import SgRoot
 RUN_METHODS = {"run", "run_output", "run_with_input"}
 RUN_MACROS = {"run", "run_output"}
 VCS = "crates/flotilla-core/src/"
+RUNTIME_BINARIES = {"docker", "podman", "buildah", "skopeo", "ctr"}
+RUNTIME_NAMES = RUNTIME_BINARIES | {"containerd", "host-direct", "host_direct"}
+RUNTIME_METHODS = RUN_METHODS | {"run_with_timeout", "run_to_file", "run_from_file", "spawn_long_lived", "exists"}
+# Discovery's version probe is an implementation operation too. No directory
+# exemption: adding a new adapter requires an explicit boundary decision.
+RUNTIME_IMPLEMENTATIONS = {
+    VCS + "providers/environment/docker.rs",
+    VCS + "providers/environment/docker_image.rs",
+    VCS + "providers/environment/runner.rs",
+    VCS + "providers/discovery/factories/docker.rs",
+}
+CONCRETE_RUNTIME_TYPES = {
+    "DockerEnvironmentProvider", "DockerEnvironmentProviderInner",
+    "DockerProvisionedEnvironment", "DockerEnvironmentRunner",
+    "HostDirectEnvironmentProvider", "BuildxImageBuilder",
+}
+COMPOSITION_ROOT = "crates/flotilla-daemon/src/runtime.rs"
 
 
 def integration_test_path(path):
@@ -75,34 +92,41 @@ def test_attribute(node):
     )
 
 
-def git_literal(node):
+def command_literal(node, commands, executable=False):
+    if executable and node.kind() == "reference_expression":
+        children = named(node)
+        return len(children) == 1 and command_literal(children[0], commands, executable=True)
+
+    def matches(text):
+        return text in commands or (executable and text.replace("\\", "/").rsplit("/", 1)[-1] in commands)
+
     # Like the old lint, inspect a string literal's decoded content, not substrings.
     if node.kind() == "raw_string_literal":
         content = node.find(kind="string_content")
-        return node.text().startswith("r") and content is not None and content.text() == "git"
+        return node.text().startswith("r") and content is not None and matches(content.text())
     if node.kind() != "string_literal":
         return False
     text = node.text()[1:-1]
     text = re.sub(r"\\\s*\n\s*", "", text)
     text = re.sub(r"\\x([0-9a-fA-F]{2})|\\u\{([0-9a-fA-F_]+)\}",
                   lambda m: chr(int((m[1] or m[2]).replace("_", ""), 16)), text)
-    return text == "git"
+    return matches(text)
 
 
 def named(node):
     return [c for c in node.children() if c.is_named() and c.kind() not in {"line_comment", "block_comment"}]
 
 
-def raw_git(node):
+def raw_command(node, commands, methods):
     if node.kind() == "call_expression":
         function = node.field("function")
         args = named(node.field("arguments"))
-        if not args or not git_literal(args[0]):
+        if not args or not command_literal(args[0], commands, executable=commands == RUNTIME_BINARIES):
             return False
         if function.kind() == "generic_function":
             function = function.field("function")
         if function.kind() == "field_expression":
-            return function.field("field").text() in RUN_METHODS
+            return function.field("field").text() in methods
         # Like the old AST lint, match any Type::new literal, including aliases;
         # without name resolution this conservatively also catches Foo::new("git").
         return function.kind() == "scoped_identifier" and function.field("name").text() == "new"
@@ -118,8 +142,52 @@ def raw_git(node):
                 groups.append([])
             elif token.kind() not in {"line_comment", "block_comment"}:
                 groups[-1].append(token)
-        return len(groups) >= 3 and len(groups[1]) == 1 and git_literal(groups[1][0])
+        if len(groups) < 3:
+            return False
+        command = groups[1]
+        if commands == RUNTIME_BINARIES and len(command) == 2 and command[0].text() == "&":
+            command = command[1:]
+        return len(command) == 1 and command_literal(command[0], commands, executable=commands == RUNTIME_BINARIES)
     return False
+
+
+def runtime_lookup(node):
+    if node.kind() != "call_expression":
+        return False
+    function = node.field("function")
+    if function.kind() == "generic_function":
+        function = function.field("function")
+    if function.kind() != "field_expression":
+        return False
+    method = function.field("field").text()
+    receiver = function.field("value")
+    args = named(node.field("arguments"))
+    provider_set = receiver.text() == "environment_providers" or any(
+        identifier.text() == "environment_providers"
+        for identifier in receiver.find_all(kind="field_identifier")
+    )
+    if method not in {"prefer_by_implementation", "prefer_by_backend"} and not (
+        method in {"get", "contains_key", "select"} and provider_set
+    ):
+        return False
+    # Borrowed literals and select(kind, Some("docker")) are still literal
+    # runtime selections. Search arguments structurally, never their source text.
+    return any(
+        command_literal(literal, RUNTIME_NAMES)
+        for arg in args
+        for literal in [arg] + arg.find_all(kind="string_literal") + arg.find_all(kind="raw_string_literal")
+    )
+
+
+def runtime_violation(node, path):
+    if path not in RUNTIME_IMPLEMENTATIONS and raw_command(node, RUNTIME_BINARIES, RUNTIME_METHODS):
+        return True
+    # Match imports as well as qualified references and constructor aliases.
+    providers = path.startswith(VCS + "providers/")
+    if not providers and path != COMPOSITION_ROOT and node.kind() in {"identifier", "type_identifier"}:
+        if node.text().removeprefix("r#") in CONCRETE_RUNTIME_TYPES:
+            return True
+    return runtime_lookup(node)
 
 
 def test_modules(source, path, production=False):
@@ -165,13 +233,14 @@ def test_modules(source, path, production=False):
 
 
 def violations(source, path, production=False):
-    if exempt(path, production):
+    fixture = integration_test_path(path) and not production
+    if fixture:
         return []
     root = SgRoot(source, "rust").root()
     found = []
 
     def visit(node):
-        if raw_git(node):
+        if (not exempt(path, production) and raw_command(node, {"git"}, RUN_METHODS)) or runtime_violation(node, path):
             found.append(node.range().start.line + 1)
         skip = False
         for child in node.children():
@@ -188,7 +257,7 @@ def violations(source, path, production=False):
             skip = False
 
     visit(root)
-    return found
+    return sorted(set(found))
 
 
 def module_descendant(file, modules):
@@ -203,7 +272,7 @@ def scan_sources(sources):
         errors = SgRoot(source, "rust").root().find_all(kind="ERROR")
         if errors:
             line = errors[0].range().start.line + 1
-            raise ValueError(f"{file}:{line}: Rust parse error; refusing an incomplete Git boundary check")
+            raise ValueError(f"{file}:{line}: Rust parse error; refusing an incomplete operation boundary check")
     excluded = set()
     for file, source in sources.items():
         excluded.update(test_modules(source, file))
@@ -245,7 +314,7 @@ def main():
         return 1
     for file, lines in results.items():
         for line in lines:
-            print(f"{file}:{line}: invoke Git through the checkout-scoped Vcs trait instead of a raw command")
+            print(f"{file}:{line}: operation boundary violation: use Vcs or environment capability traits; keep runtime commands and concrete adapters in their implementations")
             failed = True
     return int(failed)
 

@@ -321,3 +321,17 @@ pub(super) fn test_agent_material_registry(env: Arc<dyn EnvVars>) -> AgentMateri
 }
 
 use flotilla_discovery_testkit::InProcessDiscoveryExt;
+
+// Real built-in detection providers over an injected subprocess stand-in.
+pub(super) fn detection_registry(runner: Arc<dyn CommandRunner>) -> Arc<ProviderRegistry> {
+    use flotilla_core::providers::environment::{command_provider, EnvironmentKind};
+    let mut registry = ProviderRegistry::new();
+    for (name, kind) in [("docker", EnvironmentKind::Docker), ("host-direct", EnvironmentKind::HostDirect)] {
+        registry.environment_providers.insert(
+            name,
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, name),
+            command_provider(kind, runner.clone()),
+        );
+    }
+    Arc::new(registry)
+}

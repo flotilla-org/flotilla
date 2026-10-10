@@ -241,10 +241,19 @@ async fn validate_daemon_with_preview(
             }
         }
     }
+    let image_provider = flotilla_core::providers::environment::command_provider(
+        flotilla_core::providers::environment::EnvironmentKind::Docker,
+        Arc::new(ProcessCommandRunner),
+    );
     let mut frozen_report = frozen::check(
         &frozen_inventory,
         &retired,
-        &frozen::CandidateProbes { options: probes, inventory: &frozen_inventory, runner: &ProcessCommandRunner },
+        &frozen::CandidateProbes {
+            options: probes,
+            inventory: &frozen_inventory,
+            runner: &ProcessCommandRunner,
+            provider: image_provider.as_ref(),
+        },
     )
     .await?;
     frozen_report.inventory_complete &= !frozen_inventory_failed && !retirement_inventory_failed;

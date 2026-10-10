@@ -250,6 +250,7 @@ impl DaemonRuntime {
                 Arc::clone(&daemon),
                 options.namespace.clone(),
                 profile.clone(),
+                Arc::clone(&local_registry),
                 config.state_dir().as_path().join("probe-cwd"),
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),

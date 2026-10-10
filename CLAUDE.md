@@ -225,6 +225,19 @@ Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS op
 
 Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 
+### Environment runtime boundary
+
+Use `EnvironmentProvider`, its instance-owned `LocalImageCache`, and `ImageBuilder` capabilities for environment and image operations. Pre-provisioning tool detection uses `EnvironmentProvider::detect`; read-only image-reference validation uses the owning cache's `inspect_reference` and `registry_available` methods. These observations never pull images or admit mutable tags for provisioning. Select providers by `EnvironmentKind` or a configured instance name, never by a literal runtime name. Direct OCI distribution reads use `RegistryClient`. Candidate validation's read-only registry fallback stays behind the provider cache and uses the host tool's configured credentials. Resource specifications and runtime-neutral traits remain usable by consumers.
+
+The ast-grep operation boundary check in the existing format job rejects literal invocations of `docker`, `podman`, `buildah`, `skopeo`, and `ctr` outside these exact implementation files:
+
+- `crates/flotilla-core/src/providers/environment/docker.rs`
+- `crates/flotilla-core/src/providers/environment/docker_image.rs`
+- `crates/flotilla-core/src/providers/environment/runner.rs`
+- `crates/flotilla-core/src/providers/discovery/factories/docker.rs` (discovery version probe)
+
+Concrete environment adapters and Buildx types belong under core `providers/`; only `crates/flotilla-daemon/src/runtime.rs`, the composition root, may name them elsewhere. This allowance does not permit raw runtime commands or literal provider selection in the composition root. New runtime adapters require an explicit file-level allowlist change. Genuine test fixtures are exempt; production inclusions of fixture files remain checked. Build tooling has no runtime exemption.
+
 ### Observed resources and aggregation
 
 Provider refreshes publish discovered checkout facts into the daemon's ephemeral observed-resource backend. Durable resources remain authoritative for desired and adopted state. The Aggregator watches both stores, applies durable-over-observed precedence where a resource is present in both, and emits named-query result sets and deltas for surfaces.

@@ -39,3 +39,24 @@ Only the exact core VCS implementation paths are exempt from production checks.
 CI's format job installs the pinned parser and runs
 both commands in the existing every-PR Format job. Workflow changes are applied
 by the operator.
+
+## Environment runtime boundary
+
+The same scan and test-module traversal also reject:
+
+- literal runtime CLI calls outside `RUNTIME_IMPLEMENTATIONS`' exact files;
+- concrete environment adapter and Buildx identifiers outside core `providers/`
+  and the exact daemon composition root;
+- literal runtime names in environment-provider registry lookups or provider
+  implementation/backend preferences.
+
+Runtime calls include timeout and file-streaming runner methods. Unlike Git,
+there is no build-script exemption. The composition root permits concrete types
+only. Resource DTOs and capability flags are not concrete adapter references or
+provider selections. These are syntax guards, not Rust name resolution: lookups
+through renamed local registry variables and computed runtime names are outside
+this check's scope. The negative-test matrices exercise all three rules, exact
+file boundaries, literal forms, and shared production/test source inclusions.
+Runtime executable paths and borrowed command literals are checked as well as
+bare names, including supervised process spawning and binary probes. Literal
+instance names passed to `select(kind, Some(...))` are checked structurally.
