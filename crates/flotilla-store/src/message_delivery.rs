@@ -767,6 +767,8 @@ impl MessageInbox {
             let receivers = match receivers {
                 Some(receivers) => receivers,
                 None => {
+                    // The idle caller saw no active Messages; this query can
+                    // find one only if admission raced with gate cleanup.
                     loaded = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
                     &loaded
                 }
@@ -938,6 +940,56 @@ mod framing_tests {
                 .expectation(MessageExpectation::Reply)
                 .build(),
         ]
+    }
+
+    // A topic receipt uses this pass's convoy evidence. A missing convoy refuses
+    // receipt identity even if that convoy appears later; only a fresh pass sees it.
+    #[tokio::test]
+    async fn topic_receipt_requires_convoy_in_snapshot() {
+        let backend = crate::ResourceBackend::InMemory(crate::InMemoryBackend::default());
+        let mut intent = messages().remove(0);
+        intent.receiver = "topic:project/supervision".into();
+        let message = backend
+            .using::<Message>("project")
+            .create(&InputMeta::builder().name("message".into()).build(), &intent)
+            .await
+            .expect("message");
+        let holder = backend
+            .using::<TerminalSession>("project")
+            .create(
+                &InputMeta::builder()
+                    .name("terminal".into())
+                    .labels(std::collections::BTreeMap::from([
+                        (crate::CONVOY_LABEL.into(), "convoy".into()),
+                        (crate::VESSEL_LABEL.into(), "work".into()),
+                        (crate::ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &crate::TerminalSessionSpec::builder()
+                    .env_ref("environment".into())
+                    .role("coder".into())
+                    .source(crate::TerminalSessionSource::Tool { command: "sh".into() })
+                    .cwd("/repo".into())
+                    .pool("cleat".into())
+                    .build(),
+            )
+            .await
+            .expect("holder");
+        let old = MessageReceiverSnapshot::load(&backend, "project").await.expect("snapshot");
+        backend
+            .using::<crate::Convoy>("project")
+            .create(
+                &InputMeta::builder().name("convoy".into()).build(),
+                &crate::ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("project".into()).build(),
+            )
+            .await
+            .expect("convoy created after snapshot");
+        assert!(matches!(MessageInbox::delivered_role_address(&old, &message, &holder), Err(ResourceError::NotFound { .. })));
+        let fresh = MessageReceiverSnapshot::load(&backend, "project").await.expect("fresh snapshot");
+        assert_eq!(
+            MessageInbox::delivered_role_address(&fresh, &message, &holder).expect("receipt identity"),
+            Some("project/convoy/work/coder".into())
+        );
     }
 
     // Header fields stay on one line; bodies (including empty bodies) are preserved exactly.
