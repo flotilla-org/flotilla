@@ -125,7 +125,7 @@ def main():
     errors = violations(metadata)
     tree_arguments = ("tree", "--locked", "--prefix", "none", "--format", "{p}|{f}")
     members = [package for package in metadata["packages"] if package["id"] in metadata["workspace_members"]]
-    # Resolver 2 unifies optional anchor features within a command. Compare to
+    # Resolver 2 unifies dependency features within a command. Compare to
     # the union of consumers in the same layer, not the unrelated native stack.
     workspace = {}
     for group in ("base", "native"):
@@ -138,6 +138,7 @@ def main():
         if package["id"] not in metadata["workspace_members"]:
             continue
         if package["name"] in C_FREE_BASE:
+            # cargo tree resolves metadata only: Windows std need not be installed.
             windows = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", "normal,build",
                                           "--target", "x86_64-pc-windows-gnu"))
             errors.extend(c_free_violations(package["name"], windows))

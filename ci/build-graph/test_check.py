@@ -165,6 +165,34 @@ class LayerContract(unittest.TestCase):
                         self.assertEqual(main(), 1)
                     self.assertIn(f"{name}: Windows production graph compiles C through {dependency}", diagnostic.getvalue())
 
+    def test_cli_anchor_test_util_stays_on_dev_edges(self):
+        # Cargo boundary scenario: a consumer reaches Tokio through either
+        # anchor. Dev trees may enable test-util; production trees must not,
+        # even if an indirect activation escapes manifest-level validation.
+        for anchor in ("flotilla-build-features-async", "flotilla-build-features-http-server"):
+            for leak in (False, True):
+                with self.subTest(anchor=anchor, leak=leak):
+                    metadata = graph(package("consumer", normal=(anchor,)), package(anchor, dev=("tokio",)))
+
+                    def cargo_result(arguments, **kwargs):
+                        if "metadata" in arguments:
+                            output = json.dumps(metadata)
+                        else:
+                            selected = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-p"]
+                            packages = set(selected) | {anchor}
+                            edges = arguments[arguments.index("--edges") + 1]
+                            features = "full,test-util" if leak or "dev" in edges else "full"
+                            output = "\n".join(f"{name} v1|" for name in sorted(packages)) + f"\ntokio v1|{features}"
+                        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+                    diagnostic = io.StringIO()
+                    with patch("check.subprocess.run", side_effect=cargo_result), contextlib.redirect_stderr(diagnostic), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(main(), int(leak))
+                    if leak:
+                        self.assertIn("production graph activates tokio test-util", diagnostic.getvalue())
+                    else:
+                        self.assertEqual(diagnostic.getvalue(), "")
+
     def test_c_free_empty_and_rust_only_graphs_are_valid(self):
         # A Rust build script/proc macro is legal; the rule bans C compilation,
         # rather than all host build dependencies or unrelated native consumers.

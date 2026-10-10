@@ -182,6 +182,12 @@ cargo tree --workspace --locked --edges normal,build,dev --prefix none --format 
 python3 -m unittest discover -s ci/build-graph -p test_check.py
 ```
 
+To add a dependency, first declare the real dependency in its consumer. Select
+only anchors already reachable through that dependency graph; place test-only
+anchors in dev-dependencies. Run the guard above, then update the corresponding
+anchor's feature declarations for reported context drift, including transitive
+dependencies. Re-run the guard for both production and dev edges.
+
 The contributor owns the static anchor declarations and affected consumers'
 production/dev selections. Reconcile reported dependency contexts within the
 corresponding layer; do not add an unrelated native anchor merely to match a
@@ -262,7 +268,7 @@ stayed cached.
 Cross-layer command reuse is not promised. Release profiles and runtime source
 code are unchanged, and no test helpers are added to production.
 
-The updated guard's 20 tests cover all five names independently of the policy
+The updated guard's 21 tests cover all five names independently of the policy
 implementation, compiler-driver dependencies, duplicates, empty/Rust-only
 graphs, the four resources exemptions, anchor contexts and CLI Windows wiring.
 The new C rule rejects all five baseline trees (cc, SQLite and ring). Five
@@ -271,3 +277,7 @@ failures), ignore feature drift (3), omit transport (10), bypass Windows
 validation (10), and skip anchor contexts (1). No fixtures or stored-record
 corpus were regenerated. The registered integration target runs these checks
 in the existing workspace CI job; no workflow change is made.
+
+Review regression: both async and HTTP-server anchor scenarios allow Tokio
+`test-util` on dev edges and reject transitive production activation. Disabling
+that production check makes both negative scenarios fail.

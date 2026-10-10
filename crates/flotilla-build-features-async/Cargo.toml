@@ -1,3 +1,4 @@
+# Maintenance: see docs/measurements/2747-build-graph.md (Maintaining the feature anchors).
 [package]
 name = "flotilla-build-features-async"
 version = "0.1.0"
