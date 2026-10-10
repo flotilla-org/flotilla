@@ -1,11 +1,10 @@
-//! Host-local Buildx adapter. Lifecycle policy lives in the controller and
-//! source acquisition stays behind the checkout-scoped VCS seam.
+//! Host-local build orchestration. Provider capabilities own execution; lifecycle
+//! policy lives in the controller and source acquisition stays behind VCS.
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -13,20 +12,20 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::{ImageBuildResult, ImageBuildRunner};
 use flotilla_core::{
     image_build::{ImageBuildInputResolver, ImageBuildSourceInputs},
-    providers::{ChannelLabel, CommandRunner},
     vcs::Vcs,
 };
 use flotilla_resources::{
-    Artifact, ArtifactSpec, FrozenImageLayer, ImageBuildFailure, ImageBuildFailureClass, ImageBuildSpec, ImageLayerParent, InputMeta,
-    PlacedImageIdentity, ResourceBackend,
+    Artifact, ArtifactSpec, FrozenImageLayer, ImageBuildFailure, ImageBuildFailureClass, ImageBuildSpec, InputMeta, PlacedImageIdentity,
+    ResourceBackend,
 };
 use sha2::{Digest, Sha256};
 
 use crate::blob_store::{BlobStore, TieredBlobStore};
 
-pub(crate) struct BuildxRunner {
-    pub distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::DockerImageIo>>>,
-    pub runner: Arc<dyn CommandRunner>,
+pub(crate) struct LocalImageBuildRunner {
+    pub distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
+    pub builder: Option<Arc<dyn flotilla_core::providers::environment::ImageBuilder>>,
+    pub cache_name: Option<String>,
     pub vcs: Arc<dyn Vcs>,
     pub directory: PathBuf,
     pub backend: ResourceBackend,
@@ -98,9 +97,6 @@ fn hash_layer_inputs_blocking(context: &Path, layer: &FrozenImageLayer) -> Resul
     Ok(hashes)
 }
 
-const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REASON_CHARS: usize = 2048;
 
 async fn hash_layer_inputs(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
@@ -109,57 +105,7 @@ async fn hash_layer_inputs(context: &Path, layer: &FrozenImageLayer) -> Result<V
     tokio::task::spawn_blocking(move || hash_layer_inputs_blocking(&context, &layer)).await.map_err(|error| error.to_string())?
 }
 
-// Status holds a bounded diagnostic, while the Artifact retains the full output.
-// BuildKit's final ERROR summary follows the progress stream. Never classify
-// arbitrary Dockerfile/probe output as infrastructure evidence.
-fn failure_summary(stderr: &str, exit_code: Option<i32>) -> String {
-    let tail = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
-    let summary = if tail.is_empty() { format!("Docker process exited with {exit_code:?}") } else { tail.to_string() };
-    summary.chars().take(MAX_REASON_CHARS).collect()
-}
-
-fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFailureClass {
-    let reason = failure_summary(reason, exit_code).to_ascii_lowercase();
-    if exit_code.is_some() && exit_code != Some(137) && reason.contains("did not complete successfully") && reason.contains("exit code:") {
-        return ImageBuildFailureClass::Deterministic;
-    }
-    let infrastructure = [
-        "connection reset",
-        "connection refused",
-        "no space left on device",
-        "temporary failure in name resolution",
-        "no such host",
-        "tls handshake timeout",
-        "cannot connect to the docker daemon",
-        "network is unreachable",
-        "service unavailable",
-        "code = unavailable",
-        "unexpected eof",
-        "i/o timeout",
-        "context deadline exceeded",
-        "http 429",
-        "status code: 429",
-        "429 too many requests",
-    ];
-    if exit_code.is_none() || exit_code == Some(137) || infrastructure.iter().any(|signal| reason.contains(signal)) {
-        ImageBuildFailureClass::Transient
-    } else {
-        ImageBuildFailureClass::Deterministic
-    }
-}
-
-impl BuildxRunner {
-    async fn output_with_timeout(
-        &self,
-        args: &[&str],
-        context: &Path,
-        timeout: Duration,
-    ) -> Result<flotilla_core::providers::CommandOutput, String> {
-        tokio::time::timeout(timeout, self.runner.run_output("docker", args, context, &ChannelLabel::Default))
-            .await
-            .map_err(|_| format!("Docker process exceeded wall-clock deadline of {} seconds", timeout.as_secs()))?
-    }
-
+impl LocalImageBuildRunner {
     async fn context(&self, layer: &FrozenImageLayer) -> Result<PathBuf, String> {
         let directory =
             self.directory.join(format!("source-{:x}", Sha256::digest(format!("{}\0{}", layer.spec.repository, layer.spec.revision))));
@@ -207,164 +153,22 @@ impl BuildxRunner {
         if hashes != spec.inputs.content_hashes {
             return Err(deterministic("image context differs from frozen input hashes".into()));
         }
-        let config = self.directory.join(format!("config-{:x}", Sha256::digest(name)));
-        tokio::fs::create_dir_all(&config).await.map_err(|error| transient(error.to_string()))?;
-        let config_arg = config.to_str().ok_or_else(|| deterministic("Docker config path is not UTF-8".into()))?;
-        let architecture = match spec.inputs.architecture.as_str() {
-            "x86_64" | "amd64" => "amd64",
-            "aarch64" | "arm64" => "arm64",
-            other => other,
-        };
-        let tag = format!("flotilla-build:{:x}", Sha256::digest(format!("{name}\0{}", spec.recipe_key)));
-        let mut args = vec![
-            "--config".into(),
-            config_arg.into(),
-            "buildx".into(),
-            "build".into(),
-            "--builder".into(),
-            "default".into(),
-            "--load".into(),
-            "--progress=plain".into(),
-            "--platform".into(),
-            format!("linux/{architecture}"),
-            "--tag".into(),
-            tag.clone(),
-            "--file".into(),
-            spec.layer.spec.fragment.clone(),
-        ];
-        let base = match &spec.layer.spec.parent {
-            ImageLayerParent::Image(image) => image.clone(),
-            _ => {
-                // Buildx's default Docker driver consumes images from the host
-                // store. Give the exact local ID a content-derived label for FROM;
-                // record the ID, never this label, as the parent identity.
-                let label = format!("flotilla-parent:{:x}", Sha256::digest(parent_digest));
-                self.runner
-                    .run_with_timeout(
-                        "docker",
-                        &["--config", config_arg, "image", "tag", parent_digest, &label],
-                        &context,
-                        &ChannelLabel::Default,
-                        CLI_TIMEOUT,
-                    )
-                    .await
-                    .map_err(transient)?;
-                label
-            }
-        };
-        let mut build_args = spec.layer.spec.args.clone();
-        build_args.extend(spec.layer.spec.pins.iter().map(|(name, pin)| (name.clone(), pin.value.clone())));
-        build_args.insert("BASE".into(), base);
-        for (name, value) in build_args {
-            args.extend(["--build-arg".into(), format!("{name}={value}")]);
-        }
-        args.push(".".into());
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let cached = self
-            .output_with_timeout(&["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag], &context, CLI_TIMEOUT)
-            .await
-            .map_err(transient)?;
-        if !cached.success() {
-            let output = self.output_with_timeout(&args, &context, BUILD_TIMEOUT).await.map_err(transient)?;
-            log.push_str(&output.stdout);
-            log.push_str(&output.stderr);
-            if !output.success() {
-                let reason = failure_summary(&output.stderr, output.exit_code);
-                let class = classify_build_failure(output.exit_code, &reason);
-                return Err(ImageBuildFailure { class, reason });
-            }
-        }
-        let identity = self
-            .runner
-            .run_with_timeout(
-                "docker",
-                &["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag],
-                &context,
-                &ChannelLabel::Default,
-                CLI_TIMEOUT,
-            )
-            .await
-            .map_err(transient)?;
-        let identity = PlacedImageIdentity { local_image_id: identity.trim().into(), registry_digest: None };
-        identity.validate().map_err(deterministic)?;
-        let mut verified = BTreeSet::new();
-        for provide in &spec.layer.spec.provides {
-            let command = spec
-                .layer
-                .spec
-                .probes
-                .get(provide)
-                .filter(|command| !command.is_empty())
-                .ok_or_else(|| deterministic(format!("no verification probe declared for {provide}")))?;
-            let probe_name = format!("flotilla-probe-{:x}", Sha256::digest(format!("{name}\0{provide}")));
-            let cpus = spec.reservation.cpu.to_string();
-            // Positional arguments preserve arbitrary probe argv without shell
-            // interpolation. Preludes and the probe share their export scope.
-            let script = flotilla_core::agent_process::with_preludes("exec \"$@\"");
-            let mut args = vec![
-                "--config",
-                config_arg,
-                "run",
-                "--rm",
-                "--name",
-                &probe_name,
-                "--cpus",
-                &cpus,
-                "--memory",
-                "512m",
-                "--pids-limit",
-                "128",
-                "--pull=never",
-                "--network=none",
-                "--entrypoint",
-                "sh",
-                &identity.local_image_id,
-                "-c",
-                &script,
-                "flotilla-provide-probe",
-            ];
-            args.extend(command.iter().map(String::as_str));
-            let output = match self.output_with_timeout(&args, &context, PROBE_TIMEOUT).await {
-                Ok(output) => output,
-                Err(reason) => {
-                    // Dropping the Docker CLI alone does not stop its container.
-                    let _ = self
-                        .runner
-                        .run_with_timeout(
-                            "docker",
-                            &["--config", config_arg, "rm", "--force", &probe_name],
-                            &context,
-                            &ChannelLabel::Default,
-                            CLI_TIMEOUT,
-                        )
-                        .await;
-                    return Err(transient(reason));
-                }
-            };
-            log.push_str(&output.stdout);
-            log.push_str(&output.stderr);
-            if !output.success() {
-                let reason = failure_summary(&output.stderr, output.exit_code);
-                // 125 is Docker's own failure, 126/127 are an unusable probe
-                // command, and other nonzero codes belong to the probe itself.
-                let class = if output.exit_code == Some(125) || output.exit_code.is_none() || output.exit_code == Some(137) {
-                    classify_build_failure(output.exit_code, &reason)
-                } else {
-                    ImageBuildFailureClass::Deterministic
-                };
-                return Err(ImageBuildFailure {
-                    class,
-                    reason: format!("provide verification failed: {provide}: {reason}").chars().take(MAX_REASON_CHARS).collect(),
-                });
-            }
-            verified.insert(provide.clone());
-        }
-        Ok((identity, verified))
+        let cache_name = self.cache_name.as_deref().ok_or_else(|| transient("image builder has no named cache".into()))?;
+        let probe_script = flotilla_core::agent_process::with_preludes("exec \"$@\"");
+        let request = flotilla_core::providers::environment::image::ImageLayerBuild::builder()
+            .name(name)
+            .spec(spec)
+            .parent_digest(parent_digest)
+            .context(&context)
+            .cache_name(cache_name)
+            .probe_script(&probe_script)
+            .build();
+        self.builder.as_ref().ok_or_else(|| transient("image builder capability unavailable".into()))?.build_layer(request, None, log).await
     }
 }
 
 #[async_trait]
-impl ImageBuildInputResolver for BuildxRunner {
+impl ImageBuildInputResolver for LocalImageBuildRunner {
     async fn resolve(&self, layer: &FrozenImageLayer, architecture: &str) -> Result<ImageBuildSourceInputs, String> {
         let context = self.context(layer).await?;
         Ok(ImageBuildSourceInputs::builder()
@@ -378,11 +182,10 @@ impl ImageBuildInputResolver for BuildxRunner {
 }
 
 #[async_trait]
-impl ImageBuildRunner for BuildxRunner {
+impl ImageBuildRunner for LocalImageBuildRunner {
     async fn build(&self, name: &str, spec: &ImageBuildSpec, parent_digest: &str) -> Result<ImageBuildResult, String> {
         let mut log = String::new();
         let mut result = self.execute(name, spec, parent_digest, &mut log).await;
-        let _ = tokio::fs::remove_dir_all(self.directory.join(format!("config-{:x}", Sha256::digest(name)))).await;
         if let Err(failure) = &mut result {
             log.push_str(&format!("\n{}\n", failure.reason));
             failure.reason = failure.reason.chars().take(MAX_REASON_CHARS).collect();
@@ -468,6 +271,7 @@ mod tests {
     };
 
     use super::*;
+    use flotilla_resources::ImageLayerParent;
 
     // A declared builder projects a remote demand only once, writes evidence
     // at its own authority, and replication returns that evidence to admission.
@@ -557,7 +361,7 @@ mod tests {
 #[cfg(test)]
 mod runner_contract {
     use flotilla_core::{
-        providers::{vcs::git_worktree::GitWorktreeStrategy, CommandOutput},
+        providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandOutput, CommandRunner},
         vcs::{FlotillaVcs, GitCheckoutStrategy},
     };
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -567,6 +371,8 @@ mod runner_contract {
 
     use super::*;
     use crate::blob_store::{BlobDigest, MemoryBlobStore};
+    use flotilla_core::providers::environment::docker_image::{classify_build_failure, failure_summary, BUILD_TIMEOUT, PROBE_TIMEOUT};
+    use flotilla_resources::ImageLayerParent;
 
     // Stands in for Docker processes and enforces the documented Buildx/run
     // request contract; source contents and log/artifact storage remain real.
@@ -599,7 +405,7 @@ mod runner_contract {
         async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
             assert_eq!(cmd, "docker");
             assert_eq!(args[0], "--config");
-            assert!(Path::new(args[1]).file_name().expect("config directory").to_str().expect("UTF-8").starts_with("config-"));
+            assert!(Path::new(args[1]).file_name().expect("config directory").to_str().expect("UTF-8").starts_with("flotilla-anonymous-"));
             match args[2] {
                 "buildx" => {
                     self.builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -679,7 +485,7 @@ mod runner_contract {
 
     // Buildx loads the host-local image without a registry, overrides arbitrary
     // image ENTRYPOINTs to run each declared probe, and stores the actual log.
-    async fn fixture(processes: Arc<DockerProcess>) -> (tempfile::TempDir, BuildxRunner, ImageBuildSpec) {
+    async fn fixture(processes: Arc<DockerProcess>) -> (tempfile::TempDir, LocalImageBuildRunner, ImageBuildSpec) {
         let temp = tempfile::tempdir().expect("state directory");
         let directory = temp.path().join("image-builds");
         let layer = FrozenImageLayer {
@@ -707,9 +513,13 @@ mod runner_contract {
         ));
         let backend = ResourceBackend::InMemory(Default::default());
         let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![("memory".into(), Arc::new(MemoryBlobStore::default()))]));
-        let builder = BuildxRunner {
+        let builder = LocalImageBuildRunner {
             distributor: None,
-            runner,
+            builder: Some(Arc::new(flotilla_core::providers::environment::docker_image::BuildxImageBuilder::for_cache(
+                runner,
+                "test-cache".into(),
+            ))),
+            cache_name: Some("test-cache".into()),
             vcs,
             directory,
             backend: backend.clone(),

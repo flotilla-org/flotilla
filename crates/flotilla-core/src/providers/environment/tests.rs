@@ -16,6 +16,24 @@ use crate::providers::ChannelLabel;
 use crate::providers::CommandOutput;
 use crate::providers::CommandRunner;
 
+// Boundary double: admitted material is lowered to a virtual tool config.
+struct TestRegistryMaterial(PathBuf);
+impl super::registry_auth::RegistryAuthMaterial for TestRegistryMaterial {
+    fn config(&self) -> Result<super::registry_auth::RegistryConfig, String> {
+        Ok(super::registry_auth::RegistryConfig::new(self.0.clone(), ()))
+    }
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+    }
+}
+fn test_registry_auth(path: &str) -> super::PreparedEnvironmentAuth {
+    Some(super::RegistryAuth::new(
+        "registry.example/crew".into(),
+        flotilla_resources::HostImageAction::ImagePull,
+        Arc::new(TestRegistryMaterial(path.into())),
+    ))
+}
+
 fn test_daemon_tool(socket_path: impl Into<PathBuf>) -> EnvironmentTool {
     let socket_path = socket_path.into();
     let environment_socket_path = contained_daemon_socket_path(&socket_path);
@@ -65,7 +83,18 @@ impl RecordingRunner {
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
-        self.calls.lock().expect("calls mutex").clone()
+        self.calls
+            .lock()
+            .expect("calls mutex")
+            .iter()
+            .cloned()
+            .map(|(cmd, mut args, cwd)| {
+                if args.first().is_some_and(|a| a == "--config") && args.get(1).is_some_and(|a| a.contains("flotilla-anonymous-")) {
+                    args.drain(..2);
+                }
+                (cmd, args, cwd)
+            })
+            .collect()
     }
 }
 
@@ -180,7 +209,18 @@ impl QueuedRunner {
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
-        self.calls.lock().expect("calls mutex").clone()
+        self.calls
+            .lock()
+            .expect("calls mutex")
+            .iter()
+            .cloned()
+            .map(|(cmd, mut args, cwd)| {
+                if args.first().is_some_and(|a| a == "--config") && args.get(1).is_some_and(|a| a.contains("flotilla-anonymous-")) {
+                    args.drain(..2);
+                }
+                (cmd, args, cwd)
+            })
+            .collect()
     }
 }
 
@@ -451,7 +491,7 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
-        prepared_auth: super::PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new("/run/flotilla/registry-auth") },
+        prepared_auth: test_registry_auth("/run/flotilla/registry-auth"),
         cpu_limit: None,
         memory_policy: Default::default(),
     };
@@ -1699,10 +1739,7 @@ async fn docker_provisions_prepared_digest_and_refuses_another_instance() {
 async fn preparation_pulls_only_pinned_registry_content() {
     let mut spec = pinned_spec();
     spec.docker.as_mut().expect("docker").image = format!("registry.example/crew@sha256:{}", "a".repeat(64));
-    let opts = super::PrepareOpts {
-        legacy_baseline: false,
-        prepared_auth: super::PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new("/private/operation-auth") },
-    };
+    let mut opts = super::PrepareOpts { legacy_baseline: false, prepared_auth: test_registry_auth("/private/operation-auth") };
     let runner = Arc::new(QueuedRunner::new([Err("not held".into()), Ok("pulled".into()), Ok("held".into())]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     provider.prepare(&spec, &opts).await.expect("pull existing digest");
@@ -1710,6 +1747,7 @@ async fn preparation_pulls_only_pinned_registry_content() {
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[1].1, ["--config", "/private/operation-auth", "pull", spec.docker.as_ref().expect("docker").image.as_str()]);
     let absent = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([Err("not held".into()), Err("not published".into())])));
+    opts.prepared_auth = test_registry_auth("/private/operation-auth");
     let error = absent.prepare(&spec, &opts).await.err().expect("pull failed");
     assert!(error.starts_with("pinned image pull failed:"));
     let absent_after_pull = DockerEnvironmentProvider::new(Arc::new(QueuedRunner::new([
@@ -1717,6 +1755,7 @@ async fn preparation_pulls_only_pinned_registry_content() {
         Ok("pulled".into()),
         Err("still absent".into()),
     ])));
+    opts.prepared_auth = test_registry_auth("/private/operation-auth");
     assert_eq!(
         absent_after_pull.prepare(&spec, &opts).await.err().expect("verify failed"),
         "pinned image pull succeeded but digest is not present"

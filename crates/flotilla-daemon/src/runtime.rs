@@ -207,7 +207,7 @@ impl DaemonRuntime {
         let registered_image_caches = local_registry
             .environment_providers
             .iter()
-            .filter(|(_, provider)| provider.kind() == flotilla_core::providers::environment::EnvironmentKind::Docker)
+            .filter(|(_, provider)| provider.local_image_cache().is_some())
             .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
             .collect::<BTreeSet<_>>();
         crate::image_distribution::prune_unregistered_caches(
@@ -388,14 +388,17 @@ impl DaemonRuntime {
                     Arc::clone(&runner),
                     GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
                 ));
-                let distributor = if let Some((_, provider)) =
-                    local_registry.environment_providers.for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker)
+                let distributor = if let Some((_, provider)) = local_registry
+                    .environment_providers
+                    .for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker)
+                    .filter(|(_, provider)| provider.local_image_cache().is_some())
                 {
                     Some(Arc::new(
                         crate::image_distribution::ImageDistributor::builder()
                             .io(Arc::new(
-                                crate::image_distribution::DockerImageIo::builder()
-                                    .runner(Arc::clone(&runner))
+                                crate::image_distribution::ProviderImageIo::builder()
+                                    .provider(Arc::clone(provider))
+                                    .maybe_publisher(provider.image_builder())
                                     .credentials(Arc::clone(&credential_store))
                                     .host(profile.host_id.clone())
                                     .build(),
@@ -418,9 +421,10 @@ impl DaemonRuntime {
                     // registry also cannot attest which instance owns an observation.
                     None
                 };
-                Arc::new(crate::image_build::BuildxRunner {
+                Arc::new(crate::image_build::LocalImageBuildRunner {
+                    cache_name: distributor.as_ref().map(|d| d.provider_instance.clone()),
+                    builder: distributor.as_ref().and_then(|d| d.io.publisher.clone()),
                     distributor,
-                    runner,
                     vcs,
                     directory,
                     backend: daemon.resource_backend(),

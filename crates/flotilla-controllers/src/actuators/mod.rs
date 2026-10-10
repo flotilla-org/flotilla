@@ -3,8 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use flotilla_core::providers::{
     environment::{
         contained_daemon_socket_path, CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-        EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth, ProvisionedMount, ProvisionedMountMode,
-        CONTAINED_DAEMON_REQUIRED_ENV,
+        EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
     },
     terminal::TerminalPool,
 };
@@ -35,7 +34,7 @@ impl DockerEnvironmentActuator {
             tokens: self.tokens.clone(),
             working_directory: None,
             image_pull_policy: spec.pull_policy.into(),
-            prepared_auth: PreparedEnvironmentAuth::NoRegistryCredential,
+            prepared_auth: None,
             provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
             tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
                 .with_asset(EnvironmentToolAsset::new(

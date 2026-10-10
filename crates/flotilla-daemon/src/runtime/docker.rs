@@ -13,7 +13,7 @@ use flotilla_core::{
     discovery_api::EnvironmentBag,
     providers::{
         discovery::run_provisioned_host_detectors,
-        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth},
+        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
         ChannelLabel,
     },
@@ -264,7 +264,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     .await)
                 }
             },
-            None if credential_refs.is_empty() => PreparedEnvironmentAuth::NoRegistryCredential,
+            None if credential_refs.is_empty() => None,
             // Defence in depth: the earlier credential-config step rejects this
             // state today. Keep registry preflight independently fail-closed if
             // the provisioning steps are reordered in a future change.

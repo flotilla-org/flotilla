@@ -595,7 +595,10 @@ impl CommandRunner for HeldBaselineRunner {
         assert_eq!(cmd, "docker");
         match args {
             ["image", "inspect", image] if *image == self.image => Ok(String::new()),
-            ["pull", image] if *image == self.image => Ok(String::new()),
+            ["--config", directory, "pull", image] if *image == self.image => {
+                assert!(directory.contains("flotilla-anonymous-"), "baseline pull must isolate ambient credentials");
+                Ok(String::new())
+            }
             ["image", "inspect", "--format", "{{.Id}}", image] if *image == self.image => Ok(format!("sha256:{}", "a".repeat(64))),
             _ => panic!("unexpected Docker invocation: {args:?}"),
         }

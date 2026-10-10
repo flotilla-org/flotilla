@@ -187,13 +187,8 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
 }
 
 #[tokio::test]
-async fn registry_preflight_delivers_exact_auth_to_non_docker_provider_and_refuses_failures() {
-    for outcome in [
-        RegistryPreflightOutcome::Success,
-        RegistryPreflightOutcome::LoginFailure,
-        RegistryPreflightOutcome::PullFailure,
-        RegistryPreflightOutcome::MissingStore,
-    ] {
+async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_refuses_missing_store() {
+    for outcome in [RegistryPreflightOutcome::Success, RegistryPreflightOutcome::MissingStore] {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -278,19 +273,15 @@ async fn registry_preflight_delivers_exact_auth_to_non_docker_provider_and_refus
             .await
             .expect_err("capture provider or preflight must stop provision");
 
-        // Glue: the runtime must deliver exactly the artifact admitted by preflight
-        // to a non-Docker provider, and refuse creation on absent/failed preflight.
+        // Glue: admission delivers an opaque handle to the selected provider without
+        // running Docker, and refuses creation when the credential store is absent.
         assert!(!delivered_auth.exists(), "refused creation must discard delivered agent credentials");
         let opts = provider.create_opts.lock().await.take();
         if outcome == RegistryPreflightOutcome::Success {
             assert_eq!(error, "stop after capturing create options");
-            let admitted = registry_runner.directory.lock().await.clone().expect("preflight directory");
-            assert_eq!(
-                opts.expect("provider invoked").prepared_auth,
-                PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new(admitted.clone()) }
-            );
-            assert!(!admitted.exists(), "failed create must remove the admitted auth artifact");
-            assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 2);
+            let auth = opts.expect("provider invoked").prepared_auth.expect("opaque auth admitted");
+            auth.validate("registry.example/crew:latest", flotilla_resources::HostImageAction::ImagePull).expect("pull admitted");
+            assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "credential minting never invokes Docker");
         } else {
             assert!(opts.is_none(), "provider must not run without successful preflight");
             assert!(
