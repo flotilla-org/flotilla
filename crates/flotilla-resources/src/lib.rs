@@ -287,7 +287,8 @@ pub use workflow_template::{
     single_agent_shepherd_workflow_spec, single_agent_workflow_spec, validate, AllocationDecision, ArtifactSubjectBinding, ClaimExit,
     CompletionCondition, CrewCompletionExpectation, CrewSource, CrewSpec, ExitDeclaration, HoldAct, InputDefinition, InterpolationField,
     InterpolationLocation, LeafTemplate, LegacyCompletionExpectation, RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable,
-    SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    SupervisionTarget, TemplatePromise, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec,
 };
 
 pub mod role_cascade;

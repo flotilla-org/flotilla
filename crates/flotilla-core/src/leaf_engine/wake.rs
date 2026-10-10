@@ -347,10 +347,9 @@ impl ReconcilerWake {
                         let owes_claim = status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
                             snapshot.vessels.iter().any(|requirement| {
                                 requirement.name == *vessel
-                                    && requirement
-                                        .crew
-                                        .iter()
-                                        .any(|member| member.role == *role && !member.completion_conditions.is_empty())
+                                    && requirement.crew.iter().any(|member| {
+                                        member.role == *role && (!member.promises.is_empty() || !member.completion_conditions.is_empty())
+                                    })
                             })
                         });
                         if !owes_claim {

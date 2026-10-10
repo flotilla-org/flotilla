@@ -404,16 +404,65 @@ pub struct CrewSpec {
     #[serde(flatten)]
     pub source: CrewSource,
     #[builder(default)]
-    #[serde(default, rename = "completion_conditions", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "legacy_checks", skip_serializing_if = "Vec::is_empty")]
+    // Lossless carry-forward for historical custom leaves that have no kind rule.
+    // These are not new template promises; stock templates never author them.
     pub completion_conditions: Vec<CrewCompletionExpectation>,
+    /// Template obligations owned by this role. Admission freezes the declarations
+    /// and exclusions together; excluded obligations are never seeded into status.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promises: Vec<TemplatePromise>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promise_exclusions: Vec<crate::promises::PromiseKind>,
+    /// Default owner for dispatch-supplied deliverables (#2987).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deliverer: bool,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }
 
-// Decode-only compatibility for the previous generation's closed expectation
-// names. Every persisted CrewSpec is normalized to declared leaves when read.
-// Remove after the next fleet roll verifies no stored snapshots use the old field.
+impl WorkflowTemplateSpec {
+    /// Apply dispatcher/governor winnowing before allocation and freezing.
+    /// Unknown owners or kinds are refused instead of silently dropping work.
+    pub fn exclude_template_promises(&mut self, exclusions: &[TemplatePromise]) -> Result<(), String> {
+        let crew = || self.roles.iter().chain(self.vessels.iter().flat_map(|vessel| &vessel.crew));
+        for exclusion in exclusions {
+            if !crew().any(|member| member.role == exclusion.owner && member.promises.contains(exclusion)) {
+                return Err(format!("no template promise {:?} owned by `{}`", exclusion.kind, exclusion.owner));
+            }
+        }
+        for member in self.roles.iter_mut().chain(self.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
+            for exclusion in exclusions.iter().filter(|promise| promise.owner == member.role && member.promises.contains(promise)) {
+                if !member.promise_exclusions.contains(&exclusion.kind) {
+                    member.promise_exclusions.push(exclusion.kind);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A declaration has an explicit role owner even before vessel allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplatePromise {
+    pub kind: crate::promises::PromiseKind,
+    pub owner: String,
+}
+
+impl TemplatePromise {
+    pub fn decision_ledger(role: &str) -> Self {
+        Self { kind: crate::promises::PromiseKind::DecisionLedger, owner: role.to_string() }
+    }
+}
+
+// ADR 0047: remove completion_conditions/completion_expectations decoding after
+// the fleet roll following the generation deploying #2986, once the stored
+// corpus has been refreshed. This record also decodes frozen Convoy snapshots.
 #[derive(Deserialize)]
 struct CrewSpecRecord {
     role: String,
@@ -423,29 +472,62 @@ struct CrewSpecRecord {
     needs: BTreeSet<CapabilityNeed>,
     #[serde(flatten)]
     source: CrewSource,
-    #[serde(default, rename = "completion_conditions", alias = "completion_expectations")]
+    #[serde(default, alias = "completion_expectations")]
     completion_conditions: Vec<CrewCompletionExpectation>,
+    #[serde(default)]
+    legacy_checks: Vec<CrewCompletionExpectation>,
+    #[serde(default)]
+    promises: Vec<TemplatePromise>,
+    #[serde(default)]
+    promise_exclusions: Vec<crate::promises::PromiseKind>,
+    #[serde(default)]
+    deliverer: bool,
     #[serde(default)]
     labels: BTreeMap<String, String>,
 }
 
 impl From<CrewSpecRecord> for CrewSpec {
-    fn from(record: CrewSpecRecord) -> Self {
-        let completion_conditions = record
-            .completion_conditions
-            .into_iter()
-            .map(|expectation| match expectation {
-                CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::DecisionLedger) => ledger_condition(&record.role),
-                CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::ChangeRequestReady) => ready_change_request_condition(),
-                condition => condition,
-            })
-            .collect();
+    fn from(mut record: CrewSpecRecord) -> Self {
+        for expectation in record.completion_conditions {
+            match expectation {
+                CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::DecisionLedger) => {
+                    let promise = TemplatePromise::decision_ledger(&record.role);
+                    if !record.promises.contains(&promise) {
+                        record.promises.push(promise);
+                    }
+                }
+                CrewCompletionExpectation::Condition(CompletionCondition::Artifact {
+                    ref producer,
+                    ref kind,
+                    about: ArtifactSubjectBinding::Convoy,
+                    ref field_path,
+                    operator: LeafOperator::Equal,
+                    ref literal,
+                }) if producer == &record.role && kind == "decision-ledger" && field_path == ".exists" && literal == "true" => {
+                    let promise = TemplatePromise::decision_ledger(&record.role);
+                    if !record.promises.contains(&promise) {
+                        record.promises.push(promise);
+                    }
+                }
+                CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::ChangeRequestReady) => record.deliverer = true,
+                CrewCompletionExpectation::Condition(CompletionCondition::ChangeRequest {
+                    ref field_path,
+                    operator: LeafOperator::Equal,
+                    ref literal,
+                    optional_when_absent: true,
+                }) if field_path == ".ready" && literal == "true" => record.deliverer = true,
+                condition => record.legacy_checks.push(condition),
+            }
+        }
         Self {
             role: record.role,
             skills: record.skills,
             needs: record.needs,
             source: record.source,
-            completion_conditions,
+            completion_conditions: record.legacy_checks,
+            promises: record.promises,
+            promise_exclusions: record.promise_exclusions,
+            deliverer: record.deliverer,
             labels: record.labels,
         }
     }
@@ -506,19 +588,6 @@ pub enum ArtifactSubjectBinding {
     ChangeRequestHead,
 }
 
-fn ledger_condition(role: &str) -> CrewCompletionExpectation {
-    CrewCompletionExpectation::artifact_exists(role, "decision-ledger", ArtifactSubjectBinding::Convoy)
-}
-
-fn ready_change_request_condition() -> CrewCompletionExpectation {
-    CrewCompletionExpectation::Condition(CompletionCondition::ChangeRequest {
-        field_path: ".ready".to_string(),
-        operator: LeafOperator::Equal,
-        literal: "true".to_string(),
-        optional_when_absent: true,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum CrewSource {
@@ -573,7 +642,8 @@ pub fn single_agent_workflow_spec() -> WorkflowTemplateSpec {
             .name("work".to_string())
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .completion_conditions(vec![ledger_condition("coder"), ready_change_request_condition()])
+                .promises(vec![TemplatePromise::decision_ledger("coder")])
+                .deliverer(true)
                 .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                 .build()])
             .build()])
@@ -588,7 +658,8 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
             .name("work".to_string())
             .crew(vec![CrewSpec::builder()
                 .role("shepherd".to_string())
-                .completion_conditions(vec![ledger_condition("shepherd"), ready_change_request_condition()])
+                .promises(vec![TemplatePromise::decision_ledger("shepherd")])
+                .deliverer(true)
                 .source(CrewSource::Agent {
                     selector: Selector::for_capability("code"),
                     prompt: None,
@@ -606,7 +677,8 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
             .name("work".to_string())
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .completion_conditions(vec![ledger_condition("coder"), ready_change_request_condition()])
+                .promises(vec![TemplatePromise::decision_ledger("coder")])
+                .deliverer(true)
                 .source(CrewSource::Agent {
                     selector: Selector::for_capability("code"),
                     prompt: None,
@@ -636,12 +708,13 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
             .crew(vec![
                 CrewSpec::builder()
                     .role("coder".to_string())
-                    .completion_conditions(vec![ledger_condition("coder"), ready_change_request_condition()])
+                    .promises(vec![TemplatePromise::decision_ledger("coder")])
+                    .deliverer(true)
                     .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                     .build(),
                 CrewSpec::builder()
                     .role("reviewer".to_string())
-                    .completion_conditions(vec![ledger_condition("reviewer")])
+                    .promises(vec![TemplatePromise::decision_ledger("reviewer")])
                     .source(CrewSource::Agent {
                         selector: Selector::for_capability("code-review"),
                         prompt: None,
@@ -703,6 +776,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    InvalidPromise { vessel: String, role: String, reason: String },
     InvalidCompletionCondition { vessel: String, role: String, reason: String },
     EmptyExitTable,
     InvalidExitLeaf { disposition: String, template: String },
@@ -758,6 +832,9 @@ impl std::fmt::Display for InterpolationLocation {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ValidationError::InvalidPromise { vessel, role, reason } => {
+                write!(f, "vessel `{vessel}` role `{role}` has invalid promise: {reason}")
+            }
             ValidationError::InvalidCompletionCondition { vessel, role, reason } => {
                 write!(f, "vessel `{vessel}` role `{role}` has invalid completion condition: {reason}")
             }
@@ -859,6 +936,9 @@ pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>>
     for vessel in &spec.vessels {
         validate_vessel(vessel, &declared_inputs, &vessels_by_name, &mut errors);
     }
+    for role in &spec.roles {
+        validate_promises("roles", role, &mut errors);
+    }
     validate_cycles(&vessels_by_name, &mut errors);
 
     if errors.is_empty() {
@@ -958,6 +1038,35 @@ fn collect_vessels<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<Validati
     vessels_by_name
 }
 
+fn validate_promises(vessel: &str, process: &CrewSpec, errors: &mut Vec<ValidationError>) {
+    let mut kinds = Vec::new();
+    for promise in &process.promises {
+        if promise.owner != process.role || kinds.contains(&promise.kind) {
+            push_error(
+                errors,
+                ValidationError::InvalidPromise {
+                    vessel: vessel.to_string(),
+                    role: process.role.clone(),
+                    reason: "owner must match the crew role and kinds must be unique per owner".into(),
+                },
+            );
+        }
+        kinds.push(promise.kind);
+    }
+    for kind in &process.promise_exclusions {
+        if !process.promises.iter().any(|promise| promise.kind == *kind) {
+            push_error(
+                errors,
+                ValidationError::InvalidPromise {
+                    vessel: vessel.to_string(),
+                    role: process.role.clone(),
+                    reason: format!("exclusion has no declaration for {kind:?}"),
+                },
+            );
+        }
+    }
+}
+
 fn validate_vessel(
     vessel: &VesselRequirement,
     declared_inputs: &BTreeSet<String>,
@@ -983,6 +1092,7 @@ fn validate_vessel(
     }
 
     for process in &vessel.crew {
+        validate_promises(&vessel.name, process, errors);
         for expectation in &process.completion_conditions {
             let CrewCompletionExpectation::Condition(condition) = expectation else { continue };
             let (address, field_path, operator, literal) = match condition {
@@ -1204,6 +1314,7 @@ pub fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)>
                     .name("work".to_string())
                     .crew(vec![CrewSpec::builder()
                         .role("shell".to_string())
+                        .promises(vec![TemplatePromise::decision_ledger("shell")])
                         .source(CrewSource::Tool {
                             command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
                         })
@@ -1485,5 +1596,151 @@ mod state_hold_compatibility_tests {
             serde_json::from_value(serde_json::json!({"kind": "change-request-comment", "body": body})).expect("legacy hold");
         assert_eq!(hold, HoldAct::State);
         assert_eq!(serde_json::to_value(hold).expect("new hold"), serde_json::json!({"kind": "state"}));
+    }
+}
+
+#[cfg(test)]
+mod promise_template_tests {
+    use super::*;
+    use crate::{
+        promises::{self, PromiseKind, PromiseOperation},
+        ConvoyStatus, WorkflowSnapshot,
+    };
+
+    // Glue: the issue's stock-workflow contract requires a ledger declaration
+    // for every crew role, including the scratch shell; only agent deliverers
+    // carry the PR readiness/default-owner marker.
+    #[test]
+    fn stock_workflows_declare_a_ledger_for_every_role() {
+        for (name, workflow) in builtin_workflow_templates() {
+            validate(&workflow).expect("valid stock workflow");
+            for crew in workflow.roles.iter().chain(workflow.vessels.iter().flat_map(|vessel| &vessel.crew)) {
+                assert!(
+                    crew.promises.contains(&TemplatePromise::decision_ledger(&crew.role)),
+                    "{name}/{} lacks its ledger promise",
+                    crew.role
+                );
+                if crew.deliverer {
+                    assert!(matches!(crew.source, CrewSource::Agent { .. }));
+                }
+            }
+        }
+    }
+
+    // ADR 0061: all declarations apply by default; explicit exclusions survive
+    // freezing and decoding, and seeding is idempotent per owner/kind.
+    #[hegel::test]
+    fn frozen_template_promises_preserve_winnowing(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Both supported kinds, empty/full declaration sets, and every exclusion
+        // combination are generated. Repeated exclusions must be idempotent.
+        let ledger = tc.draw(gs::booleans());
+        let pr = tc.draw(gs::booleans());
+        let exclude_ledger = ledger && tc.draw(gs::booleans());
+        let exclude_pr = pr && tc.draw(gs::booleans());
+        let declarations: Vec<_> = [(ledger, PromiseKind::DecisionLedger), (pr, PromiseKind::Pr)]
+            .into_iter()
+            .filter(|(include, _)| *include)
+            .map(|(_, kind)| TemplatePromise { kind, owner: "coder".into() })
+            .collect();
+        let exclusions: Vec<_> = [(exclude_ledger, PromiseKind::DecisionLedger), (exclude_pr, PromiseKind::Pr)]
+            .into_iter()
+            .filter(|(include, _)| *include)
+            .map(|(_, kind)| TemplatePromise { kind, owner: "coder".into() })
+            .collect();
+        let mut workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".into())
+                    .promises(declarations.clone())
+                    .deliverer(true)
+                    .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+                    .build()])
+                .build()])
+            .build();
+        workflow.exclude_template_promises(&exclusions).expect("known exclusions");
+        let once = workflow.clone();
+        workflow.exclude_template_promises(&exclusions).expect("repeat exclusions");
+        assert_eq!(workflow, once);
+        validate(&workflow).expect("valid declarations");
+        let frozen = WorkflowSnapshot {
+            cascade: None,
+            exit: None,
+            turn_delivery: Default::default(),
+            stall_nudges: Default::default(),
+            supervision: None,
+            vessels: workflow.vessels,
+        };
+        let written = serde_json::to_value(&frozen).expect("write snapshot");
+        assert!(written["vessels"][0]["crew"][0].get("completion_conditions").is_none());
+        let frozen: WorkflowSnapshot = serde_json::from_value(written).expect("read snapshot");
+        assert_eq!(frozen.vessels[0].crew[0].promises, declarations);
+        assert!(frozen.vessels[0].crew[0].deliverer);
+        let mut status = ConvoyStatus { workflow_snapshot: Some(frozen), ..Default::default() };
+        let operations = promises::template_declarations(&status);
+        let expected: Vec<_> = declarations.iter().filter(|promise| !exclusions.contains(promise)).map(|promise| promise.kind).collect();
+        let actual: Vec<_> = operations
+            .iter()
+            .map(|(_, _, operation)| match operation {
+                PromiseOperation::Declare { kind, .. } => *kind,
+                _ => panic!("declaration expected"),
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        for (vessel, role, operation) in operations {
+            promises::apply(&mut status, &vessel, &role, &operation);
+        }
+        assert!(promises::template_declarations(&status).is_empty());
+    }
+
+    // ADR 0047: both previous field spellings and both historical condition
+    // representations map to promises in frozen snapshots and only write new keys.
+    #[hegel::test]
+    fn previous_conditions_decode_as_promises(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let legacy_names = tc.draw(gs::booleans());
+        let legacy_key = tc.draw(gs::booleans());
+        let role = format!("owner-{}", tc.draw(gs::integers::<usize>().min_value(0).max_value(32)));
+        let conditions = if legacy_names {
+            serde_json::json!(["decision-ledger", "change-request-ready"])
+        } else {
+            serde_json::json!([
+                {"subject":"artifact","producer":role,"kind":"decision-ledger","about":"convoy","field_path":".exists","operator":"==","literal":"true"},
+                {"subject":"change-request","field_path":".ready","operator":"==","literal":"true","optional_when_absent":true}
+            ])
+        };
+        let mut stored = serde_json::json!({"role":role,"selector":{"capability":"code"}});
+        stored[if legacy_key { "completion_expectations" } else { "completion_conditions" }] = conditions;
+        let crew: CrewSpec = serde_json::from_value(stored).expect("old crew");
+        assert_eq!(crew.promises, vec![TemplatePromise::decision_ledger(&role)]);
+        assert!(crew.deliverer);
+        assert!(crew.completion_conditions.is_empty());
+        let rewritten = serde_json::to_value(&crew).expect("new crew");
+        assert!(rewritten.get("completion_conditions").is_none());
+        assert!(rewritten.get("completion_expectations").is_none());
+        assert_eq!(serde_json::from_value::<CrewSpec>(rewritten).expect("new decode"), crew);
+    }
+
+    // Exclusions must name actual declarations; invalid owner/kind and duplicate
+    // declarations are refused rather than silently removing an obligation.
+    #[test]
+    fn invalid_promises_and_exclusions_are_refused() {
+        let mut workflow = single_agent_workflow_spec();
+        let before = workflow.clone();
+        assert!(workflow.exclude_template_promises(&[TemplatePromise { kind: PromiseKind::Pr, owner: "coder".into() }]).is_err());
+        assert_eq!(workflow, before);
+        assert!(workflow.exclude_template_promises(&[TemplatePromise::decision_ledger("missing")]).is_err());
+        workflow.vessels[0].crew[0].promise_exclusions.push(PromiseKind::Pr);
+        assert!(validate(&workflow).is_err());
+        workflow.vessels[0].crew[0].promise_exclusions.clear();
+        workflow.vessels[0].crew[0].promises.push(TemplatePromise::decision_ledger("coder"));
+        assert!(validate(&workflow).is_err());
+        workflow.vessels[0].crew[0].promises.pop();
+        workflow.vessels[0].crew[0].promises[0].owner = "missing".into();
+        assert!(validate(&workflow).is_err());
+        workflow.roles = workflow.vessels[0].crew.clone();
+        workflow.vessels[0].crew[0].promises[0].owner = "coder".into();
+        assert!(validate(&workflow).is_err(), "authored roles are validated even beside vessel hints");
     }
 }

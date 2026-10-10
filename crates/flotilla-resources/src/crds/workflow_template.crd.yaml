@@ -161,6 +161,30 @@ spec:
                             role:
                               type: string
                               minLength: 1
+                            promises:
+                              type: array
+                              items:
+                                type: object
+                                required: [kind, owner]
+                                properties:
+                                  kind:
+                                    type: string
+                                    enum: [pr, decision-ledger]
+                                  owner:
+                                    type: string
+                            promise_exclusions:
+                              type: array
+                              items:
+                                type: string
+                                enum: [pr, decision-ledger]
+                            deliverer:
+                              type: boolean
+                            legacy_checks:
+                              type: array
+                              items:
+                                type: object
+                                x-kubernetes-preserve-unknown-fields: true
+                            # ADR 0047: remove after the roll following #2986.
                             completion_expectations:
                               type: array
                               items:

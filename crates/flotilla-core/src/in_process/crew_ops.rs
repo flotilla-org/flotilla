@@ -1077,16 +1077,15 @@ impl CrewService {
                 .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
                 .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == context.caller_role))
                 .is_some_and(|crew| {
-                    crew.completion_conditions.iter().any(|condition| {
-                        matches!(
-                            condition,
-                            flotilla_resources::CrewCompletionExpectation::Condition(
-                                flotilla_resources::CompletionCondition::ChangeRequest { .. }
-                            ) | flotilla_resources::CrewCompletionExpectation::Legacy(
-                                flotilla_resources::LegacyCompletionExpectation::ChangeRequestReady
+                    crew.deliverer
+                        || crew.completion_conditions.iter().any(|condition| {
+                            matches!(
+                                condition,
+                                flotilla_resources::CrewCompletionExpectation::Condition(
+                                    flotilla_resources::CompletionCondition::ChangeRequest { .. }
+                                )
                             )
-                        )
-                    })
+                        })
                 });
             let mut observation_errors = Vec::new();
             let mut refusal_causes = Vec::new();
