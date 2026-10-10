@@ -13,14 +13,39 @@ pub enum PromiseKind {
     DecisionLedger,
 }
 
+impl PromiseKind {
+    /// Canonical stored spelling, shared by template promise identifiers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pr => "pr",
+            Self::DecisionLedger => "decision-ledger",
+        }
+    }
+
+    /// The kind defines readiness; declarations never author their own checks.
+    /// Crew completion applies this rule to selected PR declarations and to
+    /// stock deliverers' discovered PRs. An explicit PR exclusion disables it.
+    /// Keeping a PR still requires a merge; readiness alone does not keep it.
+    pub fn readiness_condition(self) -> Option<crate::CompletionCondition> {
+        match self {
+            Self::Pr => Some(crate::CompletionCondition::ChangeRequest {
+                field_path: ".ready".into(),
+                operator: flotilla_protocol::LeafOperator::Equal,
+                literal: "true".into(),
+                optional_when_absent: true,
+            }),
+            Self::DecisionLedger => None,
+        }
+    }
+}
+
 impl std::str::FromStr for PromiseKind {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, String> {
-        match value {
-            "pr" => Ok(Self::Pr),
-            "decision-ledger" => Ok(Self::DecisionLedger),
-            _ => Err(format!("unknown promise kind `{value}`; expected pr or decision-ledger")),
-        }
+        [Self::Pr, Self::DecisionLedger]
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| format!("unknown promise kind `{value}`; expected pr or decision-ledger"))
     }
 }
 
@@ -277,10 +302,9 @@ pub fn handoff(status: &mut ConvoyStatus, vessel: &str, sender: &str, target: &s
     }
 }
 
-/// Derive the current template's obligations without changing its stored shape.
-/// #2986 replaces this adapter with explicit template declarations.
+/// Seed the admitted, frozen template declarations. Exclusions remain in the
+/// snapshot for explainability, but never become open promises.
 pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, PromiseOperation)> {
-    use crate::{CompletionCondition, CrewCompletionExpectation};
     status
         .workflow_snapshot
         .iter()
@@ -297,12 +321,13 @@ pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, Prom
                         .is_none_or(|work| !matches!(work.phase, super::CrewWorkPhase::Done | super::CrewWorkPhase::HandedBack))
                 })
                 .flat_map(move |crew| {
-                    crew.completion_conditions.iter().filter_map(move |expectation| {
-                        if !matches!(expectation, CrewCompletionExpectation::Condition(CompletionCondition::Artifact { kind, .. }) if kind == "decision-ledger") {
+                    crew.promises.iter().filter_map(move |promise| {
+                        if crew.promise_exclusions.contains(&promise.kind) {
                             return None;
                         }
-                        let kind = PromiseKind::DecisionLedger;
-                        let id = "template/decision-ledger".to_string();
+                        let kind = promise.kind;
+                        let name = kind.as_str();
+                        let id = format!("template/{name}");
                         if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
                             return None;
                         }
@@ -497,9 +522,13 @@ fn discovery_owner(status: &ConvoyStatus) -> Option<(&str, &str)> {
                 .crew
                 .iter()
                 .filter(|crew| {
-                    crew.completion_conditions.iter().any(|condition| {
-                        matches!(condition, crate::CrewCompletionExpectation::Condition(crate::CompletionCondition::ChangeRequest { .. }))
-                    })
+                    crew.deliverer
+                        || crew.completion_conditions.iter().any(|condition| {
+                            matches!(
+                                condition,
+                                crate::CrewCompletionExpectation::Condition(crate::CompletionCondition::ChangeRequest { .. })
+                            )
+                        })
                 })
                 .map(move |crew| (&vessel.name, &crew.role))
         })
@@ -548,6 +577,32 @@ mod tests {
             },
         }
     }
+    // ADR 0047: historical custom PR checks retain their discovery attribution
+    // even when they do not map to the stock deliverer/readiness rule.
+    #[test]
+    fn historical_custom_check_retains_discovery_owner() {
+        let mut workflow = crate::implement_review_workflow_spec();
+        workflow.vessels[0].crew[0].deliverer = false;
+        workflow.vessels[0].crew[1] = serde_json::from_value(serde_json::json!({
+            "role": "reviewer", "selector": {"capability": "code-review"},
+            "completion_conditions": [{"subject": "change-request", "field_path": ".state",
+                "operator": "==", "literal": "merged", "optional_when_absent": false}]
+        }))
+        .expect("historical custom crew");
+        let status = ConvoyStatus {
+            workflow_snapshot: Some(crate::WorkflowSnapshot {
+                cascade: None,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+                vessels: workflow.vessels,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(discovery_owner(&status), Some(("work", "reviewer")));
+    }
+
     // ADR 0061: successive rejected attempts remain in history, replayed verdicts
     // cannot change later attempts, and kept promises never reopen. Generate
     // one through five rejections before acceptance and every source variant.

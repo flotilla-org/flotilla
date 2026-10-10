@@ -59,7 +59,7 @@ fn convoy_finalizer_renders_multiple_typed_waits_at_the_status_boundary() {
 // Completion requires the role's ledger and every bound PR's readiness;
 // optional unbound PRs only hold completion during the discovery grace period.
 #[hegel::test]
-fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::TestCase) {
+fn template_promises_are_role_scoped_and_pr_kind_requires_readiness(tc: hegel::TestCase) {
     // Cover zero-length grace and both sides of variable discovery deadlines.
     let grace = tc.draw(hegel::generators::integers::<i64>().min_value(0).max_value(600));
     let now = timestamp(100);
@@ -119,7 +119,13 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
         .expect("evaluate role")
     };
     let missing = evaluate("coder", &change_requests, &artifacts);
-    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("artifact/"))));
+    let mut promised = convoy.status.clone().expect("status");
+    let declarations = flotilla_resources::promises::template_declarations(&promised);
+    for (vessel, role, operation) in declarations {
+        flotilla_resources::promises::apply(&mut promised, &vessel, &role, &operation);
+    }
+    assert_eq!(flotilla_resources::promises::pending(&promised, "work", "coder"), vec!["template/decision-ledger"]);
+    assert_eq!(flotilla_resources::promises::pending(&promised, "work", "reviewer"), vec!["template/decision-ledger"]);
     assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("cr/"))));
     // #2211: a bound PR with no observation carries its typed identity, not a prose hint.
     assert!(missing.iter().any(|expectation| matches!(expectation,
@@ -129,6 +135,13 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
             }]
     )));
     artifacts.insert(ledger("coder").0, ledger("coder").1);
+    while let Some(patch) =
+        flotilla_resources::promises::next_observation(&promised, "completion", &change_requests, &artifacts, now, Duration::from_secs(300))
+    {
+        patch.apply(&mut promised);
+    }
+    assert!(flotilla_resources::promises::pending(&promised, "work", "coder").is_empty());
+    assert_eq!(flotilla_resources::promises::pending(&promised, "work", "reviewer"), vec!["template/decision-ledger"]);
     let mut unbound = convoy.clone();
     unbound.spec.change_request = None;
     // #2734: a PR-less coder with a ledger can complete after bounded discovery,
@@ -209,18 +222,15 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
     )
     .expect("late discovery")
     .is_empty());
-    // An explicitly required unbound PR remains required after the deadline.
+    // Historical custom checks with an explicitly required unbound PR retain
+    // their stricter rule after the discovery deadline (ADR 0047).
     let mut required = unbound.clone();
     let snapshot = required.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot");
-    for condition in &mut snapshot.vessels[0].crew[0].completion_conditions {
-        if let flotilla_resources::CrewCompletionExpectation::Condition(flotilla_resources::CompletionCondition::ChangeRequest {
-            optional_when_absent,
-            ..
-        }) = condition
-        {
-            *optional_when_absent = false;
-        }
+    let mut condition = flotilla_resources::promises::PromiseKind::Pr.readiness_condition().expect("PR readiness rule");
+    if let flotilla_resources::CompletionCondition::ChangeRequest { optional_when_absent, .. } = &mut condition {
+        *optional_when_absent = false;
     }
+    snapshot.vessels[0].crew[0].completion_conditions.push(flotilla_resources::CrewCompletionExpectation::Condition(condition));
     assert!(!evaluate_crew_completion(
         &required,
         flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
@@ -233,6 +243,12 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
     .expect("required unbound PR")
     .is_empty());
     artifacts.insert(ledger("reviewer").0, ledger("reviewer").1);
+    while let Some(patch) =
+        flotilla_resources::promises::next_observation(&promised, "completion", &change_requests, &artifacts, now, Duration::from_secs(300))
+    {
+        patch.apply(&mut promised);
+    }
+    assert!(flotilla_resources::promises::pending(&promised, "work", "reviewer").is_empty());
     let reviewer = evaluate("reviewer", &change_requests, &artifacts);
     assert!(reviewer.is_empty(), "reviewer does not carry the coder's PR readiness obligation");
 
@@ -301,6 +317,52 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
                 service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42,
             }]
     )));
+    // ADR 0061: a selected PR declaration gates readiness for any role. An
+    // explicit exclusion suppresses the gate, including on a deliverer. Stock
+    // deliverers still check discovered PRs without requiring a PR declaration.
+    for deliverer in [false, true] {
+        for declares_pr in [false, true] {
+            for excluded in [false, true].into_iter().filter(|excluded| !excluded || declares_pr) {
+                for ready in [false, true] {
+                    let mut selected = convoy.clone();
+                    let crew =
+                        &mut selected.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").vessels[0].crew[1];
+                    crew.deliverer = deliverer;
+                    if declares_pr {
+                        crew.promises.push(flotilla_resources::TemplatePromise {
+                            kind: flotilla_resources::promises::PromiseKind::Pr,
+                            owner: "reviewer".into(),
+                        });
+                    }
+                    if excluded {
+                        crew.promise_exclusions.push(flotilla_resources::promises::PromiseKind::Pr);
+                    }
+                    let records = BTreeMap::from([(
+                        record_name.clone(),
+                        record(
+                            if ready { ObservedChangeRequestState::Open } else { ObservedChangeRequestState::Draft },
+                            ObservedChecks::Pass,
+                        ),
+                    )]);
+                    let unmet = evaluate_crew_completion(
+                        &selected,
+                        flotilla_resources::CrewCompletionClaim { vessel: "work", role: "reviewer" },
+                        &checkouts,
+                        &records,
+                        &artifacts,
+                        Duration::from_secs(300),
+                        now,
+                    )
+                    .expect("selected PR readiness");
+                    assert_eq!(
+                        unmet.is_empty(),
+                        ready || excluded || !(deliverer || declares_pr),
+                        "deliverer={deliverer}, declares_pr={declares_pr}, excluded={excluded}, ready={ready}"
+                    );
+                }
+            }
+        }
+    }
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Merged, ObservedChecks::Pending));
     assert!(evaluate("coder", &change_requests, &artifacts).is_empty());
 }
@@ -983,6 +1045,26 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
 
     assert_eq!(outcome.patch, Some(expected_patch));
     assert!(outcome.events.is_empty());
+}
+
+// ADR 0061: freezing copies the chosen declarations, exclusions, and deliverer
+// marker. Later template edits cannot add promises to an admitted convoy.
+#[test]
+fn bootstrap_freezes_template_promise_selection() {
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
+    let mut template = tool_only_workflow_template_object("review-and-fix");
+    let role = template.spec.vessels[0].crew[0].role.clone();
+    template.spec.vessels[0].crew[0].promises = vec![flotilla_resources::TemplatePromise::decision_ledger(&role)];
+    template.spec.vessels[0].crew[0].deliverer = true;
+    template.spec.exclude_template_promises(&[flotilla_resources::TemplatePromise::decision_ledger(&role)]).expect("winnow");
+    let expected = template.spec.vessels[0].crew[0].clone();
+    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
+    let mut status = flotilla_resources::ConvoyStatus::default();
+    outcome.patch.expect("bootstrap patch").apply(&mut status);
+    template.spec.vessels[0].crew[0].promise_exclusions.clear();
+    let snapshot = status.workflow_snapshot.as_ref().expect("frozen workflow");
+    assert_eq!(snapshot.vessels[0].crew[0], expected);
+    assert!(flotilla_resources::promises::template_declarations(&status).is_empty());
 }
 
 #[test]

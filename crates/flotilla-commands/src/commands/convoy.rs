@@ -157,6 +157,9 @@ pub struct ConvoyStartArgs {
     /// Bare form applies to the `code` capability, e.g. --agent claude-code:opus
     #[arg(long = "agent", value_parser = parse_agent_override)]
     pub agent_overrides: Vec<AgentOverride>,
+    /// Exclude a template promise at admission (repeatable): --exclude-promise role=kind
+    #[arg(long = "exclude-promise", value_parser = parse_promise_exclusion)]
+    pub promise_exclusions: Vec<(String, String)>,
     /// Explicit skill import or -name removal (repeatable)
     #[arg(long = "skill", allow_hyphen_values = true)]
     pub skills: Vec<String>,
@@ -191,6 +194,14 @@ pub struct ConvoyCreateArgs {
     /// Existing local checkout/worktree to adopt as the convoy vessel
     #[arg(long = "adopt-checkout")]
     pub adopted_checkout: Option<PathBuf>,
+}
+
+fn parse_promise_exclusion(raw: &str) -> Result<(String, String), String> {
+    let (role, kind) = raw
+        .split_once('=')
+        .filter(|(role, kind)| !role.is_empty() && !kind.is_empty())
+        .ok_or_else(|| format!("promise exclusion must be role=kind: {raw}"))?;
+    Ok((role.to_string(), kind.to_string()))
 }
 
 fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
@@ -381,6 +392,7 @@ impl ConvoyNoun {
                     needs,
                     escalation_reason,
                     agent_overrides,
+                    promise_exclusions,
                     skills,
                     no_attach,
                     attach,
@@ -434,6 +446,7 @@ impl ConvoyNoun {
                                 needs,
                                 escalation_reason,
                                 agent_overrides,
+                                promise_exclusions,
                                 skills,
                                 auto_attach: match (attach, no_attach) {
                                     (true, false) => ConvoyAutoAttach::Always,
@@ -481,6 +494,7 @@ impl ConvoyNoun {
                                     needs: Vec::new(),
                                     escalation_reason: None,
                                     agent_overrides: Vec::new(),
+                                    promise_exclusions: Vec::new(),
                                     skills: Vec::new(),
                                     auto_attach: ConvoyAutoAttach::Never,
                                 }),
@@ -590,6 +604,7 @@ impl std::fmt::Display for ConvoyNoun {
                     needs,
                     escalation_reason,
                     agent_overrides,
+                    promise_exclusions,
                     skills,
                     no_attach,
                     attach,
@@ -636,6 +651,9 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 if let Some(reason) = escalation_reason {
                     write!(f, " --escalation-reason {}", quote_value(reason))?;
+                }
+                for (role, kind) in promise_exclusions {
+                    write!(f, " --exclude-promise {}", quote_value(&format!("{role}={kind}")))?;
                 }
                 for skill in skills {
                     write!(f, " --skill {}", quote_value(skill))?;
@@ -881,6 +899,42 @@ mod tests {
         }
     }
 
+    // Glue: the CLI must carry every explicit exclusion into admission and
+    // reproduce it when rendering a command for another surface.
+    #[test]
+    fn start_template_promise_exclusions_reach_admission() {
+        let args = [
+            "convoy",
+            "start",
+            "--project",
+            "flotilla",
+            "--exclude-promise",
+            "coder=decision-ledger",
+            "--exclude-promise",
+            "reviewer=decision-ledger",
+        ];
+        assert_round_trip::<ConvoyNoun>(&args);
+        let Resolved::NeedsContext { command, .. } = parse(&args).resolve().expect("resolve exclusions") else {
+            panic!("command expected")
+        };
+        let CommandAction::ConvoyStart { intent } = command.action else { panic!("start expected") };
+        assert_eq!(
+            intent.promise_exclusions,
+            vec![("coder".into(), "decision-ledger".into()), ("reviewer".into(), "decision-ledger".into())]
+        );
+    }
+
+    // Glue: malformed exclusions explain the required authoring syntax. Kind
+    // and owner validity depend on the admitted template, covered at that seam.
+    #[test]
+    fn malformed_promise_exclusions_explain_role_kind_syntax() {
+        for malformed in ["foo", "=pr", "coder="] {
+            let error = ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--exclude-promise", malformed])
+                .expect_err("malformed promise exclusion");
+            assert!(error.to_string().contains("role=kind"));
+        }
+    }
+
     #[test]
     fn round_trip_start_with_agent_overrides() {
         assert_round_trip::<ConvoyNoun>(&["convoy", "start", "--project", "flotilla", "--agent", "code=claude-code:sonnet"]);
@@ -978,6 +1032,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    promise_exclusions: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
@@ -1012,6 +1067,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    promise_exclusions: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
@@ -1044,6 +1100,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    promise_exclusions: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
@@ -1085,6 +1142,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    promise_exclusions: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
@@ -1203,6 +1261,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    promise_exclusions: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),

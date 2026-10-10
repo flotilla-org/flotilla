@@ -638,6 +638,10 @@ pub struct ConvoyStartIntent {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_overrides: Vec<AgentOverride>,
+    /// Explicit template winnowing at admission: (owner role, promise kind).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promise_exclusions: Vec<(String, String)>,
     #[builder(default)]
     #[serde(default)]
     pub skills: Vec<String>,
