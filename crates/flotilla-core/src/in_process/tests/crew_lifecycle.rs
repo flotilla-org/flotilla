@@ -635,3 +635,74 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     }
 }
+
+// ADR 0061: crew retraction is immediate only for crew-sourced promises;
+// template/dispatch retractions stall with the promise and reason preserved.
+#[tokio::test]
+async fn promise_retractions_and_named_completion_refusal() {
+    use flotilla_protocol::commands::CrewPromiseOperation;
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState};
+    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let created = convoys.create(&test_meta("promise-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.unwrap();
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
+            .role("coder".into())
+            .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+            .build()])),
+        crew_work: BTreeMap::from([(
+            "work".into(),
+            BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        )]),
+        ..Default::default()
+    };
+    for (id, source) in [("template", PromiseSource::Template), ("dispatch", PromiseSource::Dispatch), ("own", PromiseSource::Crew)] {
+        flotilla_resources::promises::apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Declare { id: id.into(), kind: PromiseKind::Pr, source },
+        );
+    }
+    convoys.update_status("promise-crew", &created.metadata.resource_version, &status).await.unwrap();
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &test_meta("promise-vessel"),
+            &VesselSpec {
+                convoy_ref: "promise-crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let context = CrewCommandContext {
+        namespace: Some("flotilla".into()),
+        convoy: Some("promise-crew".into()),
+        vessel_ref: Some("promise-vessel".into()),
+        role: Some("coder".into()),
+        ..Default::default()
+    };
+    let error = daemon.crew_complete_as_principal_internal(&context, None, None, None, false, None).await.unwrap_err();
+    for id in ["template", "dispatch", "own"] {
+        assert!(error.contains(id), "{error}");
+    }
+    daemon.crew_ops.promise(&context, CrewPromiseOperation::Retract { id: "own".into(), reason: "scope reduced".into() }).await.unwrap();
+    for id in ["template", "dispatch"] {
+        daemon.crew_ops.promise(&context, CrewPromiseOperation::Retract { id: id.into(), reason: "not achievable".into() }).await.unwrap();
+        let status = convoys.get("promise-crew").await.unwrap().status.unwrap();
+        let promise = status.promises["work"]["coder"].iter().find(|p| p.id == id).unwrap();
+        assert_eq!(promise.state, PromiseState::Open);
+        let stalled = status.stalled.as_ref().unwrap();
+        assert!(stalled.evidence.contains("retraction-proposed"));
+        assert!(stalled.evidence.contains(id));
+        assert!(stalled.evidence.contains("not achievable"));
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+    }
+    let status = convoys.get("promise-crew").await.unwrap().status.unwrap();
+    assert_eq!(status.promises["work"]["coder"][2].state, PromiseState::Retracted);
+    watch.abort();
+}

@@ -1570,10 +1570,19 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
         let deps = reconciler.prepare(&current).await.expect("deps");
         let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
         if known_subject {
-            let patch = outcome.patch.expect("known merged PR settles despite historical scan error");
-            let mut status = current.status.expect("status");
-            patch.apply(&mut status);
-            assert_eq!(status.phase, ConvoyPhase::Landed);
+            // Discovery first creates its submission, then the merge keeps it,
+            // and only then can the exit table settle despite the old scan error.
+            if let Some(patch) = outcome.patch {
+                flotilla_resources::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
+            }
+            for _ in 0..5 {
+                let current = convoys.get("stale-scan").await.unwrap();
+                let prepared = reconciler.prepare(&current).await.unwrap();
+                if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(40)).patch {
+                    flotilla_resources::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
+                }
+            }
+            assert_eq!(convoys.get("stale-scan").await.unwrap().status.unwrap().phase, ConvoyPhase::Landed);
         } else {
             assert!(outcome.patch.is_none(), "no subjects must still wait for discovery");
         }
@@ -2056,7 +2065,16 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
     let current = convoys.get("cross-host").await.expect("convoy with discovered request");
     let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
-    assert_eq!(outcome.patch, None, "an open remote change request must hold Landing");
+    let patch = outcome.patch.expect("discovered PR creates a promise before exit evaluation");
+    flotilla_resources::apply_status_patch(&convoys, "cross-host", &patch).await.unwrap();
+    let status = convoys.get("cross-host").await.unwrap().status.unwrap();
+    assert_eq!(status.phase, ConvoyPhase::Landing, "an open remote change request must hold Landing");
+    assert!(status
+        .promises
+        .values()
+        .flat_map(BTreeMap::values)
+        .flatten()
+        .any(|promise| promise.state == flotilla_resources::promises::PromiseState::Submitted));
 }
 
 #[test]
@@ -3282,34 +3300,31 @@ fn settlement_transition(patch: Option<ConvoyStatusPatch>) -> Option<ConvoyStatu
     })
 }
 
-// Landing still follows today's bound subjects: a first merged PR suffices even
-// though the assignment mentions a later unopened PR. Record why, then retain
-// that evidence after live observations and delivery latches disappear.
+// ADR 0061 / #2979: the first merged PR must not settle a three-PR crew.
+// Duplicate claims remain refused after each partial merge; landing retains all
+// promise states and submission evidence, even when observations are collected.
 #[hegel::test]
-fn landing_records_first_merge_before_unopened_later_pr(tc: hegel::TestCase) {
-    // Cover active/idle claims, duplicate claims, and both receipt collection
-    // orders. The later PR has no subject because it has never been opened.
-    let active = tc.draw(hegel::generators::booleans());
+fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
+    use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
     let duplicates = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
-    let collect_before_explain = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let convoys = backend.clone().using::<Convoy>("flotilla");
-        let requests = backend.clone().using::<ChangeRequest>("flotilla");
-        let workflow = implement_review_workflow_spec();
-        let mut snapshot = WorkflowSnapshot {
-            cascade: None,
-            stall_nudges: Default::default(),
-            supervision: None,
-            exit: workflow.exit,
-            turn_delivery: workflow.turn_delivery,
-            vessels: workflow.vessels,
-        };
-        snapshot.vessels[0].crew.retain(|crew| crew.role == "coder");
+        let convoys = backend.using::<Convoy>("flotilla");
+        let requests = backend.using::<ChangeRequest>("flotilla");
+        let mut workflow = implement_review_workflow_spec();
+        workflow.vessels[0].crew.retain(|crew| crew.role == "coder");
+        workflow.vessels[0].crew[0].completion_conditions.clear();
         let mut status = ConvoyStatus {
             phase: ConvoyPhase::Active,
             observed_workflow_ref: Some("review-and-fix".into()),
-            workflow_snapshot: Some(snapshot),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            }),
             work: BTreeMap::from([("work".into(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
             crew_work: BTreeMap::from([(
                 "work".into(),
@@ -3317,138 +3332,135 @@ fn landing_records_first_merge_before_unopened_later_pr(tc: hegel::TestCase) {
             )]),
             ..Default::default()
         };
-        for (source, at) in [("checks-settled", 30), ("merged-unclaimed", 45)] {
-            status.turn_deliveries.insert(
-                source.into(),
-                flotilla_resources::TurnDeliveryStatus {
-                    episodes: vec![flotilla_resources::TurnDeliveryEpisode::builder()
-                        .subject_revision("first-pr-head".into())
-                        .evidence_at(timestamp(at))
-                        .judged_claim_at(timestamp(20))
-                        .outcome(flotilla_resources::TurnDeliveryOutcome::Delivered {
-                            rung: flotilla_resources::TurnDeliveryRung::WarmSession,
-                            delivered_at: timestamp(at),
-                        })
-                        .build()],
-                    ..Default::default()
-                },
+        for number in 1..=3 {
+            flotilla_resources::promises::apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Declare { id: format!("B{number}"), kind: PromiseKind::Pr, source: PromiseSource::Dispatch },
             );
         }
-        let spec = flotilla_resources::ConvoySpec::builder()
-            .workflow_ref("review-and-fix".into())
-            .instruction("Implement the assignment as B1, B2 and B3 PRs".into())
-            .subjects(vec![flotilla_resources::DeclaredSubject {
-                subject: flotilla_protocol::Subject {
-                    kind: flotilla_protocol::SubjectKind::ChangeRequest,
-                    source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
-                    id: "2973".into(),
-                },
-                relationship: flotilla_protocol::Relationship::Produces,
-                issue: None,
-                change_request: None,
-            }])
-            .build();
-        let created = convoys.create(&convoy_meta("first-merge"), &spec).await.expect("convoy");
-        convoys.update_status("first-merge", &created.metadata.resource_version, &status).await.expect("initial status");
-        let name = change_request_record_name("github.com", "flotilla-org/flotilla", 2973);
-        let record = requests
-            .create(
-                &InputMeta::builder().name(name.clone()).build(),
-                &ChangeRequestSpec::builder()
-                    .service("github.com".into())
-                    .scope("flotilla-org/flotilla".into())
-                    .number(2973)
-                    .observing_authority("host-a".into())
-                    .build(),
-            )
+        let created = convoys
+            .create(&convoy_meta("three-pr"), &flotilla_resources::ConvoySpec::builder().workflow_ref("review-and-fix".into()).build())
             .await
-            .expect("first PR");
-        requests
-            .update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40)))
-            .await
-            .expect("first merge");
-        for offset in 0..duplicates {
-            flotilla_resources::apply_status_patch(
-                &convoys,
-                "first-merge",
-                &external_patches::mark_crew_completed_with_context(
-                    "work".into(),
-                    "coder".into(),
-                    timestamp(50 + offset as i64),
-                    Some("https://github.com/flotilla-org/flotilla/pull/2973".into()),
-                    None,
-                    None,
-                    Some("ledger-digest".into()),
-                    active,
-                    None,
-                ),
-            )
-            .await
-            .expect("completion");
-            let current = convoys.get("first-merge").await.expect("read claim");
-            let status = current.status.expect("status");
-            assert_eq!(status.phase, ConvoyPhase::Landing);
-            let entry = status.landing_entry.expect("entry evidence");
-            assert_eq!(entry.entered_at, timestamp(50));
-            assert_eq!(entry.claims.len(), 1);
-            let claim = &entry.claims[0];
-            assert_eq!((claim.vessel.as_str(), claim.role.as_str()), ("work", "coder"));
-            assert_eq!(claim.claimed_at, Some(timestamp(50)));
-            assert_eq!(claim.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/2973"));
-            assert_eq!(claim.completed_while_crew_active, active);
-            assert_eq!(claim.preceding_turn.as_ref().expect("preceding delivery").source, "merged-unclaimed");
-            assert_eq!(entry.reason(), "coder complete (#2973) after merged-unclaimed");
-        }
+            .unwrap();
+        convoys.update_status("three-pr", &created.metadata.resource_version, &status).await.unwrap();
         let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
             .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
             .with_clock(Arc::new(FixedClock(timestamp(55))));
-        let mut entry_events = 0;
-        for step in 0..3 {
-            let current = convoys.get("first-merge").await.expect("current convoy");
-            let prepared = reconciler.prepare(&current).await.expect("dependencies");
-            let outcome = reconciler.reconcile(&current, &prepared, timestamp(55));
-            entry_events += outcome.events.iter().filter(|event| event.reason == "ConvoyLandingEntered").count();
-            if let Some(patch) = outcome.patch {
-                flotilla_resources::apply_status_patch(&convoys, "first-merge", &patch).await.expect("reconcile patch");
-            }
-            let after = convoys.get("first-merge").await.expect("after reconciliation");
-            assert_eq!(
-                after.status.expect("status").phase,
-                if step == 0 { ConvoyPhase::Landing } else { ConvoyPhase::Landed },
-                "observability adds no reconciliation pass before settlement"
-            );
-        }
-        assert_eq!(entry_events, 1, "entry emits one event without delaying settlement");
-        let landed = convoys.get("first-merge").await.expect("landed convoy");
-        let status = landed.status.as_ref().expect("landed status");
-        assert_eq!(status.phase, ConvoyPhase::Landed);
-        let receipt = status.landing_settlement.as_ref().expect("settlement evidence");
-        assert!(receipt.satisfied);
-        assert_eq!(receipt.subjects.len(), 1, "unopened B2 and B3 are not exit-table subjects");
-        assert_eq!(
-            receipt.subjects[0].address,
-            flotilla_protocol::LeafAddress::ChangeRequest {
+        for number in 1..=3 {
+            let address = flotilla_protocol::LeafAddress::ChangeRequest {
                 service: "github.com".into(),
                 scope: "flotilla-org/flotilla".into(),
-                number: 2973,
+                number,
+            };
+            let name = change_request_record_name("github.com", "flotilla-org/flotilla", number);
+            let record = requests
+                .create(
+                    &InputMeta::builder().name(name.clone()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope("flotilla-org/flotilla".into())
+                        .number(number)
+                        .observing_authority("host-a".into())
+                        .build(),
+                )
+                .await
+                .unwrap();
+            requests.update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40))).await.unwrap();
+            flotilla_resources::apply_status_patch(
+                &convoys,
+                "three-pr",
+                &ConvoyStatusPatch::Promise {
+                    vessel: "work".into(),
+                    role: "coder".into(),
+                    operation: PromiseOperation::Submit {
+                        id: format!("B{number}"),
+                        kind: PromiseKind::Pr,
+                        source: PromiseSource::Crew,
+                        submission: Submission {
+                            reference: address.to_string(),
+                            metadata: BTreeMap::new(),
+                            submitted_at: timestamp(30),
+                            verdict: None,
+                        },
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            for _ in 0..3 {
+                let current = convoys.get("three-pr").await.unwrap();
+                let prepared = reconciler.prepare(&current).await.unwrap();
+                if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(55)).patch {
+                    flotilla_resources::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
+                }
             }
-        );
-        assert_eq!(receipt.subjects[0].state, Some(ObservedChangeRequestState::Merged));
-        assert_eq!(receipt.subjects[0].observed_at, Some(timestamp(40)));
-        let decoded: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).expect("encode")).expect("decode");
-        assert_eq!(&decoded, status, "both receipts survive storage");
-        if collect_before_explain {
-            requests.delete(&name).await.expect("collect PR");
+            let current = convoys.get("three-pr").await.unwrap();
+            let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
+            assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize);
+            for _ in 0..duplicates {
+                flotilla_resources::apply_status_patch(
+                    &convoys,
+                    "three-pr",
+                    &external_patches::mark_crew_completed_with_context(
+                        "work".into(),
+                        "coder".into(),
+                        timestamp(60),
+                        None,
+                        None,
+                        None,
+                        Some("ledger-digest".into()),
+                        true,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap();
+                let current = convoys.get("three-pr").await.unwrap();
+                assert_eq!(current.status.as_ref().unwrap().phase, if number == 3 { ConvoyPhase::Landing } else { ConvoyPhase::Active });
+                let evidence = evaluate_landing_settlement(
+                    &current,
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    &requests.list().await.unwrap().items.into_iter().map(|cr| (cr.metadata.name.clone(), cr)).collect(),
+                    Duration::from_secs(180),
+                    Duration::from_secs(180),
+                    timestamp(55),
+                );
+                assert_eq!(evidence.satisfied, number == 3);
+                assert_eq!(evidence.promises.len(), 3);
+            }
         }
-        let explanation = evaluate_landing_settlement(
-            &landed,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            Duration::from_secs(180),
-            Duration::from_secs(180),
-            timestamp(1000),
+        for _ in 0..3 {
+            let current = convoys.get("three-pr").await.unwrap();
+            let prepared = reconciler.prepare(&current).await.unwrap();
+            if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(65)).patch {
+                flotilla_resources::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
+            }
+        }
+        let landed = convoys.get("three-pr").await.unwrap();
+        let status = landed.status.as_ref().unwrap();
+        assert_eq!(status.phase, ConvoyPhase::Landed);
+        let receipt = status.landing_settlement.as_ref().unwrap();
+        assert_eq!(receipt.promises.len(), 3);
+        assert_eq!(receipt.subjects.len(), 3);
+        assert!(receipt.promises.iter().all(|p| p.state == PromiseState::Kept));
+        assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(status).unwrap()).unwrap(), *status);
+        for number in 1..=3 {
+            requests.delete(&change_request_record_name("github.com", "flotilla-org/flotilla", number)).await.unwrap();
+        }
+        assert_eq!(
+            &evaluate_landing_settlement(
+                &landed,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                Duration::from_secs(180),
+                Duration::from_secs(180),
+                timestamp(1000)
+            ),
+            receipt
         );
-        assert_eq!(&explanation, receipt, "explain reads historical evidence even after GC and expiry");
     });
 }

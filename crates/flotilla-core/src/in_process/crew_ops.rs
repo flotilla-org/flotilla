@@ -805,6 +805,141 @@ impl CrewService {
             .build())
     }
 
+    pub(super) async fn promise(
+        &self,
+        requested: &CrewCommandContext,
+        operation: flotilla_protocol::commands::CrewPromiseOperation,
+    ) -> Result<(), String> {
+        use flotilla_protocol::commands::CrewPromiseOperation as Request;
+        use flotilla_resources::promises::{owned, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
+        let routing = self.resolve_crew_routing_context(requested).await?;
+        let namespace = routing.command_context.namespace.as_deref().expect("resolved namespace");
+        let name = routing.command_context.convoy.as_deref().expect("resolved convoy");
+        let lock = self.convoy_message_lock(namespace, name).await;
+        let _guard = lock.lock().await;
+        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
+        ensure_crew_work_is_defined(&convoy, &context)?;
+        let status = convoy.status.as_ref().ok_or("convoy has no status")?;
+        let work = status.crew_work.get(&context.vessel).and_then(|crew| crew.get(&context.caller_role)).ok_or("crew work is missing")?;
+        if status.phase.is_terminal() || work.phase == CrewWorkPhase::Done {
+            return Err("cannot change promises after completion".into());
+        }
+        let promises = owned(status, &context.vessel, &context.caller_role);
+        let operation = match operation {
+            Request::Promise { id, kind } => {
+                if id.trim().is_empty() {
+                    return Err("promise identifier must not be empty".into());
+                }
+                if promises.iter().any(|p| p.id == id) {
+                    return Err(format!("promise `{id}` already exists"));
+                }
+                PromiseOperation::Declare { id, kind: kind.parse()?, source: PromiseSource::Crew }
+            }
+            Request::Submit { promise, kind, reference, metadata } => {
+                let kind: PromiseKind = kind.parse()?;
+                if reference.trim().is_empty() {
+                    return Err("submission reference must not be empty".into());
+                }
+                let mut metadata = metadata;
+                if kind == PromiseKind::Pr {
+                    let forges = self
+                        .resource_backend
+                        .definitions::<Forge>(namespace)
+                        .list()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|forge| forge.spec)
+                        .collect::<Vec<_>>();
+                    let subjects = change_request_subjects_from_claim(&reference, &convoy.spec.repositories, &forges);
+                    let [subject] = subjects.as_slice() else {
+                        return Err("PR reference must name one change request in the convoy's repositories".into());
+                    };
+                    metadata.insert("subject".into(), subject.internal()?);
+                }
+                let id = match promise {
+                    Some(id) => id,
+                    None => {
+                        let canonical = metadata.get("subject").unwrap_or(&reference);
+                        if let Some(existing) = promises.iter().find(|p| {
+                            p.kind == kind
+                                && p.state != PromiseState::Retracted
+                                && p.submissions.last().is_some_and(|s| s.subject() == canonical)
+                        }) {
+                            existing.id.clone()
+                        } else {
+                            let matching = promises.iter().filter(|p| p.kind == kind && p.state == PromiseState::Open).collect::<Vec<_>>();
+                            match matching.as_slice() {
+                                [p] => p.id.clone(),
+                                [] => reference.clone(),
+                                _ => return Err("multiple open promises match; select --promise".into()),
+                            }
+                        }
+                    }
+                };
+                if let Some(p) = promises.iter().find(|p| p.id == id) {
+                    let same = p.submissions.last().is_some_and(|s| s.subject() == metadata.get("subject").unwrap_or(&reference));
+                    if p.kind != kind
+                        || (p.state != PromiseState::Open && !(same && matches!(p.state, PromiseState::Submitted | PromiseState::Kept)))
+                    {
+                        return Err(format!("promise `{id}` does not accept this submission"));
+                    }
+                }
+                PromiseOperation::Submit {
+                    id,
+                    kind,
+                    source: PromiseSource::Crew,
+                    submission: Submission { reference, metadata, submitted_at: self.clock.now(), verdict: None },
+                }
+            }
+            Request::Retract { id, reason } => {
+                if reason.trim().is_empty() {
+                    return Err("retraction requires a reason".into());
+                }
+                let promise = promises.iter().find(|p| p.id == id).ok_or_else(|| format!("unknown promise `{id}`"))?;
+                if promise.state.terminal() {
+                    return Err(format!("promise `{id}` is already terminal"));
+                }
+                if promise.source != PromiseSource::Crew {
+                    apply_resource_status_patch(
+                        &convoys,
+                        name,
+                        &convoy_external_patches::mark_crew_stalled(
+                            name.to_string(),
+                            context.vessel.clone(),
+                            context.caller_role.clone(),
+                            self.clock.now(),
+                            flotilla_protocol::StallReason::Decision,
+                            Some(flotilla_protocol::StallProposedDisposition::ReduceScope),
+                            format!("retraction-proposed: promise `{id}` ({:?}): {reason}", promise.source),
+                        ),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+                PromiseOperation::Retract { id, reason }
+            }
+        };
+        let updated = apply_resource_status_patch(
+            &convoys,
+            name,
+            &ConvoyStatusPatch::Promise { vessel: context.vessel.clone(), role: context.caller_role.clone(), operation: operation.clone() },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if updated
+            .status
+            .as_ref()
+            .is_none_or(|status| !flotilla_resources::promises::effect_present(status, &context.vessel, &context.caller_role, &operation))
+        {
+            return Err("promise changed concurrently; inspect convoy explain and retry".into());
+        }
+        Ok(())
+    }
+
     pub(super) async fn complete(
         &self,
         requested: &CrewCommandContext,
@@ -863,6 +998,32 @@ impl CrewService {
             .await
             .map_err(|error| error.to_string())?;
         }
+        if let Some(status) = &convoy.status {
+            for (vessel, role, operation) in flotilla_resources::promises::template_declarations(status) {
+                convoy = apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::Promise { vessel, role, operation })
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        for subject in &claim_subjects {
+            if let Some(operation) = convoy.status.as_ref().and_then(|status| {
+                flotilla_resources::promises::discovered_submission(
+                    status,
+                    &context.vessel,
+                    &context.caller_role,
+                    subject,
+                    self.clock.now(),
+                )
+            }) {
+                convoy = apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &ConvoyStatusPatch::Promise { vessel: context.vessel.clone(), role: context.caller_role.clone(), operation },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
         let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
         let ledger_artifact =
             match self.resource_backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&ledger_name).await {
@@ -895,7 +1056,14 @@ impl CrewService {
                         || claim.decision_ledger_ref.is_some()
                         || claim.completion_override.is_some())
             });
-        if decision_ledger_ref.is_none() && forced_by.is_none() && existing_claim_is_admitted {
+        if decision_ledger_ref.is_none()
+            && forced_by.is_none()
+            && existing_claim_is_admitted
+            && convoy
+                .status
+                .as_ref()
+                .is_none_or(|status| flotilla_resources::promises::pending(status, &context.vessel, &context.caller_role).is_empty())
+        {
             return Ok(flotilla_protocol::CommandValue::Ok);
         }
         if forced_by.is_none() && !existing_claim_is_admitted {
@@ -1008,6 +1176,13 @@ impl CrewService {
                     .map(|expectation| format!("{}: {}", expectation.subject, expectation.detail))
                     .collect::<Vec<_>>();
                 reasons.extend(observation_errors);
+                if let Some(status) = &convoy.status {
+                    reasons.extend(
+                        flotilla_resources::promises::pending(status, &context.vessel, &context.caller_role)
+                            .into_iter()
+                            .map(|id| format!("promise `{id}` is not kept or retracted")),
+                    );
+                }
                 let expectation = reasons.join("; ");
                 apply_resource_status_patch(
                     &convoys,
@@ -1023,6 +1198,60 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
                 return Err(format!("crew completion expectations unmet: {expectation}"));
+            }
+        }
+        let promise_sources =
+            self.resource_backend.including_replicas::<ResourceChangeRequest>(namespace).list().await.map_err(|e| e.to_string())?;
+        let promise_change_requests = flotilla_resources::select_change_requests(promise_sources.items.iter().map(|source| &source.object))
+            .into_values()
+            .map(|record| {
+                (flotilla_resources::change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record)
+            })
+            .collect();
+        let promise_artifacts = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::Artifact>(namespace)
+            .list()
+            .await
+            .map_err(|e| e.to_string())?
+            .items
+            .into_iter()
+            .map(|item| (item.object.metadata.name.clone(), item.object))
+            .collect();
+        loop {
+            let next = convoy.status.as_ref().and_then(|status| {
+                flotilla_resources::promises::next_observation(
+                    status,
+                    convoy_name,
+                    &promise_change_requests,
+                    &promise_artifacts,
+                    self.clock.now(),
+                    self.leaf_subscriptions.change_request_stale_after(),
+                )
+            });
+            let Some(patch) = next else {
+                break;
+            };
+            convoy = apply_resource_status_patch(&convoys, convoy_name, &patch).await.map_err(|e| e.to_string())?;
+        }
+        if let Some(status) = &convoy.status {
+            let pending = flotilla_resources::promises::pending(status, &context.vessel, &context.caller_role);
+            if !pending.is_empty() {
+                let expectation = format!("crew promises are not kept or retracted: {}", pending.join(", "));
+                apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &ConvoyStatusPatch::RefuseCrewCompletion {
+                        vessel: context.vessel.clone(),
+                        role: context.caller_role.clone(),
+                        expectation: expectation.clone(),
+                        causes: Vec::new(),
+                        message: message.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                return Err(expectation);
             }
         }
         if let Some(reference) = convoy
@@ -1073,12 +1302,12 @@ impl CrewService {
                 return Ok(flotilla_protocol::CommandValue::CrewFollowUpDelivered);
             }
         }
-        apply_resource_status_patch(
+        let updated = apply_resource_status_patch(
             &convoys,
             convoy_name,
             &convoy_external_patches::mark_crew_completed_with_context(
-                context.vessel,
-                context.caller_role,
+                context.vessel.clone(),
+                context.caller_role.clone(),
                 chrono::Utc::now(),
                 message,
                 disposition,
@@ -1090,6 +1319,15 @@ impl CrewService {
         )
         .await
         .map_err(|err| err.to_string())?;
+        if updated
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .and_then(|crew| crew.get(&context.caller_role))
+            .is_none_or(|work| work.phase != CrewWorkPhase::Done)
+        {
+            return Err("crew completion changed concurrently; inspect pending promises and retry".into());
+        }
         if let Some(session_name) = routing.session_name {
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }

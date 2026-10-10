@@ -30,7 +30,8 @@ brief's merge authority; a delivery-only crew leaves merging to its supervisor.
 ## Settlement order
 
 The final snapshot establishes readiness for the current head. Submit the ledger
-only after that snapshot is clean, then complete. If new feedback or failed
+only after that snapshot is clean. Submit the PR against its promise, and
+complete only once all promises are kept or retracted. If new feedback or failed
 checks arrive before completion, handle them and take a new clean snapshot before
 resubmitting the ledger. Completion stores the crew's settlement claim; the
-convoy's merge and landing can occur afterward.
+convoy lands after its exit table fires and every promise is kept or retracted.

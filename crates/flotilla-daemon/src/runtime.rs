@@ -886,6 +886,7 @@ fn spawn_controller_loops(
                             backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
                             daemon.change_request_stale_after(),
                         )
+                        .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
                         .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
                         .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
                         .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(

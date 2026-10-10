@@ -9088,7 +9088,7 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         )
         .await
         .expect_err("refuse completion without a ledger");
-    assert!(error.contains("decision-ledger") && error.contains(".exists"), "{error}");
+    assert!(error.contains("template/decision-ledger"), "{error}");
 
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
     assert_eq!(status.phase, before.phase);
@@ -9121,30 +9121,12 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         )
         .await
         .expect("dispatch forced completion");
-    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Ok);
-
-    let forced = convoys.get("missing-ledger").await.expect("read forced convoy").status.expect("forced status");
-    assert_eq!(forced.phase, ConvoyPhase::Landing);
-    assert_eq!(forced.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
-    assert_eq!(forced.crew_work["work"]["coder"].completion_override.as_ref().map(|override_| &override_.principal), Some(&operator));
-
-    daemon
-        .crew_complete_with_disposition_internal(
-            &flotilla_protocol::CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".to_string()),
-                convoy: Some("missing-ledger".to_string()),
-                vessel_ref: Some("missing-ledger-vessel".to_string()),
-                role: Some("coder".to_string()),
-            },
-            Some("stray duplicate".to_string()),
-            Some("must not replace the admitted claim".to_string()),
-            None,
-        )
-        .await
-        .expect("already-admitted completion is idempotent");
-    let after_duplicate = convoys.get("missing-ledger").await.expect("read convoy after duplicate").status.expect("status after duplicate");
-    assert_eq!(after_duplicate, forced);
+    let forced = recv_command_finished(&mut events, command_id).await;
+    assert!(matches!(forced, CommandValue::Error { ref message } if message.contains("template/decision-ledger")), "{forced:?}");
+    let status = convoys.get("missing-ledger").await.unwrap().status.unwrap();
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert!(status.crew_work["work"]["coder"].completion_override.is_none());
 }
 
 async fn run_identity_command(daemon: &InProcessDaemon, action: CommandAction, selector: RepoSelector) -> CommandValue {

@@ -2341,7 +2341,13 @@ impl Aggregator {
         } else {
             SurfaceState::Working
         };
+        let mut promise_counts = BTreeMap::<String, BTreeMap<String, usize>>::new();
+        for promise in status.into_iter().flat_map(|s| s.promises.values()).flat_map(BTreeMap::values).flatten() {
+            let state = serde_json::to_value(promise.state).expect("promise state").as_str().expect("state string").to_string();
+            *promise_counts.entry(format!("{}/{}", promise.vessel, promise.role)).or_default().entry(state).or_default() += 1;
+        }
         ConvoyRow::builder()
+            .promise_counts(promise_counts)
             .admission_blockers(
                 status
                     .and_then(|status| status.stalled.as_ref())

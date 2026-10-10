@@ -15,6 +15,7 @@ use crate::{
     ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
 
+pub mod promises;
 mod reconcile;
 
 pub use reconcile::{
@@ -568,7 +569,7 @@ pub fn instantiate_turn_delivery(
     } else {
         Vec::new()
     };
-    Ok(snapshot
+    let mut rows: Vec<_> = snapshot
         .turn_delivery
         .iter()
         .flat_map(|(source, rule)| {
@@ -609,7 +610,35 @@ pub fn instantiate_turn_delivery(
                 rule: rule.clone(),
             })
         })
-        .collect())
+        .collect();
+    if let Some(status) = &convoy.status {
+        for promise in status
+            .promises
+            .values()
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .filter(|p| p.kind == promises::PromiseKind::Pr && !p.state.terminal())
+        {
+            let Some(submission) = promise.submissions.last() else {
+                continue;
+            };
+            let reference = submission.metadata.get("subject").unwrap_or(&submission.reference);
+            let Ok(address) = reference.parse::<LeafAddress>() else {
+                continue;
+            };
+            let rule = TurnDeliveryRule::builder()
+                .on("$cr.state == closed".parse().expect("valid rejection leaf"))
+                .to(crate::TurnDeliveryTarget::builder().vessel(promise.vessel.clone()).role(promise.role.clone()).build())
+                .brief(format!("Promise `{}` submission `{}` was rejected: PR closed without merging. Inspect your open promises and resubmit or propose retraction with a reason.", promise.id, submission.reference))
+                .hold(crate::HoldAct::State).build();
+            rows.push(InstantiatedTurnDelivery {
+                source: format!("promise-rejected/{}/{}/{}/{}", promise.vessel, promise.role, promise.id, promise.submissions.len()),
+                leaf: Leaf { address, field_path: ".state".into(), operator: LeafOperator::Equal, literal: "closed".into() },
+                rule,
+            });
+        }
+    }
+    Ok(rows)
 }
 
 pub fn issue_address(reference: &IssueRef) -> Result<LeafAddress, String> {
@@ -936,6 +965,9 @@ pub struct ConvoyStatus {
     /// vessel name and then by its unique role. Tool processes are excluded.
     #[serde(default)]
     pub crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
+    /// ADR 0061. Remove decoder default one roll after introduction (ADR 0047).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub promises: BTreeMap<String, BTreeMap<String, Vec<promises::Promise>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1565,6 +1597,17 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    Promise {
+        vessel: String,
+        role: String,
+        operation: promises::PromiseOperation,
+    },
+    /// World observations remain valid after a crew claim, until convoy settlement.
+    ObservePromise {
+        vessel: String,
+        role: String,
+        operation: promises::PromiseOperation,
+    },
     HoldTurnDelivery {
         source: String,
         hold: ConvoyAttention,
@@ -1861,6 +1904,14 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RecordEnsureAdmission { config } => {
                 status.ensure_admission.get_or_insert_with(|| config.clone());
             }
+            Self::Promise { vessel, role, operation } => {
+                if status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_none_or(|work| work.phase != CrewWorkPhase::Done) {
+                    promises::apply(status, vessel, role, operation);
+                }
+            }
+            Self::ObservePromise { vessel, role, operation } => {
+                promises::apply(status, vessel, role, operation);
+            }
             Self::DiscoverSubjects { subjects, source, at } => {
                 for (subject, relationship) in subjects {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);
@@ -1894,6 +1945,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.observed_workflows = Some(observed_workflows.clone());
                 status.work = work.clone();
                 status.crew_work = crew_work.clone();
+                for (vessel, role, operation) in promises::template_declarations(status) {
+                    promises::apply(status, &vessel, &role, &operation);
+                }
                 status.phase = *phase;
                 if let Some(started_at) = started_at {
                     status.started_at.get_or_insert(*started_at);
@@ -1982,6 +2036,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::Settle { disposition, target_mismatches, finished_at, evidence } => {
+                if status.promises.values().flat_map(BTreeMap::values).flatten().any(|p| !p.state.terminal()) {
+                    return;
+                }
                 if status.phase != ConvoyPhase::Landed {
                     status.landing_settlement = evidence.clone();
                 }
@@ -2169,6 +2226,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 completed_while_crew_active,
                 forced_by,
             } => {
+                if !promises::pending(status, vessel, role).is_empty() {
+                    return;
+                }
                 clear_nudge_budget(status, vessel, role);
                 let completion_turn = preceding_turn(status, vessel, role, *finished_at);
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
@@ -2288,6 +2348,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 });
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
+                if status.crew_work.get(vessel).is_some_and(|crew| crew.contains_key(target_role)) {
+                    promises::handoff(status, vessel, sender_role, target_role);
+                }
                 if let Some(work) = status.work.get_mut(vessel) {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }

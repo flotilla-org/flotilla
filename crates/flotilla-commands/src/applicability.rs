@@ -72,6 +72,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ConvoyResume { .. }
         | CommandAction::ConvoyWithdrawPendingBrief { .. }
         | CommandAction::CrewHandoff { .. }
+        | CommandAction::CrewPromise { .. }
         | CommandAction::CrewComplete { .. }
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewStall { .. }

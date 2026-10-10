@@ -48,6 +48,10 @@ pub trait ConvoyTeardownRuntime: Send + Sync {
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, checkouts: &[ResourceObject<Checkout>]) -> Result<(), String>;
 }
 
+// Convoy secondary watches cover work/checkouts, not arbitrary PR or artifact
+// records. A bounded retry also handles observation freshness without an event.
+const PROMISE_OBSERVATION_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
     pub patch: Option<ConvoyStatusPatch>,
@@ -87,6 +91,7 @@ pub struct ConvoyReconciler {
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
     checkouts: Option<TypedResolver<Checkout>>,
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
+    artifacts: Option<ReplicaReadResolver<Artifact>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
     forges: Option<DefinitionResolver<Forge>>,
     hosts: Option<ReplicaReadResolver<Host>>,
@@ -104,6 +109,7 @@ pub struct ConvoyPrepared {
     terminal_sessions: Vec<ResourceObject<TerminalSession>>,
     checkouts: BTreeMap<String, ResourceObject<Checkout>>,
     observed_subjects: Vec<Subject>,
+    promise_patch: Option<ConvoyStatusPatch>,
     exit_disposition: Option<String>,
     settlement_evidence: Option<SettlementEvaluation>,
     settlement_attention: Option<crate::ConvoyAttention>,
@@ -120,6 +126,7 @@ impl ConvoyReconciler {
             terminal_sessions: None,
             checkouts: None,
             federated_checkouts: None,
+            artifacts: None,
             change_requests: None,
             forges: None,
             hosts: None,
@@ -129,6 +136,11 @@ impl ConvoyReconciler {
             prepared_snapshot_gc: None,
             teardown_runtime: None,
         }
+    }
+
+    pub fn with_artifacts(mut self, artifacts: ReplicaReadResolver<Artifact>) -> Self {
+        self.artifacts = Some(artifacts);
+        self
     }
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
@@ -492,6 +504,10 @@ fn evaluate_declared_completion_condition(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct SettlementEvaluation {
+    /// ADR 0047: remove default one roll after introduction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub promises: Vec<super::promises::Promise>,
     /// Exact instantiated exit-table subjects and their state at evaluation.
     /// ADR 0047: remove the decoder default one roll after deployment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -540,6 +556,34 @@ pub fn evaluate_landing_settlement(
 }
 
 fn evaluate_landing_settlement_with_disposition(
+    convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    change_request_stale_after: std::time::Duration,
+    landing_evidence_stale_after: std::time::Duration,
+    now: DateTime<Utc>,
+) -> LandingSettlement {
+    let mut result = evaluate_exit_with_disposition(
+        convoy,
+        vessels,
+        checkouts,
+        change_requests,
+        change_request_stale_after,
+        landing_evidence_stale_after,
+        now,
+    );
+    if let Some(status) = convoy.status.as_ref().filter(|status| status.phase != ConvoyPhase::Landed) {
+        result.evaluation.promises = status.promises.values().flat_map(BTreeMap::values).flatten().cloned().collect();
+        if result.evaluation.promises.iter().any(|p| !p.state.terminal()) {
+            result.evaluation.satisfied = false;
+            result.disposition = None;
+        }
+    }
+    result
+}
+
+fn evaluate_exit_with_disposition(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
@@ -975,12 +1019,38 @@ impl Reconciler for ConvoyReconciler {
         };
         let observed_subjects = observed_change_request_subjects(obj, &checkouts, &forges).map_err(ResourceError::other)?;
         let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
+        let needs_pr = is_landing
+            || obj.status.as_ref().is_some_and(|status| super::promises::needs_observation(status, super::promises::PromiseKind::Pr));
+        let needs_ledger = obj
+            .status
+            .as_ref()
+            .is_some_and(|status| super::promises::needs_observation(status, super::promises::PromiseKind::DecisionLedger));
         let change_requests = match &self.change_requests {
-            Some(change_requests) if is_landing => {
-                change_requests.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
+            Some(change_requests) if needs_pr => {
+                let sources = change_requests.list().await?.items;
+                crate::select_change_requests(sources.iter().map(|source| &source.object))
+                    .into_values()
+                    .map(|record| (crate::change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record))
+                    .collect()
             }
             _ => BTreeMap::new(),
         };
+        let artifacts = match &self.artifacts {
+            Some(artifacts) if needs_ledger => {
+                artifacts.list().await?.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect()
+            }
+            _ => BTreeMap::new(),
+        };
+        let promise_patch = obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
+            super::promises::next_observation(
+                status,
+                &obj.metadata.name,
+                &change_requests,
+                &artifacts,
+                self.clock.now(),
+                self.change_request_stale_after,
+            )
+        });
         let settlement = if is_landing {
             Some(evaluate_landing_settlement_with_disposition(
                 obj,
@@ -1044,6 +1114,7 @@ impl Reconciler for ConvoyReconciler {
             terminal_sessions,
             checkouts,
             observed_subjects,
+            promise_patch,
             exit_disposition,
             settlement_evidence: settlement.map(|settlement| settlement.evaluation),
             settlement_attention,
@@ -1123,6 +1194,14 @@ impl Reconciler for ConvoyReconciler {
                 requeue_after: None,
             };
         }
+        if let Some(patch) = &prepared.promise_patch {
+            return ControllerReconcileOutcome {
+                patch: Some(patch.clone()),
+                actuations: Vec::new(),
+                events: Vec::new(),
+                requeue_after: None,
+            };
+        }
         let mut outcome = reconcile_internal(
             obj,
             prepared.template.as_ref(),
@@ -1189,7 +1268,21 @@ impl Reconciler for ConvoyReconciler {
             patch: outcome.patch,
             actuations: outcome.actuations,
             events: outcome.events.into_iter().map(|event| convoy_object_event(obj, event)).collect(),
-            requeue_after: provisioning_requeue.or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)),
+            requeue_after: provisioning_requeue.or_else(|| reclaim_refused.then_some(self.landing_evidence_stale_after)).or_else(|| {
+                obj.status.as_ref().filter(|status| !status.phase.is_terminal()).and_then(|status| {
+                    status
+                        .promises
+                        .values()
+                        .flat_map(BTreeMap::values)
+                        .flatten()
+                        .any(|p| {
+                            p.state == super::promises::PromiseState::Submitted
+                                || (p.kind == super::promises::PromiseKind::DecisionLedger
+                                    && p.state == super::promises::PromiseState::Open)
+                        })
+                        .then_some(PROMISE_OBSERVATION_RETRY)
+                })
+            }),
         }
     }
 
@@ -1736,7 +1829,9 @@ fn roll_up_phase_outcome(
     conditions: &LifecycleConditions,
     now: DateTime<Utc>,
 ) -> Option<ReconcileOutcome> {
-    let all_complete = !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete);
+    let all_complete = !status.work.is_empty()
+        && status.work.values().all(|state| state.phase == WorkPhase::Complete)
+        && status.promises.values().flat_map(BTreeMap::values).flatten().all(|p| p.state.terminal());
     if let (ConvoyPhase::Landing, true, Some(exit_disposition)) = (status.phase, all_complete, conditions.exit_disposition.as_deref()) {
         let target_mismatches = convoy
             .spec

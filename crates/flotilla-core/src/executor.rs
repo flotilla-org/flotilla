@@ -245,6 +245,7 @@ pub async fn build_plan(
         | CommandAction::ConvoyAbandon { .. }
         | CommandAction::ConvoyResume { .. }
         | CommandAction::ConvoyWithdrawPendingBrief { .. }
+        | CommandAction::CrewPromise { .. }
         | CommandAction::CrewComplete { .. }
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewStall { .. }

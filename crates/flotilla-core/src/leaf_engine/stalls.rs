@@ -168,7 +168,18 @@ pub(super) fn is_merged_settlement_probe(leaf: &Leaf) -> bool {
 /// Workflow-declared checks, review and merged settlement rules run during active crew work too,
 /// including custom rules; conflict probes retain their active delivery behavior.
 pub(super) fn is_active_change_request_probe(status: &ConvoyStatus, rule: &TurnDeliveryRule, leaf: &Leaf) -> bool {
-    let active_field = is_conflict_probe(leaf)
+    // Promise rejection rows are armed for their owner while work remains active.
+    let promise_rejection = leaf.field_path == ".state"
+        && leaf.operator == LeafOperator::Equal
+        && leaf.literal == "closed"
+        && flotilla_resources::promises::owned(status, &rule.to.vessel, &rule.to.role).iter().any(|promise| {
+            !promise.state.terminal()
+                && promise.submissions.last().is_some_and(|submission| {
+                    submission.metadata.get("subject").unwrap_or(&submission.reference) == &leaf.address.to_string()
+                })
+        });
+    let active_field = promise_rejection
+        || is_conflict_probe(leaf)
         || is_merged_settlement_probe(leaf)
         || (matches!(leaf.address, LeafAddress::ChangeRequest { .. })
             && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head"));
@@ -177,6 +188,7 @@ pub(super) fn is_active_change_request_probe(status: &ConvoyStatus, rule: &TurnD
         && status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role)).is_some_and(|work| {
             work.finished_at.is_none()
                 && (is_conflict_probe(leaf)
+                    || (promise_rejection && work.phase == flotilla_resources::CrewWorkPhase::Stalled)
                     || matches!(work.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Interrupted))
         })
 }

@@ -188,6 +188,9 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        promises: vec![
+            serde_json::json!({"id": "second-pr", "vessel": "work", "role": "coder", "state": "open", "submissions": [{"reference": "https://github.com/org/repo/pull/42", "metadata": {"commit": "rejected-head"}, "verdict": {"accepted": false, "why": "closed unmerged"}}]}),
+        ],
         landing_entry: None,
         landing_settlement: None,
         holds: Vec::new(),
@@ -338,6 +341,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        promises: Vec::new(),
         landing_entry: None,
         landing_settlement: None,
         holds: Vec::new(),

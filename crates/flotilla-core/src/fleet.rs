@@ -471,6 +471,7 @@ fn append_crewless_convoy_rows(
                     .crew("-")
                     .crew_state(convoy_state_label(row))
                     .maybe_landing_reason(row.landing_reason.clone())
+                    .promise_counts(row.promise_counts.clone())
                     .surface_state(row.surface_state)
                     .host(row.resource.host.clone().unwrap_or_else(|| host.clone()))
                     .maybe_placement_decision(row.placement_decision.clone())

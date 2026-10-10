@@ -1213,6 +1213,15 @@ impl ReadProjections<'_> {
                 .as_ref()
                 .and_then(|status| status.landing_entry.as_ref())
                 .map(|entry| serde_json::to_value(entry).expect("serialize landing entry")),
+            promises: convoy
+                .status
+                .as_ref()
+                .into_iter()
+                .flat_map(|status| status.promises.values())
+                .flat_map(BTreeMap::values)
+                .flatten()
+                .map(|promise| serde_json::to_value(promise).expect("serialize promise"))
+                .collect(),
             landing_settlement: convoy
                 .status
                 .as_ref()

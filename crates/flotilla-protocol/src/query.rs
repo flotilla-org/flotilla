@@ -564,6 +564,9 @@ impl std::fmt::Display for DeclarationAttentionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct FleetListRow {
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub promise_counts: BTreeMap<String, BTreeMap<String, usize>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_reason: Option<String>,
     pub convoy: String,
