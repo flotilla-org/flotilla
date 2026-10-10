@@ -89,6 +89,7 @@ cargo build --locked --manifest-path "$repo_root/Cargo.toml" --bin flotilla --bi
 # Cargo reports the actual executables, including target/profile subdirectories.
 python3 - "$repo_root" "$root/cargo-artifacts.jsonl" <<'PYTHON'
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -101,7 +102,28 @@ for line in Path(sys.argv[2]).read_text().splitlines():
 for name in ('flotilla', 'flotillad'):
     if name not in artifacts:
         raise SystemExit(f'missing cargo artifact: {name}')
-subprocess.run(['python3', str(Path(sys.argv[1]) / 'scripts/test-fleet-canary-real.py'),
-                artifacts['flotilla'], artifacts['flotillad']], check=True)
+# A temporary host home supplies only a fake registry token path. The real
+# admission test never reads an operator credential or launches Docker.
+host_home = Path(sys.argv[2]).parent / 'host-home'
+token = host_home / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'
+token.parent.mkdir(parents=True)
+token.write_text('test-registry-token\n')
+# The real daemon publishes held credentials on its 30-second heartbeat.
+# Give that observation two heartbeats without changing the production timeout
+# or the separate real-daemon test's fixed assertions.
+runner = """
+import importlib.util
+import sys
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location('real_canary_test', sys.argv[1])
+test = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(test)
+sys.argv = sys.argv[1:]
+constructor = test.canary.Canary
+with patch.object(test.canary, 'Canary', lambda *args, **kwargs: constructor(*args, **{**kwargs, 'timeout': 65})):
+    test.main()
+"""
+subprocess.run(['python3', '-c', runner, str(Path(sys.argv[1]) / 'scripts/test-fleet-canary-real.py'),
+                artifacts['flotilla'], artifacts['flotillad']], check=True, env={**os.environ, 'HOME': str(host_home)})
 PYTHON
 echo 'fleet canary contract passed'

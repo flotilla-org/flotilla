@@ -92,7 +92,8 @@ class Processes:
             if command[3:] != ['--local-only']:
                 raise AssertionError('probe must inspect only its own store')
             resources = {
-                'hosts': [{'metadata': {'name': 'canary-host'}}],
+                'hosts': [{'metadata': {'name': 'canary-host'}, 'status': {'capabilities': {
+                    'held_credentials': [] if self.failure == 'credential-observation' else [canary.REGISTRY_CREDENTIAL]}}}],
                 'vessels': [] if self.completed else [{'status': {'phase': 'Ready'}}],
                 'terminalsessions': [] if self.completed else [{'status': {'phase': 'Running'}}],
                 'environments': [] if self.completed else [{'spec': {'docker': {'image': 'pinned-image'}},
@@ -143,14 +144,123 @@ class Contract(unittest.TestCase):
             release = root / 'release'
             release.mkdir()
             (release / 'fleet-canary-agent.sh').write_text('#!/bin/bash\n')
+            token = root / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'
+            token.parent.mkdir(parents=True)
+            token.write_text('test-registry-token\n')
             processes = Processes(root / 'probe', failure)
-            gate = canary.Canary(release, root / 'probe', processes, timeout=0.02)
+            gate = canary.Canary(release, root / 'probe', processes, timeout=0.02, host_home=root)
             if failure:
                 with self.assertRaises(canary.CanaryFailure) as error:
                     gate.exercise()
                 return str(error.exception), processes
             gate.exercise()
             return None, processes
+
+    # The host CLI is a process-boundary fake: live declarations win and only
+    # a successful response without the named credential permits defaults.
+    def test_live_registry_lookup(self):
+        live = {'consumer': {'adapter': 'docker-registry', 'registry': 'live.example', 'username': 'live-user'},
+                'source': {'kind': 'file', 'path': '/host/token'}, 'lifecycle': 'static'}
+        for records, expected in [([], None), ([{'metadata': {'name': 'other'}, 'spec': {}}], None),
+                                  ([{'metadata': {'name': canary.REGISTRY_CREDENTIAL}, 'spec': live}], live)]:
+            with self.subTest(records=records), patch.object(canary.Commands, 'run', return_value=json.dumps({
+                    'records': [{'object': item} for item in records]})) as run:
+                self.assertEqual(canary.live_registry_spec(io.StringIO()), expected)
+                self.assertEqual(run.call_args.args[0], [
+                    'flotilla', '--json', 'resource', 'list', 'credentialspecs', '--local-only'])
+        with patch.object(canary.Commands, 'run', side_effect=canary.CanaryFailure('host unavailable')):
+            with self.assertRaisesRegex(canary.CanaryFailure, 'host unavailable'):
+                canary.live_registry_spec(io.StringIO())
+
+    # Registry declarations and grants must precede admission; material stays on
+    # the host. This is manifest/CLI glue, exercised through the process fake.
+    def test_registry_spec_and_project_grant_applied_before_admission(self):
+        _, processes = self.exercise()
+        credential = processes.manifests['CredentialSpec']
+        self.assertEqual(credential['metadata']['name'], canary.REGISTRY_CREDENTIAL)
+        self.assertEqual(credential['spec']['consumer'], {
+            'adapter': 'docker-registry', 'registry': 'forgejo.lab.flotilla.work', 'username': 'flotilla-crew'})
+        self.assertEqual(credential['spec']['source']['kind'], 'file')
+        self.assertNotIn('/probe/home/', credential['spec']['source']['path'])
+        self.assertEqual(processes.manifests['CredentialGrant']['spec'], {
+            'selector': {'projects': ['fleet-canary']}, 'credentials': [canary.REGISTRY_CREDENTIAL]})
+        admission = next(i for i, call in enumerate(processes.calls) if call[4:6] == ['convoy', 'start'])
+        credential_apply = next(i for i, call in enumerate(processes.calls)
+                                if call[-1].endswith('/lab-forgejo-registry-pull.json'))
+        self.assertLess(credential_apply, admission)
+
+    # Live declarations override every default. Enumerate tilde and absolute
+    # paths, nested paths and spaces; never read even the temporary token contents.
+    def test_live_registry_host_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            for relative in ('token', 'nested/token with spaces'):
+                token = home / relative
+                token.parent.mkdir(parents=True, exist_ok=True)
+                token.write_text('test-registry-token\n')
+                for path in ('~/' + relative, str(token)):
+                    live = {'consumer': {'adapter': 'docker-registry', 'registry': 'other.example',
+                                         'username': 'other-user'},
+                            'source': {'kind': 'file', 'path': path}, 'lifecycle': 'static'}
+                    with self.subTest(path=path), patch.object(Path, 'read_text', side_effect=AssertionError('token read')):
+                        resolved = canary.registry_credential(home, live)
+                        self.assertEqual(resolved['consumer'], live['consumer'])
+                        self.assertEqual(resolved['source']['path'], str(token))
+                        self.assertEqual(live['source']['path'], path)
+
+    # A present but unsuitable declaration must fail with a named diagnostic
+    # instead of a traceback or defaults. Cover missing/invalid shape and paths.
+    def test_invalid_registry_declarations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            valid = {'consumer': {'adapter': 'docker-registry'},
+                     'source': {'kind': 'file', 'path': str(home)}, 'lifecycle': 'static'}
+            cases = [({}, 'expected docker-registry'),
+                     ([], 'invalid credential declaration'),
+                     ({**valid, 'consumer': {'adapter': 'gh'}}, 'expected docker-registry'),
+                     ({**valid, 'source': {'kind': 'env'}}, 'expected docker-registry'),
+                     ({**valid, 'source': {'kind': 'file'}}, 'token path'),
+                     ({**valid, 'source': None}, 'expected docker-registry'),
+                     ({key: value for key, value in valid.items() if key != 'lifecycle'}, 'lifecycle'),
+                     ({**valid, 'lifecycle': []}, 'lifecycle')]
+            for path in ('', None, 42, 'relative', '~', '~other/token', str(home)):
+                diagnostic = ('token path' if not isinstance(path, str) or not path
+                              else 'missing token file' if path == str(home) else 'absolute')
+                cases.append(({**valid, 'source': {'kind': 'file', 'path': path}}, diagnostic))
+            for live, diagnostic in cases:
+                with self.subTest(live=live), self.assertRaisesRegex(
+                        canary.CanaryFailure, canary.REGISTRY_CREDENTIAL + '.*' + diagnostic):
+                    canary.registry_credential(home, live)
+
+    # Malformed host list records must retain named canary diagnostics, including
+    # absent metadata/spec and invalid JSON, rather than leak a raw traceback.
+    def test_invalid_host_registry_records(self):
+        records = [{}, {'metadata': None}, {'metadata': {}}, {'metadata': {'name': None}},
+                   {'metadata': {'name': canary.REGISTRY_CREDENTIAL}},
+                   {'metadata': {'name': canary.REGISTRY_CREDENTIAL}, 'spec': None}]
+        responses = [json.dumps({'records': [{'object': record}]}) for record in records]
+        responses.extend(('invalid-json', '{}', '{"records": null}'))
+        for response in responses:
+            with self.subTest(response=response), patch.object(canary.Commands, 'run', return_value=response):
+                with self.assertRaisesRegex(canary.CanaryFailure, canary.REGISTRY_CREDENTIAL + '.*invalid host'):
+                    canary.live_registry_spec(io.StringIO())
+
+    # Missing host material fails before starting a daemon or admitting a convoy.
+    def test_missing_registry_token_fails_before_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'fleet-canary-agent.sh').write_text('#!/bin/bash\n')
+            processes = Processes(root / 'probe')
+            gate = canary.Canary(root, root / 'probe', processes, host_home=root)
+            with self.assertRaisesRegex(canary.CanaryFailure, 'lab-forgejo-registry-pull: missing token file:') as error:
+                gate.prepare()
+            self.assertIn(str(root / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'), str(error.exception))
+            self.assertEqual(processes.calls, [])
+
+    # The canary environment must ignore ambient Docker login configuration.
+    def test_no_ambient_docker_config(self):
+        with patch.dict(os.environ, {'DOCKER_CONFIG': '/ambient/docker'}):
+            self.assertNotIn('DOCKER_CONFIG', canary.isolated_environment(Path('/release'), Path('/probe')))
 
     # CLI failures may put structured diagnostics on stdout, stderr, or both.
     # Exercise the actual subprocess boundary, including empty streams.
@@ -211,6 +321,7 @@ class Contract(unittest.TestCase):
     # Cases cover admission, launch, isolation, baseline, settlement and cleanup failures.
     def test_lifecycle_failures_name_the_failed_assertion(self):
         for failure, diagnostic in [('federated', 'unfederated'), ('admission', 'admission'),
+                                    ('credential-observation', 'host observes registry credential'),
                                     ('terminal', 'Running'), ('skills', 'crew skills'),
                                     ('settlement', 'convoy settles'), ('resources', 'resources are reaped'),
                                     ('container', 'containers were not reaped')]:
@@ -225,6 +336,9 @@ class Contract(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 release = Path(directory)
                 (release / 'fleet-canary-agent.sh').write_text('#!/bin/bash\n')
+                token = release / '.config/flotilla/credentials/lab-forgejo-registry-pull.token'
+                token.parent.mkdir(parents=True)
+                token.write_text('test-registry-token\n')
                 processes = []
 
                 def factory(environment, log):
@@ -245,7 +359,9 @@ class Contract(unittest.TestCase):
                     return fake
 
                 stdout, stderr = io.StringIO(), io.StringIO()
-                with patch.object(canary, 'Commands', factory), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with patch.object(canary, 'Commands', factory), patch.object(canary, 'live_registry_spec', return_value=None), \
+                        patch.object(Path, 'home', return_value=release), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     result = canary.main([str(release)])
                 root = processes[0].root
                 try:
