@@ -1354,6 +1354,23 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CliList(items) => format_cli_list_human(items),
         CommandValue::DispatchBoard(board) => serde_json::to_string_pretty(board).expect("board serializes"),
         CommandValue::DispatchQueue(queue) => format_dispatch_queue_human(queue),
+        CommandValue::PromiseQueue(set) => {
+            let mut output = String::from("CONVOY\tVESSEL\tROLE\tPROMISE\tREFERENCE\tDIGEST\tSUBMITTED AT\n");
+            for row in set.rows.as_verdict_queue().unwrap_or_default() {
+                output.push_str(&format!(
+                    "{}/{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    row.convoy.namespace,
+                    row.convoy.name,
+                    row.vessel,
+                    row.role,
+                    row.promise,
+                    row.reference,
+                    row.digest,
+                    row.submitted_at.to_rfc3339()
+                ));
+            }
+            output
+        }
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
         CommandValue::FleetHealth(fleet) => format_fleet_health_human(fleet),

@@ -125,6 +125,7 @@ fn uncovered_subject_service_warns_with_service() {
         convoys: &convoys,
         independents: &[],
         standing_roles: &[],
+        verdict_queue: &[],
         project_repositories: &[],
     };
     let warnings = Warnings::default();

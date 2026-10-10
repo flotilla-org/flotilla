@@ -37,6 +37,7 @@ fn command_action_name(command: &Command) -> &'static str {
         CommandAction::ConvoyAbandon { .. } => "convoy_abandon",
         CommandAction::ConvoyResume { .. } => "convoy_resume",
         CommandAction::CrewPromise { .. } => "crew_promise",
+        CommandAction::PromiseVerdict { .. } => "promise_verdict",
         CommandAction::CrewComplete { .. } => "crew_complete",
         CommandAction::CrewFail { .. } => "crew_fail",
         CommandAction::CrewStall { .. } => "crew_stall",
@@ -58,7 +59,7 @@ fn command_subject(action: &CommandAction) -> String {
         | CommandAction::ConvoyResume { namespace, name, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), name)
         }
-        CommandAction::CrewSupervise { namespace, convoy, .. } => {
+        CommandAction::CrewSupervise { namespace, convoy, .. } | CommandAction::PromiseVerdict { namespace, convoy, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), convoy)
         }
         CommandAction::CrewComplete { context, .. }

@@ -13,7 +13,7 @@ use flotilla_protocol::{
     issue_query::READY_ISSUE_LABEL,
     result_set::{
         AwarenessGrouping, AwarenessLimit, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, ProjectRepositoriesRow, QueryId,
-        QueryScope, ResultDelta, ResultSet, ResultSetState, Rows, StandingRoleRow,
+        QueryScope, ResultDelta, ResultSet, ResultSetState, Rows, StandingRoleRow, VerdictQueueRow,
     },
     HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
@@ -28,6 +28,7 @@ use crate::{
     salience::SalienceFacts,
     scoped_store::{ScopedCheckoutProjection, ScopedIndependentProjection},
     standing_roles::StandingRoleProjection,
+    verdict_queue::VerdictQueueProjection,
 };
 
 /// A typed row of some named query's result set.
@@ -134,6 +135,8 @@ pub struct AggregatorProjectionState {
     checkouts: Arc<RwLock<ScopedCheckoutProjection>>,
     #[builder(skip)]
     standing_roles: Arc<RwLock<StandingRoleProjection>>,
+    #[builder(skip)]
+    verdict_queue: Arc<RwLock<VerdictQueueProjection>>,
     #[builder(skip)]
     project_repositories: Arc<RwLock<ProjectRepositoryProjection>>,
     #[builder(skip)]
@@ -255,6 +258,10 @@ impl AggregatorProjectionState {
 
     /// Replace the fleet-wide standing-role declarations. Ensures replicate as
     /// definitions, so these rows are already fleet-merged.
+    pub async fn update_verdict_queue(&self, convoy: &ResourceRef, rows: Vec<VerdictQueueRow>) -> Vec<ResultDelta> {
+        self.verdict_queue.write().await.update_convoy(convoy, rows)
+    }
+
     pub async fn replace_standing_role_rows(&self, rows: Vec<StandingRoleRow>) -> Vec<ResultDelta> {
         self.standing_roles.write().await.replace_rows(rows)
     }
@@ -360,6 +367,7 @@ impl AggregatorProjectionState {
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
             QueryId::Awareness { scope, grouping, limit } => Some(self.awareness_result_set(scope, *grouping, *limit).await),
             QueryId::StandingRoles { scope } => Some(self.standing_roles.write().await.result_set(scope)),
+            QueryId::VerdictQueue { scope } => Some(self.verdict_queue.write().await.result_set(scope)),
             QueryId::DispatchReady { scope } => Some(self.dispatch_ready.write().await.result_set(scope)),
             QueryId::ProjectRepositories { scope } => Some(self.project_repositories.write().await.result_set(scope)),
         };

@@ -842,6 +842,9 @@ impl CrewService {
                 if reference.trim().is_empty() {
                     return Err("submission reference must not be empty".into());
                 }
+                if kind.requires_human_verdict() && metadata.get("digest").is_none_or(|digest| digest.trim().is_empty()) {
+                    return Err("demo-video submissions require digest metadata for the uploaded file".into());
+                }
                 let mut metadata = metadata;
                 if kind == PromiseKind::Pr {
                     let forges = self
@@ -862,11 +865,12 @@ impl CrewService {
                 let id = match promise {
                     Some(id) => id,
                     None => {
-                        let canonical = metadata.get("subject").unwrap_or(&reference);
+                        let canonical =
+                            if kind.requires_human_verdict() { &reference } else { metadata.get("subject").unwrap_or(&reference) };
                         if let Some(existing) = promises.iter().find(|p| {
                             p.kind == kind
                                 && p.state != PromiseState::Retracted
-                                && p.submissions.last().is_some_and(|s| s.subject() == canonical)
+                                && p.submissions.last().is_some_and(|s| s.identity(kind) == canonical)
                         }) {
                             existing.id.clone()
                         } else {
@@ -880,7 +884,8 @@ impl CrewService {
                     }
                 };
                 if let Some(p) = promises.iter().find(|p| p.id == id) {
-                    let same = p.submissions.last().is_some_and(|s| s.subject() == metadata.get("subject").unwrap_or(&reference));
+                    let canonical = if kind.requires_human_verdict() { &reference } else { metadata.get("subject").unwrap_or(&reference) };
+                    let same = p.submissions.last().is_some_and(|s| s.identity(kind) == canonical);
                     if p.kind != kind
                         || (p.state != PromiseState::Open && !(same && matches!(p.state, PromiseState::Submitted | PromiseState::Kept)))
                     {

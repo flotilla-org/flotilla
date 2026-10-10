@@ -1309,7 +1309,9 @@ impl App {
                             .dispatch_ready
                             .insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
-                    flotilla_protocol::Rows::StandingRoles { .. } | flotilla_protocol::Rows::ProjectRepositories { .. } => {}
+                    flotilla_protocol::Rows::VerdictQueue { .. }
+                    | flotilla_protocol::Rows::StandingRoles { .. }
+                    | flotilla_protocol::Rows::ProjectRepositories { .. } => {}
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1384,7 +1386,7 @@ impl App {
                             |left, right| left.reference.cmp_id_desc(&right.reference),
                         );
                     }
-                    flotilla_protocol::QueryChanges::StandingRoles { .. } => {}
+                    flotilla_protocol::QueryChanges::StandingRoles { .. } | flotilla_protocol::QueryChanges::VerdictQueue { .. } => {}
                     flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
                         let result = self.query_tables.checkouts.entry(query).or_default();
                         result.apply_delta(

@@ -10,7 +10,7 @@ use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, ConvoyPhase,
         ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
-        SurfaceState, Timestamp, VesselRow, WorkPhase,
+        SurfaceState, Timestamp, VerdictQueueRow, VesselRow, WorkPhase,
     },
     HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
@@ -32,8 +32,10 @@ use crate::{
         KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
         KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON,
         KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME,
-        KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
-        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES,
+        KEY_PROJECT_REPOSITORY_COUNT, KEY_PROMISE_ID, KEY_PROMISE_KIND, KEY_PROMISE_ROLE, KEY_PROMISE_VESSEL, KEY_REPO_NAME, KEY_ROLE,
+        KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
+        KEY_SUBMISSION_CONVOY_NAME, KEY_SUBMISSION_CONVOY_NAMESPACE, KEY_SUBMISSION_DIGEST, KEY_SUBMISSION_REFERENCE,
+        KEY_SUBMISSION_SUBMITTED_AT, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES,
         KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME,
         KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND,
         KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME, KEY_VESSEL_POLICY,
@@ -52,6 +54,7 @@ pub struct CatalogInput<'a> {
     pub convoys: &'a [ConvoyRow],
     pub independents: &'a [IndependentRow],
     pub standing_roles: &'a [StandingRoleRow],
+    pub verdict_queue: &'a [VerdictQueueRow],
     pub project_repositories: &'a [ProjectRepositoriesRow],
 }
 
@@ -372,6 +375,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
 /// Projection for connectors that own diagnostic suppression across rebuilds.
 pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catalog {
     let mut catalog = Catalog::default();
+    project_verdict_queue(&mut catalog, input.verdict_queue);
     if let Some(nodes) = input.awareness {
         for node in nodes {
             project_awareness_node(&mut catalog, node, input.convoys, mint);
@@ -1261,6 +1265,31 @@ fn direct_facts(endpoint: Option<&CleatEndpoint>, host: &HostName, mint: &dyn Re
             ]
         }
         Err(reason) => vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text(reason))],
+    }
+}
+
+fn project_verdict_queue(catalog: &mut Catalog, rows: &[VerdictQueueRow]) {
+    for row in rows {
+        let target = entity::verdict_submission(&row.resource);
+        let convoy = entity::convoy(&row.convoy.namespace, &row.convoy.name, &entity::resource_origin(&row.convoy));
+        catalog.assert_entity(
+            target,
+            [
+                (KEY_CONVOY, MetadataValue::text(convoy.id)),
+                (KEY_DISPLAY_LABEL, MetadataValue::text(&row.promise)),
+                (KEY_SUBMISSION_CONVOY_NAMESPACE, MetadataValue::text(&row.convoy.namespace)),
+                (KEY_SUBMISSION_CONVOY_NAME, MetadataValue::text(&row.convoy.name)),
+                (KEY_PROMISE_ID, MetadataValue::text(&row.promise)),
+                (KEY_PROMISE_KIND, MetadataValue::text(&row.kind)),
+                (KEY_PROMISE_VESSEL, MetadataValue::text(&row.vessel)),
+                (KEY_PROMISE_ROLE, MetadataValue::text(&row.role)),
+                (KEY_SUBMISSION_REFERENCE, MetadataValue::text(&row.reference)),
+                (KEY_SUBMISSION_DIGEST, MetadataValue::text(&row.digest)),
+                (KEY_SUBMISSION_SUBMITTED_AT, MetadataValue::text(row.submitted_at.to_rfc3339())),
+                (KEY_STATUS_STATE, MetadataValue::text("awaiting_human_verdict")),
+            ],
+            None,
+        );
     }
 }
 
