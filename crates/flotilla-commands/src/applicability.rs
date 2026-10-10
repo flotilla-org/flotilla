@@ -43,6 +43,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryFulfilmentList {}
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
+        | CommandAction::QueryPromiseQueue { .. }
         | CommandAction::QueryCrewCapabilities { .. }
         | CommandAction::QueryMessageContacts { .. }
         | CommandAction::QueryCrewList { .. }
@@ -73,6 +74,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::ConvoyWithdrawPendingBrief { .. }
         | CommandAction::CrewHandoff { .. }
         | CommandAction::CrewPromise { .. }
+        | CommandAction::PromiseVerdict { .. }
         | CommandAction::CrewComplete { .. }
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewStall { .. }

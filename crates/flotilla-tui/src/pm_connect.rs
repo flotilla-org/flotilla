@@ -38,7 +38,7 @@ use flotilla_manifest::{
 use flotilla_protocol::{
     result_set::{
         AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, ProjectRepositoriesRow, QueryChanges, ResultDelta,
-        ResultSet, Rows, StandingRoleRow,
+        ResultSet, Rows, StandingRoleRow, VerdictQueueRow,
     },
     DaemonEvent, HostName, QueryCursor, QueryId, ResourceRef,
 };
@@ -128,6 +128,7 @@ pub struct ConnectorState {
     convoys: HashMap<ResourceRef, ConvoyRow>,
     independents: HashMap<ResourceRef, IndependentRow>,
     standing_roles: HashMap<ResourceRef, StandingRoleRow>,
+    verdict_queue: HashMap<ResourceRef, VerdictQueueRow>,
     project_repositories: HashMap<ResourceRef, ProjectRepositoriesRow>,
     seqs: HashMap<QueryId, u64>,
     catalog: Arc<Mutex<Catalog>>,
@@ -143,6 +144,7 @@ impl Default for ConnectorState {
             convoys: HashMap::new(),
             independents: HashMap::new(),
             standing_roles: HashMap::new(),
+            verdict_queue: HashMap::new(),
             project_repositories: HashMap::new(),
             seqs: HashMap::new(),
             catalog: Arc::new(Mutex::new(Catalog::default())),
@@ -184,6 +186,10 @@ impl ConnectorState {
                 self.standing_roles = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
             }
             Rows::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
+            Rows::VerdictQueue { scope: None, rows } => {
+                self.verdict_queue = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+            }
+            Rows::VerdictQueue { scope: Some(_), .. } => return Applied::Ignored,
             Rows::ProjectRepositories { scope: None, rows } => {
                 self.project_repositories = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
             }
@@ -236,6 +242,15 @@ impl ConnectorState {
                 }
             }
             QueryChanges::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
+            QueryChanges::VerdictQueue { scope: None, changed: rows, removed } => {
+                for row in rows {
+                    self.verdict_queue.insert(row.resource.clone(), row.clone());
+                }
+                for removed in removed {
+                    self.verdict_queue.remove(removed);
+                }
+            }
+            QueryChanges::VerdictQueue { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::ProjectRepositories { scope: None, changed, removed } => {
                 for row in changed {
                     self.project_repositories.insert(row.resource.clone(), row.clone());
@@ -274,6 +289,7 @@ impl ConnectorState {
     pub fn rebuild_at(&mut self, mint: &dyn RecipeMint, now: flotilla_protocol::result_set::Timestamp) -> Vec<MetadataPatch> {
         let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
         let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
+        let verdict_queue = self.verdict_queue.values().cloned().collect::<Vec<_>>();
         let standing_roles: Vec<StandingRoleRow> = self.standing_roles.values().cloned().collect();
         let project_repositories: Vec<ProjectRepositoriesRow> = self.project_repositories.values().cloned().collect();
         let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
@@ -286,6 +302,7 @@ impl ConnectorState {
                 convoys: &convoys,
                 independents: &independents,
                 standing_roles: &standing_roles,
+                verdict_queue: &verdict_queue,
                 project_repositories: &project_repositories,
             },
             mint,

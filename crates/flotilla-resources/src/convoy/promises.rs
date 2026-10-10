@@ -11,6 +11,20 @@ use super::ConvoyStatus;
 pub enum PromiseKind {
     Pr,
     DecisionLedger,
+    DemoVideo,
+}
+
+impl PromiseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pr => "pr",
+            Self::DecisionLedger => "decision-ledger",
+            Self::DemoVideo => "demo-video",
+        }
+    }
+    pub fn requires_human_verdict(self) -> bool {
+        matches!(self, Self::DemoVideo)
+    }
 }
 
 impl std::str::FromStr for PromiseKind {
@@ -19,7 +33,8 @@ impl std::str::FromStr for PromiseKind {
         match value {
             "pr" => Ok(Self::Pr),
             "decision-ledger" => Ok(Self::DecisionLedger),
-            _ => Err(format!("unknown promise kind `{value}`; expected pr or decision-ledger")),
+            "demo-video" => Ok(Self::DemoVideo),
+            _ => Err(format!("unknown promise kind `{value}`; expected pr, decision-ledger or demo-video")),
         }
     }
 }
@@ -67,6 +82,18 @@ pub struct Submission {
     pub verdict: Option<SubmissionVerdict>,
 }
 impl Submission {
+    /// PR subject metadata canonicalizes forge URLs. Human evidence refers to
+    /// the uploaded file itself, regardless of other submitted annotations.
+    pub fn identity(&self, kind: PromiseKind) -> &str {
+        if kind.requires_human_verdict() {
+            &self.reference
+        } else {
+            self.subject()
+        }
+    }
+    fn has_required_evidence(&self, kind: PromiseKind) -> bool {
+        !kind.requires_human_verdict() || self.metadata.get("digest").is_some_and(|digest| !digest.trim().is_empty())
+    }
     pub fn subject(&self) -> &str {
         self.metadata.get("subject").map(String::as_str).unwrap_or(&self.reference)
     }
@@ -87,10 +114,11 @@ pub fn effect_present(status: &ConvoyStatus, vessel: &str, role: &str, operation
     match operation {
         PromiseOperation::Declare { kind, source, .. } => promise.kind == *kind && promise.source == *source,
         PromiseOperation::Submit { kind, submission, .. } => {
-            promise.kind == *kind
+            submission.has_required_evidence(*kind)
+                && promise.kind == *kind
                 && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept)
                 && promise.submissions.last().is_some_and(|prior| {
-                    prior.subject() == submission.subject()
+                    prior.identity(*kind) == submission.identity(*kind)
                         && submission.metadata.iter().all(|(key, value)| prior.metadata.get(key) == Some(value))
                 })
         }
@@ -129,6 +157,8 @@ pub fn needs_observation(status: &ConvoyStatus, kind: PromiseKind) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmissionVerdict {
     pub accepted: bool,
+    /// Human verdicts record the authenticated principal as `namespace/name`;
+    /// automatic verdicts retain the observing controller's identity.
     pub who: String,
     pub at: DateTime<Utc>,
     pub why: String,
@@ -150,6 +180,11 @@ pub fn pending(status: &ConvoyStatus, vessel: &str, role: &str) -> Vec<String> {
 }
 
 pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &PromiseOperation) {
+    if let PromiseOperation::Submit { kind, submission, .. } = operation {
+        if !submission.has_required_evidence(*kind) {
+            return;
+        }
+    }
     if status.phase.is_terminal() {
         return;
     }
@@ -171,8 +206,11 @@ pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &Pr
             let promise = promises.iter_mut().find(|p| p.id == *id).expect("inserted promise");
             if let PromiseOperation::Submit { submission, .. } = operation {
                 if promise.kind == *kind && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept) {
-                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.subject() == submission.subject()) {
-                        prior.metadata.extend(submission.metadata.clone());
+                    if let Some(prior) = promise.submissions.last_mut().filter(|prior| prior.identity(*kind) == submission.identity(*kind))
+                    {
+                        if !kind.requires_human_verdict() {
+                            prior.metadata.extend(submission.metadata.clone());
+                        }
                     }
                     return;
                 }
@@ -434,6 +472,7 @@ fn observed_verdict(
     }
     let submission = promise.submissions.last()?;
     let (accepted, who, why) = match promise.kind {
+        PromiseKind::DemoVideo => return None, // Only an operator verdict keeps a video.
         // Kept verifies artifact existence/provenance, not the quality of its
         // decisions. Ledger validation remains the artifact intake boundary.
         PromiseKind::DecisionLedger => {
@@ -516,6 +555,57 @@ fn discovery_owner(status: &ConvoyStatus) -> Option<(&str, &str)> {
         .find(|(_, role)| role.as_str() == "coder")
         .or_else(|| owners.first())
         .map(|(vessel, role)| (vessel.as_str(), role.as_str()))
+}
+
+/// Resolve an unambiguous current human-reviewed attempt. Automatic kinds cannot
+/// be overridden; caller authentication is the command boundary's responsibility.
+pub fn human_verdict(
+    status: &ConvoyStatus,
+    id: &str,
+    vessel: Option<&str>,
+    role: Option<&str>,
+    submitted_at: Option<DateTime<Utc>>,
+    verdict: SubmissionVerdict,
+) -> Result<(String, String, PromiseOperation), String> {
+    if status.phase.is_terminal() {
+        return Err("cannot give a verdict on a terminal convoy".into());
+    }
+    if verdict.why.trim().is_empty() || verdict.who.trim().is_empty() {
+        return Err("verdict requires who and a reason".into());
+    }
+    let matches = status
+        .promises
+        .iter()
+        .filter(|(v, _)| vessel.is_none_or(|wanted| wanted == v.as_str()))
+        .flat_map(|(v, crew)| {
+            crew.iter()
+                .filter(move |(r, _)| role.is_none_or(|wanted| wanted == r.as_str()))
+                .flat_map(move |(r, promises)| promises.iter().filter(move |p| p.id == id).map(move |p| (v, r, p)))
+        })
+        .collect::<Vec<_>>();
+    let [(vessel, role, promise)] = matches.as_slice() else {
+        return Err("promise is missing or ambiguous; select --vessel and --role".into());
+    };
+    if !promise.kind.requires_human_verdict() {
+        return Err("this promise kind does not accept human verdicts".into());
+    }
+    if promise.state != PromiseState::Submitted {
+        return Err("promise has no submission awaiting a verdict".into());
+    }
+    let submission = promise.submissions.last().filter(|s| s.verdict.is_none()).ok_or("submission already has a verdict")?;
+    if submitted_at.is_some_and(|at| at != submission.submitted_at) {
+        return Err("submission changed; inspect the queue and retry".into());
+    }
+    Ok((
+        (*vessel).clone(),
+        (*role).clone(),
+        PromiseOperation::Verdict {
+            id: id.into(),
+            reference: submission.reference.clone(),
+            submitted_at: submission.submitted_at,
+            verdict,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -810,5 +900,157 @@ mod tests {
         let before = status.clone();
         apply(&mut status, "work", "coder", &verdict("feature", 1, true));
         assert_eq!(status, before);
+    }
+}
+
+#[cfg(test)]
+mod human_tests {
+    use super::*;
+    // Every submit writer shares the same evidence boundary, including optimistic
+    // status patches that bypass the crew command's early validation.
+    #[hegel::test]
+    fn human_submissions_require_digest_at_the_shared_transition(tc: hegel::TestCase) {
+        let digest = tc.draw(hegel::generators::integers::<usize>().max_value(3));
+        let declared = tc.draw(hegel::generators::booleans());
+        let mut status = ConvoyStatus { phase: super::super::ConvoyPhase::Active, ..Default::default() };
+        if declared {
+            apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Declare { id: "demo".into(), kind: PromiseKind::DemoVideo, source: PromiseSource::Crew },
+            );
+        }
+        let before = status.clone();
+        let metadata = match digest {
+            0 => BTreeMap::new(),
+            1 => BTreeMap::from([("digest".into(), "".into())]),
+            2 => BTreeMap::from([("digest".into(), " \t".into())]),
+            _ => BTreeMap::from([("digest".into(), "sha256:video".into())]),
+        };
+        let operation = PromiseOperation::Submit {
+            id: "demo".into(),
+            kind: PromiseKind::DemoVideo,
+            source: PromiseSource::Crew,
+            submission: Submission { reference: "https://upload/video.mp4".into(), metadata, submitted_at: Utc::now(), verdict: None },
+        };
+        apply(&mut status, "work", "coder", &operation);
+        if digest < 3 {
+            assert_eq!(status, before, "invalid evidence must not create or mutate a promise");
+            assert!(!effect_present(&status, "work", "coder", &operation));
+        } else {
+            assert!(effect_present(&status, "work", "coder", &operation));
+            // Even if old stored evidence lacks a digest, an invalid operation
+            // must never be reported as a successful persisted submission.
+            status.promises.get_mut("work").unwrap().get_mut("coder").unwrap()[0].submissions[0].metadata.clear();
+            let mut invalid = operation.clone();
+            if let PromiseOperation::Submit { submission, .. } = &mut invalid {
+                submission.metadata.clear();
+            }
+            assert!(!effect_present(&status, "work", "coder", &invalid));
+        }
+    }
+
+    // Human verdicts apply only to the current attempt of human-reviewed kinds;
+    // they preserve who/when/reason and never rewrite already reviewed evidence.
+    #[hegel::test]
+    fn human_verdict_keeps_history_and_refuses_automatic_kinds(tc: hegel::TestCase) {
+        let accepted = tc.draw(hegel::generators::booleans());
+        let kind_index = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
+        let kind = [PromiseKind::DemoVideo, PromiseKind::Pr, PromiseKind::DecisionLedger][kind_index];
+        let mut status = ConvoyStatus { phase: super::super::ConvoyPhase::Active, ..Default::default() };
+        let now = Utc::now();
+        let submit = PromiseOperation::Submit {
+            id: "demo".into(),
+            kind,
+            source: PromiseSource::Crew,
+            submission: Submission {
+                reference: "https://upload/video.mp4".into(),
+                metadata: BTreeMap::from([("digest".into(), "sha256:original".into())]),
+                submitted_at: now,
+                verdict: None,
+            },
+        };
+        apply(&mut status, "work", "coder", &submit);
+        let verdict = SubmissionVerdict { accepted, who: "flotilla/operator".into(), at: now, why: "reviewed".into() };
+        let result = human_verdict(&status, "demo", None, None, Some(now), verdict.clone());
+        if kind != PromiseKind::DemoVideo {
+            assert!(result.is_err());
+            return;
+        }
+        let (v, r, operation) = result.expect("verdict");
+        apply(&mut status, &v, &r, &operation);
+        let promise = &owned(&status, "work", "coder")[0];
+        assert_eq!(promise.state, if accepted { PromiseState::Kept } else { PromiseState::Open });
+        assert_eq!(promise.submissions[0].verdict, Some(verdict.clone()));
+        assert!(human_verdict(&status, "demo", None, None, None, verdict.clone()).is_err());
+        if accepted {
+            let mut replacement = submit.clone();
+            if let PromiseOperation::Submit { submission, .. } = &mut replacement {
+                submission.metadata.insert("digest".into(), "sha256:replacement".into());
+            }
+            apply(&mut status, "work", "coder", &replacement);
+            assert_eq!(owned(&status, "work", "coder")[0].submissions[0].metadata["digest"], "sha256:original");
+            assert!(!effect_present(&status, "work", "coder", &replacement));
+        }
+    }
+
+    // A video's uploaded-file reference is its identity. Arbitrary metadata
+    // cannot make a different upload count as the already pending attempt.
+    #[hegel::test]
+    fn human_video_identity_is_the_uploaded_reference(tc: hegel::TestCase) {
+        // Generate distinct uploads with identical unrelated subject annotations;
+        // the lifecycle property above covers submissions without that metadata.
+        let index = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
+        let reference = format!("https://upload/{index}.mp4");
+        let mut status = ConvoyStatus { phase: super::super::ConvoyPhase::Active, ..Default::default() };
+        let mut submit = PromiseOperation::Submit {
+            id: "demo".into(),
+            kind: PromiseKind::DemoVideo,
+            source: PromiseSource::Crew,
+            submission: Submission {
+                reference: reference.clone(),
+                submitted_at: Utc::now(),
+                verdict: None,
+                metadata: BTreeMap::from([("digest".into(), "sha256:one".into()), ("subject".into(), format!("overview-{index}"))]),
+            },
+        };
+        apply(&mut status, "work", "coder", &submit);
+        if let PromiseOperation::Submit { submission, .. } = &mut submit {
+            submission.reference = format!("https://upload/{}.mp4", index + 1);
+        }
+        apply(&mut status, "work", "coder", &submit);
+        assert!(!effect_present(&status, "work", "coder", &submit));
+        assert_eq!(owned(&status, "work", "coder")[0].submissions[0].reference, reference);
+    }
+
+    // Identifiers are per crew owner. The CLI must disambiguate collisions.
+    #[test]
+    fn human_verdict_requires_unambiguous_owner_and_reason() {
+        let now = Utc::now();
+        let mut status = ConvoyStatus { phase: super::super::ConvoyPhase::Active, ..Default::default() };
+        for role in ["coder", "reviewer"] {
+            apply(
+                &mut status,
+                "work",
+                role,
+                &PromiseOperation::Submit {
+                    id: "demo".into(),
+                    kind: PromiseKind::DemoVideo,
+                    source: PromiseSource::Crew,
+                    submission: Submission {
+                        reference: "artifact/video".into(),
+                        metadata: BTreeMap::from([("digest".into(), "sha256:video".into())]),
+                        submitted_at: now,
+                        verdict: None,
+                    },
+                },
+            );
+        }
+        let verdict = SubmissionVerdict { accepted: false, who: "human".into(), at: now, why: "missing audio".into() };
+        assert!(human_verdict(&status, "demo", None, None, None, verdict.clone()).is_err());
+        assert!(human_verdict(&status, "demo", Some("work"), Some("coder"), None, verdict.clone()).is_ok());
+        let empty = SubmissionVerdict { why: " ".into(), ..verdict };
+        assert!(human_verdict(&status, "demo", Some("work"), Some("coder"), None, empty).is_err());
     }
 }

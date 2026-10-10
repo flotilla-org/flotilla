@@ -61,7 +61,7 @@ pub struct CrewPromiseArgs {
     /// Promise identifier
     #[arg(long)]
     pub promise: Option<String>,
-    /// Registered promise kind: pr or decision-ledger
+    /// Registered promise kind: pr, decision-ledger or demo-video
     #[arg(long)]
     pub kind: Option<String>,
     /// Submission reference

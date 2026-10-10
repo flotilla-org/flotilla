@@ -795,3 +795,109 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         assert!(deliveries[0].brief.contains("closed without merging"));
     });
 }
+
+// Human rejection reuses the durable turn-delivery episode machinery, including
+// exactly-once wake for working, interrupted and stalled owners.
+#[hegel::test]
+fn human_rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
+    // Cover working, yielded and stalled owners; rejection must reach each.
+    let phase = [CrewWorkPhase::Working, CrewWorkPhase::Interrupted, CrewWorkPhase::Stalled]
+        [tc.draw(hegel::generators::integers::<usize>().max_value(2))];
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use flotilla_resources::promises::{human_verdict, SubmissionVerdict};
+        use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let wake = supervision_wake(&backend);
+        let table = &wake.subscriptions;
+        let actuator = Arc::new(RecordingTurnDelivery::default());
+        table.set_turn_delivery_actuator(actuator.clone()).await;
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        let convoys = backend.using::<Convoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("rejected-promise".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+            )
+            .await
+            .unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            started_at: Some(started_at),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            }),
+            work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+            crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]))]),
+            ..Default::default()
+        };
+        flotilla_resources::promises::apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Submit {
+                id: "implementation".into(),
+                kind: PromiseKind::DemoVideo,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: "https://uploads.example/demo.mp4".into(),
+                    metadata: BTreeMap::from([("digest".into(), "sha256:video".into())]),
+                    submitted_at: started_at,
+                    verdict: None,
+                },
+            },
+        );
+        let (v, r, operation) = human_verdict(
+            &status,
+            "implementation",
+            None,
+            None,
+            None,
+            SubmissionVerdict { accepted: false, who: "operator".into(), at: Utc::now(), why: "missing narration".into() },
+        )
+        .expect("human verdict");
+        flotilla_resources::promises::apply(&mut status, &v, &r, &operation);
+        let current =
+            convoys.update_status("rejected-promise", &created.metadata.resource_version, &status).await.expect("rejected status");
+        wake.sync_rows("flotilla", &HashMap::from([("rejected-promise".into(), current)])).await.unwrap();
+        let row = table
+            .rows()
+            .await
+            .into_iter()
+            .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source.starts_with("promise-rejected/")))
+            .expect("rejection row");
+        let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { panic!("turn row") };
+        // Let the watcher record its episode before replaying the rejection. Aborting
+        // it after actuation can leave the fake's request recorded without an episode.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if convoys
+                    .get("rejected-promise")
+                    .await
+                    .unwrap()
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.turn_deliveries.get(source).is_some_and(|delivery| !delivery.episodes.is_empty()))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("promise rejection wakes its owner and records delivery");
+        table.deliver_turn(row.id, "rejected-promise", source, rule, &row.leaves[0]).await.unwrap();
+        table.deliver_turn(row.id, "rejected-promise", source, rule, &row.leaves[0]).await.unwrap();
+        let deliveries = actuator.requests.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].role, "coder");
+        assert!(deliveries[0].brief.contains("implementation"));
+        assert!(deliveries[0].brief.contains("missing narration"));
+        assert!(deliveries[0].brief.contains("operator"));
+    });
+}

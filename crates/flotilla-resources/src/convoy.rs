@@ -576,6 +576,7 @@ pub fn instantiate_turn_delivery(
         .flat_map(|(source, rule)| {
             let subjects = match &rule.on.subject {
                 SubjectVariable::ChangeRequest => change_requests.clone(),
+                SubjectVariable::Convoy => vec![LeafAddress::Convoy { name: convoy.metadata.name.clone() }],
                 SubjectVariable::Issue => issues.clone(),
                 SubjectVariable::Artifact { producer, kind, about } => match about {
                     crate::ArtifactSubjectBinding::Convoy => vec![LeafAddress::Artifact {
@@ -613,6 +614,38 @@ pub fn instantiate_turn_delivery(
         })
         .collect();
     if let Some(status) = &convoy.status {
+        // Human rejection is already a durable verdict. Arm the existing turn
+        // delivery mechanism against this active convoy, once per attempt.
+        for promise in status
+            .promises
+            .values()
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .filter(|p| p.kind.requires_human_verdict() && p.state == promises::PromiseState::Open)
+        {
+            let Some(submission) = promise.submissions.last() else {
+                continue;
+            };
+            let Some(verdict) = submission.verdict.as_ref().filter(|verdict| !verdict.accepted) else {
+                continue;
+            };
+            let leaf = Leaf {
+                address: LeafAddress::Convoy { name: convoy.metadata.name.clone() },
+                field_path: ".status.phase".into(),
+                operator: LeafOperator::Equal,
+                literal: "Active".into(),
+            };
+            let rule = TurnDeliveryRule::builder().on("$convoy.status.phase == Active".parse().expect("valid human rejection leaf"))
+                .to(crate::TurnDeliveryTarget::builder().vessel(promise.vessel.clone()).role(promise.role.clone()).build())
+                .brief(format!("Promise `{}` submission `{}` was rejected by {}: {}. Inspect your open promises and resubmit or propose retraction with a reason.",
+                    promise.id, submission.reference, verdict.who, verdict.why))
+                .hold(crate::HoldAct::State).build();
+            rows.push(InstantiatedTurnDelivery {
+                source: format!("promise-rejected/{}/{}/{}/{}", promise.vessel, promise.role, promise.id, promise.submissions.len()),
+                leaf,
+                rule,
+            });
+        }
         for promise in status
             .promises
             .values()

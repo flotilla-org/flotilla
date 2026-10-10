@@ -118,6 +118,72 @@ pub(super) struct CrewActions<'a> {
 }
 
 impl CrewActions<'_> {
+    pub(super) async fn execute_action_promise_verdict(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<CommandCaller>,
+    ) -> Result<u64, String> {
+        let CommandAction::PromiseVerdict { namespace, convoy, promise, vessel, role, accepted, reason, submitted_at } = &command.action
+        else {
+            return Err("wrong verdict handler".into());
+        };
+        let identity = self.port.start_context_free_command(id, command.description().to_string());
+        let result = async {
+            let caller = caller.as_ref().filter(|caller| caller.crew.is_none()).ok_or("human verdict requires an operator caller")?;
+            if reason.trim().is_empty() {
+                return Err("a verdict requires a nonempty reason".into());
+            }
+            let namespace = namespace.clone().unwrap_or(self.port.provisioning_namespace().await);
+            let convoys = self.port.resource_backend().clone().using::<ResourceConvoy>(&namespace);
+            // Exact record names only: never list the store to resolve this operation.
+            let object = convoys.get(convoy).await.map_err(|e| e.to_string())?;
+            let operation = flotilla_resources::promises::human_verdict(
+                object.status.as_ref().ok_or("convoy has no status")?,
+                promise,
+                vessel.as_deref(),
+                role.as_deref(),
+                *submitted_at,
+                flotilla_resources::promises::SubmissionVerdict {
+                    accepted: *accepted,
+                    who: format!("{}/{}", caller.principal_ref.namespace, caller.principal_ref.name),
+                    at: self.port.clock().now(),
+                    why: reason.trim().to_owned(),
+                },
+            )?;
+            let (vessel, role, operation) = operation;
+            let updated = flotilla_store::apply_status_patch(
+                &convoys,
+                convoy,
+                &flotilla_resources::ConvoyStatusPatch::Promise {
+                    vessel: vessel.clone(),
+                    role: role.clone(),
+                    operation: operation.clone(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            if updated
+                .status
+                .as_ref()
+                .is_none_or(|status| !flotilla_resources::promises::effect_present(status, &vessel, &role, &operation))
+            {
+                return Err("submission changed concurrently; inspect the queue and retry".into());
+            }
+            Ok(())
+        }
+        .await;
+        self.port.finish_context_free_command(
+            id,
+            identity,
+            match result {
+                Ok(()) => CommandValue::Ok,
+                Err(message) => CommandValue::Error { message },
+            },
+        );
+        Ok(id)
+    }
+
     pub(super) async fn execute_action_crew_promise(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::CrewPromise { context, operation } = &command.action else {
             return Err("wrong promise handler".into());

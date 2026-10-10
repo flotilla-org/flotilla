@@ -176,9 +176,15 @@ pub struct LeafTemplate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectVariable {
+    /// Used by generated promise-rejection rules; not admitted in workflow templates.
+    Convoy,
     ChangeRequest,
     Issue,
-    Artifact { producer: String, kind: String, about: ArtifactSubjectBinding },
+    Artifact {
+        producer: String,
+        kind: String,
+        about: ArtifactSubjectBinding,
+    },
 }
 
 impl FromStr for LeafTemplate {
@@ -198,6 +204,7 @@ impl FromStr for LeafTemplate {
             .ok_or_else(|| leaf_template_syntax_error(input))?;
         let subject = match subject {
             "$cr" => SubjectVariable::ChangeRequest,
+            "$convoy" => SubjectVariable::Convoy,
             "$issue" => SubjectVariable::Issue,
             artifact if artifact.starts_with("$artifact(") && artifact.ends_with(')') => {
                 let values = artifact.trim_start_matches("$artifact(").trim_end_matches(')').split(',').collect::<Vec<_>>();
@@ -237,6 +244,7 @@ impl fmt::Display for LeafTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let subject = match &self.subject {
             SubjectVariable::ChangeRequest => "$cr",
+            SubjectVariable::Convoy => "$convoy",
             SubjectVariable::Issue => "$issue",
             SubjectVariable::Artifact { .. } => return write!(f, "{}{} {} {}", self.subject, self.field_path, self.operator, self.literal),
         };
@@ -248,6 +256,7 @@ impl fmt::Display for SubjectVariable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ChangeRequest => f.write_str("$cr"),
+            Self::Convoy => f.write_str("$convoy"),
             Self::Issue => f.write_str("$issue"),
             Self::Artifact { producer, kind, about } => write!(
                 f,
@@ -886,6 +895,7 @@ fn validate_turn_delivery(
         } else {
             let kind = match &rule.on.subject {
                 SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
+                SubjectVariable::Convoy => LeafKind::Convoy,
                 SubjectVariable::Issue => LeafKind::Issue,
                 SubjectVariable::Artifact { .. } => LeafKind::Artifact,
             };

@@ -369,3 +369,14 @@ pub const KEY_CONVOY_HOLDS: &str = "flotilla.convoy.holds";
 pub const KEY_CONVOY_LEDGER: &str = "flotilla.convoy.latest_ledger";
 pub const KEY_CONVOY_PENDING_MESSAGES: &str = "flotilla.convoy.pending_messages";
 pub const KEY_CONVOY_STUCK_MESSAGES: &str = "flotilla.convoy.stuck_messages";
+
+// Human verdict queue entities. These are connector facts, never stored resources.
+pub const KEY_PROMISE_ID: &str = "flotilla.promise.id";
+pub const KEY_PROMISE_KIND: &str = "flotilla.promise.kind";
+pub const KEY_PROMISE_VESSEL: &str = "flotilla.promise.vessel";
+pub const KEY_PROMISE_ROLE: &str = "flotilla.promise.role";
+pub const KEY_SUBMISSION_REFERENCE: &str = "flotilla.submission.reference";
+pub const KEY_SUBMISSION_DIGEST: &str = "flotilla.submission.digest";
+pub const KEY_SUBMISSION_SUBMITTED_AT: &str = "flotilla.submission.submitted-at";
+pub const KEY_SUBMISSION_CONVOY_NAMESPACE: &str = "flotilla.submission.convoy.namespace";
+pub const KEY_SUBMISSION_CONVOY_NAME: &str = "flotilla.submission.convoy.name";

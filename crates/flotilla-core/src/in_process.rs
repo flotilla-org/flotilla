@@ -3122,7 +3122,8 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
-            flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. } => {
+            flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. }
+            | flotilla_protocol::CommandAction::PromiseVerdict { namespace, convoy, .. } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), convoy.as_str())
             }
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
@@ -5916,6 +5917,7 @@ impl InProcessDaemon {
                 return boxed_action!(crew.execute_action_convoy_withdraw_pending_brief(id, &command))
             }
             CommandAction::CrewPromise { .. } => return boxed_action!(crew.execute_action_crew_promise(id, &command)),
+            CommandAction::PromiseVerdict { .. } => return boxed_action!(crew.execute_action_promise_verdict(id, &command, &caller)),
             CommandAction::CrewComplete { .. } => {
                 return boxed_action!(crew.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref))
             }
@@ -6093,6 +6095,15 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        if matches!(command.action, CommandAction::QueryPromiseQueue {}) {
+            let set = self
+                .aggregator_projection_state()
+                .await
+                .result_set_for(&flotilla_protocol::QueryId::VerdictQueue { scope: None })
+                .await
+                .ok_or("verdict queue unavailable")?;
+            return Ok(CommandValue::PromiseQueue(Box::new(set)));
+        }
         projections_actions::ProjectionsActions { port: self }.execute_query(command, session_id).await
     }
 
