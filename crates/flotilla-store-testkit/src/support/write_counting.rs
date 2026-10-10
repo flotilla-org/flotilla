@@ -3,9 +3,8 @@ use std::sync::{
     Arc,
 };
 
-use flotilla_resources::{
-    apply_status_patch, InputMeta, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, StatusPatch, TypedResolver,
-};
+use flotilla_resources::{InputMeta, Resource, ResourceError, ResourceList, ResourceObject, StatusPatch};
+use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
 
 /// Decorates a resource backend with a counter for attempted mutations.
 ///

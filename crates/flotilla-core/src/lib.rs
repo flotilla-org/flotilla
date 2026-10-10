@@ -66,7 +66,6 @@ pub mod vcs;
 
 // Re-export shared infrastructure and host types for convenience.
 pub use flotilla_protocol::HostName;
-pub use flotilla_resources::tls;
 
 pub mod forge_observation;
 

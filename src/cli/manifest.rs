@@ -215,7 +215,8 @@ mod tests {
 
     #[tokio::test]
     async fn drifted_batch_selection_decodes_typed_status_and_deduplicates_replicas() {
-        use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, InMemoryBackend, InputMeta, ResourceBackend};
+        use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, InputMeta};
+        use flotilla_store::{InMemoryBackend, ResourceBackend};
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let mut ensure = backend
             .using::<ConvoyEnsure>("flotilla")

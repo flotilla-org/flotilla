@@ -1,0 +1,65 @@
+[package]
+name = "flotilla-store"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[features]
+# Keep helper features uniform across build/workspace/package commands on stable.
+default = []
+aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
+skip-no-sandbox-tests = []
+
+[dependencies]
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-tls = { path = "../flotilla-tls" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+futures = "0.3"
+indexmap = { workspace = true, features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+reqwest = { workspace = true, features = ["json", "query", "stream"] }
+rustls = { workspace = true }
+serde_yml = "0.0.12"
+base64 = "0.22"
+bytes = "1"
+tracing = "0.1"
+sha2 = "0.10"
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+tokio-rusqlite = "0.7"
+uuid = { version = "1", features = ["v4"] }
+object_store = { version = "0.12", features = ["aws"] }
+serde_path_to_error = "0.1.20"
+
+[dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
+tokio = { workspace = true, features = ["test-util"] }
+hegeltest = "=0.48.1"
+rstest = { workspace = true }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[[example]]
+name = "k8s_crud"
+test = false
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

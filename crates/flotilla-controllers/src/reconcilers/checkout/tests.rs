@@ -12,10 +12,8 @@ use flotilla_core::{
     providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner},
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_resources::{
-    CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend,
-    ResourceBackend, SqliteBackend,
-};
+use flotilla_resources::{CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
+use flotilla_store::{InMemoryBackend, ResourceBackend, SqliteBackend};
 use tempfile::TempDir;
 
 use super::*;

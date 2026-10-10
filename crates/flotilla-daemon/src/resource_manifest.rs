@@ -15,10 +15,13 @@ use std::{
 use flotilla_core::charter_store::read_charter_source;
 use flotilla_core::vcs::Vcs;
 use flotilla_resources::{
-    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, CharterSource,
-    ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRecorder, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
-    ManifestRootSpec, ManifestRootStatus, ObjectEvent, ResolutionAction, ResolutionOutcome, ResourceBackend, ResourceError, RetryCeiling,
+    CharterSource, ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
+    ManifestRootSpec, ManifestRootStatus, ObjectEvent, ResolutionAction, ResolutionOutcome, ResourceError, RetryCeiling,
     StallEvidenceSource, StallRung, StalledCondition, MANAGED_BY_LABEL,
+};
+use flotilla_store::{
+    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, EventRecorder,
+    ResourceBackend,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -1116,10 +1119,8 @@ mod tests {
     use flotilla_discovery_testkit::FakeDiscoveryProviders;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_protocol::{HostName, NodeId};
-    use flotilla_resources::{
-        patch_resource_annotation, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, ResourceBackend,
-        WatchStart, WorkflowTemplate, MANIFEST_WRITER_SOURCE,
-    };
+    use flotilla_resources::{InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, WatchStart, WorkflowTemplate};
+    use flotilla_store::{patch_resource_annotation, InMemoryBackend, ResourceBackend, MANIFEST_WRITER_SOURCE};
     use futures::StreamExt;
 
     use super::*;
@@ -2087,7 +2088,7 @@ mod tests {
         }
         meta.annotations.insert("flotilla.work/manifest-resolution".into(), "sync".into());
         let legacy = resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.expect("write legacy metadata");
-        flotilla_resources::decode_stored_resource_document(&serde_json::to_value(legacy.to_k8s_object()).expect("encode"))
+        flotilla_store::decode_stored_resource_document(&serde_json::to_value(legacy.to_k8s_object()).expect("encode"))
             .expect("decode previous-generation annotations");
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("cleanup pass").updated, 1);
         let cleaned = resolver.get("legacy").await.expect("policy");
@@ -2105,9 +2106,10 @@ mod registered_charter_tests {
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::HostName;
     use flotilla_resources::{
-        CharterPointer, InMemoryBackend, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-        RepositoryKey, ResourceProvenance,
+        CharterPointer, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
+        ResourceProvenance,
     };
+    use flotilla_store::InMemoryBackend;
 
     use super::*;
     use crate::testkits::server::spawn_in_memory_request_topology;

@@ -336,7 +336,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
         disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
         ..conflict_retry
     };
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &environments,
         env_id.as_str(),
         &EnvironmentStatusPatch::CredentialDelivery { retry: Some(due_retry) },
@@ -359,7 +359,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     settle(ConvoyPhase::Landing).await;
     reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials after claim admission");
     assert!(can_fill_git_credential().await, "live crew can act after its claim is admitted");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "credential-work",
         &flotilla_resources::external_patches::resume_crew_work(
@@ -378,7 +378,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
     settle(ConvoyPhase::Landing).await;
     reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials at review boundary");
     assert!(can_fill_git_credential().await);
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "credential-work",
         &flotilla_resources::external_patches::record_turn_delivery(
@@ -440,7 +440,7 @@ async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_fai
     let connection = rusqlite::Connection::open(&sqlite_path).expect("raw sqlite store");
     insert_undecodable_resource::<CredentialSpec>(&connection, "broken-spec");
     drop(connection);
-    flotilla_resources::quarantine_undecodable_stored_objects(&backend, NAMESPACE).await.expect("quarantine undecodable spec");
+    flotilla_store::quarantine_undecodable_stored_objects(&backend, NAMESPACE).await.expect("quarantine undecodable spec");
     let granted = BTreeSet::from(["broken-spec".to_string()]);
     let need = credential_quarantine_need(&backend, NAMESPACE, &granted)
         .await

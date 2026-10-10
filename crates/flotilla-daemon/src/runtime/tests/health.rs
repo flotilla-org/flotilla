@@ -199,7 +199,7 @@ async fn clone_controller_failure_is_visible_in_convoy_explain() {
     let backend = daemon.resource_backend();
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
         .await
         .expect("repository");
     backend

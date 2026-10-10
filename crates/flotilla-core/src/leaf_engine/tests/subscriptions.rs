@@ -197,7 +197,7 @@ fn leaf_recovery_budget_resets_after_healthy_watch(tc: hegel::TestCase) {
 async fn missing_resumed_session_does_not_suppress_supervision_forever() {
     let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
     let convoys = backend.using::<Convoy>("flotilla");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "stalled-work",
         &flotilla_resources::external_patches::resume_crew_work(

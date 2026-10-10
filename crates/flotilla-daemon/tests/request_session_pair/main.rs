@@ -69,18 +69,21 @@ use flotilla_protocol::SurfaceCharacter;
 use flotilla_protocol::SurfaceDeclaration;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
-    api_version, controller::ControllerLoop, list_resource_kind, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec, ConvoyStatus, CredentialConsumer,
-    CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-    CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, LifecycleAuthority,
-    Message, OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceBackend, ResourceError,
-    ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS,
-    ROLE_LABEL, VESSEL_LABEL,
+    api_version, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
+    ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector,
+    CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority, Message,
+    PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceError, ResourceProvenance, Selector, SystemClock,
+    TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
+    VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+use flotilla_store::{
+    controller::ControllerLoop, list_resource_kind, ConvoyReconciler, InMemoryBackend, OwnerGarbageCollector, ResourceBackend,
+    REGISTERED_RESOURCE_KINDS,
 };
 use hegel::generators as gs;
 
@@ -3910,7 +3913,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
             .expect("replicate presence");
     }
     let convoys = a_backend.using::<Convoy>("flotilla");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "stalled-work",
         &flotilla_resources::external_patches::mark_crew_stalled(
@@ -4410,7 +4413,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
         )
         .await
         .expect("working crew");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &remote,
         "remote-stall",
         &flotilla_resources::external_patches::mark_crew_stalled(

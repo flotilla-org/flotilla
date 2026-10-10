@@ -1,6 +1,5 @@
-use flotilla_resources::{
-    InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError, WriterIdentity, MANAGED_BY_LABEL,
-};
+use flotilla_resources::{InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceError, WriterIdentity, MANAGED_BY_LABEL};
+use flotilla_store::ResourceBackend;
 use tracing::warn;
 
 /// Reconcile a daemon-discovered placement policy without claiming
@@ -83,8 +82,8 @@ mod tests {
     use flotilla_resources::DockerPerVesselPlacementPolicySpec;
     use flotilla_resources::HostDirectPlacementPolicyCheckout;
     use flotilla_resources::HostDirectPlacementPolicySpec;
-    use flotilla_resources::InMemoryBackend;
     use flotilla_resources::ResourceObject;
+    use flotilla_store::InMemoryBackend;
     use flotilla_store_testkit::run_transition_sequence;
     use flotilla_store_testkit::FixpointPredicate;
     use flotilla_store_testkit::LivenessEnrollment;

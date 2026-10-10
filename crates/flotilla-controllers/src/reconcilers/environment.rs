@@ -3,9 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
 use flotilla_resources::{
-    controller::{ReconcileOutcome, Reconciler},
     DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase,
-    ResourceBackend, ResourceError, ResourceObject, TypedResolver,
+    ResourceError, ResourceObject,
+};
+use flotilla_store::{
+    controller::{ReconcileOutcome, Reconciler},
+    ResourceBackend, TypedResolver,
 };
 
 #[async_trait]
@@ -166,7 +169,7 @@ where
                     let waiting = |message: String| Ok(EnvironmentPrepared::Waiting(message, progress.clone()));
 
                     if let Some(name) = &spec.image_build_ref {
-                        let mut build = match flotilla_resources::read_image_build(&self.backend, &self.namespace, name).await {
+                        let mut build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
                             Ok(build) => build,
                             Err(ResourceError::NotFound { .. }) => {
                                 return waiting(format!("ImageBuild {name} awaiting replicated build status"))
@@ -174,7 +177,7 @@ where
                             Err(error) => return Err(error),
                         };
                         for _ in 0..3 {
-                            match flotilla_resources::read_image_build(
+                            match flotilla_store::read_image_build(
                                 &self.backend,
                                 &self.namespace,
                                 &format!("{}-retry", build.metadata.name),
@@ -198,7 +201,7 @@ where
                             let Some(parent) = parent else {
                                 break;
                             };
-                            match flotilla_resources::read_image_build(&self.backend, &self.namespace, parent).await {
+                            match flotilla_store::read_image_build(&self.backend, &self.namespace, parent).await {
                                 Ok(parent) if parent.status.as_ref().is_some_and(|status| status.phase == ImageBuildPhase::Built) => break,
                                 Ok(parent) => dependency = parent,
                                 Err(ResourceError::NotFound { .. }) => {

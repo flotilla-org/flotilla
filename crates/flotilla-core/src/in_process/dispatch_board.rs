@@ -188,8 +188,8 @@ pub(super) mod tests {
     async fn layered_deadlines_preserve_observation_timeout_and_recover() {
         use crate::forge_observation::ForgeReads;
         use flotilla_resources::Clock;
-        use flotilla_resources::InMemoryBackend;
-        use flotilla_resources::ResourceBackend;
+        use flotilla_store::InMemoryBackend;
+        use flotilla_store::ResourceBackend;
         use flotilla_store_testkit::VirtualClock;
         let cache = DispatchBoardCache::default();
         let source = source("org/shared");

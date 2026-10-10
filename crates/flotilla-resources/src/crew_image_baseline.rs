@@ -22,24 +22,3 @@ pub struct CrewImageBaselineSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layers: Option<crate::ImageLayerSelection>,
 }
-
-impl CrewImageBaseline {
-    /// Resolve image and layer selection from one merged revision, refusing
-    /// deleted or conflicted definitions rather than choosing a merge winner.
-    pub async fn resolve(name: &str, baselines: &crate::DefinitionResolver<Self>) -> Result<CrewImageBaselineSpec, String> {
-        let baseline = baselines.get(name).await.map_err(|error| format!("image-baseline `{name}` missing/unresolved: {error}"))?;
-        let unresolved = if baseline.metadata.deletion_timestamp.is_some() {
-            Some("baseline is deleted")
-        } else if baseline.metadata.merge.as_ref().is_some_and(|merge| !merge.conflicts.is_empty()) {
-            Some("baseline has unresolved merge conflicts")
-        } else if baseline.spec.image.trim().is_empty() {
-            Some("baseline image is empty")
-        } else {
-            None
-        };
-        if let Some(reason) = unresolved {
-            return Err(format!("image-baseline `{name}` missing/unresolved: {reason}"));
-        }
-        Ok(baseline.spec)
-    }
-}

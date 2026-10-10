@@ -8,12 +8,12 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState, QueryId, Relationship, SubjectKind};
 use flotilla_resources::{
-    watch_resource_kind_replica_sources, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutPhase,
-    CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus,
-    InMemoryBackend, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceBackend,
-    ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus,
+    ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus, InputMeta, IntegrationCondition,
+    ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{watch_resource_kind_replica_sources, InMemoryBackend, ResourceBackend, SqliteBackend};
 use futures::StreamExt;
 
 fn config(path: std::path::PathBuf, machine_id: &str) -> Arc<ConfigStore> {
@@ -397,7 +397,7 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
             .expect("seed stale origin replica");
     }
 
-    let deleted = flotilla_resources::delete_resource_kind(&kiwi.resource_backend(), "flotilla", "terminalsessions", "lost-at-authority")
+    let deleted = flotilla_store::delete_resource_kind(&kiwi.resource_backend(), "flotilla", "terminalsessions", "lost-at-authority")
         .await
         .expect("tombstone lost authority record");
     assert!(!deleted.already_deleted);
@@ -442,7 +442,7 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
         );
     }
 
-    let repeated = flotilla_resources::delete_resource_kind(&kiwi.resource_backend(), "flotilla", "terminalsessions", "lost-at-authority")
+    let repeated = flotilla_store::delete_resource_kind(&kiwi.resource_backend(), "flotilla", "terminalsessions", "lost-at-authority")
         .await
         .expect("repeat lost authority delete");
     assert!(repeated.already_deleted);

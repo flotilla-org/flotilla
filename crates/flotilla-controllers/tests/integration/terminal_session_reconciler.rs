@@ -14,13 +14,10 @@ use flotilla_controllers::reconcilers::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
 };
-use flotilla_resources::controller::Actuation;
-use flotilla_resources::controller::ControllerLoop;
-use flotilla_resources::controller::Reconciler;
+use flotilla_resources::Actuation;
 use flotilla_resources::Checkout;
 use flotilla_resources::Convoy;
 use flotilla_resources::ConvoyPhase;
-use flotilla_resources::ConvoyReconciler;
 use flotilla_resources::ConvoyTeardownRuntime;
 use flotilla_resources::EnvironmentSpec;
 use flotilla_resources::EnvironmentStatus;
@@ -30,7 +27,6 @@ use flotilla_resources::InputMeta;
 use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::OwnerReference;
 use flotilla_resources::Resource;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::StatusPatch;
@@ -50,6 +46,10 @@ use flotilla_resources::CONVOY_LABEL;
 use flotilla_resources::CREDENTIAL_SCOPES_ANNOTATION;
 use flotilla_resources::CREDENTIAL_SCOPES_SESSION_TAG;
 use flotilla_resources::VESSEL_REF_LABEL;
+use flotilla_store::controller::ControllerLoop;
+use flotilla_store::controller::Reconciler;
+use flotilla_store::ConvoyReconciler;
+use flotilla_store::ResourceBackend;
 use flotilla_store_testkit::run_transition_sequence;
 use flotilla_store_testkit::FixpointPredicate;
 use flotilla_store_testkit::LivenessEnrollment;
@@ -1060,7 +1060,7 @@ impl ReconcileStep<GhostRecoveryWorld> for GhostRecoveryStep {
     }
 
     async fn apply_patch(&self, world: &mut GhostRecoveryWorld, patch: Self::Patch) -> Result<(), String> {
-        flotilla_resources::apply_status_patch(&world.backend.clone().using::<TerminalSession>("flotilla"), GHOST_SESSION_NAME, &patch)
+        flotilla_store::apply_status_patch(&world.backend.clone().using::<TerminalSession>("flotilla"), GHOST_SESSION_NAME, &patch)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -2012,7 +2012,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         // startup retry into an unbounded established-turn wait.
         assert_eq!(runtime.delivered.lock().expect("delivered mutex")[attempt - 1].2, TerminalDeliveryReadiness::Startup);
         // A different failed observation cannot clear a possibly accepted write.
-        let failure = flotilla_resources::controller::ReconcileFailure { message: "pool unreachable".into(), consecutive_failures: 5 };
+        let failure = flotilla_store::controller::ReconcileFailure { message: "pool unreachable".into(), consecutive_failures: 5 };
         assert!(reconciler.reconcile_degraded_patch(&flagged, &failure).is_none());
         if !startup_not_ready || attempt == 3 {
             break;
@@ -2079,7 +2079,7 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
         let result = reconciler.reconcile(&session, &observation, start + chrono::Duration::seconds(second));
         assert_eq!(result.patch.is_some(), changed);
         if let Some(patch) = result.patch {
-            flotilla_resources::apply_status_patch(&sessions, "output-crew", &patch).await.expect("persist output progress");
+            flotilla_store::apply_status_patch(&sessions, "output-crew", &patch).await.expect("persist output progress");
         }
         let status = sessions.get("output-crew").await.expect("session").status.expect("status");
         assert_eq!(status.last_output_activity_at, Some(start + chrono::Duration::seconds(expected)));

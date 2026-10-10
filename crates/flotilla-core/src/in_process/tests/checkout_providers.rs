@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InMemoryBackend,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceBackend,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
+    RepositorySpec,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::test_meta;
 use crate::config::ConfigStore;

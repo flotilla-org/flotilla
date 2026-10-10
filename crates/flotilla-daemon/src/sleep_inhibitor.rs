@@ -7,9 +7,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::SleepInhibitionHealth;
 use flotilla_resources::{
-    apply_status_patch, Convoy, ConvoyPhase, Host, HostStatusPatch, ReadResourceList, ReadResourceObject, ReadWatchEvent,
-    ReplicaReadResolver, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, Vessel, WatchEvent, WatchStart,
+    Convoy, ConvoyPhase, Host, HostStatusPatch, ReadResourceList, ReadResourceObject, ReadWatchEvent, ResourceError, ResourceObject,
+    ResourceProvenance, Vessel, WatchEvent, WatchStart,
 };
+use flotilla_store::{apply_status_patch, ReplicaReadResolver, TypedResolver};
 use futures::StreamExt;
 use tokio::{
     io::AsyncReadExt,
@@ -564,7 +565,8 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_protocol::{CanonicalHostId, NodeId, PlacementDecision, PlacementTargetHost, PrincipalRef};
-    use flotilla_resources::{ConvoySpec, ConvoyStatus, HostSpec, InMemoryBackend, InputMeta, ResourceBackend, VesselSpec};
+    use flotilla_resources::{ConvoySpec, ConvoyStatus, HostSpec, InputMeta, VesselSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use tokio::sync::mpsc;
 
     use super::*;

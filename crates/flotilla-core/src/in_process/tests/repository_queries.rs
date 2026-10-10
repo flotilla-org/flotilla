@@ -5,9 +5,10 @@ use chrono::Utc;
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy,
-    ConvoySpec, ConvoyStatus, InMemoryBackend, ObjectMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository, RepositorySpec, ResourceBackend, ResourceObject, VesselRequirement,
+    ConvoySpec, ConvoyStatus, ObjectMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
+    RepositorySpec, ResourceObject, VesselRequirement,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::test_meta;
 use crate::config::ConfigStore;

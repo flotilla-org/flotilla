@@ -16,13 +16,12 @@ use flotilla_protocol::{
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, change_request_address_with_forges, change_request_record_name,
-    controller::delete_lifecycle_owned_matching, evaluate_crew_completion, expected_change_request_leaves,
+    change_request_address_with_forges, change_request_record_name, evaluate_crew_completion, expected_change_request_leaves,
     external_patches as convoy_external_patches, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
     CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
     CrewCompletionPending, CrewCompletionRefusalCause, CrewMessageSender, CrewSource, CrewWorkPhase, Demand as ResourceDemand, Forge,
     HoldAct, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState, Project, Repository, RepositoryKey, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WorkCompletionAuthority,
     CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, ROLE_LABEL, VESSEL_LABEL,
@@ -30,6 +29,7 @@ use flotilla_resources::{
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, controller::delete_lifecycle_owned_matching, ResourceBackend};
 use tokio::sync::{Mutex, RwLock};
 #[cfg(test)]
 use tracing::debug;
@@ -62,7 +62,7 @@ pub(super) struct CrewService {
     #[builder(default)]
     pub(super) capability_source: RwLock<Option<Arc<dyn crate::crew_capabilities::SessionCapabilitySource>>>,
     #[builder(default)]
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::ResourceIntentPublisher>>>,
     leaf_subscriptions: LeafSubscriptionTable,
@@ -355,7 +355,7 @@ pub(super) fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, require
 // Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
 #[cfg(test)]
 pub(super) async fn queue_pending_crew_message(
-    sessions: &flotilla_resources::TypedResolver<ResourceTerminalSession>,
+    sessions: &flotilla_store::TypedResolver<ResourceTerminalSession>,
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
     sender: CrewMessageSender,
     message: &str,
@@ -366,7 +366,7 @@ pub(super) async fn queue_pending_crew_message(
 // Legacy fixture seeding only; remove after the first fleet roll deploying #2710.
 #[cfg(test)]
 async fn queue_crew_message_object(
-    sessions: &flotilla_resources::TypedResolver<ResourceTerminalSession>,
+    sessions: &flotilla_store::TypedResolver<ResourceTerminalSession>,
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
     next: TerminalCrewMessage,
 ) -> Result<(), String> {
@@ -394,7 +394,7 @@ impl CrewService {
         self.leaf_subscriptions.unsubscribe_connection(connection_id).await;
     }
 
-    pub(super) fn reconciler_wake_watch(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = ResourceConvoy>> {
+    pub(super) fn reconciler_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = ResourceConvoy>> {
         self.leaf_subscriptions.reconciler_wake_watch()
     }
 
@@ -642,7 +642,7 @@ impl CrewService {
     pub(super) async fn message_contacts_internal(
         &self,
         requested: &CrewCommandContext,
-    ) -> Result<flotilla_resources::CrewAddressBook, String> {
+    ) -> Result<flotilla_store::CrewAddressBook, String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoy = self
             .resource_backend
@@ -652,7 +652,7 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let address = format!("{project}/{}/{}/{}", context.convoy, context.vessel, context.caller_role);
-        flotilla_resources::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
+        flotilla_store::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
     }
 
     pub(super) async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
@@ -1865,7 +1865,7 @@ impl CrewService {
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
             None => WorkCompletionAuthority::Unattributed,
         };
-        flotilla_resources::apply_status_patch_with_before_update(
+        flotilla_store::apply_status_patch_with_before_update(
             &convoys,
             name,
             &convoy_external_patches::mark_convoy_abandoned(expected_phase, Utc::now(), authority, reason.to_string()),
@@ -1990,7 +1990,7 @@ impl CrewService {
             {
                 return Err(format!("crew target `{receiver}` has failed work and cannot receive a handoff"));
             }
-            let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
+            let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &context.namespace, &receiver)
                 .await
                 .map_err(|error| error.to_string())?;
             if holder.as_ref().is_some_and(|holder| {
@@ -2208,7 +2208,7 @@ impl CrewService {
                         handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
                     if let Some(project) = convoy.spec.project_ref.as_deref() {
                         let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
-                        let book = flotilla_resources::crew_address_book(&self.resource_backend, &context.namespace, &address)
+                        let book = flotilla_store::crew_address_book(&self.resource_backend, &context.namespace, &address)
                             .await
                             .map_err(|error| error.to_string())?;
                         brief.content.push('\n');
@@ -2415,7 +2415,7 @@ impl CrewService {
             let relation = flotilla_resources::MessageRelation::Supervisor;
             let prior = self
                 .resource_backend
-                .query_messages(namespace, &flotilla_resources::MessageQuery::Active { receiver: Some(receiver.clone()) })
+                .query_messages(namespace, &flotilla_store::MessageQuery::Active { receiver: Some(receiver.clone()) })
                 .await
                 .map_err(|error| error.to_string())?
                 .into_iter()
@@ -2576,7 +2576,7 @@ impl CrewService {
             flotilla_resources::StatusPatch::apply(&patch, &mut next);
             let replacement = serde_json::to_value(next).expect("message status");
             let result = if matches!(message.provenance, ResourceProvenance::Local) {
-                flotilla_resources::patch_resource_status_if_version(
+                flotilla_store::patch_resource_status_if_version(
                     &self.resource_backend,
                     namespace,
                     "Message",
@@ -2703,7 +2703,7 @@ impl CrewService {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+        let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
             .await
             .map_err(|error| error.to_string())?;
         let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
@@ -2720,7 +2720,7 @@ impl CrewService {
                 .lock()
                 .await
                 .entry(request.namespace.clone())
-                .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), &request.namespace))
+                .or_insert_with(|| flotilla_store::MessageInbox::new(self.resource_backend.clone(), &request.namespace))
                 .clone();
             let existing = self.resource_backend.using::<flotilla_resources::Message>(&request.namespace).get(&name).await.is_ok();
             let admission = inbox
@@ -2728,8 +2728,8 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
             let object = match admission {
-                flotilla_resources::MessageAdmission::Accepted(object) => object,
-                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_store::MessageAdmission::Accepted(object) => object,
+                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
         };
@@ -2756,7 +2756,7 @@ impl CrewService {
         use flotilla_resources::MessageSpec;
         let managed_request;
         let request = if let Some(receiver) = &request.receiver {
-            let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+            let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
                 .await
                 .map_err(|error| error.to_string())?;
             if holder.as_ref().is_none_or(|holder| {
@@ -2812,7 +2812,7 @@ impl CrewService {
             &sender,
             &crate::leaf_engine::turn_message_producer_key(&request.source, &request.subject_revision),
         );
-        let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
+        let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
             .await
             .map_err(|error| error.to_string())?;
         // This is the observed admission rung, not a transport or session receipt.
@@ -2918,7 +2918,7 @@ impl CrewService {
                     .await
                     .entry(request.namespace.clone())
                     .or_insert_with(|| {
-                        flotilla_resources::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
+                        flotilla_store::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
                             self.leaf_subscriptions.change_request_stale_after(),
                             self.leaf_subscriptions.issue_stale_after(),
                         )
@@ -2929,8 +2929,8 @@ impl CrewService {
                     .await
                     .map_err(|error| error.to_string())?;
                 let record = match admission {
-                    flotilla_resources::MessageAdmission::Accepted(record) => record,
-                    flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                    flotilla_store::MessageAdmission::Accepted(record) => record,
+                    flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
                 };
                 ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
             };
@@ -3000,7 +3000,7 @@ impl CrewService {
             turns.sort_by_key(|turn| turn.queued_order);
             for turn in turns {
                 let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
-                let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
+                let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
                     .await
                     .map_err(|error| error.to_string())?;
                 if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
@@ -3018,7 +3018,7 @@ impl CrewService {
                 .filter_map(|delivery| delivery.pending_brief.as_ref())
             {
                 let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role);
-                let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
+                let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
                     .await
                     .map_err(|error| error.to_string())?;
                 if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
@@ -3186,7 +3186,7 @@ impl CrewService {
         if let Some(publisher) = publisher {
             return publisher.publish(namespace, serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":namespace}, "spec":intent})).await;
         }
-        let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
+        let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, &intent.receiver)
             .await
             .map_err(|error| error.to_string())?;
         if holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
@@ -3197,15 +3197,15 @@ impl CrewService {
             .lock()
             .await
             .entry(namespace.into())
-            .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .or_insert_with(|| flotilla_store::MessageInbox::new(self.resource_backend.clone(), namespace))
             .clone();
         let admission = inbox
             .accept(&InputMeta::builder().name(name.into()).build(), intent, self.clock.now())
             .await
             .map_err(|error| error.to_string())?;
         let record = match admission {
-            flotilla_resources::MessageAdmission::Accepted(record) => record,
-            flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+            flotilla_store::MessageAdmission::Accepted(record) => record,
+            flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
@@ -3220,7 +3220,7 @@ impl CrewService {
         let HoldAct::State = act; // Also covers previous-generation snapshots through the serde alias.
         let attention =
             flotilla_resources::ConvoyAttention { source: request.source.clone(), reason: reason.into(), raised_at: self.clock.now() };
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &convoys,
             &request.convoy,
             &ConvoyStatusPatch::HoldTurnDelivery { source: request.source.clone(), hold: attention.clone() },
@@ -3251,9 +3251,7 @@ impl CrewService {
             let session = source.object;
             let patch = TerminalSessionStatusPatch::HoldTurnDelivery { hold: attention.clone() };
             if matches!(source.provenance, ResourceProvenance::Local) {
-                flotilla_resources::apply_status_patch(&sessions, &session.metadata.name, &patch)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                flotilla_store::apply_status_patch(&sessions, &session.metadata.name, &patch).await.map_err(|error| error.to_string())?;
             } else {
                 let mut next = session.status.clone().unwrap_or_default();
                 flotilla_resources::StatusPatch::apply(&patch, &mut next);
@@ -3364,7 +3362,7 @@ impl CrewService {
         &self,
         namespace: &str,
         environment_ref: &str,
-        convoys: &flotilla_resources::TypedResolver<ResourceConvoy>,
+        convoys: &flotilla_store::TypedResolver<ResourceConvoy>,
         name: &str,
         previous_status: flotilla_resources::ConvoyStatus,
         reopened: &ResourceObject<ResourceConvoy>,
@@ -3380,7 +3378,7 @@ impl CrewService {
 
     async fn restore_crew_work_after_delivery_failure(
         &self,
-        convoys: &flotilla_resources::TypedResolver<ResourceConvoy>,
+        convoys: &flotilla_store::TypedResolver<ResourceConvoy>,
         name: &str,
         reopened_version: &str,
         previous_status: &flotilla_resources::ConvoyStatus,

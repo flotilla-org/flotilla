@@ -26,7 +26,8 @@ use flotilla_core::{
 use flotilla_protocol::{
     ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
-use flotilla_resources::{ResourceBackend, SqliteBackend};
+
+use flotilla_store::{ResourceBackend, SqliteBackend};
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,

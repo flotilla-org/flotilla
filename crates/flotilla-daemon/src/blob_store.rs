@@ -309,7 +309,7 @@ impl S3BlobStore {
         if credentials.access_key_id.is_empty() || credentials.secret_access_key.is_empty() {
             return Err("S3 credentials are empty".into());
         }
-        let client = flotilla_core::tls::client_builder().build().map_err(|error| format!("build S3 request client: {error}"))?;
+        let client = flotilla_tls::client_builder().build().map_err(|error| format!("build S3 request client: {error}"))?;
         Ok(Self {
             endpoint,
             bucket: bucket.into(),

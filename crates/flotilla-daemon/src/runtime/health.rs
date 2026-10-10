@@ -17,10 +17,10 @@ use flotilla_credentials::CredentialStore;
 use flotilla_protocol::{HostSummary, NodeId, Rows};
 use flotilla_resources::Resource;
 use flotilla_resources::{
-    home_bound_authorship_collisions, ConditionValue, Convoy, CredentialExpiry, Forge, Host, HostCondition, HostStatus, HostStatusPatch,
-    ManifestRoot, ReplicationClass, ResourceBackend, ResourceError, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, REGISTERED_RESOURCE_KINDS,
+    ConditionValue, Convoy, CredentialExpiry, Forge, Host, HostCondition, HostStatus, HostStatusPatch, ManifestRoot, ReplicationClass,
+    ResourceError, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
 };
+use flotilla_store::{home_bound_authorship_collisions, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
@@ -395,7 +395,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
     }
     capabilities.insert("forge_budgets".into(), serde_json::to_value(daemon.forge_budget_rows()).expect("forge budgets serialize"));
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &hosts,
         &profile.host_id,
         &HostStatusPatch::Heartbeat {
@@ -544,7 +544,7 @@ pub(super) async fn resource_replication_content_condition(
             if kind.replication_class == ReplicationClass::None {
                 continue;
             }
-            if flotilla_resources::replica_cursor_for_resource_kind(&backend, namespace, kind.kind, &peer)
+            if flotilla_store::replica_cursor_for_resource_kind(&backend, namespace, kind.kind, &peer)
                 .await
                 .map_err(|error| error.to_string())?
                 .is_some()

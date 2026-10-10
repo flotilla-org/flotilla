@@ -108,7 +108,7 @@ impl CodexTokenRefresher for RealCodexTokenRefresher {
             "client_id": self.client_id,
             "refresh_token": refresh_token,
         });
-        let request = flotilla_resources::tls::client()
+        let request = flotilla_tls::client()
             .post(&self.token_url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body)

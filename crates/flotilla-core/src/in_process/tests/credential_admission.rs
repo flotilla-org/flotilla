@@ -6,9 +6,10 @@ use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ConvoyRepositorySpec, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
     CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-    Host as ResourceHost, HostSpec, HostStatus, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
-    RepositoryTrust, ResourceBackend, Selector, VesselRequirement, WorkflowTemplateSpec,
+    Host as ResourceHost, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, RepositoryTrust,
+    Selector, VesselRequirement, WorkflowTemplateSpec,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
 use crate::agent_adapter::CapabilityTable;

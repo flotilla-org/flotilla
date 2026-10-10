@@ -18,9 +18,9 @@ use flotilla_core::{
 use flotilla_credentials::CredentialStore;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
-    watch_resource_kind, watch_resource_kind_including_replicas, Checkout, Clone, Convoy, Host, HostStatusPatch, Resource, ResourceBackend,
-    ResourceError, RetryBackoff, SystemClock, TerminalSession, Vessel,
+    Checkout, Clone, Convoy, Host, HostStatusPatch, Resource, ResourceError, RetryBackoff, SystemClock, TerminalSession, Vessel,
 };
+use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
 use futures::stream::{BoxStream, SelectAll};
 use futures::FutureExt;
 use futures::StreamExt;
@@ -174,7 +174,7 @@ pub(super) fn spawn_blob_sync_status_task(
         async move {
             let status = store.status().await;
             let hosts = backend.using::<Host>(&namespace);
-            if let Err(error) = flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::BlobSync { status }).await {
+            if let Err(error) = flotilla_store::apply_status_patch(&hosts, &host_id, &HostStatusPatch::BlobSync { status }).await {
                 warn!(%error, "failed to publish blob sync status");
             }
         }
@@ -342,7 +342,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
             .await
             {
                 Ok(facts) if facts != previous || model_probes != status.model_probes => {
-                    if let Err(error) = flotilla_resources::apply_status_patch(
+                    if let Err(error) = flotilla_store::apply_status_patch(
                         &hosts,
                         &profile.host_id,
                         &HostStatusPatch::FulfilmentFacts { facts, model_probes },
@@ -389,7 +389,7 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
             {
                 Ok(facts) if facts != previous || model_probes != status.model_probes => {
                     *ssh.fulfilment_facts.write().await = facts.clone();
-                    if let Err(error) = flotilla_resources::apply_status_patch(
+                    if let Err(error) = flotilla_store::apply_status_patch(
                         &hosts,
                         &ssh.provisioning.host_id,
                         &HostStatusPatch::FulfilmentFacts { facts, model_probes },
@@ -635,7 +635,7 @@ pub(super) fn spawn_demand_expiry_task(backend: ResourceBackend, namespace: Stri
 }
 
 pub(super) fn spawn_event_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {
-    let recorder = flotilla_resources::EventRecorder::new(backend);
+    let recorder = flotilla_store::EventRecorder::new(backend);
     spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
         let recorder = recorder.clone();
         let namespace = namespace.clone();

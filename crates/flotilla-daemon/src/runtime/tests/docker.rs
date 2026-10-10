@@ -694,7 +694,7 @@ async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
         let repositories = backend.using::<Repository>(NAMESPACE);
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
         let repository =
-            flotilla_resources::ensure_repository(&repositories, &repository_spec.key(), &repository_spec).await.expect("repository");
+            flotilla_store::ensure_repository(&repositories, &repository_spec.key(), &repository_spec).await.expect("repository");
         repositories
             .update_status(
                 &repository.metadata.name,
@@ -779,7 +779,7 @@ async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
                 break;
             }
             let patch = outcome.patch.expect("convoy must advance toward Vessel");
-            flotilla_resources::apply_status_patch(&convoys, &name, &patch).await.expect("advance convoy");
+            flotilla_store::apply_status_patch(&convoys, &name, &patch).await.expect("advance convoy");
         }
         let vessel = created_vessel.expect("convoy must create a Vessel within four transitions");
         assert!(vessel.spec.placement_policy_ref.starts_with("placement-snapshot-"));

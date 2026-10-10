@@ -8,10 +8,8 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh, spawn_in_memory_request_topology, InMemoryRequestTopology};
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
-use flotilla_resources::{
-    collect_resource_replica_kind, delete_resource_kind, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta, ResourceBackend,
-    ResourceError, ResourceProvenance, SqliteBackend, WatchEvent,
-};
+use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, ResourceError, ResourceProvenance, WatchEvent};
+use flotilla_store::{collect_resource_replica_kind, delete_resource_kind, InMemoryBackend, ResourceBackend, SqliteBackend};
 use futures::StreamExt;
 
 const NAMESPACE: &str = "flotilla";

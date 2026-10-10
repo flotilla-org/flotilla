@@ -7,9 +7,10 @@ use flotilla_protocol::{
     CommandValue, DaemonEvent, EvidenceFreshness, ExplainedCondition, ExplainedUnmetExpectation, NodeId, RepoIdentity, ResourceCursor,
     ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
-use flotilla_resources::{
+use flotilla_resources::{ConditionValue, IntegrationCondition, ResourceError, ResourceProvenance, UnmetSettlementExpectation, WatchStart};
+use flotilla_store::{
     watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
-    ConditionValue, IntegrationCondition, ResourceBackend, ResourceError, ResourceProvenance, UnmetSettlementExpectation, WatchStart,
+    ResourceBackend,
 };
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;

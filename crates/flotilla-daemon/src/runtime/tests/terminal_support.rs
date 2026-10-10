@@ -147,7 +147,7 @@ pub(super) async fn refresh_message_test_attention(runtime: &TerminalControllerR
     let sessions = backend.using::<TerminalSession>(NAMESPACE);
     let holder = sessions.get(name).await.expect("attention holder");
     let observation = runtime.observe_attention(name, &holder.spec).await.expect("terminal observation").expect("observed attention");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &sessions,
         name,
         &flotilla_resources::TerminalSessionStatusPatch::Observe {
@@ -234,7 +234,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
         let holder = sessions.get("agent").await.expect("attention holder");
         let observation =
             runtime.observe_attention("agent", &holder.spec).await.expect("terminal observation").expect("observed attention");
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &sessions,
             "agent",
             &flotilla_resources::TerminalSessionStatusPatch::Observe {

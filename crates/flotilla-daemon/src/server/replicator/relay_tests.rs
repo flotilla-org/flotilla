@@ -6,9 +6,10 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyStartIntent, DaemonEvent, HostName};
 use flotilla_resources::{
-    single_agent_workflow_spec, Convoy, CrewSource, HttpBackend, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend,
-    ResourceObject, ResourceProvenance, SqliteBackend, WorkflowTemplate, WorkflowTemplateSpec, WORKFLOW_SNAPSHOT_ANNOTATION,
+    single_agent_workflow_spec, Convoy, CrewSource, InputMeta, Project, ProjectSpec, ResourceObject, ResourceProvenance, WorkflowTemplate,
+    WorkflowTemplateSpec, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
+use flotilla_store::{HttpBackend, InMemoryBackend, ResourceBackend, SqliteBackend};
 use flotilla_test_support::TestSocketDir;
 use tokio::{io::AsyncReadExt, net::UnixListener, task::JoinSet};
 

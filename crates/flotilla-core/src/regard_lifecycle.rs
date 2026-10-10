@@ -5,10 +5,9 @@ use std::{
 
 use chrono::Duration;
 use flotilla_protocol::{PrincipalRef, ResourceRef, SurfaceCharacter, SurfaceDeclaration};
-use flotilla_resources::{
-    apply_status_patch, InputMeta, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatusPatch, ResourceBackend, ResourceError,
-};
 pub use flotilla_resources::{Clock, SystemClock};
+use flotilla_resources::{InputMeta, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatusPatch, ResourceError};
+use flotilla_store::{apply_status_patch, ResourceBackend};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 

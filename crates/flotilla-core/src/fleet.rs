@@ -10,10 +10,11 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceBackend, ResourceProvenance, TerminalAttentionState,
+    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceProvenance, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL,
     ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
 use tracing::debug;
 

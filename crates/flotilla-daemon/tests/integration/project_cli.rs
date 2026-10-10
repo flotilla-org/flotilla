@@ -37,10 +37,10 @@ use flotilla_protocol::{
     commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
 };
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
-    ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, WorkflowTemplate,
-    WorkflowTemplateSpec, MANAGED_BY_LABEL,
+    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
+    ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use tracing::instrument::WithSubscriber;
 
 #[derive(Clone)]

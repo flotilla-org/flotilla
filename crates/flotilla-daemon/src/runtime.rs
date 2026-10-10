@@ -31,9 +31,10 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
-    controller::ControllerLoop, host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, ConvoyReconciler, Environment, Forge,
-    Host, ManifestRoot, Repository, Resource, ResourceBackend, ResourceError, SystemClock, TerminalSession, Vessel, WorkflowTemplate,
+    host_direct_environment_name, ChangeRequest, Checkout, Clone, Convoy, Environment, Forge, Host, ManifestRoot, Repository, Resource,
+    ResourceError, SystemClock, TerminalSession, Vessel, WorkflowTemplate,
 };
+use flotilla_store::{controller::ControllerLoop, ConvoyReconciler, ResourceBackend};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
@@ -199,7 +200,7 @@ impl DaemonRuntime {
         let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
         phase(
             "quarantine_undecodable_stored_objects",
-            flotilla_resources::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace),
+            flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace),
         )
         .await
         .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
@@ -733,7 +734,7 @@ fn spawn_controller_loops(
     let gc_health = runtime_health.clone();
     let gc = tokio::spawn(async move {
         supervise_controller("owner_gc", gc_supervision, gc_health, move || {
-            let collector = flotilla_resources::OwnerGarbageCollector::new(gc_backend.clone(), gc_namespace.clone());
+            let collector = flotilla_store::OwnerGarbageCollector::new(gc_backend.clone(), gc_namespace.clone());
             async move { collector.run(controller_resync_interval).await }
         })
         .await;
@@ -889,7 +890,7 @@ fn spawn_controller_loops(
                         .with_artifacts(backend.including_replicas::<flotilla_resources::Artifact>(&namespace_string))
                         .with_landing_evidence_stale_after(LANDING_EVIDENCE_TTL)
                         .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(daemon)))
-                        .with_prepared_snapshot_gc(flotilla_resources::PreparedSnapshotGarbageCollector::new(
+                        .with_prepared_snapshot_gc(flotilla_store::PreparedSnapshotGarbageCollector::new(
                             backend.clone(),
                             &namespace_string,
                         )),

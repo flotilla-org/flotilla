@@ -1,5 +1,6 @@
 //! Local and agentless-SSH discovery and fulfilment observations.
 
+use flotilla_store::DockerImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -20,10 +21,11 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
     host_direct_environment_name, ConditionValue, FulfilmentFacts, FulfilmentKind, FulfilmentRealisation, Host, HostCondition,
-    HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceBackend, ResourceError, AGENTLESS_CAPABILITY,
+    HostConnection, HostSpec, HostStatus, InputMeta, ModelProbeState, Platform, ResourceError, AGENTLESS_CAPABILITY,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     TRANSPORT_CAPABILITY,
 };
+use flotilla_store::ResourceBackend;
 use serde_json::json;
 use tokio::sync::RwLock;
 use tracing::warn;

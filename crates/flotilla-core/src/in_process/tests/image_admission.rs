@@ -1,10 +1,10 @@
+use flotilla_store::DockerImageSourceStoreExt;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use flotilla_protocol::HostName;
-use flotilla_resources::{
-    CrewSource, CrewSpec, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend, VesselRequirement, WorkflowTemplateSpec,
-};
+use flotilla_resources::{CrewSource, CrewSpec, InputMeta, PlacementPolicy, VesselRequirement, WorkflowTemplateSpec};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{create_docker_placement, test_meta};
 use crate::config::ConfigStore;

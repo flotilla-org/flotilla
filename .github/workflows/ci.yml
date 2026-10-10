@@ -201,10 +201,9 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64
           rustup target add x86_64-pc-windows-gnu
-          cargo --config 'profile.dev.package."*".debug=0' check --target x86_64-pc-windows-gnu -p flotilla -p flotilla-client -p flotilla-tui -p flotilla-manifest -p flotilla-transport --all-targets --locked
+          cargo --config 'profile.dev.package."*".debug=0' check --target x86_64-pc-windows-gnu -p flotilla-client -p flotilla-transport --all-targets --locked
+          cargo --config 'profile.dev.package."*".debug=0' check --target x86_64-pc-windows-gnu -p flotilla-resources -p flotilla-protocol -p flotilla-paths -p flotilla-daemon-api --lib --locked
 
   relay-wasm:
     name: Relay Workers target

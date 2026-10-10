@@ -13,8 +13,7 @@ use flotilla_controllers::reconcilers::{
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_resources::change_request_record_name;
-use flotilla_resources::controller::Actuation;
-use flotilla_resources::controller::Reconciler;
+use flotilla_resources::Actuation;
 use flotilla_resources::ChangeRequest;
 use flotilla_resources::ChangeRequestMergeability;
 use flotilla_resources::ChangeRequestObservation;
@@ -33,7 +32,6 @@ use flotilla_resources::Clock;
 use flotilla_resources::ConditionValue;
 use flotilla_resources::Convoy;
 use flotilla_resources::ConvoyPhase;
-use flotilla_resources::ConvoyReconciler;
 use flotilla_resources::ConvoyStatusPatch;
 use flotilla_resources::FreshCloneCheckoutSpec;
 use flotilla_resources::InputMeta;
@@ -47,6 +45,8 @@ use flotilla_resources::RepositoryKey;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::WorkPhase;
 use flotilla_resources::CONVOY_LABEL;
+use flotilla_store::controller::Reconciler;
+use flotilla_store::ConvoyReconciler;
 use flotilla_store_testkit::assert_actuation_drop_recovery;
 use flotilla_store_testkit::assert_bounded_convergence;
 use flotilla_store_testkit::assert_degradation_not_wedging;

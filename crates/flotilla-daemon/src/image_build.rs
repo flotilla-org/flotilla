@@ -16,8 +16,8 @@ use flotilla_core::{
 };
 use flotilla_resources::{
     Artifact, ArtifactSpec, FrozenImageLayer, ImageBuildFailure, ImageBuildFailureClass, ImageBuildSpec, InputMeta, PlacedImageIdentity,
-    ResourceBackend,
 };
+use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 
 use crate::blob_store::{BlobStore, TieredBlobStore};
@@ -135,12 +135,11 @@ impl LocalImageBuildRunner {
         let deterministic = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Deterministic, reason };
         let transient = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Transient, reason };
         if let (Some(distributor), Some(parent)) = (&self.distributor, &spec.parent_build_ref) {
-            let mut parent = flotilla_resources::read_image_build(&self.backend, &self.namespace, parent)
+            let mut parent = flotilla_store::read_image_build(&self.backend, &self.namespace, parent)
                 .await
                 .map_err(|error| transient(error.to_string()))?;
             for _ in 0..3 {
-                match flotilla_resources::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", parent.metadata.name)).await
-                {
+                match flotilla_store::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", parent.metadata.name)).await {
                     Ok(next) => parent = next,
                     Err(flotilla_resources::ResourceError::NotFound { .. }) => break,
                     Err(error) => return Err(transient(error.to_string())),
@@ -266,9 +265,10 @@ pub(crate) async fn project_builds(
 mod tests {
     use flotilla_protocol::NodeId;
     use flotilla_resources::{
-        apply_status_patch, read_image_build, ImageBuild, ImageBuildPhase, ImageBuildReason, ImageBuildReservation, ImageBuildStatusPatch,
-        ImageInputStability, ImageLayerSpec, ImageLayerStage, ResolvedImageInputs,
+        ImageBuild, ImageBuildPhase, ImageBuildReason, ImageBuildReservation, ImageBuildStatusPatch, ImageInputStability, ImageLayerSpec,
+        ImageLayerStage, ResolvedImageInputs,
     };
+    use flotilla_store::{apply_status_patch, read_image_build};
 
     use super::*;
     use flotilla_resources::ImageLayerParent;

@@ -247,7 +247,7 @@ pub(super) async fn record_environment_observation(
     env_id: &EnvironmentId,
     observation: &flotilla_protocol::EnvironmentRuntimeObservation,
 ) -> Result<(), String> {
-    use flotilla_resources::apply_status_patch;
+    use flotilla_store::apply_status_patch;
     let backend = state.daemon.resource_backend();
     let environments = backend.using::<Environment>(namespace);
     let environment = environments.get(env_id.as_str()).await.map_err(|error| error.to_string())?;
@@ -343,7 +343,7 @@ pub(super) async fn mark_unavailable_environment(
     } else {
         format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
     };
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &state.daemon.resource_backend().using::<Environment>(namespace),
         env_id.as_str(),
         &match disposition {

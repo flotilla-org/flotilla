@@ -73,8 +73,8 @@ adding dependencies. Optional TLS providers and sandbox skips remain opt-in. The
 depend on the native feature selections.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
-`flotilla-resources` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
-The resources `watch_allocations` target stays separate because it installs a process-wide counting allocator.
+`flotilla-store` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
+The store `watch_allocations` target stays separate because it installs a process-wide counting allocator.
 `flotilla-daemon` uses that target for general integration tests and `tests/request_session_pair/main.rs` for routing scenarios.
 Run `cargo test -p <package> --locked --test integration` for the integration target, and
 `cargo test -p flotilla-daemon --locked --test request_session_pair` for routing scenarios. Append a former target's module name or a test name
@@ -139,7 +139,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-daemon` | Runtime supervision, socket server, resource replication, peer networking, multi-host command routing |
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
 | `flotilla-aggregator` | Durable/observed resource query projection and demand-backed issue materialization |
-| `flotilla-resources` | Resource kinds, typed resolvers, lifecycle authority, and storage backends |
+| `flotilla-resources` | Resource kinds, lifecycle authority, pure helpers, and typed list/watch shapes; no storage dependencies |
+| `flotilla-store` | Typed resolvers, SQLite/HTTP/in-memory backends, replica/watch machinery, store queries, and the generic controller runtime |
+| `flotilla-tls` | Shared TLS provider selection and HTTP client construction |
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |

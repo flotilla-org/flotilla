@@ -18,11 +18,11 @@ use flotilla_core::{
 };
 #[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_resources::validate_resource_document;
 #[cfg(unix)]
-use flotilla_resources::{
-    validate_message_migration_complete, K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS,
-};
+use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject};
+use flotilla_store::validate_resource_document;
+#[cfg(unix)]
+use flotilla_store::{validate_message_migration_complete, REGISTERED_RESOURCE_KINDS};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -633,7 +633,8 @@ mod tests {
     use flotilla_daemon::server::DaemonServer;
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_protocol::NodeId;
-    use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
+    use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
+    use flotilla_store::validate_resource_document;
     use flotilla_test_support::TestSocketDir;
     use serde_json::Value;
 
@@ -770,9 +771,9 @@ mod tests {
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
         };
-        flotilla_core::tls::install_default_provider();
+        flotilla_tls::install_default_provider();
         for legacy in [false, true] {
-            let backend = flotilla_resources::ResourceBackend::InMemory(Default::default());
+            let backend = flotilla_store::ResourceBackend::InMemory(Default::default());
             let record = backend
                 .using::<TerminalSession>("flotilla")
                 .create(
@@ -846,9 +847,9 @@ mod tests {
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
         };
-        flotilla_core::tls::install_default_provider();
+        flotilla_tls::install_default_provider();
         for mode in 0..6 {
-            let backend = flotilla_resources::ResourceBackend::InMemory(Default::default());
+            let backend = flotilla_store::ResourceBackend::InMemory(Default::default());
             let project = backend
                 .using::<Project>("flotilla")
                 .create(
@@ -965,7 +966,7 @@ mod tests {
 
     #[tokio::test]
     async fn validates_mixed_kinds_from_an_in_process_daemon() {
-        flotilla_core::tls::install_default_provider();
+        flotilla_tls::install_default_provider();
         let root = std::env::temp_dir().join(format!("flotilla-live-validate-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("config")).expect("create daemon directory");
         std::fs::write(root.join("config/daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon identity");
@@ -1186,7 +1187,7 @@ mod tests {
         )
         .expect("uncommitted edit");
         let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
-        let backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = flotilla_store::ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         let project = backend
             .using::<Project>("flotilla")
             .create(
@@ -1232,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_checks_registered_ops_entries_and_fails_on_unknown_fields() {
-        flotilla_core::tls::install_default_provider();
+        flotilla_tls::install_default_provider();
         use std::sync::Arc;
 
         use flotilla_core::{
@@ -1265,7 +1266,7 @@ mod tests {
             .expect("commit fixture")
             .success());
         let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
-        let backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = flotilla_store::ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         let project = backend
             .using::<Project>("flotilla")
             .create(
@@ -1420,7 +1421,8 @@ mod tests {
     async fn on_host_candidate_reinspects_after_a_daemon_inventory_refusal() {
         use std::collections::BTreeSet;
 
-        use flotilla_resources::{InMemoryBackend, ProjectRepositoryRole, ProjectRepositorySpec, RepositoryKey, ResourceBackend};
+        use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositoryKey};
+        use flotilla_store::{InMemoryBackend, ResourceBackend};
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
@@ -1567,7 +1569,7 @@ mod frozen_reference_regression {
     // The true resource HTTP boundary is injected; records use the real decoder.
     #[tokio::test]
     async fn candidate_refuses_schema_valid_unresolvable_governor_pin() {
-        flotilla_core::tls::install_default_provider();
+        flotilla_tls::install_default_provider();
         let mut status = serde_json::to_value(ConvoyStatus::default()).expect("status");
         status["phase"] = serde_json::json!("Active");
         status["workflow_snapshot"] = serde_json::json!({"vessels":[{"name":"work","crew":[{

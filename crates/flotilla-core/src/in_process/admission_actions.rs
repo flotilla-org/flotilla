@@ -22,11 +22,11 @@ use flotilla_resources::Project;
 use flotilla_resources::Repository;
 use flotilla_resources::RepositoryKey;
 use flotilla_resources::RepositorySpec;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
 use flotilla_resources::WorkflowTemplate;
 use flotilla_resources::WorkflowTemplateSpec;
 use flotilla_resources::WriterIdentity;
+use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
 
 use super::{
@@ -341,7 +341,7 @@ impl AdmissionActions<'_> {
                     let repository_spec = self.port.resolve_repository_remote(&url).await?;
                     let canonical_url = self.port.repository_transport_url(&namespace, &repository_spec).await?;
                     let repo_ref = repository_spec.key();
-                    let repository = flotilla_resources::ensure_repository(
+                    let repository = flotilla_store::ensure_repository(
                         &self.port.resource_backend().clone().using::<Repository>(&namespace),
                         &repo_ref,
                         &repository_spec,

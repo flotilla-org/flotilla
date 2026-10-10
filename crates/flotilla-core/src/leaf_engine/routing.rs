@@ -6,7 +6,8 @@ use std::{
 };
 
 use flotilla_protocol::LeafAddress;
-use flotilla_resources::{Artifact, ChangeRequest, Convoy, Issue, ReadWatchEvent, Resource, ResourceBackend, ResourceError, Usage, Vessel};
+use flotilla_resources::{Artifact, ChangeRequest, Convoy, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel};
+use flotilla_store::ResourceBackend;
 use futures::{
     stream::{BoxStream, SelectAll},
     StreamExt,

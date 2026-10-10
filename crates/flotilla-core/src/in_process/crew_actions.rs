@@ -16,16 +16,16 @@ use flotilla_protocol::Relationship;
 use flotilla_protocol::RepoIdentity;
 use flotilla_protocol::StallProposedDisposition;
 use flotilla_protocol::StallReason;
-use flotilla_resources::apply_status_patch_checked as apply_resource_status_patch_checked;
 use flotilla_resources::external_patches as convoy_external_patches;
 use flotilla_resources::Clock;
 use flotilla_resources::Convoy as ResourceConvoy;
-use flotilla_resources::MessageInbox;
 use flotilla_resources::MessageReference;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::WorkPhase;
+use flotilla_store::apply_status_patch_checked as apply_resource_status_patch_checked;
+use flotilla_store::MessageInbox;
+use flotilla_store::ResourceBackend;
 
 use super::{crew_ops, resolve_local_convoy_name};
 use crate::in_process::crew_ops::ConvoyResumeOutcome;
@@ -136,8 +136,7 @@ impl CrewActions<'_> {
             return Err("ledger reservation selected the wrong handler".into());
         };
         let identity = self.port.start_context_free_command(id, command.description().to_string());
-        let result = match flotilla_resources::reserve_ledger_comment_creation(self.port.resource_backend(), namespace, name, address).await
-        {
+        let result = match flotilla_store::reserve_ledger_comment_creation(self.port.resource_backend(), namespace, name, address).await {
             Ok(granted) => CommandValue::LedgerCommentCreationReserved { granted },
             Err(error) => CommandValue::Error { message: error.to_string() },
         };

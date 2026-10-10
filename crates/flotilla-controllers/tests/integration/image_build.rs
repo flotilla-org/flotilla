@@ -13,8 +13,6 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::image_build::{ImageBuildAdmission, ImageBuildInputResolver, ImageBuildSourceInputs};
 use flotilla_protocol::{EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo};
-use flotilla_resources::apply_status_patch;
-use flotilla_resources::controller::Reconciler;
 use flotilla_resources::DockerEnvironmentSpec;
 use flotilla_resources::DockerImagePullPolicy;
 use flotilla_resources::Environment;
@@ -39,8 +37,10 @@ use flotilla_resources::ImageLayerSpec;
 use flotilla_resources::ImageLayerStage;
 use flotilla_resources::InputMeta;
 use flotilla_resources::PlacedImageIdentity;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
+use flotilla_store::apply_status_patch;
+use flotilla_store::controller::Reconciler;
+use flotilla_store::ResourceBackend;
 use flotilla_store_testkit::VirtualClock;
 
 struct Inputs;

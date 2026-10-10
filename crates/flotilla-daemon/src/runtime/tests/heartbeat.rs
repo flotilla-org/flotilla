@@ -200,7 +200,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
 
     release.notify_one();
     let observed_facts = probe.await.expect("probe task");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &hosts,
         &host_id,
         &HostStatusPatch::FulfilmentFacts { facts: observed_facts, model_probes: ModelProbeState::default() },
@@ -214,7 +214,7 @@ async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts(
     assert_eq!(status.fulfilment_facts["host-direct-async-facts-test"].toolchains["rustc"], "rustc 1.94.1");
 
     let mut model_probes = ModelProbeState { total_requests: 2, ..ModelProbeState::default() };
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &hosts,
         &host_id,
         &HostStatusPatch::FulfilmentFacts { facts: status.fulfilment_facts.clone(), model_probes: model_probes.clone() },
@@ -337,7 +337,7 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
 
     ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration should succeed");
     let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &hosts,
         &host_id,
         &flotilla_resources::HostStatusPatch::SleepInhibition {

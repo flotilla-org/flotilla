@@ -11,9 +11,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceBackend,
-    ResourceError, ResourceObject, WatchEvent, WatchStart,
+    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceError,
+    ResourceObject, WatchEvent, WatchStart,
 };
+use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use tokio::sync::{watch, OnceCell};
 use tracing::warn;

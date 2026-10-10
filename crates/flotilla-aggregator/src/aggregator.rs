@@ -30,11 +30,11 @@ use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
     Demand, DemandAddressee, DemandState, Environment, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
-    RegardExpiryPolicy, ReplicaReadResolver, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
-    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
-    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    RegardExpiryPolicy, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance, StallRung, StalledCondition,
+    TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement, WatchEvent, WatchStart,
+    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{ReplicaReadResolver, TypedResolver};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
     sync::{broadcast, mpsc},
@@ -2838,11 +2838,11 @@ mod tests {
     use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
     use flotilla_resources::{
         BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, DemandKind, DemandSpec, DemandStatus,
-        DemandTransition, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec,
-        PlacementStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus, RepositorySpec,
-        ResourceBackend, TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-        VesselRequirement, WorkflowSnapshot,
+        DemandTransition, EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus,
+        PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus, RepositorySpec, TerminalAttention,
+        TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
     use uuid::Uuid;
@@ -3747,7 +3747,7 @@ mod tests {
     }
 
     async fn convoy_ensure_object(role: &str, status: Option<flotilla_resources::ConvoyEnsureStatus>) -> ResourceObject<ConvoyEnsure> {
-        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         let mut ensure = backend
             .using::<ConvoyEnsure>("flotilla")
             .create(
@@ -4201,7 +4201,7 @@ mod tests {
     }
 
     async fn convoy_object(name: &str) -> ResourceObject<Convoy> {
-        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         backend
             .using::<Convoy>("flotilla")
             .create(
@@ -4229,7 +4229,7 @@ mod tests {
     }
 
     async fn convoy_with_branch(name: &str) -> ResourceObject<Convoy> {
-        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         backend
             .using::<Convoy>("flotilla")
             .create(
@@ -4252,7 +4252,7 @@ mod tests {
     }
 
     pub(super) async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
-        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         let resolver = backend.using::<Convoy>("flotilla");
         let created = resolver
             .create(
@@ -6428,7 +6428,7 @@ mod tests {
         for sqlite in [false, true] {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let durable = if sqlite {
-                ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(temp.path().join("gate.sqlite")).expect("sqlite"))
+                ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(temp.path().join("gate.sqlite")).expect("sqlite"))
             } else {
                 ResourceBackend::InMemory(InMemoryBackend::default())
             };
@@ -6527,7 +6527,8 @@ mod tests {
 
 #[cfg(test)]
 mod project_parent_tests {
-    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InMemoryBackend, InputMeta, ProjectSpec, ResourceBackend};
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, ProjectSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::*;
 

@@ -28,13 +28,15 @@ use flotilla_protocol::{
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    controller::ControllerLoop, list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy,
-    ConvoyReconciler, ConvoySpec, CrewSessionStatus, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError,
-    ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent,
-    WatchStart, WorkflowTemplate,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, FulfilmentFacts,
+    FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceError,
+    ResourceList, ResourceProvenance, Selector, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart,
+    WorkflowTemplate,
+};
+use flotilla_store::{
+    controller::ControllerLoop, list_resource_kind, ConvoyReconciler, HttpBackend, InMemoryBackend, ResourceBackend, SqliteBackend,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};

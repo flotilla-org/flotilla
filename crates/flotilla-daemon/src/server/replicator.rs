@@ -6,10 +6,10 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::NodeId;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
 use flotilla_resources::{
-    DigestQuery, HttpBackend, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent,
-    WatchStart,
+    DigestQuery, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceProvenance, WatchEvent, WatchStart,
 };
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
+use flotilla_store::{HttpBackend, ResourceBackend};
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -580,9 +580,9 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
 
 async fn apply_http_watch<T: Resource>(
     mut watch: flotilla_resources::WatchStream<T>,
-    writer: &flotilla_resources::ReplicaWriter<T>,
+    writer: &flotilla_store::ReplicaWriter<T>,
     snapshot_version: String,
-    remote: &flotilla_resources::TypedResolver<T>,
+    remote: &flotilla_store::TypedResolver<T>,
     peer: &NodeId,
 ) -> Result<(), OriginWatchFailure> {
     // Relay updates share the writer but cannot move this direct stream's
@@ -641,7 +641,7 @@ impl DigestFailures {
 /// Run beside the direct log consumer, so live events cannot be applied during
 /// an authoritative snapshot replacement. Relay sources are never authorities.
 async fn reconcile_digest<T: Resource, F, Fut>(
-    writer: &flotilla_resources::ReplicaWriter<T>,
+    writer: &flotilla_store::ReplicaWriter<T>,
     peer: &NodeId,
     mut fetch: F,
 ) -> Result<bool, String>
@@ -1053,7 +1053,7 @@ async fn apply_relay_response<T: Resource>(
 }
 
 async fn apply_response<T: Resource>(
-    writer: &flotilla_resources::ReplicaWriter<T>,
+    writer: &flotilla_store::ReplicaWriter<T>,
     initial: &mut Vec<ResourceObject<T>>,
     initializing: &mut bool,
     response: ResourceReadEnvelope,
@@ -1474,7 +1474,8 @@ mod relay_tests;
 
 #[cfg(test)]
 mod digest_tests {
-    use flotilla_resources::{Convoy, ConvoySpec, InMemoryBackend, InputMeta};
+    use flotilla_resources::{Convoy, ConvoySpec, InputMeta};
+    use flotilla_store::InMemoryBackend;
 
     use super::*;
 

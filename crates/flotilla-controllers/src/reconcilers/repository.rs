@@ -3,10 +3,13 @@ use std::{marker::PhantomData, sync::Arc};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
     resolve_default_branch, Checkout, CheckoutSpec, Clone, DefaultBranchObservation, DefaultBranchProvenance, Environment, ForgeIdentity,
-    LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceBackend,
-    ResourceError, ResourceObject, TypedResolver, REPO_KEY_LABEL,
+    LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceError,
+    ResourceObject, REPO_KEY_LABEL,
+};
+use flotilla_store::{
+    controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
+    ResourceBackend, TypedResolver,
 };
 
 #[async_trait]

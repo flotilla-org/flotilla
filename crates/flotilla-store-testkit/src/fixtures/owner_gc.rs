@@ -1,9 +1,7 @@
 use std::time::Duration;
 
-use flotilla_resources::{
-    Host, HostSpec, InputMeta, LifecycleAuthority, OwnerGarbageCollector, OwnerReference, ResourceBackend, ResourceError, WatchEvent,
-    WatchStart,
-};
+use flotilla_resources::{Host, HostSpec, InputMeta, LifecycleAuthority, OwnerReference, ResourceError, WatchEvent, WatchStart};
+use flotilla_store::{OwnerGarbageCollector, ResourceBackend};
 use futures::StreamExt;
 
 pub const NS: &str = "gc-test";

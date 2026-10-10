@@ -19,9 +19,10 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend,
-    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    controller_patches, Convoy, ConvoyPhase, ConvoySpec, InputMeta, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
+use flotilla_store::{apply_status_patch, InMemoryBackend, ResourceBackend};
 use flotilla_tui::{app::App, theme::Theme};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {

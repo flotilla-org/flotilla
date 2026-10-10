@@ -106,7 +106,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         )
         .await
         .expect("checkout");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &checkouts,
         "recoverable-work",
         &flotilla_resources::CheckoutStatusPatch::MarkReady {
@@ -208,7 +208,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let vessel = vessels.update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &vessel_status).await.expect("restart");
     let prepared = vessel_reconciler.prepare(&vessel).await.expect("prepare vessel");
     let outcome = vessel_reconciler.reconcile(&vessel, &prepared, chrono::Utc::now());
-    flotilla_resources::apply_status_patch(&vessels, &vessel.metadata.name, &outcome.patch.expect("mark vessel lost"))
+    flotilla_store::apply_status_patch(&vessels, &vessel.metadata.name, &outcome.patch.expect("mark vessel lost"))
         .await
         .expect("persist vessel loss");
     let lost_status = vessels.get(&vessel.metadata.name).await.expect("vessel").status.expect("status");
@@ -223,7 +223,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
     let convoy = convoys.get("memory-incident").await.expect("convoy");
     let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
     let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-    flotilla_resources::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("copy runtime evidence"))
+    flotilla_store::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("copy runtime evidence"))
         .await
         .expect("persist convoy evidence");
     assert_eq!(
@@ -237,7 +237,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         let convoy = convoys.get("memory-incident").await.expect("convoy");
         let prepared = convoy_reconciler.prepare(&convoy).await.expect("prepare convoy");
         let outcome = convoy_reconciler.reconcile(&convoy, &prepared, chrono::Utc::now());
-        flotilla_resources::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("roll up loss"))
+        flotilla_store::apply_status_patch(&convoys, "memory-incident", &outcome.patch.expect("roll up loss"))
             .await
             .expect("persist convoy interruption");
     }

@@ -1,3 +1,4 @@
+use flotilla_resources::Actuation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -79,24 +80,25 @@ use flotilla_replay_testkit::Masks;
 use flotilla_replay_testkit::ReplayHttpClient;
 use flotilla_replay_testkit::Session;
 use flotilla_resources::{
-    clone_key,
-    controller::{Actuation, ControllerLoop, Reconciler},
-    delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, Checkout,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
+    clone_key, Checkout, Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
     CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, Clone, CloneSpec, ConditionValue,
     ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyProvisioningState,
-    ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant,
-    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
-    Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
-    EnvironmentStatusPatch, Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
-    InMemoryBackend, InputMeta, LifecycleAuthority, ManifestRoot, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PlacementPolicy, PlacementPolicySpec, PlacementStatus, Project, ReplicationClass, Repository, RepositoryKey, RepositorySpec,
-    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate,
-    WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
-    CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CredentialConsumer, CredentialGrant, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, Demand,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
+    Forge, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputMeta, LifecycleAuthority,
+    ManifestRoot, ModelProbeState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    PlacementStatus, Project, ReplicationClass, Repository, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceError,
+    ResourceList, Selector, StatusPatch, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselRequirement, VesselSpec,
+    VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, MANAGED_BY_LABEL,
+};
+use flotilla_store::{
+    controller::{ControllerLoop, Reconciler},
+    delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, ConvoyReconciler,
+    InMemoryBackend, ResourceBackend, SqliteBackend,
 };
 use futures::StreamExt;
 use serde_json::json;

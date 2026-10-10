@@ -5,9 +5,10 @@ use flotilla_core::config::ConfigStore;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    Host as ResourceHost, InMemoryBackend, InputMeta, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceBackend,
-    ResourceError, ResourceObject, WorkflowTemplate,
+    Host as ResourceHost, InputMeta, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
+    WorkflowTemplate,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use std::{sync::Arc, time::Duration};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -125,12 +126,12 @@ async fn assert_independent_placement_snapshots(factory: &dyn EnsureScenarioCont
             .expect("exchange placement snapshots");
     }
     for store in [&first_store, &second_store] {
-        assert!(flotilla_resources::home_bound_authorship_collisions(store, "flotilla").await.expect("diagnostics").is_empty());
+        assert!(flotilla_store::home_bound_authorship_collisions(store, "flotilla").await.expect("diagnostics").is_empty());
     }
     // A remote reference may still be in flight when the first origin releases
     // its convoy. The second admission must retain its own frozen placement.
     let first_convoy = first_store.using::<ResourceConvoy>("flotilla").list().await.expect("first convoys").items.remove(0);
-    flotilla_resources::PreparedSnapshotGarbageCollector::new(first_store.clone(), "flotilla")
+    flotilla_store::PreparedSnapshotGarbageCollector::new(first_store.clone(), "flotilla")
         .collect(Some(&first_convoy.metadata.name))
         .await
         .expect("collect first origin snapshots");
@@ -520,10 +521,8 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
 use chrono::Duration as ChronoDuration;
 use flotilla_core::ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
-use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, CheckoutStatus as ResourceCheckoutStatus, ConvoySpec, FulfilmentKind,
-    LifecycleAuthority,
-};
+use flotilla_resources::{CheckoutStatus as ResourceCheckoutStatus, ConvoySpec, FulfilmentKind, LifecycleAuthority};
+use flotilla_store::apply_status_patch as apply_resource_status_patch;
 use sha2::{Digest, Sha256};
 
 use flotilla_core::in_process::convoy_admission::allocate_convoy_generation;

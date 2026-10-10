@@ -9,11 +9,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
-    actor_obligation,
-    controller::{SecondaryWatch, WorkQueueSender},
-    instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest, Checkout,
-    CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, Forge, InstantiatedExit, LeafMaker, ResourceBackend, ResourceError, ResourceObject,
+    actor_obligation, instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest,
+    Checkout, CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject,
     RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WatchEvent, WatchStart, WorkPhase,
+};
+use flotilla_store::{
+    controller::{SecondaryWatch, WorkQueueSender},
+    ResourceBackend,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -110,7 +112,7 @@ impl ReconcilerWake {
         let mut next = status.clone();
         patch.apply(&mut next);
         if next != *status {
-            flotilla_resources::apply_status_patch(
+            flotilla_store::apply_status_patch(
                 &self.subscriptions.inner.backend.clone().using::<Convoy>(namespace),
                 &convoy.metadata.name,
                 &patch,

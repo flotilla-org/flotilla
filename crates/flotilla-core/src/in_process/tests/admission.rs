@@ -12,10 +12,11 @@ use flotilla_resources::{
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
     Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialLifecycle,
     CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, ImageAcquisitionCost, InMemoryBackend, InputMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
-    ResourceBackend, ResourceObject, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    FulfilmentRealisation, ImageAcquisitionCost, InputMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, ResourceObject,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
 use crate::admission::AvailableSpaceProbe;
@@ -172,7 +173,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         &[forge],
     );
     assert_eq!(claim.len(), 1);
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "multi-repo",
         &ConvoyStatusPatch::DiscoverSubjects {

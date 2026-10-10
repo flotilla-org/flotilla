@@ -129,7 +129,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         .expect("workflow template create should succeed");
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
     backend
@@ -310,7 +310,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
 }
 
 pub(super) async fn record_successful_empty_branch_scan(backend: &ResourceBackend, convoy: &str) {
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &backend.clone().using::<Convoy>(NAMESPACE),
         convoy,
         &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },

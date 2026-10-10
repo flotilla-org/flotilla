@@ -33,11 +33,11 @@ use flotilla_protocol::TerminalStatus;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
     Checkout, CheckoutPhase, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment,
-    EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
-    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    EnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository,
+    RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");

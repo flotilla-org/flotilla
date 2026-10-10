@@ -4,13 +4,14 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    canonicalize_repo_url, ensure_repository, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase,
-    CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy,
-    DockerEnvironmentSpec, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
+    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, Repository,
+    RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement,
+    VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
+use flotilla_store::{ensure_repository, ResourceBackend};
 use tokio::{
     task::JoinHandle,
     time::{sleep, Instant},

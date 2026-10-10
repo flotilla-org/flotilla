@@ -419,7 +419,7 @@ async fn failed_environment_readoption_does_not_block_a_live_sibling() {
         )
         .await
         .expect("create orphaned environment");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &environments,
         orphaned_id.as_str(),
         &EnvironmentStatusPatch::MarkReady {

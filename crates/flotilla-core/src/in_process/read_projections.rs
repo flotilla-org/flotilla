@@ -1,5 +1,7 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
+use flotilla_store::ProjectHierarchyStoreExt;
+
 use crate::providers::change_request::observation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -31,14 +33,16 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, repository_display_labels, resolve_project_issue_sources, ChangeRequestStatus, Checkout as ResourceCheckout,
-    Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState,
-    EventRecorder, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
-    IssueSourceResolution, IssueSourceUnavailable, ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend,
-    ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
-    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    expected_checkout_refs, repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue,
+    Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, Forge, FulfilmentKind,
+    FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution, IssueSourceUnavailable,
+    ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceObject, ResourceProvenance, SettlementMode,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::resolve_project_issue_sources;
+use flotilla_store::{EventRecorder, ResourceBackend};
 use tracing::warn;
 
 use super::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
@@ -1495,7 +1499,7 @@ fn explain_subject_observation(
 /// Convoy explanation still scans namespace history here (tracked in #2953).
 /// Crew orientation deliberately avoids this projection (#2952).
 pub(super) async fn crew_message_views(
-    backend: &flotilla_resources::ResourceBackend,
+    backend: &flotilla_store::ResourceBackend,
     namespace: &str,
 ) -> Result<Vec<flotilla_protocol::query::CrewMessageView>, String> {
     let mut records =
@@ -1506,7 +1510,7 @@ pub(super) async fn crew_message_views(
     let mut views = Vec::new();
     for source in records {
         let message = source.object;
-        let holder = flotilla_resources::resolve_message_receiver(backend, namespace, &message.spec.receiver)
+        let holder = flotilla_store::resolve_message_receiver(backend, namespace, &message.spec.receiver)
             .await
             .map_err(|error| error.to_string())?;
         let current_receiver = holder.and_then(|holder| {
@@ -1541,10 +1545,11 @@ mod tests {
     use flotilla_protocol::{qualified_path::HostId, EvidenceFreshness, HostSummary, IssueSource, NodeInfo, Relationship, SystemInfo};
     use flotilla_resources::{
         ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyPhase, ConvoySpec, CrewWorkState, DeclaredSubject,
-        DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend, InputMeta, Observation,
-        ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock,
-        TerminalSessionSource, TerminalSessionSpec,
+        DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InputMeta, Observation, ObservedChangeRequestState,
+        ObservedChecks, ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock, TerminalSessionSource,
+        TerminalSessionSpec,
     };
+    use flotilla_store::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
@@ -2413,7 +2418,8 @@ mod tests {
     #[tokio::test]
     async fn convoy_explanation_reports_terminal_provider_loss_and_recovery() {
         use flotilla_protocol::ExplainedTerminalCondition;
-        use flotilla_resources::{apply_status_patch, TerminalSessionStatus, TerminalSessionStatusPatch};
+        use flotilla_resources::{TerminalSessionStatus, TerminalSessionStatusPatch};
+        use flotilla_store::apply_status_patch;
 
         let fixture = ProjectionFixture::new();
         fixture
@@ -2771,7 +2777,8 @@ mod tests {
     // reasons survive reads, and delivery identity comes only from evidence.
     #[tokio::test]
     async fn message_views_preserve_waiting_reasons_and_delivery_identity() {
-        use flotilla_resources::{Message, MessageInbox, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
+        use flotilla_resources::{Message, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
+        use flotilla_store::MessageInbox;
         let backend = ResourceBackend::InMemory(Default::default());
         let inbox = MessageInbox::new(backend.clone(), "flotilla");
         let intent = MessageSpec::builder()
@@ -2785,7 +2792,7 @@ mod tests {
         assert_eq!(pending[0].phase, "accepted");
         assert!(pending[0].reason.as_deref().is_some_and(|reason| !reason.is_empty()));
         assert!(pending[0].crew_id.is_none());
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &backend.using::<Message>("flotilla"),
             "view",
             &MessageStatusPatch::Delivered {
@@ -2810,7 +2817,8 @@ mod tests {
 
 #[cfg(test)]
 mod project_hierarchy_projection_tests {
-    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend};
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::ReadProjections;
 

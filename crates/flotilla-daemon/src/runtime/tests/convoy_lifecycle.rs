@@ -79,7 +79,7 @@ async fn standing_ensure_dependency_changes_emit_wakes() {
                     .await
                     .expect("create renewed clone demand");
                 watch.next().await.expect("watch should remain open").expect("clone create event");
-                flotilla_resources::apply_status_patch(&clones, "renewed-demand", &flotilla_resources::CloneStatusPatch::MarkCloning)
+                flotilla_store::apply_status_patch(&clones, "renewed-demand", &flotilla_resources::CloneStatusPatch::MarkCloning)
                     .await
                     .expect("renew clone demand");
             }
@@ -616,8 +616,8 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let temp = TempDir::new().expect("tempdir");
     let authority_root = flotilla_protocol::NodeId::new("authority-root");
     let checkout_root = flotilla_protocol::NodeId::new("checkout-root");
-    let authority = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()).with_local_root(authority_root.clone());
-    let checkout_host = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()).with_local_root(checkout_root.clone());
+    let authority = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default()).with_local_root(authority_root.clone());
+    let checkout_host = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default()).with_local_root(checkout_root.clone());
     let authority_config_base = temp.path().join("authority-config");
     fs::create_dir_all(&authority_config_base).expect("config directory");
     fs::write(authority_config_base.join("daemon.toml"), "machine_id = \"checkout-authority-evidence-test\"\n").expect("daemon config");
@@ -736,7 +736,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let dependencies = observer.prepare(&checkout).await.expect("observe integration on checkout authority");
     let observation = observer.reconcile(&checkout, &dependencies, chrono::Utc::now());
     let patch = observation.patch.expect("Landing observation should update checkout evidence");
-    flotilla_resources::apply_status_patch(&checkouts, "checkout-b", &patch).await.expect("persist authority-local observation");
+    flotilla_store::apply_status_patch(&checkouts, "checkout-b", &patch).await.expect("persist authority-local observation");
     assert_eq!(
         checkouts.get("checkout-b").await.expect("observed checkout").status.expect("checkout status").integration.landed.value,
         ConditionValue::True,
@@ -772,7 +772,7 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let dependencies = reconciler.prepare(&current).await.expect("consume replicated checkout evidence");
     let outcome = reconciler.reconcile(&current, &dependencies, chrono::Utc::now());
     let patch = outcome.patch.expect("fresh replicated evidence should settle the convoy");
-    flotilla_resources::apply_status_patch(&convoys, "cross-host", &patch).await.expect("persist Landed phase");
+    flotilla_store::apply_status_patch(&convoys, "cross-host", &patch).await.expect("persist Landed phase");
 
     assert_eq!(convoys.get("cross-host").await.expect("settled convoy").status.expect("convoy status").phase, ConvoyPhase::Landed,);
     assert!(

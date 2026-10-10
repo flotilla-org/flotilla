@@ -191,7 +191,7 @@ async fn captured_scrollback_delivery_and_bounded_hold() {
             )
             .await;
         let backend = ResourceBackend::InMemory(Default::default());
-        let inbox = flotilla_resources::MessageInbox::new(backend, NAMESPACE);
+        let inbox = flotilla_store::MessageInbox::new(backend, NAMESPACE);
         inbox
             .accept(
                 &empty_meta("turn"),
@@ -261,7 +261,7 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
         .update_status("subject", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
         .await
         .unwrap();
-    let inbox = flotilla_resources::MessageInbox::new(backend.clone(), NAMESPACE);
+    let inbox = flotilla_store::MessageInbox::new(backend.clone(), NAMESPACE);
     inbox
         .accept(
             &empty_meta("turn"),
@@ -301,7 +301,8 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
 // Once its task is gone, polling the durable intent never types it again.
 #[tokio::test(start_paused = true)]
 async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_never_types() {
-    use flotilla_resources::{MessageBatch, MessageSubmission, MessageTransport, MessageTransportOutcome};
+    use flotilla_resources::MessageSubmission;
+    use flotilla_store::{MessageBatch, MessageTransport, MessageTransportOutcome};
     const ID: &str = "message-crew";
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-transport-test\"\n").expect("daemon config");

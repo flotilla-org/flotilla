@@ -9,9 +9,10 @@ use chrono::{Duration, Utc};
 use flotilla_core::in_process::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
-    artifact_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceBackend, ResourceError,
-    ResourceObject, TerminalSession, TerminalSessionSource,
+    artifact_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceError, ResourceObject,
+    TerminalSession, TerminalSessionSource,
 };
+use flotilla_store::ResourceBackend;
 
 use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
 
@@ -331,10 +332,8 @@ impl ArtifactService<'_> {
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::CallerCrew;
-    use flotilla_resources::{
-        apply_resource_document, InMemoryBackend, Selector, SqliteBackend, TerminalBrief, TerminalCrewContext, TerminalSessionSpec,
-        TerminalSessionStatus,
-    };
+    use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSpec, TerminalSessionStatus};
+    use flotilla_store::{apply_resource_document, InMemoryBackend, SqliteBackend};
 
     use super::{ArtifactBody, *};
     use crate::blob_store::MemoryBlobStore;

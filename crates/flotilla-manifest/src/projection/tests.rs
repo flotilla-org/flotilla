@@ -1483,7 +1483,8 @@ fn live_role_carries_its_attempts_vessel_attention() {
 #[test]
 fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     use flotilla_protocol::{Relationship, RepositoryAlias, Subject, SubjectKind};
-    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Forge, ForgeKind, ForgeSpec, InMemoryBackend, InputMeta, ResourceBackend};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Forge, ForgeKind, ForgeSpec, InputMeta};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let record = runtime.block_on(async {
@@ -1575,7 +1576,8 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
 #[test]
 fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     use flotilla_protocol::{Relationship, Subject, SubjectKind};
-    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InMemoryBackend, InputMeta, ResourceBackend};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InputMeta};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let mut record = runtime
@@ -1712,9 +1714,10 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     use flotilla_protocol::{NodeId, ReferenceContext, Relationship, RepositoryAlias, Subject, SubjectKind};
     use flotilla_resources::{
         convoy_subject_rows, ChangeRequest, ChangeRequestSpec, Convoy, ConvoySpec, ConvoyStatus, DeclaredSubject, Forge, ForgeKind,
-        ForgeSpec, InMemoryBackend, InputMeta, Issue, IssueSpec, IssueStatus, ObservedIssueState, Resource, ResourceBackend,
-        ResourceObject, SubjectDiscoverySource, WatchEvent,
+        ForgeSpec, InputMeta, Issue, IssueSpec, IssueStatus, ObservedIssueState, Resource, ResourceObject, SubjectDiscoverySource,
+        WatchEvent,
     };
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     async fn create<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> ResourceObject<T> {
         backend.using::<T>("flotilla").create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("create fixture")
     }
@@ -1958,7 +1961,8 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
 #[hegel::test]
 fn subject_project_is_unambiguous(tc: hegel::TestCase) {
     use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
-    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InMemoryBackend, InputMeta, Issue, IssueSpec, ResourceBackend};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InputMeta, Issue, IssueSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use hegel::generators as gs;
 
     // Empty through repeated and conflicting projects, missing project refs,
@@ -2103,9 +2107,8 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
 #[hegel::test]
 fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
     use flotilla_protocol::Relationship;
-    use flotilla_resources::{
-        select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InMemoryBackend, InputMeta, ResourceBackend,
-    };
+    use flotilla_resources::{select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InputMeta};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use hegel::generators as gs;
 
     // Cover empty/single/many records, equal and unequal timestamps, multiple
@@ -2251,7 +2254,8 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
 #[test]
 fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
     use flotilla_protocol::Relationship;
-    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InMemoryBackend, InputMeta, ResourceBackend};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InputMeta};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let now = "2026-10-02T12:00:00Z".parse().expect("time");
@@ -2317,7 +2321,8 @@ fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
 #[hegel::test]
 fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
-    use flotilla_resources::{ChangeRequestSpec, ForgeKind, ForgeSpec, InMemoryBackend, InputMeta, IssueSpec, ResourceBackend};
+    use flotilla_resources::{ChangeRequestSpec, ForgeKind, ForgeSpec, InputMeta, IssueSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use hegel::generators as gs;
 
     // Cover absent, unrelated, installation-URL and host-alias
@@ -3014,9 +3019,10 @@ fn structured_recipe_mint_refuses_ambiguous_hosts() {
 fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
     use crate::keys::{KEY_CONVOY_HELD, KEY_CONVOY_HOLDS, KEY_CONVOY_LEDGER, KEY_CONVOY_PENDING_MESSAGES, KEY_CONVOY_STUCK_MESSAGES};
     use flotilla_resources::{
-        Artifact, ArtifactSpec, Convoy, ConvoyAttention, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, Message, MessagePhase,
-        MessageRelation, MessageSpec, MessageStatus, ResourceBackend,
+        Artifact, ArtifactSpec, Convoy, ConvoyAttention, ConvoySpec, ConvoyStatus, InputMeta, Message, MessagePhase, MessageRelation,
+        MessageSpec, MessageStatus,
     };
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use hegel::generators as gs;
     let held = tc.draw(gs::booleans());
     let ledger = tc.draw(gs::booleans());

@@ -13,7 +13,8 @@ use std::{
 
 use flotilla_controllers::reconcilers::DockerEnvironmentRuntime;
 use flotilla_core::providers::environment::{EnvironmentBacking, EnvironmentProvider};
-use flotilla_resources::{Environment, Resource, ResourceBackend};
+use flotilla_resources::{Environment, Resource};
+use flotilla_store::ResourceBackend;
 use tokio::time::Instant;
 
 pub(crate) const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -334,7 +335,7 @@ mod tests {
     async fn orphan_sweep_preserves_quarantined_environment() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("resources.sqlite");
-        let backend = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(&path).expect("store"));
+        let backend = ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(&path).expect("store"));
         let connection = rusqlite::Connection::open(&path).expect("raw store");
         connection
             .execute(

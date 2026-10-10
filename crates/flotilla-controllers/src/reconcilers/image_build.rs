@@ -7,9 +7,12 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    controller::{ReconcileOutcome, Reconciler},
     Clock, Host, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildSpec,
-    ImageBuildStatusPatch, InputMeta, PlacedImageIdentity, ResourceBackend, ResourceError, ResourceObject, SystemClock, TypedResolver,
+    ImageBuildStatusPatch, InputMeta, PlacedImageIdentity, ResourceError, ResourceObject, SystemClock,
+};
+use flotilla_store::{
+    controller::{ReconcileOutcome, Reconciler},
+    ResourceBackend, TypedResolver,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -88,9 +91,9 @@ impl<R> ImageBuildReconciler<R> {
     }
 
     async fn latest(&self, name: &str) -> Result<ResourceObject<ImageBuild>, ResourceError> {
-        let mut current = flotilla_resources::read_image_build(&self.backend, &self.namespace, name).await?;
+        let mut current = flotilla_store::read_image_build(&self.backend, &self.namespace, name).await?;
         for _ in 0..3 {
-            match flotilla_resources::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", current.metadata.name)).await {
+            match flotilla_store::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", current.metadata.name)).await {
                 Ok(next) => current = next,
                 Err(ResourceError::NotFound { .. }) => break,
                 Err(error) => return Err(error),

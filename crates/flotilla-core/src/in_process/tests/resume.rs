@@ -4,11 +4,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoySpec,
-    ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, ResourceBackend, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState,
+    InputMeta, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
 use super::support::{resume_staging_fixture, resume_staging_fixture_with_backend, test_meta};
 use crate::config::ConfigStore;
@@ -128,7 +129,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let database_dir = tempfile::tempdir().expect("resource database");
     let database_path = database_dir.path().join("resources.db");
     let (mut daemon, mut backend, probe) = resume_staging_fixture_with_backend(ResourceBackend::Sqlite(
-        flotilla_resources::SqliteBackend::open(&database_path).expect("resource store"),
+        flotilla_store::SqliteBackend::open(&database_path).expect("resource store"),
     ))
     .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -235,7 +236,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         )
         .await
         .expect("governor working");
-    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     let mut task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     let patch = convoy_external_patches::mark_crew_stalled(
         "resume-staging".to_string(),
@@ -301,7 +302,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     task.abort();
     let _ = task.await;
     drop(daemon);
-    backend = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(&database_path).expect("reopen stored resources"));
+    backend = ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(&database_path).expect("reopen stored resources"));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let restart_config = tempfile::tempdir().expect("restart config");
@@ -316,7 +317,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .await;
     daemon.set_work_credential_reconciler(probe.clone()).await;
     daemon.crew_ops.set_turn_delivery_actuator(supervision.clone()).await;
-    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

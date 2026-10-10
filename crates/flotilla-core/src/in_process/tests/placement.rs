@@ -6,12 +6,13 @@ use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, Host as ResourceHost,
-    HostCondition, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta,
-    PlacementPolicy, PlacementPolicySpec, Project, ProjectSpec, ResourceBackend, ResourceProvenance, Selector,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    HostCondition, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Project, ProjectSpec, ResourceProvenance, Selector, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{
     create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, placement_policy, test_meta,

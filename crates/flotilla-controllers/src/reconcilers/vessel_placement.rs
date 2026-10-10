@@ -5,10 +5,10 @@ use std::{
 
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
-    Convoy, InputMeta, LifecycleAuthority, OwnerReference, ReadResourceObject, ReadWatchEvent, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    VESSEL_PLACEMENTS_ANNOTATION,
+    Convoy, InputMeta, LifecycleAuthority, OwnerReference, ReadResourceObject, ReadWatchEvent, Resource, ResourceError, ResourceObject,
+    ResourceProvenance, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION,
 };
+use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 

@@ -719,7 +719,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn cli_round_trip_host_reference<T: flotilla_resources::Resource>(
-        backend: &flotilla_resources::ResourceBackend,
+        backend: &flotilla_store::ResourceBackend,
         daemon: &dyn flotilla_daemon_api::daemon::DaemonHandle,
         node_id: Option<NodeId>,
         spec: &T::Spec,

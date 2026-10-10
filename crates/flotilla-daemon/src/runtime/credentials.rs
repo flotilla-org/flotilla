@@ -21,9 +21,10 @@ use flotilla_credentials::{
 use flotilla_resources::Resource;
 use flotilla_resources::{
     ControllerRetry, ControllerRetryDisposition, Convoy, Demand, DemandKind, DemandSpec, Environment, EnvironmentPhase,
-    EnvironmentStatusPatch, InputMeta, Repository, RepositoryTrust, ResourceBackend, ResourceError, RetryBackoff, TerminalSession,
-    TerminalSessionSource, Vessel, VesselStatusPatch,
+    EnvironmentStatusPatch, InputMeta, Repository, RepositoryTrust, ResourceError, RetryBackoff, TerminalSession, TerminalSessionSource,
+    Vessel, VesselStatusPatch,
 };
+use flotilla_store::ResourceBackend;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -426,7 +427,7 @@ pub(super) async fn record_credential_delivery_retry(
         mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
         return Ok(());
     }
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &environments,
         environment_ref,
         &EnvironmentStatusPatch::CredentialDelivery { retry: retry.clone() },
@@ -458,7 +459,7 @@ pub(super) async fn mirror_credential_retry_to_vessels(
         } else {
             VesselStatusPatch::CredentialDelivery { retry: retry.clone() }
         };
-        flotilla_resources::apply_status_patch(&vessels, &vessel.metadata.name, &patch)
+        flotilla_store::apply_status_patch(&vessels, &vessel.metadata.name, &patch)
             .await
             .map_err(|error| format!("record vessel credential disposition: {error}"))?;
     }
@@ -669,7 +670,7 @@ pub(super) async fn record_credential_refresh_dispositions(
         if previous == retry.as_ref() {
             continue;
         }
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &environments,
             &environment.metadata.name,
             &EnvironmentStatusPatch::CredentialRefresh { retry: retry.clone() },

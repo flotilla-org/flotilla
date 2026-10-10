@@ -716,9 +716,10 @@ async fn connector_bootstraps_replicated_subjects_and_publishes_watch_updates() 
 #[tokio::test]
 async fn connector_uses_project_aliases_for_previous_generation_remote_repositories() {
     use flotilla_resources::{
-        Forge, ForgeKind, ForgeSpec, InMemoryBackend, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-        Repository, RepositorySpec, Resource, ResourceBackend,
+        Forge, ForgeKind, ForgeSpec, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository,
+        RepositorySpec, Resource,
     };
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     async fn envelope<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> flotilla_protocol::ResourceReadEnvelope {
         let object = backend.using::<T>("flotilla").create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("resource");
         flotilla_protocol::ResourceReadEnvelope::builder()
@@ -934,7 +935,8 @@ fn connector_clock_expires_landed_subjects_without_resource_updates() {
 async fn connector_real_daemon_stays_subscribed() {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
-    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     let tmp = tempfile::tempdir().expect("config directory");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-2523\"\n").expect("machine id");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -967,7 +969,8 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
     use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
-    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     let tmp = tempfile::tempdir().expect("config directory");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-refusal-2523\"\n").expect("machine id");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -1016,7 +1019,8 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
 async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
-    use flotilla_resources::{ChangeRequest, InMemoryBackend, K8sResourceObject, ResourceBackend, ResourceObject, WatchEvent};
+    use flotilla_resources::{ChangeRequest, K8sResourceObject, ResourceObject, WatchEvent};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     let tmp = tempfile::tempdir().expect("config");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-namespace-2523\"\n").expect("config");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());

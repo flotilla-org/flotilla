@@ -10,8 +10,9 @@ use flotilla_resources::{
     canonical_host_id, descriptive_repo_slug, is_prepared_snapshot, Clone, CloneSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, FulfilmentKind, FulfilmentKindSpec, Host, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
-    Repository, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
+    Repository, ResourceError, ResourceObject, WorkflowTemplate, MANAGED_BY_LABEL, PLACEMENT_SNAPSHOT_KIND,
 };
+use flotilla_store::ResourceBackend;
 use tracing::warn;
 
 use super::discovery::{LocalProvisioningProfile, DEFAULT_DOCKER_IMAGE};
@@ -184,7 +185,7 @@ pub(super) async fn discover_local_clones(
         };
         let repository_spec = inspection.spec;
         let repository_key = repository_spec.key();
-        flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
+        flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
             .await
             .map_err(|error| error.to_string())?;
         let repo_key_value = repository_key.to_string();

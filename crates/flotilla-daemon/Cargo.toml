@@ -6,10 +6,12 @@ license.workspace = true
 
 [features]
 default = []
-aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-resources/aws-lc-provider", "flotilla-credentials/aws-lc-provider", "flotilla-aggregator/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-resources/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
+aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provider", "flotilla-credentials/aws-lc-provider", "flotilla-aggregator/aws-lc-provider"]
+skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-tls = { path = "../flotilla-tls" }
+flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 bon = { workspace = true }

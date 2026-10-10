@@ -2,10 +2,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_resources::{
-    CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, CrewSource, ResourceBackend, ResourceError, TerminalSessionSource,
-    VESSEL_LABEL,
-};
+use flotilla_resources::{CrewSource, ResourceError, TerminalSessionSource, VESSEL_LABEL};
+use flotilla_store::{CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, ResourceBackend};
 
 use crate::{
     agent_adapter::{
@@ -81,7 +79,7 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
         let scopes = requirement.map(|requirement| &requirement.credential_scopes).unwrap_or(&empty_scopes);
         append_convoy_work_context(&mut brief.content, convoy, &repositories, scopes);
         let address = format!("{}/{}/{}/{}", input.project.metadata.name, convoy.metadata.name, vessel, input.role);
-        let book = flotilla_resources::crew_address_book(&self.backend, &context.namespace, &address).await?;
+        let book = flotilla_store::crew_address_book(&self.backend, &context.namespace, &address).await?;
         brief.content.push('\n');
         brief.content.push_str(&book.render());
         Ok(brief.content)
@@ -94,10 +92,10 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_resources::{
-        reconcile_charter_notifications_with_renderer, Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InMemoryBackend, InputMeta, Message,
-        MessageInbox, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
-        TerminalSessionSpec, VesselRequirement, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL,
+        Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InputMeta, Message, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
+        TerminalCrewContext, TerminalSession, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL,
     };
+    use flotilla_store::{reconcile_charter_notifications_with_renderer, InMemoryBackend, MessageInbox};
 
     use super::*;
 

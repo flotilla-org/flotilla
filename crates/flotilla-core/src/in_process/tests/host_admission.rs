@@ -7,9 +7,10 @@ use flotilla_protocol::{HostName, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     CapabilityNeed, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
     FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
-    WorkflowTemplateSpec, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, WorkflowTemplateSpec,
+    GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{create_identity_convoy, placement_policy, test_meta};
 use crate::config::ConfigStore;

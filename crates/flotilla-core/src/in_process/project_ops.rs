@@ -12,12 +12,12 @@ use flotilla_protocol::{
     PrincipalRef, ProviderData, ResourceRef,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, ensure_repository, normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec,
-    ConvoyEnsureStatusPatch, ConvoyRepositorySpec, DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, EventRecorder, Forge,
-    InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository,
-    RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate,
-    WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
+    DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,
+    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError,
+    ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend};
 use tracing::{debug, warn};
 
 use super::{
@@ -116,7 +116,7 @@ fn whole_repository_project_meta(name: impl Into<String>) -> InputMeta {
 /// generator-owned. Explicit Project operations are the only way to refresh a
 /// materialized definition.
 async fn reconcile_whole_repository_project_definition(
-    projects: &flotilla_resources::DefinitionResolver<Project>,
+    projects: &flotilla_store::DefinitionResolver<Project>,
     existing: ResourceObject<Project>,
 ) -> Result<ResourceObject<Project>, String> {
     if is_declaration_backed_project(&existing) {
@@ -1537,7 +1537,8 @@ pub(super) async fn snapshot_project_repositories_with_backend(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use flotilla_resources::{InMemoryBackend, SystemClock};
+    use flotilla_resources::SystemClock;
+    use flotilla_store::InMemoryBackend;
 
     use super::*;
     use crate::ops_entry::OperationalEntryFile;

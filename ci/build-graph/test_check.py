@@ -9,11 +9,12 @@ from check import (C_FREE_BASE, RESOURCE_EXEMPTIONS, c_free_violations,
                    feature_differences, is_testkit, layer, main, tree_features, violations)
 
 
-# Explicit finite generator: the five names are fixed by the amended contract,
+# Explicit finite generator: the seven names are fixed by the amended contract,
 # independent of the implementation's policy set (which might regress).
 BASE_CRATES = (
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
+    "flotilla-resources", "flotilla-client",
 )
 
 
@@ -238,9 +239,9 @@ class LayerContract(unittest.TestCase):
 
     def test_resources_exemptions_remain_native(self):
         self.assertTrue(RESOURCE_EXEMPTIONS.isdisjoint(C_FREE_BASE))
-        # The amendment explicitly keeps real resources consumers exempt until
-        # the step 3 store split; they must still get native feature checks.
-        for name in ("flotilla-client", "flotilla-manifest", "flotilla-tui", "flotilla"):
+        # Manifest keeps TLS and TUI/the executable still reach store through core;
+        # these production graphs retain native feature checks.
+        for name in ("flotilla-manifest", "flotilla-tui", "flotilla"):
             self.assertIn(name, RESOURCE_EXEMPTIONS)
             self.assertEqual(layer(name), "native")
             self.assertEqual(c_free_violations(name, tree_features("ring v1|std\nlibsqlite3-sys v1|bundled")), [])

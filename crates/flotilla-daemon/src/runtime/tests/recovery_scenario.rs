@@ -547,7 +547,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .details(vec!["no change request exists for branch".to_string()])
         .observed_at(Utc::now().to_rfc3339())
         .build();
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &checkouts,
         &checkout.metadata.name,
         &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },

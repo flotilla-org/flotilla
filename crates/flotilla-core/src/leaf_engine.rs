@@ -9,10 +9,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::Leaf;
-use flotilla_resources::{
-    controller::SecondaryWatch, Convoy, HoldAct, LeafMaker, ResourceBackend, TerminalAttentionSource, TerminalAttentionState,
-    TurnDeliveryRule, TurnDeliveryRung,
-};
+use flotilla_resources::{Convoy, HoldAct, LeafMaker, TerminalAttentionSource, TerminalAttentionState, TurnDeliveryRule, TurnDeliveryRung};
+use flotilla_store::{controller::SecondaryWatch, ResourceBackend};
 use tokio::{
     sync::{broadcast, Mutex},
     task::JoinHandle,
@@ -133,8 +131,8 @@ pub struct LeafSubscriptionTable {
 
 struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
-    charter_brief_renderer: Arc<dyn flotilla_resources::CharterBriefRenderer>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
+    charter_brief_renderer: Arc<dyn flotilla_store::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
@@ -164,12 +162,12 @@ enum UnableEvidenceKey {
 }
 
 impl LeafSubscriptionTable {
-    pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_resources::CharterBriefRenderer>) -> Self {
+    pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_store::CharterBriefRenderer>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
         self
     }
 
-    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>) -> Self {
+    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure inboxes before sharing subscriptions").message_inboxes = inboxes;
         self
     }
@@ -210,7 +208,7 @@ impl LeafSubscriptionTable {
             inner: Arc::new(LeafSubscriptionTableInner {
                 backend,
                 message_inboxes: Default::default(),
-                charter_brief_renderer: Arc::new(flotilla_resources::CharterProseRenderer),
+                charter_brief_renderer: Arc::new(flotilla_store::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),

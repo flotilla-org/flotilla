@@ -3,9 +3,10 @@ pub mod runtime;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_resources::{
+use flotilla_resources::{Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, ResourceError, ResourceObject};
+use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
-    Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, ResourceError, ResourceObject, TypedResolver,
+    TypedResolver,
 };
 
 const CLONE_BACKOFF: flotilla_resources::RetryBackoff =

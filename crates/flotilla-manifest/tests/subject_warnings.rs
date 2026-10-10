@@ -21,7 +21,8 @@ fn uncovered_subject_service_warns_with_service() {
     use std::sync::{Arc, Mutex};
 
     use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
-    use flotilla_resources::{ChangeRequestSpec, InMemoryBackend, InputMeta, IssueSpec, ResourceBackend};
+    use flotilla_resources::{ChangeRequestSpec, InputMeta, IssueSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
     use tracing::{
         field::{Field, Visit},
         span::{Attributes, Id, Record},

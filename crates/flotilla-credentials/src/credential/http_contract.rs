@@ -169,7 +169,7 @@ async fn github_app_mint_satisfies_http_contract() {
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires loopback listener")]
 async fn github_app_stand_in_rejects_contract_violations() {
     let server = stand_in().await;
-    flotilla_resources::tls::install_default_provider();
+    flotilla_tls::install_default_provider();
     let client = reqwest::Client::builder().no_proxy().build().expect("test client");
     let claims = json!({"iss":"12345", "iat":NOW-60, "exp":NOW+540});
     let sign = |claims: &Value| {

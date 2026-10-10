@@ -77,7 +77,7 @@ mod unix {
     }
 
     async fn async_main() -> Result<(), String> {
-        flotilla_core::tls::install_default_provider();
+        flotilla_tls::install_default_provider();
         let cli = Cli::parse();
         let config_dir = cli.config_dir();
         let state_dir = cli.state_dir();

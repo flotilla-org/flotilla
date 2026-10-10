@@ -10,9 +10,9 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
-    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,
-    SqliteBackend, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
+    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InputMeta, PlacementPolicy, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend, SqliteBackend};
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
     backend

@@ -23,9 +23,9 @@ use flotilla_core::{
 use flotilla_protocol::RepoSelector;
 use flotilla_resources::{
     ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, ClonePhase, Convoy, ConvoyTeardownRuntime, Demand, DemandKind,
-    DemandSpec, Forge, ForgeIdentity, InputMeta, ManifestRoot, ReplicaReadResolver, Resource, ResourceBackend, ResourceError,
-    ResourceObject,
+    DemandSpec, Forge, ForgeIdentity, InputMeta, ManifestRoot, Resource, ResourceError, ResourceObject,
 };
+use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use tracing::{info, warn};
 
 use super::credentials::{reconcile_work_credentials_for_environment, record_credential_delivery_retry};
@@ -89,7 +89,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready) {
                     return Ok(format!("Clone/{name} is already ready"));
                 }
-                flotilla_resources::apply_status_patch(&clones, name, &flotilla_resources::CloneStatusPatch::MarkCloning)
+                flotilla_store::apply_status_patch(&clones, name, &flotilla_resources::CloneStatusPatch::MarkCloning)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(format!("Clone/{name} retry requested"))
