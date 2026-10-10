@@ -145,7 +145,7 @@ children by this cascade. Selection of grants remains a separate policy seam.
 | Ensure `driver`, `placement`, `escalation_reason`, `presents-as` | Placement, homing and presentation of this local standing instance; retain genuine host differences. |
 | Workflow frontmatter `kind/name/repos`, spec `repository_refs` | Local reusable workflow definition and local member scope. |
 | Workflow `inputs/exit/turn_delivery/stall_nudges/handoffs/roles/vessels` | Declared workflow content; the role shape fields above can inherit independently. |
-| Vessel `name/depends_on/repository_refs/credential_refs/credential_scopes/credential_permissions`, crew `role/needs/labels/completion_conditions` | Local workflow graph, execution requirements and completion policy. |
+| Vessel `name/depends_on/repository_refs/credential_refs/credential_scopes/credential_permissions`, crew `role/needs/labels/promises/promise_exclusions/deliverer` | Local workflow graph, execution requirements and completion policy. |
 | Crew `prompt` project-specific prose | Move into Project `charter_prose.<role>`; render it into the artifact with its applied source revision. |
 | Verification entry `kind/name/repos/command` | Local verification command and target repository subset. |
 | Repository `identity/remotes/forge/upstream/allow_reviewless_workflows/verification_commands/vcs/change_request` | Catalog identities and repository-specific policy. |
@@ -154,6 +154,22 @@ children by this cascade. Selection of grants remains a separate policy seam.
 | Forge `forge_id/kind/hosts/https_url/git_ssh_host` | Fleet-local forge catalog (`forge-lab.json`). |
 | ManifestRoot `binding/host/path/source/suspended/resolutions` | Local reconciliation source and drift decisions. |
 | Metadata labels / source annotations | Authoring, ownership and commit evidence, not cascade values. |
+
+Workflow crew obligations use `promises: [{kind: decision-ledger, owner: coder}]`.
+The owner must match the declaring crew role, and each kind is unique for that
+owner. Mark the role that receives dispatch-supplied deliverables with
+`deliverer: true`. All declarations apply unless their kind appears in that
+crew's `promise_exclusions`. Dispatchers can also supply repeatable
+`--exclude-promise coder=decision-ledger` options to `convoy start`; admission
+refuses unknown owners or undeclared kinds before allocating vessels. The frozen
+snapshot retains both declarations and exclusions, so later template edits do
+not change a convoy's obligations.
+
+Previous-generation `completion_conditions` and `completion_expectations` decode
+for one roll: ledger existence becomes a ledger promise, and stock PR readiness
+becomes the deliverer marker using the `pr` kind's readiness rule. Historical
+custom leaves without a supported promise kind retain their checks under
+`legacy_checks`; new workflows should use the declared promise kinds.
 
 Project-map's applied manifest inventory additionally contains
 `crew-defaults-fleet.json`, `repository-andamento.json`,
