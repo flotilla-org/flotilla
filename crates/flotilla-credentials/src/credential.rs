@@ -9,12 +9,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::providers::discovery::EnvVars;
-use flotilla_core::providers::environment::PreparedEnvironmentAuth;
+use flotilla_core::providers::environment::{
+    registry_auth::{RegistryAuthMaterial, RegistryConfig},
+    PreparedEnvironmentAuth, RegistryAuth,
+};
 use flotilla_core::providers::ChannelLabel;
 use flotilla_core::providers::CommandRunner;
 use flotilla_core::providers::HttpClient;
 use flotilla_core::providers::ReqwestHttpClient;
-use flotilla_protocol::DaemonHostPath;
 use flotilla_resources::{
     capped_github_app_permissions, Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec,
     CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError,
@@ -23,7 +25,7 @@ use flotilla_resources::{
 use futures::future::BoxFuture;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{Mutex, OnceCell};
 use url::Url;
 
 use crate::vessel_config::agent_environment_fragment;
@@ -311,8 +313,6 @@ pub struct CredentialStore {
     ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
-    registry_configs: Mutex<BTreeMap<String, PathBuf>>,
-    registry_cache_maintenance: RwLock<()>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
     github_app_delivery_locks: Mutex<GithubAppDeliveryLocks>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
@@ -593,8 +593,6 @@ impl CredentialStore {
             ledger_delivery_environment: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
-            registry_configs: Mutex::new(BTreeMap::new()),
-            registry_cache_maintenance: RwLock::new(()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
             github_app_delivery_locks: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
@@ -1094,36 +1092,16 @@ impl CredentialStore {
         }
     }
 
-    /// Registry host actions resolve only declared material and own their private
-    /// Docker configuration for this operation, including error/cancellation cleanup.
-    pub fn image_registry_operation<'a>(
+    /// Mint an opaque in-memory handle after host-action grant admission.
+    pub fn registry_auth<'a>(
         &'a self,
         host: &'a str,
         action: flotilla_resources::HostImageAction,
         credential: &'a str,
         repository: &'a str,
-        arguments: &'a [&'a str],
-    ) -> BoxFuture<'a, Result<String, String>> {
+    ) -> BoxFuture<'a, Result<RegistryAuth, String>> {
         Box::pin(async move {
-            use flotilla_resources::{CredentialGrant, Host, HostImageAction, ImageBuildCapacity};
-            let verb = match action {
-                HostImageAction::ImagePush => "push",
-                HostImageAction::ImagePull => "pull",
-            };
-            if arguments.len() != 2
-                || arguments[0] != verb
-                || !image_registry_matches(arguments[1], repository.split('/').next().unwrap_or(""))
-            {
-                return Err("host image action requires its declared registry operation".into());
-            }
-            if !arguments[1].strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
-                return Err("host image operation does not target the declared repository".into());
-            }
-            if action == HostImageAction::ImagePull
-                && !arguments[1].rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
-            {
-                return Err("host image pull requires a manifest digest".into());
-            }
+            use flotilla_resources::{CredentialGrant, Host, ImageBuildCapacity};
             let hosts = self.backend.including_replicas::<Host>(&self.namespace).list().await.map_err(|error| error.to_string())?;
             let declared_builder = hosts.items.iter().any(|source| {
                 source.object.metadata.name == host
@@ -1145,38 +1123,19 @@ impl CredentialStore {
             let material = self.resolve_for_adapter(credential, &spec, None, None).await?;
             let material = material.value.trim_end();
             validate_scalar_material(credential, "docker-registry", material)?;
-            let root = self.state_dir.join("image-registry-operations");
-            tokio::fs::create_dir_all(&root).await.map_err(|error| error.to_string())?;
-            // TempDir removes the config on cancellation as well as every return path.
-            let config = tempfile::Builder::new().prefix("operation-").tempdir_in(root).map_err(|error| error.to_string())?;
-            tokio::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;
-            let directory = config.path().to_string_lossy();
-            let operation = async {
-                self.host_runner
-                    .run_with_input(
-                        "docker",
-                        &["--config", &directory, "login", "--username", username, "--password-stdin", registry],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                        material.as_bytes(),
-                    )
-                    .await?;
-                let mut args = vec!["--config", directory.as_ref()];
-                args.extend_from_slice(arguments);
-                self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
-            };
-            let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), operation)
-                .await
-                .map_err(|_| "image registry operation timed out".to_string())?
-                .map_err(|error| bounded_adapter_error(credential, "docker-registry", &error.replace(material, "[redacted]")))?;
-            // Return only Docker's non-secret operation output, never login output.
-            Ok(output.replace(material, "[redacted]"))
+            Ok(RegistryAuth::new(
+                repository.into(),
+                action,
+                Arc::new(RegistryMaterial { registry: registry.clone(), username: username.clone(), password: material.into() }),
+            ))
         })
     }
 
+    /// Environment admission resolves credentials without invoking a runtime or
+    /// writing secrets. The provider performs the pull, once, with this handle.
     pub fn prepare_registry_pull<'a>(
         &'a self,
-        environment_ref: &'a str,
+        _environment_ref: &'a str,
         credential_refs: &'a BTreeSet<String>,
         image: &'a str,
     ) -> BoxFuture<'a, Result<PreparedEnvironmentAuth, String>> {
@@ -1184,73 +1143,33 @@ impl CredentialStore {
             let mut matching = Vec::new();
             for name in credential_refs {
                 let spec = self.spec(name).await?;
-                let CredentialConsumer::DockerRegistry { registry, .. } = &spec.consumer else {
-                    continue;
-                };
-                if image_registry_matches(image, registry) {
-                    matching.push((name.clone(), spec));
+                if let CredentialConsumer::DockerRegistry { registry, .. } = &spec.consumer {
+                    if image_registry_matches(image, registry) {
+                        matching.push((name, spec));
+                    }
                 }
             }
+            if matching.len() > 1 {
+                return Err("multiple granted credentials match the image registry".into());
+            }
             let Some((name, spec)) = matching.pop() else {
-                return Ok(PreparedEnvironmentAuth::NoRegistryCredential);
+                return Ok(None);
             };
-            if !matching.is_empty() {
-                return Err(bounded_adapter_error(&name, "docker-registry", "multiple granted credentials match the image registry"));
-            }
-            let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
-                unreachable!("matching credentials are docker-registry consumers");
-            };
-            // Keep creation, preflight, and registration in the same critical section
-            // as sweeping: a fresh cache must not look orphaned before it is indexed.
-            let _maintenance = self.registry_cache_maintenance.read().await;
-            let previous = self.registry_configs.lock().await.remove(environment_ref);
-            if let Some(previous) = previous {
-                remove_registry_config(&previous)
-                    .await
-                    .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
-            }
-            let material = self.resolve_for_adapter(&name, &spec, None, None).await?;
-            let material = material.value.trim_end();
-            validate_scalar_material(&name, "docker-registry", material)?;
-            let config_dir = self
-                .state_dir
-                .join("credential-runtime")
-                .join(registry_environment_dir(environment_ref))
-                .join(uuid::Uuid::new_v4().to_string());
-            tokio::fs::create_dir_all(&config_dir)
-                .await
-                .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("create cache directory: {error}")))?;
-            tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
-                .await
-                .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("protect cache directory: {error}")))?;
-            let config = config_dir.to_string_lossy();
-            let operation = async {
-                self.host_runner
-                    .run_with_input(
-                        "docker",
-                        &["--config", &config, "login", "--username", username, "--password-stdin", registry],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                        material.as_bytes(),
-                    )
-                    .await
-                    .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
-                self.host_runner
-                    .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
-            }
-            .await;
-            if let Err(operation_error) = operation {
-                let cleanup_result = remove_registry_config(&config_dir).await;
-                let detail = match cleanup_result {
-                    Ok(()) => operation_error,
-                    Err(cleanup_error) => format!("{operation_error}; additionally failed to remove writable cache: {cleanup_error}"),
-                };
-                return Err(bounded_adapter_error(&name, "docker-registry", &detail));
-            }
-            self.registry_configs.lock().await.insert(environment_ref.to_string(), config_dir.clone());
-            Ok(PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new(config_dir) })
+            let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else { unreachable!() };
+            let material = self.resolve_for_adapter(name, &spec, None, None).await?;
+            let password = material.value.trim_end();
+            validate_scalar_material(name, "docker-registry", password)?;
+            let repository = image.split('@').next().expect("reference");
+            // A colon in the final segment denotes a tag, not a registry port.
+            let repository = repository.rsplit_once('/').map_or_else(
+                || repository.split(':').next().expect("repository").to_string(),
+                |(host, path)| format!("{host}/{}", path.split(':').next().expect("repository")),
+            );
+            Ok(Some(RegistryAuth::new(
+                repository,
+                flotilla_resources::HostImageAction::ImagePull,
+                Arc::new(RegistryMaterial { registry: registry.clone(), username: username.clone(), password: password.into() }),
+            )))
         })
     }
 
@@ -1315,10 +1234,6 @@ impl CredentialStore {
             self.git_config_fragments.lock().await.remove(environment_ref);
             self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
             self.github_app_adoption_failures.lock().await.remove(environment_ref);
-            let config_dir = self.registry_configs.lock().await.remove(environment_ref);
-            if let Some(config_dir) = config_dir {
-                remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
-            }
             Ok(())
         })
     }
@@ -1336,7 +1251,6 @@ impl CredentialStore {
             // Clients may begin preparing caches after the live/backing snapshots.
             // Holding this through deletion serializes sweeping with preparation,
             // including the interval before Docker preflight registers its cache.
-            let _maintenance = self.registry_cache_maintenance.write().await;
             let root = self.state_dir.join("credential-runtime");
             let mut entries = match tokio::fs::read_dir(&root).await {
                 Ok(entries) => entries,
@@ -1345,7 +1259,6 @@ impl CredentialStore {
             };
             let protected =
                 live_environments.iter().chain(running_backings).map(|name| registry_environment_dir(name)).collect::<BTreeSet<_>>();
-            let active_paths = self.registry_configs.lock().await.values().cloned().collect::<BTreeSet<_>>();
             while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list Docker credential cache: {error}"))? {
                 let kind = entry.file_type().await.map_err(|error| format!("inspect Docker credential cache: {error}"))?;
                 if !kind.is_dir() {
@@ -1357,12 +1270,12 @@ impl CredentialStore {
                     .is_some_and(|hex| !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
                 let legacy =
                     name.len() > 37 && name.as_bytes()[name.len() - 37] == b'-' && uuid::Uuid::parse_str(&name[name.len() - 36..]).is_ok();
-                if owned && !protected.contains(&name) && !active_paths.iter().any(|path| path.starts_with(entry.path())) {
+                if owned && !protected.contains(&name) {
                     remove_registry_config(&entry.path())
                         .await
                         .map_err(|error| format!("remove orphaned Docker credential cache {}: {error}", entry.path().display()))?;
                     tracing::info!(path = %entry.path().display(), "removed orphaned Docker credential cache");
-                } else if legacy && live_environments.is_empty() && running_backings.is_empty() && !active_paths.contains(&entry.path()) {
+                } else if legacy && live_environments.is_empty() && running_backings.is_empty() {
                     remove_registry_config(&entry.path())
                         .await
                         .map_err(|error| format!("remove legacy Docker credential cache {}: {error}", entry.path().display()))?;
@@ -2391,6 +2304,35 @@ async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&s
         .await
         .map(|_| ())
         .map_err(|error| format!("authentication preflight failed: {error}"))
+}
+
+/// CredentialStore's sole registry-file lowering helper. A TempDir guard owns
+/// every return path and cancellation; neither the handle nor preflight writes.
+struct RegistryMaterial {
+    registry: String,
+    username: String,
+    password: String,
+}
+impl RegistryAuthMaterial for RegistryMaterial {
+    fn redact(&self, text: String) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        text.replace(&STANDARD.encode(format!("{}:{}", self.username, self.password)), "[redacted]").replace(&self.password, "[redacted]")
+    }
+    fn config(&self) -> Result<RegistryConfig, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let directory = tempfile::Builder::new().prefix("flotilla-registry-").tempdir().map_err(|e| e.to_string())?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        let config =
+            serde_json::json!({"auths": {&self.registry: {"auth": STANDARD.encode(format!("{}:{}", self.username, self.password))}}});
+        let path = directory.path().join("config.json");
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(|e| e.to_string())?;
+        file.write_all(&serde_json::to_vec(&config).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        Ok(RegistryConfig::new(directory.path().into(), directory))
+    }
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.basic_auth(&self.username, Some(&self.password))
+    }
 }
 
 async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {
@@ -5599,15 +5541,7 @@ interactions:
             runner.clone(),
             state.path().into(),
         );
-        let operation = || {
-            store.image_registry_operation(
-                "builder",
-                HostImageAction::ImagePush,
-                "registry",
-                "registry.example/images",
-                &["push", "registry.example/images:label"],
-            )
-        };
+        let operation = || store.registry_auth("builder", HostImageAction::ImagePush, "registry", "registry.example/images");
         assert!(operation().await.expect_err("no grant").contains("no ImagePush grant"));
         backend
             .definitions::<CredentialGrant>("flotilla")
@@ -5634,32 +5568,102 @@ interactions:
             reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1024 },
         });
         hosts.update(&InputMeta::from(&host.metadata), &host.metadata.resource_version, &spec).await.expect("builder");
-        operation().await.expect("push");
-        operation().await.expect("second push");
-        let calls = runner.calls.lock().expect("calls");
-        assert_eq!(calls.len(), 4);
-        assert_ne!(calls[0].1[1], calls[2].1[1]);
-        for (index, (_, args, input)) in calls.iter().enumerate() {
+        let first = operation().await.expect("mint push auth");
+        let second = operation().await.expect("mint second push auth");
+        assert!(runner.calls.lock().expect("calls").is_empty(), "minting is executor-neutral");
+        assert!(first.validate("registry.example/images:label", HostImageAction::ImagePush).is_ok());
+        assert!(first.validate("registry.example/other:label", HostImageAction::ImagePush).is_err());
+        assert!(first.validate("registry.example/images:label", HostImageAction::ImagePull).is_err());
+        assert!(!format!("{first:?}").contains("test-secret"));
+        assert_eq!(RegistryAuth::redact(Some(&first), "error: test-secret".into()), "error: [redacted]");
+        let config = RegistryAuth::config(Some(&first)).expect("lower config");
+        let second_config = RegistryAuth::config(Some(&second)).expect("second config");
+        assert_ne!(config.path(), second_config.path());
+        let path = config.path().to_path_buf();
+        assert_eq!(std::fs::metadata(&path).expect("directory").permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(path.join("config.json")).expect("file").permissions().mode() & 0o777, 0o600);
+        drop(config);
+        assert!(RegistryAuth::config(Some(&first)).is_err(), "one operation per handle, including clones");
+        assert!(RegistryAuth::config(Some(&first.clone())).is_err());
+        assert!(!path.exists(), "lowered config is operation-owned");
+    }
+
+    // Subprocess boundary double: observes the real lowered files, then fails
+    // or pauses so the adapter's error/cancellation cleanup can be checked.
+    #[derive(Default)]
+    struct RegistryOperationRunner {
+        pause: bool,
+        path: std::sync::Mutex<Option<PathBuf>>,
+        entered: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl CommandRunner for RegistryOperationRunner {
+        async fn run(&self, command: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(command, "docker");
             assert_eq!(args[0], "--config");
-            assert!(!Path::new(&args[1]).exists(), "config removed after operation");
-            assert!(args[1].starts_with(state.path().to_str().expect("state path")));
-            assert!(!args.iter().any(|arg| arg.contains("test-secret")));
-            assert_eq!(input.as_slice(), if index % 2 == 0 { b"test-secret".as_slice() } else { &[] });
+            assert_eq!(args[2], "pull");
+            let path = PathBuf::from(args[1]);
+            assert!(path.join("config.json").is_file());
+            *self.path.lock().expect("path") = Some(path);
+            self.entered.notify_one();
+            if self.pause {
+                std::future::pending::<()>().await;
+            }
+            Err("backend rejected test-secret".into())
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("unexpected output operation")
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
         }
     }
 
-    // Cancellation while login is in flight removes the config and never
-    // starts a pull; cleanup does not rely on the operation reaching a return.
+    // Errors and cancellation of the actual cache adapter drop its private
+    // configuration, and runtime diagnostics cannot expose admitted material.
     #[tokio::test]
     async fn cancelled_host_image_operation_removes_private_config() {
-        use flotilla_resources::{CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, HostActionSelector, HostImageAction};
+        use flotilla_core::providers::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider};
+        for pause in [false, true] {
+            let runner = Arc::new(RegistryOperationRunner { pause, ..Default::default() });
+            let provider = DockerEnvironmentProvider::new(runner.clone());
+            let auth = RegistryAuth::new(
+                "registry.example/images".into(),
+                flotilla_resources::HostImageAction::ImagePull,
+                Arc::new(RegistryMaterial { registry: "registry.example".into(), username: "user".into(), password: "test-secret".into() }),
+            );
+            let task = tokio::spawn(async move {
+                provider
+                    .local_image_cache()
+                    .expect("cache")
+                    .pull(&format!("registry.example/images@sha256:{}", "3".repeat(64)), Some(&auth))
+                    .await
+            });
+            runner.entered.notified().await;
+            let path = runner.path.lock().expect("path").clone().expect("operation path");
+            if pause {
+                assert!(path.is_dir());
+                task.abort();
+                assert!(task.await.expect_err("cancelled").is_cancelled());
+            } else {
+                let error = task.await.expect("task").expect_err("operation error");
+                assert_eq!(error, "backend rejected [redacted]");
+            }
+            assert!(!path.exists(), "configuration removed after error or cancellation");
+        }
+    }
+
+    // Pull admission must mint in memory without preflight Docker operations or
+    // disk files. A retained handle remains usable after environment cleanup.
+    #[tokio::test]
+    async fn registry_pull_admission_is_in_memory() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         backend
             .definitions::<CredentialSpec>("flotilla")
             .create(
-                &InputMeta::builder().name("registry".into()).build(),
+                &InputMeta::builder().name("private-registry".into()).build(),
                 &CredentialSpecSpec {
-                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "host".into() },
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "crew".into() },
                     source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
                     lifecycle: CredentialLifecycle::Static,
                     placement: Default::default(),
@@ -5667,117 +5671,25 @@ interactions:
             )
             .await
             .expect("credential");
-        backend
-            .definitions::<CredentialGrant>("flotilla")
-            .create(
-                &InputMeta::builder().name("pull".into()).build(),
-                &CredentialGrantSpec::builder()
-                    .selector(
-                        CredentialGrantSelector::builder()
-                            .host_action(HostActionSelector::builder().action(HostImageAction::ImagePull).build())
-                            .build(),
-                    )
-                    .credentials(BTreeSet::from(["registry".into()]))
-                    .build(),
-            )
-            .await
-            .expect("grant");
-        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Semaphore::new(0)));
-        let runner = Arc::new(RecordingRunner { registry_login_gate: Some(gate.clone()), ..Default::default() });
+        let runner = Arc::new(RecordingRunner::default());
         let state = tempfile::tempdir().expect("state");
-        let store = Arc::new(CredentialStore::new(
+        let store = CredentialStore::new(
             backend,
             "flotilla",
             Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "test-secret".into())]))),
             EnvironmentBag::new(),
             runner.clone(),
             state.path().into(),
-        ));
-        let task = tokio::spawn(async move {
-            store
-                .image_registry_operation(
-                    "host",
-                    HostImageAction::ImagePull,
-                    "registry",
-                    "registry.example/images",
-                    &["pull", "registry.example/images@sha256:3333333333333333333333333333333333333333333333333333333333333333"],
-                )
-                .await
-        });
-        gate.0.notified().await;
-        let path = runner.calls.lock().expect("calls")[0].1[1].clone();
-        assert!(Path::new(&path).is_dir());
-        task.abort();
-        assert!(task.await.expect_err("cancelled").is_cancelled());
-        assert!(!Path::new(&path).exists());
-        assert_eq!(runner.calls.lock().expect("calls").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn registry_config_survives_concurrent_sweep_and_preflight_until_the_environment_is_forgotten() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        backend
-            .clone()
-            .definitions::<CredentialSpec>("flotilla")
-            .create(
-                &InputMeta::builder().name("private-registry".to_string()).build(),
-                &CredentialSpecSpec {
-                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
-                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                },
-            )
-            .await
-            .expect("create credential declaration");
-        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".to_string(), "registry-secret".to_string())])));
-        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Semaphore::new(0)));
-        let runner = Arc::new(RecordingRunner { registry_login_gate: Some(Arc::clone(&gate)), ..RecordingRunner::default() });
-        let state = tempfile::tempdir().expect("create state directory");
-        let store =
-            Arc::new(CredentialStore::new(backend, "flotilla", env, EnvironmentBag::new(), runner.clone(), state.path().to_path_buf()));
-
-        let preparing = {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move {
-                store
-                    .prepare_registry_pull("env-a", &BTreeSet::from(["private-registry".to_string()]), "registry.example/crew:latest")
-                    .await
-            })
-        };
-        gate.0.notified().await;
-        // At the process boundary the cache exists but has not been indexed.
-        // Sweeping must be excluded across this whole vulnerable lifecycle.
-        assert!(store.registry_cache_maintenance.try_write().is_err(), "sweep must wait for in-flight cache registration");
-        let sweeping = {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move { store.sweep_orphaned_registry_configs(&BTreeSet::new(), &BTreeSet::new()).await })
-        };
-        gate.1.add_permits(1);
-        let PreparedEnvironmentAuth::RegistryConfig { directory } =
-            preparing.await.expect("preparation task").expect("prepare registry credential")
-        else {
-            panic!("matching credential");
-        };
-        let config_dir = directory.as_path();
-        sweeping.await.expect("sweep task").expect("sweep with stale empty owner snapshots");
-
-        assert!(config_dir.is_dir(), "credential config must remain available to docker run");
-        assert_eq!(
-            std::fs::metadata(config_dir).expect("credential config metadata").permissions().mode() & 0o777,
-            0o700,
-            "credential config directory must not be readable by other host users"
         );
-        let config = config_dir.to_string_lossy();
-        {
-            let calls = runner.calls.lock().expect("calls lock");
-            assert!(calls
-                .iter()
-                .any(|(command, args, _)| { command == "docker" && args.windows(2).any(|pair| pair == ["--config", config.as_ref()]) }));
-        }
-
-        store.forget_environment("env-a").await.expect("forget environment");
-        assert!(!config_dir.exists(), "credential config should be deleted with the environment");
+        let auth = store
+            .prepare_registry_pull("env", &BTreeSet::from(["private-registry".into()]), "registry.example/crew:latest")
+            .await
+            .expect("mint")
+            .expect("auth");
+        assert!(runner.calls.lock().expect("calls").is_empty());
+        assert_eq!(std::fs::read_dir(state.path()).expect("state").count(), 0);
+        store.forget_environment("env").await.expect("forget");
+        assert!(auth.validate("registry.example/crew:latest", flotilla_resources::HostImageAction::ImagePull).is_ok());
     }
 
     #[tokio::test]

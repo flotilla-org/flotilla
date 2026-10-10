@@ -27,7 +27,6 @@ use crate::providers::environment::EnvironmentToolAssetAccess;
 use crate::providers::environment::EnvironmentToolAssetKind;
 use crate::providers::environment::EnvironmentVariableUpdate;
 use crate::providers::environment::PreparedEnvironment;
-use crate::providers::environment::PreparedEnvironmentAuth;
 use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::ProvisionedMountMode;
 use crate::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
@@ -375,7 +374,7 @@ impl EnvironmentManager {
                     "the contained host-daemon requirement",
                 ))],
             image_pull_policy: Default::default(),
-            prepared_auth: PreparedEnvironmentAuth::NoRegistryCredential,
+            prepared_auth: None,
             cpu_limit: None,
             memory_policy: Default::default(),
         };

@@ -11,3 +11,30 @@ Part B of #2862 adds capabilities independently of the generic lifecycle interfa
 The Part B checker confines runtime binaries to specific implementation files, concrete runtime types to providers except composition-root construction, and refuses runtime-name lookup literals. Registry retention belongs to registry operators. Flotilla collects host caches per cache, retaining current/previous and frozen/live digests. This avoids conflating runtime lifecycle, build execution, cache availability and registry retention behind one Docker-oriented interface.
 
 This is a new decision, not a supersession of ADR 0057: that number belongs to forge observation on main. The container ADR with that number existed only in closed PR #2865 and never landed (operator correction, 2026-10-08). Part B will extend this ADR with its implemented capability contracts.
+
+## Part B2 capability contracts
+
+Provider instances expose an optional `LocalImageCache`; host-direct exposes none.
+Cache inspection, inventory, pinned pulls, archive imports and removals use the
+instance's injected endpoint. The daemon reaches that cache through the provider,
+while Buildx execution and provide probes live behind `ImageBuilder`. Frozen input
+acquisition and resource/log publication remain daemon orchestration. The default
+Buildx driver is explicitly bound to a named cache; portable Docker archives can
+also be loaded through another named cache capability or published to a registry.
+
+`RegistryClient` implements only OCI manifest HEAD/GET and paginated tags. It
+negotiates supported manifest formats, checks content digests, and performs the
+Distribution token exchange in memory. Token-service origins other than the
+registry must be explicitly trusted by composition; credentials never follow
+redirects or pagination outside the repository. It has no delete operation.
+
+`CredentialStore` admits each pull/push and mints an opaque in-memory `RegistryAuth`
+with repository/action scope. Clones share a single-use claim. Each adapter lowers
+it for one operation: the credential-store helper owns private throwaway Docker
+files (0700 directory, 0600 file, cleanup by an owned guard on error/cancellation),
+while the HTTP adapter obtains an in-memory token. No runtime login/preflight or
+persistent registry config is created during minting. Anonymous operations select
+an isolated empty configuration and never read ambient registry credentials.
+
+B2 changes no stored resource, manifest or config shapes. B1's N→N+1 availability
+and inventory readers remain unchanged. The runtime boundary checker is B3.

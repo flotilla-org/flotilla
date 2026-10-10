@@ -1,6 +1,12 @@
 pub mod docker;
+pub mod docker_image;
 pub mod host_direct;
+pub mod image;
+pub mod registry_auth;
+pub mod registry_client;
 pub mod runner;
+pub use image::{ImageBuilder, LocalImageCache};
+pub use registry_auth::RegistryAuth;
 
 #[cfg(test)]
 mod tests;
@@ -49,8 +55,7 @@ pub struct ProvisionOpts {
     pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
 }
 
-/// Admitted operation credentials. Part B replaces the artifact with an opaque
-/// RegistryAuth handle; callers never select an image through these options.
+/// Admitted operation credentials; callers never select an image through these options.
 #[derive(Debug, Clone, Default)]
 pub struct PrepareOpts {
     /// Transitional admission for baseline-sourced tags until #2731 cuts the
@@ -72,19 +77,8 @@ impl From<CreateOpts> for ProvisionOpts {
     }
 }
 
-/// Auth admitted by credential preflight for this environment's image pull.
-/// Runtime-only: the credential store owns the artifact and its cleanup. Providers
-/// must use a supplied artifact rather than substituting ambient credentials.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum PreparedEnvironmentAuth {
-    /// No granted credential matches the image registry.
-    #[default]
-    NoRegistryCredential,
-    /// A private registry auth configuration directory containing `config.json`
-    /// in the container-registry auth format. Providers interpret this artifact;
-    /// only the Docker adapter lowers its directory to Docker CLI configuration.
-    RegistryConfig { directory: DaemonHostPath },
-}
+/// Runtime-only opaque admitted pull credentials.
+pub type PreparedEnvironmentAuth = Option<RegistryAuth>;
 
 /// A host-side tool that an environment provider must make invokable inside a
 /// provisioned environment.
@@ -288,6 +282,14 @@ impl PreparedEnvironment {
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
     fn kind(&self) -> EnvironmentKind;
+    /// Optional image capability owned by this exact provider instance.
+    fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
+        None
+    }
+    /// Optional builder using the same endpoint as this instance's local cache.
+    fn image_builder(&self) -> Option<Arc<dyn ImageBuilder>> {
+        None
+    }
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String>;
     async fn provision(&self, id: EnvironmentId, prepared: &PreparedEnvironment, opts: ProvisionOpts) -> Result<EnvironmentHandle, String>;
     async fn inspect(&self, id: &EnvironmentId) -> Result<Option<EnvironmentHandle>, String> {
@@ -368,3 +370,9 @@ pub fn legacy_environment_spec(spec: &flotilla_protocol::EnvironmentSpec) -> Res
 /// Frozen provider instance identity carried from placement policy to its
 /// environment. Metadata is extensible, so this adds no stored spec shape.
 pub const ENVIRONMENT_PROVIDER_INSTANCE_LABEL: &str = "flotilla.work/environment-provider-instance";
+
+#[cfg(test)]
+mod registry_client_tests;
+
+#[cfg(test)]
+mod image_tests;

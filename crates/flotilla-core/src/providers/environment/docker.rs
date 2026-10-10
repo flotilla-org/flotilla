@@ -10,8 +10,7 @@ use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
 use super::{
     runner::DockerEnvironmentRunner, CreateOpts, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
-    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, PreparedEnvironmentAuth, ProvisionedEnvironment,
-    ProvisionedMount, ProvisionedMountMode,
+    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::environment::{PrepareOpts, ProvisionOpts};
 use crate::providers::{ChannelLabel, CommandRunner};
@@ -25,27 +24,25 @@ const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr
 
 /// An `EnvironmentProvider` that manages Docker containers as sandbox environments.
 pub struct DockerEnvironmentProvider {
-    inner: Arc<DockerEnvironmentProviderInner>,
+    pub(super) inner: Arc<DockerEnvironmentProviderInner>,
     preparation_owner: Arc<()>,
 }
 
 impl DockerEnvironmentProvider {
     async fn pull_prepared_image(&self, image: &str, opts: &PrepareOpts) -> Result<(), String> {
-        let directory = match &opts.prepared_auth {
-            PreparedEnvironmentAuth::RegistryConfig { directory } => Some(directory.to_string()),
-            PreparedEnvironmentAuth::NoRegistryCredential => None,
-        };
-        let mut args = Vec::new();
-        if let Some(directory) = &directory {
-            args.extend(["--config", directory.as_str()]);
+        if let Some(auth) = &opts.prepared_auth {
+            auth.validate(image, flotilla_resources::HostImageAction::ImagePull)?;
         }
+        let config = super::RegistryAuth::config(opts.prepared_auth.as_ref())?;
+        let directory = config.path().to_string_lossy();
+        let mut args = vec!["--config", directory.as_ref()];
         args.extend(["pull", image]);
         self.inner
             .runner
             .run("docker", &args, Path::new("/"), &ChannelLabel::Default)
             .await
             .map(|_| ())
-            .map_err(|error| format!("pinned image pull failed: {error}"))
+            .map_err(|error| format!("pinned image pull failed: {}", super::RegistryAuth::redact(opts.prepared_auth.as_ref(), error)))
     }
 
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
@@ -61,6 +58,13 @@ fn host_user() -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
+    fn image_builder(&self) -> Option<Arc<dyn super::ImageBuilder>> {
+        Some(Arc::new(super::docker_image::BuildxImageBuilder::new(self.inner.runner.clone())))
+    }
+    fn local_image_cache(&self) -> Option<&dyn super::LocalImageCache> {
+        Some(self)
+    }
+
     fn kind(&self) -> super::EnvironmentKind {
         super::EnvironmentKind::Docker
     }
@@ -239,8 +243,8 @@ fn protected_git_mount(mount: &ProvisionedMount) -> bool {
         && mount.host_path.as_path().file_name().is_some_and(|name| name == "config" || name == "hooks" || name == "worktrees")
 }
 
-struct DockerEnvironmentProviderInner {
-    runner: Arc<dyn CommandRunner>,
+pub(super) struct DockerEnvironmentProviderInner {
+    pub(super) runner: Arc<dyn CommandRunner>,
 }
 
 impl DockerEnvironmentProviderInner {
@@ -408,8 +412,8 @@ pub struct DockerProvisionedEnvironment {
     container_name: String,
     image: ImageId,
     local_image_id: Option<String>,
-    inner: Arc<DockerEnvironmentProviderInner>,
-    runner: Arc<dyn CommandRunner>,
+    pub(super) inner: Arc<DockerEnvironmentProviderInner>,
+    pub(super) runner: Arc<dyn CommandRunner>,
     provisioned_mounts: Vec<ProvisionedMount>,
 }
 
@@ -622,10 +626,8 @@ impl DockerEnvironmentProvider {
         let requested_mounts = opts.provisioned_mounts;
         let mut provisioned_mounts = Vec::new();
         let mut tokens = opts.tokens;
-        let docker_config = match &opts.prepared_auth {
-            PreparedEnvironmentAuth::NoRegistryCredential => None,
-            PreparedEnvironmentAuth::RegistryConfig { directory } => Some(directory.to_string()),
-        };
+        let config = super::RegistryAuth::config(opts.prepared_auth.as_ref())?;
+        let docker_config = (opts.image_pull_policy != ImagePullPolicy::Never).then(|| config.path().to_string_lossy().into_owned());
         let mut pull_policy = opts.image_pull_policy.docker_value();
         // Docker replaces an image's variable outright when `-e` names it, so a
         // prepend with no caller-supplied value must start from the image's own.
