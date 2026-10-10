@@ -760,9 +760,6 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         .unwrap();
         let current = flotilla_resources::apply_status_patch(&convoys, &current.metadata.name, &patch).await.unwrap();
         wake.sync_rows("flotilla", &HashMap::from([("rejected-promise".into(), current)])).await.unwrap();
-        for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
-            task.abort();
-        }
         let row = table
             .rows()
             .await
@@ -770,6 +767,25 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
             .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source.starts_with("promise-rejected/")))
             .expect("rejection row");
         let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { panic!("turn row") };
+        // Let the watcher record its episode before replaying the rejection. Aborting
+        // it after actuation can leave the fake's request recorded without an episode.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if convoys
+                    .get("rejected-promise")
+                    .await
+                    .unwrap()
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.turn_deliveries.get(source).is_some_and(|delivery| !delivery.episodes.is_empty()))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("promise rejection wakes its owner and records delivery");
         table.deliver_turn(row.id, "rejected-promise", source, rule, &row.leaves[0]).await.unwrap();
         table.deliver_turn(row.id, "rejected-promise", source, rule, &row.leaves[0]).await.unwrap();
         let deliveries = actuator.requests.lock().unwrap();
