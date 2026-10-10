@@ -89,6 +89,7 @@ impl InProcessDaemon {
             | A::ConvoyResume { .. }
             | A::ConvoyWithdrawPendingBrief { .. }
             | A::ConvoyWorkForceComplete { .. }
+            | A::PromiseVerdict { .. }
             | A::CrewPromise { .. }
             | A::CrewComplete { .. }
             | A::CrewFail { .. }
@@ -106,7 +107,8 @@ impl InProcessDaemon {
             | A::RepositoryRemoteRemove { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
             A::QueryCrewCapabilities { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Command),
             A::ArchiveSession { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Steps),
-            A::QueryHostList { .. }
+            A::QueryPromiseQueue { .. }
+            | A::QueryHostList { .. }
             | A::QueryExplainProject { .. }
             | A::QueryProjectList { .. }
             | A::QueryCliList { .. }

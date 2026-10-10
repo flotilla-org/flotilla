@@ -415,6 +415,11 @@ impl ReconcilerWake {
                         tracing::debug!(convoy = %convoy.metadata.name, source = %delivery.source,
                             reason = "arm_eligible_active_crew_and_subject", "turn delivery subscription decision");
                     }
+                    let maker = if matches!(delivery.leaf.address, LeafAddress::Convoy { .. }) {
+                        LeafMaker::Observed { refresher: "promise".into(), external_party: "human".into() }
+                    } else {
+                        LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() }
+                    };
                     desired.push(LeafSubscriptionRow {
                         id: uuid::Uuid::nil(),
                         namespace: namespace.to_string(),
@@ -424,7 +429,7 @@ impl ReconcilerWake {
                             source: delivery.source,
                             rule: Box::new(delivery.rule),
                         },
-                        maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+                        maker,
                         freshness_demand: None,
                         created_at: Utc::now(),
                         episode_key: EpisodeKeyFields::default(),

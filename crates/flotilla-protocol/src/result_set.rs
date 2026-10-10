@@ -62,6 +62,8 @@ pub enum QueryId {
     /// Standing project roles declared by `ConvoyEnsure`, fleet-wide
     /// (`None`) or in one Project. Rows are [`StandingRoleRow`].
     StandingRoles { scope: Option<QueryScope> },
+    /// Submitted promises awaiting a human verdict, maintained from the Convoy watch.
+    VerdictQueue { scope: Option<QueryScope> },
     /// Authoritative Project repository definitions, including known-empty projects.
     ProjectRepositories { scope: Option<QueryScope> },
     /// Contract-ready work maintained by the daemon.
@@ -91,6 +93,7 @@ impl QueryId {
         QueryId::Independents { scope: None },
         QueryId::Checkouts { scope: None },
         QueryId::StandingRoles { scope: None },
+        QueryId::VerdictQueue { scope: None },
         QueryId::ProjectRepositories { scope: None },
         QueryId::DispatchReady { scope: None },
     ];
@@ -103,6 +106,7 @@ impl QueryId {
             Self::Checkouts { .. } => "checkouts",
             Self::Awareness { .. } => "awareness",
             Self::StandingRoles { .. } => "standing_roles",
+            Self::VerdictQueue { .. } => "verdict_queue",
             Self::ProjectRepositories { .. } => "project_repositories",
             Self::DispatchReady { .. } => "dispatch_ready",
         }
@@ -201,6 +205,12 @@ pub enum QueryChanges {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
     },
+    VerdictQueue {
+        scope: Option<QueryScope>,
+        changed: Vec<VerdictQueueRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<ResourceRef>,
+    },
     DispatchReady {
         scope: Option<QueryScope>,
         changed: Vec<crate::DispatchQueueRow>,
@@ -227,6 +237,7 @@ impl QueryChanges {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
             }
             Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
+            Self::VerdictQueue { scope, .. } => QueryId::VerdictQueue { scope: scope.clone() },
             Self::ProjectRepositories { scope, .. } => QueryId::ProjectRepositories { scope: scope.clone() },
             Self::DispatchReady { scope, .. } => QueryId::DispatchReady { scope: scope.clone() },
         }
@@ -240,6 +251,7 @@ impl QueryChanges {
             Self::Checkouts { changed, .. } => changed.len(),
             Self::Awareness { changed, .. } => changed.len(),
             Self::StandingRoles { changed, .. } => changed.len(),
+            Self::VerdictQueue { changed, .. } => changed.len(),
             Self::ProjectRepositories { changed, .. } => changed.len(),
             Self::DispatchReady { changed, .. } => changed.len(),
         }
@@ -251,6 +263,7 @@ impl QueryChanges {
             | Self::Independents { removed, .. }
             | Self::Checkouts { removed, .. }
             | Self::StandingRoles { removed, .. }
+            | Self::VerdictQueue { removed, .. }
             | Self::ProjectRepositories { removed, .. } => removed.len(),
             Self::Issues { removed, .. } => removed.len(),
             Self::DispatchReady { removed, .. } => removed.len(),
@@ -297,6 +310,13 @@ impl QueryChanges {
         }
     }
 
+    pub fn as_verdict_queue(&self) -> Option<&[VerdictQueueRow]> {
+        match self {
+            Self::VerdictQueue { changed, .. } => Some(changed),
+            _ => None,
+        }
+    }
+
     pub fn as_standing_roles(&self) -> Option<&[StandingRoleRow]> {
         match self {
             Self::StandingRoles { changed, .. } => Some(changed),
@@ -317,6 +337,7 @@ impl QueryChanges {
             | Self::Independents { removed, .. }
             | Self::Checkouts { removed, .. }
             | Self::StandingRoles { removed, .. }
+            | Self::VerdictQueue { removed, .. }
             | Self::ProjectRepositories { removed, .. } => Some(removed),
             Self::Issues { .. } | Self::DispatchReady { .. } | Self::Awareness { .. } => None,
         }
@@ -331,6 +352,7 @@ impl QueryChanges {
             | Self::Checkouts { .. }
             | Self::Awareness { .. }
             | Self::StandingRoles { .. }
+            | Self::VerdictQueue { .. }
             | Self::ProjectRepositories { .. } => None,
         }
     }
@@ -415,6 +437,10 @@ pub enum Rows {
         scope: Option<QueryScope>,
         rows: Vec<StandingRoleRow>,
     },
+    VerdictQueue {
+        scope: Option<QueryScope>,
+        rows: Vec<VerdictQueueRow>,
+    },
     DispatchReady {
         scope: Option<QueryScope>,
         rows: Vec<crate::DispatchQueueRow>,
@@ -438,6 +464,7 @@ impl Rows {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
             }
             Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
+            Self::VerdictQueue { scope, .. } => QueryId::VerdictQueue { scope: scope.clone() },
             Self::ProjectRepositories { scope, .. } => QueryId::ProjectRepositories { scope: scope.clone() },
             Self::DispatchReady { scope, .. } => QueryId::DispatchReady { scope: scope.clone() },
         }
@@ -451,6 +478,7 @@ impl Rows {
             Self::Checkouts { rows, .. } => rows.len(),
             Self::Awareness { rows, .. } => rows.len(),
             Self::StandingRoles { rows, .. } => rows.len(),
+            Self::VerdictQueue { rows, .. } => rows.len(),
             Self::ProjectRepositories { rows, .. } => rows.len(),
             Self::DispatchReady { rows, .. } => rows.len(),
         }
@@ -491,6 +519,13 @@ impl Rows {
     pub fn as_awareness(&self) -> Option<&[AwarenessNode]> {
         match self {
             Self::Awareness { rows, .. } => Some(rows),
+            _ => None,
+        }
+    }
+
+    pub fn as_verdict_queue(&self) -> Option<&[VerdictQueueRow]> {
+        match self {
+            Self::VerdictQueue { rows, .. } => Some(rows),
             _ => None,
         }
     }
@@ -1300,6 +1335,23 @@ pub struct CrewMemberSummary {
     pub requested_stance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<String>,
+}
+
+/// One current submission awaiting a human. `resource` is a synthetic row key,
+/// not a stored resource; `convoy` is the authoritative status record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct VerdictQueueRow {
+    pub resource: ResourceRef,
+    pub convoy: ResourceRef,
+    pub project_ref: Option<String>,
+    pub vessel: String,
+    pub role: String,
+    pub promise: String,
+    pub kind: String,
+    pub reference: String,
+    pub digest: String,
+    pub submitted_at: Timestamp,
 }
 
 #[cfg(test)]

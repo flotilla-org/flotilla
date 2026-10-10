@@ -205,6 +205,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::FleetPostInstall { .. }
         | CommandValue::FulfilmentList(_)
         | CommandValue::FleetList(_)
+        | CommandValue::PromiseQueue(_)
         | CommandValue::CrewStalls(_)
         | CommandValue::CrewCapabilities { .. }
         | CommandValue::MessageContacts { .. }

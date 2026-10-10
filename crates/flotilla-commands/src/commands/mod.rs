@@ -9,5 +9,6 @@ pub mod fulfilment;
 pub mod host;
 pub mod issue;
 pub mod project;
+pub mod promise;
 pub mod repo;
 pub mod workflow_template;

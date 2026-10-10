@@ -169,15 +169,24 @@ pub(super) fn is_merged_settlement_probe(leaf: &Leaf) -> bool {
 /// including custom rules; conflict probes retain their active delivery behavior.
 pub(super) fn is_active_change_request_probe(status: &ConvoyStatus, rule: &TurnDeliveryRule, leaf: &Leaf) -> bool {
     // Promise rejection rows are armed for their owner while work remains active.
-    let promise_rejection = leaf.field_path == ".state"
-        && leaf.operator == LeafOperator::Equal
-        && leaf.literal == "closed"
+    let human_rejection = matches!(leaf.address, LeafAddress::Convoy { .. })
+        && leaf.field_path == ".status.phase"
+        && leaf.literal == "Active"
         && flotilla_resources::promises::owned(status, &rule.to.vessel, &rule.to.role).iter().any(|promise| {
-            !promise.state.terminal()
-                && promise.submissions.last().is_some_and(|submission| {
-                    submission.metadata.get("subject").unwrap_or(&submission.reference) == &leaf.address.to_string()
-                })
+            promise.kind.requires_human_verdict()
+                && promise.state == flotilla_resources::promises::PromiseState::Open
+                && promise.submissions.last().is_some_and(|s| s.verdict.as_ref().is_some_and(|v| !v.accepted))
         });
+    let promise_rejection = human_rejection
+        || leaf.field_path == ".state"
+            && leaf.operator == LeafOperator::Equal
+            && leaf.literal == "closed"
+            && flotilla_resources::promises::owned(status, &rule.to.vessel, &rule.to.role).iter().any(|promise| {
+                !promise.state.terminal()
+                    && promise.submissions.last().is_some_and(|submission| {
+                        submission.metadata.get("subject").unwrap_or(&submission.reference) == &leaf.address.to_string()
+                    })
+            });
     let active_field = promise_rejection
         || is_conflict_probe(leaf)
         || is_merged_settlement_probe(leaf)

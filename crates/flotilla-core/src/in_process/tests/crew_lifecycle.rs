@@ -707,3 +707,70 @@ async fn promise_retractions_and_named_completion_refusal() {
     assert_eq!(status.promises["work"]["coder"][2].state, PromiseState::Retracted);
     watch.abort();
 }
+
+// A video submission references an already uploaded file and must carry its
+// digest. Repeating it is idempotent; pending evidence cannot be rewritten.
+#[tokio::test]
+async fn human_video_submission_requires_digest_and_preserves_pending_evidence() {
+    use flotilla_protocol::commands::CrewPromiseOperation;
+    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let created =
+        convoys.create(&test_meta("video-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
+            .role("coder".into())
+            .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+            .build()])),
+        crew_work: BTreeMap::from([(
+            "work".into(),
+            BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        )]),
+        ..Default::default()
+    };
+    convoys.update_status("video-crew", &created.metadata.resource_version, &status).await.expect("status");
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &test_meta("video-vessel"),
+            &VesselSpec {
+                convoy_ref: "video-crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("vessel");
+    let context = CrewCommandContext {
+        namespace: Some("flotilla".into()),
+        convoy: Some("video-crew".into()),
+        vessel_ref: Some("video-vessel".into()),
+        role: Some("coder".into()),
+        ..Default::default()
+    };
+    let submit = |digest: Option<&str>| CrewPromiseOperation::Submit {
+        promise: Some("demo".into()),
+        kind: "demo-video".into(),
+        reference: "https://uploads.example/demo.mp4".into(),
+        metadata: digest
+            .map(|digest| BTreeMap::from([("digest".into(), digest.into()), ("subject".into(), "overview".into())]))
+            .unwrap_or_default(),
+    };
+    let error = daemon.crew_ops.promise(&context, submit(None)).await.expect_err("missing digest");
+    assert!(error.contains("digest"));
+    daemon.crew_ops.promise(&context, submit(Some("sha256:original"))).await.expect("submission");
+    daemon.crew_ops.promise(&context, submit(Some("sha256:original"))).await.expect("idempotent submission");
+    assert!(daemon.crew_ops.promise(&context, submit(Some("sha256:changed"))).await.is_err());
+    let mut different_file = submit(Some("sha256:original"));
+    if let CrewPromiseOperation::Submit { reference, .. } = &mut different_file {
+        *reference = "https://uploads.example/different.mp4".into();
+    }
+    assert!(daemon.crew_ops.promise(&context, different_file).await.is_err());
+    let status = convoys.get("video-crew").await.expect("convoy").status.expect("status");
+    let promise = &status.promises["work"]["coder"][0];
+    assert_eq!(promise.submissions.len(), 1);
+    assert_eq!(promise.submissions[0].metadata["digest"], "sha256:original");
+    watch.abort();
+}

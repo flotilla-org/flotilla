@@ -90,6 +90,11 @@ pub fn checkout(checkout_ref: &str) -> EntityRef {
     EntityRef::new("checkout", checkout_ref)
 }
 
+/// Synthetic queue key includes the owning convoy and length-prefixed promise components.
+pub fn verdict_submission(reference: &ResourceRef) -> EntityRef {
+    EntityRef::new("verdict_submission", format!("{}/{}@{}", reference.namespace, reference.name, resource_origin(reference)))
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{HostName, IssueSource};

@@ -871,6 +871,17 @@ pub enum CommandAction {
         #[serde(default)]
         carries: Vec<crate::MessageReference>,
     },
+    PromiseVerdict {
+        namespace: Option<String>,
+        convoy: String,
+        promise: String,
+        vessel: Option<String>,
+        role: Option<String>,
+        accepted: bool,
+        reason: String,
+        submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    QueryPromiseQueue {},
     CrewPromise {
         context: CrewCommandContext,
         operation: CrewPromiseOperation,
@@ -1134,6 +1145,7 @@ impl CommandAction {
                 | CommandAction::QueryFulfilmentList {}
                 | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewStalls { .. }
+                | CommandAction::QueryPromiseQueue { .. }
                 | CommandAction::QueryCrewCapabilities { .. }
                 | CommandAction::QueryMessageContacts { .. }
                 | CommandAction::QueryCrewList { .. }
@@ -1178,6 +1190,8 @@ impl Command {
             CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
+            CommandAction::PromiseVerdict { .. } => "Recording human verdict...",
+            CommandAction::QueryPromiseQueue {} => "query human verdict queue",
             CommandAction::CrewPromise { .. } => "Updating crew promises...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
@@ -1369,6 +1383,7 @@ pub enum CommandValue {
     FulfilmentList(Box<FulfilmentListResponse>),
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),
+    PromiseQueue(Box<crate::result_set::ResultSet>),
     CrewCapabilities {
         card: String,
     },

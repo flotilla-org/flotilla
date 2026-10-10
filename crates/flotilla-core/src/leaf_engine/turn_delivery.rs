@@ -131,6 +131,22 @@ impl LeafSubscriptionTable {
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
         let (subject_revision, evidence_at, brief, message_subject) = match &leaf.address {
+            LeafAddress::Convoy { name } if name == convoy_name && source.starts_with("promise-rejected/") => {
+                // Re-read the persisted attempt before actuation: a queued firing
+                // cannot wake an owner for a rejection they already resubmitted.
+                let promise = flotilla_resources::promises::owned(status, &rule.to.vessel, &rule.to.role).iter().find(|p| {
+                    p.kind.requires_human_verdict()
+                        && p.state == flotilla_resources::promises::PromiseState::Open
+                        && source == format!("promise-rejected/{}/{}/{}/{}", p.vessel, p.role, p.id, p.submissions.len())
+                });
+                let Some(submission) = promise.and_then(|p| p.submissions.last()) else {
+                    return Ok(());
+                };
+                let Some(verdict) = submission.verdict.as_ref().filter(|v| !v.accepted) else {
+                    return Ok(());
+                };
+                (format!("{source}@{}", submission.submitted_at.to_rfc3339()), verdict.at, rule.brief.clone(), None)
+            }
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
                 let record = self

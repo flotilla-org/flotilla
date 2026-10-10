@@ -1052,6 +1052,11 @@ impl Aggregator {
         self.convoy_change_requests.retain(|reference, _| current.contains_key(reference));
         for reference in references {
             self.handle_convoy_transition(&reference, previous.get(&reference), current.get(&reference));
+            if previous.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
+                != current.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
+            {
+                self.update_verdict_queue(&reference, current.get(&reference)).await;
+            }
         }
         self.change_request_refresh_generations.retain(|reference, _| current.contains_key(reference));
         self.change_request_refresh_started.retain(|reference, _| current.contains_key(reference));
@@ -1155,6 +1160,11 @@ impl Aggregator {
         let references = previous.keys().chain(current.keys()).cloned().collect::<HashSet<_>>();
         for reference in references {
             self.handle_convoy_transition(&reference, previous.get(&reference), current.get(&reference));
+            if previous.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
+                != current.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
+            {
+                self.update_verdict_queue(&reference, current.get(&reference)).await;
+            }
         }
         self.convoy_change_requests.retain(|reference, _| current.contains_key(reference));
         self.change_request_refresh_generations.retain(|reference, _| current.contains_key(reference));
@@ -1164,6 +1174,11 @@ impl Aggregator {
         if let Err(error) = self.rebuild_checkout_rows().await {
             debug!(%error, "could not refresh checkout orphan attention after convoy event");
         }
+    }
+
+    async fn update_verdict_queue(&self, reference: &ResourceRef, convoy: Option<&ResourceObject<Convoy>>) {
+        let rows = convoy.map(|convoy| verdict_queue_rows(reference, convoy)).unwrap_or_default();
+        self.emit_store_deltas(self.state.update_verdict_queue(reference, rows).await).await;
     }
 
     fn handle_convoy_transition(
@@ -2144,10 +2159,25 @@ impl Aggregator {
                 ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
             })
             .collect::<HashSet<_>>();
-        self.origin_hosts = match &self.attach_resolver {
+        let origin_hosts = match &self.attach_resolver {
             Some(resolver) => resolver.origin_host_names(&origins).await,
             None => HashMap::new(),
         };
+        if origin_hosts == self.origin_hosts {
+            return;
+        }
+        // Host knowledge may arrive on another watched family after a Convoy
+        // was buffered. Re-key only contributions newly visible or removed;
+        // unchanged origins retain their incremental projection.
+        let previous = self.effective_convoys();
+        self.origin_hosts = origin_hosts;
+        let current = self.effective_convoys();
+        let references = previous.keys().chain(current.keys()).cloned().collect::<HashSet<_>>();
+        for reference in references {
+            if !previous.contains_key(&reference) || !current.contains_key(&reference) {
+                self.update_verdict_queue(&reference, current.get(&reference)).await;
+            }
+        }
     }
 
     fn terminal_session_ref(&self, session: &ReadResourceObject<TerminalSession>) -> Option<ResourceRef> {
@@ -2821,6 +2851,42 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
         ResourceWorkPhase::Cancelled => WorkPhase::Cancelled,
         ResourceWorkPhase::Abandoned => WorkPhase::Abandoned,
     }
+}
+
+fn verdict_queue_rows(reference: &ResourceRef, convoy: &ResourceObject<Convoy>) -> Vec<flotilla_protocol::result_set::VerdictQueueRow> {
+    use flotilla_resources::promises::PromiseState;
+    let Some(status) = convoy.status.as_ref().filter(|status| !status.phase.is_terminal()) else { return Vec::new() };
+    status
+        .promises
+        .iter()
+        .flat_map(|(vessel, crew)| {
+            crew.iter().flat_map(move |(role, promises)| {
+                promises.iter().filter_map(move |promise| {
+                    if !promise.kind.requires_human_verdict() || promise.state != PromiseState::Submitted {
+                        return None;
+                    }
+                    let submission = promise.submissions.last().filter(|submission| submission.verdict.is_none())?;
+                    let mut key = reference.clone();
+                    key.kind = "PromiseSubmission".into();
+                    key.name = [&reference.name, vessel, role, &promise.id].into_iter().map(|s| format!("{}:{s}", s.len())).collect();
+                    Some(
+                        flotilla_protocol::result_set::VerdictQueueRow::builder()
+                            .resource(key)
+                            .convoy(reference.clone())
+                            .maybe_project_ref(convoy.spec.project_ref.clone())
+                            .vessel(vessel)
+                            .role(role)
+                            .promise(&promise.id)
+                            .kind(promise.kind.as_str())
+                            .reference(&submission.reference)
+                            .digest(submission.metadata.get("digest").cloned().unwrap_or_default())
+                            .submitted_at(submission.submitted_at)
+                            .build(),
+                    )
+                })
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3948,6 +4014,156 @@ mod tests {
         let node = result.rows.as_awareness().expect("awareness rows").first().expect("convoy node");
         let vessel = node.entries.iter().find(|entry| entry.kind == flotilla_protocol::AwarenessKind::Vessel).expect("vessel entry");
         (vessel.salience, vessel.as_of)
+    }
+
+    // ADR 0061: submit queues the current attempt, either verdict removes it,
+    // rejection preserves history and resubmission queues fresh evidence.
+    // Generated sequences cover multiple owners, approve/reject, duplicates,
+    // scoped views and watch recovery. The source stands in for the store watch
+    // boundary, with reads counted rather than permitted during requests.
+    #[hegel::test]
+    fn verdict_queue_follows_watch_without_request_reads(tc: hegel::TestCase) {
+        use flotilla_resources::promises::{
+            apply, human_verdict, PromiseKind, PromiseOperation, PromiseSource, Submission, SubmissionVerdict,
+        };
+        let rounds = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+        let accepted = (0..rounds).map(|_| tc.draw(hegel::generators::booleans())).collect::<Vec<_>>();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let state = AggregatorProjectionState::new();
+            let (event_tx, _) = broadcast::channel(64);
+            let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+            let mut convoy = convoy_with_vessel("video-convoy").await;
+            convoy.spec.project_ref = Some("project".into());
+            let source = ScriptedSource::new(
+                vec![ResourceList { items: vec![convoy.clone()], resource_version: "1".into(), generation: None }],
+                vec![Ok(pending_watch())],
+            );
+            let _watch = aggregator.recover_replica_convoy_watch(&source).await.expect("initial watch");
+            let query = QueryId::VerdictQueue { scope: None };
+            let scoped = QueryId::VerdictQueue { scope: Some(flotilla_protocol::QueryScope::new("flotilla", "project")) };
+            let other = QueryId::VerdictQueue { scope: Some(flotilla_protocol::QueryScope::new("flotilla", "other")) };
+            assert!(state.result_set_for(&query).await.expect("queue").rows.is_empty());
+            let now = Utc::now();
+            // A second owner with the same local promise id remains a distinct row.
+            let submit = |id: &str, attempt: usize| PromiseOperation::Submit {
+                id: id.into(),
+                kind: PromiseKind::DemoVideo,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: format!("https://uploads.example/{attempt}.mp4"),
+                    metadata: BTreeMap::from([("digest".into(), format!("sha256:{attempt}"))]),
+                    submitted_at: now + chrono::Duration::seconds(attempt as i64),
+                    verdict: None,
+                },
+            };
+            apply(convoy.status.as_mut().expect("status"), "work", "reviewer", &submit("demo-0", 100));
+            aggregator.apply_replica_convoy_event(local_read_event(WatchEvent::Modified(convoy.clone()))).await;
+            for (attempt, accepted) in accepted.into_iter().enumerate() {
+                let id = format!("demo-{attempt}");
+                let status = convoy.status.as_mut().expect("status");
+                apply(status, "work", "coder", &submit(&id, attempt * 2));
+                aggregator.apply_replica_convoy_event(local_read_event(WatchEvent::Modified(convoy.clone()))).await;
+                let set = state.result_set_for(&query).await.expect("queue");
+                let rows = set.rows.as_verdict_queue().expect("queue rows");
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows.iter().find(|row| row.role == "coder").expect("owner").digest, format!("sha256:{}", attempt * 2));
+                let seq = set.seq;
+                aggregator.apply_replica_convoy_event(local_read_event(WatchEvent::Modified(convoy.clone()))).await;
+                assert_eq!(state.result_set_for(&query).await.expect("duplicate").seq, seq);
+                assert_eq!(state.result_set_for(&scoped).await.expect("project queue").rows.len(), 2);
+                assert!(state.result_set_for(&other).await.expect("other project").rows.is_empty());
+                let verdict = SubmissionVerdict { accepted, who: "flotilla/operator".into(), at: now, why: "human review".into() };
+                let status = convoy.status.as_mut().expect("status");
+                let (vessel, role, operation) =
+                    human_verdict(status, &id, Some("work"), Some("coder"), None, verdict).expect("human verdict");
+                apply(status, &vessel, &role, &operation);
+                aggregator.apply_replica_convoy_event(local_read_event(WatchEvent::Modified(convoy.clone()))).await;
+                assert_eq!(state.result_set_for(&query).await.expect("verdict queue").rows.len(), 1);
+                if !accepted {
+                    let status = convoy.status.as_mut().expect("status");
+                    apply(status, "work", "coder", &submit(&id, attempt * 2 + 1));
+                    assert_eq!(status.promises["work"]["coder"].last().expect("promise").submissions.len(), 2);
+                    aggregator.apply_replica_convoy_event(local_read_event(WatchEvent::Modified(convoy.clone()))).await;
+                    let set = state.result_set_for(&query).await.expect("resubmitted queue");
+                    assert_eq!(set.rows.len(), 2);
+                    let row = set.rows.as_verdict_queue().expect("rows").iter().find(|row| row.role == "coder").expect("new attempt");
+                    assert_eq!(row.digest, format!("sha256:{}", attempt * 2 + 1));
+                    // A delayed UI verdict cannot approve the rejected attempt again.
+                    let verdict = SubmissionVerdict { accepted: true, who: "human".into(), at: now, why: "looks good".into() };
+                    assert!(human_verdict(
+                        convoy.status.as_ref().expect("status"),
+                        &id,
+                        Some("work"),
+                        Some("coder"),
+                        Some(now + chrono::Duration::seconds((attempt * 2) as i64)),
+                        verdict.clone()
+                    )
+                    .is_err());
+                    let status = convoy.status.as_mut().expect("status");
+                    let (v, r, operation) = human_verdict(status, &id, Some("work"), Some("coder"), None, verdict).expect("fresh verdict");
+                    apply(status, &v, &r, &operation);
+                    aggregator.apply_replica_convoy_event(local_read_event(WatchEvent::Modified(convoy.clone()))).await;
+                    assert_eq!(state.result_set_for(&query).await.expect("approved queue").rows.len(), 1);
+                }
+                for _ in 0..3 {
+                    let _ = state.result_set_for(&query).await.expect("repeated request");
+                }
+                assert_eq!(source.list_calls.load(Ordering::SeqCst), 1, "requests and incremental updates must not list convoys");
+                assert_eq!(source.watch_calls.load(Ordering::SeqCst), 1, "requests reuse the live watch");
+            }
+            aggregator.replace_replica_convoys(vec![]).await;
+            assert!(state.result_set_for(&query).await.expect("recovered queue").rows.is_empty(), "relist removes vanished convoy rows");
+        });
+    }
+
+    // A Convoy watch can precede knowledge of its replica origin. Subsequent
+    // watched-family rebuilds must publish/re-key/remove its maintained queue.
+    #[tokio::test]
+    async fn verdict_queue_tracks_late_origin_resolution() {
+        use flotilla_resources::promises::{apply, PromiseKind, PromiseOperation, PromiseSource, Submission};
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("remote-video").await;
+        apply(
+            convoy.status.as_mut().expect("status"),
+            "work",
+            "coder",
+            &PromiseOperation::Submit {
+                id: "demo".into(),
+                kind: PromiseKind::DemoVideo,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: "https://uploads.example/demo.mp4".into(),
+                    metadata: BTreeMap::from([("digest".into(), "sha256:1234".into())]),
+                    submitted_at: Utc::now(),
+                    verdict: None,
+                },
+            },
+        );
+        aggregator
+            .apply_replica_convoy_event(ReadWatchEvent::Added(ReadResourceObject {
+                object: convoy,
+                provenance: ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("video-node"),
+                    last_synced_at: Utc::now(),
+                },
+            }))
+            .await;
+        let query = QueryId::VerdictQueue { scope: None };
+        assert!(state.result_set_for(&query).await.expect("unknown origin").rows.is_empty());
+        for name in ["first-name", "renamed"] {
+            aggregator.attach_resolver = Some(Arc::new(CountingAttachResolver::with_origin("video-node", name)));
+            aggregator.apply_environment_event(WatchEvent::Added(environment_object("unrelated").await)).await;
+            let set = state.result_set_for(&query).await.expect("resolved queue");
+            let rows = set.rows.as_verdict_queue().expect("queue rows");
+            assert_eq!(rows.len(), 1, "origin changes must replace rather than duplicate contributions");
+            assert_eq!(rows[0].convoy.host, Some(HostName::new(name)));
+        }
+        aggregator.attach_resolver = None;
+        aggregator.apply_environment_event(WatchEvent::Added(environment_object("unrelated").await)).await;
+        assert!(state.result_set_for(&query).await.expect("lost origin").rows.is_empty());
     }
 
     struct ScriptedSource<T: Resource> {

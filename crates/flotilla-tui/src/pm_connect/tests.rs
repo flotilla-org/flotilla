@@ -1256,3 +1256,47 @@ fn connector_admits_hold_ledger_and_message_records() {
     assert!(facts.unset.contains(&"flotilla.convoy.latest_ledger".into()));
     assert_eq!(facts.set["flotilla.convoy.pending_messages"].value, MetadataValue::StringList(vec![]));
 }
+
+// The connector publishes the maintained queue with its evidence, retracts a
+// reviewed attempt, and recovers gaps through the normal query cursor contract.
+#[test]
+fn verdict_queue_publishes_evidence_and_retracts_reviewed_submissions() {
+    let mut state = ConnectorState::default();
+    let resource = ResourceRef::new("flotilla.work/v1", "PromiseSubmission", "dev", "5:video4:work5:coder4:demo");
+    let row = VerdictQueueRow::builder()
+        .resource(resource.clone())
+        .convoy(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "video"))
+        .project_ref("platform")
+        .vessel("work")
+        .role("coder")
+        .promise("demo")
+        .kind("demo-video")
+        .reference("https://uploads.example/demo.mp4")
+        .digest("sha256:1234")
+        .submitted_at(chrono::Utc::now())
+        .build();
+    let target = MetadataTarget::Entity(entity::verdict_submission(&resource));
+    let set = DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::VerdictQueue { scope: None, rows: vec![row] },
+        state: Default::default(),
+    }));
+    assert_eq!(state.apply_event(&set), Applied::Updated);
+    let published = state.rebuild(&mint());
+    let patch = published.iter().find(|patch| patch.target == target).expect("submission entity");
+    assert_eq!(patch.set["flotilla.submission.digest"].value, flotilla_manifest::wire::MetadataValue::text("sha256:1234"));
+    assert!(state.cursors().iter().any(|cursor| cursor.query == QueryId::VerdictQueue { scope: None }));
+    let delta = |seq| {
+        DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq,
+            changes: QueryChanges::VerdictQueue { scope: None, changed: vec![], removed: vec![resource.clone()] },
+            state: None,
+        }))
+    };
+    assert_eq!(state.apply_event(&delta(3)), Applied::Gap(QueryId::VerdictQueue { scope: None }));
+    assert_eq!(state.apply_event(&delta(2)), Applied::Updated);
+    let patches = state.rebuild(&mint());
+    let patch = patches.iter().find(|patch| patch.target == target).expect("reviewed entity retraction");
+    assert!(patch.unset.iter().any(|key| key == "flotilla.submission.digest"));
+    assert_eq!(state.apply_event(&delta(2)), Applied::Ignored);
+}

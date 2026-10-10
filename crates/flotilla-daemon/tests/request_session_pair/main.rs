@@ -1601,6 +1601,19 @@ async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
 #[tokio::test]
 async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
     let scenarios = [
+        (
+            "promise-verdict",
+            CommandAction::PromiseVerdict {
+                namespace: Some("flotilla".into()),
+                convoy: "remote-work".into(),
+                promise: "demo".into(),
+                vessel: None,
+                role: None,
+                accepted: true,
+                reason: "reviewed".into(),
+                submitted_at: None,
+            },
+        ),
         ("ensure-roll", CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "remote-ensure".into() }),
         (
             "resume",
@@ -4746,3 +4759,93 @@ fn generated_capabilities_queries_use_session_home(tc: hegel::TestCase) {
 }
 
 use flotilla_discovery_testkit::InProcessDiscoveryExt;
+
+// An operator on one host reviews a submission homed on another. Attribution
+// crosses the in-memory transport; only the authority's status is patched.
+#[tokio::test]
+async fn human_verdict_routes_to_authority_and_preserves_operator_evidence() {
+    use flotilla_resources::promises::{apply, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
+    for crew in [
+        None,
+        Some(
+            CallerCrew::builder()
+                .namespace("flotilla".into())
+                .convoy("another".into())
+                .vessel("another-work".into())
+                .role("coder".into())
+                .crew_id("crew-agent".into())
+                .build(),
+        ),
+    ] {
+        let is_crew = crew.is_some();
+        let desk = empty_daemon_named("verdict-desk").await;
+        let home = empty_daemon_named("verdict-home").await;
+        let principal = PrincipalRef { namespace: "flotilla".into(), name: "alice".into() };
+        let caller = CommandCaller { principal_ref: principal.clone(), process: None, crew };
+        let topology = spawn_in_memory_request_topology_stateful_with_caller(
+            desk,
+            home,
+            SurfaceDeclaration { principal_ref: principal, character: SurfaceCharacter::Focal },
+            caller,
+        )
+        .await
+        .expect("operator topology");
+        let convoys = topology.follower.resource_backend().using::<Convoy>("flotilla");
+        let object =
+            convoys.create(&convoy_meta("remote-video", "remote-video"), &convoy_spec("scratch", "remote-video")).await.expect("convoy");
+        let now = Utc::now();
+        let mut status = ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() };
+        apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Submit {
+                id: "demo".into(),
+                kind: PromiseKind::DemoVideo,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: "https://uploads.example/demo.mp4".into(),
+                    metadata: BTreeMap::from([("digest".into(), "sha256:1234".into())]),
+                    submitted_at: now,
+                    verdict: None,
+                },
+            },
+        );
+        convoys.update_status("remote-video", &object.metadata.resource_version, &status).await.expect("submission");
+        apply_convoy_replica_feed(&topology.leader, "flotilla", "remote-video", topology.follower_host.clone()).await;
+        let mut events = topology.leader.subscribe();
+        let command = Command::builder()
+            .action(CommandAction::PromiseVerdict {
+                namespace: Some("flotilla".into()),
+                convoy: "remote-video".into(),
+                promise: "demo".into(),
+                vessel: None,
+                role: None,
+                accepted: true,
+                reason: "good demonstration".into(),
+                submitted_at: Some(now),
+            })
+            .build();
+        let id = topology.client.execute(command).await.expect("routed verdict");
+        let result = await_command_result(&mut events, id).await;
+        if is_crew {
+            assert!(matches!(result, CommandValue::Error { ref message } if message.contains("operator caller")), "{result:?}");
+            let status = convoys.get("remote-video").await.expect("home status").status.expect("status");
+            assert_eq!(status.promises["work"]["coder"][0].state, PromiseState::Submitted);
+            assert!(status.promises["work"]["coder"][0].submissions[0].verdict.is_none());
+            continue;
+        }
+        assert_eq!(result, CommandValue::Ok);
+        let status = convoys.get("remote-video").await.expect("home convoy").status.expect("status");
+        let promise = &status.promises["work"]["coder"][0];
+        assert_eq!(promise.state, PromiseState::Kept);
+        let verdict = promise.submissions[0].verdict.as_ref().expect("stored verdict");
+        assert_eq!(verdict.who, "flotilla/alice");
+        assert_eq!(verdict.why, "good demonstration");
+        assert!(verdict.at >= now);
+        assert!(
+            topology.leader.resource_backend().using::<Convoy>("flotilla").get("remote-video").await.is_err(),
+            "desk must not author a local copy"
+        );
+    }
+}

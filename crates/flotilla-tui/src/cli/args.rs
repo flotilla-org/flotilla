@@ -283,6 +283,8 @@ pub enum DomainCommand {
     Dispatch(flotilla_commands::commands::dispatch::DispatchNoun),
     /// Communicate with crew members
     Crew(flotilla_commands::commands::crew::CrewNoun),
+    /// Human verdicts and submissions awaiting review
+    Promise(flotilla_commands::commands::promise::PromiseNoun),
     /// Inspect live message relationships
     Message(MessageNoun),
     /// Code review (alias on CrNoun itself, not duplicated here)
@@ -344,6 +346,7 @@ impl DomainCommand {
     pub fn resolve(self) -> Result<flotilla_commands::Resolved> {
         match self {
             DomainCommand::Repo(noun) => noun.resolve(),
+            DomainCommand::Promise(noun) => noun.resolve(),
             DomainCommand::Environment(noun) => noun.resolve(),
             DomainCommand::Checkout(noun) => noun.resolve(),
             DomainCommand::Convoy(noun) => noun.resolve(),
