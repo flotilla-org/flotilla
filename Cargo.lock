@@ -1139,6 +1139,7 @@ dependencies = [
  "digest",
  "flotilla-build-features",
  "generic-array",
+ "libc",
  "memchr",
  "serde",
  "serde_core",
@@ -1206,6 +1207,7 @@ name = "flotilla-build-features-http-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bitflags 2.11.0",
  "flotilla-build-features",
  "futures-channel",
  "futures-task",
@@ -1256,7 +1258,9 @@ name = "flotilla-build-features-os"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
+ "errno",
  "flotilla-build-features",
+ "libc",
  "linux-raw-sys",
  "once_cell",
  "rustix",

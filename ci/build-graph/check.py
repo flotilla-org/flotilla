@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep production free of testkits and package-local test feature selections reusable."""
 
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -117,7 +118,11 @@ def feature_differences(workspace, selected):
     return errors
 
 
-def main():
+def main(arguments=()):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", help="Cargo target triple for both layer and package feature trees (default: host)")
+    options = parser.parse_args(arguments)
+    target_arguments = ("--target", options.target) if options.target else ()
     root = Path(__file__).resolve().parents[2]
 
     def cargo(*arguments):
@@ -135,7 +140,7 @@ def main():
                      for argument in ("-p", package["name"])]
         if selection:
             for edges in ("normal,build", "normal,build,dev"):
-                workspace[group, edges] = tree_features(cargo(*tree_arguments, *selection, "--edges", edges))
+                workspace[group, edges] = tree_features(cargo(*tree_arguments, *selection, "--edges", edges, *target_arguments))
     for package in metadata["packages"]:
         if package["id"] not in metadata["workspace_members"]:
             continue
@@ -147,7 +152,7 @@ def main():
         for edges in ("normal,build", "normal,build,dev"):
             if edges == "normal,build" and is_testkit(package["name"]):
                 continue
-            selected = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", edges))
+            selected = tree_features(cargo(*tree_arguments, "-p", package["name"], "--edges", edges, *target_arguments))
             if edges == "normal,build":
                 for dependency, contexts in selected.items():
                     if dependency.startswith("tokio v") and any("test-util" in features for features in contexts):
@@ -157,9 +162,9 @@ def main():
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("Workspace build graph: C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable")
+    print(f"Workspace build graph ({options.target or 'host'}): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
