@@ -199,6 +199,12 @@ remain accepted unchanged. Previous stored Projects, CrewDefaults, workflow
 specs and workflow snapshots decode with absent new fields; the golden stored
 corpus must not be regenerated.
 
+For the #2986 promise-shape roll, validate previous-generation manifests and
+stored snapshots with the candidate before deploying. Roll all daemons together
+before writing the new shape: old binaries silently ignore `promises` and
+`deliverer` in stored snapshots and lose those obligations. Peer fingerprint
+checks do not protect stored records; do not reopen them with an old binary.
+
 After the candidate rolls, the owning project-map crew should declare the
 fleet Project's governor agent/model/workflow/template once. Then each owning
 ops crew should move its project prose into `charter_prose.governor`, remove an ensure's

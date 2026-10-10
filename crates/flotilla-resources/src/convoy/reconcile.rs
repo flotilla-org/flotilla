@@ -179,8 +179,9 @@ pub fn evaluate_crew_completion(
         .and_then(|requirement| requirement.crew.iter().find(|candidate| candidate.role == role))
         .ok_or_else(|| format!("workflow has no crew role `{vessel}/{role}`"))?;
     let mut unmet = Vec::new();
-    if crew.deliverer {
-        if let Some(condition) = super::promises::PromiseKind::Pr.readiness_condition() {
+    let pr = super::promises::PromiseKind::Pr;
+    if !crew.promise_exclusions.contains(&pr) && (crew.deliverer || crew.promises.iter().any(|promise| promise.kind == pr)) {
+        if let Some(condition) = pr.readiness_condition() {
             if let Some(expectation) =
                 evaluate_declared_completion_condition(convoy, &condition, checkouts, change_requests, artifacts, stale_after, now)?
             {
