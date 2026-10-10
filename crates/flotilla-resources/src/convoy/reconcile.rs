@@ -564,7 +564,7 @@ fn evaluate_landing_settlement_with_disposition(
             _ => SettlementMode::WorldTerminal,
         };
         return LandingSettlement {
-            evaluation: SettlementEvaluation { subjects: Vec::new(), mode, satisfied: true, unmet: Vec::new() },
+            evaluation: SettlementEvaluation::builder().mode(mode).satisfied(true).unmet(Vec::new()).build(),
             disposition: status.disposition.clone(),
         };
     }
@@ -573,12 +573,11 @@ fn evaluate_landing_settlement_with_disposition(
         Ok(expected) => expected,
         Err(message) => {
             return LandingSettlement {
-                evaluation: SettlementEvaluation {
-                    subjects: Vec::new(),
-                    mode: SettlementMode::WorldTerminal,
-                    satisfied: false,
-                    unmet: vec![UnmetSettlementExpectation::InvalidExpectedCheckouts { message }],
-                },
+                evaluation: SettlementEvaluation::builder()
+                    .mode(SettlementMode::WorldTerminal)
+                    .satisfied(false)
+                    .unmet(vec![UnmetSettlementExpectation::InvalidExpectedCheckouts { message }])
+                    .build(),
                 disposition: None,
             };
         }
@@ -597,15 +596,14 @@ fn evaluate_landing_settlement_with_disposition(
         });
     if discovery_pending {
         return LandingSettlement {
-            evaluation: SettlementEvaluation {
-                subjects: Vec::new(),
-                mode: SettlementMode::WorldTerminal,
-                satisfied: false,
-                unmet: vec![UnmetSettlementExpectation::SubjectDiscoveryPending {
+            evaluation: SettlementEvaluation::builder()
+                .mode(SettlementMode::WorldTerminal)
+                .satisfied(false)
+                .unmet(vec![UnmetSettlementExpectation::SubjectDiscoveryPending {
                     convoy: convoy.metadata.name.clone(),
                     error: convoy.status.as_ref().and_then(|status| status.branch_subject_scan_error.clone()),
-                }],
-            },
+                }])
+                .build(),
             disposition: None,
         };
     }
@@ -613,12 +611,11 @@ fn evaluate_landing_settlement_with_disposition(
         Ok(exit) => exit,
         Err(message) => {
             return LandingSettlement {
-                evaluation: SettlementEvaluation {
-                    subjects: Vec::new(),
-                    mode: SettlementMode::WorldTerminal,
-                    satisfied: false,
-                    unmet: vec![UnmetSettlementExpectation::InvalidCondition { subject: convoy.metadata.name.clone(), message }],
-                },
+                evaluation: SettlementEvaluation::builder()
+                    .mode(SettlementMode::WorldTerminal)
+                    .satisfied(false)
+                    .unmet(vec![UnmetSettlementExpectation::InvalidCondition { subject: convoy.metadata.name.clone(), message }])
+                    .build(),
                 disposition: None,
             };
         }
@@ -629,23 +626,13 @@ fn evaluate_landing_settlement_with_disposition(
                 return observed_digest;
             }
             return LandingSettlement {
-                evaluation: SettlementEvaluation {
-                    subjects: Vec::new(),
-                    mode: SettlementMode::NoExit,
-                    satisfied: false,
-                    unmet: Vec::new(),
-                },
+                evaluation: SettlementEvaluation::builder().mode(SettlementMode::NoExit).satisfied(false).unmet(Vec::new()).build(),
                 disposition: None,
             };
         }
         InstantiatedExit::Claim => {
             return LandingSettlement {
-                evaluation: SettlementEvaluation {
-                    subjects: Vec::new(),
-                    mode: SettlementMode::ClaimExit,
-                    satisfied: true,
-                    unmet: Vec::new(),
-                },
+                evaluation: SettlementEvaluation::builder().mode(SettlementMode::ClaimExit).satisfied(true).unmet(Vec::new()).build(),
                 disposition: Some("claim".to_string()),
             };
         }
@@ -776,7 +763,12 @@ fn evaluate_landing_settlement_with_disposition(
         }
     }
     LandingSettlement {
-        evaluation: SettlementEvaluation { subjects, mode: SettlementMode::WorldTerminal, satisfied, unmet },
+        evaluation: SettlementEvaluation::builder()
+            .subjects(subjects)
+            .mode(SettlementMode::WorldTerminal)
+            .satisfied(satisfied)
+            .unmet(unmet)
+            .build(),
         disposition: satisfied.then_some(disposition).flatten(),
     }
 }
@@ -829,7 +821,7 @@ fn evaluate_observed_digest_anchor(
     }
     let satisfied = unmet.is_empty();
     Some(LandingSettlement {
-        evaluation: SettlementEvaluation { subjects: Vec::new(), mode: SettlementMode::ObservedDigest, satisfied, unmet },
+        evaluation: SettlementEvaluation::builder().mode(SettlementMode::ObservedDigest).satisfied(satisfied).unmet(unmet).build(),
         disposition: satisfied.then(|| "observed-digest".to_string()),
     })
 }
