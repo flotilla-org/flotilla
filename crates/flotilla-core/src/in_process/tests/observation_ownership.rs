@@ -208,8 +208,8 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
         assert_eq!(provider.dispatch_board(&source).await.unwrap().issues.len(), 400);
     }
     assert_eq!(providers.iter().map(|p| p.calls.load(Ordering::SeqCst)).sum::<usize>(), 1);
-    // Issue pages, individual fetches and changed-since reads use the same
-    // ownership seam, including requests first made on nonowners.
+    // Issue pages and individual fetches use replicated demand. Incremental
+    // changed-since reads remain owner-local and never author cursor demands.
     let reference = flotilla_protocol::IssueRef { source: source.clone(), id: "1".into() };
     for daemon in &daemons {
         let provider = daemon.issue_provider_for_source(&source).await.unwrap();
@@ -220,13 +220,18 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     assert_eq!(providers.iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).collect::<Vec<_>>(), vec![3, 0, 0]);
     replicate::<ForgeRead>(&daemons).await;
     replicate::<ForgeReadHeartbeat>(&daemons).await;
-    for daemon in &daemons {
+    for (index, daemon) in daemons.iter().enumerate() {
         let provider = daemon.issue_provider_for_source(&source).await.unwrap();
         assert_eq!(provider.query(&source, &Default::default(), 1, 50).await.unwrap().items.len(), 1);
         assert_eq!(provider.fetch_by_id(&reference).await.unwrap().title, "Shared issue");
-        assert_eq!(provider.list_changed_since(&source, "2026-10-01T00:00:00Z", 50).await.unwrap().updated.len(), 1);
+        let changes = provider.list_changed_since(&source, "2026-10-01T00:00:00Z", 50).await;
+        if index == 0 {
+            assert_eq!(changes.unwrap().updated.len(), 1);
+        } else {
+            assert_eq!(changes.unwrap_err(), "incremental forge reads are owner-local");
+        }
     }
-    assert_eq!(providers.iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 3);
+    assert_eq!(providers.iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 4);
     let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get("host-0").await.unwrap();
     hosts
@@ -245,6 +250,25 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
             Some(expected.clone())
         );
     }
+    // Previous-generation cursor demands can still be stored at roll time.
+    // They stay decodable but must not trigger background incremental loads.
+    let legacy_request = flotilla_resources::ForgeReadRequest::Changes { since: "2026-10-01T00:00:00Z".into(), count: 50 };
+    let legacy_name = flotilla_resources::forge_read_name(&source, &legacy_request);
+    daemons[0]
+        .resource_backend()
+        .using::<ForgeRead>("flotilla")
+        .create(
+            &test_meta(&legacy_name),
+            &flotilla_resources::ForgeReadSpec { source: source.clone(), request: legacy_request, demanded_at: Utc::now() },
+        )
+        .await
+        .expect("legacy incremental demand");
+    daemons[0]
+        .resource_backend()
+        .using::<ForgeReadHeartbeat>("flotilla")
+        .create(&test_meta(&legacy_name), &flotilla_resources::ForgeReadHeartbeatSpec { demanded_at: Utc::now() })
+        .await
+        .expect("legacy incremental renewal");
     // Expire every observation without sleeping; replicas preserve this age.
     // Legacy demand is older than retention: the companion renewal must keep
     // requests active through fallback and recovery without whole-value writes.
@@ -268,8 +292,8 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     let counts = providers.iter().map(|p| p.calls.load(Ordering::SeqCst)).collect::<Vec<_>>();
     assert_eq!(counts[0], 1);
     assert_eq!(counts[1] + counts[2], 1, "exactly one fallback polls");
-    assert_eq!(providers[0].issue_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(providers[1..].iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 3);
+    assert_eq!(providers[0].issue_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(providers[1..].iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 2);
     replicate::<ForgeRead>(&daemons).await;
     replicate::<ForgeReadHeartbeat>(&daemons).await;
     for daemon in &daemons {
@@ -319,7 +343,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     assert_eq!(providers[0].calls.load(Ordering::SeqCst), 2);
     assert_eq!(providers[1..].iter().map(|p| p.calls.load(Ordering::SeqCst)).sum::<usize>(), 1);
     assert_eq!(providers[0].issue_calls.load(Ordering::SeqCst), 6);
-    assert_eq!(providers[1..].iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 3);
+    assert_eq!(providers[1..].iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 2);
 }
 
 // #2873: fresh forge facts accept only open/draft continuation; a PR-free

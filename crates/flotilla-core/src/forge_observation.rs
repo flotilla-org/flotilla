@@ -270,6 +270,18 @@ impl ForgeReads {
         Fut: Future<Output = Result<T, String>> + Send,
     {
         let source = canonical_source(source);
+        // Incremental cursors change every poll and belong to the owner's
+        // materialization loop. Never persist or replicate one record per cursor.
+        if matches!(request, ForgeReadRequest::Changes { .. }) {
+            if !owns_source(&self.backend, &self.namespace, &source).await? {
+                return Err("incremental forge reads are owner-local".into());
+            }
+            let result = tokio::time::timeout(LOAD_TIMEOUT, load()).await.unwrap_or_else(|_| Err("forge observation timed out".into()));
+            if !owns_source(&self.backend, &self.namespace, &source).await? {
+                return Err("forge observer changed during read".into());
+            }
+            return result;
+        }
         let name = forge_read_name(&source, &request);
         let lock = self.locks.lock().await.entry(name.clone()).or_default().clone();
         let mut local = lock.lock().await;
@@ -629,6 +641,66 @@ mod tests {
         (reads, clock)
     }
 
+    // Incremental cursors are owner-local: any sequence of cursors, limits and
+    // successful/error responses creates zero durable demand/result records.
+    #[hegel::test]
+    fn incremental_reads_do_not_accumulate_records(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let polls = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+        let steps = (0..polls)
+            .map(|_| {
+                (
+                    tc.draw(gs::integers::<u32>().min_value(0).max_value(3)),
+                    tc.draw(gs::integers::<usize>().min_value(0).max_value(100)),
+                    tc.draw(gs::booleans()),
+                )
+            })
+            .collect::<Vec<_>>();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+            let reads = ForgeReads::new(backend("owner"), "flotilla".into());
+            for (cursor, count, fail) in steps {
+                let expected = if fail { Err("provider failed".to_string()) } else { Ok(cursor) };
+                let result = reads
+                    .read(&source(), ForgeReadRequest::Changes { since: cursor.to_string(), count }, || async { expected.clone() })
+                    .await;
+                assert_eq!(result, expected);
+                assert!(reads.backend.using::<ForgeRead>("flotilla").list().await.expect("list records").items.is_empty());
+                assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").list().await.expect("list records").items.is_empty());
+            }
+        });
+    }
+
+    // A nonowner never runs the incremental loader or authors a cursor demand.
+    #[tokio::test]
+    async fn nonowner_incremental_read_is_refused_without_records() {
+        let owner = backend("owner");
+        let peer = backend("peer");
+        owner
+            .using::<Project>("flotilla")
+            .create(
+                &meta("shared"),
+                &ProjectSpec::builder()
+                    .display_name("Shared".into())
+                    .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source()).alias("shared".into()).build()])
+                    .build(),
+            )
+            .await
+            .expect("owner declaration");
+        replicate::<Project>(&owner, &peer).await;
+        let reads = ForgeReads::new(peer, "flotilla".into());
+        assert_eq!(
+            reads
+                .read::<u32, _, _>(&source(), ForgeReadRequest::Changes { since: "cursor".into(), count: 50 }, || async {
+                    panic!("nonowner incremental loader")
+                })
+                .await
+                .expect_err("nonowner refusal"),
+            "incremental forge reads are owner-local"
+        );
+        assert!(reads.backend.using::<ForgeRead>("flotilla").list().await.expect("list records").items.is_empty());
+        assert!(reads.backend.using::<ForgeReadHeartbeat>("flotilla").list().await.expect("list records").items.is_empty());
+    }
+
     // An externally removed parent leaves a live demand companion until its
     // lease expires; at the retention boundary even an orphan is tombstoned.
     // A new read afterwards recreates the pair and resumes normally.
@@ -734,22 +806,20 @@ mod tests {
 
     // Other whole reads carry Issue observation timestamps too. Their freshness
     // must not republish unchanged facts, and similarly named user fields and
-    // as_of revision timestamps must remain semantic. Generate all issue shapes.
+    // as_of revision timestamps must remain semantic. Generate both replicated issue shapes; owner-local Changes never publish.
     #[hegel::test]
     fn issue_read_publication_preserves_user_fields_and_revision_time(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let shape = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        let shape = tc.draw(gs::integers::<u8>().min_value(0).max_value(1));
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (reads, clock) = clocked_reads("owner");
             let request = match shape {
                 0 => ForgeReadRequest::Issue { id: "7".into() },
-                1 => ForgeReadRequest::Query { params: IssueQuery::default(), page: 1, count: 1 },
-                _ => ForgeReadRequest::Changes { since: "cursor".into(), count: 1 },
+                _ => ForgeReadRequest::Query { params: IssueQuery::default(), page: 1, count: 1 },
             };
             let wrap = |item: serde_json::Value| match shape {
                 0 => item,
-                1 => serde_json::json!({"items":[item]}),
-                _ => serde_json::json!({"updated":[item]}),
+                _ => serde_json::json!({"items":[item]}),
             };
             let source = source();
             let name = forge_read_name(&source, &request);

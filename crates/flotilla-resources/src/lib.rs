@@ -276,6 +276,8 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);
+        $callback::<$crate::ForgeRead>($($argument),*);
+        $callback::<$crate::ForgeReadHeartbeat>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::ManifestRoot>($($argument),*);
