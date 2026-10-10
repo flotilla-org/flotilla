@@ -71,12 +71,16 @@ pub trait MessageTransport: Send + Sync {
 }
 
 impl MessageInbox {
-    /// A pass always observes holders, including held submissions. Admission and
+    /// A pass with active Messages observes holders, including held submissions.
+    /// Idle passes skip receiver reads but still repair abandoned gates. Admission and
     /// delivery serialize separately; admission never waits on transport I/O.
+    /// Holder evidence is frozen after admission repair for this entire pass,
+    /// including gate cleanup. Transport calls are bounded individually, but a
+    /// pass may contain many groups: holder changes refresh on the next pass.
+    /// Cleanup may temporarily retain or remove a gate using that older evidence;
+    /// the next pass repairs it from current holders and active Messages.
     pub async fn reconcile_delivery(&self, transport: &dyn MessageTransport, now: DateTime<Utc>) -> Result<(), ResourceError> {
         let _delivery = self.delivery.lock().await;
-        let snapshot = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
-        let receivers = &snapshot;
         {
             let _admission = self.admission.lock().await;
             // A created record with no status is an interrupted admission. Finish
@@ -86,6 +90,13 @@ impl MessageInbox {
             }
         }
         let mut messages = self.messages.query(&MessageQuery::active()).await?;
+        if messages.is_empty() {
+            self.cleanup_delivery_gates(None, now).await?;
+            tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&messages)).await.ok();
+            return Ok(());
+        }
+        let snapshot = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+        let receivers = &snapshot;
         messages.sort_by_key(|message| {
             (
                 message.metadata.creation_timestamp,
@@ -148,7 +159,7 @@ impl MessageInbox {
                     {
                         if reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
                             && reply.object.spec.receiver == message.spec.sender
-                            && self.reply_sender_matches(receivers, message, &reply.object.spec.sender)?
+                            && Self::reply_sender_matches(receivers, message, &reply.object.spec.sender)?
                         {
                             answered = true;
                             break;
@@ -231,7 +242,7 @@ impl MessageInbox {
         for (_, (holder, pending)) in groups {
             self.deliver_group(receivers, transport, &holder, &pending, &messages, now).await?;
         }
-        self.cleanup_delivery_gates(receivers, now).await?;
+        self.cleanup_delivery_gates(Some(receivers), now).await?;
         let current = self.messages.query(&MessageQuery::active()).await?;
         tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&current)).await.ok();
         Ok(())
@@ -279,7 +290,6 @@ impl MessageInbox {
     }
 
     fn delivered_role_address(
-        &self,
         receivers: &MessageReceiverSnapshot,
         message: &ResourceObject<Message>,
         holder: &ResourceObject<TerminalSession>,
@@ -329,7 +339,6 @@ impl MessageInbox {
     }
 
     fn reply_sender_matches(
-        &self,
         receivers: &MessageReceiverSnapshot,
         message: &ResourceObject<Message>,
         sender: &str,
@@ -467,7 +476,7 @@ impl MessageInbox {
                         receivers,
                         &members,
                         &ResolvedMessageReceiver::builder()
-                            .maybe_role_address(self.delivered_role_address(receivers, &members[0], holder)?)
+                            .maybe_role_address(Self::delivered_role_address(receivers, &members[0], holder)?)
                             .crew_id(submission.crew_id.clone())
                             .session(submission.session.clone())
                             .delivered_at(now)
@@ -595,7 +604,7 @@ impl MessageInbox {
                     receivers,
                     members,
                     &ResolvedMessageReceiver::builder()
-                        .maybe_role_address(self.delivered_role_address(receivers, &members[0], holder)?)
+                        .maybe_role_address(Self::delivered_role_address(receivers, &members[0], holder)?)
                         .crew_id(submission.crew_id.clone())
                         .session(submission.session.clone())
                         .delivered_at(now)
@@ -721,7 +730,7 @@ impl MessageInbox {
 
     // Repair a crash between terminal closure/receipt and gate deletion. Only
     // actual receiver gates are checked; historical Messages cause no deletes.
-    async fn cleanup_delivery_gates(&self, receivers: &MessageReceiverSnapshot, _now: DateTime<Utc>) -> Result<(), ResourceError> {
+    async fn cleanup_delivery_gates(&self, receivers: Option<&MessageReceiverSnapshot>, _now: DateTime<Utc>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
         let gates: Vec<_> = demands
             .list()
@@ -753,9 +762,19 @@ impl MessageInbox {
             })
             .collect();
         let mut retained = std::collections::BTreeSet::new();
-        for message in active {
-            if let Some(holder) = self.resolve_receiver(receivers, &message).await? {
-                retained.insert(delivery_demand_name(&holder.object));
+        if !active.is_empty() {
+            let loaded;
+            let receivers = match receivers {
+                Some(receivers) => receivers,
+                None => {
+                    loaded = MessageReceiverSnapshot::load(&self.backend, &self.namespace).await?;
+                    &loaded
+                }
+            };
+            for message in active {
+                if let Some(holder) = self.resolve_receiver(receivers, &message).await? {
+                    retained.insert(delivery_demand_name(&holder.object));
+                }
             }
         }
         for gate in gates {

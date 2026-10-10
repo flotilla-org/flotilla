@@ -278,8 +278,12 @@ impl MessageReceiverSnapshot {
     }
 
     pub fn resolve(&self, address: &str) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
-        use crate::{TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
         validate_message_address(address)?;
+        self.resolve_validated(address)
+    }
+
+    fn resolve_validated(&self, address: &str) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
+        use crate::{TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
         let parts: Vec<_> = address.split('/').collect();
         let convoys = &self.convoys;
         let (project, convoy, vessel, role) = match parts.as_slice() {
@@ -370,5 +374,5 @@ pub async fn resolve_message_receiver(
     address: &str,
 ) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
     validate_message_address(address)?;
-    MessageReceiverSnapshot::load(backend, namespace).await?.resolve(address)
+    MessageReceiverSnapshot::load(backend, namespace).await?.resolve_validated(address)
 }

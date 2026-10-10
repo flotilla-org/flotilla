@@ -604,7 +604,8 @@ async fn delivery_receiver_reads_are_bounded() {
             assert_eq!(message.status.expect("waiting status").phase, MessagePhase::Accepted);
         }
     }
-    assert_eq!(counts[0], counts[1]);
+    assert_eq!(counts[0], [0; 3], "idle passes do not load receiver evidence");
+    assert_eq!(counts[1], [2; 3], "one local and replica read per receiver kind");
     assert_eq!(counts[1], counts[2]);
 }
 

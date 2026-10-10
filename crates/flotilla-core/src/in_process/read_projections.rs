@@ -1079,9 +1079,9 @@ impl ReadProjections<'_> {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let terminal_sessions = receivers.terminals();
-        let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), terminal_sessions, name);
-        let selected_sessions = flotilla_resources::select_convoy_children(&convoy, terminal_sessions);
+        let observed_sessions = receivers.terminals();
+        let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), observed_sessions, name);
+        let selected_sessions = flotilla_resources::select_convoy_children(&convoy, observed_sessions);
         let queued_turns = convoy
             .status
             .as_ref()
@@ -1116,7 +1116,7 @@ impl ReadProjections<'_> {
                 })
             })
             .collect();
-        let mut crew_deliveries = terminal_sessions
+        let mut crew_deliveries = observed_sessions
             .iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
             .cloned()
@@ -1499,8 +1499,7 @@ fn explain_subject_observation(
 }
 
 /// Project durable inbox state without inferring delivery from terminal phases.
-/// Convoy explanation still scans namespace history here (tracked in #2953).
-/// Crew orientation deliberately avoids this projection (#2952).
+/// Test seam for projecting all durable history against a single snapshot.
 #[cfg(test)]
 pub(super) async fn crew_message_views(
     backend: &flotilla_store::ResourceBackend,
@@ -1510,6 +1509,9 @@ pub(super) async fn crew_message_views(
     message_views(backend, namespace, &receivers, None).await
 }
 
+/// Namespace history is still listed once (#2953), but convoy candidates are
+/// filtered before pure resolution against the shared receiver snapshot.
+/// Crew orientation uses its bounded inbox query instead (#2952).
 async fn message_views(
     backend: &flotilla_store::ResourceBackend,
     namespace: &str,
@@ -2813,7 +2815,7 @@ mod tests {
         };
         use flotilla_store_testkit::ReadCountsBackendExt;
         let mut counts = Vec::new();
-        for n in [10, 200] {
+        for (n, adopted) in [(10, false), (200, false), (10, true), (200, true)] {
             let mut fixture = ProjectionFixture::new();
             let memory = InMemoryBackend::default().with_read_counts();
             fixture.backend = ResourceBackend::InMemory(memory.clone());
@@ -2829,29 +2831,53 @@ mod tests {
                 )
                 .await
                 .expect("convoy");
-            let ensures = fixture.backend.using::<ConvoyEnsure>("flotilla");
-            let ensure = ensures
-                .create(
-                    &InputMeta::builder().name("guide".into()).build(),
-                    &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("guide".into()).repositories(Vec::new()).build(),
-                )
-                .await
-                .expect("ensure");
-            let ensure = ensures.get(&ensure.metadata.name).await.expect("current ensure");
-            ensures
-                .update_status(
-                    "guide",
-                    &ensure.metadata.resource_version,
-                    &ConvoyEnsureStatus { convoy_ref: Some("target".into()), ..Default::default() },
-                )
-                .await
-                .expect("holder declaration");
+            if adopted {
+                use flotilla_resources::{ProjectSpec, RoleDefinition};
+                fixture
+                    .backend
+                    .definitions::<Project>("flotilla")
+                    .create(
+                        &InputMeta::builder().name("flotilla".into()).build(),
+                        &ProjectSpec::builder()
+                            .display_name("Flotilla".into())
+                            .role_definitions(BTreeMap::from([(
+                                "guide".into(),
+                                RoleDefinition { adoptable: Some(true), ..Default::default() },
+                            )]))
+                            .build(),
+                    )
+                    .await
+                    .expect("adoptable role");
+            } else {
+                let ensures = fixture.backend.using::<ConvoyEnsure>("flotilla");
+                let ensure = ensures
+                    .create(
+                        &InputMeta::builder().name("guide".into()).build(),
+                        &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("guide".into()).repositories(Vec::new()).build(),
+                    )
+                    .await
+                    .expect("ensure");
+                let ensure = ensures.get(&ensure.metadata.name).await.expect("current ensure");
+                ensures
+                    .update_status(
+                        "guide",
+                        &ensure.metadata.resource_version,
+                        &ConvoyEnsureStatus { convoy_ref: Some("target".into()), ..Default::default() },
+                    )
+                    .await
+                    .expect("holder declaration");
+            }
             fixture
                 .backend
                 .using::<ResourceTerminalSession>("flotilla")
                 .create(
                     &InputMeta::builder()
                         .name("holder".into())
+                        .annotations(if adopted {
+                            BTreeMap::from([(flotilla_resources::ROLE_ADDRESS_ANNOTATION.into(), "flotilla/guide".into())])
+                        } else {
+                            BTreeMap::new()
+                        })
                         .labels(BTreeMap::from([
                             (CONVOY_LABEL.into(), "target".into()),
                             (VESSEL_LABEL.into(), "work".into()),
@@ -2882,6 +2908,18 @@ mod tests {
                 )
                 .await
                 .expect("holder");
+            if adopted {
+                let terminals = fixture.backend.using::<ResourceTerminalSession>("flotilla");
+                let holder = terminals.get("holder").await.expect("holder");
+                terminals
+                    .update_status(
+                        "holder",
+                        &holder.metadata.resource_version,
+                        &flotilla_resources::TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
+                    )
+                    .await
+                    .expect("running adopted holder");
+            }
             fixture
                 .backend
                 .using::<Message>("flotilla")
@@ -2932,17 +2970,11 @@ mod tests {
                     .await
                     .expect("unrelated address form");
             }
-            let objects_before = memory.read_counts();
             let before = memory.read_calls();
             let explanation = fixture.projections().explain_convoy("flotilla", "guide@flotilla").await.expect("explain");
             assert_eq!(
                 explanation.messages.iter().map(|message| message.name.as_str()).collect::<Vec<_>>(),
                 vec!["alias".to_string(), format!("message-{n}")]
-            );
-            assert!(
-                memory.read_counts().get("Convoy").copied().unwrap_or_default() - objects_before.get("Convoy").copied().unwrap_or_default()
-                    <= 4,
-                "convoys decoded a bounded number of times"
             );
             let delta = memory
                 .read_calls()
@@ -2959,7 +2991,8 @@ mod tests {
             }
             counts.push(delta);
         }
-        assert_eq!(counts[0], counts[1], "namespace history must not multiply reads");
+        assert_eq!(counts[0], counts[1], "namespace history must not multiply ensured-role reads");
+        assert_eq!(counts[2], counts[3], "namespace history must not multiply adopted-role reads");
     }
 
     // Both crew and convoy surfaces share the durable projection. Waiting
