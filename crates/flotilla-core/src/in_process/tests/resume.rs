@@ -333,7 +333,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .await
     .expect("supervisor row restored after restart");
     daemon
-        .crew_supervise_internal(
+        .crew_ops
+        .supervise(
             CrewSupervisionRequest::builder()
                 .namespace("flotilla")
                 .convoy_name("resume-staging")

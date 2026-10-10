@@ -273,10 +273,6 @@ impl ProjectService<'_> {
         self.namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 
-    pub(super) async fn repository_transport_url(&self, namespace: &str, repository: &RepositorySpec) -> Result<String, String> {
-        repository_transport_url_with_backend(self.resource_backend, namespace, repository).await
-    }
-
     pub(super) async fn snapshot_project_repositories(
         &self,
         namespace: &str,
