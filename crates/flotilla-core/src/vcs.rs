@@ -4,11 +4,11 @@
 //! inside a provisioned environment, and across command transports.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt,
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -18,16 +18,29 @@ use flotilla_resources::{canonicalize_repo_url, CheckoutBranchProvenance};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::{
-    charter_store::{is_charter_file, reconciliation_lock, CharterSnapshot},
-    providers::{
-        command_channel_label,
-        types::Checkout,
-        vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy, CloneProvisioner, GitCloneProvisioner},
-        CommandOutput, CommandRunner,
-    },
+use crate::providers::{
+    command_channel_label,
+    types::Checkout,
+    vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy, CloneProvisioner, GitCloneProvisioner},
+    CommandOutput, CommandRunner,
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+
+fn revision_cache(cache: &Path, repo: &str) -> PathBuf {
+    cache.join(format!("{:x}", Sha256::digest(repo.as_bytes())))
+}
+
+fn object_cache_lock(directory: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Mutex::default).lock().expect("object cache locks poisoned");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(directory).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(directory.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
 
 /// Check host-owned repository configuration before a local Git process can
 /// interpret it. A contained worktree can write refs in the shared gitdir, so
@@ -689,6 +702,52 @@ pub enum CheckoutRegistration<'a> {
     Release,
 }
 
+/// Generic marker for providers without revision fetching.
+pub const REVISION_FETCH_UNAVAILABLE: &str = "revision fetching is unavailable";
+
+/// Generic timeout marker; callers add their own source context.
+pub const REVISION_FETCH_TIMEOUT: &str = "revision fetch exceeded 60 seconds";
+
+/// A file in an immutable tree. Blob I/O is deferred until the consumer asks
+/// for it, so generic tree enumeration does not force reads of unrelated files.
+#[async_trait]
+pub trait RevisionedFile: Send + Sync {
+    async fn read(&self) -> Result<Vec<u8>, String>;
+}
+
+/// Generic tree entries distinguish regular blobs from symlinks and submodules.
+/// Consumers choose which regular files to read and how to interpret their bytes.
+pub enum TreeEntry {
+    File(Arc<dyn RevisionedFile>),
+    Other,
+}
+
+#[derive(bon::Builder)]
+struct GitRevisionedFile {
+    runner: Arc<dyn CommandRunner>,
+    directory: PathBuf,
+    revision: String,
+    name: String,
+}
+
+#[async_trait]
+impl RevisionedFile for GitRevisionedFile {
+    async fn read(&self) -> Result<Vec<u8>, String> {
+        let lock = object_cache_lock(&self.directory);
+        let _guard = lock.lock().await;
+        // The cache guard protects this shared scratch path through write,
+        // read and cleanup. Keep all blob I/O inside its lifetime.
+        let output = self.directory.join("flotilla-tree-blob");
+        let contents = async {
+            self.runner.run_to_file("git", &["show", &format!("{}:{}", self.revision, self.name)], &self.directory, &output).await?;
+            tokio::fs::read(&output).await.map_err(|error| error.to_string())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&output).await;
+        contents
+    }
+}
+
 /// Flotilla operations bound to one checkout, independent of its VCS or storage medium.
 #[async_trait]
 pub trait Vcs: Send + Sync {
@@ -697,9 +756,22 @@ pub trait Vcs: Send + Sync {
         Err("image build source materialisation is unavailable".into())
     }
 
-    /// Fetch a bound branch and read its immutable blobs from a private object cache.
-    async fn charter_snapshot(&self, _cache: &Path, _repo: &str, _branch: &str, _path: &str) -> Result<CharterSnapshot, String> {
-        Err("bound charter inspection is unavailable".into())
+    /// Fetch a branch into an object cache and resolve it to an immutable commit.
+    /// The fetch itself has a 60-second deadline; cache lock wait is excluded.
+    async fn fetch_revision(&self, _cache: &Path, _repo: &str, _branch: &str) -> Result<String, String> {
+        Err(REVISION_FETCH_UNAVAILABLE.into())
+    }
+
+    /// Read every entry under a path at an immutable revision, relative to that path.
+    /// Non-regular entries have no contents; regular blobs expose lazy, byte-preserving reads.
+    async fn files_at_revision(
+        &self,
+        _cache: &Path,
+        _repo: &str,
+        _revision: &str,
+        _path: &str,
+    ) -> Result<BTreeMap<String, TreeEntry>, String> {
+        Err("revision tree inspection is unavailable".into())
     }
 
     async fn read_repository(&self, _path: &Path, _read: RepositoryRead<'_>) -> Result<String, String> {
@@ -926,14 +998,10 @@ impl Vcs for FlotillaVcs {
         Ok(())
     }
 
-    async fn charter_snapshot(&self, cache: &Path, repo: &str, branch: &str, path: &str) -> Result<CharterSnapshot, String> {
-        // Serialise fetch+resolve: overlapping reconciliation and candidate reads
-        // must never observe another fetch's FETCH_HEAD.
-        let source = flotilla_resources::CharterSource::Repository { repo: repo.into(), branch: branch.into(), path: path.into() };
-        source.validate()?;
-        let digest = Sha256::digest(format!("{repo}\0{branch}").as_bytes());
-        let directory = cache.join(format!("{:x}", digest));
-        let lock = reconciliation_lock(&format!("cache:{}", directory.display()));
+    async fn fetch_revision(&self, cache: &Path, repo: &str, branch: &str) -> Result<String, String> {
+        // Keep fetch+resolve atomic across providers sharing an object cache.
+        let directory = revision_cache(cache, repo);
+        let lock = object_cache_lock(&directory);
         let _guard = lock.lock().await;
         tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
         let backend = GitCliBackend::new(&directory, &*self.runner);
@@ -941,15 +1009,21 @@ impl Vcs for FlotillaVcs {
         backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
         tokio::time::timeout(Duration::from_secs(60), backend.run(&["fetch", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]))
             .await
-            .map_err(|_| format!("fetch charter branch {branch}: timed out after 60s"))??;
-        let revision = backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string();
-        let tree = backend.run(&["ls-tree", "-r", "-z", &revision]).await?;
+            .map_err(|_| REVISION_FETCH_TIMEOUT.to_string())??;
+        Ok(backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string())
+    }
+
+    async fn files_at_revision(&self, cache: &Path, repo: &str, revision: &str, path: &str) -> Result<BTreeMap<String, TreeEntry>, String> {
+        let directory = revision_cache(cache, repo);
+        let lock = object_cache_lock(&directory);
+        let _guard = lock.lock().await;
+        let backend = GitCliBackend::new(&directory, &*self.runner);
+        let tree = backend.run(&["ls-tree", "-r", "-z", revision]).await?;
         let normalized_path: PathBuf = Path::new(path).components().filter(|part| matches!(part, Component::Normal(_))).collect();
-        let prefix = normalized_path.to_str().ok_or("charter path is not UTF-8")?;
+        let prefix = normalized_path.to_str().ok_or("tree path is not UTF-8")?;
         let mut files = BTreeMap::new();
-        let mut found_path = prefix.is_empty();
         for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
-            let (meta, name) = entry.split_once('\t').ok_or("invalid charter tree entry")?;
+            let (meta, name) = entry.split_once('\t').ok_or("invalid tree entry")?;
             let relative = if prefix.is_empty() {
                 name
             } else {
@@ -958,29 +1032,21 @@ impl Vcs for FlotillaVcs {
                 };
                 relative
             };
-            found_path = true;
-            if !is_charter_file(Path::new(relative)) {
-                continue;
-            }
-            if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
-                return Err(format!("charter path {name} is not a regular file"));
-            }
-            // String command output is lossy. Stream the blob bytes first so
-            // invalid UTF-8 is refused with its source path, like local files.
-            let output = directory.join("flotilla-charter-blob");
-            let contents = async {
-                self.runner.run_to_file("git", &["show", &format!("{revision}:{name}")], &directory, &output).await?;
-                tokio::fs::read_to_string(&output).await.map_err(|error| error.to_string())
-            }
-            .await;
-            let _ = tokio::fs::remove_file(&output).await;
-            let contents = contents.map_err(|error| format!("read charter {name}: {error}"))?;
+            let contents = if meta.starts_with("100644 blob ") || meta.starts_with("100755 blob ") {
+                TreeEntry::File(Arc::new(
+                    GitRevisionedFile::builder()
+                        .runner(Arc::clone(&self.runner))
+                        .directory(directory.clone())
+                        .revision(revision.to_string())
+                        .name(name.to_string())
+                        .build(),
+                ))
+            } else {
+                TreeEntry::Other
+            };
             files.insert(relative.to_string(), contents);
         }
-        if !found_path {
-            return Err(format!("charter path {path} has no files at {revision}"));
-        }
-        Ok(CharterSnapshot { revision, files })
+        Ok(files)
     }
 
     async fn read_repository(&self, path: &Path, read: RepositoryRead<'_>) -> Result<String, String> {
@@ -2218,6 +2284,61 @@ mod tests {
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::TimeoutOnlyRunner;
+
+    // A subprocess double holds fetch open. Cache contention must not consume
+    // its 60-second deadline; the fetch itself still expires after exactly 60s.
+    #[tokio::test]
+    async fn revision_fetch_deadline_excludes_cache_lock_wait() {
+        struct HeldFetch {
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl CommandRunner for HeldFetch {
+            async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                if args.contains(&"fetch") {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok("commit".into())
+            }
+            async fn run_output(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _cwd: &Path,
+                _label: &crate::providers::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                unreachable!("fetch uses run")
+            }
+            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+                true
+            }
+        }
+        let cache = tempfile::tempdir().expect("cache");
+        let repo = "https://example.test/repository";
+        let directory = revision_cache(cache.path(), repo);
+        tokio::fs::create_dir_all(&directory).await.expect("cache directory");
+        let lock = object_cache_lock(&directory);
+        let guard = lock.lock().await;
+        let runner = Arc::new(HeldFetch { started: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+        let vcs = test_fl(cache.path(), runner.clone(), true);
+        let cache_path = cache.path().to_path_buf();
+        tokio::time::pause();
+        let task = tokio::spawn(async move { vcs.fetch_revision(&cache_path, repo, "main").await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(!task.is_finished(), "lock contention is outside the fetch deadline");
+        drop(guard);
+        runner.started.notified().await;
+        tokio::time::advance(Duration::from_secs(59) + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "fetch retains its full 60-second budget");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "fetch itself must expire after 60 seconds");
+        assert_eq!(task.await.expect("fetch task").expect_err("fetch deadline"), "revision fetch exceeded 60 seconds");
+    }
 
     fn git(cwd: &Path, args: &[&str]) {
         let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");
