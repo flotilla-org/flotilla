@@ -16,7 +16,7 @@ use flotilla_resources::{
 
 const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// The Docker process seam. All methods operate on exact IDs, never mutable tags.
+/// Distribution orchestration over exact IDs and pinned registry references.
 /// Returning from pull does not attest identity: the caller inspects it.
 #[async_trait]
 pub(crate) trait ImageDistributionIo: Send + Sync {

@@ -23,9 +23,14 @@ pub fn validate_digest(reference: &str) -> Result<(), String> {
 }
 
 async fn run(runner: &dyn CommandRunner, args: &[&str], auth: Option<&RegistryAuth>) -> Result<String, String> {
-    let config = RegistryAuth::config(auth)?;
-    let directory = config.path().to_string_lossy();
-    let mut private = vec!["--config", directory.as_ref()];
+    // Only registry operations need isolated credentials. Local cache commands
+    // use the owning provider's endpoint without allocating a throwaway path.
+    let config = if auth.is_some() || matches!(args.first(), Some(&"pull" | &"push")) { Some(RegistryAuth::config(auth)?) } else { None };
+    let directory = config.as_ref().map(|config| config.path().to_string_lossy());
+    let mut private = Vec::new();
+    if let Some(directory) = &directory {
+        private.extend(["--config", directory.as_ref()]);
+    }
     private.extend_from_slice(args);
     runner
         .run_with_timeout("docker", &private, Path::new("/"), &ChannelLabel::Default, Duration::from_secs(30 * 60))
@@ -39,7 +44,21 @@ impl LocalImageCache for DockerEnvironmentProvider {
     async fn inspect(&self, reference: &str) -> Result<Option<PlacedImageIdentity>, String> {
         validate_digest(reference)?;
         // Do not collapse transport/runtime errors into an absent image.
-        if !self.inventory().await?.contains(reference.rsplit_once('@').map_or(reference, |(_, digest)| digest)) {
+        let present = if reference.contains('@') {
+            // Shared content and archive loads do not attest a repository.
+            // Query exact RepoDigests before inspect so these are absence, while
+            // transport errors remain errors.
+            let references = run(
+                self.inner.runner.as_ref(),
+                &["image", "ls", "--no-trunc", "--digests", "--format", "{{.Repository}}@{{.Digest}}"],
+                None,
+            )
+            .await?;
+            references.lines().any(|held| held.trim() == reference)
+        } else {
+            self.inventory().await?.contains(reference)
+        };
+        if !present {
             return Ok(None);
         }
         let output = run(self.inner.runner.as_ref(), &["image", "inspect", "--format", "{{json .}}", reference], None).await?;
@@ -58,6 +77,8 @@ impl LocalImageCache for DockerEnvironmentProvider {
             return Err("cache inspection returned a different local digest".into());
         }
         if let Some((_, digest)) = reference.rsplit_once('@') {
+            // The inventory admitted the exact reference. Refuse a changed or
+            // malformed attestation instead of accepting partial evidence.
             if registry_digest.as_deref() != Some(digest) {
                 return Err("cache inspection returned a different registry digest".into());
             }

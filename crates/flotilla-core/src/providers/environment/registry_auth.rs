@@ -29,6 +29,8 @@ pub struct RegistryConfig {
 struct AnonymousConfig(PathBuf);
 impl Drop for AnonymousConfig {
     fn drop(&mut self) {
+        // Only registry/Buildx operations own these paths. Keep cleanup in Drop
+        // so cancellation cannot leave state for a detached async cleanup task.
         // Buildx may create non-secret state beneath an initially absent config.
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -74,6 +76,8 @@ impl RegistryAuth {
             None => text,
         }
     }
+    /// A claim is irreversible, even if subsequent validation, lowering or I/O
+    /// fails. This is fail-closed: retries need a newly admitted handle.
     pub fn claim(&self) -> Result<(), String> {
         self.used
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

@@ -26,6 +26,7 @@ fn digest(index: usize) -> String {
 #[derive(Default)]
 struct DockerStandIn {
     held: Mutex<BTreeSet<String>>,
+    repo_digests: Vec<String>,
     fail: bool,
     corrupt: bool,
     calls: Mutex<Vec<Vec<String>>>,
@@ -40,18 +41,28 @@ impl CommandRunner for DockerStandIn {
     }
     async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
         assert_eq!(cmd, "docker");
-        assert_eq!(args[0], "--config");
-        assert!(args[1].contains("flotilla-anonymous-"));
         self.calls.lock().expect("calls").push(args.iter().map(|s| s.to_string()).collect());
+        let private = args.first() == Some(&"--config");
+        let args = if private {
+            assert!(args[1].contains("flotilla-anonymous-"));
+            &args[2..]
+        } else {
+            args
+        };
         if self.fail {
             return Err("runtime unavailable".into());
         }
         let mut held = self.held.lock().expect("held");
-        match &args[2..] {
-            ["image", "ls", "--no-trunc", "--digests", "--format", "{{.ID}} {{.Digest}}"] => {
-                Ok(held.iter().cloned().collect::<Vec<_>>().join("\n"))
-            }
+        match args {
+            ["image", "ls", "--no-trunc", "--digests", "--format", "{{.ID}} {{.Digest}}"] => Ok(held
+                .iter()
+                .cloned()
+                .chain(self.repo_digests.iter().map(|r| r.rsplit_once('@').expect("digest").1.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n")),
+            ["image", "ls", "--no-trunc", "--digests", "--format", "{{.Repository}}@{{.Digest}}"] => Ok(self.repo_digests.join("\n")),
             ["pull", reference] => {
+                assert!(private, "registry operations require isolated configuration");
                 let (repo, digest) = reference.split_once('@').expect("pinned pull");
                 assert_eq!(repo, "registry.example/team/image");
                 assert!(is_image_digest(digest));
@@ -59,8 +70,15 @@ impl CommandRunner for DockerStandIn {
                 Ok(String::new())
             }
             ["image", "inspect", "--format", "{{json .}}", id] => {
-                assert!(held.contains(*id));
-                Ok(serde_json::json!({"Id": id, "RepoDigests": []}).to_string())
+                let local = if id.contains('@') {
+                    assert!(self.repo_digests.iter().any(|r| r == id));
+                    held.iter().next().expect("local identity").as_str()
+                } else {
+                    assert!(held.contains(*id));
+                    id
+                };
+                let attestations = if self.corrupt { vec![] } else { self.repo_digests.clone() };
+                Ok(serde_json::json!({"Id": local, "RepoDigests": attestations}).to_string())
             }
             ["image", "rm", id] => {
                 assert!(is_image_digest(id));
@@ -82,6 +100,7 @@ impl CommandRunner for DockerStandIn {
                 Ok(String::new())
             }
             ["push", tag] => {
+                assert!(private, "registry operations require isolated configuration");
                 assert!(tag.starts_with("registry.example/team/image:flotilla-"));
                 Ok(format!("digest: {} size: 123", digest(9)))
             }
@@ -221,4 +240,64 @@ async fn builder_contract_refuses_invalid_digest() {
         .await
         .expect_err("invalid digest")
         .contains("valid config digest"));
+}
+
+// Local-only commands preserve the provider endpoint without constructing an
+// operation config; anonymous pulls still isolate ambient registry credentials.
+#[tokio::test]
+async fn local_cache_commands_do_not_allocate_registry_configuration() {
+    let directory = tempfile::tempdir().expect("directory");
+    let archive = directory.path().join("image.tar");
+    std::fs::write(&archive, digest(1)).expect("archive");
+    let runner = Arc::new(DockerStandIn::default());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let cache = provider.local_image_cache().expect("cache");
+    cache.load(&archive).await.expect("load");
+    assert!(cache.inspect(&digest(1)).await.expect("inspect").is_some());
+    cache.remove(&digest(1)).await.expect("remove");
+    assert!(runner.calls.lock().expect("calls").iter().all(|args| args[0] == "image"));
+    cache.pull(&format!("registry.example/team/image@{}", digest(2)), None).await.expect("pull");
+    assert_eq!(runner.calls.lock().expect("calls").last().expect("pull")[0], "--config");
+}
+
+// A loaded config digest attests local content only. An exact repository and
+// manifest digest must be present before inspect, and its returned attestation
+// must agree; a sibling repository is absent even when content is shared.
+#[tokio::test]
+async fn cache_inspection_distinguishes_content_from_repository_attestations() {
+    let repository = "registry.example/team/image";
+    let reference = format!("{repository}@{}", digest(9));
+    for attestations in [vec![], vec![reference.clone()]] {
+        let runner = Arc::new(DockerStandIn {
+            held: Mutex::new(BTreeSet::from([digest(1)])),
+            repo_digests: attestations.clone(),
+            ..Default::default()
+        });
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let cache = provider.local_image_cache().expect("cache");
+        let local = cache.inspect(&digest(1)).await.expect("local").expect("held");
+        assert_eq!(local.local_image_id, digest(1));
+        assert_eq!(local.registry_digest, None);
+        assert!(cache.inspect(&format!("{repository}@{}", digest(1))).await.expect("loaded content is not repository evidence").is_none());
+        let inspected = cache.inspect(&reference).await.expect("registry reference");
+        assert_eq!(inspected.is_some(), !attestations.is_empty());
+        if let Some(identity) = inspected {
+            assert_eq!(identity.local_image_id, digest(1));
+            assert_eq!(identity.registry_digest, Some(digest(9)));
+        }
+        assert!(cache.inspect(&format!("registry.example/other/image@{}", digest(9))).await.expect("other repository").is_none());
+    }
+    let provider = DockerEnvironmentProvider::new(Arc::new(DockerStandIn {
+        held: Mutex::new(BTreeSet::from([digest(1)])),
+        repo_digests: vec![reference.clone()],
+        corrupt: true,
+        ..Default::default()
+    }));
+    assert!(provider
+        .local_image_cache()
+        .expect("cache")
+        .inspect(&reference)
+        .await
+        .expect_err("attestation changed")
+        .contains("different registry digest"));
 }

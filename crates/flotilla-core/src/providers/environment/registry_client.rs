@@ -27,6 +27,8 @@ pub struct Manifest {
     pub bytes: Vec<u8>,
 }
 
+/// Read-only registry metadata. Authenticated requests require a fresh,
+/// pull-scoped RegistryAuth; push-scoped handles are deliberately refused.
 pub struct RegistryClient {
     http: reqwest::Client,
     origin: Url,
