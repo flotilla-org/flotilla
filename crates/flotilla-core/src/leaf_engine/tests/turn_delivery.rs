@@ -664,3 +664,118 @@ async fn issue_turn_delivery_fires_once_for_changed_issue() {
     assert_eq!(status.turn_deliveries["issue"].episodes.len(), 1);
     watch.abort();
 }
+
+// ADR 0061: a closed, unmerged submission wakes its active owner once, with
+// the promise and rejection reason, through the existing delivery collaborator.
+#[hegel::test]
+fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
+    // Cover working, yielded and stalled owners; rejection must reach each.
+    let phase = [CrewWorkPhase::Working, CrewWorkPhase::Interrupted, CrewWorkPhase::Stalled]
+        [tc.draw(hegel::generators::integers::<usize>().max_value(2))];
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
+        use flotilla_resources::{Observation, ObservedChangeRequestState};
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let wake = supervision_wake(&backend);
+        let table = &wake.subscriptions;
+        let actuator = Arc::new(RecordingTurnDelivery::default());
+        table.set_turn_delivery_actuator(actuator.clone()).await;
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        let convoys = backend.using::<Convoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("rejected-promise".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+            )
+            .await
+            .unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        let address = LeafAddress::ChangeRequest { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42 };
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            started_at: Some(started_at),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            }),
+            work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+            crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]))]),
+            ..Default::default()
+        };
+        flotilla_resources::promises::apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Submit {
+                id: "implementation".into(),
+                kind: PromiseKind::Pr,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: address.to_string(),
+                    metadata: BTreeMap::new(),
+                    submitted_at: started_at,
+                    verdict: None,
+                },
+            },
+        );
+        let current = convoys.update_status("rejected-promise", &created.metadata.resource_version, &status).await.unwrap();
+        let requests = backend.using::<ChangeRequest>("flotilla");
+        let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+        let cr = requests
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(42)
+                    .observing_authority("host".into())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let observed = flotilla_resources::ChangeRequestStatus {
+            state: Observation::known(ObservedChangeRequestState::Closed, Utc::now()),
+            head_sha: Observation::known("closed-head".into(), Utc::now()),
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            checks: Default::default(),
+            mergeable: Default::default(),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+        };
+        let observed = requests.update_status(&name, &cr.metadata.resource_version, &observed).await.unwrap();
+        let patch = flotilla_resources::promises::next_observation(
+            &status,
+            "rejected-promise",
+            &BTreeMap::from([(name.clone(), observed)]),
+            &BTreeMap::new(),
+            Utc::now(),
+            Duration::from_secs(180),
+        )
+        .unwrap();
+        let current = flotilla_resources::apply_status_patch(&convoys, &current.metadata.name, &patch).await.unwrap();
+        wake.sync_rows("flotilla", &HashMap::from([("rejected-promise".into(), current)])).await.unwrap();
+        for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+            task.abort();
+        }
+        let row = table
+            .rows()
+            .await
+            .into_iter()
+            .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source.starts_with("promise-rejected/")))
+            .expect("rejection row");
+        let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { panic!("turn row") };
+        table.deliver_turn(row.id, "rejected-promise", source, rule, &row.leaves[0]).await.unwrap();
+        table.deliver_turn(row.id, "rejected-promise", source, rule, &row.leaves[0]).await.unwrap();
+        let deliveries = actuator.requests.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].role, "coder");
+        assert!(deliveries[0].brief.contains("implementation"));
+        assert!(deliveries[0].brief.contains("closed without merging"));
+    });
+}

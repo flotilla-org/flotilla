@@ -661,7 +661,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
             TurnDeliveryRule::builder()
                 .on("$cr.checks != pending".parse().expect("valid stock checks leaf"))
                 .to(target())
-                .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; complete when checks pass, review findings are handled, and the PR is mergeable.".to_string())
+                .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; inspect your open promises after checks pass, review findings are handled, and the PR is mergeable. Submit the PR against its promise and continue until every promise is kept or retracted.".to_string())
                 .hold(HoldAct::State)
                 .build(),
         ),
@@ -670,7 +670,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
             TurnDeliveryRule::builder()
                 .on("$cr.state == merged".parse().expect("valid stock merged leaf"))
                 .to(target())
-                .brief("The PR merged. Submit your decision ledger and run `flotilla crew complete` with the PR URL to finish your settlement claim.".to_string())
+                .brief("The PR merged. Inspect your open promises, continue any remaining work, and submit your decision ledger. Run `flotilla crew complete` once every promise is kept or retracted.".to_string())
                 .hold(HoldAct::State)
                 .build(),
         ),

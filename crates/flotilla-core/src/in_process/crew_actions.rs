@@ -61,6 +61,11 @@ pub(super) trait CrewActionPort: Send + Sync {
         principal_ref: Option<&PrincipalRef>,
     ) -> Result<Vec<CheckoutArchiveOutcome>, String>;
     async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String>;
+    async fn crew_promise_internal(
+        &self,
+        requested: &CrewCommandContext,
+        operation: flotilla_protocol::commands::CrewPromiseOperation,
+    ) -> Result<(), String>;
     async fn crew_complete_as_principal_internal(
         &self,
         requested: &CrewCommandContext,
@@ -113,6 +118,19 @@ pub(super) struct CrewActions<'a> {
 }
 
 impl CrewActions<'_> {
+    pub(super) async fn execute_action_crew_promise(&self, id: u64, command: &Command) -> Result<u64, String> {
+        let CommandAction::CrewPromise { context, operation } = &command.action else {
+            return Err("wrong promise handler".into());
+        };
+        let identity = self.port.start_context_free_command(id, command.description().to_string());
+        let result = match self.port.crew_promise_internal(context, operation.clone()).await {
+            Ok(()) => CommandValue::Ok,
+            Err(message) => CommandValue::Error { message },
+        };
+        self.port.finish_context_free_command(id, identity, result);
+        Ok(id)
+    }
+
     pub(super) async fn execute_action_artifact_reserve_ledger_comment(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ArtifactReserveLedgerComment { namespace, name, address } = &command.action else {
             return Err("ledger reservation selected the wrong handler".into());

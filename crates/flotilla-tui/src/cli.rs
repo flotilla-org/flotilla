@@ -732,6 +732,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
             "Placement",
             "Staleness",
             "Landing",
+            "Promises",
         ]);
         for row in &response.rows {
             let vessel = match &row.authority {
@@ -775,6 +776,18 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                 )),
                 Cell::new(format_fleet_staleness(&row.staleness)),
                 Cell::new(row.landing_reason.as_deref().unwrap_or("-")),
+                Cell::new(
+                    row.promise_counts
+                        .iter()
+                        .map(|(owner, counts)| {
+                            format!(
+                                "{owner}: {}",
+                                counts.iter().map(|(state, count)| format!("{count} {state}")).collect::<Vec<_>>().join(", ")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
             ]);
         }
         out.push_str(&table.to_string());
@@ -1010,6 +1023,13 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    output.push_str("\nPromises:\n");
+    if explanation.promises.is_empty() {
+        output.push_str("  (none)\n");
+    }
+    for promise in &explanation.promises {
+        let _ = writeln!(output, "{}", serde_json::to_string_pretty(promise).expect("format promise"));
+    }
     if let Some(entry) = &explanation.landing_entry {
         let _ = writeln!(output, "\nLanding entry:\n{}", serde_json::to_string_pretty(entry).expect("format landing entry"));
     }

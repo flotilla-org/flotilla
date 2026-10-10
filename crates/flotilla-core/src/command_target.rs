@@ -89,6 +89,7 @@ impl InProcessDaemon {
             | A::ConvoyResume { .. }
             | A::ConvoyWithdrawPendingBrief { .. }
             | A::ConvoyWorkForceComplete { .. }
+            | A::CrewPromise { .. }
             | A::CrewComplete { .. }
             | A::CrewFail { .. }
             | A::CrewStall { .. }

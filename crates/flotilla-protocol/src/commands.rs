@@ -409,6 +409,8 @@ pub struct ExplainedSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promises: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_entry: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -677,6 +679,13 @@ impl std::str::FromStr for AgentOverride {
 /// persisted by the selected execution host.
 ///
 /// Commands the client can send to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrewPromiseOperation {
+    Promise { id: String, kind: String },
+    Submit { promise: Option<String>, kind: String, reference: String, metadata: std::collections::BTreeMap<String, String> },
+    Retract { id: String, reason: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrewSupervisionAction {
@@ -861,6 +870,10 @@ pub enum CommandAction {
         message: String,
         #[serde(default)]
         carries: Vec<crate::MessageReference>,
+    },
+    CrewPromise {
+        context: CrewCommandContext,
+        operation: CrewPromiseOperation,
     },
     CrewComplete {
         context: CrewCommandContext,
@@ -1165,6 +1178,7 @@ impl Command {
             CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
+            CommandAction::CrewPromise { .. } => "Updating crew promises...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::CrewStall { .. } => "Stalling crew work...",

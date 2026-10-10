@@ -2463,6 +2463,33 @@ async fn artifact_environment_reference_contract() {
             assert_eq!(topology.client.artifact_get(reference, "result.bin".into()).await.expect("get"), (bytes.len() as u64, None));
             assert_eq!(tokio::fs::read(&destination).await.expect("destination"), bytes);
         }
+        // ADR 0061 routing row: promise mutations resolve the ambient crew and
+        // reach its convoy home over the same local/remote environment matrix.
+        for operation in [
+            flotilla_protocol::commands::CrewPromiseOperation::Promise { id: "route-proof".into(), kind: "pr".into() },
+            flotilla_protocol::commands::CrewPromiseOperation::Retract {
+                id: "route-proof".into(),
+                reason: "routing proof finished".into(),
+            },
+        ] {
+            let mut events = leader.subscribe();
+            let id = topology
+                .client
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::CrewPromise {
+                            context: CrewCommandContext { crew_id: Some("crew-artifact".into()), ..Default::default() },
+                            operation,
+                        })
+                        .build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(await_command_result(&mut events, id).await, CommandValue::Ok);
+        }
+        let status = leader.resource_backend().using::<Convoy>(namespace).get(convoy).await.unwrap().status.unwrap();
+        let promise = status.promises["work"]["coder"].iter().find(|p| p.id == "route-proof").unwrap();
+        assert_eq!(promise.state, flotilla_resources::promises::PromiseState::Retracted);
         let completion = || {
             Command::builder()
                 .action(CommandAction::CrewComplete {

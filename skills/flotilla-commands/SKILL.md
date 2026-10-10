@@ -25,3 +25,32 @@ path; shell-quote values containing spaces. Read only the area needed now:
 - To report a blocker or supervise stalled work, read [stalls](references/stalls.md).
 - To settle PR checks, reviews and claims, read [PR shepherding](references/pr-shepherding.md).
 - To inspect convoy state or fleet stalls, read [convoy inspection](references/convoy-inspection.md).
+
+## Promises
+
+Declare separately checkable deliverables before starting multi-part work:
+
+```sh
+flotilla crew promise --promise implementation --kind pr
+flotilla crew submit --promise implementation --kind pr --reference PR_URL
+flotilla convoy CONVOY explain
+```
+
+Attach submission evidence with optional JSON metadata, for example
+`--metadata '{"commit":"HEAD_SHA"}'`.
+
+Supported kinds are `pr` (kept when merged) and `decision-ledger` (kept when its
+artifact exists). Submission without a matching promise creates a crew-sourced
+promise; discovered produced PRs participate too. A closed, unmerged PR rejects
+its submission, retains the verdict in history, and reopens the promise. Submit
+the next attempt against the same promise.
+
+Retract your own crew-sourced promise with
+`flotilla crew retract --promise IDENTIFIER --reason REASON`. Retraction of a
+workflow- or dispatch-sourced promise proposes retraction through a stall for
+its supplier to decide. Inspect `convoy list` counts and `convoy explain` history.
+
+`crew complete` is a separate settlement claim and needs no deliverable
+reference. It refuses while any of your promises is open or submitted. After a
+PR merges, continue the remaining promises; submit the ledger and complete only
+when every promise is kept or retracted.

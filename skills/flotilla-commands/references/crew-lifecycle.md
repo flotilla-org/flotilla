@@ -8,12 +8,14 @@ first. Include at least one decision.
 
 ```sh
 flotilla artifact put --kind decision-ledger /tmp/decision-ledger.md
-flotilla crew complete --message RESULT
+flotilla convoy CONVOY explain
+flotilla crew complete
 ```
 
-Run completion as the final act after the ledger is accepted. Report the PR URL
-for a repository assignment. Let the convoy wait for merge and landing after
-completion. Supply `--disposition` only when the brief declares a settlement
+Run completion as the final act after the ledger is accepted and every promise
+is kept or retracted. Submit PR references with `crew submit`; PR promises remain
+submitted until merge. Continue remaining promises after each merge. Completion
+carries no deliverable reference. Supply `--disposition` only when the brief declares a settlement
 answer. Use [settlement order](pr-shepherding.md#settlement-order) for the rationale.
 
 As the named supervisor, resume the exact stalled obligation with guidance:

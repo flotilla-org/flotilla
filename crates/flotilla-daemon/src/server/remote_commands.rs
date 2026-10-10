@@ -36,6 +36,7 @@ fn command_action_name(command: &Command) -> &'static str {
         CommandAction::ConvoyUnlink { .. } => "convoy_unlink",
         CommandAction::ConvoyAbandon { .. } => "convoy_abandon",
         CommandAction::ConvoyResume { .. } => "convoy_resume",
+        CommandAction::CrewPromise { .. } => "crew_promise",
         CommandAction::CrewComplete { .. } => "crew_complete",
         CommandAction::CrewFail { .. } => "crew_fail",
         CommandAction::CrewStall { .. } => "crew_stall",
@@ -61,6 +62,7 @@ fn command_subject(action: &CommandAction) -> String {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), convoy)
         }
         CommandAction::CrewComplete { context, .. }
+        | CommandAction::CrewPromise { context, .. }
         | CommandAction::CrewFail { context, .. }
         | CommandAction::CrewStall { context, .. }
         | CommandAction::CrewHandoff { context, .. } => format!(
@@ -1139,7 +1141,8 @@ impl RemoteCommandRouter {
             CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } => {
                 (context, Some((message.clone(), disposition.clone(), decision_ledger_ref.clone(), *force)))
             }
-            CommandAction::CrewFail { context, .. }
+            CommandAction::CrewPromise { context, .. }
+            | CommandAction::CrewFail { context, .. }
             | CommandAction::CrewStall { context, .. }
             | CommandAction::CrewHandoff { context, .. }
             | CommandAction::QueryMessageContacts { context }

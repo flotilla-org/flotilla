@@ -69,6 +69,7 @@ macro_rules! define_patch_kinds {
 }
 
 define_patch_kinds! {
+    ConvoyPromise => NONE,
     ConvoyRestoreTurnActivation => DUPLICATE,
     ConvoyObserveEnvironment => NONE,
     ConvoySetStalled => NONE,
@@ -177,6 +178,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
+        ConvoyStatusPatch::Promise { .. } => PatchKind::ConvoyPromise,
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
         ConvoyStatusPatch::RefuseCrewCompletion { .. } => PatchKind::ConvoyRefuseCrewCompletion,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
@@ -303,6 +305,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
         environment_observations: Default::default(),

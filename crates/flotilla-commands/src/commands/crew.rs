@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction, CrewCommandContext, CrewSupervisionAction, StallProposedDisposition, StallReason};
 
 use crate::{
@@ -15,6 +15,9 @@ pub struct CrewNoun {
     pub subjects: SubjectArgs,
     #[command(subcommand)]
     pub verb: Option<CrewVerb>,
+    #[command(flatten)]
+    #[builder(default)]
+    pub promise_args: Box<CrewPromiseArgs>,
     /// Explicit crew identity (normally read from FLOTILLA_CREW_ID)
     #[arg(long)]
     pub crew_id: Option<String>,
@@ -33,7 +36,7 @@ pub struct CrewNoun {
     /// Completion, stall, or failure message
     #[arg(long)]
     pub message: Option<String>,
-    /// Why crew work is blocked while it remains wanted
+    /// Stall category or promise retraction reason
     #[arg(long)]
     pub reason: Option<String>,
     /// Suggested supervisor action when stalling crew work
@@ -51,6 +54,22 @@ pub struct CrewNoun {
     /// Show complete evidence in the fleet-wide stall listing
     #[arg(long)]
     pub full: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Args)]
+pub struct CrewPromiseArgs {
+    /// Promise identifier
+    #[arg(long)]
+    pub promise: Option<String>,
+    /// Registered promise kind: pr or decision-ledger
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Submission reference
+    #[arg(long)]
+    pub reference: Option<String>,
+    /// Submission metadata as a JSON string map
+    #[arg(long)]
+    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -113,7 +132,55 @@ impl CrewNoun {
         if self.full && subject.value != "stalls" {
             return Err("--full is only valid with `flotilla crew stalls`".to_string());
         }
+        let promise_command = matches!(subject.value.as_str(), "promise" | "submit" | "retract");
+        if !promise_command
+            && (self.promise_args.promise.is_some()
+                || self.promise_args.kind.is_some()
+                || self.promise_args.reference.is_some()
+                || self.promise_args.metadata.is_some())
+        {
+            return Err("promise options require crew promise, submit or retract".into());
+        }
+        if promise_command && (self.force || self.message.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some()) {
+            return Err("promise operations do not accept completion options".into());
+        }
+        if promise_command && subject.value != "retract" && self.reason.is_some() {
+            return Err("--reason is only valid for crew retract or stall".into());
+        }
+        if matches!(subject.value.as_str(), "promise" | "retract")
+            && (self.promise_args.reference.is_some() || self.promise_args.metadata.is_some())
+        {
+            return Err("--reference and --metadata require crew submit".into());
+        }
+        if subject.value == "retract" && self.promise_args.kind.is_some() {
+            return Err("crew retract selects an existing promise without --kind".into());
+        }
         let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
+            ("promise" | "submit" | "retract", SubjectInterpretation::Ordinary, None) => {
+                use flotilla_protocol::commands::CrewPromiseOperation;
+                let operation = match subject.value.as_str() {
+                    "promise" => CrewPromiseOperation::Promise {
+                        id: self.promise_args.promise.ok_or("crew promise requires --promise")?,
+                        kind: self.promise_args.kind.ok_or("crew promise requires --kind")?,
+                    },
+                    "submit" => CrewPromiseOperation::Submit {
+                        promise: self.promise_args.promise,
+                        kind: self.promise_args.kind.ok_or("crew submit requires --kind")?,
+                        reference: self.promise_args.reference.ok_or("crew submit requires --reference")?,
+                        metadata: self
+                            .promise_args
+                            .metadata
+                            .map(|value| serde_json::from_str(&value).map_err(|e| format!("invalid submission metadata: {e}")))
+                            .transpose()?
+                            .unwrap_or_default(),
+                    },
+                    _ => CrewPromiseOperation::Retract {
+                        id: self.promise_args.promise.ok_or("crew retract requires --promise")?,
+                        reason: self.reason.ok_or("crew retract requires --reason")?,
+                    },
+                };
+                CommandAction::CrewPromise { context, operation }
+            }
             ("stalls", SubjectInterpretation::Ordinary, None) => {
                 if stalls_scope_requested {
                     return Err("`flotilla crew stalls` is fleet-wide and does not accept crew selectors".to_string());
@@ -260,6 +327,10 @@ impl std::fmt::Display for CrewNoun {
             ("--vessel-ref", self.vessel_ref.as_ref()),
             ("--vessel", self.vessel.as_ref()),
             ("--role", self.role.as_ref()),
+            ("--promise", self.promise_args.promise.as_ref()),
+            ("--kind", self.promise_args.kind.as_ref()),
+            ("--reference", self.promise_args.reference.as_ref()),
+            ("--metadata", self.promise_args.metadata.as_ref()),
         ] {
             if let Some(value) = value {
                 write!(f, " {flag} {}", quote_value(value))?;
@@ -664,5 +735,29 @@ mod tests {
     fn marked_and_explicit_subjects_round_trip() {
         assert_round_trip::<CrewNoun>(&["crew", "@list", "handoff", "--message", "review"]);
         assert_round_trip::<CrewNoun>(&["crew", "--subject", "@reviewer", "handoff", "--message", "review"]);
+    }
+    // Glue: the three verbs preserve their identifiers, references and metadata.
+    #[test]
+    fn promise_verbs_round_trip() {
+        for args in [
+            vec!["crew", "promise", "--promise", "second PR", "--kind", "pr"],
+            vec![
+                "crew",
+                "submit",
+                "--promise",
+                "second PR",
+                "--kind",
+                "pr",
+                "--reference",
+                "https://github.com/org/repo/pull/42",
+                "--metadata",
+                "{\"commit\":\"abc\"}",
+            ],
+            vec!["crew", "retract", "--promise", "second PR", "--reason", "scope reduced"],
+        ] {
+            assert_round_trip::<CrewNoun>(&args);
+            let noun = CrewNoun::try_parse_from(args).unwrap();
+            assert!(matches!(action(noun, Some("crew-123")), CommandAction::CrewPromise { .. }));
+        }
     }
 }

@@ -3123,8 +3123,9 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
                 (self.provisioning_namespace().await, convoy.as_str())
             }
-            flotilla_protocol::CommandAction::CrewComplete { context, .. }
-            | flotilla_protocol::CommandAction::CrewFail { context, .. }
+            flotilla_protocol::CommandAction::CrewPromise { context, .. }
+            | flotilla_protocol::CommandAction::CrewComplete { context, .. }
+            | CommandAction::CrewFail { context, .. }
             | flotilla_protocol::CommandAction::CrewStall { context, .. }
             | flotilla_protocol::CommandAction::CrewHandoff { context, .. }
             | flotilla_protocol::CommandAction::QueryMessageContacts { context }
@@ -5909,6 +5910,7 @@ impl InProcessDaemon {
             CommandAction::ConvoyWithdrawPendingBrief { .. } => {
                 return boxed_action!(crew.execute_action_convoy_withdraw_pending_brief(id, &command))
             }
+            CommandAction::CrewPromise { .. } => return boxed_action!(crew.execute_action_crew_promise(id, &command)),
             CommandAction::CrewComplete { .. } => {
                 return boxed_action!(crew.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref))
             }
@@ -6436,6 +6438,13 @@ impl crew_actions::CrewActionPort for InProcessDaemon {
     }
     async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
         InProcessDaemon::convoy_withdraw_pending_brief_internal(self, namespace, name).await
+    }
+    async fn crew_promise_internal(
+        &self,
+        requested: &CrewCommandContext,
+        operation: flotilla_protocol::commands::CrewPromiseOperation,
+    ) -> Result<(), String> {
+        self.crew_ops.promise(requested, operation).await
     }
     async fn crew_complete_as_principal_internal(
         &self,

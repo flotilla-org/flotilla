@@ -127,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &created_convoy.metadata.name,
             &created_convoy.metadata.resource_version,
             &ConvoyStatus {
+                promises: Default::default(),
                 landing_entry: None,
                 landing_settlement: None,
                 environment_observations: Default::default(),

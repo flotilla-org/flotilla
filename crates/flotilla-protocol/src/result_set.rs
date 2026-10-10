@@ -8,7 +8,10 @@
 //! (columns, labels, tab composition) are consumer config and never appear
 //! on the wire.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1032,6 +1035,10 @@ impl HandledRung {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ConvoyRow {
+    /// Counts by vessel/role, then promise state.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub promise_counts: BTreeMap<String, BTreeMap<String, usize>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing_reason: Option<String>,
     /// Controller-owned admission holds, including capacity waits before a

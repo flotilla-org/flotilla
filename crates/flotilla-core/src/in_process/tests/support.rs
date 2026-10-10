@@ -249,6 +249,7 @@ pub(super) struct BatchedObservationRunner {
     pub(super) one_started: tokio::sync::Notify,
     pub(super) release_one: tokio::sync::Notify,
     pub(super) conflicting: std::sync::atomic::AtomicBool,
+    pub(super) merged: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -277,6 +278,7 @@ impl CommandRunner for BatchedObservationRunner {
                 self.rate_limit_all.load(Ordering::SeqCst),
                 self.mixed_history_errors.load(Ordering::SeqCst),
                 self.conflicting.load(Ordering::SeqCst),
+                self.merged.load(Ordering::SeqCst),
             ];
             let etag = format!("{flags:?}");
             let unchanged = args.iter().any(|arg| *arg == format!("If-None-Match: {etag}"));
@@ -343,7 +345,7 @@ impl CommandRunner for BatchedObservationRunner {
                 Some((
                     format!("pr{number}"),
                     serde_json::json!({
-                        "state": "OPEN", "isDraft": false, "headRefOid": "abc", "reviewDecision": null,
+                        "state": if self.merged.load(Ordering::SeqCst) { "MERGED" } else { "OPEN" }, "isDraft": false, "headRefOid": "abc", "reviewDecision": null,
                         "mergeable": if self.conflicting.load(std::sync::atomic::Ordering::SeqCst) { "CONFLICTING" } else { "MERGEABLE" },
                         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]},
                         "comments": {"nodes": [], "pageInfo": {

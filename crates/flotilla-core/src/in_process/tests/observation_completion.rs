@@ -168,6 +168,7 @@ async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
+        merged: std::sync::atomic::AtomicBool::new(false),
         conflicting: std::sync::atomic::AtomicBool::new(false),
     });
     let temp = tempfile::tempdir().expect("tempdir");
@@ -209,6 +210,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
+        merged: std::sync::atomic::AtomicBool::new(false),
         conflicting: std::sync::atomic::AtomicBool::new(false),
     });
     let temp = tempfile::tempdir().expect("tempdir");
@@ -366,6 +368,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
+        merged: std::sync::atomic::AtomicBool::new(false),
         conflicting: std::sync::atomic::AtomicBool::new(true),
     });
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -594,6 +597,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
         assert_eq!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal strike").consecutive_count, 2);
+        runner.merged.store(true, std::sync::atomic::Ordering::SeqCst);
         runner.mixed_history_errors.store(false, std::sync::atomic::Ordering::SeqCst);
         runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -642,7 +646,11 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             assert!(status.crew_work["work"]["coder"].completion_refusal.is_some());
             return;
         }
-        assert_eq!(claim().await.expect("fresh ready claim"), flotilla_protocol::CommandValue::Ok);
+        // ADR 0061: readiness alone cannot keep a PR promise. A fresh merge
+        // observation is required before its separate completion claim succeeds.
+        assert!(claim().await.expect_err("open ready PR still owes its promise").contains("2200"));
+        runner.merged.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(claim().await.expect("fresh merged claim"), flotilla_protocol::CommandValue::Ok);
         let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
         return;
