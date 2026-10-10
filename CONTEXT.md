@@ -782,6 +782,8 @@ _Avoid_: Bot, assistant.
 The crew's turn-ending report (ADR 0017), filed by `crew complete` — the
 crew *claims* its brief is fulfilled. Claims are never world-facts and never
 evidence of safety; integration conditions and observations judge the world.
+Since ADR 0061 it carries no deliverable reference and is refused while any
+of the crew member's **Promises** is open or submitted.
 _Avoid_: Completion (that is the admission-time stage), outcome, result.
 
 **Disposition**:
@@ -839,6 +841,23 @@ explicit continuation, either a new generation or a new convoy with
 `--continue-pr` (ADR 0059).
 _Avoid_: Done (a crew work phase), merged (one possible world terminal),
 complete.
+
+**Promise**:
+Something one crew member undertakes to produce that someone else can check
+(ADR 0061). It is owned by a vessel/role, sourced from the workflow template,
+the dispatch, or the crew, and has a kind (`pr`, `ref`, `decision-ledger`,
+`demo-video`, …) whose rule says when it is kept. States: `open`,
+`submitted`, `kept`, `retracted`. A crew retracts only its own promises; a
+template or dispatch promise it cannot keep is a `retraction-proposed`
+**Stall**. Stored in Convoy status per crew member.
+_Avoid_: Deliverable (collides with Turn Delivery), task, todo, obligation.
+
+**Submission**:
+One attempt to keep a **Promise** — the PR, ref, upload or ledger submitted,
+with traceable metadata (commit, digest) and its verdict (ADR 0061). A
+rejection returns the promise to `open`, keeping the submission in its
+history. Submitting without a matching promise creates one.
+_Avoid_: Delivery, fulfilment (both already mean something else).
 
 **Durability Fence**:
 The obligation a **Settlement Claim** carries: everything the convoy will
