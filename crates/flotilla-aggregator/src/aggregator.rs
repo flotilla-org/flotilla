@@ -2359,6 +2359,12 @@ impl Aggregator {
             .workflow_ref(&convoy.spec.workflow_ref)
             .dispatching_principal_ref(convoy.spec.dispatching_principal_ref.clone())
             .phase(convoy_phase(phase))
+            .maybe_landing_reason(
+                status
+                    .filter(|status| matches!(status.phase, ResourceConvoyPhase::Landing | ResourceConvoyPhase::Landed))
+                    .and_then(|status| status.landing_entry.as_ref())
+                    .map(|entry| format!("{}: {}", convoy_phase(phase), entry.reason())),
+            )
             .maybe_placement_decision(status.and_then(|status| status.placement_decision.clone()))
             .initializing(convoy_is_initializing(status))
             .maybe_message(
@@ -5560,6 +5566,32 @@ mod tests {
                 work,
                 ..Default::default()
             }),
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_reason_only_describes_landing_phases() {
+        for phase in [ResourceConvoyPhase::Active, ResourceConvoyPhase::Landing, ResourceConvoyPhase::Landed] {
+            let mut convoy = convoy_with_work().convoy_phase(phase).call();
+            convoy.status.as_mut().expect("status").landing_entry = Some(flotilla_resources::LandingEntry {
+                entered_at: Utc::now(),
+                claims: vec![flotilla_resources::LandingClaim::builder()
+                    .vessel("work".into())
+                    .role("coder".into())
+                    .completed_while_crew_active(false)
+                    .build()],
+                event_emitted: true,
+            });
+            let state = AggregatorProjectionState::new();
+            let (tx, _rx) = broadcast::channel(1);
+            let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+            let result = state.result_set().await;
+            let reason = &result.rows.as_convoys().expect("convoys")[0].landing_reason;
+            assert_eq!(reason.is_some(), matches!(phase, ResourceConvoyPhase::Landing | ResourceConvoyPhase::Landed));
+            if let Some(reason) = reason {
+                assert!(reason.ends_with(": coder complete"));
+            }
         }
     }
 

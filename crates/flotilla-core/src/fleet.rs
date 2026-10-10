@@ -267,15 +267,23 @@ impl FleetService {
             );
         }
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
-        let subjects_by_convoy = result_sets
+        let context_by_convoy = result_sets
             .iter()
             .filter_map(|result_set| result_set.rows.as_convoys())
             .flatten()
-            .map(|convoy| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), convoy.subjects.clone()))
+            .map(|convoy| {
+                (
+                    (convoy.resource.namespace.clone(), convoy.resource.name.clone()),
+                    (convoy.subjects.clone(), convoy.landing_reason.clone()),
+                )
+            })
             .collect::<HashMap<_, _>>();
         for row in &mut rows {
             if let Some(convoy_ref) = &row.convoy_ref {
-                row.subjects = subjects_by_convoy.get(&(row.namespace.clone(), convoy_ref.clone())).cloned().unwrap_or_default();
+                if let Some((subjects, reason)) = context_by_convoy.get(&(row.namespace.clone(), convoy_ref.clone())) {
+                    row.subjects = subjects.clone();
+                    row.landing_reason = reason.clone();
+                }
             }
         }
         {
@@ -462,6 +470,7 @@ fn append_crewless_convoy_rows(
                     .vessel("-")
                     .crew("-")
                     .crew_state(convoy_state_label(row))
+                    .maybe_landing_reason(row.landing_reason.clone())
                     .surface_state(row.surface_state)
                     .host(row.resource.host.clone().unwrap_or_else(|| host.clone()))
                     .maybe_placement_decision(row.placement_decision.clone())
@@ -527,7 +536,8 @@ mod tests {
             .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy").on_host(remote.clone()))
             .name("convoy".to_string())
             .workflow_ref("workflow".to_string())
-            .phase(ConvoyPhase::Active)
+            .landing_reason("landed: coder complete (#2973) after merged-unclaimed")
+            .phase(ConvoyPhase::Landed)
             .build();
         let result_sets = vec![ResultSet { seq: 1, rows: Rows::Convoys { scope: None, rows: vec![convoy] }, state: Default::default() }];
 
@@ -535,6 +545,8 @@ mod tests {
         append_crewless_convoy_rows(&mut merged_rows, "flotilla", &result_sets, &local, FleetStaleness::Local);
         assert_eq!(merged_rows.len(), 1);
         assert_eq!(merged_rows[0].host, remote);
+        // The retained convoy row carries its trigger after the crew is gone.
+        assert_eq!(merged_rows[0].landing_reason.as_deref(), Some("landed: coder complete (#2973) after merged-unclaimed"));
     }
 
     #[test]

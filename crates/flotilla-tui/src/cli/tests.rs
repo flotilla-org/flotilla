@@ -188,6 +188,8 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        landing_entry: None,
+        landing_settlement: None,
         holds: Vec::new(),
         cascade: None,
         environment_observations: Default::default(),
@@ -280,6 +282,22 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
     };
 
+    // Every claim renders the active-process marker, including a superseded
+    // claim and a claim with a valid ledger artifact.
+    let mut all_active = explanation.clone();
+    for ledger in &mut all_active.decision_ledgers {
+        ledger.completed_while_crew_active = true;
+    }
+    assert_eq!(format_convoy_explanation_human(&all_active).matches("completed while crew active").count(), 4);
+    all_active.landing_entry = Some(serde_json::json!({"entered_at": "2026-10-09T22:41:39Z", "claims": [{
+        "vessel": "work", "role": "coder", "message": "https://github.com/flotilla-org/flotilla/pull/2973",
+        "preceding_turn": {"source": "merged-unclaimed"}
+    }]}));
+    all_active.landing_settlement = Some(serde_json::json!({"satisfied": true, "subjects": [{"number": 2973, "state": "merged"}]}));
+    let full_record = format_convoy_explanation_human(&all_active);
+    assert!(full_record.contains("Landing entry:") && full_record.contains("merged-unclaimed"));
+    assert!(full_record.contains("Landing settlement (recorded at landing):") && full_record.contains("2973"));
+
     let output = format_convoy_explanation_human(&explanation);
     assert!(output.contains("Artifacts:\n  - explainer: artifact/example https://artifacts.example.test/fleet/digest"));
     assert!(
@@ -320,6 +338,8 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        landing_entry: None,
+        landing_settlement: None,
         holds: Vec::new(),
         cascade: None,
         environment_observations: Default::default(),
@@ -829,4 +849,28 @@ fn crew_list_explains_recoverable_environment_loss() {
     let json = serde_json::to_value(response).expect("JSON");
     assert_eq!(json["members"][0]["state"], "lost");
     assert_eq!(json["members"][0]["reason"], "lost, recoverable: host reboot");
+}
+
+// Glue: the convoy list renders the projected reason even after crew sessions
+// have been collected and the only remaining row is the convoy itself.
+#[test]
+fn convoy_list_shows_landed_trigger_without_a_crew_session() {
+    let reason = "landed: coder complete (#2973) after merged-unclaimed";
+    let response = flotilla_protocol::FleetListResponse {
+        fleet_project: None,
+        declaration_attention: Vec::new(),
+        replicas: Vec::new(),
+        rows: vec![flotilla_protocol::FleetListRow::builder()
+            .convoy("env-partb-2972")
+            .convoy_ref("convoy-first-merge")
+            .vessel("-")
+            .crew("-")
+            .crew_state("landed")
+            .landing_reason(reason)
+            .host(HostName::new("work"))
+            .namespace("flotilla")
+            .staleness(flotilla_protocol::FleetStaleness::Local)
+            .build()],
+    };
+    assert!(super::format_fleet_list_human(&response).contains(reason));
 }

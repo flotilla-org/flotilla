@@ -1032,6 +1032,8 @@ impl HandledRung {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ConvoyRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_reason: Option<String>,
     /// Controller-owned admission holds, including capacity waits before a
     /// workflow snapshot or concrete Vessel exists.
     #[builder(default)]

@@ -33,9 +33,9 @@ use crate::{
         ValidationError, WorkflowTemplate,
     },
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
-    InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError,
-    RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue, TypedResolver,
-    ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
+    InputValue, LeafMaker, ObservedChangeRequestState, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector,
+    ReplicaReadResolver, Resource, ResourceError, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition,
+    SystemClock, ThreeValue, TypedResolver, ENSURED_FROM_ANNOTATION, PROVISIONING_RETRY_BACKOFF,
 };
 
 fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
@@ -65,10 +65,12 @@ struct InternalReconcileOutcome {
 struct LifecycleConditions {
     exit_disposition: Option<String>,
     reclaim_eligible: bool,
+    settlement_evidence: Option<SettlementEvaluation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyEvent {
+    LandingEntered { entry: super::LandingEntry },
     PhaseChanged { from: ConvoyPhase, to: ConvoyPhase },
     WorkPhaseChanged { work: String, from: WorkPhase, to: WorkPhase },
     TemplateNotFound { name: String },
@@ -103,6 +105,7 @@ pub struct ConvoyPrepared {
     checkouts: BTreeMap<String, ResourceObject<Checkout>>,
     observed_subjects: Vec<Subject>,
     exit_disposition: Option<String>,
+    settlement_evidence: Option<SettlementEvaluation>,
     settlement_attention: Option<crate::ConvoyAttention>,
     reclaim_eligible: bool,
     capacity_wait: Option<String>,
@@ -487,11 +490,23 @@ fn evaluate_declared_completion_condition(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct SettlementEvaluation {
+    /// Exact instantiated exit-table subjects and their state at evaluation.
+    /// ADR 0047: remove the decoder default one roll after deployment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub subjects: Vec<SettlementSubject>,
     pub mode: SettlementMode,
     pub satisfied: bool,
     pub unmet: Vec<UnmetSettlementExpectation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementSubject {
+    pub address: LeafAddress,
+    pub state: Option<ObservedChangeRequestState>,
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 struct LandingSettlement {
@@ -538,6 +553,9 @@ fn evaluate_landing_settlement_with_disposition(
     // change-request GC; consulting it again would turn settled history into
     // a missing-record hold. Legacy Landed records need no new receipt.
     if let Some(status) = convoy.status.as_ref().filter(|status| status.phase == ConvoyPhase::Landed) {
+        if let Some(evaluation) = &status.landing_settlement {
+            return LandingSettlement { evaluation: evaluation.clone(), disposition: status.disposition.clone() };
+        }
         let mode = match status.disposition.as_deref() {
             Some("observed-digest") => SettlementMode::ObservedDigest,
             Some("claim") => SettlementMode::ClaimExit,
@@ -546,7 +564,7 @@ fn evaluate_landing_settlement_with_disposition(
             _ => SettlementMode::WorldTerminal,
         };
         return LandingSettlement {
-            evaluation: SettlementEvaluation { mode, satisfied: true, unmet: Vec::new() },
+            evaluation: SettlementEvaluation::builder().mode(mode).satisfied(true).unmet(Vec::new()).build(),
             disposition: status.disposition.clone(),
         };
     }
@@ -555,11 +573,11 @@ fn evaluate_landing_settlement_with_disposition(
         Ok(expected) => expected,
         Err(message) => {
             return LandingSettlement {
-                evaluation: SettlementEvaluation {
-                    mode: SettlementMode::WorldTerminal,
-                    satisfied: false,
-                    unmet: vec![UnmetSettlementExpectation::InvalidExpectedCheckouts { message }],
-                },
+                evaluation: SettlementEvaluation::builder()
+                    .mode(SettlementMode::WorldTerminal)
+                    .satisfied(false)
+                    .unmet(vec![UnmetSettlementExpectation::InvalidExpectedCheckouts { message }])
+                    .build(),
                 disposition: None,
             };
         }
@@ -578,14 +596,14 @@ fn evaluate_landing_settlement_with_disposition(
         });
     if discovery_pending {
         return LandingSettlement {
-            evaluation: SettlementEvaluation {
-                mode: SettlementMode::WorldTerminal,
-                satisfied: false,
-                unmet: vec![UnmetSettlementExpectation::SubjectDiscoveryPending {
+            evaluation: SettlementEvaluation::builder()
+                .mode(SettlementMode::WorldTerminal)
+                .satisfied(false)
+                .unmet(vec![UnmetSettlementExpectation::SubjectDiscoveryPending {
                     convoy: convoy.metadata.name.clone(),
                     error: convoy.status.as_ref().and_then(|status| status.branch_subject_scan_error.clone()),
-                }],
-            },
+                }])
+                .build(),
             disposition: None,
         };
     }
@@ -593,11 +611,11 @@ fn evaluate_landing_settlement_with_disposition(
         Ok(exit) => exit,
         Err(message) => {
             return LandingSettlement {
-                evaluation: SettlementEvaluation {
-                    mode: SettlementMode::WorldTerminal,
-                    satisfied: false,
-                    unmet: vec![UnmetSettlementExpectation::InvalidCondition { subject: convoy.metadata.name.clone(), message }],
-                },
+                evaluation: SettlementEvaluation::builder()
+                    .mode(SettlementMode::WorldTerminal)
+                    .satisfied(false)
+                    .unmet(vec![UnmetSettlementExpectation::InvalidCondition { subject: convoy.metadata.name.clone(), message }])
+                    .build(),
                 disposition: None,
             };
         }
@@ -608,21 +626,21 @@ fn evaluate_landing_settlement_with_disposition(
                 return observed_digest;
             }
             return LandingSettlement {
-                evaluation: SettlementEvaluation { mode: SettlementMode::NoExit, satisfied: false, unmet: Vec::new() },
+                evaluation: SettlementEvaluation::builder().mode(SettlementMode::NoExit).satisfied(false).unmet(Vec::new()).build(),
                 disposition: None,
             };
         }
         InstantiatedExit::Claim => {
             return LandingSettlement {
-                evaluation: SettlementEvaluation { mode: SettlementMode::ClaimExit, satisfied: true, unmet: Vec::new() },
+                evaluation: SettlementEvaluation::builder().mode(SettlementMode::ClaimExit).satisfied(true).unmet(Vec::new()).build(),
                 disposition: Some("claim".to_string()),
             };
         }
         InstantiatedExit::Table(entries) => entries,
     };
 
-    let evaluate_terminal = |leaf: &flotilla_protocol::Leaf| {
-        let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+    let evaluate_terminal = |leaf: &Leaf| {
+        let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
             return Err(UnmetSettlementExpectation::InvalidCondition {
                 subject: convoy.metadata.name.clone(),
                 message: "exit table leaf did not address a change request".to_string(),
@@ -720,14 +738,37 @@ fn evaluate_landing_settlement_with_disposition(
         }
     }
 
+    let subjects: Vec<_> = addresses
+        .into_iter()
+        .map(|address| {
+            let record = match &address {
+                LeafAddress::ChangeRequest { service, scope, number } => {
+                    change_requests.get(&crate::change_request_record_name(service, scope, *number))
+                }
+                _ => None,
+            };
+            let observation = record.and_then(|record| record.status.as_ref()).map(|status| &status.state);
+            SettlementSubject {
+                address,
+                state: observation.and_then(|state| state.value),
+                observed_at: observation.map(|state| state.observed_at),
+            }
+        })
+        .collect();
     let satisfied = disposition.is_some() && unmet.is_empty();
     if !satisfied {
-        if let Some(observed_digest) = observed_digest {
+        if let Some(mut observed_digest) = observed_digest {
+            observed_digest.evaluation.subjects = subjects;
             return observed_digest;
         }
     }
     LandingSettlement {
-        evaluation: SettlementEvaluation { mode: SettlementMode::WorldTerminal, satisfied, unmet },
+        evaluation: SettlementEvaluation::builder()
+            .subjects(subjects)
+            .mode(SettlementMode::WorldTerminal)
+            .satisfied(satisfied)
+            .unmet(unmet)
+            .build(),
         disposition: satisfied.then_some(disposition).flatten(),
     }
 }
@@ -780,7 +821,7 @@ fn evaluate_observed_digest_anchor(
     }
     let satisfied = unmet.is_empty();
     Some(LandingSettlement {
-        evaluation: SettlementEvaluation { mode: SettlementMode::ObservedDigest, satisfied, unmet },
+        evaluation: SettlementEvaluation::builder().mode(SettlementMode::ObservedDigest).satisfied(satisfied).unmet(unmet).build(),
         disposition: satisfied.then(|| "observed-digest".to_string()),
     })
 }
@@ -1004,6 +1045,7 @@ impl Reconciler for ConvoyReconciler {
             checkouts,
             observed_subjects,
             exit_disposition,
+            settlement_evidence: settlement.map(|settlement| settlement.evaluation),
             settlement_attention,
             reclaim_eligible,
             capacity_wait,
@@ -1086,7 +1128,11 @@ impl Reconciler for ConvoyReconciler {
             prepared.template.as_ref(),
             &prepared.vessels,
             &prepared.checkouts,
-            LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
+            LifecycleConditions {
+                exit_disposition: prepared.exit_disposition.clone(),
+                reclaim_eligible: prepared.reclaim_eligible,
+                settlement_evidence: prepared.settlement_evidence.clone(),
+            },
             now,
         );
         // Landed convoy records are retained, so their deletion finalizer may
@@ -1199,6 +1245,7 @@ impl Reconciler for ConvoyReconciler {
 
 fn convoy_object_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) -> crate::ObjectEvent {
     let (reason, message) = match event {
+        ConvoyEvent::LandingEntered { entry } => ("ConvoyLandingEntered", format!("landing at {}: {}", entry.entered_at, entry.reason())),
         ConvoyEvent::PhaseChanged { from, to } => ("ConvoyPhaseChanged", format!("convoy phase changed from {from:?} to {to:?}")),
         ConvoyEvent::WorkPhaseChanged { work, from, to } => {
             ("ConvoyWorkPhaseChanged", format!("work {work} changed phase from {from:?} to {to:?}"))
@@ -1232,13 +1279,29 @@ pub fn reconcile(
         template,
         &BTreeMap::new(),
         &BTreeMap::new(),
-        LifecycleConditions { exit_disposition, reclaim_eligible: false },
+        LifecycleConditions { exit_disposition, reclaim_eligible: false, settlement_evidence: None },
         now,
     );
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }
 }
 
 fn reconcile_internal(
+    convoy: &ResourceObject<Convoy>,
+    template: Option<&ResourceObject<WorkflowTemplate>>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    conditions: LifecycleConditions,
+    now: DateTime<Utc>,
+) -> InternalReconcileOutcome {
+    let mut outcome = reconcile_internal_without_landing_event(convoy, template, vessels, checkouts, conditions, now);
+    if let Some(entry) = convoy.status.as_ref().and_then(|status| status.landing_entry.as_ref()).filter(|entry| !entry.event_emitted) {
+        outcome.patch = Some(ConvoyStatusPatch::RecordLandingEvent { transition: outcome.patch.map(Box::new) });
+        outcome.events.insert(0, ConvoyEvent::LandingEntered { entry: entry.clone() });
+    }
+    outcome
+}
+
+fn reconcile_internal_without_landing_event(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
@@ -1337,7 +1400,7 @@ fn reconcile_internal(
         );
     }
 
-    if let Some(outcome) = roll_up_phase_outcome(convoy, &status, checkouts, conditions.exit_disposition.as_deref(), now) {
+    if let Some(outcome) = roll_up_phase_outcome(convoy, &status, checkouts, &conditions, now) {
         return with_cleanup(
             convoy,
             &status,
@@ -1670,11 +1733,11 @@ fn roll_up_phase_outcome(
     convoy: &ResourceObject<Convoy>,
     status: &super::ConvoyStatus,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
-    exit_disposition: Option<&str>,
+    conditions: &LifecycleConditions,
     now: DateTime<Utc>,
 ) -> Option<ReconcileOutcome> {
     let all_complete = !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete);
-    if let (ConvoyPhase::Landing, true, Some(exit_disposition)) = (status.phase, all_complete, exit_disposition) {
+    if let (ConvoyPhase::Landing, true, Some(exit_disposition)) = (status.phase, all_complete, conditions.exit_disposition.as_deref()) {
         let target_mismatches = convoy
             .spec
             .repositories
@@ -1697,7 +1760,12 @@ fn roll_up_phase_outcome(
             })
             .collect();
         return Some(ReconcileOutcome {
-            patch: Some(controller_patches::settle(exit_disposition.to_string(), target_mismatches, now)),
+            patch: Some(controller_patches::settle_with_evidence(
+                exit_disposition.to_string(),
+                target_mismatches,
+                now,
+                conditions.settlement_evidence.clone(),
+            )),
             events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Landing, to: ConvoyPhase::Landed }],
         });
     }
