@@ -27,3 +27,19 @@ The Windows production guard now enforces the C-free graph for resources and
 client. Manifest remains native because its HTTP sink uses ring-backed TLS;
 TUI and the executable remain native because core uses the store. Manifest and
 TUI import store only in dev-dependencies for their existing integration coverage.
+
+## Feature-anchor ownership
+
+On native targets, `flotilla-store` retains the backend/runtime anchors: umbrella,
+async, base, hmac, http, os, sqlite, tracing and types. `flotilla-tls` retains the
+TLS/client anchors: umbrella, async, base, http, os, tracing and types. Both use
+logging only as a dev anchor; TLS also enables Tokio test-util in dev builds to
+match the workspace test feature selection. Dependency changes must keep build
+and test selections aligned with `ci/build-graph/check.py`.
+
+The Relay Workers job builds and lints `flotilla-relay` for
+`wasm32-unknown-unknown`. Its production/build dependency tree includes none of
+`flotilla-store`, `flotilla-tls`, or `flotilla-resources`; the native anchor blocks
+in the extracted crates are outside that job's graph. Verified with
+`cargo tree --locked -p flotilla-relay --target wasm32-unknown-unknown --edges normal,build`.
+The exact Relay Workers build and Clippy commands from `ci.yml` also pass.
