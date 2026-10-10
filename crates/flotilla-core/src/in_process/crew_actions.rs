@@ -148,7 +148,7 @@ impl CrewActions<'_> {
                     accepted: *accepted,
                     who: format!("{}/{}", caller.principal_ref.namespace, caller.principal_ref.name),
                     at: self.port.clock().now(),
-                    why: reason.clone(),
+                    why: reason.trim().to_owned(),
                 },
             )?;
             let (vessel, role, operation) = operation;

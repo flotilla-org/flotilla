@@ -4822,7 +4822,7 @@ async fn human_verdict_routes_to_authority_and_preserves_operator_evidence() {
                 vessel: None,
                 role: None,
                 accepted: true,
-                reason: "good demonstration".into(),
+                reason: "  good demonstration \n".into(),
                 submitted_at: Some(now),
             })
             .build();

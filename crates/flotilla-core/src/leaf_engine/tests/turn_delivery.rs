@@ -846,7 +846,7 @@ fn human_rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
                 source: PromiseSource::Crew,
                 submission: Submission {
                     reference: "https://uploads.example/demo.mp4".into(),
-                    metadata: BTreeMap::new(),
+                    metadata: BTreeMap::from([("digest".into(), "sha256:video".into())]),
                     submitted_at: started_at,
                     verdict: None,
                 },
