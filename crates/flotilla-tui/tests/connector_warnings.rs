@@ -5,7 +5,8 @@ use flotilla_protocol::{
     ConvoyPhase, ConvoyRow, DaemonEvent, IssueSource, NodeId, Relationship, ResourceCursor, ResourceReadEnvelope, ResourceReadRecord,
     ResourceRecordProvenance, ResourceRecordType, ResourceRef, Subject, SubjectKind,
 };
-use flotilla_resources::{Forge, ForgeKind, ForgeSpec, InMemoryBackend, InputMeta, ResourceBackend};
+use flotilla_resources::{Forge, ForgeKind, ForgeSpec, InputMeta};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use flotilla_tui::pm_connect::ConnectorState;
 use tracing::instrument::WithSubscriber;
 

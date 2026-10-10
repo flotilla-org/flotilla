@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use flotilla_protocol::HostName;
-use flotilla_resources::{InMemoryBackend, Repository, RepositorySpec, ResourceBackend};
+use flotilla_resources::{Repository, RepositorySpec};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::test_meta;
 use crate::config::ConfigStore;

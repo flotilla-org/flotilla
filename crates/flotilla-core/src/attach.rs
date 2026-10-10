@@ -17,9 +17,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
-    Environment as ResourceEnvironment, Project, ResourceBackend, ResourceProvenance, TerminalSession as ResourceTerminalSession,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    Environment as ResourceEnvironment, Project, ResourceProvenance, TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
+use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 
 use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};

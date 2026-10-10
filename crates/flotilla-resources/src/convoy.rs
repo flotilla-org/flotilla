@@ -16,11 +16,12 @@ use crate::{
 };
 
 pub mod promises;
-mod reconcile;
+#[doc(hidden)]
+pub mod reconcile;
 
 pub use reconcile::{
-    evaluate_crew_completion, evaluate_landing_settlement, reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime,
-    CrewCompletionClaim, ReconcileOutcome, SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
+    evaluate_crew_completion, evaluate_landing_settlement, reconcile, ConvoyEvent, ConvoyTeardownRuntime, CrewCompletionClaim,
+    ReconcileOutcome, SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
 };
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);

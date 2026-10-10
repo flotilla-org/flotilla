@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    ConvoyRepositorySpec, Host as ResourceHost, HostSpec, HostStatus, InMemoryBackend, InputMeta, Project, ProjectSpec, Repository,
-    RepositorySpec, ResourceBackend,
+    ConvoyRepositorySpec, Host as ResourceHost, HostSpec, HostStatus, InputMeta, Project, ProjectSpec, Repository, RepositorySpec,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};

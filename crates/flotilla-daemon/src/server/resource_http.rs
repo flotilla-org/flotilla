@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
-use flotilla_resources::{
+use flotilla_resources::{ResourceError, WatchStart};
+use flotilla_store::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind,
     watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch,
-    ResourceBackend, ResourceError, WatchStart, REGISTERED_RESOURCE_KINDS,
+    ResourceBackend, REGISTERED_RESOURCE_KINDS,
 };
 use futures::StreamExt;
 use tokio::{
@@ -124,7 +125,7 @@ pub(super) async fn serve_resource_http_with_daemon(
             }
             _ => return write_error(&mut stream, 400, "invalid digest query").await,
         };
-        return match flotilla_resources::digest_resource_kind(&backend, namespace, kind, &query).await {
+        return match flotilla_store::digest_resource_kind(&backend, namespace, kind, &query).await {
             Ok(digest) => write_json(&mut stream, 200, &serde_json::to_value(digest).map_err(|error| error.to_string())?).await,
             Err(error) => write_resource_error(&mut stream, error).await,
         };
@@ -163,7 +164,7 @@ pub(super) async fn serve_resource_http_with_daemon(
         if kind != "messages" || watch || replica_sources {
             return write_error(&mut stream, 400, "messageQuery requires a Message collection read").await;
         }
-        let filter: flotilla_resources::MessageQuery = match serde_json::from_str(encoded) {
+        let filter: flotilla_store::MessageQuery = match serde_json::from_str(encoded) {
             Ok(filter) => filter,
             Err(error) => return write_error(&mut stream, 400, &format!("invalid Message query: {error}")).await,
         };
@@ -182,7 +183,7 @@ pub(super) async fn serve_resource_http_with_daemon(
         };
         return match items {
             Ok(items) => {
-                let document = flotilla_resources::message_query_document(&items).map_err(|error| error.to_string())?;
+                let document = flotilla_store::message_query_document(&items).map_err(|error| error.to_string())?;
                 write_json(&mut stream, 200, &document).await
             }
             Err(error) => write_resource_error(&mut stream, error).await,

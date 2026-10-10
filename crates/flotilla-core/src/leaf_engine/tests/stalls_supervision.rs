@@ -73,7 +73,7 @@ fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
             let convoys = backend.using::<Convoy>("flotilla");
             let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
             if other_attention {
-                flotilla_resources::apply_status_patch(
+                flotilla_store::apply_status_patch(
                     &convoys,
                     "stalled-work",
                     &flotilla_resources::ConvoyStatusPatch::SetSettlementAttention { attention: Some(other.clone()) },
@@ -550,7 +550,7 @@ async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
     let (backend, wake, delivery) = project_supervision_case(&[]).await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let resumed_at = Utc::now();
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "stalled-work",
         &flotilla_resources::external_patches::resume_crew_work(
@@ -875,7 +875,7 @@ async fn stalled_work_routes_to_live_governor_after_abandoned_generation() {
 async fn exhausted_governor_cursor_retries_in_one_pass() {
     let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
     let convoys = backend.using::<Convoy>("flotilla");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "stalled-work",
         &external_patches::mark_crew_stalled(
@@ -1239,7 +1239,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
     ];
     let mut standing_row_id = None;
     for (retry, expected) in scenarios {
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &vessels,
             "delivery-work",
             &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: Some(retry) },
@@ -1264,7 +1264,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
         let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
         assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);
     }
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &vessels,
         "delivery-work",
         &flotilla_resources::VesselStatusPatch::CredentialDelivery { retry: None },
@@ -1301,7 +1301,7 @@ async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_
             Some("retrying without progress"),
         ),
     ] {
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &checkouts,
             "delivery-checkout",
             &flotilla_resources::CheckoutStatusPatch::ObserveCloneRetry { retry: Some(retry) },

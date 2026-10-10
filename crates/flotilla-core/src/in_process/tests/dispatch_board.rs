@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use flotilla_protocol::HostName;
-use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, InMemoryBackend, Project, ProjectSpec, ResourceBackend};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoySpec, Project, ProjectSpec};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{test_meta, SuspendedBoardProvider};
 use crate::config::ConfigStore;

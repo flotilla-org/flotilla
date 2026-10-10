@@ -526,9 +526,9 @@ pub(crate) fn load_tokens(path: Option<&Path>) -> Result<BTreeMap<String, PathBu
 #[cfg(test)]
 mod tests {
     use flotilla_resources::{
-        ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, InMemoryBackend, InputMeta, ResolvedSkills, ResourceBackend, VesselRequirement,
-        WorkflowSnapshot,
+        ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, InputMeta, ResolvedSkills, VesselRequirement, WorkflowSnapshot,
     };
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::*;
 
@@ -629,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn missing_frozen_skill_revision_refuses_and_satisfiable_store_passes() {
         let (_, inventory) = frozen_store().await;
-        flotilla_resources::validate_resource_document(&inventory[0]).expect("the previous decode-only gate accepts this frozen pin");
+        flotilla_store::validate_resource_document(&inventory[0]).expect("the previous decode-only gate accepts this frozen pin");
         let good = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert!(good.failures.is_empty(), "{:?}", good.failures);
         assert_eq!(good.live_convoys, 1);
@@ -834,7 +834,8 @@ mod tests {
     #[tokio::test]
     async fn frozen_images_follow_placement_across_two_host_inventories() {
         use flotilla_protocol::NodeId;
-        use flotilla_resources::{list_resource_kind_including_replicas, DockerEnvironmentSpec, EnvironmentSpec, Host};
+        use flotilla_resources::{DockerEnvironmentSpec, EnvironmentSpec, Host};
+        use flotilla_store::list_resource_kind_including_replicas;
         let (backend, mut inventory) = placed_image_inventory().await;
         let supply = Supply { revision: "1".repeat(40), image_available: true };
         let replica_backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -1038,7 +1039,7 @@ mod tests {
             FrozenImageLayer, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageInputStability,
             ImageLayerParent, ImageLayerSpec, ImageLayerStage, InputMeta, PlacedImageIdentity, ResolvedImageInputs,
         };
-        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
         let digest = format!("sha256:{}", "a".repeat(64));
         let inputs = ResolvedImageInputs::builder()
             .parent_digest(digest.clone())

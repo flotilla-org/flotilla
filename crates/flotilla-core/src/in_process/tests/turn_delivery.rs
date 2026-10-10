@@ -4,11 +4,12 @@ use std::sync::Arc;
 use chrono::Utc;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta, ResourceBackend,
-    Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, Selector, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, TurnDeliveryRung, VesselRequirement, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{resume_staging_fixture, test_meta, RecordingWorkCredentials};
 use crate::config::ConfigStore;
@@ -106,7 +107,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
     daemon.deliver_standing_turn(&request).await.expect("first intent");
     let messages = backend.using::<flotilla_resources::Message>("flotilla");
     let message = messages.list().await.expect("messages").items.remove(0);
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &messages,
         &message.metadata.name,
         &flotilla_resources::MessageStatusPatch::Delivered {
@@ -301,7 +302,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             source: TerminalAttentionSource::Hook,
         });
         sessions.update_status("resume-staging-session", &session.metadata.resource_version, &session_status).await.expect("idle session");
-        let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
+        let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
         let watcher = daemon.reconciler_wake_watch();
         let task = tokio::spawn(watcher.spawn(backend.clone(), "flotilla".to_string(), tx));
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
@@ -332,7 +333,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
                 for nudge in messages.list().await.expect("nudges").items {
                     if nudge.status.as_ref().is_some_and(|status| status.phase.is_waiting()) {
-                        flotilla_resources::apply_status_patch(
+                        flotilla_store::apply_status_patch(
                             &messages,
                             &nudge.metadata.name,
                             &flotilla_resources::MessageStatusPatch::Delivered {

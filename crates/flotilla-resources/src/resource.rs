@@ -328,7 +328,7 @@ pub struct ResourceObject<T: Resource> {
 }
 
 impl<T: Resource> ResourceObject<T> {
-    pub(crate) fn matches_update(&self, meta: &InputMeta, spec: &T::Spec) -> Result<bool, ResourceError> {
+    pub fn matches_update(&self, meta: &InputMeta, spec: &T::Spec) -> Result<bool, ResourceError> {
         let current_spec =
             serde_json::to_value(&self.spec).map_err(|err| ResourceError::decode(format!("serialize current spec: {err}")))?;
         let requested_spec = serde_json::to_value(spec).map_err(|err| ResourceError::decode(format!("serialize requested spec: {err}")))?;
@@ -341,7 +341,7 @@ impl<T: Resource> ResourceObject<T> {
             && current_spec == requested_spec)
     }
 
-    pub(crate) fn matches_status(&self, status: &T::Status) -> Result<bool, ResourceError> {
+    pub fn matches_status(&self, status: &T::Status) -> Result<bool, ResourceError> {
         let Some(current_status) = &self.status else { return Ok(false) };
         let current =
             serde_json::to_value(current_status).map_err(|err| ResourceError::decode(format!("serialize current status: {err}")))?;
@@ -483,35 +483,35 @@ impl<T: Resource> K8sResourceList<T> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct K8sInputMetadata<'a> {
-    pub(crate) name: &'a str,
+pub struct K8sInputMetadata<'a> {
+    pub name: &'a str,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) labels: &'a BTreeMap<String, String>,
+    pub labels: &'a BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[serde(serialize_with = "encode_annotations")]
-    pub(crate) annotations: &'a BTreeMap<String, String>,
+    pub annotations: &'a BTreeMap<String, String>,
     #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
-    pub(crate) owner_references: &'a Vec<OwnerReference>,
+    pub owner_references: &'a Vec<OwnerReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) finalizers: &'a Vec<String>,
+    pub finalizers: &'a Vec<String>,
     #[serde(rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
-    pub(crate) deletion_timestamp: &'a Option<DateTime<Utc>>,
+    pub deletion_timestamp: &'a Option<DateTime<Utc>>,
     #[serde(rename = "resourceVersion", skip_serializing_if = "Option::is_none")]
-    pub(crate) resource_version: Option<&'a str>,
+    pub resource_version: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(bound(serialize = "T::Spec: Serialize"))]
-pub(crate) struct K8sInputResourceObject<'a, T: Resource> {
+pub struct K8sInputResourceObject<'a, T: Resource> {
     #[serde(rename = "apiVersion")]
-    pub(crate) api_version: String,
-    pub(crate) kind: &'static str,
-    pub(crate) metadata: K8sInputMetadata<'a>,
-    pub(crate) spec: &'a T::Spec,
+    pub api_version: String,
+    pub kind: &'static str,
+    pub metadata: K8sInputMetadata<'a>,
+    pub spec: &'a T::Spec,
 }
 
 impl<'a, T: Resource> K8sInputResourceObject<'a, T> {
-    pub(crate) fn for_spec(meta: &'a InputMeta, resource_version: Option<&'a str>, spec: &'a T::Spec) -> Self {
+    pub fn for_spec(meta: &'a InputMeta, resource_version: Option<&'a str>, spec: &'a T::Spec) -> Self {
         Self {
             api_version: api_version(T::API_PATHS),
             kind: T::API_PATHS.kind,
@@ -530,24 +530,24 @@ impl<'a, T: Resource> K8sInputResourceObject<'a, T> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct K8sStatusMetadata<'a> {
-    pub(crate) name: &'a str,
+pub struct K8sStatusMetadata<'a> {
+    pub name: &'a str,
     #[serde(rename = "resourceVersion")]
-    pub(crate) resource_version: &'a str,
+    pub resource_version: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(bound(serialize = "T::Status: Serialize"))]
-pub(crate) struct K8sStatusResourceObject<'a, T: Resource> {
+pub struct K8sStatusResourceObject<'a, T: Resource> {
     #[serde(rename = "apiVersion")]
-    pub(crate) api_version: String,
-    pub(crate) kind: &'static str,
-    pub(crate) metadata: K8sStatusMetadata<'a>,
-    pub(crate) status: &'a T::Status,
+    pub api_version: String,
+    pub kind: &'static str,
+    pub metadata: K8sStatusMetadata<'a>,
+    pub status: &'a T::Status,
 }
 
 impl<'a, T: Resource> K8sStatusResourceObject<'a, T> {
-    pub(crate) fn new(name: &'a str, resource_version: &'a str, status: &'a T::Status) -> Self {
+    pub fn new(name: &'a str, resource_version: &'a str, status: &'a T::Status) -> Self {
         Self {
             api_version: api_version(T::API_PATHS),
             kind: T::API_PATHS.kind,

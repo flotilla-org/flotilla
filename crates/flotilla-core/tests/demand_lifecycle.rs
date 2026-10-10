@@ -11,7 +11,7 @@ use flotilla_resources::DemandKind;
 use flotilla_resources::DemandSpec;
 use flotilla_resources::DemandState;
 use flotilla_resources::InputMeta;
-use flotilla_resources::ResourceBackend;
+use flotilla_store::ResourceBackend;
 use flotilla_store_testkit::VirtualClock;
 
 fn timestamp(second: u32) -> chrono::DateTime<Utc> {

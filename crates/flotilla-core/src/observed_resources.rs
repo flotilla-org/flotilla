@@ -6,8 +6,9 @@ use std::{
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
+use flotilla_store::ResourceBackend;
 use sha2::{Digest, Sha256};
 
 /// Rebuild the query-facing adopted Checkout projection from the durable
@@ -97,7 +98,7 @@ pub async fn project_adopted_checkout(
 }
 
 async fn ensure_adopted_checkout_status(
-    checkouts: &flotilla_resources::TypedResolver<ResourceCheckout>,
+    checkouts: &flotilla_store::TypedResolver<ResourceCheckout>,
     checkout: ResourceObject<ResourceCheckout>,
 ) -> Result<ResourceObject<ResourceCheckout>, ResourceError> {
     if checkout.status.is_some() {
@@ -111,7 +112,7 @@ async fn ensure_adopted_checkout_status(
 }
 
 async fn project_adopted_checkout_with(
-    checkouts: &flotilla_resources::TypedResolver<ResourceCheckout>,
+    checkouts: &flotilla_store::TypedResolver<ResourceCheckout>,
     durable: &ResourceObject<ResourceCheckout>,
 ) -> Result<(), ResourceError> {
     let meta = InputMeta::from(&durable.metadata);
@@ -264,7 +265,8 @@ mod tests {
         qualified_path::{HostId, QualifiedPath},
         Checkout, HostName, ProviderData,
     };
-    use flotilla_resources::{Checkout as ResourceCheckout, InMemoryBackend, RepositoryKey, ResourceBackend};
+    use flotilla_resources::{Checkout as ResourceCheckout, RepositoryKey};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::{observed_checkout_name, reconcile_checkouts};
 

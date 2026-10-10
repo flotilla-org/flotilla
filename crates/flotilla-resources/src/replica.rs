@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Resource, ResourceObject, ResourceTombstone, WatchEvent};
 
-pub(crate) const ORIGIN_ROOT_ANNOTATION: &str = "flotilla.work/origin-root";
-pub(crate) const LAST_SYNCED_AT_ANNOTATION: &str = "flotilla.work/last-synced-at";
-
 /// Cross-root behavior for a resource kind.
 ///
 /// Replication is deliberately opt-in at the kind declaration. Additional
@@ -25,7 +22,7 @@ pub enum ReplicationClass {
 }
 
 impl ReplicationClass {
-    pub(crate) fn event_retention(self, configured: usize) -> usize {
+    pub fn event_retention(self, configured: usize) -> usize {
         if self == Self::Observations {
             1
         } else {
@@ -61,7 +58,7 @@ pub enum ReadWatchEvent<T: Resource> {
 }
 
 impl<T: Resource> ReadWatchEvent<T> {
-    pub(crate) fn local(event: WatchEvent<T>) -> Self {
+    pub fn local(event: WatchEvent<T>) -> Self {
         match event {
             WatchEvent::Added(object) => Self::Added(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
             WatchEvent::Modified(object) => Self::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
@@ -75,19 +72,4 @@ impl<T: Resource> ReadWatchEvent<T> {
 pub struct ReplicaCursor {
     pub resource_version: String,
     pub generation: Option<String>,
-}
-
-#[derive(Debug, Clone, bon::Builder)]
-pub(crate) struct StoredReplicaEvent {
-    pub origin_root: NodeId,
-    pub synced_at: DateTime<Utc>,
-    pub kind: StoredReplicaEventKind,
-    pub object: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum StoredReplicaEventKind {
-    Added,
-    Modified,
-    Deleted,
 }

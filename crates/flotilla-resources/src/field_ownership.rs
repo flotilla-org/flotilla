@@ -110,7 +110,7 @@ pub struct FieldOwnershipViolation {
     pub observed_at: DateTime<Utc>,
 }
 
-pub(crate) fn merge_owned_spec<T: FieldOwnedResource>(
+pub fn merge_owned_spec<T: FieldOwnedResource>(
     current: &T::Spec,
     requested: &T::Spec,
     writer: &WriterIdentity,
@@ -159,7 +159,7 @@ pub(crate) fn merge_owned_spec<T: FieldOwnedResource>(
     Ok((merged, violations))
 }
 
-pub(crate) fn serialized_spec_field_value<T: Resource>(spec: &T::Spec, field: &str) -> Result<Option<Value>, ResourceError> {
+pub fn serialized_spec_field_value<T: Resource>(spec: &T::Spec, field: &str) -> Result<Option<Value>, ResourceError> {
     let relative = field
         .strip_prefix("spec.")
         .ok_or_else(|| ResourceError::invalid(format!("{} ownership field '{field}' is not rooted at spec", T::API_PATHS.kind)))?;

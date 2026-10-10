@@ -6,12 +6,13 @@ use std::{
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    delete_resource_kind, Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, Host, HostSpec, HostStatus,
-    InMemoryBackend, InputMeta, IssueSource, OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard,
-    RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, Host, HostSpec, HostStatus, InputMeta, IssueSource,
+    OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec,
+    RepositoryKey, Resource, ResourceError, ResourceObject, ResourceProvenance, TerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{delete_resource_kind, InMemoryBackend, ResourceBackend, TypedResolver};
 use futures::StreamExt;
 use tokio::time::timeout;
 
@@ -282,7 +283,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     let replica = all.items.iter().find(|item| item.object.metadata.name == "remote").expect("remote replica row");
     assert_eq!(replica.provenance, ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: synced_at });
     let wire =
-        flotilla_resources::list_resource_kind_including_replicas(&backend, "flotilla", "convoys").await.expect("list replica wire view");
+        flotilla_store::list_resource_kind_including_replicas(&backend, "flotilla", "convoys").await.expect("list replica wire view");
     let wire_replica = wire.value["items"]
         .as_array()
         .expect("wire items")
@@ -377,9 +378,8 @@ pub async fn assert_get_all_provenances_contract(backend: ResourceBackend) {
     assert_eq!(copies.items.len(), 3);
     assert_eq!(copies.items.iter().map(|item| item.object.spec.workflow_ref.as_str()).collect::<Vec<_>>(), ["local", "first", "second"]);
     assert!(copies.items.iter().all(|item| item.object.metadata.name == "shared"));
-    let wire = flotilla_resources::get_resource_kind_all_provenances(&backend, namespace, "convoys", "shared")
-        .await
-        .expect("point read wire view");
+    let wire =
+        flotilla_store::get_resource_kind_all_provenances(&backend, namespace, "convoys", "shared").await.expect("point read wire view");
     assert_eq!(wire.value["items"].as_array().expect("wire items").len(), 3);
 
     local.delete("shared").await.expect("delete local copy");

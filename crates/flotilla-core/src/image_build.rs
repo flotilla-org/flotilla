@@ -5,8 +5,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use flotilla_resources::{
     FrozenImageLayer, Host, ImageBuild, ImageBuildCapacity, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageComposition,
-    ImageInputStability, ImageLayerParent, InputMeta, ResolvedImageInputs, ResourceBackend, ResourceError,
+    ImageInputStability, ImageLayerParent, InputMeta, ResolvedImageInputs, ResourceError,
 };
+use flotilla_store::ResourceBackend;
 
 pub fn canonical_image_architecture(architecture: &str) -> &str {
     match architecture {
@@ -89,7 +90,7 @@ impl ImageBuildAdmission {
             }) else {
                 return Ok(None);
             };
-            let found = flotilla_resources::read_image_build(&self.backend, &self.namespace, &found.metadata.name)
+            let found = flotilla_store::read_image_build(&self.backend, &self.namespace, &found.metadata.name)
                 .await
                 .map_err(|error| error.to_string())?;
             let Some(status) = found.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built) else {
@@ -131,9 +132,8 @@ impl ImageBuildAdmission {
                 let Some(parent) = &completed.spec.parent_build_ref else {
                     break;
                 };
-                completed = flotilla_resources::read_image_build(&self.backend, &self.namespace, parent)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                completed =
+                    flotilla_store::read_image_build(&self.backend, &self.namespace, parent).await.map_err(|error| error.to_string())?;
             }
             chain.reverse();
             if chain.len() == composition.layers.len() {
@@ -203,7 +203,7 @@ impl ImageBuildAdmission {
                 .stability(source.stability)
                 .build();
             let old = match composition.build_refs.get(index) {
-                Some(name) => match flotilla_resources::read_image_build(&self.backend, &self.namespace, name).await {
+                Some(name) => match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
                     Ok(old) if old.spec.inputs == inputs && old.spec.host_ref == host_ref => Some(old),
                     Ok(_) | Err(ResourceError::NotFound { .. }) => None,
                     Err(error) => return Err(error.to_string()),
@@ -293,10 +293,9 @@ impl ImageBuildAdmission {
             parent_key = Some(recipe_key);
             joined.push(name.clone());
             let mut execution =
-                flotilla_resources::read_image_build(&self.backend, &self.namespace, &name).await.map_err(|error| error.to_string())?;
+                flotilla_store::read_image_build(&self.backend, &self.namespace, &name).await.map_err(|error| error.to_string())?;
             for _ in 0..3 {
-                match flotilla_resources::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", execution.metadata.name))
-                    .await
+                match flotilla_store::read_image_build(&self.backend, &self.namespace, &format!("{}-retry", execution.metadata.name)).await
                 {
                     Ok(next) => execution = next,
                     Err(ResourceError::NotFound { .. }) => break,

@@ -97,25 +97,26 @@ use flotilla_protocol::ToolInventory;
 use flotilla_protocol::TopologyRoute;
 use flotilla_protocol_testkit::TestIssue;
 use flotilla_resources::{
-    apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
-    single_agent_shepherd_workflow_spec, single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant,
-    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
-    FulfilmentKindSpec, HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputMeta, LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
-    RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    controller_patches as convoy_controller_patches, implement_review_workflow_spec, single_agent_shepherd_workflow_spec,
+    single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
+    CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, HarnessFacts,
+    Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
+    LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
+    RepositorySpec, ResourceError, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, WatchEvent,
+    WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{apply_status_patch, ResourceBackend, SqliteBackend, TypedResolver};
 use futures::StreamExt;
 use tokio::sync::Notify;
 
 // Boundary stand-in for the ordinary receiver-home ResourceApply router.
 struct ReceiverIntentPublisher {
-    inbox: flotilla_resources::MessageInbox,
+    inbox: flotilla_store::MessageInbox,
 }
 #[async_trait]
 impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPublisher {
@@ -127,8 +128,8 @@ impl flotilla_core::leaf_engine::ResourceIntentPublisher for ReceiverIntentPubli
         let meta = InputMeta::builder().name(document["metadata"]["name"].as_str().ok_or("missing name")?.into()).build();
         let admission = self.inbox.accept(&meta, &spec, chrono::Utc::now()).await.map_err(|error| error.to_string())?;
         let record = match admission {
-            flotilla_resources::MessageAdmission::Accepted(record) => record,
-            flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+            flotilla_store::MessageAdmission::Accepted(record) => record,
+            flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
         };
         Ok(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
     }
@@ -1944,7 +1945,7 @@ async fn resource_watch_streams_current_update_and_resumed_delete_without_loss()
     daemon.cancel(resumed_command_id).await.expect("cancel resumed watch");
 }
 
-async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
+async fn create_test_contained_policy(backend: &flotilla_store::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = match hosts.get("host-test").await {
         Ok(host) => host,
@@ -2004,7 +2005,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
         .expect("docker kind create");
 }
 
-async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_source_bindings: Option<IssueSource>) {
+async fn create_test_convoy_project(backend: &flotilla_store::ResourceBackend, issue_source_bindings: Option<IssueSource>) {
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
         .clone()
@@ -2536,7 +2537,7 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
 }
 
 async fn create_test_host_direct_policy(
-    backend: &flotilla_resources::ResourceBackend,
+    backend: &flotilla_store::ResourceBackend,
     policy_name: &str,
     host_ref: &str,
     priority: i32,
@@ -6632,7 +6633,8 @@ impl RepositoryInspector for ForgeAliasInspector {
 
 #[tokio::test]
 async fn forge_alias_observations_from_two_hosts_record_canonical_live_remote_additively() {
-    use flotilla_resources::{Forge, InMemoryBackend};
+    use flotilla_resources::Forge;
+    use flotilla_store::InMemoryBackend;
 
     let temp = tempfile::tempdir().expect("create tempdir");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -7064,7 +7066,8 @@ async fn forge_identity_sweep_merges_records_whose_bookkeeping_annotations_diffe
 
 #[tokio::test]
 async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
-    use flotilla_resources::{Forge, InMemoryBackend};
+    use flotilla_resources::Forge;
+    use flotilla_store::InMemoryBackend;
 
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
@@ -8192,7 +8195,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
     let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
-        Arc::new(ReceiverIntentPublisher { inbox: flotilla_resources::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+        Arc::new(ReceiverIntentPublisher { inbox: flotilla_store::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let snapshot = WorkflowSnapshot {
         cascade: None,
@@ -8381,7 +8384,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
     let publisher: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> =
-        Arc::new(ReceiverIntentPublisher { inbox: flotilla_resources::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
+        Arc::new(ReceiverIntentPublisher { inbox: flotilla_store::MessageInbox::new(terminal_host.resource_backend(), "flotilla") });
     authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
     let created = convoys
@@ -9468,7 +9471,8 @@ async fn startup_forgejo_case(
     work_credentials: usize,
     daemon_credential: Option<&str>,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
-    use flotilla_resources::{Forge, InMemoryBackend};
+    use flotilla_resources::Forge;
+    use flotilla_store::InMemoryBackend;
     let (temp, fixture) = symlinked_fixture();
     let repo = fixture.join("repo");
     let healthy = fixture.join("healthy");

@@ -5,11 +5,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta,
-    ResourceBackend, Selector, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use futures::{FutureExt, StreamExt};
 
 use super::support::test_meta;
@@ -103,7 +104,7 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
             let temp = tempfile::tempdir().expect("contract directory");
             std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"noop-contract\"\n").expect("daemon identity");
             let backend = if sqlite {
-                ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(temp.path().join("resources.db")).expect("sqlite backend"))
+                ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(temp.path().join("resources.db")).expect("sqlite backend"))
             } else {
                 ResourceBackend::InMemory(InMemoryBackend::default())
             };

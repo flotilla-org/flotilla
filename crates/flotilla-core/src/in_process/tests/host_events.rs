@@ -7,7 +7,8 @@ use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostProviderStatus, HostSummary, NodeId, NodeInfo,
     PeerConnectionState, StreamKey,
 };
-use flotilla_resources::{Host as ResourceHost, HostSpec, HostStatus, InMemoryBackend, ResourceBackend, AGENT_ADAPTERS_CAPABILITY};
+use flotilla_resources::{Host as ResourceHost, HostSpec, HostStatus, AGENT_ADAPTERS_CAPABILITY};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use tokio::sync::broadcast;
 
 use super::support::test_meta;

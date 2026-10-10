@@ -1,4 +1,6 @@
 //! Standing-convoy reconciliation and its complete transaction guard.
+
+use flotilla_store::ResolvedCascadeStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -18,12 +20,13 @@ use flotilla_core::{
 };
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef, ResourceRef};
 use flotilla_resources::{
-    api_version, apply_status_patch as apply_resource_status_patch, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy,
-    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
-    ConvoyEnsureStatusPatch, ConvoyPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec,
-    DemandState, EventRecorder, Host as ResourceHost, InputMeta, ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository,
-    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
+    api_version, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
+    ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch, ConvoyPhase,
+    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Host as ResourceHost, InputMeta,
+    ObjectEvent, PlacementPolicy, Project, ReadResourceObject, Repository, Resource, ResourceError, ResourceObject, ResourceProvenance,
+    WorkflowTemplate, DRIVER_ADMISSION_CONDITION_TYPE,
 };
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, EventRecorder, ResourceBackend};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -1196,9 +1199,9 @@ mod tests {
     use flotilla_protocol::CanonicalHostId;
     use flotilla_resources::ConvoySpec;
     use flotilla_resources::ConvoyStatus;
-    use flotilla_resources::InMemoryBackend;
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::WorkflowTemplateSpec;
+    use flotilla_store::InMemoryBackend;
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;

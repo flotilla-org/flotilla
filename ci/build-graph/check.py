@@ -12,11 +12,12 @@ import sys
 C_FREE_BASE = frozenset({
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
+    "flotilla-resources", "flotilla-client",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
-# These crates genuinely depend on resources' SQLite and ring implementations.
+# Manifest uses TLS; TUI and the executable still reach store through core.
 RESOURCE_EXEMPTIONS = frozenset({
-    "flotilla-client", "flotilla-manifest", "flotilla-tui", "flotilla",
+    "flotilla-manifest", "flotilla-tui", "flotilla",
 })
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a

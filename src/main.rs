@@ -36,7 +36,7 @@ fn allows_daemon_reexec(command: &Option<SubCommand>) -> bool {
 
 fn main() -> Result<()> {
     flotilla_daemon_api::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
-    flotilla_core::tls::install_default_provider();
+    flotilla_tls::install_default_provider();
     color_eyre::install()?;
     let mut cli =
         Cli::try_parse_with_version(env!("CARGO_PKG_VERSION"), binary_version()).unwrap_or_else(|error| exit_cli_parse_error(error));

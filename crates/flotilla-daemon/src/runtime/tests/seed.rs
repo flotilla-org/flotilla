@@ -82,7 +82,7 @@ async fn deleted_code_owned_builtin_is_reconciled_back() {
     let backend = ResourceBackend::InMemory(Default::default());
     reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("initial builtin reconciliation should succeed");
 
-    let deleted = flotilla_resources::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent")
+    let deleted = flotilla_store::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent")
         .await
         .expect("raw delete should remove builtin");
     assert_eq!(deleted.object.value["metadata"]["name"], "single-agent");
@@ -130,7 +130,7 @@ async fn startup_reconciles_owned_single_agent_shepherd_builtin() {
 
 #[tokio::test]
 async fn migrates_display_name_host_ref_to_canonical_host_id() {
-    let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+    let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
     let host_id = "b2aac222-host-id";
     backend
         .clone()
@@ -237,7 +237,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
 
 #[tokio::test]
 async fn conflicting_policy_does_not_block_other_host_ref_migrations() {
-    let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+    let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
     let host_id = "host-id";
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     hosts.create(&empty_meta(host_id), &HostSpec { display_name: "kiwi".into(), ..HostSpec::default() }).await.expect("seed host");
@@ -270,7 +270,7 @@ async fn conflicting_policy_does_not_block_other_host_ref_migrations() {
 
 #[tokio::test]
 async fn migrates_live_policy_names_to_fulfilment_kinds() {
-    let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+    let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
     let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
     for host in ["feta", "kiwi", "udder"] {
         let name = format!("docker-crew-image-{host}");

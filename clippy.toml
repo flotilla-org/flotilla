@@ -42,6 +42,8 @@ absolute-paths-allowed-crates = [
     "flotilla_relay_protocol",
     "flotilla_replay_testkit",
     "flotilla_resources",
+    "flotilla_store",
+    "flotilla_tls",
     "flotilla_store_testkit",
     "flotilla_test_support",
     "flotilla_transport",

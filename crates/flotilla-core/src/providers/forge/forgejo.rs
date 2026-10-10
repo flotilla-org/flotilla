@@ -37,7 +37,7 @@ pub(crate) struct ForgejoClient {
 }
 impl ForgejoClient {
     pub(crate) fn new(http: Arc<dyn HttpClient>, config: ForgejoIssueProviderConfig) -> Self {
-        let client = crate::tls::client_builder().build().expect("build Forgejo request client");
+        let client = flotilla_tls::client_builder().build().expect("build Forgejo request client");
         Self { http, client, config }
     }
     fn issue_request(&self, path: &str, query: &[(&str, String)]) -> Result<reqwest::Request, String> {

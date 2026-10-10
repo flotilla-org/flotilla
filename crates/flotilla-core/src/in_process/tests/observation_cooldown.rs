@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend,
-    RepositorySpec, ResourceBackend, Vessel, VesselSpec,
+    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, RepositorySpec, Vessel,
+    VesselSpec,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use tokio::sync::Mutex;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};

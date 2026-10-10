@@ -1,4 +1,4 @@
-use flotilla_resources::{InMemoryBackend, ReadObserver};
+use flotilla_store::{InMemoryBackend, ReadObserver};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},

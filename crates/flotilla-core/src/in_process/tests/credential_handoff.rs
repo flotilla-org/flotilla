@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InMemoryBackend, RepositoryKey,
-    ResourceBackend, Selector, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
-    Vessel, VesselRequirement, CREDENTIAL_REFS_ANNOTATION,
+    Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, RepositoryKey, Selector,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement,
+    CREDENTIAL_REFS_ANNOTATION,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{test_meta, SessionStagingProbe};
 use crate::config::ConfigStore;

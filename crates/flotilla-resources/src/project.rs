@@ -8,8 +8,8 @@ pub use flotilla_protocol::{IssueSource, ProjectRepositoryRole};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    status_patch::StatusPatch, ApiPaths, CapabilityNeed, InputMeta, Platform, ProjectHierarchy, ReplicaReadResolver, ReplicationClass,
-    Repository, RepositoryKey, Resource, ResourceError, ResourceObject,
+    status_patch::StatusPatch, ApiPaths, CapabilityNeed, InputMeta, Platform, ProjectHierarchy, ReplicationClass, Repository,
+    RepositoryKey, Resource, ResourceError, ResourceObject,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,14 +367,6 @@ pub fn normalize_issue_source(source: &IssueSource) -> IssueSource {
         None => service,
     };
     IssueSource { service, scope: source.scope.trim().trim_matches('/').to_string() }
-}
-
-pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
-    let mut inventory = BTreeMap::new();
-    for member in &project.repositories {
-        inventory.insert(member.repo.to_string(), repositories.get(&member.repo.to_string()).await.map(|record| record.object));
-    }
-    resolve_project_issue_sources_from_inventory(&inventory, project)
 }
 
 /// Resolve authoritative Repository declarations from a pass-wide inventory.

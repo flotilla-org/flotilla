@@ -1,3 +1,4 @@
+use flotilla_resources::Actuation;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -14,18 +15,20 @@ use flotilla_controllers::reconcilers::{vessel::WorktreeMetadataResolver, Vessel
 use flotilla_core::{in_process::BRIEF_ARTIFACTS_ANNOTATION, vcs::WorktreeMetadata};
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    artifact_record_name, canonicalize_repo_url, clone_key,
-    controller::{Actuation, ControllerLoop, Reconciler},
-    ensure_repository, interactive_single_workflow_spec, patch_resource_annotation, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
-    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
+    artifact_record_name, canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
     DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
     ExitDeclaration, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
     InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec,
-    ResourceBackend, ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement,
-    VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
-    CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
+    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+};
+use flotilla_store::{
+    controller::{ControllerLoop, Reconciler},
+    ensure_repository, patch_resource_annotation, ConvoyReconciler, ResourceBackend,
 };
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
@@ -183,7 +186,7 @@ async fn secondary_watches_map_checkout_events_by_convoy_only() {
         .await
         .expect("stale vessel-labeled checkout should create");
 
-    let (sender, mut receiver) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let handles = VesselReconciler::secondary_watches()
         .into_iter()
         .map(|watch| tokio::spawn(watch.spawn(backend.clone(), NAMESPACE.to_string(), sender.clone())))
@@ -439,7 +442,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         "later vessels should reuse the convoy checkout"
     );
 
-    flotilla_resources::apply_status_patch(&checkouts, &checkout_meta.name, &flotilla_resources::CheckoutStatusPatch::MarkGone)
+    flotilla_store::apply_status_patch(&checkouts, &checkout_meta.name, &flotilla_resources::CheckoutStatusPatch::MarkGone)
         .await
         .expect("observe removed worktree");
     let gone_outcome = reconciler.reconcile(&review, &reconciler.prepare(&review).await.expect("gone checkout dependencies"), Utc::now());
@@ -535,7 +538,7 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
     let second_deps = reconciler.prepare(&second).await.expect("second dependencies");
     let first_outcome = reconciler.reconcile(&first, &first_deps, Utc::now());
     let second_outcome = reconciler.reconcile(&second, &second_deps, Utc::now());
-    let checkout_path = |outcome: &flotilla_resources::controller::ReconcileOutcome<_>| {
+    let checkout_path = |outcome: &flotilla_store::controller::ReconcileOutcome<_>| {
         outcome
             .actuations
             .iter()
@@ -2239,7 +2242,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         "the session must not restart before its interruption contradicts the durable Running work state"
     );
 
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &backend.clone().using::<Vessel>(NAMESPACE),
         &workspace.metadata.name,
         outcome.patch.as_ref().expect("interrupted vessel patch"),
@@ -2303,7 +2306,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
         )
     }));
 
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &backend.using::<Checkout>(NAMESPACE),
         "adopted-checkout-convoy-adopted",
         &flotilla_resources::CheckoutStatusPatch::MarkGone,
@@ -2428,7 +2431,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         )
         .await
         .expect("running coder");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &backend.using::<Convoy>(NAMESPACE),
         "convoy-crew",
         &flotilla_resources::external_patches::resume_crew_work(
@@ -3047,7 +3050,7 @@ async fn create_convoy_with_labeled_processes(
 ) -> flotilla_resources::ResourceObject<Convoy> {
     let repository_spec = RepositorySpec::remote(repo_url).expect("repository URL should be canonical");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
     let convoys = backend.clone().using::<Convoy>(namespace);
@@ -3348,9 +3351,8 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
 #[tokio::test]
 async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edits(#[case] sqlite: bool) {
     use flotilla_protocol::NodeId;
-    use flotilla_resources::{
-        CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, PlacementPolicy, SqliteBackend, VesselStatusPatch,
-    };
+    use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, PlacementPolicy, VesselStatusPatch};
+    use flotilla_store::SqliteBackend;
 
     let mut hosts = Vec::new();
     for name in ["kiwi", "feta", "udder"] {
@@ -3433,9 +3435,8 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
 #[case::worktree(DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() })]
 #[tokio::test]
 async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: DockerCheckoutStrategy) {
-    use flotilla_resources::{
-        apply_status_patch, CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, EnvironmentPhase, VesselStatusPatch,
-    };
+    use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, EnvironmentPhase, VesselStatusPatch};
+    use flotilla_store::apply_status_patch;
 
     let backend = ResourceBackend::InMemory(Default::default());
     let baselines = backend.definitions::<CrewImageBaseline>(NAMESPACE);

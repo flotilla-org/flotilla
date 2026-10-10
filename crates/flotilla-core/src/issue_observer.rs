@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::LeafAddress;
 use flotilla_relay_protocol::{Subject, SubjectKind};
-use flotilla_resources::{issue_record_name, InputMeta, Issue, IssueSpec, IssueStatus, ResourceBackend, ResourceProvenance};
+use flotilla_resources::{issue_record_name, InputMeta, Issue, IssueSpec, IssueStatus, ResourceProvenance};
+use flotilla_store::ResourceBackend;
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -438,7 +439,8 @@ fn observed_values_equal(left: &IssueStatus, right: &IssueStatus) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use flotilla_resources::{InMemoryBackend, Observation, ObservedIssueState};
+    use flotilla_resources::{Observation, ObservedIssueState};
+    use flotilla_store::InMemoryBackend;
 
     use super::*;
 

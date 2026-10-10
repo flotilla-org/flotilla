@@ -1,3 +1,5 @@
+use flotilla_resources::Actuation;
+use flotilla_store::DockerImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
@@ -17,20 +19,20 @@ use flotilla_core::{
 };
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
-    artifact_record_name, canonicalize_repo_url,
-    controller::{
-        delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
-    },
-    host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec,
-    CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase, DefinitionResolver,
+    artifact_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase,
     DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec,
-    ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel,
-    VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
-    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
+    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
+};
+use flotilla_store::{
+    controller::{delete_lifecycle_owned_matching, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    DefinitionResolver, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -1295,7 +1297,7 @@ impl Reconciler for VesselReconciler {
                                 append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
                                 if let Some(project) = convoy.spec.project_ref.as_deref() {
                                     let address = format!("{project}/{}/{}/{}", convoy.metadata.name, obj.spec.vessel_name, process.role);
-                                    let book = flotilla_resources::crew_address_book(&self.backend, &self.namespace, &address).await?;
+                                    let book = flotilla_store::crew_address_book(&self.backend, &self.namespace, &address).await?;
                                     brief.content.push('\n');
                                     brief.content.push_str(&book.render());
                                 }
@@ -1318,7 +1320,7 @@ impl Reconciler for VesselReconciler {
                         .and_then(|workflow| workflow.cascade.as_ref())
                         .and_then(|cascade| cascade.charter_commit.as_ref())
                     {
-                        terminal_meta.annotations.insert(flotilla_resources::BRIEF_CHARTER_REVISION_ANNOTATION.into(), revision.clone());
+                        terminal_meta.annotations.insert(flotilla_store::BRIEF_CHARTER_REVISION_ANNOTATION.into(), revision.clone());
                     }
                     terminal_meta.annotations.extend(actuator_annotations(obj));
                     if !requirement.credential_refs.is_empty() {
@@ -1769,9 +1771,10 @@ mod tests {
     use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
     use flotilla_resources::{
         Convoy, ConvoySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy,
-        PlacementPolicySpec, ResourceBackend, ResourceError, Vessel, VesselSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
+        PlacementPolicySpec, ResourceError, Vessel, VesselSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
         PREPARED_SNAPSHOT_LABEL,
     };
+    use flotilla_store::ResourceBackend;
 
     use super::{
         checkout_name, checkout_placement_scope, configure_contained_tracking, environment_with_credentials, legible_waiting_for,

@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{HostName, ResourceRef};
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, Convoy as ResourceConvoy, ConvoyStatusPatch, CrewCompletionPending,
-    CrewMessageSender, CrewWorkPhase, InMemoryBackend, InputMeta, ResourceBackend, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    Convoy as ResourceConvoy, ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewWorkPhase, InputMeta,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, InMemoryBackend, ResourceBackend};
 
 use super::{fixture, StagingProbe};
 use crate::config::ConfigStore;
@@ -40,7 +40,7 @@ async fn turn_admission_returns_the_canonical_suppressed_message() {
         .expectation(MessageExpectation::Reply)
         .build();
     let first = crew.deliver_turn(&request).await.expect("first admission");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &backend.using::<Message>("flotilla"),
         &first.message.name,
         &MessageStatusPatch::Delivered {
@@ -84,7 +84,7 @@ async fn follow_up_reference_releases_from_message_evidence() {
     let pending = convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].pending_follow_up.clone().unwrap();
     crew.reconcile_pending_supervisor_turns_once("flotilla").await.unwrap();
     assert_eq!(convoys.get("crew").await.unwrap().status.unwrap().crew_work["work"]["coder"].pending_follow_up.as_ref(), Some(&pending));
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &backend.using::<Message>("flotilla"),
         &pending.name,
         &MessageStatusPatch::Delivered {
@@ -134,7 +134,7 @@ async fn follow_up_reference_uses_target_namespace() {
     intent.body = "target continuation".into();
     let messages = backend.using::<Message>("target");
     messages.create(&InputMeta::builder().name(name.clone()).build(), &intent).await.expect("target message");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &messages,
         &name,
         &MessageStatusPatch::Delivered {
@@ -160,9 +160,9 @@ async fn follow_up_reference_uses_target_namespace() {
 #[tokio::test]
 async fn remote_suppression_restores_workflow_before_replication() {
     use flotilla_resources::{
-        Message, MessageExpectation, MessageInbox, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch,
-        ResolvedMessageReceiver,
+        Message, MessageExpectation, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver,
     };
+    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     // Boundary stand-in for the ordinary cross-host resource mutation endpoint.
@@ -178,8 +178,8 @@ async fn remote_suppression_restores_workflow_before_replication() {
                 .await
                 .unwrap();
             let record = match admission {
-                flotilla_resources::MessageAdmission::Accepted(record) => record,
-                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_store::MessageAdmission::Accepted(record) => record,
+                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
@@ -202,7 +202,7 @@ async fn remote_suppression_restores_workflow_before_replication() {
         .expectation(MessageExpectation::Reply)
         .build();
     inbox.accept(&InputMeta::builder().name("canonical".into()).build(), &existing, Utc::now()).await.unwrap();
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &remote.using::<Message>("flotilla"),
         "canonical",
         &MessageStatusPatch::Delivered {
@@ -246,9 +246,9 @@ async fn remote_suppression_restores_workflow_before_replication() {
 #[tokio::test]
 async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() {
     use flotilla_resources::{
-        Message, MessageExpectation, MessageInbox, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch,
-        ResolvedMessageReceiver,
+        Message, MessageExpectation, MessageReference, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver,
     };
+    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
     struct ReceiverPublisher(MessageInbox);
@@ -263,8 +263,8 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
                 .await
                 .unwrap();
             let record = match admission {
-                flotilla_resources::MessageAdmission::Accepted(record) => record,
-                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_store::MessageAdmission::Accepted(record) => record,
+                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
@@ -286,7 +286,7 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
             .expectation(MessageExpectation::Reply)
             .build();
         inbox.accept(&InputMeta::builder().name("canonical".into()).build(), &intent, Utc::now()).await.unwrap();
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &receiver.using::<Message>("flotilla"),
             "canonical",
             &MessageStatusPatch::Delivered {
@@ -405,7 +405,7 @@ async fn turn_publication_errors_restore_the_owned_activation() {
                 .relation(flotilla_resources::MessageRelation::System)
                 .body("concurrent intent".into())
                 .build();
-            flotilla_resources::MessageInbox::new(self.backend.clone(), namespace)
+            flotilla_store::MessageInbox::new(self.backend.clone(), namespace)
                 .accept(&InputMeta::builder().name(name).build(), &spec, Utc::now())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -505,7 +505,7 @@ async fn replica_withdraw_preserves_receiver_submission_on_race() {
                     .build(),
             );
             messages.update_status(name, &current.metadata.resource_version, &next).await.expect("receiver begins submission");
-            flotilla_resources::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
+            flotilla_store::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -519,7 +519,7 @@ async fn replica_withdraw_preserves_receiver_submission_on_race() {
         .relation(flotilla_resources::MessageRelation::Supervisor)
         .body("retain this brief".into())
         .build();
-    flotilla_resources::MessageInbox::new(receiver.clone(), "flotilla")
+    flotilla_store::MessageInbox::new(receiver.clone(), "flotilla")
         .accept(&InputMeta::builder().name("racing-message".into()).build(), &spec, Utc::now())
         .await
         .expect("receiver admission");
@@ -593,7 +593,8 @@ async fn fresh_idle_admission_keeps_completion_and_delivery_evidence_receiver_ow
 // workflow state even after terminal audit retention has removed its body.
 #[tokio::test]
 async fn turn_admission_replays_compacted_message_without_reopening_work() {
-    use flotilla_resources::{Message, MessageInbox, MessagePhase, MessageRelation, MessageSpec};
+    use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec};
+    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::CrewTurnIntent;
     let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;

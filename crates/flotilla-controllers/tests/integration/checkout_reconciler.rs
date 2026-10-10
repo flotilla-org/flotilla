@@ -17,11 +17,8 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::vcs::CheckoutMaterialisationError;
 use flotilla_protocol::NodeId;
-use flotilla_resources::apply_status_patch;
-use flotilla_resources::controller::Actuation;
-use flotilla_resources::controller::ControllerLoop;
-use flotilla_resources::controller::Reconciler;
 use flotilla_resources::repo_key;
+use flotilla_resources::Actuation;
 use flotilla_resources::Checkout;
 use flotilla_resources::CheckoutBranchProvenance;
 use flotilla_resources::CheckoutPhase;
@@ -40,18 +37,21 @@ use flotilla_resources::ConvoySpec;
 use flotilla_resources::ConvoyStatus;
 use flotilla_resources::Event;
 use flotilla_resources::FreshCloneCheckoutSpec;
-use flotilla_resources::InMemoryBackend;
 use flotilla_resources::InputMeta;
 use flotilla_resources::IntegrationCondition;
 use flotilla_resources::LifecycleAuthority;
 use flotilla_resources::RepositoryKey;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
 use flotilla_resources::StatusPatch;
 use flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION;
 use flotilla_resources::CHANGE_REQUEST_ID_LABEL;
 use flotilla_resources::CONVOY_LABEL;
+use flotilla_store::apply_status_patch;
+use flotilla_store::controller::ControllerLoop;
+use flotilla_store::controller::Reconciler;
+use flotilla_store::InMemoryBackend;
+use flotilla_store::ResourceBackend;
 use flotilla_store_testkit::VirtualClock;
 use tokio::{
     sync::{watch, Notify},
@@ -544,7 +544,7 @@ async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_
     assert!(outcome.patch.is_none());
     assert!(matches!(
         outcome.actuations.as_slice(),
-        [flotilla_resources::controller::Actuation::RetryClone { name, failed_at: observed_failed_at }]
+        [flotilla_resources::Actuation::RetryClone { name, failed_at: observed_failed_at }]
             if name == "clone-a" && *observed_failed_at == failed_at
     ));
     assert!(outcome.requeue_after.is_some());

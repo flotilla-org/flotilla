@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use flotilla_protocol::HostName;
-use flotilla_resources::{InMemoryBackend, Repository, RepositoryKey, RepositorySpec, ResourceBackend};
+use flotilla_resources::{Repository, RepositoryKey, RepositorySpec};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::test_meta;
 use crate::config::ConfigStore;

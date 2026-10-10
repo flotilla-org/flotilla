@@ -6,7 +6,8 @@ use std::{
 };
 
 use flotilla_protocol::{RepoIdentity, RepoSelector};
-use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Environment, Project, Repository, RepositoryKey, ResourceBackend};
+use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Environment, Project, Repository, RepositoryKey};
+use flotilla_store::ResourceBackend;
 
 use flotilla_paths::path_context::canonical_or_original;
 
@@ -172,9 +173,8 @@ pub(crate) async fn local_checkouts(
 
 #[cfg(test)]
 mod tests {
-    use flotilla_resources::{
-        InMemoryBackend, InputMeta, ObservedCheckoutSpec, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec,
-    };
+    use flotilla_resources::{InputMeta, ObservedCheckoutSpec, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec};
+    use flotilla_store::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;

@@ -121,7 +121,7 @@ async fn credential_refresh_attention_appears_and_clears_on_recovery() {
     assert_eq!(raised.len(), 1);
     assert!(raised[0].metadata.annotations[CREDENTIAL_REFRESH_REASON_ANNOTATION].contains("expires in 120 seconds"));
     assert_eq!(raised[0].spec.originating_work_ref.name, "credential-convoy");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &demands,
         &raised[0].metadata.name,
         &flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() },

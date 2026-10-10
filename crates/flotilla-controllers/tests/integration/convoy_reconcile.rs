@@ -8,18 +8,20 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, VesselReconciler};
 use flotilla_resources::{
-    change_request_record_name,
-    controller::{Actuation, ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
-    controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
-    interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation,
-    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
-    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase,
-    ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource, CrewWorkPhase,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
-    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, RepositoryKey, ResourceBackend,
-    ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    change_request_record_name, controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches,
+    implement_review_workflow_spec, interactive_single_workflow_spec, reconcile, Actuation, BoundChangeRequest, ChangeRequest,
+    ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState,
+    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock,
+    ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause,
+    CrewSource, CrewWorkPhase, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
+    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, RepositoryKey, ReviewRefPair,
+    SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
     WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+};
+use flotilla_store::{
+    controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
+    ConvoyReconciler, InMemoryBackend, ResourceBackend,
 };
 
 use flotilla_store_testkit::fixtures as common;
@@ -465,7 +467,7 @@ async fn reconcile_once_with_resources(
     template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
     workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
     now: chrono::DateTime<chrono::Utc>,
-) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
+) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -530,7 +532,7 @@ async fn reconcile_with_observed_change_request(
     condition: Option<ConditionValue>,
     observed_target_ref: Option<&str>,
     observed_at: chrono::DateTime<chrono::Utc>,
-) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
+) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -640,7 +642,7 @@ async fn reconcile_with_observed_digest(
     phase: ConvoyPhase,
     observed_digest: Option<&str>,
     existing_attention: bool,
-) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
+) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
     let now = timestamp(40);
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -1573,13 +1575,13 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
             // Discovery first creates its submission, then the merge keeps it,
             // and only then can the exit table settle despite the old scan error.
             if let Some(patch) = outcome.patch {
-                flotilla_resources::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
+                flotilla_store::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
             }
             for _ in 0..5 {
                 let current = convoys.get("stale-scan").await.unwrap();
                 let prepared = reconciler.prepare(&current).await.unwrap();
                 if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(40)).patch {
-                    flotilla_resources::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
+                    flotilla_store::apply_status_patch(&convoys, "stale-scan", &patch).await.unwrap();
                 }
             }
             assert_eq!(convoys.get("stale-scan").await.unwrap().status.unwrap().phase, ConvoyPhase::Landed);
@@ -2055,7 +2057,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         panic!("remote checkout evidence must be persisted before settlement");
     };
     assert_eq!(subjects.len(), 1);
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &convoys,
         "cross-host",
         &ConvoyStatusPatch::DiscoverSubjects { subjects, source: flotilla_resources::SubjectDiscoverySource::Branch, at: timestamp(40) },
@@ -2066,7 +2068,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
     let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
     let patch = outcome.patch.expect("discovered PR creates a promise before exit evaluation");
-    flotilla_resources::apply_status_patch(&convoys, "cross-host", &patch).await.unwrap();
+    flotilla_store::apply_status_patch(&convoys, "cross-host", &patch).await.unwrap();
     let status = convoys.get("cross-host").await.unwrap().status.unwrap();
     assert_eq!(status.phase, ConvoyPhase::Landing, "an open remote change request must hold Landing");
     assert!(status
@@ -3368,7 +3370,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 .await
                 .unwrap();
             requests.update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40))).await.unwrap();
-            flotilla_resources::apply_status_patch(
+            flotilla_store::apply_status_patch(
                 &convoys,
                 "three-pr",
                 &ConvoyStatusPatch::Promise {
@@ -3393,14 +3395,14 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
                 let current = convoys.get("three-pr").await.unwrap();
                 let prepared = reconciler.prepare(&current).await.unwrap();
                 if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(55)).patch {
-                    flotilla_resources::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
+                    flotilla_store::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
                 }
             }
             let current = convoys.get("three-pr").await.unwrap();
             let promises = &current.status.as_ref().unwrap().promises["work"]["coder"];
             assert_eq!(promises.iter().filter(|p| p.state == PromiseState::Kept).count(), number as usize);
             for _ in 0..duplicates {
-                flotilla_resources::apply_status_patch(
+                flotilla_store::apply_status_patch(
                     &convoys,
                     "three-pr",
                     &external_patches::mark_crew_completed_with_context(
@@ -3436,7 +3438,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
             let current = convoys.get("three-pr").await.unwrap();
             let prepared = reconciler.prepare(&current).await.unwrap();
             if let Some(patch) = reconciler.reconcile(&current, &prepared, timestamp(65)).patch {
-                flotilla_resources::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
+                flotilla_store::apply_status_patch(&convoys, "three-pr", &patch).await.unwrap();
             }
         }
         let landed = convoys.get("three-pr").await.unwrap();

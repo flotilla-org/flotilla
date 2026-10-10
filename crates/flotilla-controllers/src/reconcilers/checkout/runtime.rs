@@ -13,8 +13,9 @@ use flotilla_core::{
 };
 use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, Environment, ForgeSpec,
-    ReplicaReadResolver, ResourceBackend, ResourceObject,
+    ResourceObject,
 };
+use flotilla_store::{ReplicaReadResolver, ResourceBackend};
 use tracing::{debug, warn};
 
 use crate::reconcilers::{

@@ -8,7 +8,8 @@ use flotilla_core::convoy_ensure::ConvoyEnsureReconciler;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_orchestration_testkit as ensure_scenarios;
 use flotilla_orchestration_testkit::EnsureScenarioController;
-use flotilla_resources::{Clock, ConvoyEnsure, ResourceBackend, ResourceObject};
+use flotilla_resources::{Clock, ConvoyEnsure, ResourceObject};
+use flotilla_store::ResourceBackend;
 
 struct Controller;
 #[async_trait]

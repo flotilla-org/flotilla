@@ -236,9 +236,9 @@ impl ReconcilerWake {
             .lock()
             .await
             .entry(namespace.to_string())
-            .or_insert_with(|| flotilla_resources::MessageInbox::new(backend.clone(), namespace))
+            .or_insert_with(|| flotilla_store::MessageInbox::new(backend.clone(), namespace))
             .clone();
-        flotilla_resources::reconcile_charter_notifications_with_renderer(
+        flotilla_store::reconcile_charter_notifications_with_renderer(
             &inbox,
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
             now,
@@ -278,7 +278,7 @@ impl ReconcilerWake {
                 if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
                     && prior.map(|attention| &attention.reason) != reason.as_ref()
                 {
-                    flotilla_resources::apply_status_patch(
+                    flotilla_store::apply_status_patch(
                         &backend.clone().using::<Convoy>(namespace),
                         &convoy.metadata.name,
                         &flotilla_resources::ConvoyStatusPatch::ObserveTurnHookHealth { reason, observed_at: now },
@@ -304,7 +304,7 @@ impl ReconcilerWake {
                             }
                         }
                         if status.nudge_obligations != obligations {
-                            flotilla_resources::apply_status_patch(
+                            flotilla_store::apply_status_patch(
                                 &backend.clone().using::<Convoy>(namespace),
                                 &convoy.metadata.name,
                                 &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
@@ -312,7 +312,7 @@ impl ReconcilerWake {
                             .await
                             .map_err(|error| error.to_string())?;
                         }
-                        flotilla_resources::apply_status_patch(
+                        flotilla_store::apply_status_patch(
                             &backend.clone().using::<Convoy>(namespace),
                             &convoy.metadata.name,
                             &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: None },
@@ -817,7 +817,7 @@ impl ReconcilerWake {
                     .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
                     .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
                 let path =
-                    flotilla_resources::supervision_path(backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
+                    flotilla_store::supervision_path(backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
                 if !path.is_empty() {
                     // Explicit convoy supervision remains first; Project and fleet
                     // routing comes from subscriptions, not role-name guesses.
@@ -1190,7 +1190,7 @@ impl ReconcilerWake {
                                     supervisor
                                 }
                                 SupervisionTarget::Address { address } => {
-                                    flotilla_resources::resolve_message_receiver(backend, namespace, address)
+                                    flotilla_store::resolve_message_receiver(backend, namespace, address)
                                         .await
                                         .map_err(|error| error.to_string())?
                                         .map(|holder| {
@@ -1349,7 +1349,7 @@ impl ReconcilerWake {
                     .cloned()
             };
             if status.nudge_obligations != obligations {
-                flotilla_resources::apply_status_patch(
+                flotilla_store::apply_status_patch(
                     &backend.clone().using::<Convoy>(namespace),
                     &convoy.metadata.name,
                     &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
@@ -1358,7 +1358,7 @@ impl ReconcilerWake {
                 .map_err(|error| error.to_string())?;
             }
             if status.stalled != next {
-                if let Err(error) = flotilla_resources::apply_status_patch(
+                if let Err(error) = flotilla_store::apply_status_patch(
                     &backend.clone().using::<Convoy>(namespace),
                     &convoy.metadata.name,
                     &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: next },

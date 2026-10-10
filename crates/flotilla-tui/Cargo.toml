@@ -44,6 +44,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 libc = "0.2"
 
 [dev-dependencies]
+flotilla-store = { path = "../flotilla-store" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
@@ -70,7 +71,6 @@ flotilla-build-features-http = { path = "../flotilla-build-features-http" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-build-features-os = { path = "../flotilla-build-features-os" }
 flotilla-build-features-signing = { path = "../flotilla-build-features-signing" }
-flotilla-build-features-sqlite = { path = "../flotilla-build-features-sqlite" }
 flotilla-build-features-time = { path = "../flotilla-build-features-time" }
 flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
 flotilla-build-features-types = { path = "../flotilla-build-features-types" }

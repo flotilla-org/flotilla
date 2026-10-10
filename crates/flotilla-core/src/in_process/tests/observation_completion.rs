@@ -8,12 +8,12 @@ use chrono::Utc;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
     change_request_record_name, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec,
-    ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta,
-    Repository, RepositorySpec, ResourceBackend, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement,
-    VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, InputMeta, Repository, RepositorySpec,
+    Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
@@ -565,7 +565,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             &[],
         );
         assert_eq!(subjects.len(), 1);
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &convoys,
             "refused-claim",
             &ConvoyStatusPatch::DiscoverSubjects {
@@ -679,7 +679,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         .expect("claim-time observation");
     assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));
 
-    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -726,7 +726,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     .expect("supervision escalation");
     assert_eq!(turns.0.lock().expect("turns").iter().filter(|request| request.source.starts_with("stall-nudge")).count(), 1);
     task.abort();
-    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
     let restarted = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(

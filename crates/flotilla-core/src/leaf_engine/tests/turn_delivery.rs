@@ -758,7 +758,7 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
             Duration::from_secs(180),
         )
         .unwrap();
-        let current = flotilla_resources::apply_status_patch(&convoys, &current.metadata.name, &patch).await.unwrap();
+        let current = flotilla_store::apply_status_patch(&convoys, &current.metadata.name, &patch).await.unwrap();
         wake.sync_rows("flotilla", &HashMap::from([("rejected-promise".into(), current)])).await.unwrap();
         let row = table
             .rows()

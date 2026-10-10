@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{
-    Convoy as ResourceConvoy, CrewWorkPhase, InMemoryBackend, InputMeta, Project, Repository, RepositoryKey, ResourceBackend,
-    TerminalSession as ResourceTerminalSession, Vessel,
+    Convoy as ResourceConvoy, CrewWorkPhase, InputMeta, Project, Repository, RepositoryKey, TerminalSession as ResourceTerminalSession,
+    Vessel,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::fixture;
 

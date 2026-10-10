@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMountMode, FulfilmentKind, ImageBuild, InputMeta, Message,
-    MessageInbox, MessageReference, MessageRelation, MessageSpec, ResourceBackend, ResourceError, ResourceObject, ResourceRef,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
+    MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, CREDENTIAL_REFS_ANNOTATION,
 };
+use flotilla_store::{MessageInbox, ResourceBackend};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 

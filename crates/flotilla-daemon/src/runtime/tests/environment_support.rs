@@ -557,7 +557,7 @@ pub(super) async fn create_ready_docker_environment(
         )
         .await
         .expect("create environment record");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &environments,
         name,
         &EnvironmentStatusPatch::MarkReady {

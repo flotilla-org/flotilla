@@ -20,13 +20,15 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key,
+    canonicalize_repo_url, clone_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
+    ClonePhase, CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
+    HostDirectEnvironmentSpec, HostSpec, HostStatus, Repository, RepositorySpec, ResourceError, ResourceObject, TerminalSession,
+    TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, VESSEL_REF_LABEL,
+};
+use flotilla_store::{
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
-    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Repository,
-    RepositorySpec, ResourceBackend, ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase,
-    VesselRequirement, VESSEL_REF_LABEL,
+    ResourceBackend,
 };
 
 use crate::common;
@@ -277,7 +279,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
 
     let known = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("known repository");
     let missing = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("missing repository");
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &known.key(), &known)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &known.key(), &known)
         .await
         .expect("known repository should create");
 
@@ -391,7 +393,7 @@ async fn clone_controller_marks_clone_ready() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     let repository_spec = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
-    flotilla_resources::ensure_repository(
+    flotilla_store::ensure_repository(
         &backend.clone().using::<flotilla_resources::Repository>(NAMESPACE),
         &repository_spec.key(),
         &repository_spec,
@@ -440,7 +442,7 @@ async fn clone_controller_marks_clone_ready() {
 async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
         .await
         .expect("repository create should succeed");
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));

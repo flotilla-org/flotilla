@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, CrewImageBaseline,
-    DefinitionResolver, FieldOwnedResource, FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
+    field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, FieldOwnedResource,
+    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
 };
 
 define_resource!(
@@ -159,29 +159,5 @@ impl From<String> for DockerImageSource {
 impl From<&str> for DockerImageSource {
     fn from(image: &str) -> Self {
         Self::Literal(image.to_string())
-    }
-}
-
-impl DockerImageSource {
-    /// Resolve before creating an Environment; the Docker provider only ever
-    /// receives a concrete image. Conflicted Definitions must be resolved by
-    /// an operator rather than silently using a deterministic merge winner.
-    pub async fn resolve(&self, baselines: &DefinitionResolver<CrewImageBaseline>) -> Result<String, String> {
-        match self {
-            Self::Composition { composition } => {
-                if let Some(identity) = &composition.identity {
-                    identity.validate()?;
-                    return Ok(identity.registry_digest.as_ref().unwrap_or(&identity.local_image_id).clone());
-                }
-                composition
-                    .baseline_image
-                    .clone()
-                    .filter(|image| !image.trim().is_empty())
-                    .ok_or_else(|| "image composition awaits placement-time build identity".to_string())
-            }
-            Self::Literal(image) if !image.trim().is_empty() => Ok(image.clone()),
-            Self::Literal(_) => Err("placement image is empty".to_string()),
-            Self::Baseline { image_baseline_ref: name } => Ok(CrewImageBaseline::resolve(name, baselines).await?.image),
-        }
     }
 }

@@ -102,7 +102,8 @@ pub(super) fn preview(templates: &[Value], projects: &[Value], designations: &[V
 
 #[cfg(test)]
 mod tests {
-    use flotilla_resources::{InMemoryBackend, InputMeta, ProjectSpec, ResourceBackend, WorkflowTemplateSpec};
+    use flotilla_resources::{InputMeta, ProjectSpec, WorkflowTemplateSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::*;
 
@@ -175,7 +176,7 @@ mod tests {
         other["metadata"]["namespace"] = serde_json::json!("other");
         assert!(preview(&documents, &[other], &[]).expect("other namespace").references.is_empty());
         for definition in &report.definitions {
-            flotilla_resources::validate_resource_document(definition).expect("restoration manifest");
+            flotilla_store::validate_resource_document(definition).expect("restoration manifest");
             assert!(definition.get("status").is_none());
             assert!(definition["metadata"].get("uid").is_none());
             let original = before.iter().find(|t| t.metadata.name == definition["metadata"]["name"]).expect("original");

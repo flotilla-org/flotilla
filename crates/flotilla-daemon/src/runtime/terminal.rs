@@ -26,10 +26,11 @@ use flotilla_credentials::crew_git_identity_environment;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
 use flotilla_resources::{
-    Checkout, Convoy, Environment, FulfilmentKind, ResourceBackend, ResourceError, ResourceObject, TerminalAttentionSource,
-    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    Checkout, Convoy, Environment, FulfilmentKind, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState,
+    TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
+use flotilla_store::ResourceBackend;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -208,7 +209,7 @@ pub(super) async fn deliver_guarded_and_confirm(
     adapter: Option<&dyn AgentAdapter>,
     session: &str,
     text: &str,
-    inbox: &flotilla_resources::MessageInbox,
+    inbox: &flotilla_store::MessageInbox,
     members: &[String],
 ) -> Result<TerminalDeliveryOutcome, String> {
     let deadline =

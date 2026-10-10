@@ -11,9 +11,10 @@ use flotilla_core::{
     ops_entry::{materialized_workflow_name, parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION},
 };
 use flotilla_resources::{
-    CharterPointer, CharterSource, ConvoyEnsureSpec, FleetDesignation, Project, ProjectRepositoryRole, ProjectSpec, ResourceBackend,
-    ResourceError, FLEET_DESIGNATION_NAME,
+    CharterPointer, CharterSource, ConvoyEnsureSpec, FleetDesignation, Project, ProjectRepositoryRole, ProjectSpec, ResourceError,
+    FLEET_DESIGNATION_NAME,
 };
+use flotilla_store::ResourceBackend;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -53,7 +54,7 @@ struct Document {
 }
 
 fn is_kind(document: &Value, expected: &str) -> bool {
-    document.get("kind").and_then(Value::as_str).and_then(|kind| flotilla_resources::canonical_resource_kind(kind).ok()) == Some(expected)
+    document.get("kind").and_then(Value::as_str).and_then(|kind| flotilla_store::canonical_resource_kind(kind).ok()) == Some(expected)
 }
 
 fn namespace(document: &Value, default: &str) -> String {
@@ -102,7 +103,7 @@ pub(crate) async fn expand_registered_charters(
     let mut registration_catalogs = BTreeMap::<String, BTreeMap<String, ProjectSpec>>::new();
     while let Some(mut document) = pending.pop_front() {
         let kind = document.value.get("kind").and_then(Value::as_str).ok_or("charter document missing kind")?;
-        document.value["kind"] = json!(flotilla_resources::canonical_resource_kind(kind).map_err(|error| error.to_string())?);
+        document.value["kind"] = json!(flotilla_store::canonical_resource_kind(kind).map_err(|error| error.to_string())?);
         // Finite input documents may embed recursive inline registrations or
         // reference a repository cycle. Duplicate Project claims stop cycles;
         // the budget also bounds adversarial chains of distinct Projects.
@@ -368,7 +369,7 @@ pub(crate) async fn expand_registered_charters(
             annotations.insert(CHARTER_REVISION.into(), json!(document.revision));
             annotations.insert(CHARTER_SCOPE.into(), json!(format!("{scope_ns}/{project}")));
         }
-        flotilla_resources::validate_resource_document(&document.value).map_err(|error| format!("{}: {error}", document.path.display()))?;
+        flotilla_store::validate_resource_document(&document.value).map_err(|error| format!("{}: {error}", document.path.display()))?;
         result.push((document.path, Ok(vec![document.value])));
     }
     Ok(Some(result))
@@ -496,7 +497,8 @@ fn parse_charter_file(path: &str, contents: &str, project: &str, spec: &ProjectS
 mod tests {
     use std::sync::Mutex;
 
-    use flotilla_resources::{InMemoryBackend, ProjectRepositorySpec, RepositoryKey};
+    use flotilla_resources::{ProjectRepositorySpec, RepositoryKey};
+    use flotilla_store::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;

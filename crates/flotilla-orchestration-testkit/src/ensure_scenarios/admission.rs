@@ -8,7 +8,8 @@ pub async fn two_origins_admit_identical_placements_without_authorship_collision
 }
 
 pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_second_convoy(factory: &dyn EnsureScenarioController) {
-    use flotilla_resources::controller::{Actuation, Reconciler};
+    use flotilla_resources::Actuation;
+    use flotilla_store::controller::Reconciler;
 
     let (daemon, backend, clock, temp) = standing_ensure_fixture(factory).await;
     configure_standing_ensure_agent(&backend, Vec::new()).await;
@@ -89,14 +90,14 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
     restarted.install_convoy_ensure_reconciler(factory.create(restarted.resource_backend(), restarted.clock_for_scenarios())).await;
 
     let reconciler =
-        flotilla_resources::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+        flotilla_store::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
     let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
     let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
     assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkProvisioningRetry { .. })));
     // #2875: reboot recovery keeps the death cause and waits for a durable
     // deadline, rather than replacing the governor at every watch tick.
     assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { .. })));
-    flotilla_resources::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
+    flotilla_store::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
     clock.advance(ChronoDuration::seconds(29));
     let convoy = convoys.get(&convoy_name).await.expect("backing off governor");
     assert_eq!(convoy.status.as_ref().expect("status").work["work"].message.as_deref(), Some("Docker container stopped after host reboot"));
@@ -118,7 +119,7 @@ pub async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_
         "convoy annotations: {:?}",
         convoy.metadata.annotations
     );
-    flotilla_resources::apply_status_patch(&convoys, &convoy_name, &replacement.patch.expect("reserve next attempt"))
+    flotilla_store::apply_status_patch(&convoys, &convoy_name, &replacement.patch.expect("reserve next attempt"))
         .await
         .expect("retry reservation");
     let convoy = convoys.get(&convoy_name).await.expect("reserved retry");

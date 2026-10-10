@@ -816,10 +816,10 @@ enum VisitState {
     Visited,
 }
 
-pub(crate) struct TemplateToken<'a> {
-    pub(crate) open: usize,
-    pub(crate) text: &'a str,
-    pub(crate) end: Option<usize>,
+pub struct TemplateToken<'a> {
+    pub open: usize,
+    pub text: &'a str,
+    pub end: Option<usize>,
 }
 
 pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>> {
@@ -1126,7 +1126,7 @@ fn validate_template_text(
     });
 }
 
-pub(crate) fn visit_template_tokens<'a>(text: &'a str, mut visit: impl FnMut(TemplateToken<'a>)) {
+pub fn visit_template_tokens<'a>(text: &'a str, mut visit: impl FnMut(TemplateToken<'a>)) {
     let mut search_from = 0;
     while let Some(open_offset) = text[search_from..].find("{{") {
         let open = search_from + open_offset;

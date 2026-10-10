@@ -1,0 +1,1883 @@
+use flotilla_resources::Actuation;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+
+use flotilla_resources::{
+    ApiPaths, Checkout, CheckoutSpec, CheckoutWorktreeSpec, InputMeta, LifecycleAuthority, NoStatusPatch, RepositoryKey, Resource,
+    ResourceError, ResourceObject, StatusPatch, Vessel, VesselSpec,
+};
+use flotilla_store::{
+    controller::{
+        ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure,
+        ReconcileOutcome, Reconciler, ResolverLabelMappedWatch,
+    },
+    InMemoryBackend, ResourceBackend, TypedResolver,
+};
+use flotilla_store_testkit::fixtures::{resource_meta, TestLoopHarness};
+use serde::{Deserialize, Serialize};
+use tokio::{sync::Notify, time::timeout};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrimaryResource;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrimarySpec {
+    value: String,
+}
+
+impl Resource for PrimaryResource {
+    type Spec = PrimarySpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-primaries", kind: "TestPrimary" };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SecondaryResource;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SecondarySpec {
+    value: String,
+}
+
+impl Resource for SecondaryResource {
+    type Spec = SecondarySpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-secondaries", kind: "TestSecondary" };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FailureResource;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FailureStatus {
+    degraded: bool,
+    message: Option<String>,
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkDegraded(ReconcileFailure);
+
+impl StatusPatch<FailureStatus> for MarkDegraded {
+    fn apply(&self, status: &mut FailureStatus) {
+        status.degraded = true;
+        status.message = Some(self.0.message.clone());
+        status.consecutive_failures = self.0.consecutive_failures;
+    }
+}
+
+impl Resource for FailureResource {
+    type Spec = PrimarySpec;
+    type Status = FailureStatus;
+    type StatusPatch = MarkDegraded;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-failures", kind: "TestFailure" };
+}
+
+#[derive(Clone)]
+struct BudgetedFailureReconciler {
+    attempts: Arc<AtomicUsize>,
+    persist_degraded: bool,
+    wake_degraded: Arc<AtomicBool>,
+}
+
+impl Reconciler for BudgetedFailureReconciler {
+    type Resource = FailureResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(ResourceError::other("provider registry unavailable"))
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        unreachable!("dependency failure should prevent reconcile")
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
+        Some(ReconcileErrorPolicy {
+            max_consecutive_failures: 3,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(40),
+            exhaustion: ReconcileErrorExhaustion::Park,
+        })
+    }
+
+    fn reconcile_degraded_patch(&self, _obj: &ResourceObject<Self::Resource>, failure: &ReconcileFailure) -> Option<MarkDegraded> {
+        self.persist_degraded.then(|| MarkDegraded(failure.clone()))
+    }
+
+    fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
+        obj.status.as_ref().is_some_and(|status| status.degraded)
+    }
+
+    async fn degraded_object_needs_reconcile(&self, _obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
+        Ok(self.wake_degraded.swap(false, Ordering::SeqCst))
+    }
+}
+
+#[derive(Clone)]
+struct RecordingReconciler {
+    reconciled: Arc<Mutex<Vec<String>>>,
+    notify: Arc<Notify>,
+}
+
+impl RecordingReconciler {
+    fn new(reconciled: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { reconciled, notify: Arc::new(Notify::new()) }
+    }
+
+    fn with_notify(reconciled: Arc<Mutex<Vec<String>>>, notify: Arc<Notify>) -> Self {
+        Self { reconciled, notify }
+    }
+}
+
+impl Reconciler for RecordingReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        self.notify.notify_one();
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[derive(Clone)]
+struct FailingObjectReconciler {
+    failed_name: String,
+    reconciled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for FailingObjectReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        if obj.metadata.name == self.failed_name {
+            return Err(ResourceError::other("object-specific teardown failure"));
+        }
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+#[derive(Clone)]
+struct FinalizingReconciler {
+    finalized: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for FinalizingReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        self.finalized.lock().expect("finalized lock").push(obj.metadata.name.clone());
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+#[derive(Clone)]
+struct RacingFinalizerRemovalReconciler {
+    finalized: Arc<Mutex<Vec<String>>>,
+    primaries: TypedResolver<PrimaryResource>,
+}
+
+impl Reconciler for RacingFinalizerRemovalReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        self.finalized.lock().expect("finalized lock").push(obj.metadata.name.clone());
+        let meta = InputMeta::from(&obj.metadata).without_finalizer("flotilla.work/test-finalizer");
+        match self.primaries.update(&meta, &obj.metadata.resource_version, &obj.spec).await {
+            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+fn delete_synchronously<T: Resource>(resolver: TypedResolver<T>, name: String) {
+    let handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime for synchronous delete");
+        runtime.block_on(async move {
+            resolver.delete(&name).await.expect("synchronous delete should succeed");
+        });
+    });
+    assert!(handle.join().is_ok(), "synchronous delete thread should not panic");
+}
+
+#[derive(Clone)]
+struct RacingAttachReconciler {
+    primaries: TypedResolver<PrimaryResource>,
+    target: String,
+    raced: Arc<AtomicBool>,
+}
+
+impl Reconciler for RacingAttachReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        if !self.raced.swap(true, Ordering::SeqCst) {
+            delete_synchronously(self.primaries.clone(), self.target.clone());
+        }
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusfulResource;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StatusfulSpec {
+    value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StatusfulStatus {
+    touched: bool,
+}
+
+enum TouchPatch {
+    Touch,
+}
+
+impl StatusPatch<StatusfulStatus> for TouchPatch {
+    fn apply(&self, status: &mut StatusfulStatus) {
+        match self {
+            Self::Touch => status.touched = true,
+        }
+    }
+}
+
+impl Resource for StatusfulResource {
+    type Spec = StatusfulSpec;
+    type Status = StatusfulStatus;
+    type StatusPatch = TouchPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-statusful", kind: "TestStatusful" };
+}
+
+#[derive(Clone)]
+struct RacingStatusPatchReconciler {
+    primaries: TypedResolver<StatusfulResource>,
+    target: String,
+    reconciled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for RacingStatusPatchReconciler {
+    type Resource = StatusfulResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        if obj.metadata.name == self.target {
+            delete_synchronously(self.primaries.clone(), obj.metadata.name.clone());
+        }
+        ReconcileOutcome::new(Some(TouchPatch::Touch))
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[derive(Clone)]
+struct RestartingSecondaryWatch {
+    spawns: Arc<AtomicUsize>,
+}
+
+impl flotilla_store::controller::SecondaryWatch for RestartingSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        _sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ExpiringSecondaryWatch {
+    spawns: Arc<AtomicUsize>,
+    expire: Arc<Notify>,
+    spawned: Arc<Notify>,
+}
+
+impl flotilla_store::controller::SecondaryWatch for ExpiringSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        _sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let spawn = self.spawns.fetch_add(1, Ordering::SeqCst);
+            self.spawned.notify_one();
+            if spawn == 0 {
+                self.expire.notified().await;
+                return Err(ResourceError::WatchExpired { requested_version: "1".to_string(), compacted_through: Some("2".to_string()) });
+            }
+            std::future::pending().await
+        })
+    }
+}
+
+#[derive(Clone)]
+struct FailingSecondaryWatch;
+
+#[derive(Clone)]
+struct FloodingSecondaryWatch {
+    sent: Arc<AtomicUsize>,
+}
+
+impl flotilla_store::controller::SecondaryWatch for FloodingSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            loop {
+                sender.send("alpha".to_string()).await.map_err(|_| ResourceError::other("queue closed"))?;
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BlockingFirstReconciler {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    first: Arc<AtomicBool>,
+    reconciled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for BlockingFirstReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        if obj.metadata.name == "alpha" && self.first.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _: &Self::Prepared,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, _: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+impl flotilla_store::controller::SecondaryWatch for FailingSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        _sender: flotilla_store::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async { Err(ResourceError::other("secondary watch failed")) })
+    }
+}
+
+#[derive(Clone)]
+struct ActuatingReconciler {
+    actuation: Actuation,
+    reconciled: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+impl Reconciler for ActuatingReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Prepared,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        if let Some(reconciled) = &self.reconciled {
+            reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        }
+        ReconcileOutcome::with_actuations(None, vec![self.actuation.clone()])
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+fn primary_meta(name: &str) -> InputMeta {
+    resource_meta().name(name).call()
+}
+
+fn primary_meta_with_authority(name: &str, authority: LifecycleAuthority) -> InputMeta {
+    primary_meta(name).with_lifecycle_authority(authority)
+}
+
+fn secondary_meta(name: &str, primary: &str) -> InputMeta {
+    resource_meta().name(name).labels([("flotilla.work/primary".to_string(), primary.to_string())].into_iter().collect()).call()
+}
+
+fn grouped_primary_meta(name: &str, group: &str) -> InputMeta {
+    resource_meta().name(name).labels([("flotilla.work/group".to_string(), group.to_string())].into_iter().collect()).call()
+}
+
+fn grouped_secondary_meta(name: &str, group: &str) -> InputMeta {
+    resource_meta().name(name).labels([("flotilla.work/group".to_string(), group.to_string())].into_iter().collect()).call()
+}
+
+#[tokio::test]
+async fn controller_loop_reconciles_existing_primary_objects_from_initial_list() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial list should reconcile alpha");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_watches_survive_resume_on_a_generational_backend() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let secondaries = backend.clone().using::<SecondaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(LabelMappedWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/primary",
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("primary watch should resume within the store generation");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    secondaries
+        .create(&secondary_meta("secondary-a", "alpha"), &SecondarySpec { value: "wake".to_string() })
+        .await
+        .expect("secondary create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary watch should resume within the store generation");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn resolver_label_mapped_watch_resumes_on_a_generational_observed_backend() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let observed_secondaries = observed.clone().using::<SecondaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(ResolverLabelMappedWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/primary",
+                resolver: observed_secondaries.clone(),
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial list should reconcile alpha");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    observed_secondaries
+        .create(&secondary_meta("secondary-a", "alpha"), &SecondarySpec { value: "wake".to_string() })
+        .await
+        .expect("observed secondary create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observed secondary watch should resume within the store generation");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn label_mapped_watch_enqueues_primary_named_in_secondary_label() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let secondaries = backend.clone().using::<SecondaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(LabelMappedWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/primary",
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().filter(|name| *name == "alpha").count() >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial list should reconcile alpha once");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    secondaries
+        .create(&secondary_meta("secondary-a", "alpha"), &SecondarySpec { value: "wake".to_string() })
+        .await
+        .expect("secondary create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let hits = reconciled.lock().expect("reconciled lock").iter().filter(|name| *name == "alpha").count();
+            if hits >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary watch should enqueue alpha");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn label_join_watch_enqueues_each_primary_sharing_the_label_value() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let secondaries = backend.clone().using::<SecondaryResource>("flotilla");
+    primaries
+        .create(&grouped_primary_meta("alpha", "convoy-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("alpha create should succeed");
+    primaries
+        .create(&grouped_primary_meta("beta", "convoy-a"), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("beta create should succeed");
+    primaries
+        .create(&grouped_primary_meta("gamma", "convoy-b"), &PrimarySpec { value: "three".to_string() })
+        .await
+        .expect("gamma create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(LabelJoinWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/group",
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = reconciled.lock().expect("reconciled lock").clone();
+            let alpha_hits = reconciled.iter().filter(|name| *name == "alpha").count();
+            let beta_hits = reconciled.iter().filter(|name| *name == "beta").count();
+            let gamma_hits = reconciled.iter().filter(|name| *name == "gamma").count();
+            if alpha_hits >= 1 && beta_hits >= 1 && gamma_hits >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial list should reconcile each primary once");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    secondaries
+        .create(&grouped_secondary_meta("secondary-a", "convoy-a"), &SecondarySpec { value: "wake".to_string() })
+        .await
+        .expect("secondary create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let reconciled = reconciled.lock().expect("reconciled lock").clone();
+            let alpha_hits = reconciled.iter().filter(|name| *name == "alpha").count();
+            let beta_hits = reconciled.iter().filter(|name| *name == "beta").count();
+            let gamma_hits = reconciled.iter().filter(|name| *name == "gamma").count();
+            if alpha_hits >= 1 && beta_hits >= 1 && gamma_hits == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("join watch should wake both matching primaries and no non-matches");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_secondary_events_for_the_same_primary_are_deduped_per_burst() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let secondaries = backend.clone().using::<SecondaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(LabelMappedWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/primary",
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().filter(|name| *name == "alpha").count() >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial list should reconcile alpha once");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    let secondary_a_meta = secondary_meta("secondary-a", "alpha");
+    let secondary_b_meta = secondary_meta("secondary-b", "alpha");
+    let secondary_a_spec = SecondarySpec { value: "wake-a".to_string() };
+    let secondary_b_spec = SecondarySpec { value: "wake-b".to_string() };
+    let create_a = secondaries.create(&secondary_a_meta, &secondary_a_spec);
+    let create_b = secondaries.create(&secondary_b_meta, &secondary_b_spec);
+    let (_a, _b) = tokio::join!(create_a, create_b);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if !reconciled.lock().expect("reconciled lock").is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary burst should wake alpha");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reconciled.lock().expect("reconciled lock").as_slice(), &["alpha".to_string()]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn flooded_secondary_queue_does_not_block_resync_or_other_primaries() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("create alpha");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sent = Arc::new(AtomicUsize::new(0));
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    let waiting = entered.notified();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: vec![Box::new(FloodingSecondaryWatch { sent: Arc::clone(&sent) })],
+            reconciler: BlockingFirstReconciler {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: Arc::new(AtomicBool::new(true)),
+                reconciled: Arc::clone(&reconciled),
+            },
+            resync_interval: Duration::from_millis(10),
+            backend,
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(1), waiting).await.expect("alpha should enter prepare");
+    timeout(Duration::from_secs(1), async {
+        while sent.load(Ordering::SeqCst) < 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary flood should exceed the old queue capacity");
+    primaries.create(&primary_meta("beta"), &PrimarySpec { value: "one".to_string() }).await.expect("create beta");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    release.notify_one();
+    timeout(Duration::from_secs(1), async {
+        while !reconciled.lock().expect("reconciled lock").contains(&"beta".to_string()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resync and beta must keep progressing under a hot alpha watch");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn event_during_reconcile_requeues_the_same_name() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("create alpha");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    let waiting = entered.notified();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: BlockingFirstReconciler {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: Arc::new(AtomicBool::new(true)),
+                reconciled: Arc::clone(&reconciled),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(1), waiting).await.expect("alpha should enter prepare");
+    let alpha = primaries.get("alpha").await.expect("get alpha");
+    primaries
+        .update(&InputMeta::from(&alpha.metadata), &alpha.metadata.resource_version, &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("update alpha during reconcile");
+    release.notify_one();
+    timeout(Duration::from_secs(1), async {
+        while reconciled.lock().expect("reconciled lock").iter().filter(|name| *name == "alpha").count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alpha should reconcile again after its in-flight update");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn work_queue_enqueues_each_name_only_once() {
+    let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();
+    for _ in 0..256 {
+        sender.send("alpha".to_string()).await.expect("enqueue alpha");
+    }
+    sender.send("beta".to_string()).await.expect("enqueue beta");
+    assert_eq!(receiver.try_recv().expect("alpha queued"), "alpha");
+    assert_eq!(receiver.try_recv().expect("beta queued"), "beta");
+    assert!(receiver.try_recv().is_err(), "duplicate alpha must not occupy queue space");
+}
+
+#[tokio::test]
+async fn finalizer_failure_does_not_stop_other_objects_from_reconciling() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let failing_meta = resource_meta()
+        .name("alpha-failing")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call();
+    primaries.create(&failing_meta, &PrimarySpec { value: "one".to_string() }).await.expect("failing primary create should succeed");
+    primaries
+        .create(&primary_meta("beta-healthy"), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("healthy primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: FailingObjectReconciler { failed_name: "alpha-failing".to_string(), reconciled: Arc::clone(&reconciled) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").contains(&"beta-healthy".to_string()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("healthy primary should reconcile despite another object's permanent failure");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_runs_finalizer_and_deletes_resource_after_finalizer_completion() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let meta = resource_meta()
+        .name("alpha")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call();
+    primaries.create(&meta, &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let finalized = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::clone(&finalized) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let finalized_hits = finalized.lock().expect("finalized lock").iter().filter(|name| *name == "alpha").count();
+            if finalized_hits >= 1 && matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finalizer should run and then the deleting resource should disappear");
+
+    assert!(matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_survives_notfound_when_removing_finalizer() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let meta = resource_meta()
+        .name("alpha")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call();
+    primaries.create(&meta, &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let finalized = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: RacingFinalizerRemovalReconciler { finalized: Arc::clone(&finalized), primaries: primaries.clone() },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let finalized_alpha = finalized.lock().expect("finalized lock").iter().any(|name| name == "alpha");
+            if finalized_alpha && matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alpha should be finalized and removed by the racing delete");
+
+    primaries.create(&primary_meta("beta"), &PrimarySpec { value: "two".to_string() }).await.expect("beta create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let object = primaries.get("beta").await.expect("beta should still exist");
+            if object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should continue after finalizer removal NotFound");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_survives_notfound_when_attaching_finalizer() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: RacingAttachReconciler {
+                primaries: primaries.clone(),
+                target: "alpha".to_string(),
+                raced: Arc::new(AtomicBool::new(false)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let primaries = primaries.clone();
+            async move { matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })) }
+        })
+        .await;
+
+    primaries.create(&primary_meta("beta"), &PrimarySpec { value: "two".to_string() }).await.expect("second primary create should succeed");
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let primaries = primaries.clone();
+            async move {
+                primaries
+                    .get("beta")
+                    .await
+                    .is_ok_and(|object| object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()])
+            }
+        })
+        .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_survives_notfound_when_patching_status() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<StatusfulResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &StatusfulSpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: RacingStatusPatchReconciler {
+                primaries: primaries.clone(),
+                target: "alpha".to_string(),
+                reconciled: Arc::clone(&reconciled),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let primaries = primaries.clone();
+            let reconciled = Arc::clone(&reconciled);
+            async move {
+                let alpha_reconciled = reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha");
+                alpha_reconciled && matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. }))
+            }
+        })
+        .await;
+
+    primaries
+        .create(&primary_meta("beta"), &StatusfulSpec { value: "two".to_string() })
+        .await
+        .expect("second primary create should succeed");
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let reconciled = Arc::clone(&reconciled);
+            async move { reconciled.lock().expect("reconciled lock").iter().any(|name| name == "beta") }
+        })
+        .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_adds_finalizer_to_managed_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::new(Mutex::new(Vec::new())) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let object = primaries.get("alpha").await.expect("primary get should succeed");
+            if object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller should attach its finalizer");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_skips_reconcile_for_observed_and_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries
+        .create(&primary_meta_with_authority("a-adopted", LifecycleAuthority::Adopted), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("adopted primary create should succeed");
+    primaries
+        .create(&primary_meta_with_authority("b-observed", LifecycleAuthority::Observed), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("observed primary create should succeed");
+    primaries.create(&primary_meta("z-managed"), &PrimarySpec { value: "three".to_string() }).await.expect("managed create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "z-managed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("managed primary should reconcile");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reconciled.lock().expect("reconciled lock").as_slice(), &["z-managed".to_string()]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_does_not_add_finalizers_to_observed_or_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries
+        .create(&primary_meta_with_authority("a-adopted", LifecycleAuthority::Adopted), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("adopted primary create should succeed");
+    primaries
+        .create(&primary_meta_with_authority("b-observed", LifecycleAuthority::Observed), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("observed primary create should succeed");
+    primaries.create(&primary_meta("z-managed"), &PrimarySpec { value: "three".to_string() }).await.expect("managed create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::new(Mutex::new(Vec::new())) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let object = primaries.get("z-managed").await.expect("managed primary get should succeed");
+            if object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller should attach its finalizer to managed primary");
+
+    assert!(primaries.get("a-adopted").await.expect("adopted primary get should succeed").metadata.finalizers.is_empty());
+    assert!(primaries.get("b-observed").await.expect("observed primary get should succeed").metadata.finalizers.is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_removes_existing_adopted_finalizer_without_running_teardown() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let meta = resource_meta()
+        .name("a-adopted")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call()
+        .with_lifecycle_authority(LifecycleAuthority::Adopted);
+    primaries.create(&meta, &PrimarySpec { value: "one".to_string() }).await.expect("adopted primary create should succeed");
+
+    let finalized = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::clone(&finalized) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(primaries.get("a-adopted").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted primary should be unblocked without teardown");
+
+    assert!(finalized.lock().expect("finalized lock").is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_identical_reconcile_errors_back_off_and_park_as_degraded() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler {
+                attempts: Arc::clone(&attempts),
+                persist_degraded: true,
+                wake_degraded: Arc::new(AtomicBool::new(false)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_millis(9)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "first retry must respect its backoff");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    tokio::time::advance(Duration::from_millis(19)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "second retry must use an increased backoff");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if failures.get("terminal-a").await.expect("failure resource should remain").status.as_ref().is_some_and(|status| status.degraded) {
+            break;
+        }
+    }
+
+    let status = failures.get("terminal-a").await.expect("failure resource should remain").status.expect("degraded status");
+    assert!(status.degraded);
+    assert_eq!(status.consecutive_failures, 3);
+    assert_eq!(status.message.as_deref(), Some("provider registry unavailable"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    tokio::time::advance(Duration::from_secs(120)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "degraded object must remain parked across resyncs");
+
+    failures.delete("terminal-a").await.expect("degraded resource should be deleted");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "replacement".to_string() })
+        .await
+        .expect("same-name replacement should be created");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 4 {
+            break;
+        }
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "same-name replacement must not inherit the deleted object's failure budget");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_lifecycle_wake_bypasses_a_parked_objects_remaining_backoff() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let wake_degraded = Arc::new(AtomicBool::new(false));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler {
+                attempts: Arc::clone(&attempts),
+                persist_degraded: true,
+                wake_degraded: Arc::clone(&wake_degraded),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for delay in [0, 10, 20] {
+        tokio::time::advance(Duration::from_millis(delay)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if attempts.load(Ordering::SeqCst) == 3 {
+                break;
+            }
+        }
+    }
+    let degraded = failures.get("terminal-a").await.expect("degraded failure resource");
+    assert!(degraded.status.as_ref().is_some_and(|status| status.degraded));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+    wake_degraded.store(true, Ordering::SeqCst);
+    failures
+        .update(
+            &InputMeta::from(&degraded.metadata),
+            &degraded.metadata.resource_version,
+            &PrimarySpec { value: "lifecycle-wake".to_string() },
+        )
+        .await
+        .expect("lifecycle change should be persisted");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        if attempts.load(Ordering::SeqCst) == 4 {
+            break;
+        }
+    }
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "explicit lifecycle wake must bypass the remaining retry delay");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_budget_keeps_retrying_until_degraded_status_is_persistable() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let failures = backend.clone().using::<FailureResource>("flotilla");
+    failures
+        .create(&primary_meta("terminal-a"), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("failure resource should be created");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: failures.clone(),
+            secondaries: Vec::new(),
+            reconciler: BudgetedFailureReconciler {
+                attempts: Arc::clone(&attempts),
+                persist_degraded: false,
+                wake_degraded: Arc::new(AtomicBool::new(false)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    for delay in [10, 20, 40] {
+        tokio::time::advance(Duration::from_millis(delay)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 4, "missing degraded persistence must not silently park the object");
+    assert!(failures.get("terminal-a").await.expect("failure resource should remain").status.is_none());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn secondary_watch_restart_is_backed_off() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(RestartingSecondaryWatch { spawns: Arc::clone(&spawns) })],
+            reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    tokio::task::yield_now().await;
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "watch should start immediately");
+
+    tokio::time::advance(Duration::from_millis(99)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "watch should not restart before the backoff elapses");
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if spawns.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary watch should restart once the backoff elapses");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_secondary_watch_resyncs_primaries_without_restarting_controller_loop() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let expire = Arc::new(Notify::new());
+    let spawned = Arc::new(Notify::new());
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let reconciled_notify = Arc::new(Notify::new());
+    let first_spawned = spawned.notified();
+    let initially_reconciled = reconciled_notify.notified();
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(ExpiringSecondaryWatch {
+                spawns: Arc::clone(&spawns),
+                expire: Arc::clone(&expire),
+                spawned: Arc::clone(&spawned),
+            })],
+            reconciler: RecordingReconciler::with_notify(Arc::clone(&reconciled), Arc::clone(&reconciled_notify)),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), first_spawned).await.expect("secondary watch should start");
+    timeout(Duration::from_secs(1), initially_reconciled).await.expect("initial primary list should reconcile alpha");
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "watch should start immediately");
+    reconciled.lock().expect("reconciled lock").clear();
+
+    let resynced = reconciled_notify.notified();
+    expire.notify_one();
+    timeout(Duration::from_secs(1), resynced).await.expect("expiry should immediately resync all primaries");
+    assert!(reconciled.lock().expect("reconciled lock").contains(&"alpha".to_string()), "expiry should immediately resync all primaries");
+
+    let restarted = spawned.notified();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    timeout(Duration::from_secs(1), restarted).await.expect("expired secondary watch should restart in place");
+    assert_eq!(spawns.load(Ordering::SeqCst), 2, "expired secondary watch should restart in place");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_expiry_secondary_watch_error_still_exits_controller_loop() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let result = timeout(
+        Duration::from_secs(1),
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(FailingSecondaryWatch)],
+            reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    )
+    .await
+    .expect("controller loop should return the watch error")
+    .expect_err("non-expiry watch error should reach supervision");
+
+    assert_eq!(result, ResourceError::other("secondary watch failed"));
+}
+
+#[tokio::test]
+async fn controller_loop_applies_delete_actuations_idempotently() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    vessels
+        .create(
+            &resource_meta().name("alpha-task").call(),
+            &VesselSpec {
+                convoy_ref: "alpha".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "local".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("task workspace create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler { actuation: Actuation::DeleteVessel { name: "alpha-task".to_string() }, reconciled: None },
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(vessels.get("alpha-task").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete task workspace actuation should remove the resource");
+
+    vessels.delete("alpha-task").await.expect_err("resource should already be gone");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    vessels
+        .create(
+            &resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed),
+            &VesselSpec {
+                convoy_ref: "alpha".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "local".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("task workspace create should succeed");
+    checkouts
+        .create(
+            &resource_meta().name("adopted-checkout").call().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/adopted".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/adopted".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("adopted checkout create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeleteVessel { name: "observed-task".to_string() },
+                reconciled: Some(Arc::clone(&reconciled)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete task workspace actuation should run");
+    let vessel = vessels.get("observed-task").await.expect("observed task workspace should remain");
+    assert_eq!(vessel.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
+
+    harness.shutdown().await;
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeleteCheckout { name: "adopted-checkout".to_string() },
+                reconciled: Some(Arc::clone(&reconciled)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete checkout actuation should run");
+    let checkout = checkouts.get("adopted-checkout").await.expect("adopted checkout owner record should remain");
+    assert_eq!(checkout.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Adopted));
+
+    harness.shutdown().await;
+}

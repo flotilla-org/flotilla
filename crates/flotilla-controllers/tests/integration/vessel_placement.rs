@@ -4,9 +4,10 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
 use flotilla_protocol::{CanonicalHostId, NodeId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
-    Convoy, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, ResourceBackend, ResourceError, Vessel, VesselSpec,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    Convoy, ConvoySpec, ConvoyStatus, InputMeta, ResourceError, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 const NAMESPACE: &str = "flotilla";
 
@@ -82,10 +83,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some("feta-host"));
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str), Some("kiwi-root"));
     assert!(
-        flotilla_resources::home_bound_authorship_collisions(&feta, NAMESPACE)
-            .await
-            .expect("placement host collision diagnosis")
-            .is_empty(),
+        flotilla_store::home_bound_authorship_collisions(&feta, NAMESPACE).await.expect("placement host collision diagnosis").is_empty(),
         "the placed-Vessel actuator is a projection of the origin's Vessel, not a second author"
     );
     kiwi.replica_writer::<Vessel>(NodeId::new("feta-root"), NAMESPACE)
@@ -93,10 +91,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
         .await
         .expect("replicate actuator status to admitting root");
     assert!(
-        flotilla_resources::home_bound_authorship_collisions(&kiwi, NAMESPACE)
-            .await
-            .expect("admitting host collision diagnosis")
-            .is_empty(),
+        flotilla_store::home_bound_authorship_collisions(&kiwi, NAMESPACE).await.expect("admitting host collision diagnosis").is_empty(),
         "the origin must not treat the actuator replica as another author"
     );
     assert!(

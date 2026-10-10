@@ -1,3 +1,4 @@
+use flotilla_resources::Actuation;
 pub mod runtime;
 
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
@@ -10,14 +11,17 @@ use flotilla_core::{
     vcs::CheckoutMaterialisationError,
 };
 use flotilla_resources::{
+    convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
+    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,
+    LifecycleAuthority, ObjectEvent, Resource, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
+};
+use flotilla_store::{
     apply_status_patch,
     controller::{
-        Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch,
+        ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch,
     },
-    convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, EventRecorder, Forge,
-    IntegrationCondition, LifecycleAuthority, ObjectEvent, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
+    EventRecorder, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, warn};
@@ -140,7 +144,7 @@ pub struct CheckoutReconciler<R> {
     checkouts: TypedResolver<Checkout>,
     clones: TypedResolver<Clone>,
     convoys: TypedResolver<Convoy>,
-    forges: flotilla_resources::DefinitionResolver<Forge>,
+    forges: flotilla_store::DefinitionResolver<Forge>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     local_root: Option<flotilla_protocol::NodeId>,
     clock: Arc<dyn Clock>,

@@ -19,9 +19,10 @@ use flotilla_core::providers::HttpClient;
 use flotilla_core::providers::ReqwestHttpClient;
 use flotilla_resources::{
     capped_github_app_permissions, Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError,
-    SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+    CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceError, SystemClock,
+    AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
+use flotilla_store::ResourceBackend;
 use futures::future::BoxFuture;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -184,7 +185,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
     async fn resolve_installation(&self, request: &GithubAppInstallationRequest) -> Result<u64, String> {
         let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await?;
         let url = format!("https://api.github.com/repos/{}/installation", request.repository);
-        let http_request = flotilla_resources::tls::client()
+        let http_request = flotilla_tls::client()
             .get(&url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
@@ -216,7 +217,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
     async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
         let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await.map_err(GithubAppMintError::Other)?;
         let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
-        let http_request = flotilla_resources::tls::client()
+        let http_request = flotilla_tls::client()
             .post(&url)
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
@@ -2421,11 +2422,11 @@ mod tests {
     use flotilla_replay_testkit::Session;
     use flotilla_resources::CredentialPlacementRequirements;
     use flotilla_resources::ForgeSpec;
-    use flotilla_resources::InMemoryBackend;
     use flotilla_resources::InputMeta;
     use flotilla_resources::ProjectRepositorySpec;
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::RepositorySpec;
+    use flotilla_store::InMemoryBackend;
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;

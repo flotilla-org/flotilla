@@ -77,7 +77,8 @@ mod tests {
     // because spawn_blocking itself cannot be cancelled.
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_probe_does_not_block_resource_store() {
-        use flotilla_resources::{Host, ResourceBackend};
+        use flotilla_resources::Host;
+        use flotilla_store::ResourceBackend;
         let (release, blocked) = std::sync::mpsc::channel();
         let (started, observed) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(blocking("privacy", Duration::from_millis(30), move || {

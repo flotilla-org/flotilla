@@ -7,10 +7,12 @@ license.workspace = true
 [features]
 default = []
 cleat-environment-contract = []
-aws-lc-provider = ["flotilla-resources/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-resources/skip-no-sandbox-tests"]
+aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
+skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-tls = { path = "../flotilla-tls" }
+flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-manifest = { path = "../flotilla-manifest" }

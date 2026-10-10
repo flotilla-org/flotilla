@@ -7,10 +7,11 @@ use async_trait::async_trait;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_resources::{
-    ChangeRequestStatus, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, CrewWorkState, InMemoryBackend,
-    InputMeta, ResourceBackend, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, WorkState, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ChangeRequestStatus, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
+    SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
+    TerminalSessionSpec, WorkState, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use tokio::sync::RwLock;
 
 use crate::change_request_observer::ChangeRequestRefreshCadence;

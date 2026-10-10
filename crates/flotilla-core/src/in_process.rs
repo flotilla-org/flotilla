@@ -3,6 +3,8 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+use flotilla_store::ResolvedCascadeStoreExt;
+
 mod admission_actions;
 #[path = "attach.rs"]
 mod attach;
@@ -63,27 +65,30 @@ use flotilla_protocol::{
 #[cfg(test)]
 use flotilla_resources::CrewMessageSender;
 use flotilla_resources::{
-    active_change_request_subjects, api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    capped_github_app_permissions, change_request_address, change_request_address_with_forges, change_request_record_name,
-    get_resource_kind, get_resource_kind_including_replicas, host_direct_environment_name, normalize_issue_source,
-    observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
-    ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant,
-    CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec, DocumentKey, Environment as ResourceEnvironment,
-    EnvironmentPhase, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
-    LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec, ReadResourceObject, Repository, RepositoryIdentity,
-    RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext, TurnDeliveryRung, VesselRequirement, WatchEvent,
-    WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    active_change_request_subjects, api_version, capped_github_app_permissions, change_request_address, change_request_address_with_forges,
+    change_request_record_name, host_direct_environment_name, normalize_issue_source, observed_change_request_subjects, AllocationDecision,
+    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
+    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
+    CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionPending, CrewSource, CrewSpec, DocumentKey,
+    Environment as ResourceEnvironment, EnvironmentPhase, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
+    Resource, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock, TerminalCrewContext,
+    TurnDeliveryRung, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{
     CheckoutIntegrationStatus, ConditionValue, ConvoyPhase, CrewCompletionRefusalCause, HoldAct, IntegrationCondition,
     TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
+};
+use flotilla_store::resolve_project_issue_sources;
+use flotilla_store::{
+    apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind, get_resource_kind_including_replicas,
+    InMemoryBackend, ResourceBackend,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -936,7 +941,7 @@ async fn create_adopted_checkout_resource(
     let path_str = path.to_string_lossy().to_string();
     let checkout_ref = adopted_checkout_name(convoy_name);
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&durable_backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
+    flotilla_store::ensure_repository(&durable_backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
     let meta = InputMeta::builder()
@@ -1409,7 +1414,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
     clock: Arc<dyn Clock>,
     regard_lifecycle: Arc<RegardLifecycle>,
     observed_resource_backend: ResourceBackend,
@@ -1602,7 +1607,7 @@ impl InProcessDaemon {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.expect("create observation replica directory");
             }
-            let replicas = flotilla_resources::SqliteBackend::open_async(&path).await.expect("open durable observation replicas");
+            let replicas = flotilla_store::SqliteBackend::open_async(&path).await.expect("open durable observation replicas");
             InMemoryBackend::observed_with_durable_replicas(replicas)
         } else {
             InMemoryBackend::observed()
@@ -1720,7 +1725,7 @@ impl InProcessDaemon {
                             None => inspection.spec.clone(),
                         };
                         let key = spec.key();
-                        flotilla_resources::ensure_repository(
+                        flotilla_store::ensure_repository(
                             &resource_backend.clone().using::<Repository>(DEFAULT_PROVISIONING_NAMESPACE),
                             &key,
                             &spec,
@@ -2742,7 +2747,7 @@ impl InProcessDaemon {
         self.crew_ops.unsubscribe_waits(connection_id).await;
     }
 
-    pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
+    pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_store::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
         self.crew_ops.reconciler_wake_watch()
     }
 
@@ -3889,11 +3894,11 @@ async fn ensure_repository_and_default_project_workflow(
     repository_key: &RepositoryKey,
     repository_spec: &RepositorySpec,
 ) -> Result<(), String> {
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
     ensure_default_workflows(backend, namespace).await?;
-    flotilla_resources::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
+    flotilla_store::PreparedSnapshotGarbageCollector::new(backend.clone(), namespace)
         .collect(None)
         .await
         .map(|_| ())
@@ -4410,9 +4415,8 @@ impl InProcessDaemon {
         repository_spec: &RepositorySpec,
     ) -> Result<(), String> {
         let repositories = self.resource_backend.clone().using::<Repository>(namespace);
-        let stored = flotilla_resources::ensure_repository(&repositories, repository_key, repository_spec)
-            .await
-            .map_err(|error| error.to_string())?;
+        let stored =
+            flotilla_store::ensure_repository(&repositories, repository_key, repository_spec).await.map_err(|error| error.to_string())?;
         if stored.spec != *repository_spec {
             // Unlike identity-only observations, the current per-repository
             // config is authoritative and may remove a previously set stance.
@@ -5533,9 +5537,9 @@ impl InProcessDaemon {
             None
         };
         let holder = if receiver.starts_with("topic:") {
-            flotilla_resources::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender).await
+            flotilla_store::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender).await
         } else {
-            flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, receiver).await
+            flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, receiver).await
         }
         .map_err(|error| error.to_string())?;
         if let Some(holder) = holder {
@@ -5767,14 +5771,14 @@ impl InProcessDaemon {
         execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await
     }
 
-    pub async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
+    pub async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
         self.message_inboxes
             .lock()
             .await
             .entry(namespace.to_string())
             .or_insert_with(|| {
                 let (change_request, issue) = self.crew_ops.message_observation_staleness();
-                flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace)
+                flotilla_store::MessageInbox::new(self.resource_backend.clone(), namespace)
                     .with_observation_staleness(change_request, issue)
                     .with_audit_retention_days(self.config.load_daemon_config().unwrap_or_default().message_audit_retention_days)
             })
@@ -5788,12 +5792,13 @@ impl InProcessDaemon {
         &self,
         namespace: &str,
         document: serde_json::Value,
-    ) -> Result<flotilla_resources::DynamicResourceObject, ResourceError> {
-        use flotilla_resources::{get_resource_kind, MessageAdmission, MessageSpec};
+    ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
+        use flotilla_resources::MessageSpec;
+        use flotilla_store::{get_resource_kind, MessageAdmission};
         if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
             return apply_resource_document(&self.resource_backend, namespace, document).await;
         }
-        flotilla_resources::validate_resource_document(&document)?;
+        flotilla_store::validate_resource_document(&document)?;
         let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
         let meta: InputMeta = serde_json::from_value(document.get("metadata").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
@@ -6404,7 +6409,7 @@ impl crew_actions::CrewActionPort for InProcessDaemon {
     fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
     }
-    async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
+    async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
         InProcessDaemon::message_inbox(self, namespace).await
     }
     async fn convoy_resume_with_sender_internal(
@@ -6528,7 +6533,7 @@ impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
         self.attach_resolver().attach_project_context(selector).await
     }
-    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<flotilla_resources::CrewAddressBook, String> {
+    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<flotilla_store::CrewAddressBook, String> {
         self.crew_ops.message_contacts_internal(requested).await
     }
     async fn scoped_fleet_list(
@@ -6679,7 +6684,7 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
         &self,
         namespace: &str,
         document: serde_json::Value,
-    ) -> Result<flotilla_resources::DynamicResourceObject, ResourceError> {
+    ) -> Result<flotilla_store::DynamicResourceObject, ResourceError> {
         InProcessDaemon::apply_intent_document(self, namespace, document).await
     }
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {

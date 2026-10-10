@@ -25,14 +25,14 @@ use flotilla_protocol::RepoIdentity;
 use flotilla_protocol::RepoSelector;
 use flotilla_protocol::ResourceJsonResponse;
 use flotilla_resources::Checkout as ResourceCheckout;
-use flotilla_resources::DynamicResourceObject;
 use flotilla_resources::InputMeta;
 use flotilla_resources::Repository;
 use flotilla_resources::RepositoryKey;
 use flotilla_resources::Resource;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
 use flotilla_resources::ResourceObject;
+use flotilla_store::DynamicResourceObject;
+use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -182,7 +182,7 @@ impl ExecutorActions<'_> {
             let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
             let patched = match expected_resource_version {
                 Some(expected) => {
-                    flotilla_resources::patch_resource_status_if_version(
+                    flotilla_store::patch_resource_status_if_version(
                         self.port.resource_backend(),
                         namespace,
                         kind,
@@ -192,9 +192,7 @@ impl ExecutorActions<'_> {
                     )
                     .await
                 }
-                None => {
-                    flotilla_resources::patch_resource_status(self.port.resource_backend(), namespace, kind, name, status.clone()).await
-                }
+                None => flotilla_store::patch_resource_status(self.port.resource_backend(), namespace, kind, name, status.clone()).await,
             };
             let result = match patched {
                 Ok(patched) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
@@ -221,8 +219,7 @@ impl ExecutorActions<'_> {
                         "replica origin {origin_root} is connected; delete the authoritative resource instead"
                     )))
                 } else {
-                    flotilla_resources::collect_resource_replica_kind(self.port.resource_backend(), namespace, kind, name, origin_root)
-                        .await
+                    flotilla_store::collect_resource_replica_kind(self.port.resource_backend(), namespace, kind, name, origin_root).await
                 };
                 match deleted {
                     Ok(deleted) => CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
@@ -238,7 +235,7 @@ impl ExecutorActions<'_> {
                 // Serialize deletion and cleanup with adopted checkout writes.
                 let _reconciliation = self.port.observed_checkout_reconciliation().lock().await;
                 let deleted = async {
-                    let deleted = flotilla_resources::delete_resource_kind(self.port.resource_backend(), namespace, kind, name).await?;
+                    let deleted = flotilla_store::delete_resource_kind(self.port.resource_backend(), namespace, kind, name).await?;
                     if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
                         crate::observed_resources::delete_stale_adopted_checkouts(
                             self.port.resource_backend(),

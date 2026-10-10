@@ -10,9 +10,10 @@ use flotilla_protocol::{IssueSource, ReferenceContext, Relationship, Subject as 
 use flotilla_relay_protocol::{Subject, SubjectKind};
 use flotilla_resources::{
     convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests, ChangeRequest, ChangeRequestSpec,
-    ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceBackend,
-    ResourceError, ResourceProvenance,
+    ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError,
+    ResourceProvenance,
 };
+use flotilla_store::ResourceBackend;
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -760,13 +761,11 @@ mod tests {
         recipe::FlotillaRecipes,
         wire::{MetadataTarget, MetadataValue},
     };
-    use flotilla_resources::{HttpBackend, InMemoryBackend, ResourceBackend, TypedResolver};
+
+    use flotilla_store::{HttpBackend, InMemoryBackend, ResourceBackend, TypedResolver};
 
     use super::*;
-    use crate::{
-        providers::forge::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
-        tls,
-    };
+    use crate::providers::forge::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
 
     struct UnavailableSource;
 
@@ -1254,7 +1253,7 @@ mod tests {
     // without a server or a live request. Cleanup errors must not retire monitoring.
     #[tokio::test]
     async fn failed_collection_keeps_retained_monitoring() {
-        let backend = ResourceBackend::Http(HttpBackend::new(tls::client(), "invalid://resource-store"));
+        let backend = ResourceBackend::Http(HttpBackend::new(flotilla_tls::client(), "invalid://resource-store"));
         let refresher = ChangeRequestRefresher::new(
             "kiwi".into(),
             backend,

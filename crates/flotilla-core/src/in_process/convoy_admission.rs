@@ -1,5 +1,7 @@
 //! Convoy admission state and transaction boundary.
 
+use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
+
 use super::*;
 use crate::{
     agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
@@ -1957,14 +1959,13 @@ impl ConvoyAdmission {
                 );
                 if let Some(project) = spec.project_ref.as_deref() {
                     let address = format!("{project}/{name}/{}/{}", requirement.name, process.role);
-                    let mut book = flotilla_resources::crew_address_book(&self.backend, namespace, &address)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    let mut book =
+                        flotilla_store::crew_address_book(&self.backend, namespace, &address).await.map_err(|error| error.to_string())?;
                     for peer_vessel in &workflow.vessels {
                         for peer in &peer_vessel.crew {
                             let peer_address = format!("{project}/{name}/{}/{}", peer_vessel.name, peer.role);
                             if peer_address != address {
-                                book.contacts.push(flotilla_resources::RoleContact {
+                                book.contacts.push(flotilla_store::RoleContact {
                                     address: peer_address,
                                     relation: flotilla_resources::MessageRelation::Peer,
                                     project: project.into(),

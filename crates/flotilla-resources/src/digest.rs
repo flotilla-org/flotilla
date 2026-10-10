@@ -49,7 +49,7 @@ fn field(hash: &mut Sha256, value: &str) {
     hash.update(value.as_bytes());
 }
 
-pub(crate) fn hash_entries(entries: &BTreeMap<String, String>) -> String {
+pub fn hash_entries(entries: &BTreeMap<String, String>) -> String {
     let mut hash = Sha256::new();
     hash.update(b"flotilla-key-version-leaf-v1");
     for (name, version) in entries {
@@ -60,7 +60,7 @@ pub(crate) fn hash_entries(entries: &BTreeMap<String, String>) -> String {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DigestIndex {
+pub struct DigestIndex {
     entries: Vec<BTreeMap<String, String>>,
     hashes: Vec<String>,
 }
@@ -145,7 +145,7 @@ impl PartitionDigest {
         Ok(crate::ResourceList { items, generation: self.generation.clone(), resource_version: self.resource_version.clone() })
     }
 
-    pub(crate) fn new<T: Resource>(
+    pub fn new<T: Resource>(
         origin: NodeId,
         namespace: &str,
         generation: Option<String>,
@@ -176,7 +176,7 @@ impl PartitionDigest {
             items: None,
         })
     }
-    pub(crate) fn select(mut self, query: &DigestQuery) -> Result<Self, ResourceError> {
+    pub fn select(mut self, query: &DigestQuery) -> Result<Self, ResourceError> {
         let expected = match query {
             DigestQuery::Root => None,
             DigestQuery::Children { expected_root } | DigestQuery::Snapshot { expected_root, .. } => Some(expected_root),
@@ -194,7 +194,6 @@ impl PartitionDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Convoy, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend};
 
     // Length-framed key/version hashing cannot confuse field boundaries.
     #[test]
@@ -204,28 +203,6 @@ mod tests {
 
     // Incomplete snapshots and trees, including a missing live key, never
     // provide the authority's proof of absence.
-    #[tokio::test]
-    async fn truncated_bucket_and_tree_are_rejected() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let local = backend.using::<Convoy>("ns");
-        local
-            .create(&InputMeta::builder().name("retained".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-            .await
-            .expect("create");
-        let root = local.digest(&DigestQuery::Root).await.expect("root");
-        let children = local.digest(&DigestQuery::Children { expected_root: root.root.clone() }).await.expect("tree");
-        let bucket = digest_bucket("retained");
-        let mut snapshot = local.digest(&DigestQuery::Snapshot { expected_root: root.root.clone(), bucket }).await.expect("snapshot");
-        snapshot.snapshot::<Convoy>(&children, bucket).expect("complete snapshot");
-        let mut duplicate = snapshot.clone();
-        duplicate.items.as_mut().expect("items").push(snapshot.items.as_ref().expect("items")[0].clone());
-        assert!(duplicate.snapshot::<Convoy>(&children, bucket).is_err(), "duplicate keys are invalid");
-        snapshot.items.as_mut().expect("items").clear();
-        assert!(snapshot.snapshot::<Convoy>(&children, bucket).is_err(), "truncated live set is invalid");
-        let mut truncated = children;
-        truncated.children = Some(vec![]);
-        assert!(snapshot.snapshot::<Convoy>(&truncated, bucket).is_err(), "an incomplete tree cannot prove absence");
-    }
 
     // Manual sizing benchmark: cached key/version index only; no resources or
     // bodies are serialized. Bootstrap is O(N), match work is O(fanout), and a

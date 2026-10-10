@@ -6,9 +6,10 @@ use std::{
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
 use flotilla_resources::{
-    controller::Reconciler, DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
-    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceBackend, ResourceError, StatusPatch,
+    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host,
+    HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceError, StatusPatch,
 };
+use flotilla_store::{controller::Reconciler, ResourceBackend};
 
 struct FailingDockerRuntime;
 

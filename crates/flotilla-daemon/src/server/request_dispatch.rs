@@ -540,7 +540,7 @@ impl<'a> RequestDispatcher<'a> {
         {
             return Ok(());
         }
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &sessions,
             &terminal.session_name,
             &if event.event_type == AgentEventType::ToolActive {

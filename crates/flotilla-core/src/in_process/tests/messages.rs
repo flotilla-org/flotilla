@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
-use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InMemoryBackend, ResourceBackend, ResourceError,
-};
+use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceError};
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
@@ -26,7 +25,7 @@ async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
         .await
         .expect("convoy");
     // Real HTTP collaborator with an invalid URL fails before any network request.
-    let invalid = ResourceBackend::Http(flotilla_resources::HttpBackend::new(crate::tls::client(), "://invalid"));
+    let invalid = ResourceBackend::Http(flotilla_store::HttpBackend::new(flotilla_tls::client(), "://invalid"));
     for (backend, name, expected, failure) in
         [(&memory, "supervisor", "governor", false), (&memory, "missing", "missing", true), (&invalid, "unavailable", "unavailable", true)]
     {
@@ -211,7 +210,7 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
     daemon.apply_intent_document("flotilla", document.clone()).await.unwrap();
     let messages = backend.using::<Message>("flotilla");
     assert_eq!(messages.get("first").await.unwrap().spec.receiver, "flotilla/convoy/work/coder");
-    flotilla_resources::apply_status_patch(
+    flotilla_store::apply_status_patch(
         &messages,
         "first",
         &MessageStatusPatch::Delivered {

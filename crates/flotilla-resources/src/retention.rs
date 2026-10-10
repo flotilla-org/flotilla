@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{FieldOwnershipViolation, ResourceError};
 
-pub(crate) const MAX_FIELD_OWNERSHIP_VIOLATIONS: usize = 1_024;
-pub(crate) const FIELD_OWNERSHIP_VIOLATION_TTL_HOURS: i64 = 24;
+pub const MAX_FIELD_OWNERSHIP_VIOLATIONS: usize = 1_024;
+pub const FIELD_OWNERSHIP_VIOLATION_TTL_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventRetention {
@@ -21,7 +21,7 @@ impl EventRetention {
         Ok(Self { max_events_per_resource_stream })
     }
 
-    pub(crate) fn max_events_per_resource_stream(self) -> usize {
+    pub fn max_events_per_resource_stream(self) -> usize {
         self.max_events_per_resource_stream
     }
 }
@@ -77,7 +77,7 @@ pub struct ResourceStoreDiagnostics {
 impl ResourceStoreDiagnostics {
     const EVENT_TO_OBJECT_WARNING_MULTIPLIER: u64 = 10_000;
 
-    pub(crate) fn new(object_count: u64, event_count: u64, resource_stream_count: u64, retention: EventRetention) -> Self {
+    pub fn new(object_count: u64, event_count: u64, resource_stream_count: u64, retention: EventRetention) -> Self {
         let max_retained_events = resource_stream_count.saturating_mul(retention.max_events_per_resource_stream() as u64);
         let mut warnings = Vec::new();
         if event_count > max_retained_events {

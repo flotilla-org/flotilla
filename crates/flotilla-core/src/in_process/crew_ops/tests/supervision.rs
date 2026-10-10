@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{CrewCommandContext, PrincipalRef, ResourceRef};
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase,
-    ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, HoldAct, InMemoryBackend, InputMeta, ResourceBackend,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    external_patches as convoy_external_patches, Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase,
+    CrewWorkState, HoldAct, InputMeta, TerminalSession as ResourceTerminalSession, TerminalSessionPhase, TerminalSessionStatus,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, InMemoryBackend, ResourceBackend};
 use tokio::sync::RwLock;
 
 use super::fixture;
@@ -19,7 +19,8 @@ use crate::in_process::{Vessel, WorkCredentialReconciler};
 
 #[hegel::test]
 fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
-    use flotilla_resources::{Message, MessageInbox, MessageReference, MessageRelation, MessageSpec, VesselSpec};
+    use flotilla_resources::{Message, MessageReference, MessageRelation, MessageSpec, VesselSpec};
+    use flotilla_store::MessageInbox;
     use hegel::generators as gs;
 
     use crate::leaf_engine::ResourceIntentPublisher;
@@ -50,8 +51,8 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
                 .await
                 .map_err(|error| error.to_string())?;
             let record = match admission {
-                flotilla_resources::MessageAdmission::Accepted(record) => record,
-                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                flotilla_store::MessageAdmission::Accepted(record) => record,
+                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
             };
             Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, record.metadata.name))
         }
@@ -189,9 +190,8 @@ async fn legacy_pending_brief_is_adopted_once_before_withdrawal() {
 #[hegel::test]
 fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
     use flotilla_protocol::CrewSupervisionAction;
-    use flotilla_resources::{
-        Message, MessageExpectation, MessageInbox, MessageReference, MessageRelation, MessageSpec, StallRung, StallSupervisor,
-    };
+    use flotilla_resources::{Message, MessageExpectation, MessageReference, MessageRelation, MessageSpec, StallRung, StallSupervisor};
+    use flotilla_store::MessageInbox;
     use hegel::generators as gs;
     let escalation_visible = tc.draw(gs::booleans());
     // Exercise resume, conversion to failed, and escalation, including their distinct workflow effects.
@@ -317,7 +317,8 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
 // Message delivery never applies Fail/Escalate workflow transitions itself.
 #[tokio::test]
 async fn supervisor_decision_survives_authority_disappearing_after_publication() {
-    use flotilla_resources::{Message, MessageInbox, MessageSpec};
+    use flotilla_resources::{Message, MessageSpec};
+    use flotilla_store::MessageInbox;
 
     use crate::leaf_engine::ResourceIntentPublisher;
     // Boundary stand-in: the receiver admits intent, then a concurrent authority
@@ -448,7 +449,7 @@ async fn remote_session_hold_retries_through_existing_mutation_router() {
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
             let spec: flotilla_resources::MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
             let name = document["metadata"]["name"].as_str().expect("Message name");
-            flotilla_resources::MessageInbox::new(self.source.clone(), namespace)
+            flotilla_store::MessageInbox::new(self.source.clone(), namespace)
                 .accept(&InputMeta::builder().name(name.into()).build(), &spec, Utc::now())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -466,7 +467,7 @@ async fn remote_session_hold_retries_through_existing_mutation_router() {
             if self.fail.swap(false, Ordering::SeqCst) {
                 return Err("receiver unavailable".into());
             }
-            flotilla_resources::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
+            flotilla_store::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
                 .await
                 .map_err(|error| error.to_string())?;
             self.source

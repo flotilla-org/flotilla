@@ -62,7 +62,7 @@ impl LeafSubscriptionTable {
         let attempts = prior.map_or(1, |prior| prior.attempts.saturating_add(1));
         let delay = 5_i64.saturating_mul(1_i64 << attempts.saturating_sub(1).min(6)).min(300);
         let now = Utc::now();
-        flotilla_resources::apply_status_patch(
+        flotilla_store::apply_status_patch(
             &convoys,
             convoy,
             &flotilla_resources::ConvoyStatusPatch::FailTurnDelivery {

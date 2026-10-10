@@ -8,10 +8,12 @@ use flotilla_protocol::{
     Issue, IssueChangeset, IssueRef, IssueSource, NodeId,
 };
 use flotilla_resources::{
-    forge_read_name, normalize_issue_source, resolve_project_issue_sources, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec,
-    ForgeReadHeartbeatStatus, ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project,
-    Repository, ResourceBackend, ResourceError, ResourceProvenance, SystemClock,
+    forge_read_name, normalize_issue_source, Clock, ForgeRead, ForgeReadHeartbeat, ForgeReadHeartbeatSpec, ForgeReadHeartbeatStatus,
+    ForgeReadRequest, ForgeReadSpec, ForgeReadStatus, Host, InputMeta, IssueSourceResolution, Project, Repository, ResourceError,
+    ResourceProvenance, SystemClock,
 };
+use flotilla_store::resolve_project_issue_sources;
+use flotilla_store::ResourceBackend;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
@@ -618,7 +620,8 @@ impl ChangeRequestTracker for ObservedChangeRequestTracker {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_resources::{HostSpec, HostStatus, InMemoryBackend, IssueSourceBindingSpec, ProjectSpec, Resource};
+    use flotilla_resources::{HostSpec, HostStatus, IssueSourceBindingSpec, ProjectSpec, Resource};
+    use flotilla_store::InMemoryBackend;
 
     use super::*;
 

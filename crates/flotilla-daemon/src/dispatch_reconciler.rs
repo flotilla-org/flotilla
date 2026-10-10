@@ -14,11 +14,12 @@ use flotilla_protocol::{
     DispatchIssueFacts, Issue, IssueRef, IssueState,
 };
 use flotilla_resources::{
-    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold,
-    DispatchHoldStatusPatch, DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry,
-    HoldClearWhen, InputMeta, Project, ProjectStatusPatch, ReadWatchEvent, ResolvedIssueSourceBinding, ResourceBackend, ResourceError,
-    ResourceObject, SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
+    content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold, DispatchHoldStatusPatch,
+    DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, HoldClearWhen, InputMeta,
+    Project, ProjectStatusPatch, ReadWatchEvent, ResolvedIssueSourceBinding, ResourceError, ResourceObject, SystemClock, WorkflowTemplate,
+    DISPATCH_RECONCILER_PROVENANCE,
 };
+use flotilla_store::{apply_status_patch, ResourceBackend};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tracing::{info, warn};
 

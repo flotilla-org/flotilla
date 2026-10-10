@@ -36,22 +36,22 @@ use flotilla_protocol::RepoProvidersResponse;
 use flotilla_protocol::RepoSelector;
 use flotilla_protocol::ResourceCursor;
 use flotilla_protocol::ResourceRecordType;
-use flotilla_resources::current_resource_kind_position;
-use flotilla_resources::get_resource_kind_including_replicas;
-use flotilla_resources::list_resource_kind;
-use flotilla_resources::list_resource_kind_including_replicas;
-use flotilla_resources::resolve_project_issue_sources;
 use flotilla_resources::Clock;
-use flotilla_resources::CrewAddressBook;
-use flotilla_resources::EventRecorder;
 use flotilla_resources::EventRegarding;
 use flotilla_resources::IssueSourceResolution;
 use flotilla_resources::IssueSourceUnavailable;
 use flotilla_resources::ProjectSpec;
 use flotilla_resources::Repository;
 use flotilla_resources::RepositoryKey;
-use flotilla_resources::ResourceBackend;
 use flotilla_resources::ResourceError;
+use flotilla_store::current_resource_kind_position;
+use flotilla_store::get_resource_kind_including_replicas;
+use flotilla_store::list_resource_kind;
+use flotilla_store::list_resource_kind_including_replicas;
+use flotilla_store::resolve_project_issue_sources;
+use flotilla_store::CrewAddressBook;
+use flotilla_store::EventRecorder;
+use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -278,7 +278,7 @@ impl ProjectionsActions<'_> {
                     Some(kind) => (kind, self.port.observed_resource_backend()),
                     None => (kind.as_str(), self.port.resource_backend()),
                 };
-                let result = flotilla_resources::digest_resource_kind(backend, namespace, kind, query).await;
+                let result = flotilla_store::digest_resource_kind(backend, namespace, kind, query).await;
                 match result {
                     Ok(digest) => Ok(CommandValue::ResourceDigest(Box::new(digest.into()))),
                     Err(error) => Ok(CommandValue::Error { message: error.to_string() }),

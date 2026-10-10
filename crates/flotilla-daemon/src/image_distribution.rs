@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use flotilla_credentials::CredentialStore;
 use flotilla_resources::{
     is_image_digest, FleetDesignation, Host, HostImageAction, ImageBuild, ImageBuildPhase, ImageCacheBinding, LocalImageCacheKey,
-    LocalImageInventories, PlacedImageIdentity, ResourceBackend, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME,
-    IMAGE_DIGESTS_CAPABILITY,
+    LocalImageInventories, PlacedImageIdentity, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY,
 };
+use flotilla_store::ResourceBackend;
 
 const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 
@@ -335,8 +335,9 @@ mod tests {
     use chrono::Utc;
     use flotilla_resources::{
         FleetDesignationSpec, FrozenImageLayer, HostSpec, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus,
-        ImageInputStability, ImageLayerParent, ImageLayerSpec, ImageLayerStage, InMemoryBackend, InputMeta, ResolvedImageInputs,
+        ImageInputStability, ImageLayerParent, ImageLayerSpec, ImageLayerStage, InputMeta, ResolvedImageInputs,
     };
+    use flotilla_store::InMemoryBackend;
 
     use super::*;
 

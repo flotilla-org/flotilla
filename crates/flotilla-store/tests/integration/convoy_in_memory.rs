@@ -1,0 +1,512 @@
+use flotilla_protocol::{IssueRef, IssueSource, IssueState};
+use flotilla_resources::{
+    external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase, Event, FreshCloneCheckoutSpec, InputMeta,
+    IssueSnapshot, LifecycleAuthority, PlacementPolicy, PlacementPolicySpec, RepositoryKey, RepositorySpec, ResourceError, Vessel,
+    VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
+    PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
+};
+use flotilla_store::{
+    apply_status_patch, controller::ControllerLoop, ConvoyReconciler, InMemoryBackend, PreparedSnapshotGarbageCollector, ResourceBackend,
+};
+use flotilla_store_testkit::fixtures::{
+    bootstrapped_tool_only_convoy_status, convoy_meta, task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object,
+    valid_convoy_spec, workflow_template_meta,
+};
+use tokio::time::{timeout, Duration};
+
+async fn reconcile_once(
+    convoys: &flotilla_store::TypedResolver<Convoy>,
+    templates: &flotilla_store::DefinitionResolver<WorkflowTemplate>,
+    name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<flotilla_resources::ConvoyStatusPatch> {
+    let convoy = convoys.get(name).await.expect("convoy get should succeed");
+    let template = if convoy.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_none() {
+        match templates.get(&convoy.spec.workflow_ref).await {
+            Ok(template) => Some(template),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(err) => panic!("template get should succeed: {err}"),
+        }
+    } else {
+        None
+    };
+
+    let outcome = reconcile(&convoy, template.as_ref(), now);
+    if let Some(patch) = outcome.patch.clone() {
+        apply_status_patch(convoys, name, &patch).await.expect("apply patch should succeed");
+        Some(patch)
+    } else {
+        None
+    }
+}
+
+#[tokio::test]
+async fn convoy_persists_source_qualified_issue_snapshot_and_instruction() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.using::<Convoy>("flotilla");
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let mut spec = valid_convoy_spec();
+    spec.issues.push(ConvoyIssue {
+        reference: IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "WIDGET-732".into(),
+        },
+        repository_ref: Some(repository.key()),
+        snapshot: IssueSnapshot {
+            title: "Start convoy from issue".into(),
+            body: Some("Build the admission path.".into()),
+            state: IssueState::Open,
+            labels: vec!["enhancement".into()],
+            as_of: timestamp(42),
+        },
+    });
+    spec.instruction = Some("Preserve the public API.".into());
+
+    convoys.create(&convoy_meta("issue-work"), &spec).await.expect("convoy create");
+    let persisted = convoys.get("issue-work").await.expect("convoy get");
+
+    assert_eq!(persisted.spec.issues, spec.issues);
+    assert_eq!(persisted.spec.instruction.as_deref(), Some("Preserve the public API."));
+}
+
+#[tokio::test]
+async fn in_memory_controller_loop_drives_convoy_to_completion() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let convoys = backend.using::<Convoy>("flotilla");
+
+    let template = tool_only_workflow_template_object("review-and-fix");
+    templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
+    convoys.create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("convoy create should succeed");
+
+    let bootstrap = reconcile_once(&convoys, &templates, "convoy-a", timestamp(10)).await.expect("bootstrap patch");
+    assert!(matches!(bootstrap, flotilla_resources::ConvoyStatusPatch::Bootstrap { .. }));
+
+    let ready_implement = reconcile_once(&convoys, &templates, "convoy-a", timestamp(11)).await.expect("ready patch after bootstrap");
+    assert!(matches!(ready_implement, flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. }));
+
+    let active = reconcile_once(&convoys, &templates, "convoy-a", timestamp(12)).await.expect("active roll-up patch");
+    assert!(matches!(active, flotilla_resources::ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, .. }));
+
+    apply_status_patch(
+        &convoys,
+        "convoy-a",
+        &external_patches::force_work_completed("implement".to_string(), timestamp(13), Some("implemented".to_string())),
+    )
+    .await
+    .expect("implement completion should succeed");
+
+    let ready_review = reconcile_once(&convoys, &templates, "convoy-a", timestamp(14)).await.expect("review should become ready");
+    assert!(matches!(ready_review, flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. }));
+
+    apply_status_patch(
+        &convoys,
+        "convoy-a",
+        &external_patches::force_work_completed("review".to_string(), timestamp(15), Some("reviewed".to_string())),
+    )
+    .await
+    .expect("review completion should succeed");
+
+    let final_convoy = convoys.get("convoy-a").await.expect("final convoy get should succeed");
+    let final_status = final_convoy.status.expect("convoy status");
+    assert_eq!(final_status.phase, ConvoyPhase::Landing);
+    assert_eq!(final_status.work["implement"].phase, flotilla_resources::WorkPhase::Complete);
+    assert_eq!(final_status.work["review"].phase, flotilla_resources::WorkPhase::Complete);
+}
+
+#[tokio::test]
+async fn missing_template_transitions_convoy_to_failed() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let convoys = backend.using::<Convoy>("flotilla");
+
+    convoys.create(&convoy_meta("convoy-missing-template"), &valid_convoy_spec()).await.expect("convoy create should succeed");
+
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: Vec::new(),
+            reconciler: ConvoyReconciler::new(templates.clone()),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = backend.using::<Event>("flotilla").list().await.expect("list events").items;
+            if events
+                .iter()
+                .any(|event| event.spec.regarding.name == "convoy-missing-template" && event.spec.reason == "WorkflowTemplateNotFound")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("template refusal should become an object event");
+
+    let convoy = convoys.get("convoy-missing-template").await.expect("convoy get should succeed");
+    let status = convoy.status.expect("convoy status");
+    assert_eq!(status.phase, ConvoyPhase::Failed);
+    assert!(status.message.as_deref().is_some_and(|message| message.contains("not found")));
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn controller_loop_drives_convoy_progression_without_manual_reconcile_calls() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+
+    let template = tool_only_workflow_template_object("review-and-fix");
+    templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
+    convoys.create(&convoy_meta("convoy-loop"), &valid_convoy_spec()).await.expect("convoy create should succeed");
+
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: Vec::new(),
+            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(backend.clone().using::<Vessel>("flotilla")),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let convoy = convoys.get("convoy-loop").await.expect("convoy get should succeed");
+            let Some(status) = convoy.status else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if status.work.get("implement").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Ready) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should bootstrap and advance implement");
+
+    apply_status_patch(
+        &convoys,
+        "convoy-loop",
+        &external_patches::force_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
+    )
+    .await
+    .expect("implement completion should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let convoy = convoys.get("convoy-loop").await.expect("convoy get should succeed");
+            let status = convoy.status.expect("convoy status");
+            if status.work.get("review").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Ready) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should advance review after implement completion");
+
+    apply_status_patch(
+        &convoys,
+        "convoy-loop",
+        &external_patches::force_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
+    )
+    .await
+    .expect("review completion should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let convoy = convoys.get("convoy-loop").await.expect("convoy get should succeed");
+            let status = convoy.status.expect("convoy status");
+            if status.phase == ConvoyPhase::Landed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should roll convoy up to completed");
+
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn controller_loop_advances_task_via_vessel_secondary_watch() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let workspaces = backend.clone().using::<Vessel>("flotilla");
+
+    let template = tool_only_workflow_template_object("review-and-fix");
+    templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
+    convoys.create(&convoy_meta("convoy-stage4a"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
+
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: ConvoyReconciler::secondary_watches(),
+            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(workspaces.clone()),
+            resync_interval: Duration::from_millis(50),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if workspaces.get("convoy-stage4a-implement").await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should create a task workspace for the ready task");
+
+    let workspace = workspaces.get("convoy-stage4a-implement").await.expect("workspace get should succeed");
+    workspaces
+        .update_status(
+            "convoy-stage4a-implement",
+            &workspace.metadata.resource_version,
+            &VesselStatus {
+                configured_limits: None,
+                runtime_observation: None,
+                placement_decision: None,
+                phase: VesselPhase::Ready,
+                message: None,
+                observed_policy_ref: Some("laptop-docker".to_string()),
+                observed_policy_version: Some("17".to_string()),
+                environment_ref: Some("env-implement".to_string()),
+                image_ref: Some("registry.example/crew:latest".to_string()),
+                local_image_id: Some("sha256:test-image".to_string()),
+                registry_digest: None,
+                checkout_refs: Default::default(),
+                terminal_session_refs: vec!["terminal-implement-coder".to_string()],
+                interrupted_roles: Default::default(),
+                started_at: Some(timestamp(18)),
+                ready_at: Some(timestamp(19)),
+                requested_stance: None,
+                effective_stance: None,
+                held_credentials: Default::default(),
+                credential_delivery_retry: None,
+                credential_refresh_retry: None,
+            },
+        )
+        .await
+        .expect("workspace status update should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let convoy = convoys.get("convoy-stage4a").await.expect("convoy get should succeed");
+            let Some(status) = convoy.status else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if status.work.get("implement").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Running) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should advance the task to running after the workspace becomes ready");
+
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let workspaces = backend.clone().using::<Vessel>("flotilla");
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let workflow_snapshot_name = "workflow-snapshot-012345abcdef";
+    let placement_snapshot_name = "placement-snapshot-012345abcdef";
+    let snapshot_labels = |kind: &str| [(PREPARED_SNAPSHOT_LABEL.to_string(), kind.to_string())].into_iter().collect();
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name(workflow_snapshot_name.to_string()).labels(snapshot_labels(WORKFLOW_SNAPSHOT_KIND)).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("workflow snapshot create should succeed");
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name(placement_snapshot_name.to_string()).labels(snapshot_labels(PLACEMENT_SNAPSHOT_KIND)).build(),
+            &PlacementPolicySpec::builder().pool("remote".to_string()).build(),
+        )
+        .await
+        .expect("placement snapshot create should succeed");
+
+    let mut convoy_meta = convoy_meta("convoy-delete");
+    convoy_meta.annotations.insert(WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_snapshot_name.to_string());
+    convoy_meta.annotations.insert(PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_snapshot_name.to_string());
+    let created = convoys.create(&convoy_meta, &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    status.work.get_mut("implement").expect("implement").phase = flotilla_resources::WorkPhase::Running;
+    status.work.get_mut("implement").expect("implement").started_at = Some(timestamp(18));
+    convoys.update_status("convoy-delete", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
+
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-implement".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "laptop-docker".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("task workspace create should succeed");
+    checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-convoy-delete".to_string())
+                .labels([(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect())
+                .build(),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                env_ref: "env-convoy-delete".to_string(),
+                r#ref: "feature/delete".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-delete".to_string(),
+                url: "https://github.com/flotilla-org/flotilla".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-adopted".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "adopted".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                vessel_name: "adopted".to_string(),
+                placement_policy_ref: "laptop-docker".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("adopted task workspace create should succeed");
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-observed".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "observed".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Observed),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                vessel_name: "observed".to_string(),
+                placement_policy_ref: "laptop-docker".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("observed task workspace create should succeed");
+
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: ConvoyReconciler::secondary_watches(),
+            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                .with_vessels(workspaces.clone())
+                .with_checkouts(checkouts.clone())
+                .with_prepared_snapshot_gc(PreparedSnapshotGarbageCollector::new(backend.clone(), "flotilla")),
+            resync_interval: Duration::from_millis(50),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let convoy = convoys.get("convoy-delete").await.expect("convoy get should succeed");
+            if convoy.metadata.finalizers == vec!["flotilla.work/convoy-teardown".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should attach convoy finalizer");
+
+    convoys.delete("convoy-delete").await.expect("convoy delete should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
+                && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
+                && matches!(checkouts.get("checkout-convoy-delete").await, Err(ResourceError::NotFound { .. }))
+                && matches!(
+                    backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
+                    Err(ResourceError::NotFound { .. })
+                )
+                && matches!(
+                    backend.clone().using::<PlacementPolicy>("flotilla").get(placement_snapshot_name).await,
+                    Err(ResourceError::NotFound { .. })
+                )
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("convoy finalizer should delete managed vessels and checkouts");
+
+    assert_eq!(
+        workspaces
+            .get("convoy-delete-adopted")
+            .await
+            .expect("adopted task workspace should remain")
+            .metadata
+            .lifecycle_authority()
+            .expect("authority label should parse"),
+        Some(LifecycleAuthority::Adopted)
+    );
+    assert_eq!(
+        workspaces
+            .get("convoy-delete-observed")
+            .await
+            .expect("observed task workspace should remain")
+            .metadata
+            .lifecycle_authority()
+            .expect("authority label should parse"),
+        Some(LifecycleAuthority::Observed)
+    );
+
+    loop_task.abort();
+}

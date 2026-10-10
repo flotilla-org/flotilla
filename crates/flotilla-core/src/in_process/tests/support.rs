@@ -12,12 +12,13 @@ use flotilla_protocol::HostName;
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CredentialExpiry, CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment,
     EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
-    ResourceObject, Selector, TerminalAttention, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceObject, Selector,
+    TerminalAttention, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use crate::config::ConfigStore;
 use crate::discovery_api::EnvironmentBag;
@@ -571,7 +572,7 @@ pub(super) async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBacken
         backend.clone(),
     )
     .await;
-    let (sender, mut receiver) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (sender, mut receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let watch_backend = backend.clone();
     let task = tokio::spawn(async move {

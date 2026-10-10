@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use flotilla_resources::{apply_status_patch, Clock, Demand, DemandExpiryDisposition, DemandState, DemandStatusPatch, ResourceBackend};
+use flotilla_resources::{Clock, Demand, DemandExpiryDisposition, DemandState, DemandStatusPatch};
+use flotilla_store::{apply_status_patch, ResourceBackend};
 
 const EXPIRY_AUTHORITY: &str = "demand-expiry";
 

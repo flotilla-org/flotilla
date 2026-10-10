@@ -4,11 +4,12 @@ use std::sync::Arc;
 use chrono::Utc;
 use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
-    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InMemoryBackend, InputMeta,
-    ResourceBackend, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 
 use super::support::{
     claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
@@ -563,7 +564,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         replica.clone(),
     )
     .await;
-    let (sender, _receiver) = flotilla_resources::controller::WorkQueueSender::channel();
+    let (sender, _receiver) = flotilla_store::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let replica_check = replica.clone();
     let task = tokio::spawn(async move { watch.spawn(replica.clone(), "flotilla".into(), sender).await.expect("replica watch") });

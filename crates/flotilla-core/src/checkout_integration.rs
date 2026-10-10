@@ -454,9 +454,8 @@ fn non_empty_output_or(fallback: &str, output: &str) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use flotilla_resources::{
-        CheckoutSpec, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, ObservedCheckoutSpec, ResourceBackend,
-    };
+    use flotilla_resources::{CheckoutSpec, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, InputMeta, ObservedCheckoutSpec};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::*;
     use crate::providers::vcs::git_worktree::GitWorktreeStrategy;

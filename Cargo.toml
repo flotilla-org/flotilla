@@ -24,6 +24,8 @@ members = [
     "crates/flotilla-relay-protocol",
     "crates/flotilla-replay-testkit",
     "crates/flotilla-resources",
+    "crates/flotilla-store",
+    "crates/flotilla-tls",
     "crates/flotilla-store-testkit",
     "crates/flotilla-test-support",
     "crates/flotilla-transport",
@@ -65,6 +67,8 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
 [dependencies]
+flotilla-tls = { path = "crates/flotilla-tls" }
+flotilla-store = { path = "crates/flotilla-store" }
 flotilla-paths = { path = "crates/flotilla-paths" }
 flotilla-daemon-api = { path = "crates/flotilla-daemon-api" }
 flotilla-client = { path = "crates/flotilla-client" }

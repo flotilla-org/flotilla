@@ -155,9 +155,8 @@ mod tests {
 
     use async_trait::async_trait;
     use flotilla_protocol::{qualified_path::HostId, EnvironmentId, EnvironmentStatus, HostName, ImageId};
-    use flotilla_resources::{
-        ConditionValue, InMemoryBackend, InputMeta, ResourceBackend, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    };
+    use flotilla_resources::{ConditionValue, InputMeta, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
+    use flotilla_store::{InMemoryBackend, ResourceBackend};
 
     use super::*;
     use crate::config::ConfigStore;

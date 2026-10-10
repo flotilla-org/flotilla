@@ -22,9 +22,10 @@ use flotilla_protocol::{HostName, IssueSource, NodeId, Relationship, Subject, Su
 use flotilla_resources::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
     ChangeRequestSubjectHistory, Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyPhase, ConvoySpec, ConvoyStatus,
-    DeclaredSubject, InMemoryBackend, InputMeta, Observation, ObservedChangeRequestState, Project, ProjectSpec, ResourceBackend,
-    ResourceObject, WatchEvent, ENSURED_FROM_ANNOTATION,
+    DeclaredSubject, InputMeta, Observation, ObservedChangeRequestState, Project, ProjectSpec, ResourceObject, WatchEvent,
+    ENSURED_FROM_ANNOTATION,
 };
+use flotilla_store::{InMemoryBackend, ResourceBackend};
 use flotilla_tui::pm_connect::Connector;
 
 #[derive(Default)]

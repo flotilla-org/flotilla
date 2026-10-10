@@ -6,7 +6,8 @@ use std::sync::{
 use async_trait::async_trait;
 use common::meta;
 use flotilla_controllers::reconcilers::{CloneReconciler, CloneRuntime};
-use flotilla_resources::{clone_key, controller::Reconciler, CloneSpec, Repository, RepositorySpec, ResourceBackend};
+use flotilla_resources::{clone_key, CloneSpec, Repository, RepositorySpec};
+use flotilla_store::{controller::Reconciler, ResourceBackend};
 
 use crate::common;
 
@@ -61,7 +62,7 @@ async fn mismatched_clone_name_fails() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
     let resolver = backend.using::<flotilla_resources::Clone>("flotilla");
@@ -89,7 +90,7 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
     let env_ref = "host-direct-01HXYZ";
@@ -121,7 +122,7 @@ async fn clone_failures_remain_retryable() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/private").expect("repository spec");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
     let env_ref = "host-direct-01HXYZ";
@@ -153,7 +154,7 @@ async fn clone_failures_remain_retryable() {
 
     let clones = backend.clone().using::<flotilla_resources::Clone>("flotilla");
     let retrying =
-        flotilla_resources::apply_status_patch(&clones, &clone_name, &outcome.patch.expect("first failure should record retry state"))
+        flotilla_store::apply_status_patch(&clones, &clone_name, &outcome.patch.expect("first failure should record retry state"))
             .await
             .expect("retry state should apply");
     let repeated_deps = reconciler.prepare(&retrying).await.expect("repeated deps should load");
@@ -171,7 +172,7 @@ async fn transient_clone_failure_remains_retryable_and_converges() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
+    flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
         .await
         .expect("repository create should succeed");
     let env_ref = "host-direct-01HXYZ";
@@ -195,7 +196,7 @@ async fn transient_clone_failure_remains_retryable_and_converges() {
     let failed_deps = reconciler.prepare(&clone).await.expect("first deps should load");
     let failed_outcome = reconciler.reconcile(&clone, &failed_deps, chrono::Utc::now());
     let retry_patch = failed_outcome.patch.expect("transient failure should record retry state");
-    let retrying = flotilla_resources::apply_status_patch(&clones, &clone_name, &retry_patch).await.expect("retry status should apply");
+    let retrying = flotilla_store::apply_status_patch(&clones, &clone_name, &retry_patch).await.expect("retry status should apply");
 
     let recovered_deps = reconciler.prepare(&retrying).await.expect("retry deps should load");
     let recovered_outcome = reconciler.reconcile(&retrying, &recovered_deps, chrono::Utc::now());

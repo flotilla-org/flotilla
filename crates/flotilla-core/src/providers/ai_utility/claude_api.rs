@@ -7,7 +7,7 @@ use tracing::info;
 use super::Model;
 use crate::providers::{http_execute, HttpClient};
 
-static REQUEST_FACTORY: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(crate::tls::client);
+static REQUEST_FACTORY: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(flotilla_tls::client);
 
 const API_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
@@ -166,7 +166,7 @@ mod tests {
         let utility = ClaudeApiAiUtility::new("test-key".into(), server.http.clone());
         assert_eq!(utility.generate_branch_name("HTTP contract").await.expect("accepted request"), "contract-branch");
         // Malformed JSON must receive a service refusal, not panic the handler.
-        let response = crate::tls::client()
+        let response = flotilla_tls::client()
             .post(server.url.join("/v1/messages").expect("stand-in URL"))
             .header("x-api-key", "test-key")
             .header("anthropic-version", "2023-06-01")
