@@ -915,3 +915,92 @@ pub(super) fn spawn_startup_restoration(restoration: StartupRestoration) -> Join
         .await;
     })
 }
+
+/// Watch-driven forge demand service. The board tick retains periodic recovery.
+/// Readiness means both replicated-record watches are subscribed.
+pub fn spawn_forge_read_demand_task(daemon: Arc<InProcessDaemon>, namespace: String) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+    use flotilla_resources::{ForgeRead, ForgeReadHeartbeat, ReadWatchEvent, ResourceProvenance};
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        loop {
+            let backend = daemon.resource_backend();
+            let subscribed = async {
+                let reads = backend.including_replicas::<ForgeRead>(&namespace).watch().await?;
+                let pulses = backend.including_replicas::<ForgeReadHeartbeat>(&namespace).watch().await?;
+                let reads =
+                    reads.chain(futures::stream::once(async { Err(ResourceError::other("ForgeRead watch closed")) })).map(|event| {
+                        event.map(|event| match event {
+                            ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) => {
+                                Some((false, record.provenance, record.object.metadata.name, Some(record.object.spec.demanded_at)))
+                            }
+                            ReadWatchEvent::Deleted(record) => Some((false, record.provenance, record.object.metadata.name, None)),
+                            ReadWatchEvent::DeletedByName { tombstone, provenance } => Some((false, provenance, tombstone.name, None)),
+                        })
+                    });
+                let pulses = pulses
+                    .chain(futures::stream::once(async { Err(ResourceError::other("ForgeReadHeartbeat watch closed")) }))
+                    .map(|event| {
+                        event.map(|event| match event {
+                            ReadWatchEvent::Added(record) | ReadWatchEvent::Modified(record) => {
+                                Some((true, record.provenance, record.object.metadata.name, Some(record.object.spec.demanded_at)))
+                            }
+                            ReadWatchEvent::Deleted(record) => Some((true, record.provenance, record.object.metadata.name, None)),
+                            ReadWatchEvent::DeletedByName { tombstone, provenance } => Some((true, provenance, tombstone.name, None)),
+                        })
+                    });
+                Ok::<_, ResourceError>(futures::stream::select(reads, pulses))
+            }
+            .await;
+            match subscribed {
+                Ok(events) => {
+                    if let Some(ready) = ready_tx.take() {
+                        let _ = ready.send(());
+                    }
+                    let mut seen = std::collections::BTreeMap::new();
+                    let demands = events
+                        .take_while(|event| {
+                            if let Err(error) = event {
+                                warn!(%error, "forge demand watch failed; resubscribing");
+                            }
+                            futures::future::ready(event.is_ok())
+                        })
+                        .filter_map(|event| {
+                            let name = event.ok().flatten().and_then(|(pulse, provenance, name, demanded_at)| {
+                                let ResourceProvenance::Replica { origin_root, .. } = provenance else { return None };
+                                let key = (pulse, origin_root, name.clone());
+                                let Some(demanded_at) = demanded_at else {
+                                    seen.remove(&key);
+                                    return None;
+                                };
+                                if seen.get(&key).is_some_and(|previous| *previous >= demanded_at) {
+                                    return None;
+                                }
+                                seen.insert(key, demanded_at);
+                                // Bound deduplication memory; eviction only causes a harmless cache hit.
+                                if seen.len() > 4096 {
+                                    seen.clear();
+                                }
+                                Some(name)
+                            });
+                            futures::future::ready(name)
+                        });
+                    demands
+                        .for_each_concurrent(8, |name| {
+                            let daemon = daemon.clone();
+                            let namespace = namespace.clone();
+                            async move {
+                                if let Err(error) = daemon.service_forge_read_demand(&namespace, &name).await {
+                                    debug!(%error, %name, "forge demand unavailable");
+                                }
+                            }
+                        })
+                        .await;
+                }
+                Err(error) => warn!(%error, "forge demand watch subscription failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    (task, ready_rx)
+}

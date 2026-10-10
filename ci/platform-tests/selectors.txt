@@ -19,3 +19,7 @@ macos| -p flotilla-core --locked --lib providers::environment::registry_client_t
 macos| -p flotilla-credentials --locked --lib cancelled_host_image_operation_removes_private_config
 macos| -p flotilla-credentials --locked --lib registry_pull_admission_is_in_memory
 macos| -p flotilla-core --locked --lib anonymous_config_owns_private_empty_directory
+all| -p flotilla-core --locked --lib remote_wait_is_bounded_without_scanning_demands
+all| -p flotilla-core --locked --lib named_service_has_bounded_reads_and_ignores_idle_requests
+all| -p flotilla-daemon --locked --test request_session_pair forge_reads::
+all| -p flotilla-core --locked --lib remote_wait_returns_published_owner_error

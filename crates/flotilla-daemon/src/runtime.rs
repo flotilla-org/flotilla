@@ -73,9 +73,9 @@ use self::terminal::TerminalControllerRuntime;
 use crate::{blob_store::TieredBlobStore, resource_manifest::manifest_root_name, startup::phase, supervisor::ControllerSupervision};
 pub(crate) use tasks::manifest_reconciler_enabled;
 pub use tasks::spawn_pending_supervisor_turn_task;
-pub use tasks::spawn_pending_supervisor_turn_task_with_watches;
 #[cfg(test)]
 pub(crate) use tasks::wait_for_listening;
+pub use tasks::{spawn_forge_read_demand_task, spawn_pending_supervisor_turn_task_with_watches};
 
 #[derive(Debug, Clone, bon::Builder)]
 pub struct RuntimeOptions {
@@ -563,6 +563,8 @@ impl StartupRestoration {
             options.namespace.clone(),
             options.controller_resync_interval,
         ))];
+        let (forge_demands, _) = spawn_forge_read_demand_task(Arc::clone(daemon), options.namespace.clone());
+        controller_tasks.push(AbortOnDropHandle::new(forge_demands));
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };
