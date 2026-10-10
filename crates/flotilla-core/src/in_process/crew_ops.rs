@@ -440,7 +440,21 @@ impl CrewService {
         reconciler.ledger_delivery_environment(namespace, environment_ref).await
     }
 
-    async fn provisioning_namespace(&self) -> String {
+    pub(super) async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
+        self.message_inboxes
+            .lock()
+            .await
+            .entry(namespace.to_string())
+            .or_insert_with(|| {
+                let (change_request, issue) = self.message_observation_staleness();
+                flotilla_store::MessageInbox::new(self.resource_backend.clone(), namespace)
+                    .with_observation_staleness(change_request, issue)
+                    .with_audit_retention_days(self.config.load_daemon_config().unwrap_or_default().message_audit_retention_days)
+            })
+            .clone()
+    }
+
+    pub(super) async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 

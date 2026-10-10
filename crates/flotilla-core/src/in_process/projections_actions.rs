@@ -15,8 +15,6 @@ use flotilla_protocol::Command;
 use flotilla_protocol::CommandAction;
 use flotilla_protocol::CommandValue;
 use flotilla_protocol::ConvoyExplanation;
-use flotilla_protocol::CrewCommandContext;
-use flotilla_protocol::CrewListResponse;
 use flotilla_protocol::DaemonEvent;
 use flotilla_protocol::DispatchBoardResponse;
 use flotilla_protocol::DispatchQueueResponse;
@@ -49,7 +47,6 @@ use flotilla_store::get_resource_kind_including_replicas;
 use flotilla_store::list_resource_kind;
 use flotilla_store::list_resource_kind_including_replicas;
 use flotilla_store::resolve_project_issue_sources;
-use flotilla_store::CrewAddressBook;
 use flotilla_store::EventRecorder;
 use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
@@ -66,10 +63,12 @@ use crate::resource_explain::resource_record;
 use crate::resource_explain::run_resource_watch_command;
 use crate::resource_explain::ResourceWatchCommandContext;
 
+/// Host-specific read and attach orchestration. Store reads, clock, cancellation
+/// registration and crew queries use directly supplied collaborators instead of
+/// requiring the host port to expose its state.
 #[async_trait]
 pub(super) trait ProjectionsActionPort: Send + Sync {
     async fn attach_project_context(&self, selector: Option<&RepoSelector>) -> Result<Option<String>, String>;
-    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<CrewAddressBook, String>;
     async fn scoped_fleet_list(
         &self,
         project: Option<&str>,
@@ -85,7 +84,6 @@ pub(super) trait ProjectionsActionPort: Send + Sync {
         mode: AttachMode,
         project_context: Option<&str>,
     ) -> Result<ResolvedAttach, String>;
-    fn node_id(&self) -> &NodeId;
     async fn list_projects_internal(&self) -> Result<ProjectListResponse, String>;
     async fn list_hosts_internal(&self) -> Result<HostListResponse, String>;
     async fn list_cli_items_internal(&self, kind: CliListKind) -> Result<CliListResponse, String>;
@@ -100,18 +98,18 @@ pub(super) trait ProjectionsActionPort: Send + Sync {
     async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String>;
     async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String>;
     async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<DispatchBoardResponse, String>;
-    async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String>;
-    async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String>;
-    fn config(&self) -> &Arc<ConfigStore>;
-    fn clock(&self) -> &Arc<dyn Clock>;
-    fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>>;
-    fn event_sink(&self) -> &Arc<dyn EventSink>;
-    fn observed_resource_backend(&self) -> &ResourceBackend;
-    fn resource_backend(&self) -> &ResourceBackend;
 }
 
 pub(super) struct ProjectionsActions<'a> {
     pub(super) port: &'a dyn ProjectionsActionPort,
+    pub(super) crew: &'a super::crew_ops::CrewService,
+    pub(super) resource_backend: &'a ResourceBackend,
+    pub(super) observed_resource_backend: &'a ResourceBackend,
+    pub(super) event_sink: &'a Arc<dyn EventSink>,
+    pub(super) node_id: &'a NodeId,
+    pub(super) clock: &'a Arc<dyn Clock>,
+    pub(super) config: &'a Arc<ConfigStore>,
+    pub(super) active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
 }
 
 impl ProjectionsActions<'_> {
@@ -122,10 +120,10 @@ impl ProjectionsActions<'_> {
             let description = format!("watch resource {namespace}/{kind}");
             let token = CancellationToken::new();
             {
-                let mut guard = self.port.active_commands().lock().await;
+                let mut guard = self.active_commands.lock().await;
                 guard.insert(id, token.clone());
             }
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: command_node_id.clone(),
                 repo_identity: repo_identity.clone(),
@@ -134,11 +132,11 @@ impl ProjectionsActions<'_> {
             });
 
             let (backend, kind) = match kind.strip_prefix("observed/") {
-                Some(kind) => (self.port.observed_resource_backend().clone(), kind.to_string()),
-                None => (self.port.resource_backend().clone(), kind),
+                Some(kind) => (self.observed_resource_backend.clone(), kind.to_string()),
+                None => (self.resource_backend.clone(), kind),
             };
-            let event_sink = self.port.event_sink().clone();
-            let active_ref = Arc::clone(self.port.active_commands());
+            let event_sink = self.event_sink.clone();
+            let active_ref = Arc::clone(self.active_commands);
             tokio::spawn(async move {
                 let result = run_resource_watch_command(
                     ResourceWatchCommandContext::builder()
@@ -235,29 +233,29 @@ impl ProjectionsActions<'_> {
                 }
             }
             CommandAction::QueryCrewStalls { full } => {
-                match read_projections::ReadProjections::crew_stalls(self.port.resource_backend(), *full, self.port.clock().now()).await {
+                match read_projections::ReadProjections::crew_stalls(self.resource_backend, *full, self.clock.now()).await {
                     Ok(value) => Ok(CommandValue::CrewStalls(Box::new(value))),
                     Err(message) => Ok(CommandValue::Error { message }),
                 }
             }
-            CommandAction::QueryCrewCapabilities { context } => match self.port.crew_capabilities_internal(context).await {
+            CommandAction::QueryCrewCapabilities { context } => match self.crew.crew_capabilities_internal(context).await {
                 Ok(card) => Ok(CommandValue::CrewCapabilities { card }),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
-            CommandAction::QueryMessageContacts { context } => match self.port.message_contacts_internal(context).await {
+            CommandAction::QueryMessageContacts { context } => match self.crew.message_contacts_internal(context).await {
                 Ok(book) => Ok(CommandValue::MessageContacts {
                     text: book.render(),
                     book: serde_json::to_value(book).map_err(|error| error.to_string())?,
                 }),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
-            CommandAction::QueryCrewList { context } => match self.port.crew_list_internal(context).await {
+            CommandAction::QueryCrewList { context } => match self.crew.crew_list_internal(context).await {
                 Ok(v) => Ok(CommandValue::CrewList(Box::new(v))),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryDaemonLogs { query } => {
-                let generations = self.port.config().load_daemon_config()?.logging.generations;
-                let state_dir = self.port.config().state_dir().as_path().to_path_buf();
+                let generations = self.config.load_daemon_config()?.logging.generations;
+                let state_dir = self.config.state_dir().as_path().to_path_buf();
                 let query = query.clone();
                 let read_result = tokio::task::spawn_blocking(move || crate::log_file::read_daemon_logs(&state_dir, generations, &query))
                     .await
@@ -275,8 +273,8 @@ impl ProjectionsActions<'_> {
             }
             CommandAction::QueryResourceDigest { namespace, kind, query } => {
                 let (kind, backend) = match kind.strip_prefix("observed/") {
-                    Some(kind) => (kind, self.port.observed_resource_backend()),
-                    None => (kind.as_str(), self.port.resource_backend()),
+                    Some(kind) => (kind, self.observed_resource_backend),
+                    None => (kind.as_str(), self.resource_backend),
                 };
                 let result = flotilla_store::digest_resource_kind(backend, namespace, kind, query).await;
                 match result {
@@ -286,9 +284,9 @@ impl ProjectionsActions<'_> {
             }
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
                 let listed = if *include_replicas {
-                    list_resource_kind_including_replicas(self.port.resource_backend(), namespace, kind).await
+                    list_resource_kind_including_replicas(self.resource_backend, namespace, kind).await
                 } else {
-                    list_resource_kind(self.port.resource_backend(), namespace, kind).await
+                    list_resource_kind(self.resource_backend, namespace, kind).await
                 };
                 match listed {
                     Ok(v) => {
@@ -299,7 +297,7 @@ impl ProjectionsActions<'_> {
                             .into_iter()
                             .flatten()
                             .cloned()
-                            .map(|object| resource_record(ResourceRecordType::Current, object, self.port.node_id()))
+                            .map(|object| resource_record(ResourceRecordType::Current, object, self.node_id))
                             .collect();
                         Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
                             v.kind,
@@ -316,11 +314,11 @@ impl ProjectionsActions<'_> {
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
                 // duplicate) instead of being hidden behind a newer cursor.
-                let position = match current_resource_kind_position(self.port.resource_backend(), namespace, kind).await {
+                let position = match current_resource_kind_position(self.resource_backend, namespace, kind).await {
                     Ok(listed) => listed,
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
                 };
-                let visible = match get_resource_kind_including_replicas(self.port.resource_backend(), namespace, kind, name).await {
+                let visible = match get_resource_kind_including_replicas(self.resource_backend, namespace, kind, name).await {
                     Ok(object) => object,
                     Err(ResourceError::NotFound { .. }) => {
                         return Ok(CommandValue::Error { message: format!("resource {kind}/{namespace}/{name} not found") });
@@ -333,11 +331,8 @@ impl ProjectionsActions<'_> {
                 if visible.kind == "Project" {
                     match serde_json::from_value::<ProjectSpec>(value["spec"].clone()) {
                         Ok(spec) => {
-                            match resolve_project_issue_sources(
-                                &self.port.resource_backend().including_replicas::<Repository>(namespace),
-                                &spec,
-                            )
-                            .await
+                            match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &spec)
+                                .await
                             {
                                 IssueSourceResolution::Available { bindings } => {
                                     value["resolvedIssueSources"] = serde_json::Value::Array(
@@ -380,7 +375,7 @@ impl ProjectionsActions<'_> {
                         namespace: namespace.clone(),
                         name: object_name.to_string(),
                     };
-                    match EventRecorder::new(self.port.resource_backend().clone()).recent_for(&regarding, Utc::now()).await {
+                    match EventRecorder::new(self.resource_backend.clone()).recent_for(&regarding, Utc::now()).await {
                         Ok(events) if !events.is_empty() => {
                             value["recentEvents"] =
                                 serde_json::Value::Array(events.into_iter().filter_map(|event| serde_json::to_value(event).ok()).collect());
@@ -391,7 +386,7 @@ impl ProjectionsActions<'_> {
                         }
                     }
                 }
-                let record = resource_record(ResourceRecordType::Current, value, self.port.node_id());
+                let record = resource_record(ResourceRecordType::Current, value, self.node_id);
                 Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
                     visible.kind,
                     visible.plural,

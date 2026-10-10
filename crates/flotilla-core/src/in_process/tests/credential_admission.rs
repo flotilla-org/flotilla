@@ -48,6 +48,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
 
         for policy in [Some("docker-kiwi"), None] {
             let error = daemon
+                .convoy_admission
                 .resolve_convoy_placement("flotilla", None, &[], &workflow, policy, false)
                 .await
                 .expect_err("ineligible host must refuse admission");

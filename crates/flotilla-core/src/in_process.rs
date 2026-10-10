@@ -17,7 +17,7 @@ mod cleat_roll;
 mod crew_ops;
 pub(crate) use crew_ops::convoy_message_address;
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
-use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator, MessageAttribution};
+use crew_ops::{CrewService, CrewTurnDeliveryActuator};
 
 #[path = "in_process/convoy_admission.rs"]
 pub mod convoy_admission;
@@ -44,7 +44,7 @@ pub use attach::ResolvedAttach;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use convoy_admission::{
     convoy_address, convoy_ensure_name, discover_repository_change_request_with, project_not_ready_error, resolve_convoy_candidate_indices,
-    ConvoyAddressIdentity, ConvoyAdmission, ConvoyStartTask, PlacementResolution, StaticFulfilmentDecider,
+    ConvoyAddressIdentity, ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider,
 };
 pub use convoy_admission::{PreparedConvoyAdmission, RoleAddress};
 #[cfg(test)]
@@ -1414,7 +1414,6 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
-    message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
     clock: Arc<dyn Clock>,
     regard_lifecycle: Arc<RegardLifecycle>,
     observed_resource_backend: ResourceBackend,
@@ -1930,7 +1929,6 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             resource_backend: resource_backend.clone(),
-            message_inboxes,
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
@@ -2699,15 +2697,7 @@ impl InProcessDaemon {
     }
 
     fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
-        let repo_identity = empty_repo_identity();
-        self.event_sink.emit(DaemonEvent::CommandStarted {
-            command_id,
-            node_id: self.node_id.clone(),
-            repo_identity: repo_identity.clone(),
-            repo: None,
-            description,
-        });
-        repo_identity
+        action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink }.start(command_id, description)
     }
 
     fn finish_context_free_command(
@@ -2716,7 +2706,7 @@ impl InProcessDaemon {
         repo_identity: flotilla_protocol::RepoIdentity,
         result: flotilla_protocol::CommandValue,
     ) {
-        self.event_sink.emit(DaemonEvent::CommandFinished { command_id, node_id: self.node_id.clone(), repo_identity, repo: None, result });
+        action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink }.finish(command_id, repo_identity, result)
     }
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
@@ -4127,20 +4117,6 @@ impl InProcessDaemon {
         self.convoy_admission.emit_attach_regard(binding, surface_id).await
     }
 
-    async fn resolve_convoy_placement(
-        &self,
-        namespace: &str,
-        project_ref: Option<&str>,
-        repositories: &[ConvoyRepositorySpec],
-        workflow: &WorkflowTemplateSpec,
-        placement_policy: Option<&str>,
-        allow_unready: bool,
-    ) -> Result<PlacementResolution, String> {
-        self.convoy_admission
-            .resolve_convoy_placement(namespace, project_ref, repositories, workflow, placement_policy, allow_unready)
-            .await
-    }
-
     async fn run_convoy_start(
         &self,
         intent: flotilla_protocol::ConvoyStartIntent,
@@ -5277,10 +5253,6 @@ impl InProcessDaemon {
         self.crew_ops.stall(requested, reason, proposed_disposition, message).await
     }
 
-    async fn crew_supervise_internal(&self, request: CrewSupervisionRequest<'_>) -> Result<(), String> {
-        self.crew_ops.supervise(request).await
-    }
-
     async fn runner_for_resource_checkout(&self, _checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
         self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
     }
@@ -5321,17 +5293,6 @@ impl InProcessDaemon {
         Fut: std::future::Future<Output = ()>,
     {
         self.crew_ops.abandon_convoy_internal_with_hook(namespace, name, reason, principal_ref, before_update).await
-    }
-
-    async fn record_lifecycle_mutation_best_effort(
-        &self,
-        namespace: &str,
-        name: &str,
-        action: &str,
-        caller: Option<&flotilla_protocol::CommandCaller>,
-        missing_expected: bool,
-    ) {
-        self.crew_ops.record_lifecycle_mutation_best_effort(namespace, name, action, caller, missing_expected).await
     }
 
     pub async fn crew_handoff_internal(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
@@ -5772,17 +5733,7 @@ impl InProcessDaemon {
     }
 
     pub async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
-        self.message_inboxes
-            .lock()
-            .await
-            .entry(namespace.to_string())
-            .or_insert_with(|| {
-                let (change_request, issue) = self.crew_ops.message_observation_staleness();
-                flotilla_store::MessageInbox::new(self.resource_backend.clone(), namespace)
-                    .with_observation_staleness(change_request, issue)
-                    .with_audit_retention_days(self.config.load_daemon_config().unwrap_or_default().message_audit_retention_days)
-            })
-            .clone()
+        self.crew_ops.message_inbox(namespace).await
     }
 
     /// Returns the canonical admitted record. Suppression before creation does
@@ -5881,10 +5832,48 @@ impl InProcessDaemon {
             };
         }
 
-        let admission = admission_actions::AdmissionActions { port: self };
-        let crew = crew_actions::CrewActions { port: self };
-        let projections = projections_actions::ProjectionsActions { port: self };
-        let executor = executor_actions::ExecutorActions { port: self };
+        let admission = admission_actions::AdmissionActions {
+            namespace: &self.provisioning_namespace,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
+            convoy_admission: &self.convoy_admission,
+            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
+        };
+        let crew = crew_actions::CrewActions {
+            crew: &self.crew_ops,
+            port: self,
+            resource_backend: &self.resource_backend,
+            clock: &self.clock,
+            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
+        };
+        let projections = projections_actions::ProjectionsActions {
+            crew: &self.crew_ops,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            event_sink: &self.event_sink,
+            node_id: &self.node_id,
+            clock: &self.clock,
+            config: &self.config,
+            active_commands: &self.active_commands,
+        };
+        let executor = executor_actions::ExecutorActions {
+            namespace: &self.provisioning_namespace,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            config: &self.config,
+            active_commands: &self.active_commands,
+            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
+            environment_manager: &self.environment_manager,
+            runner: &self.discovery.runner,
+            env: &self.discovery.env,
+            daemon_socket_path: &self.daemon_socket_path,
+            host_name: &self.host_name,
+            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
+        };
         match &command.action {
             CommandAction::ArtifactReserveLedgerComment { .. } => {
                 return boxed_action!(crew.execute_action_artifact_reserve_ledger_comment(id, &command))
@@ -5959,7 +5948,23 @@ impl InProcessDaemon {
             _ => {}
         }
 
-        executor_actions::ExecutorActions { port: self }.execute_provider_action(id, command, command_node_id, remote_executor).await
+        executor_actions::ExecutorActions {
+            namespace: &self.provisioning_namespace,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            config: &self.config,
+            active_commands: &self.active_commands,
+            observed_checkout_reconciliation: &self.observed_checkout_reconciliation,
+            environment_manager: &self.environment_manager,
+            runner: &self.discovery.runner,
+            env: &self.discovery.env,
+            daemon_socket_path: &self.daemon_socket_path,
+            host_name: &self.host_name,
+            events: action_events::ActionEvents { node_id: &self.node_id, sink: &self.event_sink },
+        }
+        .execute_provider_action(id, command, command_node_id, remote_executor)
+        .await
     }
 }
 
@@ -6093,7 +6098,19 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
-        projections_actions::ProjectionsActions { port: self }.execute_query(command, session_id).await
+        projections_actions::ProjectionsActions {
+            crew: &self.crew_ops,
+            port: self,
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            event_sink: &self.event_sink,
+            node_id: &self.node_id,
+            clock: &self.clock,
+            config: &self.config,
+            active_commands: &self.active_commands,
+        }
+        .execute_query(command, session_id)
+        .await
     }
 
     async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
@@ -6298,33 +6315,13 @@ impl InProcessDaemon {
         &self.environment_manager
     }
 }
+mod action_events;
+#[cfg(test)]
+use convoy_admission::PlacementResolution;
 mod forge_demands;
 
 #[async_trait]
 impl admission_actions::AdmissionActionPort for InProcessDaemon {
-    async fn repository_transport_url(&self, namespace: &str, repository: &RepositorySpec) -> Result<String, String> {
-        self.project_service().repository_transport_url(namespace, repository).await
-    }
-    async fn check_local_free_space_floor(&self) -> Result<(), String> {
-        InProcessDaemon::check_local_free_space_floor(self).await
-    }
-    async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
-        InProcessDaemon::check_remote_placement_free_space_floor(self, namespace, placement).await
-    }
-    fn convoy_admission(&self) -> &ConvoyAdmission {
-        &self.convoy_admission
-    }
-    fn event_sink(&self) -> &Arc<dyn EventSink> {
-        &self.event_sink
-    }
-    fn finish_context_free_command(
-        &self,
-        command_id: u64,
-        repo_identity: flotilla_protocol::RepoIdentity,
-        result: flotilla_protocol::CommandValue,
-    ) {
-        InProcessDaemon::finish_context_free_command(self, command_id, repo_identity, result)
-    }
     async fn inspect_adopted_checkout(
         &self,
         path: &Path,
@@ -6332,15 +6329,6 @@ impl admission_actions::AdmissionActionPort for InProcessDaemon {
         git_ref: Option<&str>,
     ) -> Result<RepositoryInspection, String> {
         InProcessDaemon::inspect_adopted_checkout(self, path, repository_url, git_ref).await
-    }
-    fn node_id(&self) -> &NodeId {
-        &self.node_id
-    }
-    fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>> {
-        &self.observed_checkout_reconciliation
-    }
-    fn observed_resource_backend(&self) -> &ResourceBackend {
-        &self.observed_resource_backend
     }
     async fn project_add(
         &self,
@@ -6357,37 +6345,11 @@ impl admission_actions::AdmissionActionPort for InProcessDaemon {
     async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
         InProcessDaemon::project_register(self, target).await
     }
-    async fn provisioning_namespace(&self) -> String {
-        InProcessDaemon::provisioning_namespace(self).await
-    }
-    async fn resolve_convoy_placement(
-        &self,
-        namespace: &str,
-        project_ref: Option<&str>,
-        repositories: &[ConvoyRepositorySpec],
-        workflow: &WorkflowTemplateSpec,
-        placement_policy: Option<&str>,
-        allow_unready: bool,
-    ) -> Result<PlacementResolution, String> {
-        InProcessDaemon::resolve_convoy_placement(self, namespace, project_ref, repositories, workflow, placement_policy, allow_unready)
-            .await
-    }
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         InProcessDaemon::resolve_repository_remote(self, remote).await
     }
-    fn resource_backend(&self) -> &ResourceBackend {
-        &self.resource_backend
-    }
     async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String> {
         InProcessDaemon::roll_convoy_ensure(self, namespace, name).await
-    }
-    async fn snapshot_project_repositories(
-        &self,
-        namespace: &str,
-        project_ref: &str,
-        selected: Option<&[RepositoryKey]>,
-    ) -> Result<Vec<ConvoyRepositorySpec>, String> {
-        InProcessDaemon::snapshot_project_repositories(self, namespace, project_ref, selected).await
     }
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool {
         if let Some(daemon) = self.self_weak.upgrade() {
@@ -6399,99 +6361,10 @@ impl admission_actions::AdmissionActionPort for InProcessDaemon {
             false
         }
     }
-    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
-        InProcessDaemon::start_context_free_command(self, command_id, description)
-    }
 }
 
 #[async_trait]
 impl crew_actions::CrewActionPort for InProcessDaemon {
-    fn clock(&self) -> &Arc<dyn Clock> {
-        &self.clock
-    }
-    async fn message_inbox(&self, namespace: &str) -> flotilla_store::MessageInbox {
-        InProcessDaemon::message_inbox(self, namespace).await
-    }
-    async fn convoy_resume_with_sender_internal(
-        &self,
-        namespace: &str,
-        name: &str,
-        prompt: &str,
-        requested_vessel: Option<&str>,
-        requested_role: Option<&str>,
-        attribution: MessageAttribution,
-    ) -> Result<ConvoyResumeOutcome, String> {
-        self.crew_ops.convoy_resume_with_sender_internal(namespace, name, prompt, requested_vessel, requested_role, attribution).await
-    }
-    async fn handoff_with_carries(
-        &self,
-        requested: &CrewCommandContext,
-        target: &str,
-        message: &str,
-        carries: Vec<flotilla_resources::MessageReference>,
-    ) -> Result<(), String> {
-        self.crew_ops.handoff_with_carries(requested, target, message, carries).await
-    }
-    async fn abandon_convoy_internal(
-        &self,
-        namespace: &str,
-        name: &str,
-        reason: &str,
-        principal_ref: Option<&PrincipalRef>,
-    ) -> Result<Vec<CheckoutArchiveOutcome>, String> {
-        InProcessDaemon::abandon_convoy_internal(self, namespace, name, reason, principal_ref).await
-    }
-    async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
-        InProcessDaemon::convoy_withdraw_pending_brief_internal(self, namespace, name).await
-    }
-    async fn crew_promise_internal(
-        &self,
-        requested: &CrewCommandContext,
-        operation: flotilla_protocol::commands::CrewPromiseOperation,
-    ) -> Result<(), String> {
-        self.crew_ops.promise(requested, operation).await
-    }
-    async fn crew_complete_as_principal_internal(
-        &self,
-        requested: &CrewCommandContext,
-        message: Option<String>,
-        disposition: Option<String>,
-        decision_ledger_ref: Option<String>,
-        force: bool,
-        principal: Option<PrincipalRef>,
-    ) -> Result<flotilla_protocol::CommandValue, String> {
-        InProcessDaemon::crew_complete_as_principal_internal(self, requested, message, disposition, decision_ledger_ref, force, principal)
-            .await
-    }
-    async fn crew_fail_internal(
-        &self,
-        requested: &CrewCommandContext,
-        message: String,
-        force: bool,
-        principal: Option<&PrincipalRef>,
-    ) -> Result<(), String> {
-        InProcessDaemon::crew_fail_internal(self, requested, message, force, principal).await
-    }
-    async fn crew_stall_internal(
-        &self,
-        requested: &CrewCommandContext,
-        reason: flotilla_protocol::StallReason,
-        proposed_disposition: Option<flotilla_protocol::StallProposedDisposition>,
-        message: String,
-    ) -> Result<(), String> {
-        InProcessDaemon::crew_stall_internal(self, requested, reason, proposed_disposition, message).await
-    }
-    async fn crew_supervise_internal(&self, request: CrewSupervisionRequest<'_>) -> Result<(), String> {
-        InProcessDaemon::crew_supervise_internal(self, request).await
-    }
-    fn finish_context_free_command(
-        &self,
-        command_id: u64,
-        repo_identity: flotilla_protocol::RepoIdentity,
-        result: flotilla_protocol::CommandValue,
-    ) {
-        InProcessDaemon::finish_context_free_command(self, command_id, repo_identity, result)
-    }
     async fn link_convoy_subject(
         &self,
         namespace: &str,
@@ -6501,40 +6374,12 @@ impl crew_actions::CrewActionPort for InProcessDaemon {
     ) -> Result<(), String> {
         InProcessDaemon::link_convoy_subject(self, namespace, convoy_name, reference, relationship).await
     }
-    async fn provisioning_namespace(&self) -> String {
-        InProcessDaemon::provisioning_namespace(self).await
-    }
-    async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
-        InProcessDaemon::reap_convoy_internal(self, namespace, name, force).await
-    }
-    async fn record_lifecycle_mutation_best_effort(
-        &self,
-        namespace: &str,
-        name: &str,
-        action: &str,
-        caller: Option<&flotilla_protocol::CommandCaller>,
-        missing_expected: bool,
-    ) {
-        InProcessDaemon::record_lifecycle_mutation_best_effort(self, namespace, name, action, caller, missing_expected).await
-    }
-    async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {
-        InProcessDaemon::resolve_crew_routing_context(self, requested).await
-    }
-    fn resource_backend(&self) -> &ResourceBackend {
-        &self.resource_backend
-    }
-    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
-        InProcessDaemon::start_context_free_command(self, command_id, description)
-    }
 }
 
 #[async_trait]
 impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
         self.attach_resolver().attach_project_context(selector).await
-    }
-    async fn message_contacts_internal(&self, requested: &CrewCommandContext) -> Result<flotilla_store::CrewAddressBook, String> {
-        self.crew_ops.message_contacts_internal(requested).await
     }
     async fn scoped_fleet_list(
         &self,
@@ -6556,9 +6401,6 @@ impl projections_actions::ProjectionsActionPort for InProcessDaemon {
         project_context: Option<&str>,
     ) -> Result<ResolvedAttach, String> {
         self.resolve_attach_with_context(reference, host, transient, mode, project_context).await
-    }
-    fn node_id(&self) -> &NodeId {
-        &self.node_id
     }
     async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
         self.list_projects_internal().await
@@ -6605,30 +6447,6 @@ impl projections_actions::ProjectionsActionPort for InProcessDaemon {
     async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
         self.dispatch_board_internal(project_filter).await
     }
-    async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
-        self.crew_list_internal(requested).await
-    }
-    async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {
-        self.crew_capabilities_internal(requested).await
-    }
-    fn config(&self) -> &Arc<ConfigStore> {
-        &self.config
-    }
-    fn clock(&self) -> &Arc<dyn Clock> {
-        &self.clock
-    }
-    fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>> {
-        &self.active_commands
-    }
-    fn event_sink(&self) -> &Arc<dyn EventSink> {
-        &self.event_sink
-    }
-    fn observed_resource_backend(&self) -> &ResourceBackend {
-        &self.observed_resource_backend
-    }
-    fn resource_backend(&self) -> &ResourceBackend {
-        &self.resource_backend
-    }
 }
 
 #[async_trait]
@@ -6650,32 +6468,11 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     async fn repository_registry(&self, repository: &ResourceObject<Repository>) -> Result<Arc<ProviderRegistry>, String> {
         Ok(Arc::clone(&InProcessDaemon::repository_providers(self, repository).await?.registry))
     }
-    fn host_name(&self) -> &HostName {
-        &self.host_name
-    }
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
         InProcessDaemon::executor_provider_data(self, repo_identity, _repo_root, registry).await
     }
     async fn execution_registry(&self, repository: &ResourceObject<Repository>, path: &Path) -> Result<Arc<ProviderRegistry>, String> {
         InProcessDaemon::execution_registry(self, repository, path).await
-    }
-    fn environment_manager(&self) -> &Arc<EnvironmentManager> {
-        &self.environment_manager
-    }
-    fn runner(&self) -> &Arc<dyn CommandRunner> {
-        &self.discovery.runner
-    }
-    fn env(&self) -> &Arc<dyn EnvVars> {
-        &self.discovery.env
-    }
-    fn daemon_socket_path(&self) -> &RwLock<Option<PathBuf>> {
-        &self.daemon_socket_path
-    }
-    fn config(&self) -> &Arc<ConfigStore> {
-        &self.config
-    }
-    fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>> {
-        &self.active_commands
     }
     async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String> {
         InProcessDaemon::add_repo(self, path).await
@@ -6690,37 +6487,14 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
         InProcessDaemon::detect_repo_identity(self, repo_path).await
     }
-    fn event_sink(&self) -> &Arc<dyn EventSink> {
-        &self.event_sink
-    }
-    fn finish_context_free_command(
-        &self,
-        command_id: u64,
-        repo_identity: flotilla_protocol::RepoIdentity,
-        result: flotilla_protocol::CommandValue,
-    ) {
-        InProcessDaemon::finish_context_free_command(self, command_id, repo_identity, result)
-    }
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String> {
         InProcessDaemon::local_checkout_for_repository(self, key).await
-    }
-    fn node_id(&self) -> &NodeId {
-        &self.node_id
-    }
-    fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>> {
-        &self.observed_checkout_reconciliation
-    }
-    fn observed_resource_backend(&self) -> &ResourceBackend {
-        &self.observed_resource_backend
     }
     async fn operator_reconciler(&self) -> Option<Arc<dyn OperatorReconciler>> {
         self.operator_reconciler.read().await.clone()
     }
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         InProcessDaemon::peer_connection_status(self, node_id).await
-    }
-    async fn provisioning_namespace(&self) -> String {
-        InProcessDaemon::provisioning_namespace(self).await
     }
     async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
         InProcessDaemon::refresh(self, repo).await
@@ -6736,12 +6510,6 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     }
     async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
         InProcessDaemon::resolve_repo_selector(self, selector).await
-    }
-    fn resource_backend(&self) -> &ResourceBackend {
-        &self.resource_backend
-    }
-    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
-        InProcessDaemon::start_context_free_command(self, command_id, description)
     }
     async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
         InProcessDaemon::tracked_repo_identity_for_path(self, repo_path).await

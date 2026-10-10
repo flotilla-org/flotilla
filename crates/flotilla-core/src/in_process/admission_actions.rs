@@ -11,20 +11,16 @@ use flotilla_protocol::Command;
 use flotilla_protocol::CommandAction;
 use flotilla_protocol::CommandValue;
 use flotilla_protocol::DaemonEvent;
-use flotilla_protocol::NodeId;
 use flotilla_protocol::PlacementDecision;
 use flotilla_protocol::PrincipalRef;
-use flotilla_protocol::RepoIdentity;
 use flotilla_resources::normalize_project_spec;
 use flotilla_resources::ConvoyRepositorySpec;
 use flotilla_resources::InputMeta;
 use flotilla_resources::Project;
 use flotilla_resources::Repository;
-use flotilla_resources::RepositoryKey;
 use flotilla_resources::RepositorySpec;
 use flotilla_resources::ResourceError;
 use flotilla_resources::WorkflowTemplate;
-use flotilla_resources::WorkflowTemplateSpec;
 use flotilla_resources::WriterIdentity;
 use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
@@ -33,7 +29,6 @@ use super::{
     create_adopted_checkout_resource, empty_repo_identity, parse_and_validate_workflow_template_yaml, parse_project_yaml,
     placement_target_host, AdoptedCheckoutRequest,
 };
-use crate::event_sink::EventSink;
 use crate::in_process::convoy_admission::allocate_convoy_generation;
 use crate::in_process::convoy_admission::convoy_record_name;
 use crate::in_process::convoy_admission::normalize_convoy_start_intent;
@@ -43,28 +38,21 @@ use crate::in_process::convoy_admission::ConvoyAdmission;
 use crate::in_process::convoy_admission::ConvoyCreateAdmission;
 use crate::in_process::convoy_admission::ConvoyStartKey;
 use crate::in_process::convoy_admission::ConvoyStartTask;
-use crate::in_process::convoy_admission::PlacementResolution;
 use crate::in_process::project_ops::is_declaration_backed_project;
 use crate::in_process::project_ops::validate_project_name;
 use crate::repository_inspection::RepositoryInspection;
 
+/// Repository/project integration and worker submission supplied by the host.
+/// Admission state, placement and disk refusals remain owned by ConvoyAdmission;
+/// handlers borrow that owner directly, including its complete transaction guard.
 #[async_trait]
 pub(super) trait AdmissionActionPort: Send + Sync {
-    async fn repository_transport_url(&self, namespace: &str, repository: &RepositorySpec) -> Result<String, String>;
-    async fn check_local_free_space_floor(&self) -> Result<(), String>;
-    async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String>;
-    fn convoy_admission(&self) -> &ConvoyAdmission;
-    fn event_sink(&self) -> &Arc<dyn EventSink>;
-    fn finish_context_free_command(&self, command_id: u64, repo_identity: RepoIdentity, result: CommandValue);
     async fn inspect_adopted_checkout(
         &self,
         path: &Path,
         repository_url: Option<&str>,
         git_ref: Option<&str>,
     ) -> Result<RepositoryInspection, String>;
-    fn node_id(&self) -> &NodeId;
-    fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>>;
-    fn observed_resource_backend(&self) -> &ResourceBackend;
     async fn project_add(
         &self,
         target: &str,
@@ -74,44 +62,35 @@ pub(super) trait AdmissionActionPort: Send + Sync {
     ) -> Result<String, String>;
     async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String>;
     async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
-    async fn provisioning_namespace(&self) -> String;
-    async fn resolve_convoy_placement(
-        &self,
-        namespace: &str,
-        project_ref: Option<&str>,
-        repositories: &[ConvoyRepositorySpec],
-        workflow: &WorkflowTemplateSpec,
-        placement_policy: Option<&str>,
-        allow_unready: bool,
-    ) -> Result<PlacementResolution, String>;
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
-    fn resource_backend(&self) -> &ResourceBackend;
     async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
-    async fn snapshot_project_repositories(
-        &self,
-        namespace: &str,
-        project_ref: &str,
-        selected: Option<&[RepositoryKey]>,
-    ) -> Result<Vec<ConvoyRepositorySpec>, String>;
     fn spawn_convoy_start(&self, task: ConvoyStartTask) -> bool;
-    fn start_context_free_command(&self, command_id: u64, description: String) -> RepoIdentity;
 }
 
 pub(super) struct AdmissionActions<'a> {
     pub(super) port: &'a dyn AdmissionActionPort,
+    pub(super) namespace: &'a std::sync::RwLock<String>,
+    pub(super) resource_backend: &'a ResourceBackend,
+    pub(super) observed_resource_backend: &'a ResourceBackend,
+    pub(super) observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
+    pub(super) convoy_admission: &'a ConvoyAdmission,
+    pub(super) events: super::action_events::ActionEvents<'a>,
 }
 
 impl AdmissionActions<'_> {
+    async fn provisioning_namespace(&self) -> String {
+        self.namespace.read().expect("provisioning namespace lock poisoned").clone()
+    }
     pub(super) async fn execute_action_ensure_roll(&self, id: u64, command: &Command) -> Result<u64, String> {
         let CommandAction::ConvoyEnsureRoll { namespace, name } = &command.action else {
             return Err("ensure roll selected the wrong handler".into());
         };
-        let identity = self.port.start_context_free_command(id, command.description().to_string());
+        let identity = self.events.start(id, command.description().to_string());
         let result = match self.port.roll_convoy_ensure(namespace, name).await {
             Ok(message) => CommandValue::ResourceReconciled { resource_kind: "ConvoyEnsure".into(), name: name.clone(), message },
             Err(message) => CommandValue::Error { message },
         };
-        self.port.finish_context_free_command(id, identity, result);
+        self.events.finish(id, identity, result);
         Ok(id)
     }
 
@@ -123,21 +102,21 @@ impl AdmissionActions<'_> {
     ) -> Result<u64, String> {
         let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let CommandAction::ConvoyStart { intent } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
-            let acting_namespace = self.port.provisioning_namespace().await;
+            let empty_identity = self.events.start(id, command.description().to_string());
+            let acting_namespace = self.provisioning_namespace().await;
             let default_namespace = intent.namespace.clone().unwrap_or_else(|| acting_namespace.clone());
             let (namespace, intent) = match normalize_convoy_start_intent(&default_namespace, intent) {
                 Ok(resolved) => resolved,
                 Err(message) => {
-                    self.port.finish_context_free_command(id, empty_identity, CommandValue::Error { message });
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
                     return Ok(id);
                 }
             };
             let dispatching_principal_ref =
                 dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&acting_namespace));
             let key = ConvoyStartKey::new(namespace, &intent);
-            if !self.port.convoy_admission().mark_pending(key.clone()).await {
-                self.port.finish_context_free_command(
+            if !self.convoy_admission.mark_pending(key.clone()).await {
+                self.events.finish(
                     id,
                     empty_identity,
                     CommandValue::Error { message: format!("convoy start for project {} is already in progress", intent.project_ref) },
@@ -151,12 +130,8 @@ impl AdmissionActions<'_> {
                 .dispatching_principal_ref(dispatching_principal_ref)
                 .build();
             if !self.port.spawn_convoy_start(task) {
-                self.port.convoy_admission().clear_pending(&key).await;
-                self.port.finish_context_free_command(
-                    id,
-                    empty_identity,
-                    CommandValue::Error { message: "convoy start worker is unavailable".to_string() },
-                );
+                self.convoy_admission.clear_pending(&key).await;
+                self.events.finish(id, empty_identity, CommandValue::Error { message: "convoy start worker is unavailable".to_string() });
             }
             return Ok(id);
         }
@@ -182,32 +157,32 @@ impl AdmissionActions<'_> {
         } = &command.action
         {
             let empty_identity = empty_repo_identity();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
             });
-            let namespace = self.port.provisioning_namespace().await;
+            let namespace = self.provisioning_namespace().await;
             let role = name.clone();
             let project_identity = project_ref.as_deref();
             if let Err(message) = validate_convoy_name(&role) {
                 let result = CommandValue::Error { message };
-                self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                self.events.sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
-                    node_id: self.port.node_id().clone(),
+                    node_id: self.events.node_id.clone(),
                     repo_identity: empty_identity,
                     repo: None,
                     result,
                 });
                 return Ok(id);
             }
-            if let Err(message) = self.port.check_local_free_space_floor().await {
+            if let Err(message) = self.convoy_admission.check_local_free_space_floor().await {
                 let result = CommandValue::Error { message };
-                self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                self.events.sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
-                    node_id: self.port.node_id().clone(),
+                    node_id: self.events.node_id.clone(),
                     repo_identity: empty_identity,
                     repo: None,
                     result,
@@ -216,12 +191,12 @@ impl AdmissionActions<'_> {
             }
             // Use the admission transaction before checking identity or writing
             // adopted checkout resources. A duplicate must have no side effects.
-            let admission_guard = self.port.convoy_admission().lock().await;
-            if let Err(message) = allocate_convoy_generation(self.port.resource_backend(), &namespace, project_identity, &role).await {
+            let admission_guard = self.convoy_admission.lock().await;
+            if let Err(message) = allocate_convoy_generation(self.resource_backend, &namespace, project_identity, &role).await {
                 let result = CommandValue::Error { message };
-                self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                self.events.sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
-                    node_id: self.port.node_id().clone(),
+                    node_id: self.events.node_id.clone(),
                     repo_identity: empty_identity,
                     repo: None,
                     result,
@@ -231,8 +206,7 @@ impl AdmissionActions<'_> {
             let record_name = convoy_record_name();
             let name = &record_name;
             let mut workflow = match self
-                .port
-                .resource_backend()
+                .resource_backend
                 .clone()
                 .including_replicas::<WorkflowTemplate>(&namespace)
                 .get(workflow_ref)
@@ -242,9 +216,9 @@ impl AdmissionActions<'_> {
             {
                 Ok(workflow) => workflow,
                 Err(message) => {
-                    self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                    self.events.sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
-                        node_id: self.port.node_id().clone(),
+                        node_id: self.events.node_id.clone(),
                         repo_identity: empty_identity,
                         repo: None,
                         result: CommandValue::Error { message },
@@ -253,12 +227,14 @@ impl AdmissionActions<'_> {
                 }
             };
             let project_repositories = if let Some(project_ref) = project_ref {
-                match self.port.snapshot_project_repositories(&namespace, project_ref, None).await {
+                match super::project_ops::snapshot_project_repositories_with_backend(self.resource_backend, &namespace, project_ref, None)
+                    .await
+                {
                     Ok(repositories) => Some(repositories),
                     Err(message) => {
-                        self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                        self.events.sink.emit(DaemonEvent::CommandFinished {
                             command_id: id,
-                            node_id: self.port.node_id().clone(),
+                            node_id: self.events.node_id.clone(),
                             repo_identity: empty_identity,
                             repo: None,
                             result: CommandValue::Error { message },
@@ -271,9 +247,9 @@ impl AdmissionActions<'_> {
             };
             if project_repositories.is_some() && repository_url.is_some() {
                 let message = "convoy repository selection is not allowed when a project is supplied".to_string();
-                self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                self.events.sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
-                    node_id: self.port.node_id().clone(),
+                    node_id: self.events.node_id.clone(),
                     repo_identity: empty_identity,
                     repo: None,
                     result: CommandValue::Error { message },
@@ -293,10 +269,10 @@ impl AdmissionActions<'_> {
                             .as_deref()
                             .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
                         let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
-                        let _reconciliation = self.port.observed_checkout_reconciliation().lock().await;
+                        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                         let (checkout_ref, inferred_repository_url, inferred_ref) = create_adopted_checkout_resource(
-                            self.port.resource_backend(),
-                            self.port.observed_resource_backend(),
+                            self.resource_backend,
+                            self.observed_resource_backend,
                             AdoptedCheckoutRequest::builder()
                                 .namespace(&namespace)
                                 .convoy_name(name)
@@ -321,9 +297,9 @@ impl AdmissionActions<'_> {
                         }
                         Err(message) => {
                             let result = CommandValue::Error { message };
-                            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                            self.events.sink.emit(DaemonEvent::CommandFinished {
                                 command_id: id,
-                                node_id: self.port.node_id().clone(),
+                                node_id: self.events.node_id.clone(),
                                 repo_identity: empty_identity,
                                 repo: None,
                                 result,
@@ -339,10 +315,12 @@ impl AdmissionActions<'_> {
             } else if let Some(url) = direct_repository_url {
                 let resolved = async {
                     let repository_spec = self.port.resolve_repository_remote(&url).await?;
-                    let canonical_url = self.port.repository_transport_url(&namespace, &repository_spec).await?;
+                    let canonical_url =
+                        super::project_ops::repository_transport_url_with_backend(self.resource_backend, &namespace, &repository_spec)
+                            .await?;
                     let repo_ref = repository_spec.key();
                     let repository = flotilla_store::ensure_repository(
-                        &self.port.resource_backend().clone().using::<Repository>(&namespace),
+                        &self.resource_backend.clone().using::<Repository>(&namespace),
                         &repo_ref,
                         &repository_spec,
                     )
@@ -370,9 +348,9 @@ impl AdmissionActions<'_> {
                 match resolved {
                     Ok(repositories) => repositories,
                     Err(message) => {
-                        self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                        self.events.sink.emit(DaemonEvent::CommandFinished {
                             command_id: id,
-                            node_id: self.port.node_id().clone(),
+                            node_id: self.events.node_id.clone(),
                             repo_identity: empty_identity,
                             repo: None,
                             result: CommandValue::Error { message },
@@ -389,9 +367,9 @@ impl AdmissionActions<'_> {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
                     let message =
                         format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
-                    self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                    self.events.sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
-                        node_id: self.port.node_id().clone(),
+                        node_id: self.events.node_id.clone(),
                         repo_identity: empty_identity,
                         repo: None,
                         result: CommandValue::Error { message },
@@ -401,7 +379,7 @@ impl AdmissionActions<'_> {
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
             }
             let placement = match self
-                .port
+                .convoy_admission
                 .resolve_convoy_placement(
                     &namespace,
                     project_ref.as_deref(),
@@ -414,9 +392,9 @@ impl AdmissionActions<'_> {
             {
                 Ok(placement) => placement,
                 Err(message) => {
-                    self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                    self.events.sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
-                        node_id: self.port.node_id().clone(),
+                        node_id: self.events.node_id.clone(),
                         repo_identity: empty_identity,
                         repo: None,
                         result: CommandValue::Error { message },
@@ -425,7 +403,7 @@ impl AdmissionActions<'_> {
                 }
             };
             let credential_result = resolve_and_validate_workflow_credentials(
-                self.port.resource_backend(),
+                self.resource_backend,
                 &namespace,
                 project_ref.as_deref(),
                 &repositories,
@@ -434,9 +412,9 @@ impl AdmissionActions<'_> {
             )
             .await;
             if let Err(message) = credential_result {
-                self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                self.events.sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
-                    node_id: self.port.node_id().clone(),
+                    node_id: self.events.node_id.clone(),
                     repo_identity: empty_identity,
                     repo: None,
                     result: CommandValue::Error { message },
@@ -444,7 +422,7 @@ impl AdmissionActions<'_> {
                 return Ok(id);
             }
             let placement_decision = match placement.selected.as_ref() {
-                Some(selected) => match placement_target_host(self.port.resource_backend(), &namespace, selected).await {
+                Some(selected) => match placement_target_host(self.resource_backend, &namespace, selected).await {
                     Ok(target_host) => Some(PlacementDecision {
                         minimal_alternatives: Vec::new(),
                         escalation_reason: None,
@@ -455,9 +433,9 @@ impl AdmissionActions<'_> {
                         allocation: placement.allocation.clone(),
                     }),
                     Err(message) => {
-                        self.port.event_sink().emit(DaemonEvent::CommandFinished {
+                        self.events.sink.emit(DaemonEvent::CommandFinished {
                             command_id: id,
-                            node_id: self.port.node_id().clone(),
+                            node_id: self.events.node_id.clone(),
                             repo_identity: empty_identity,
                             repo: None,
                             result: CommandValue::Error { message },
@@ -467,10 +445,12 @@ impl AdmissionActions<'_> {
                 },
                 None => None,
             };
-            if let Err(message) = self.port.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
-                self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            if let Err(message) =
+                self.convoy_admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await
+            {
+                self.events.sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
-                    node_id: self.port.node_id().clone(),
+                    node_id: self.events.node_id.clone(),
                     repo_identity: empty_identity,
                     repo: None,
                     result: CommandValue::Error { message },
@@ -478,8 +458,7 @@ impl AdmissionActions<'_> {
                 return Ok(id);
             }
             let result = self
-                .port
-                .convoy_admission()
+                .convoy_admission
                 .admit_created_convoy(
                     ConvoyCreateAdmission::builder()
                         .namespace(&namespace)
@@ -500,9 +479,9 @@ impl AdmissionActions<'_> {
                     admission_guard,
                 )
                 .await;
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -515,15 +494,15 @@ impl AdmissionActions<'_> {
     pub(super) async fn execute_action_workflow_template_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
             });
-            let namespace = self.port.provisioning_namespace().await;
-            let templates = self.port.resource_backend().clone().using::<WorkflowTemplate>(&namespace);
+            let namespace = self.provisioning_namespace().await;
+            let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
             let result = match parse_and_validate_workflow_template_yaml(spec_yaml) {
                 Ok(spec) => {
                     let meta = InputMeta::builder().name(name.clone()).build();
@@ -539,9 +518,9 @@ impl AdmissionActions<'_> {
                 }
                 Err(err) => CommandValue::Error { message: err },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -554,9 +533,9 @@ impl AdmissionActions<'_> {
     pub(super) async fn execute_action_project_add(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
             let empty_identity = empty_repo_identity();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
@@ -565,9 +544,9 @@ impl AdmissionActions<'_> {
                 Ok(name) => CommandValue::ProjectAdded { name },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -580,15 +559,15 @@ impl AdmissionActions<'_> {
     pub(super) async fn execute_action_project_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
             });
-            let namespace = self.port.provisioning_namespace().await;
-            let projects = self.port.resource_backend().clone().definitions::<Project>(&namespace);
+            let namespace = self.provisioning_namespace().await;
+            let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
             let result = match validate_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
@@ -625,9 +604,9 @@ impl AdmissionActions<'_> {
                 },
                 Err(err) => CommandValue::Error { message: err },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -640,9 +619,9 @@ impl AdmissionActions<'_> {
     pub(super) async fn execute_action_project_register(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectRegister { target } = &command.action {
             let empty_identity = empty_repo_identity();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
@@ -651,9 +630,9 @@ impl AdmissionActions<'_> {
                 Ok((name, members)) => CommandValue::ProjectRegistered { name, members },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -666,9 +645,9 @@ impl AdmissionActions<'_> {
     pub(super) async fn execute_action_project_refresh(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ProjectRefresh { name } = &command.action {
             let empty_identity = empty_repo_identity();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
@@ -679,9 +658,9 @@ impl AdmissionActions<'_> {
                 }
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -691,3 +670,6 @@ impl AdmissionActions<'_> {
         Err("ProjectRefresh action selected the wrong handler".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -43,7 +43,6 @@ use super::{
 };
 use crate::config::ConfigStore;
 use crate::environment_manager::EnvironmentManager;
-use crate::event_sink::EventSink;
 use crate::executor;
 use crate::providers::discovery::EnvVars;
 use crate::providers::registry::ProviderRegistry;
@@ -51,6 +50,9 @@ use crate::providers::CommandRunner;
 use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepExecutor;
 
+/// Host-owned provider discovery, repository administration and intent admission.
+/// Execution collaborators and shared resource/cancellation state are supplied
+/// directly; the port contains only orchestration that remains owned by the host.
 #[async_trait]
 pub(super) trait ExecutorActionPort: Send + Sync {
     async fn post_install_cleat(
@@ -62,45 +64,45 @@ pub(super) trait ExecutorActionPort: Send + Sync {
     fn vcs_resolver(&self) -> Result<Arc<dyn crate::vcs::CheckoutVcsResolver>, String>;
     async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String>;
     async fn repository_registry(&self, repository: &ResourceObject<Repository>) -> Result<Arc<ProviderRegistry>, String>;
-    fn host_name(&self) -> &HostName;
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData;
     async fn execution_registry(&self, repository: &ResourceObject<Repository>, path: &Path) -> Result<Arc<ProviderRegistry>, String>;
-    fn environment_manager(&self) -> &Arc<EnvironmentManager>;
-    fn runner(&self) -> &Arc<dyn CommandRunner>;
-    fn env(&self) -> &Arc<dyn EnvVars>;
-    fn daemon_socket_path(&self) -> &RwLock<Option<PathBuf>>;
-    fn config(&self) -> &Arc<ConfigStore>;
-    fn active_commands(&self) -> &Arc<Mutex<HashMap<u64, CancellationToken>>>;
     async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String>;
     async fn apply_intent_document(&self, namespace: &str, document: serde_json::Value) -> Result<DynamicResourceObject, ResourceError>;
     async fn detect_repo_identity(&self, repo_path: &Path) -> RepoIdentity;
-    fn event_sink(&self) -> &Arc<dyn EventSink>;
-    fn finish_context_free_command(&self, command_id: u64, repo_identity: RepoIdentity, result: CommandValue);
     async fn local_checkout_for_repository(&self, key: &RepositoryKey) -> Result<Option<PathBuf>, String>;
-    fn node_id(&self) -> &NodeId;
-    fn observed_checkout_reconciliation(&self) -> &Arc<Mutex<()>>;
-    fn observed_resource_backend(&self) -> &ResourceBackend;
     async fn operator_reconciler(&self) -> Option<Arc<dyn OperatorReconciler>>;
     async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState;
-    async fn provisioning_namespace(&self) -> String;
     async fn refresh(&self, repo: &RepoSelector) -> Result<Option<RepositoryIdentityChange>, String>;
     async fn remove_repo(&self, path: &Path) -> Result<(), String>;
     async fn repository_for_selector(&self, selector: &RepoSelector) -> Result<ResourceObject<Repository>, String>;
     fn resolve_observation_root_selector(&self, selector: &RepoSelector) -> Result<PathBuf, String>;
     async fn resolve_repo_selector(&self, selector: &RepoSelector) -> Result<PathBuf, String>;
-    fn resource_backend(&self) -> &ResourceBackend;
-    fn start_context_free_command(&self, command_id: u64, description: String) -> RepoIdentity;
     async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<RepoIdentity>;
 }
 
 pub(super) struct ExecutorActions<'a> {
     pub(super) port: &'a dyn ExecutorActionPort,
+    pub(super) namespace: &'a std::sync::RwLock<String>,
+    pub(super) resource_backend: &'a ResourceBackend,
+    pub(super) observed_resource_backend: &'a ResourceBackend,
+    pub(super) config: &'a Arc<ConfigStore>,
+    pub(super) active_commands: &'a Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    pub(super) observed_checkout_reconciliation: &'a Arc<Mutex<()>>,
+    pub(super) environment_manager: &'a Arc<EnvironmentManager>,
+    pub(super) runner: &'a Arc<dyn CommandRunner>,
+    pub(super) env: &'a Arc<dyn EnvVars>,
+    pub(super) daemon_socket_path: &'a RwLock<Option<PathBuf>>,
+    pub(super) host_name: &'a HostName,
+    pub(super) events: super::action_events::ActionEvents<'a>,
 }
 
 impl ExecutorActions<'_> {
+    async fn provisioning_namespace(&self) -> String {
+        self.namespace.read().expect("provisioning namespace lock poisoned").clone()
+    }
     pub(super) async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceApply { namespace, document } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
+            let empty_identity = self.events.start(id, command.description().to_string());
             // Artifact reservations and Message admission can race status writers.
             // Both mutations are replay-safe; retain a bounded conflict budget.
             let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
@@ -115,7 +117,7 @@ impl ExecutorActions<'_> {
                 })),
                 Err(error) => CommandValue::Error { message: error.to_string() },
             };
-            self.port.finish_context_free_command(id, empty_identity, result);
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ResourceApply action selected the wrong handler".to_string())
@@ -123,8 +125,8 @@ impl ExecutorActions<'_> {
 
     pub(super) async fn execute_action_repository_remote_remove(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
-            let repositories = self.port.resource_backend().clone().using::<Repository>(namespace);
+            let empty_identity = self.events.start(id, command.description().to_string());
+            let repositories = self.resource_backend.clone().using::<Repository>(namespace);
             let result = match repositories.get(name).await {
                 Ok(repository) => match repository.spec.clone().remove_remote(remote) {
                     Ok(spec) => match repositories
@@ -138,7 +140,7 @@ impl ExecutorActions<'_> {
                 },
                 Err(error) => CommandValue::Error { message: error.to_string() },
             };
-            self.port.finish_context_free_command(id, empty_identity, result);
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("RepositoryRemoteRemove action selected the wrong handler".to_string())
@@ -146,9 +148,9 @@ impl ExecutorActions<'_> {
 
     pub(super) async fn execute_action_resource_manifest_resolve(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
-            let result = request_manifest_resolution(self.port.resource_backend(), namespace, kind, name, *resolution, requested_by).await;
-            self.port.finish_context_free_command(
+            let empty_identity = self.events.start(id, command.description().to_string());
+            let result = request_manifest_resolution(self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
+            self.events.finish(
                 id,
                 empty_identity,
                 match result {
@@ -163,7 +165,7 @@ impl ExecutorActions<'_> {
 
     pub(super) async fn execute_action_resource_reconcile_now(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
+            let empty_identity = self.events.start(id, command.description().to_string());
             let result = match self.port.operator_reconciler().await {
                 Some(reconciler) => match reconciler.reconcile_now(namespace, kind, name).await {
                     Ok(message) => CommandValue::ResourceReconciled { resource_kind: kind.clone(), name: name.clone(), message },
@@ -171,7 +173,7 @@ impl ExecutorActions<'_> {
                 },
                 None => CommandValue::Error { message: "operator reconciliation is unavailable before runtime startup".to_string() },
             };
-            self.port.finish_context_free_command(id, empty_identity, result);
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ResourceReconcileNow action selected the wrong handler".to_string())
@@ -179,20 +181,13 @@ impl ExecutorActions<'_> {
 
     pub(super) async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
+            let empty_identity = self.events.start(id, command.description().to_string());
             let patched = match expected_resource_version {
                 Some(expected) => {
-                    flotilla_store::patch_resource_status_if_version(
-                        self.port.resource_backend(),
-                        namespace,
-                        kind,
-                        name,
-                        status.clone(),
-                        expected,
-                    )
-                    .await
+                    flotilla_store::patch_resource_status_if_version(self.resource_backend, namespace, kind, name, status.clone(), expected)
+                        .await
                 }
-                None => flotilla_store::patch_resource_status(self.port.resource_backend(), namespace, kind, name, status.clone()).await,
+                None => flotilla_store::patch_resource_status(self.resource_backend, namespace, kind, name, status.clone()).await,
             };
             let result = match patched {
                 Ok(patched) => CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
@@ -204,7 +199,7 @@ impl ExecutorActions<'_> {
                 })),
                 Err(error) => CommandValue::Error { message: error.to_string() },
             };
-            self.port.finish_context_free_command(id, empty_identity, result);
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ResourceStatusPatch action selected the wrong handler".to_string())
@@ -212,14 +207,14 @@ impl ExecutorActions<'_> {
 
     pub(super) async fn execute_action_resource_delete(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
-            let empty_identity = self.port.start_context_free_command(id, command.description().to_string());
+            let empty_identity = self.events.start(id, command.description().to_string());
             let result = if let Some(origin_root) = replica_origin {
                 let deleted = if self.port.peer_connection_status(origin_root).await == PeerConnectionState::Connected {
                     Err(ResourceError::invalid(format!(
                         "replica origin {origin_root} is connected; delete the authoritative resource instead"
                     )))
                 } else {
-                    flotilla_store::collect_resource_replica_kind(self.port.resource_backend(), namespace, kind, name, origin_root).await
+                    flotilla_store::collect_resource_replica_kind(self.resource_backend, namespace, kind, name, origin_root).await
                 };
                 match deleted {
                     Ok(deleted) => CommandValue::ResourceDeleted(Box::new(ResourceJsonResponse {
@@ -233,13 +228,13 @@ impl ExecutorActions<'_> {
                 }
             } else {
                 // Serialize deletion and cleanup with adopted checkout writes.
-                let _reconciliation = self.port.observed_checkout_reconciliation().lock().await;
+                let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                 let deleted = async {
-                    let deleted = flotilla_store::delete_resource_kind(self.port.resource_backend(), namespace, kind, name).await?;
+                    let deleted = flotilla_store::delete_resource_kind(self.resource_backend, namespace, kind, name).await?;
                     if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
                         crate::observed_resources::delete_stale_adopted_checkouts(
-                            self.port.resource_backend(),
-                            self.port.observed_resource_backend(),
+                            self.resource_backend,
+                            self.observed_resource_backend,
                             namespace,
                         )
                         .await?;
@@ -265,7 +260,7 @@ impl ExecutorActions<'_> {
                     Err(error) => CommandValue::Error { message: error.to_string() },
                 }
             };
-            self.port.finish_context_free_command(id, empty_identity, result);
+            self.events.finish(id, empty_identity, result);
             return Ok(id);
         }
         Err("ResourceDelete action selected the wrong handler".to_string())
@@ -274,18 +269,17 @@ impl ExecutorActions<'_> {
     pub(super) async fn execute_action_refresh_all(&self, id: u64, command: &Command) -> Result<u64, String> {
         if matches!(command.action, CommandAction::Refresh { repo: None }) {
             let repositories = self
-                .port
-                .resource_backend()
-                .including_replicas::<Repository>(&self.port.provisioning_namespace().await)
+                .resource_backend
+                .including_replicas::<Repository>(&self.provisioning_namespace().await)
                 .list()
                 .await
                 .map_err(|error| error.to_string())?
                 .items;
             let repo_identity = empty_repo_identity();
             let description = command.description().to_string();
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: None,
                 description,
@@ -309,9 +303,9 @@ impl ExecutorActions<'_> {
                 Ok(()) => CommandValue::Refreshed { repos: refreshed, repository_count: repositories.len(), identity_changes },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity,
                 repo: None,
                 result,
@@ -326,9 +320,9 @@ impl ExecutorActions<'_> {
             let description = command.description().to_string();
             let repo_path = path.clone();
             let repo_identity = self.port.detect_repo_identity(path).await;
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: Some(repo_path.clone()),
                 description,
@@ -341,9 +335,9 @@ impl ExecutorActions<'_> {
                 },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: self.port.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
                 repo: Some(repo_path),
                 result,
@@ -362,9 +356,9 @@ impl ExecutorActions<'_> {
             let description = command.description().to_string();
             let repo_identity =
                 self.port.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: Some(repo_path.clone()),
                 description,
@@ -373,9 +367,9 @@ impl ExecutorActions<'_> {
                 Ok(()) => CommandValue::RepoUntracked { path: repo_path.clone() },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity,
                 repo: Some(repo_path),
                 result,
@@ -391,9 +385,9 @@ impl ExecutorActions<'_> {
             let repo_path = self.port.local_checkout_for_repository(&repository.spec.key()).await?;
             let description = command.description().to_string();
             let repo_identity = repository_operations::repository_event_identity(&repository.spec, repo_path.as_deref());
-            self.port.event_sink().emit(DaemonEvent::CommandStarted {
+            self.events.sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: repo_path.clone(),
                 description,
@@ -406,9 +400,9 @@ impl ExecutorActions<'_> {
                 },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.event_sink().emit(DaemonEvent::CommandFinished {
+            self.events.sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
-                node_id: self.port.node_id().clone(),
+                node_id: self.events.node_id.clone(),
                 repo_identity,
                 repo: repo_path,
                 result,
@@ -429,9 +423,9 @@ impl ExecutorActions<'_> {
     ) -> Result<u64, String> {
         // Gather what the spawned task needs — validate repo before broadcasting
         let repo = self.port.resolve_repo_for_command(&command).await?;
-        let runner = Arc::clone(self.port.runner());
-        let env = Arc::clone(self.port.env());
-        let event_sink = self.port.event_sink().clone();
+        let runner = Arc::clone(self.runner);
+        let env = Arc::clone(self.env);
+        let event_sink = self.events.sink.clone();
         let repository = self.port.repository_for_selector(&RepoSelector::Path(repo.clone())).await?;
         let repo_identity = repository_operations::repository_event_identity(&repository.spec, None);
         let registry = self.port.execution_registry(&repository, &repo).await?;
@@ -439,16 +433,16 @@ impl ExecutorActions<'_> {
 
         let description = command.description().to_string();
         let repo_path = repo.to_path_buf();
-        let config_base = DaemonHostPath::new(self.port.config().base_path().as_path());
+        let config_base = DaemonHostPath::new(self.config.base_path().as_path());
 
-        let active_ref = Arc::clone(self.port.active_commands());
+        let active_ref = Arc::clone(self.active_commands);
         let token = CancellationToken::new();
         {
             let mut guard = active_ref.lock().await;
             guard.insert(id, token.clone());
         }
 
-        self.port.event_sink().emit(DaemonEvent::CommandStarted {
+        self.events.sink.emit(DaemonEvent::CommandStarted {
             command_id: id,
             node_id: command_node_id.clone(),
             repo_identity: repo_identity.clone(),
@@ -456,10 +450,10 @@ impl ExecutorActions<'_> {
             description,
         });
 
-        let local_host = self.port.host_name().clone();
-        let local_node_id = self.port.node_id().clone();
-        let daemon_socket_path = self.port.daemon_socket_path().read().await.clone();
-        let environment_manager = Arc::clone(self.port.environment_manager());
+        let local_host = self.host_name.clone();
+        let local_node_id = self.events.node_id.clone();
+        let daemon_socket_path = self.daemon_socket_path.read().await.clone();
+        let environment_manager = Arc::clone(self.environment_manager);
         let vcs_resolver = self.port.vcs_resolver()?;
         tokio::spawn(async move {
             let resolver_registry = Arc::clone(&registry);
@@ -540,9 +534,9 @@ impl ExecutorActions<'_> {
         let identity = repository_operations::repository_event_identity(&repository.spec, None);
         let registry = self.port.repository_registry(&repository).await?;
         let action = command.action.clone();
-        let event_sink = self.port.event_sink().clone();
-        let node_id = self.port.node_id().clone();
-        let active_commands = Arc::clone(self.port.active_commands());
+        let event_sink = self.events.sink.clone();
+        let node_id = self.events.node_id.clone();
+        let active_commands = Arc::clone(self.active_commands);
         let cancel = CancellationToken::new();
         active_commands.lock().await.insert(command_id, cancel.clone());
         event_sink.emit(DaemonEvent::CommandStarted {
@@ -593,7 +587,7 @@ impl ExecutorActions<'_> {
 impl ExecutorActions<'_> {
     pub(super) async fn execute_action_fleet_post_install(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let CommandAction::FleetPostInstall { cleat_bin, generation, diagnostics_dir } = &command.action {
-            let identity = self.port.start_context_free_command(id, command.description().to_string());
+            let identity = self.events.start(id, command.description().to_string());
             let result = match self.port.post_install_cleat(cleat_bin, generation, diagnostics_dir).await {
                 Ok(report) => CommandValue::FleetPostInstall {
                     failed: report.failed(),
@@ -601,7 +595,7 @@ impl ExecutorActions<'_> {
                 },
                 Err(message) => CommandValue::Error { message },
             };
-            self.port.finish_context_free_command(id, identity, result);
+            self.events.finish(id, identity, result);
             return Ok(id);
         }
 
