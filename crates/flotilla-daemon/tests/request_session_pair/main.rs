@@ -4422,6 +4422,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     assert_eq!(response.rows[0].evidence, "GitHub rate limit");
 }
 
+mod forge_reads;
 mod image_layers;
 
 // Project roles retain a home before admission or launch. The ordinary router

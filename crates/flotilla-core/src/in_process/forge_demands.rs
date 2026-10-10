@@ -17,6 +17,12 @@ impl crate::in_process::InProcessDaemon {
             *demanded_at = (*demanded_at).max(record.object.spec.demanded_at);
         }
         for record in backend.including_replicas::<ForgeRead>(&namespace).list().await.map_err(|e| e.to_string())?.items {
+            // Previous-generation incremental demands remain decodable but are
+            // no longer serviced or renewed. Idle retention reaps their pairs.
+            // Remove this servicing shim one fleet roll after #2997 ships.
+            if matches!(record.object.spec.request, ForgeReadRequest::Changes { .. }) {
+                continue;
+            }
             let demanded_at = demands
                 .get(&record.object.metadata.name)
                 .copied()
