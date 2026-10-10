@@ -131,6 +131,7 @@ manifest = {
             "name": "flotilla",
             "repository": "https://github.com/flotilla-org/flotilla.git",
             "revision": os.environ["FLEET_FLOTILLA_SHA"],
+            "paths": ["skills"],
         },
     ],
 }
