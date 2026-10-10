@@ -17,7 +17,9 @@ C_FREE_BASE = frozenset({
 RESOURCE_EXEMPTIONS = frozenset({
     "flotilla-client", "flotilla-manifest", "flotilla-tui", "flotilla",
 })
-# C compiler drivers catch future C-building anchors without naming the anchor.
+# Known C packages and compiler drivers catch new anchors that reach them.
+# This is a metadata deny list, not build-script analysis: crates invoking a
+# compiler without these drivers need an explicit entry when introduced.
 C_BUILD_PACKAGES = frozenset({
     "rusqlite", "libsqlite3-sys", "ring", "cc", "cmake", "autotools",
     "aws-lc-sys", "openssl-sys", "libgit2-sys", "zstd-sys",
@@ -25,7 +27,7 @@ C_BUILD_PACKAGES = frozenset({
 
 
 def c_free_violations(name, tree):
-    if name in RESOURCE_EXEMPTIONS or name not in C_FREE_BASE:
+    if name not in C_FREE_BASE:
         return []
     dependencies = {package.split()[0] for package in tree}
     return [f"{name}: Windows production graph compiles C through {dependency}"

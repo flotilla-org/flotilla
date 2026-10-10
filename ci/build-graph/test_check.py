@@ -202,6 +202,7 @@ class LayerContract(unittest.TestCase):
         self.assertEqual(c_free_violations("flotilla-core", tree_features("ring v1|std")), [])
 
     def test_resources_exemptions_remain_native(self):
+        self.assertTrue(RESOURCE_EXEMPTIONS.isdisjoint(C_FREE_BASE))
         # The amendment explicitly keeps real resources consumers exempt until
         # the step 3 store split; they must still get native feature checks.
         for name in ("flotilla-client", "flotilla-manifest", "flotilla-tui", "flotilla"):
