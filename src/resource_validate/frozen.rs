@@ -6,7 +6,9 @@ use std::{
 };
 
 use color_eyre::{eyre::eyre, Result};
-use flotilla_core::providers::{ChannelLabel, CommandRunner};
+#[cfg(test)]
+use flotilla_core::providers::ChannelLabel;
+use flotilla_core::providers::{environment::EnvironmentProvider, CommandRunner};
 use flotilla_resources::{
     compose_image, pinned_workflow_ref, Convoy, ConvoyPhase, CredentialSpec, CredentialSpecSpec, Environment, FrozenImageLayers,
     ImageBuild, ImageComposition, InputDefinition, K8sResourceObject, Resource, ResourceObject, SkillCatalogEntry, Vessel,
@@ -39,6 +41,7 @@ pub(super) struct CandidateProbes<'a> {
     pub options: &'a ProbeOptions,
     pub inventory: &'a [Value],
     pub runner: &'a dyn CommandRunner,
+    pub provider: &'a dyn EnvironmentProvider,
 }
 
 impl Probes for CandidateProbes<'_> {
@@ -102,7 +105,7 @@ impl Probes for CandidateProbes<'_> {
         for registry in registries {
             // A location alone is not evidence. Probe with the operator host's
             // configured Docker registry credentials, without building/pulling.
-            match self.runner.run("docker", &["manifest", "inspect", &registry], Path::new("/"), &ChannelLabel::Default).await {
+            match self.provider.local_image_cache().ok_or("validation provider has no image cache")?.registry_available(&registry).await {
                 Ok(_) => return Ok(()),
                 Err(error) => errors.push(format!("registry manifest {registry}: {error}")),
             }
@@ -114,14 +117,13 @@ impl Probes for CandidateProbes<'_> {
             return Err(format!("image {reference} absent from host digest inventories; {}", errors.join("; ")));
         }
         if !flotilla_resources::is_image_digest(reference) && !reference.contains('@') {
-            if self.runner.run("docker", &["image", "inspect", reference], Path::new("/"), &ChannelLabel::Default).await.is_ok() {
+            let cache = self.provider.local_image_cache().ok_or("validation provider has no image cache")?;
+            if cache.inspect_reference(reference).await.is_ok_and(|image| image.is_some()) {
                 return Ok(());
             }
-            return self
-                .runner
-                .run("docker", &["manifest", "inspect", reference], Path::new("/"), &ChannelLabel::Default)
+            return cache
+                .registry_available(reference)
                 .await
-                .map(|_| ())
                 .map_err(|error| format!("image {reference} unavailable locally and in the registry: {error}"));
         }
         Err(format!("image {reference} is absent from host digest inventories and has no exact registry reference"))
@@ -975,6 +977,7 @@ mod tests {
     struct RegistryRunner {
         reference: String,
         available: bool,
+        local: Option<bool>,
         calls: std::sync::Mutex<usize>,
     }
 
@@ -989,12 +992,20 @@ mod tests {
         }
         async fn run_output(
             &self,
-            _command: &str,
-            _args: &[&str],
-            _cwd: &Path,
+            command: &str,
+            args: &[&str],
+            cwd: &Path,
             _label: &ChannelLabel,
         ) -> Result<flotilla_core::providers::CommandOutput, String> {
-            unreachable!("probe uses checked output");
+            assert_eq!(command, "docker");
+            assert_eq!(args, ["image", "inspect", &self.reference]);
+            assert_eq!(cwd, Path::new("/"));
+            let local = self.local.expect("exact digest validation must not probe local tags");
+            Ok(flotilla_core::providers::CommandOutput {
+                stdout: serde_json::json!([{"Id": format!("sha256:{}", "a".repeat(64))}]).to_string(),
+                stderr: "image absent".into(),
+                exit_code: Some(i32::from(!local)),
+            })
         }
         async fn exists(&self, _command: &str, _args: &[&str]) -> bool {
             false
@@ -1020,14 +1031,49 @@ mod tests {
             let held = if legacy_inventory { serde_json::json!([held]) } else { serde_json::json!({"cache-a":[held]}) };
             let inventory = vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:held}}}); duplicates];
             let options = ProbeOptions::default();
-            let runner = RegistryRunner { reference: registry.clone(), available: published, calls: std::sync::Mutex::new(0) };
-            let probes = CandidateProbes { options: &options, inventory: &inventory, runner: &runner };
+            let runner = std::sync::Arc::new(RegistryRunner {
+                reference: registry.clone(),
+                available: published,
+                local: None,
+                calls: std::sync::Mutex::new(0),
+            });
+            let provider = flotilla_core::providers::environment::command_provider(
+                flotilla_core::providers::environment::EnvironmentKind::Docker,
+                runner.clone(),
+            );
+            let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
             assert_eq!(check_identity(&probes, &local, Some(&registry)).await.is_ok(), cached || published);
             assert_eq!(*runner.calls.lock().expect("calls"), usize::from(!cached));
             if !cached && !published {
                 let error = probes.image(&registry).await.expect_err("cache and registry unavailable");
                 assert!(error.contains("absent from host digest inventories") && error.contains("manifest unknown"), "{error}");
             }
+        });
+    }
+
+    // Mutable baseline validation reads the owning provider cache first, then
+    // its registry surface only on absence. Generate both independent sources;
+    // neither reading may pull or build an image.
+    #[hegel::test]
+    fn baseline_validation_uses_provider_cache(tc: hegel::TestCase) {
+        let local = tc.draw(hegel::generators::booleans());
+        let registry = tc.draw(hegel::generators::booleans());
+        let runner = std::sync::Arc::new(RegistryRunner {
+            reference: "crew:test".into(),
+            available: registry,
+            local: Some(local),
+            calls: std::sync::Mutex::new(0),
+        });
+        let provider = flotilla_core::providers::environment::command_provider(
+            flotilla_core::providers::environment::EnvironmentKind::Docker,
+            runner.clone(),
+        );
+        let options = ProbeOptions::default();
+        let probes = CandidateProbes { options: &options, inventory: &[], runner: runner.as_ref(), provider: provider.as_ref() };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            assert_eq!(probes.image("crew:test").await.is_ok(), local || registry);
+            assert_eq!(*runner.calls.lock().expect("calls"), usize::from(!local));
         });
     }
 
@@ -1078,11 +1124,26 @@ mod tests {
             vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:{"cache-a":[]}}}}), document];
         let options = ProbeOptions::default();
         // Stands in for a registry process: this cache-only case must not invoke it.
-        let runner = RegistryRunner { reference: "unused".into(), available: false, calls: std::sync::Mutex::new(0) };
-        CandidateProbes { options: &options, inventory: &inventory, runner: &runner }.image(&digest).await.expect("legacy build existence");
+        let runner = std::sync::Arc::new(RegistryRunner {
+            reference: "unused".into(),
+            available: false,
+            local: None,
+            calls: std::sync::Mutex::new(0),
+        });
+        let provider = flotilla_core::providers::environment::command_provider(
+            flotilla_core::providers::environment::EnvironmentKind::Docker,
+            runner.clone(),
+        );
+        CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() }
+            .image(&digest)
+            .await
+            .expect("legacy build existence");
         assert_eq!(*runner.calls.lock().expect("calls"), 0);
         inventory[1]["status"]["availability"]["hosts"] = serde_json::json!([]);
-        assert!(CandidateProbes { options: &options, inventory: &inventory, runner: &runner }.image(&digest).await.is_err());
+        assert!(CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() }
+            .image(&digest)
+            .await
+            .is_err());
     }
 
     // Generated inventory property: terminal convoys are exempt; live convoys

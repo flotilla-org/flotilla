@@ -143,5 +143,81 @@ class TestkitContract(unittest.TestCase):
                 self.assertEqual(check.violations(source, path, production=True), [1])
 
 
+class RuntimeBoundaryTests(unittest.TestCase):
+    # Each forbidden runtime CLI is rejected through every runner entry point,
+    # constructor aliases and macros, including escaped/raw literal spellings.
+    def test_runtime_commands(self):
+        for binary in sorted(check.RUNTIME_BINARIES):
+            for literal in [f'"{binary}"', f'r#"{binary}"#', f'"/usr/bin/{binary}"', f'&"{binary}"', '"\\x' + f'{ord(binary[0]):02x}' + binary[1:] + '"']:
+                for callee in ['Command::new', 'Launcher::new::<Args>'] + [f'runner.{method}' for method in sorted(check.RUNTIME_METHODS)]:
+                    with self.subTest(binary=binary, literal=literal, callee=callee):
+                        self.assertEqual(check.violations(f'fn f() {{ {callee}({literal}, args); }}', 'src/a.rs'), [1])
+                for macro in ['run', 'run_output', 'crate::run']:
+                    self.assertEqual(check.violations(f'fn f() {{ {macro}!(runner(a, b), {literal}, args, cwd); }}', 'src/a.rs'), [1])
+        for source in ['', '// Command::new("docker")', 'const S: &str = "docker";',
+                       'fn f() { runner.run(command, args); runner.other("docker"); Command::new("docker-compose"); }']:
+            self.assertEqual(check.violations(source, 'src/a.rs'), [])
+
+    # Runtime invocation exemptions name files, never their neighbouring files,
+    # whole provider directories, the composition root, or build tooling.
+    def test_exact_runtime_paths(self):
+        source = 'fn f() { runner.run("docker", args); }'
+        for path in sorted(check.RUNTIME_IMPLEMENTATIONS):
+            self.assertEqual(check.violations(source, path), [])
+            self.assertEqual(check.violations(source, path.replace('.rs', '_extra.rs')), [1])
+        for path in [check.COMPOSITION_ROOT, 'build.rs', 'crates/build_identity.rs',
+                     check.VCS + 'providers/environment/host_direct.rs', check.VCS + 'providers/vcs/git.rs']:
+            self.assertEqual(check.violations(source, path), [1])
+
+    # Concrete adapter imports (including renamed imports), types and calls stay
+    # inside providers or the exact composition root; resource DTOs stay usable.
+    def test_concrete_runtime_types(self):
+        for name in sorted(check.CONCRETE_RUNTIME_TYPES):
+            for source in [f'use adapters::{name} as Adapter;', f'fn f(x: &{name}) {{}}',
+                           f'fn f() {{ adapters::{name}::new(runner); }}']:
+                self.assertEqual(check.violations(source, 'src/a.rs'), [1])
+                for path in [check.VCS + 'providers/environment/new.rs', check.COMPOSITION_ROOT]:
+                    self.assertEqual(check.violations(source, path), [])
+                self.assertEqual(check.violations(source, check.COMPOSITION_ROOT.replace('.rs', '/helper.rs')), [1])
+        self.assertEqual(check.violations('fn f(x: DockerEnvironmentSpec, y: EnvironmentKind) {}', 'src/a.rs'), [])
+
+    # Selection by kind or configured instance is legal. Hardcoded runtime names
+    # in environment registry lookups and implementation preferences are refused.
+    def test_literal_runtime_lookup(self):
+        for name in sorted(check.RUNTIME_NAMES):
+            for receiver, method in [('registry.environment_providers', 'get'),
+                                     ('registry.environment_providers', 'contains_key'),
+                                     ('providers', 'prefer_by_implementation'), ('providers', 'prefer_by_backend')]:
+                for literal in [f'"{name}"', f'r#"{name}"#']:
+                    source = f'fn f() {{ {receiver}.{method}({literal}); }}'
+                    self.assertEqual(check.violations(source, 'src/a.rs'), [1])
+                    self.assertEqual(check.violations(source, check.COMPOSITION_ROOT), [1])
+        for source in ['fn f() { registry.environment_providers.get(&"docker"); }',
+                       'fn f() { registry.environment_providers.select(EnvironmentKind::Docker, Some("docker")); }',
+                       'fn f() { environment_providers.get("docker"); }']:
+            self.assertEqual(check.violations(source, 'src/a.rs'), [1])
+        for source in ['fn f() { registry.environment_providers.get(instance); }',
+                       'fn f() { registry.environment_providers.for_kind(EnvironmentKind::Docker); }',
+                       'fn f() { capabilities.get("docker"); }',
+                       'fn f() { registry.environment_providers_extra.get("docker"); }']:
+            self.assertEqual(check.violations(source, 'src/a.rs'), [])
+
+    # The shared production/test traversal applies all runtime rules even to
+    # testkit files imported by production, but exempts genuine fixture modules.
+    def test_runtime_test_context(self):
+        for source in ['fn f() { Command::new("docker"); }',
+                       'use adapters::BuildxImageBuilder;',
+                       'fn f() { registry.environment_providers.get("docker"); }']:
+            for path in ['crates/a/tests/fixture.rs', 'crates/a-testkit/src/lib.rs']:
+                self.assertEqual(check.violations(source, path), [])
+                self.assertEqual(check.violations(source, path, production=True), [1])
+            self.assertEqual(check.violations('#[cfg(test)] mod fixture { ' + source + ' }', 'src/lib.rs'), [])
+            self.assertEqual(check.violations('#[cfg(any(test, unix))] mod fixture { ' + source + ' }', 'src/lib.rs'), [1])
+            sources = {'src/lib.rs': '#[cfg(test)] mod fixture;', 'src/fixture.rs': source}
+            self.assertNotIn('src/fixture.rs', check.scan_sources(sources))
+            sources['src/lib.rs'] += '\n#[path = "fixture.rs"] mod production;'
+            self.assertEqual(check.scan_sources(sources)['src/fixture.rs'], [1])
+
+
 if __name__ == '__main__':
     unittest.main()

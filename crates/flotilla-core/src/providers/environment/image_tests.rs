@@ -301,3 +301,132 @@ async fn cache_inspection_distinguishes_content_from_repository_attestations() {
         .expect_err("attestation changed")
         .contains("different registry digest"));
 }
+
+// Subprocess boundary stand-in: accept only the detection operation selected by
+// the property, including its endpoint, scratch directory and exact argv.
+struct DetectionProcess {
+    command: String,
+    args: Vec<String>,
+    success: bool,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl CommandRunner for DetectionProcess {
+    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        panic!("detection must preserve exit status through run_output")
+    }
+    async fn run_output(&self, command: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        assert_eq!(command, self.command);
+        assert_eq!(args, self.args);
+        assert_eq!(cwd, Path::new("/scratch/probe"));
+        *self.calls.lock().expect("calls") += 1;
+        Ok(CommandOutput { stdout: "tool 1.0".into(), stderr: "diagnostic".into(), exit_code: Some(i32::from(!self.success)) })
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        panic!("detection must not discover another endpoint")
+    }
+}
+
+// Both providers detect through their own injected endpoint. Docker's temporary
+// probe never pulls and has an isolated workdir; host-direct uses the scratch
+// directory. Generate both exit states and empty/duplicate argument lists.
+#[hegel::test]
+fn detection_contract(tc: hegel::TestCase) {
+    let docker = tc.draw(gs::booleans());
+    let success = tc.draw(gs::booleans());
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let args = vec!["--version"; count];
+    let mut expected = if docker {
+        vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", "crew:test", "tool"]
+    } else {
+        Vec::new()
+    };
+    expected.extend(&args);
+    let runner = Arc::new(DetectionProcess {
+        command: if docker { "docker" } else { "tool" }.into(),
+        args: expected.into_iter().map(str::to_owned).collect(),
+        success,
+        calls: Mutex::new(0),
+    });
+    let provider: Arc<dyn EnvironmentProvider> = if docker {
+        Arc::new(DockerEnvironmentProvider::new(runner.clone()))
+    } else {
+        Arc::new(HostDirectEnvironmentProvider::new(runner.clone(), Default::default()))
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let output = provider.detect(docker.then_some("crew:test"), "tool", &args, Path::new("/scratch/probe")).await.expect("detect");
+        assert_eq!(output.success(), success);
+        assert_eq!(output.stdout, "tool 1.0");
+        assert_eq!(output.stderr, "diagnostic");
+        assert_eq!(*runner.calls.lock().expect("calls"), 1);
+        let invalid_image = if docker { None } else { Some("crew:test") };
+        assert!(provider.detect(invalid_image, "tool", &args, Path::new("/scratch/probe")).await.is_err());
+        assert_eq!(*runner.calls.lock().expect("calls"), 1);
+    });
+}
+
+// Subprocess boundary stand-in for read-only Docker inspection. Any pulling,
+// building, or mutation command fails the exact argv contract.
+struct ReferenceProcess {
+    local: bool,
+    registry: bool,
+    malformed: bool,
+    launch_error: bool,
+}
+
+#[async_trait]
+impl CommandRunner for ReferenceProcess {
+    async fn run(&self, command: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<String, String> {
+        assert_eq!(command, "docker");
+        assert_eq!(args, ["manifest", "inspect", "crew:test"]);
+        assert_eq!(cwd, Path::new("/"));
+        self.registry.then(|| "manifest".into()).ok_or_else(|| "manifest unknown".into())
+    }
+    async fn run_output(&self, command: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        assert_eq!(command, "docker");
+        assert_eq!(args, ["image", "inspect", "crew:test"]);
+        assert_eq!(cwd, Path::new("/"));
+        if self.launch_error {
+            return Err("cannot launch runtime".into());
+        }
+        let stdout = if self.malformed {
+            "[]".into()
+        } else {
+            serde_json::json!([{"Id": digest(1), "RepoDigests": [format!("registry.example/crew@{}", digest(2))]}]).to_string()
+        };
+        Ok(CommandOutput { stdout, stderr: "image unavailable".into(), exit_code: Some(i32::from(!self.local)) })
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        panic!("no discovery")
+    }
+}
+
+// Validation can observe a mutable baseline without admitting or pulling it.
+// Missing images, malformed success responses and launch failures are distinct;
+// registry availability remains independent of the local cache observation.
+#[hegel::test]
+fn reference_observation_contract(tc: hegel::TestCase) {
+    let local = tc.draw(gs::booleans());
+    let registry = tc.draw(gs::booleans());
+    let malformed = tc.draw(gs::booleans());
+    let launch_error = tc.draw(gs::booleans());
+    let provider = DockerEnvironmentProvider::new(Arc::new(ReferenceProcess { local, registry, malformed, launch_error }));
+    let cache = provider.local_image_cache().expect("owned cache");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let observed = cache.inspect_reference("crew:test").await;
+        if launch_error || (local && malformed) {
+            assert!(observed.is_err());
+        } else if local {
+            let identity = observed.expect("observation").expect("local image");
+            assert_eq!(identity.local_image_id, digest(1));
+            assert_eq!(identity.registry_digest, Some(format!("registry.example/crew@{}", digest(2))));
+        } else {
+            assert!(observed.expect("absence").is_none());
+        }
+        assert_eq!(cache.registry_available("crew:test").await.is_ok(), registry);
+        assert!(cache.inspect("crew:test").await.is_err(), "typed digest inspection still refuses tags");
+    });
+}

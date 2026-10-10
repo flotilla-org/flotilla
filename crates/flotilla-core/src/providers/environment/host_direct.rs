@@ -33,6 +33,19 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
         EnvironmentKind::HostDirect
     }
 
+    async fn detect(
+        &self,
+        image: Option<&str>,
+        binary: &str,
+        args: &[&str],
+        scratch: &std::path::Path,
+    ) -> Result<crate::providers::CommandOutput, String> {
+        if image.is_some() {
+            return Err("host-direct detection does not accept an image".into());
+        }
+        self.runner.run_output(binary, args, scratch, &crate::providers::ChannelLabel::Default).await
+    }
+
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {
         if EnvironmentKind::of(spec)? != self.kind() {
             return Err("host-direct provider requires a host-direct spec".into());

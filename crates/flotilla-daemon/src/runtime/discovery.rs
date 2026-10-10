@@ -13,7 +13,7 @@ use flotilla_core::{
     config::ConfigStore,
     discovery_api::EnvironmentBag,
     in_process::InProcessDaemon,
-    providers::{discovery::EnvVars, registry::ProviderRegistry, ChannelLabel, CommandRunner},
+    providers::{discovery::EnvVars, environment::EnvironmentKind, registry::ProviderRegistry, ChannelLabel, CommandRunner},
 };
 use flotilla_credentials::CredentialStore;
 use flotilla_paths::path_context::DaemonHostPath;
@@ -28,7 +28,9 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 use serde_json::json;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
+
+use crate::fulfilment_probe::{probe_kind, DetectionTarget};
 
 use super::seed::{
     empty_meta, ensure_default_policies, ensure_host_direct_environment_exists, kind_belongs_to_host, migrate_live_placement_policies,
@@ -317,9 +319,8 @@ pub(super) fn build_local_profile(
 
     let host_direct_pool = local_registry.terminal_pools.preferred_name().unwrap_or("passthrough").to_string();
     let docker_pool = "cleat".to_string();
-    let docker_available =
-        local_registry.environment_providers.for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker).is_some()
-            && local_registry.terminal_pools.contains_key(&docker_pool);
+    let docker_available = local_registry.environment_providers.for_kind(EnvironmentKind::Docker).is_some()
+        && local_registry.terminal_pools.contains_key(&docker_pool);
     let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {
@@ -335,6 +336,7 @@ pub(super) fn build_local_profile(
 }
 
 pub(super) struct FulfilmentProbeContext<'a> {
+    pub(super) providers: &'a ProviderRegistry,
     pub(super) runner: &'a dyn CommandRunner,
     pub(super) env: &'a dyn EnvVars,
     pub(super) scratch: &'a Path,
@@ -381,6 +383,25 @@ pub(super) async fn observe_fulfilment_facts(
             },
             FulfilmentRealisation::HostDirect => None,
         };
+        let provider_kind = match kind.spec.realisation {
+            FulfilmentRealisation::HostDirect => EnvironmentKind::HostDirect,
+            FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentKind::Docker,
+        };
+        let Some((_, provider)) = probe.providers.environment_providers.for_kind(provider_kind) else {
+            debug!(kind = %kind.metadata.name, ?provider_kind, "cannot observe fulfilment facts without an unambiguous environment provider");
+            // Absence or ambiguity cannot attest a runtime endpoint. Replace
+            // stale affirmative evidence with a fresh unknown observation.
+            facts.insert(
+                kind.metadata.name,
+                FulfilmentFacts {
+                    image: image.map(Into::into),
+                    observed_at: Utc::now(),
+                    free_vessel_slots: (!available_pools.contains(&kind.spec.pool)).then_some(0),
+                    ..Default::default()
+                },
+            );
+            continue;
+        };
         let pool_available = available_pools.contains(&kind.spec.pool);
         let name = kind.metadata.name;
         let current = previous
@@ -395,9 +416,9 @@ pub(super) async fn observe_fulfilment_facts(
             Some(current) => Some(current),
             None => match tokio::time::timeout_at(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(45)),
-                crate::fulfilment_probe::probe_kind(
+                probe_kind(
                     &kind.spec,
-                    image.as_deref(),
+                    DetectionTarget { image: image.as_deref(), provider: provider.as_ref() },
                     pool_available,
                     probe.runner,
                     probe.env,

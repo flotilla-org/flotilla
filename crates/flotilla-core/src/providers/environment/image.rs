@@ -12,6 +12,19 @@ pub trait LocalImageCache: Send + Sync {
     async fn has(&self, digest: &str) -> Result<bool, String> {
         Ok(self.inspect(digest).await?.is_some())
     }
+    /// Read-only observation of a reference, including mutable baseline tags.
+    /// This does not admit a tag for provisioning or relax digest-only inspect.
+    /// The default supports digest references only, through `inspect`; adapters
+    /// must override it to observe mutable baseline tags. Unsupported or malformed
+    /// observations return an error, never an affirmative availability claim.
+    async fn inspect_reference(&self, reference: &str) -> Result<Option<PlacedImageIdentity>, String> {
+        self.inspect(reference).await
+    }
+    /// Check registry availability without pulling. The adapter uses the
+    /// host tool's configured registry credentials for candidate validation.
+    async fn registry_available(&self, _reference: &str) -> Result<(), String> {
+        Err("image cache does not support registry availability checks".into())
+    }
     async fn pull(&self, reference: &str, auth: Option<&RegistryAuth>) -> Result<(), String>;
     async fn inventory(&self) -> Result<BTreeSet<String>, String>;
     async fn remove(&self, digest: &str) -> Result<(), String>;

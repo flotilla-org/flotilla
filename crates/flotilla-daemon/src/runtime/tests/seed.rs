@@ -199,7 +199,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
         .expect("seed ambiguous kind");
     let previous =
         BTreeMap::from([("host-direct-udder".to_string(), FulfilmentFacts { observed_at: Utc::now(), ..FulfilmentFacts::default() })]);
-    let runner = DiscoveryMockRunner::builder().build();
+    let runner = Arc::new(DiscoveryMockRunner::builder().build());
     let facts = observe_fulfilment_facts(
         &backend,
         NAMESPACE,
@@ -207,7 +207,8 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
         &["cleat".to_string()],
         &previous,
         FulfilmentProbeContext {
-            runner: &runner,
+            providers: &detection_registry(runner.clone()),
+            runner: runner.as_ref(),
             env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
             scratch: Path::new("/tmp/flotilla-probe-test"),
         },

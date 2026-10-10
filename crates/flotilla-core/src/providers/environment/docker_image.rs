@@ -85,6 +85,26 @@ impl LocalImageCache for DockerEnvironmentProvider {
         }
         Ok(Some(PlacedImageIdentity { local_image_id, registry_digest }))
     }
+    async fn inspect_reference(&self, reference: &str) -> Result<Option<PlacedImageIdentity>, String> {
+        let output =
+            self.inner.runner.run_output("docker", &["image", "inspect", reference], Path::new("/"), &ChannelLabel::Default).await?;
+        if !output.success() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| error.to_string())?;
+        let image = value.get(0).ok_or("Docker inspection returned no image")?;
+        Ok(Some(PlacedImageIdentity {
+            local_image_id: image["Id"].as_str().ok_or("Docker inspection returned no image ID")?.to_string(),
+            registry_digest: image["RepoDigests"]
+                .as_array()
+                .and_then(|digests| digests.first())
+                .and_then(|digest| digest.as_str())
+                .map(str::to_owned),
+        }))
+    }
+    async fn registry_available(&self, reference: &str) -> Result<(), String> {
+        self.inner.runner.run("docker", &["manifest", "inspect", reference], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
+    }
     async fn pull(&self, reference: &str, auth: Option<&RegistryAuth>) -> Result<(), String> {
         validate_digest(reference)?;
         if !reference.contains('@') {

@@ -12,7 +12,11 @@ use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
-    providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
+    providers::{
+        environment::{command_provider, EnvironmentKind},
+        vcs::git_worktree::GitWorktreeStrategy,
+        ProcessCommandRunner,
+    },
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
@@ -241,10 +245,16 @@ async fn validate_daemon_with_preview(
             }
         }
     }
+    let image_provider = command_provider(EnvironmentKind::Docker, Arc::new(ProcessCommandRunner));
     let mut frozen_report = frozen::check(
         &frozen_inventory,
         &retired,
-        &frozen::CandidateProbes { options: probes, inventory: &frozen_inventory, runner: &ProcessCommandRunner },
+        &frozen::CandidateProbes {
+            options: probes,
+            inventory: &frozen_inventory,
+            runner: &ProcessCommandRunner,
+            provider: image_provider.as_ref(),
+        },
     )
     .await?;
     frozen_report.inventory_complete &= !frozen_inventory_failed && !retirement_inventory_failed;

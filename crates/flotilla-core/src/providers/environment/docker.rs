@@ -69,6 +69,19 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         super::EnvironmentKind::Docker
     }
 
+    async fn detect(
+        &self,
+        image: Option<&str>,
+        binary: &str,
+        args: &[&str],
+        scratch: &Path,
+    ) -> Result<crate::providers::CommandOutput, String> {
+        let image = image.ok_or("detection requires an image reference")?;
+        let mut command = vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", image, binary];
+        command.extend_from_slice(args);
+        self.inner.runner.run_output("docker", &command, scratch, &ChannelLabel::Default).await
+    }
+
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, opts: &PrepareOpts) -> Result<super::PreparedEnvironment, String> {
         if super::EnvironmentKind::of(spec)? != self.kind() {
             return Err("Docker provider requires a Docker environment spec".into());
