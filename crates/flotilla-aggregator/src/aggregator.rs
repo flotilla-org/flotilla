@@ -1052,9 +1052,7 @@ impl Aggregator {
         self.convoy_change_requests.retain(|reference, _| current.contains_key(reference));
         for reference in references {
             self.handle_convoy_transition(&reference, previous.get(&reference), current.get(&reference));
-            if previous.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
-                != current.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
-            {
+            if previous.get(&reference).map(verdict_queue_inputs) != current.get(&reference).map(verdict_queue_inputs) {
                 self.update_verdict_queue(&reference, current.get(&reference)).await;
             }
         }
@@ -1160,9 +1158,7 @@ impl Aggregator {
         let references = previous.keys().chain(current.keys()).cloned().collect::<HashSet<_>>();
         for reference in references {
             self.handle_convoy_transition(&reference, previous.get(&reference), current.get(&reference));
-            if previous.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
-                != current.get(&reference).map(|c| (&c.spec.project_ref, c.status.as_ref().map(|s| (&s.phase, &s.promises))))
-            {
+            if previous.get(&reference).map(verdict_queue_inputs) != current.get(&reference).map(verdict_queue_inputs) {
                 self.update_verdict_queue(&reference, current.get(&reference)).await;
             }
         }
@@ -2851,6 +2847,11 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
         ResourceWorkPhase::Cancelled => WorkPhase::Cancelled,
         ResourceWorkPhase::Abandoned => WorkPhase::Abandoned,
     }
+}
+
+// Only these Convoy fields can change a human-verdict queue contribution.
+fn verdict_queue_inputs(convoy: &ResourceObject<Convoy>) -> impl PartialEq + '_ {
+    (&convoy.spec.project_ref, convoy.status.as_ref().map(|status| (&status.phase, &status.promises)))
 }
 
 fn verdict_queue_rows(reference: &ResourceRef, convoy: &ResourceObject<Convoy>) -> Vec<flotilla_protocol::result_set::VerdictQueueRow> {

@@ -57,14 +57,14 @@ impl CrewActions<'_> {
         else {
             return Err("wrong verdict handler".into());
         };
-        let identity = self.port.start_context_free_command(id, command.description().to_string());
+        let identity = self.events.start(id, command.description().to_string());
         let result = async {
             let caller = caller.as_ref().filter(|caller| caller.crew.is_none()).ok_or("human verdict requires an operator caller")?;
             if reason.trim().is_empty() {
                 return Err("a verdict requires a nonempty reason".into());
             }
-            let namespace = namespace.clone().unwrap_or(self.port.provisioning_namespace().await);
-            let convoys = self.port.resource_backend().clone().using::<ResourceConvoy>(&namespace);
+            let namespace = namespace.clone().unwrap_or(self.crew.provisioning_namespace().await);
+            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
             // Exact record names only: never list the store to resolve this operation.
             let object = convoys.get(convoy).await.map_err(|e| e.to_string())?;
             let operation = flotilla_resources::promises::human_verdict(
@@ -76,8 +76,8 @@ impl CrewActions<'_> {
                 flotilla_resources::promises::SubmissionVerdict {
                     accepted: *accepted,
                     who: format!("{}/{}", caller.principal_ref.namespace, caller.principal_ref.name),
-                    at: self.port.clock().now(),
-                    why: reason.clone(),
+                    at: self.clock.now(),
+                    why: reason.trim().to_owned(),
                 },
             )?;
             let (vessel, role, operation) = operation;
@@ -102,7 +102,7 @@ impl CrewActions<'_> {
             Ok(())
         }
         .await;
-        self.port.finish_context_free_command(
+        self.events.finish(
             id,
             identity,
             match result {

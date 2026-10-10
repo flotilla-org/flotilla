@@ -91,6 +91,9 @@ impl Submission {
             self.subject()
         }
     }
+    fn has_required_evidence(&self, kind: PromiseKind) -> bool {
+        !kind.requires_human_verdict() || self.metadata.get("digest").is_some_and(|digest| !digest.trim().is_empty())
+    }
     pub fn subject(&self) -> &str {
         self.metadata.get("subject").map(String::as_str).unwrap_or(&self.reference)
     }
@@ -111,7 +114,8 @@ pub fn effect_present(status: &ConvoyStatus, vessel: &str, role: &str, operation
     match operation {
         PromiseOperation::Declare { kind, source, .. } => promise.kind == *kind && promise.source == *source,
         PromiseOperation::Submit { kind, submission, .. } => {
-            promise.kind == *kind
+            submission.has_required_evidence(*kind)
+                && promise.kind == *kind
                 && matches!(promise.state, PromiseState::Submitted | PromiseState::Kept)
                 && promise.submissions.last().is_some_and(|prior| {
                     prior.identity(*kind) == submission.identity(*kind)
@@ -153,6 +157,8 @@ pub fn needs_observation(status: &ConvoyStatus, kind: PromiseKind) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmissionVerdict {
     pub accepted: bool,
+    /// Human verdicts record the authenticated principal as `namespace/name`;
+    /// automatic verdicts retain the observing controller's identity.
     pub who: String,
     pub at: DateTime<Utc>,
     pub why: String,
@@ -174,6 +180,11 @@ pub fn pending(status: &ConvoyStatus, vessel: &str, role: &str) -> Vec<String> {
 }
 
 pub fn apply(status: &mut ConvoyStatus, vessel: &str, role: &str, operation: &PromiseOperation) {
+    if let PromiseOperation::Submit { kind, submission, .. } = operation {
+        if !submission.has_required_evidence(*kind) {
+            return;
+        }
+    }
     if status.phase.is_terminal() {
         return;
     }
@@ -895,6 +906,51 @@ mod tests {
 #[cfg(test)]
 mod human_tests {
     use super::*;
+    // Every submit writer shares the same evidence boundary, including optimistic
+    // status patches that bypass the crew command's early validation.
+    #[hegel::test]
+    fn human_submissions_require_digest_at_the_shared_transition(tc: hegel::TestCase) {
+        let digest = tc.draw(hegel::generators::integers::<usize>().max_value(3));
+        let declared = tc.draw(hegel::generators::booleans());
+        let mut status = ConvoyStatus { phase: super::super::ConvoyPhase::Active, ..Default::default() };
+        if declared {
+            apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Declare { id: "demo".into(), kind: PromiseKind::DemoVideo, source: PromiseSource::Crew },
+            );
+        }
+        let before = status.clone();
+        let metadata = match digest {
+            0 => BTreeMap::new(),
+            1 => BTreeMap::from([("digest".into(), "".into())]),
+            2 => BTreeMap::from([("digest".into(), " \t".into())]),
+            _ => BTreeMap::from([("digest".into(), "sha256:video".into())]),
+        };
+        let operation = PromiseOperation::Submit {
+            id: "demo".into(),
+            kind: PromiseKind::DemoVideo,
+            source: PromiseSource::Crew,
+            submission: Submission { reference: "https://upload/video.mp4".into(), metadata, submitted_at: Utc::now(), verdict: None },
+        };
+        apply(&mut status, "work", "coder", &operation);
+        if digest < 3 {
+            assert_eq!(status, before, "invalid evidence must not create or mutate a promise");
+            assert!(!effect_present(&status, "work", "coder", &operation));
+        } else {
+            assert!(effect_present(&status, "work", "coder", &operation));
+            // Even if old stored evidence lacks a digest, an invalid operation
+            // must never be reported as a successful persisted submission.
+            status.promises.get_mut("work").unwrap().get_mut("coder").unwrap()[0].submissions[0].metadata.clear();
+            let mut invalid = operation.clone();
+            if let PromiseOperation::Submit { submission, .. } = &mut invalid {
+                submission.metadata.clear();
+            }
+            assert!(!effect_present(&status, "work", "coder", &invalid));
+        }
+    }
+
     // Human verdicts apply only to the current attempt of human-reviewed kinds;
     // they preserve who/when/reason and never rewrite already reviewed evidence.
     #[hegel::test]
@@ -984,7 +1040,7 @@ mod human_tests {
                     source: PromiseSource::Crew,
                     submission: Submission {
                         reference: "artifact/video".into(),
-                        metadata: BTreeMap::new(),
+                        metadata: BTreeMap::from([("digest".into(), "sha256:video".into())]),
                         submitted_at: now,
                         verdict: None,
                     },
