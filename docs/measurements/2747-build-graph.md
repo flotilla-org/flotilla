@@ -281,3 +281,55 @@ in the existing workspace CI job; no workflow change is made.
 Review regression: both async and HTTP-server anchor scenarios allow Tokio
 `test-util` on dev edges and reject transitive production activation. Disabling
 that production check makes both negative scenarios fail.
+
+## #2994: target-specific feature contexts (2026-10-10 UTC)
+
+The macOS graph at `cbb6221f6` reproduced all ten reported differences when
+queried from Linux with `--target aarch64-apple-darwin`. Unlike Linux, sha2's
+cpufeatures path reaches libc, rustix reaches libc and errno, and hyper-util's
+system-configuration path reaches bitflags. Their isolated anchor selections
+lacked the default/std features selected by the rest of the same layer.
+
+Three macOS-only dependency sections now normalize those existing transitive
+packages: libc in base on Apple Silicon, libc/errno in OS, and bitflags/std in
+HTTP-server. The base libc declaration matches cpufeatures' architecture gate
+so Intel macOS does not gain an unrelated dependency.
+They introduce no new locked package versions or runtime source changes.
+Linux anchor lines, the C-free policy/exemptions and CI topology are unchanged.
+
+The guard accepts `--target <triple>` and applies it to both the layer reference
+and every package-local build/test tree. Without that flag it retains Cargo's
+host selection, including Cargo configuration. The separate Windows C-free
+queries remain fixed to Windows GNU. This makes target validation available
+from Linux without installing another target's standard library or compiler.
+
+Validation commands and output:
+
+```text
+$ python3 ci/build-graph/check.py --target aarch64-apple-darwin
+Workspace build graph (aarch64-apple-darwin): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable
+$ python3 ci/build-graph/check.py --target x86_64-apple-darwin
+Workspace build graph (x86_64-apple-darwin): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable
+$ python3 ci/build-graph/check.py --target x86_64-unknown-linux-gnu
+Workspace build graph (x86_64-unknown-linux-gnu): C-free Windows base; production excludes testkits and test-util; layer-local build/test features reusable
+```
+
+The CLI regression generates Linux, macOS and Windows targets, with matching
+contexts and independent production/test drift controls. Its subprocess fake
+represents Cargo's process boundary and a macOS-only libc dependency. A target
+must be used by both reference and selected queries; checking the Linux graph
+instead cannot silently pass. Empty libc feature sets on either macOS edge
+selection are rejected. The existing registered Rust integration suite runs
+all 22 Python tests without a new CI job.
+
+Mutation checks in isolated copies: omit target propagation (nine failed
+subcases), and disable feature-difference rejection (five failed assertions).
+Both were caught and reverted. The real macOS graph also failed before the
+anchor fix and passed afterward.
+
+A full Windows GNU feature run reports the same 44 winapi/windows-sys
+context diagnostics as the unmodified baseline; this fix does not normalize
+the native Windows graph.
+The mandatory Windows C-free base queries still pass, and target feature drift
+is rejected rather than hidden. No macOS build or test execution is claimed:
+these are Cargo graph queries from Linux.

@@ -32,6 +32,10 @@ tower = { version = "0.5", default-features = false, features = ["make", "retry"
 tracing = { version = "0.1" }
 tracing-core = { version = "0.1" }
 
+# The macOS system-proxy path reaches bitflags without its std feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+bitflags = { version = "2", default-features = false, features = ["std"] }
+
 [dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
 

@@ -193,6 +193,41 @@ class LayerContract(unittest.TestCase):
                     else:
                         self.assertEqual(diagnostic.getvalue(), "")
 
+    def test_cli_target_specific_features_and_negative_control(self):
+        # Process-boundary fake: macOS alone introduces libc through a target
+        # dependency. Every build/test comparison must use that target, and
+        # dropping its std anchor must fail rather than silently check Linux.
+        for target in ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"):
+            for drift_edges in (None, "normal,build", "normal,build,dev"):
+                with self.subTest(target=target, drift_edges=drift_edges):
+                    metadata = graph(package("consumer", normal=("anchor",)), package("anchor"))
+                    metadata["packages"][0]["dependencies"].append({
+                        "name": "libc", "kind": None, "rename": None,
+                        "features": [], "target": 'cfg(target_os = "macos")',
+                    })
+
+                    def cargo_result(arguments, **kwargs):
+                        if "metadata" in arguments:
+                            output = json.dumps(metadata)
+                        else:
+                            selected = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-p"]
+                            actual_target = arguments[arguments.index("--target") + 1] if "--target" in arguments else "host"
+                            self.assertEqual(actual_target, target)
+                            output = "\n".join(f"{name} v1|" for name in sorted(set(selected) | {"anchor"}))
+                            if actual_target == "aarch64-apple-darwin":
+                                edges = arguments[arguments.index("--edges") + 1]
+                                features = "" if len(selected) == 1 and edges == drift_edges else "default,std"
+                                output += f"\nlibc v0.2|{features}"
+                        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+                    diagnostic = io.StringIO()
+                    with patch("check.subprocess.run", side_effect=cargo_result), contextlib.redirect_stderr(diagnostic), contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(main(["--target", target]), int(target == "aarch64-apple-darwin" and drift_edges is not None))
+                    if target == "aarch64-apple-darwin" and drift_edges is not None:
+                        self.assertIn(f"consumer ({drift_edges}): libc v0.2: selected contexts [[]]", diagnostic.getvalue())
+                    else:
+                        self.assertEqual(diagnostic.getvalue(), "")
+
     def test_c_free_empty_and_rust_only_graphs_are_valid(self):
         # A Rust build script/proc macro is legal; the rule bans C compilation,
         # rather than all host build dependencies or unrelated native consumers.
