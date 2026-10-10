@@ -447,3 +447,100 @@ async fn peer_summary_does_not_author_transitional_host_or_policy_rows() {
     let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
     assert!(matches!(policies.get("host-direct-feta-host").await, Err(ResourceError::NotFound { .. })));
 }
+
+// Subprocess boundary stand-in: unresolved provider selection must not invoke a
+// command against a guessed endpoint, including scratch creation.
+struct UnselectedProbeRunner;
+
+#[async_trait]
+impl CommandRunner for UnselectedProbeRunner {
+    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        panic!("unselected provider must not launch a process")
+    }
+    async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        panic!("unselected provider must not launch a process")
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        panic!("unselected provider must not discover an endpoint")
+    }
+}
+
+// Missing or ambiguous providers publish fresh unknown facts rather than omit a
+// kind or reuse stale affirmative evidence. Generate both runtime kinds, zero
+// and two matching instances, present/absent prior facts and pool availability.
+#[hegel::test]
+fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
+    use flotilla_core::providers::environment::{command_provider, EnvironmentKind};
+    let docker = tc.draw(hegel::generators::booleans());
+    let ambiguous = tc.draw(hegel::generators::booleans());
+    let prior = tc.draw(hegel::generators::booleans());
+    let pool = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        ensure_host_exists(&backend, NAMESPACE, "host", "test").await.expect("host");
+        let realisation =
+            if docker { FulfilmentRealisation::DockerPerVessel { image: "crew:test".into() } } else { FulfilmentRealisation::HostDirect };
+        backend
+            .clone()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta("kind"),
+                &FulfilmentKindSpec::builder().host_ref("host".into()).pool("pool".into()).realisation(realisation).build(),
+            )
+            .await
+            .expect("kind");
+        let runner = Arc::new(UnselectedProbeRunner);
+        let mut providers = ProviderRegistry::new();
+        let provider_kind = if docker { EnvironmentKind::Docker } else { EnvironmentKind::HostDirect };
+        if ambiguous {
+            for instance in ["cache-a", "cache-b"] {
+                providers.environment_providers.insert(
+                    instance,
+                    ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, instance),
+                    command_provider(provider_kind, runner.clone()),
+                );
+            }
+        }
+        let prior_time = Utc::now() - chrono::Duration::minutes(1);
+        let previous = if prior {
+            BTreeMap::from([(
+                "kind".into(),
+                FulfilmentFacts {
+                    image: docker.then(|| "crew:test".to_string().into()),
+                    image_present: Some(true),
+                    observed_at: prior_time,
+                    ..Default::default()
+                },
+            )])
+        } else {
+            BTreeMap::new()
+        };
+        let pools = if pool { vec!["pool".into()] } else { Vec::new() };
+        let mut model_probes = ModelProbeState::default();
+        let observed = observe_fulfilment_facts(
+            &backend,
+            NAMESPACE,
+            "host",
+            &pools,
+            &previous,
+            FulfilmentProbeContext {
+                providers: &providers,
+                runner: runner.as_ref(),
+                env: &TestEnvVars::default(),
+                scratch: Path::new("/tmp/probe"),
+            },
+            &mut model_probes,
+        )
+        .await
+        .expect("observation");
+        assert_eq!(observed.len(), 1);
+        let facts = observed.get("kind").expect("unknown facts remain visible");
+        assert_eq!(facts.image.as_ref().map(|image| image.image_ref.as_str()), docker.then_some("crew:test"));
+        assert_eq!(facts.image_present, None);
+        assert!(facts.harnesses.is_empty() && facts.toolchains.is_empty());
+        assert!(facts.observed_at > prior_time);
+        assert_eq!(facts.free_vessel_slots, (!pool).then_some(0));
+        assert_eq!(model_probes.total_requests, 0);
+    });
+}

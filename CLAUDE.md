@@ -236,6 +236,8 @@ The ast-grep operation boundary check in the existing format job rejects literal
 - `crates/flotilla-core/src/providers/environment/runner.rs`
 - `crates/flotilla-core/src/providers/discovery/factories/docker.rs` (discovery version probe)
 
+Local daemon probing uses the discovered provider instance. Callers without a discovery registry may compose a known command endpoint with `command_provider` or `command_provider_registry` inside core providers: candidate validation deliberately reads the operator host through `ProcessCommandRunner`, and agentless SSH detection uses its remote runner. These helpers do not select a configured cache instance; callers with a registry must use that existing instance. Missing or ambiguous providers publish fresh unknown fulfilment facts, clearing stale affirmative evidence. Malformed successful image inspections are also unknown, rather than reporting an image present without an identity.
+
 Concrete environment adapters and Buildx types belong under core `providers/`; only `crates/flotilla-daemon/src/runtime.rs`, the composition root, may name them elsewhere. This allowance does not permit raw runtime commands or literal provider selection in the composition root. New runtime adapters require an explicit file-level allowlist change. Genuine test fixtures are exempt; production inclusions of fixture files remain checked. Build tooling has no runtime exemption.
 
 ### Observed resources and aggregation

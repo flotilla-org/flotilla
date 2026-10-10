@@ -12,7 +12,13 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
 use flotilla_core::{
-    aggregator_projection::AggregatorProjectionState, demand_lifecycle::DemandLifecycle, in_process::InProcessDaemon,
+    aggregator_projection::AggregatorProjectionState,
+    demand_lifecycle::DemandLifecycle,
+    in_process::InProcessDaemon,
+    providers::{
+        environment::{command_provider_registry, EnvironmentKind},
+        registry::ProviderRegistry,
+    },
     vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
 };
 use flotilla_credentials::CredentialStore;
@@ -317,7 +323,7 @@ pub(super) fn spawn_local_fulfilment_probe_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
     profile: LocalProvisioningProfile,
-    providers: Arc<flotilla_core::providers::registry::ProviderRegistry>,
+    providers: Arc<ProviderRegistry>,
     scratch: PathBuf,
 ) -> JoinHandle<()> {
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
@@ -367,10 +373,14 @@ pub(super) fn spawn_local_fulfilment_probe_task(
 }
 
 pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: String, ssh: AgentlessSshProfile) -> JoinHandle<()> {
+    // Compose the remote detection endpoint once, then retain that exact
+    // provider instance across observation passes.
+    let providers = Arc::new(command_provider_registry(&[EnvironmentKind::HostDirect], Arc::clone(&ssh.runner)));
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let ssh = ssh.clone();
+        let providers = Arc::clone(&providers);
         async move {
             let hosts = daemon.resource_backend().using::<Host>(&namespace);
             let status = hosts.get(&ssh.provisioning.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();
@@ -383,19 +393,6 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
                     return;
                 }
             };
-            // SSH fulfilment is host-direct: compose against that remote endpoint.
-            let mut providers = flotilla_core::providers::registry::ProviderRegistry::new();
-            providers.environment_providers.insert(
-                "host-direct",
-                flotilla_core::providers::discovery::ProviderDescriptor::named(
-                    flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-                    "host-direct",
-                ),
-                flotilla_core::providers::environment::command_provider(
-                    flotilla_core::providers::environment::EnvironmentKind::HostDirect,
-                    Arc::clone(&ssh.runner),
-                ),
-            );
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
@@ -719,9 +716,7 @@ pub(super) fn spawn_environment_orphan_sweep_task(state: Arc<ControllerRuntimeSt
         let state = Arc::clone(&state);
         let sweep = Arc::clone(&sweep);
         async move {
-            let Some((_, provider)) =
-                state.local_registry.environment_providers.for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker)
-            else {
+            let Some((_, provider)) = state.local_registry.environment_providers.for_kind(EnvironmentKind::Docker) else {
                 return;
             };
             let runtime = DockerControllerRuntime { state: Arc::clone(&state) };

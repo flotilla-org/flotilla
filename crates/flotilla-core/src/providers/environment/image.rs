@@ -14,6 +14,9 @@ pub trait LocalImageCache: Send + Sync {
     }
     /// Read-only observation of a reference, including mutable baseline tags.
     /// This does not admit a tag for provisioning or relax digest-only inspect.
+    /// The default supports digest references only, through `inspect`; adapters
+    /// must override it to observe mutable baseline tags. Unsupported or malformed
+    /// observations return an error, never an affirmative availability claim.
     async fn inspect_reference(&self, reference: &str) -> Result<Option<PlacedImageIdentity>, String> {
         self.inspect(reference).await
     }

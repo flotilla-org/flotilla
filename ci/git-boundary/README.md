@@ -1,7 +1,8 @@
-# Git boundary check
+# Operation boundary check
 
-This check uses ast-grep's Rust parser to reject literal Git invocations outside
-`flotilla_core::vcs::Vcs` implementations. It runs without compiling Rust.
+This check uses ast-grep's Rust parser to enforce both the VCS and environment
+runtime boundaries. The `ci/git-boundary` path is retained so existing CI and
+local commands keep working. It runs without compiling Rust.
 
 With `uv` (available in crew images, which lack `ensurepip`), run it in one line; `uv` caches the pinned package:
 
