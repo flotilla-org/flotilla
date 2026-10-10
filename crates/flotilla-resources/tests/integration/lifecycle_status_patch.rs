@@ -84,6 +84,7 @@ define_patch_kinds! {
     ConvoyRollUpPhase => &[LifecycleClass::Duplicate, LifecycleClass::Continuation],
     ConvoySettle => DUPLICATE,
     ConvoySetSettlementAttention => NONE,
+    ConvoyRecordLandingEvent => NONE,
     ConvoyObserveTurnHookHealth => NONE,
     ConvoyQueueSupervisorTurn => NONE,
     ConvoyAcknowledgeSupervisorTurn => NONE,
@@ -140,6 +141,8 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::RecordLandingEvent { transition: Some(transition) } => convoy_patch_kind(transition),
+        ConvoyStatusPatch::RecordLandingEvent { transition: None } => PatchKind::ConvoyRecordLandingEvent,
         ConvoyStatusPatch::HoldTurnDelivery { .. } => PatchKind::ConvoyHoldTurnDelivery,
         ConvoyStatusPatch::RestoreTurnActivation { .. } => PatchKind::ConvoyRestoreTurnActivation,
         ConvoyStatusPatch::RecordEnsureAdmission { .. }
@@ -279,6 +282,7 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
     CrewWorkState {
+        completion_turn: None,
         pending_follow_up: None,
         phase,
         resumed_at: None,
@@ -299,6 +303,8 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -545,8 +551,12 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             exercise: || {
                 let mut status = settled_convoy_status();
                 let before = convoy_timestamps(&status);
-                let patch =
-                    ConvoyStatusPatch::Settle { disposition: "merged".to_string(), target_mismatches: Vec::new(), finished_at: ts(30) };
+                let patch = ConvoyStatusPatch::Settle {
+                    evidence: None,
+                    disposition: "merged".to_string(),
+                    target_mismatches: Vec::new(),
+                    finished_at: ts(30),
+                };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
             },

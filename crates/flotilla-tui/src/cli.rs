@@ -720,7 +720,19 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
     } else {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec!["Convoy", "Subjects", "Vessel", "Crew", "State", "Surface", "Attention", "Host", "Placement", "Staleness"]);
+        table.set_header(vec![
+            "Convoy",
+            "Subjects",
+            "Vessel",
+            "Crew",
+            "State",
+            "Surface",
+            "Attention",
+            "Host",
+            "Placement",
+            "Staleness",
+            "Landing",
+        ]);
         for row in &response.rows {
             let vessel = match &row.authority {
                 Some(authority) => format!("{} ({authority})", row.vessel),
@@ -762,6 +774,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                     },
                 )),
                 Cell::new(format_fleet_staleness(&row.staleness)),
+                Cell::new(row.landing_reason.as_deref().unwrap_or("-")),
             ]);
         }
         out.push_str(&table.to_string());
@@ -997,15 +1010,26 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    if let Some(entry) = &explanation.landing_entry {
+        let _ = writeln!(output, "\nLanding entry:\n{}", serde_json::to_string_pretty(entry).expect("format landing entry"));
+    }
+    if let Some(evidence) = &explanation.landing_settlement {
+        let _ = writeln!(
+            output,
+            "\nLanding settlement (recorded at landing):\n{}",
+            serde_json::to_string_pretty(evidence).expect("format landing settlement")
+        );
+    }
     output.push_str("\nDecision ledgers:\n");
     if explanation.decision_ledgers.is_empty() {
         output.push_str("  (no settlement claims)\n");
     } else {
         for ledger in &explanation.decision_ledgers {
+            let active = if ledger.completed_while_crew_active { " — completed while crew active" } else { "" };
             if ledger.superseded {
                 let _ = writeln!(
                     output,
-                    "  - {}/{} superseded claim at={} comment={} message={}",
+                    "  - {}/{} superseded claim at={} comment={} message={}{active}",
                     ledger.vessel,
                     ledger.role,
                     ledger.claimed_at.as_deref().unwrap_or("-"),
@@ -1031,13 +1055,13 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                     ledger.vessel,
                     ledger.role,
                     ledger.claimed_at.as_deref().unwrap_or("-"),
-                    if ledger.completed_while_crew_active { " — completed while crew active" } else { "" },
+                    active,
                     ledger.comment_url.as_deref().unwrap_or("-")
                 );
             } else {
                 let _ = writeln!(
                     output,
-                    "  - {}/{} claimed_at={} artifact={} comment={}",
+                    "  - {}/{} claimed_at={} artifact={} comment={}{active}",
                     ledger.vessel,
                     ledger.role,
                     ledger.claimed_at.as_deref().unwrap_or("-"),

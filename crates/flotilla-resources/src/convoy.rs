@@ -19,7 +19,7 @@ mod reconcile;
 
 pub use reconcile::{
     evaluate_crew_completion, evaluate_landing_settlement, reconcile, ConvoyEvent, ConvoyReconciler, ConvoyTeardownRuntime,
-    CrewCompletionClaim, ReconcileOutcome, SettlementEvaluation, SettlementMode, UnmetSettlementExpectation,
+    CrewCompletionClaim, ReconcileOutcome, SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
 };
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
@@ -882,6 +882,12 @@ pub enum InputValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
+    /// Landing provenance is observational only. ADR 0047: remove the decoder
+    /// defaults one fleet roll after deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_entry: Option<LandingEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_settlement: Option<SettlementEvaluation>,
     /// Per-vessel runtime evidence survives backing environment teardown.
     /// ADR 0047: keep this decoder default for one roll.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -954,6 +960,55 @@ pub struct ConvoyStatus {
     /// Mutating lifecycle requests retained for operator explanation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<LifecycleMutation>,
+}
+
+/// Frozen completion claims that triggered the existing Active → Landing rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct LandingEntry {
+    pub entered_at: DateTime<Utc>,
+    pub claims: Vec<LandingClaim>,
+    /// The reconciler publishes the entry event once, including when settlement
+    /// happens on its first pass after the completion patch.
+    pub event_emitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct LandingClaim {
+    pub vessel: String,
+    pub role: String,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub message: Option<String>,
+    pub completed_while_crew_active: bool,
+    pub preceding_turn: Option<LandingTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingTurn {
+    pub source: String,
+    pub episode: TurnDeliveryEpisode,
+}
+
+impl LandingEntry {
+    pub fn reason(&self) -> String {
+        self.claims
+            .iter()
+            .map(|claim| {
+                let reference = claim
+                    .message
+                    .as_deref()
+                    .and_then(|message| {
+                        message.split_whitespace().find_map(|word| {
+                            let (_, number) = word.rsplit_once("/pull/")?;
+                            number.parse::<u64>().ok().map(|number| format!(" (#{number})"))
+                        })
+                    })
+                    .unwrap_or_default();
+                let after = claim.preceding_turn.as_ref().map(|turn| format!(" after {}", turn.source)).unwrap_or_default();
+                format!("{} complete{reference}{after}", claim.role)
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1388,6 +1443,10 @@ impl WorkCompletionAuthority {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewWorkState {
+    /// Snapshot at claim time, before later deliveries can replace the latch.
+    /// ADR 0047: remove this decoder default one fleet roll after deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_turn: Option<LandingTurn>,
     /// Workflow continuation awaiting a turn boundary; payload and delivery
     /// remain in Message. Remove the decoder default after one fleet roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1575,7 +1634,11 @@ pub enum ConvoyStatusPatch {
         started_at: Option<DateTime<Utc>>,
         finished_at: Option<DateTime<Utc>>,
     },
+    RecordLandingEvent {
+        transition: Option<Box<ConvoyStatusPatch>>,
+    },
     Settle {
+        evidence: Option<SettlementEvaluation>,
         disposition: String,
         target_mismatches: Vec<TargetMismatch>,
         finished_at: DateTime<Utc>,
@@ -1737,6 +1800,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             && !matches!(
                 self,
                 Self::ObserveEnvironment { .. }
+                    | Self::RecordLandingEvent { .. }
                     | Self::RecordLifecycleMutation { .. }
                     | Self::SetStalled { .. }
                     | Self::SetTeardownWait { .. }
@@ -1898,7 +1962,18 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     clear_operator_pending_brief(status);
                 }
             }
-            Self::Settle { disposition, target_mismatches, finished_at } => {
+            Self::RecordLandingEvent { transition } => {
+                if let Some(transition) = transition {
+                    transition.apply(status);
+                }
+                if let Some(entry) = &mut status.landing_entry {
+                    entry.event_emitted = true;
+                }
+            }
+            Self::Settle { disposition, target_mismatches, finished_at, evidence } => {
+                if status.phase != ConvoyPhase::Landed {
+                    status.landing_settlement = evidence.clone();
+                }
                 let previous_phase = status.phase;
                 status.phase = ConvoyPhase::Landed;
                 status.target_mismatches = target_mismatches.clone();
@@ -2030,7 +2105,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }
-                enter_landing_if_completion_claims_settled(status);
+                enter_landing_if_completion_claims_settled(status, *finished_at);
             }
             Self::MarkWorkFailed { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
@@ -2084,6 +2159,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 forced_by,
             } => {
                 clear_nudge_budget(status, vessel, role);
+                let completion_turn = preceding_turn(status, vessel, role, *finished_at);
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.completion_refusal = None;
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
@@ -2091,6 +2167,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         || disposition.as_ref().is_some_and(|disposition| state.disposition.as_ref() != Some(disposition))
                     {
                         state.finished_at = None;
+                        state.completion_turn = completion_turn;
                     }
                     state.phase = CrewWorkPhase::Done;
                     state.pending_follow_up = None;
@@ -2118,7 +2195,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.completed_while_crew_active |= *completed_while_crew_active;
                 }
                 clear_stall_for_crew(status, vessel, role);
-                enter_landing_if_completion_claims_settled(status);
+                enter_landing_if_completion_claims_settled(status, *finished_at);
             }
             Self::RefuseCrewCompletion { vessel, role, expectation, causes, message } => {
                 clear_nudge_budget(status, vessel, role);
@@ -2470,7 +2547,7 @@ pub mod controller_patches {
     }
 
     pub fn settle(disposition: String, target_mismatches: Vec<TargetMismatch>, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::Settle { disposition, target_mismatches, finished_at }
+        ConvoyStatusPatch::Settle { disposition, target_mismatches, finished_at, evidence: None }
     }
 
     pub fn roll_up_work(work: String, phase: WorkPhase, transitioned_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
@@ -2494,7 +2571,30 @@ pub mod provisioning_patches {
     }
 }
 
-fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus) {
+fn preceding_turn(status: &ConvoyStatus, vessel: &str, role: &str, claimed_at: DateTime<Utc>) -> Option<LandingTurn> {
+    status
+        .turn_deliveries
+        .iter()
+        .flat_map(|(source, delivery)| {
+            let target_matches = status
+                .workflow_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.turn_delivery.get(source))
+                .is_some_and(|rule| rule.to.vessel == vessel && rule.to.role == role);
+            delivery.episodes.iter().filter_map(move |episode| {
+                let at = match &episode.outcome {
+                    TurnDeliveryOutcome::Delivered { delivered_at, .. } if target_matches => *delivered_at,
+                    TurnDeliveryOutcome::MessageAccepted { new_turn: true, accepted_at, .. } if target_matches => *accepted_at,
+                    _ => return None,
+                };
+                (at <= claimed_at).then(|| (at, LandingTurn { source: source.clone(), episode: episode.clone() }))
+            })
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, turn)| turn)
+}
+
+fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus, entered_at: DateTime<Utc>) {
     if status.phase != ConvoyPhase::Active || status.work.is_empty() {
         return;
     }
@@ -2508,6 +2608,43 @@ fn enter_landing_if_completion_claims_settled(status: &mut ConvoyStatus) {
                     .is_some_and(|crew| !crew.is_empty() && crew.values().all(|member| member.phase == CrewWorkPhase::Done)))
     });
     if all_work_claimed_complete {
+        status.landing_entry = Some(LandingEntry {
+            entered_at,
+            claims: status
+                .work
+                .iter()
+                .flat_map(|(vessel, work)| {
+                    let mut claims = Vec::new();
+                    if work.completion_authority == WorkCompletionAuthority::CrewRollup {
+                        if let Some(crew) = status.crew_work.get(vessel) {
+                            claims.extend(crew.iter().filter(|(_, member)| member.phase == CrewWorkPhase::Done).map(|(role, member)| {
+                                LandingClaim {
+                                    vessel: vessel.clone(),
+                                    role: role.clone(),
+                                    claimed_at: member.finished_at,
+                                    message: member.message.clone(),
+                                    completed_while_crew_active: member.completed_while_crew_active,
+                                    preceding_turn: member.completion_turn.clone(),
+                                }
+                            }));
+                        }
+                    }
+                    if claims.is_empty() {
+                        claims.push(LandingClaim {
+                            vessel: vessel.clone(),
+                            role: "work override".to_string(),
+                            claimed_at: work.finished_at,
+                            message: work.message.clone(),
+                            completed_while_crew_active: false,
+                            preceding_turn: None,
+                        });
+                    }
+                    claims
+                })
+                .collect(),
+            event_emitted: false,
+        });
+        status.landing_settlement = None;
         status.phase = ConvoyPhase::Landing;
     }
 }

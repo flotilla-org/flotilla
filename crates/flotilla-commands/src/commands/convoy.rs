@@ -27,7 +27,7 @@ pub enum ConvoyVerb {
     /// List convoys and their crew across the fleet
     List,
     /// Explain why this convoy is holding in its current phase
-    Explain,
+    Explain(ConvoyExplainArgs),
     /// Manage the work aboard a convoy's vessels
     Work(ConvoyWorkNoun),
     /// Delete a convoy and tear down its managed resources
@@ -44,6 +44,12 @@ pub enum ConvoyVerb {
     Start(Box<ConvoyStartArgs>),
     /// Create a convoy from a workflow template
     Create(ConvoyCreateArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyExplainArgs {
+    /// Convoy name or role@project address (also accepted before `explain`)
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -252,14 +258,18 @@ impl ConvoyNoun {
                     action: CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None },
                 }))
             }
-            ConvoyVerb::Explain => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Explain(args) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::QueryExplainConvoy {
                         namespace: None,
-                        name: self.subject.ok_or_else(|| "convoy name is required before `explain`".to_string())?,
+                        name: match (self.subject, args.name) {
+                            (Some(name), None) | (None, Some(name)) => name,
+                            (None, None) => return Err("convoy name is required for `explain`".to_string()),
+                            (Some(_), Some(_)) => return Err("provide only one convoy name for `explain`".to_string()),
+                        },
                     },
                 },
                 repo: RepoContext::None,
@@ -512,7 +522,12 @@ impl std::fmt::Display for ConvoyNoun {
         }
         match &self.verb {
             ConvoyVerb::List => write!(f, " list")?,
-            ConvoyVerb::Explain => write!(f, " explain")?,
+            ConvoyVerb::Explain(args) => {
+                write!(f, " explain")?;
+                if let Some(name) = &args.name {
+                    write!(f, " {}", quote_value(name))?;
+                }
+            }
             ConvoyVerb::Work(work) => {
                 write!(f, " work {}", work.subject)?;
                 match &work.verb {
@@ -715,7 +730,12 @@ mod tests {
 
     #[test]
     fn convoy_explain_resolves_as_a_query() {
+        // Glue: both supported argument orders resolve to the same query.
+        let prefix = parse(&["convoy", "explain", "held-work"]).resolve().expect("name after explain");
         let resolved = parse(&["convoy", "held-work", "explain"]).resolve().expect("resolve");
+        assert_eq!(prefix, resolved);
+        assert_round_trip::<ConvoyNoun>(&["convoy", "explain", "held-work"]);
+        assert!(parse(&["convoy", "one", "explain", "two"]).resolve().is_err());
         assert!(matches!(resolved, Resolved::NeedsContext { command, .. }
             if command.action == CommandAction::QueryExplainConvoy { namespace: None, name: "held-work".to_string() }));
     }

@@ -564,6 +564,8 @@ impl std::fmt::Display for DeclarationAttentionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct FleetListRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_reason: Option<String>,
     pub convoy: String,
     /// Opaque record key used for internal joins. Human surfaces render
     /// `convoy`, which is the role address.

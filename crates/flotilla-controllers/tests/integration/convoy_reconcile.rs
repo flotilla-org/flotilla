@@ -730,7 +730,10 @@ async fn reconcile_with_observed_digest(
 #[tokio::test]
 async fn approved_claim_settles_when_remote_ref_is_observed_at_claimed_digest() {
     let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("claimed-digest"), false).await;
-    assert_eq!(outcome.patch, Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), timestamp(40)))
+    );
 }
 
 #[tokio::test]
@@ -1395,7 +1398,13 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
             now,
         )
     };
-    assert!(evaluate(&records).satisfied, "mixed merged and closed subjects are all terminal");
+    let evaluation = evaluate(&records);
+    assert!(evaluation.satisfied, "mixed merged and closed subjects are all terminal");
+    // The recorded subject set includes every evaluated active subject, with
+    // merged and closed states, and excludes superseded references.
+    assert_eq!(evaluation.subjects.len(), 3);
+    assert_eq!(evaluation.subjects.iter().filter(|subject| subject.state == Some(ObservedChangeRequestState::Merged)).count(), 2);
+    assert_eq!(evaluation.subjects.iter().filter(|subject| subject.state == Some(ObservedChangeRequestState::Closed)).count(), 1);
     records.remove(&change_request_record_name("github.com", "flotilla-org/cleat", 281));
     assert!(!evaluate(&records).satisfied, "a second repository still blocks landing");
 }
@@ -1575,7 +1584,10 @@ async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
 async fn landing_discharges_checkout_without_change_request_despite_false_landed_condition() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::False), None, timestamp(40)).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
+    );
 }
 
 #[tokio::test]
@@ -1583,7 +1595,10 @@ async fn landing_with_settled_change_request_becomes_landed() {
     let outcome =
         reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
+    );
 }
 
 #[tokio::test]
@@ -1638,7 +1653,10 @@ async fn landing_on_a_different_target_records_a_fact_and_still_becomes_landed()
         .declared_target_ref("main".to_string())
         .observed_target_ref("release".to_string())
         .build();
-    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), vec![expected_mismatch.clone()], timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("merged".to_string(), vec![expected_mismatch.clone()], timestamp(40)))
+    );
     let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
     outcome.patch.expect("settlement patch").apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Landed);
@@ -1656,7 +1674,10 @@ async fn landing_without_checkout_evidence_stays_landing() {
 async fn landing_discharges_checkout_without_change_request_despite_stale_landed_evidence() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), None, timestamp(9)).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
+    );
 }
 
 struct TerminalChangeRequestReconcile {
@@ -1879,14 +1900,20 @@ async fn reconcile_terminal_bound_change_request(
 async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
     let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
+    );
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
     let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(false, false, false).await;
 
-    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+    assert_eq!(
+        settlement_transition(outcome.patch.clone()),
+        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
+    );
 }
 
 #[tokio::test]
@@ -1903,7 +1930,10 @@ async fn merged_change_request_discharges_present_context_checkout_without_chang
     assert!(evaluation.satisfied, "the untouched context checkout must not block the merged exit: {:?}", evaluation.unmet);
     assert!(evaluation.unmet.is_empty());
     let patch = outcome.patch.expect("merged disposition should settle the convoy");
-    assert_eq!(patch, controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)));
+    assert_eq!(
+        settlement_transition(Some(patch.clone())),
+        Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)))
+    );
     let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
     patch.apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Landed);
@@ -3239,4 +3269,186 @@ async fn lost_vessel_interrupts_work_without_provisioning_retry_or_recreation() 
         assert!(!again.actuations.iter().any(|action| matches!(action, Actuation::CreateVessel { .. })));
         assert!(!matches!(again.patch, Some(ConvoyStatusPatch::WorkProvisioningRetry { .. } | ConvoyStatusPatch::MarkWorkFailed { .. })));
     }
+}
+
+// The existing settlement transition is unchanged; production additionally retains
+// the exact evaluation. Keep the transition assertions independent of the receipt.
+fn settlement_transition(patch: Option<ConvoyStatusPatch>) -> Option<ConvoyStatusPatch> {
+    patch.map(|mut patch| {
+        if let ConvoyStatusPatch::Settle { evidence, .. } = &mut patch {
+            assert!(evidence.take().expect("production settlement receipt").satisfied);
+        }
+        patch
+    })
+}
+
+// Landing still follows today's bound subjects: a first merged PR suffices even
+// though the assignment mentions a later unopened PR. Record why, then retain
+// that evidence after live observations and delivery latches disappear.
+#[hegel::test]
+fn landing_records_first_merge_before_unopened_later_pr(tc: hegel::TestCase) {
+    // Cover active/idle claims, duplicate claims, and both receipt collection
+    // orders. The later PR has no subject because it has never been opened.
+    let active = tc.draw(hegel::generators::booleans());
+    let duplicates = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+    let collect_before_explain = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Runtime::new().expect("runtime").block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let requests = backend.clone().using::<ChangeRequest>("flotilla");
+        let workflow = implement_review_workflow_spec();
+        let mut snapshot = WorkflowSnapshot {
+            cascade: None,
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+        };
+        snapshot.vessels[0].crew.retain(|crew| crew.role == "coder");
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            observed_workflow_ref: Some("review-and-fix".into()),
+            workflow_snapshot: Some(snapshot),
+            work: BTreeMap::from([("work".into(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        };
+        for (source, at) in [("checks-settled", 30), ("merged-unclaimed", 45)] {
+            status.turn_deliveries.insert(
+                source.into(),
+                flotilla_resources::TurnDeliveryStatus {
+                    episodes: vec![flotilla_resources::TurnDeliveryEpisode::builder()
+                        .subject_revision("first-pr-head".into())
+                        .evidence_at(timestamp(at))
+                        .judged_claim_at(timestamp(20))
+                        .outcome(flotilla_resources::TurnDeliveryOutcome::Delivered {
+                            rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                            delivered_at: timestamp(at),
+                        })
+                        .build()],
+                    ..Default::default()
+                },
+            );
+        }
+        let spec = flotilla_resources::ConvoySpec::builder()
+            .workflow_ref("review-and-fix".into())
+            .instruction("Implement the assignment as B1, B2 and B3 PRs".into())
+            .subjects(vec![flotilla_resources::DeclaredSubject {
+                subject: flotilla_protocol::Subject {
+                    kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                    source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                    id: "2973".into(),
+                },
+                relationship: flotilla_protocol::Relationship::Produces,
+                issue: None,
+                change_request: None,
+            }])
+            .build();
+        let created = convoys.create(&convoy_meta("first-merge"), &spec).await.expect("convoy");
+        convoys.update_status("first-merge", &created.metadata.resource_version, &status).await.expect("initial status");
+        let name = change_request_record_name("github.com", "flotilla-org/flotilla", 2973);
+        let record = requests
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(2973)
+                    .observing_authority("host-a".into())
+                    .build(),
+            )
+            .await
+            .expect("first PR");
+        requests
+            .update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40)))
+            .await
+            .expect("first merge");
+        for offset in 0..duplicates {
+            flotilla_resources::apply_status_patch(
+                &convoys,
+                "first-merge",
+                &external_patches::mark_crew_completed_with_context(
+                    "work".into(),
+                    "coder".into(),
+                    timestamp(50 + offset as i64),
+                    Some("https://github.com/flotilla-org/flotilla/pull/2973".into()),
+                    None,
+                    None,
+                    Some("ledger-digest".into()),
+                    active,
+                    None,
+                ),
+            )
+            .await
+            .expect("completion");
+            let current = convoys.get("first-merge").await.expect("read claim");
+            let status = current.status.expect("status");
+            assert_eq!(status.phase, ConvoyPhase::Landing);
+            let entry = status.landing_entry.expect("entry evidence");
+            assert_eq!(entry.entered_at, timestamp(50));
+            assert_eq!(entry.claims.len(), 1);
+            let claim = &entry.claims[0];
+            assert_eq!((claim.vessel.as_str(), claim.role.as_str()), ("work", "coder"));
+            assert_eq!(claim.claimed_at, Some(timestamp(50)));
+            assert_eq!(claim.message.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/2973"));
+            assert_eq!(claim.completed_while_crew_active, active);
+            assert_eq!(claim.preceding_turn.as_ref().expect("preceding delivery").source, "merged-unclaimed");
+            assert_eq!(entry.reason(), "coder complete (#2973) after merged-unclaimed");
+        }
+        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
+            .with_clock(Arc::new(FixedClock(timestamp(55))));
+        let mut entry_events = 0;
+        for step in 0..3 {
+            let current = convoys.get("first-merge").await.expect("current convoy");
+            let prepared = reconciler.prepare(&current).await.expect("dependencies");
+            let outcome = reconciler.reconcile(&current, &prepared, timestamp(55));
+            entry_events += outcome.events.iter().filter(|event| event.reason == "ConvoyLandingEntered").count();
+            if let Some(patch) = outcome.patch {
+                flotilla_resources::apply_status_patch(&convoys, "first-merge", &patch).await.expect("reconcile patch");
+            }
+            let after = convoys.get("first-merge").await.expect("after reconciliation");
+            assert_eq!(
+                after.status.expect("status").phase,
+                if step == 0 { ConvoyPhase::Landing } else { ConvoyPhase::Landed },
+                "observability adds no reconciliation pass before settlement"
+            );
+        }
+        assert_eq!(entry_events, 1, "entry emits one event without delaying settlement");
+        let landed = convoys.get("first-merge").await.expect("landed convoy");
+        let status = landed.status.as_ref().expect("landed status");
+        assert_eq!(status.phase, ConvoyPhase::Landed);
+        let receipt = status.landing_settlement.as_ref().expect("settlement evidence");
+        assert!(receipt.satisfied);
+        assert_eq!(receipt.subjects.len(), 1, "unopened B2 and B3 are not exit-table subjects");
+        assert_eq!(
+            receipt.subjects[0].address,
+            flotilla_protocol::LeafAddress::ChangeRequest {
+                service: "github.com".into(),
+                scope: "flotilla-org/flotilla".into(),
+                number: 2973,
+            }
+        );
+        assert_eq!(receipt.subjects[0].state, Some(ObservedChangeRequestState::Merged));
+        assert_eq!(receipt.subjects[0].observed_at, Some(timestamp(40)));
+        let decoded: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).expect("encode")).expect("decode");
+        assert_eq!(&decoded, status, "both receipts survive storage");
+        if collect_before_explain {
+            requests.delete(&name).await.expect("collect PR");
+        }
+        let explanation = evaluate_landing_settlement(
+            &landed,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Duration::from_secs(180),
+            Duration::from_secs(180),
+            timestamp(1000),
+        );
+        assert_eq!(&explanation, receipt, "explain reads historical evidence even after GC and expiry");
+    });
 }

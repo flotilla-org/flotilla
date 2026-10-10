@@ -2359,6 +2359,9 @@ impl Aggregator {
             .workflow_ref(&convoy.spec.workflow_ref)
             .dispatching_principal_ref(convoy.spec.dispatching_principal_ref.clone())
             .phase(convoy_phase(phase))
+            .maybe_landing_reason(
+                status.and_then(|status| status.landing_entry.as_ref()).map(|entry| format!("{}: {}", convoy_phase(phase), entry.reason())),
+            )
             .maybe_placement_decision(status.and_then(|status| status.placement_decision.clone()))
             .initializing(convoy_is_initializing(status))
             .maybe_message(

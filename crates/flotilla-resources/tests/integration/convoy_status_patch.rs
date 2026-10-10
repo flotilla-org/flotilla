@@ -270,6 +270,8 @@ fn successful_branch_scan_clears_a_stale_lookup_error() {
 #[test]
 fn abandon_convoy_stamps_convoy_and_open_work() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -354,7 +356,12 @@ fn terminal_convoy_outcomes_survive_stale_status_patches() {
         let stale = [
             controller_patches::roll_up_phase(ConvoyPhase::Active, Some(ts(60)), None),
             controller_patches::fail_convoy(BTreeMap::from([("implement".to_string(), ts(60))]), ts(60), Some("stale".to_string())),
-            ConvoyStatusPatch::Settle { disposition: "merged".to_string(), target_mismatches: Vec::new(), finished_at: ts(60) },
+            ConvoyStatusPatch::Settle {
+                evidence: None,
+                disposition: "merged".to_string(),
+                target_mismatches: Vec::new(),
+                finished_at: ts(60),
+            },
             external_patches::mark_convoy_abandoned(
                 if phase == ConvoyPhase::Failed { ConvoyPhase::Active } else { ConvoyPhase::Failed },
                 ts(60),
@@ -441,6 +448,8 @@ fn one_shot_work_patches_preserve_existing_terminal_outcomes() {
 #[test]
 fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -517,6 +526,8 @@ fn crew_completion_updates_only_the_calling_agent() {
 #[test]
 fn final_crew_completion_claim_enters_landing_idempotently() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -601,6 +612,8 @@ fn stall_after_completion_preserves_done_and_landing() {
 #[test]
 fn crew_failure_records_terminal_state_and_message() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -651,6 +664,8 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     let mut coder = crew_work(CrewWorkPhase::Done);
     coder.finished_at = Some(ts(15));
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -715,6 +730,8 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
     coder.finished_at = Some(ts(15));
     coder.message = Some("ready".to_string());
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -770,6 +787,8 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
     let mut pending_coder = crew_work(CrewWorkPhase::Pending);
     pending_coder.started_at = None;
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -822,6 +841,8 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
 #[test]
 fn running_vessel_work_leaves_latent_agents_pending() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -911,6 +932,8 @@ fn bootstrap_sets_snapshot_and_initial_work_map() {
 #[test]
 fn advance_work_to_ready_updates_only_selected_vessels() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -975,6 +998,8 @@ fn init_failure_records_that_provisioning_never_started() {
 #[test]
 fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -1052,6 +1077,8 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         placement: None,
     };
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -1090,6 +1117,8 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
 #[test]
 fn forced_work_completion_claim_enters_landing() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -1142,6 +1171,8 @@ fn forced_work_completion_claim_enters_landing() {
 #[test]
 fn forced_work_completion_preserves_agent_owned_state() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -1198,6 +1229,8 @@ fn forced_work_completion_preserves_agent_owned_state() {
 #[test]
 fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     let mut status = ConvoyStatus {
+        landing_entry: None,
+        landing_settlement: None,
         environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
@@ -1450,4 +1483,154 @@ fn turn_activation_restoration_preserves_concurrent_status(tc: hegel::TestCase) 
     let restored = current.clone();
     patch.apply(&mut current);
     assert_eq!(current, restored, "restoration is idempotent");
+}
+
+// Landing records each contributing claim only once all declared crew claims
+// are complete. Later duplicate claims do not rewrite that frozen provenance.
+#[hegel::test]
+fn landing_claims_wait_for_every_crew_and_remain_frozen(tc: hegel::TestCase) {
+    // Cover single/multiple claims, both claim orders, and absent messages.
+    let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+    let reverse = tc.draw(hegel::generators::booleans());
+    let with_message = tc.draw(hegel::generators::booleans());
+    let roles: Vec<_> = (0..count).map(|index| format!("role-{index}")).collect();
+    let mut order = roles.clone();
+    if reverse {
+        order.reverse();
+    }
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+        crew_work: BTreeMap::from([("work".into(), roles.iter().map(|role| (role.clone(), crew_work(CrewWorkPhase::Working))).collect())]),
+        ..Default::default()
+    };
+    for (index, role) in order.iter().enumerate() {
+        external_patches::mark_crew_completed_with_context(
+            "work".into(),
+            role.clone(),
+            ts(20 + index as i64),
+            with_message.then(|| format!("{role} done")),
+            None,
+            None,
+            Some("digest".into()),
+            true,
+            None,
+        )
+        .apply(&mut status);
+        assert_eq!(status.phase, if index + 1 == count { ConvoyPhase::Landing } else { ConvoyPhase::Active });
+        assert_eq!(status.landing_entry.is_some(), index + 1 == count);
+    }
+    let entry = status.landing_entry.clone().expect("entry");
+    assert_eq!(entry.claims.len(), count);
+    for claim in &entry.claims {
+        assert!(roles.contains(&claim.role));
+        assert!(claim.preceding_turn.is_none(), "absence of a delivery is explicit");
+        assert_eq!(claim.message.is_some(), with_message);
+    }
+    external_patches::mark_crew_completed_with_context(
+        "work".into(),
+        roles[0].clone(),
+        ts(100),
+        Some("duplicate".into()),
+        None,
+        None,
+        Some("digest".into()),
+        false,
+        None,
+    )
+    .apply(&mut status);
+    assert_eq!(status.landing_entry.as_ref(), Some(&entry));
+    let mut legacy = serde_json::to_value(&status).expect("encode");
+    legacy.as_object_mut().expect("status object").remove("landing_entry");
+    legacy.as_object_mut().expect("status object").remove("landing_settlement");
+    for crew in legacy["crew_work"]["work"].as_object_mut().expect("crew object").values_mut() {
+        crew.as_object_mut().expect("claim object").remove("completion_turn");
+    }
+    let decoded: ConvoyStatus = serde_json::from_value(legacy).expect("previous-generation status");
+    assert_eq!(decoded.phase, ConvoyPhase::Landing);
+    assert!(decoded.landing_entry.is_none() && decoded.landing_settlement.is_none());
+}
+
+// A claim names only a preceding turn for its own role. Future, queued,
+// refused, and duplicate/suppressed admissions cannot become its trigger.
+#[hegel::test]
+fn landing_turn_is_targeted_and_precedes_the_claim(tc: hegel::TestCase) {
+    // Cover the time boundary on both sides, every delivery outcome, and
+    // missing or unrelated workflow targets.
+    let delivered_at = tc.draw(hegel::generators::integers::<i64>().min_value(49).max_value(51));
+    let outcome_kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
+    let target_kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+    let workflow = flotilla_resources::implement_review_workflow_spec();
+    let mut snapshot = WorkflowSnapshot {
+        cascade: None,
+        stall_nudges: Default::default(),
+        supervision: None,
+        exit: workflow.exit,
+        turn_delivery: workflow.turn_delivery,
+        vessels: workflow.vessels,
+    };
+    if target_kind == 1 {
+        snapshot.turn_delivery.get_mut("merged-unclaimed").expect("rule").to.role = "reviewer".into();
+    } else if target_kind == 2 {
+        snapshot.turn_delivery.shift_remove("merged-unclaimed");
+    } else if target_kind == 3 {
+        snapshot.turn_delivery.get_mut("merged-unclaimed").expect("rule").to.vessel = "other".into();
+    }
+    let rung = flotilla_resources::TurnDeliveryRung::WarmSession;
+    let outcome = match outcome_kind {
+        0 => flotilla_resources::TurnDeliveryOutcome::Delivered { rung, delivered_at: ts(delivered_at) },
+        1 | 2 => flotilla_resources::TurnDeliveryOutcome::MessageAccepted {
+            new_turn: outcome_kind == 1,
+            message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "turn"),
+            rung,
+            accepted_at: ts(delivered_at),
+        },
+        3 => flotilla_resources::TurnDeliveryOutcome::Queued {
+            rung,
+            queued_at: ts(delivered_at),
+            vessel: "work".into(),
+            role: "coder".into(),
+            message_id: "turn".into(),
+            blocking_reason: "active turn".into(),
+        },
+        _ => flotilla_resources::TurnDeliveryOutcome::Refused {
+            reason: "not ready".into(),
+            refused_at: ts(delivered_at),
+            hold_executed: false,
+        },
+    };
+    let episode = flotilla_resources::TurnDeliveryEpisode::builder()
+        .subject_revision("head".into())
+        .evidence_at(ts(40))
+        .judged_claim_at(ts(20))
+        .outcome(outcome)
+        .build();
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(snapshot),
+        work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+        crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), crew_work(CrewWorkPhase::Working))]))]),
+        turn_deliveries: BTreeMap::from([(
+            "merged-unclaimed".into(),
+            flotilla_resources::TurnDeliveryStatus { episodes: vec![episode.clone()], ..Default::default() },
+        )]),
+        ..Default::default()
+    };
+    external_patches::mark_crew_completed_with_context(
+        "work".into(),
+        "coder".into(),
+        ts(50),
+        None,
+        None,
+        None,
+        Some("digest".into()),
+        false,
+        None,
+    )
+    .apply(&mut status);
+    let preceding = &status.landing_entry.expect("entry").claims[0].preceding_turn;
+    assert_eq!(preceding.is_some(), target_kind == 0 && outcome_kind <= 1 && delivered_at <= 50);
+    if let Some(turn) = preceding {
+        assert_eq!(turn.episode, episode);
+    }
 }

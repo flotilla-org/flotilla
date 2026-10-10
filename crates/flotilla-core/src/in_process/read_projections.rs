@@ -1208,6 +1208,16 @@ impl ReadProjections<'_> {
             })
             .collect();
         Ok(ConvoyExplanation {
+            landing_entry: convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.landing_entry.as_ref())
+                .map(|entry| serde_json::to_value(entry).expect("serialize landing entry")),
+            landing_settlement: convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.landing_settlement.as_ref())
+                .map(|evidence| serde_json::to_value(evidence).expect("serialize landing settlement")),
             holds: convoy
                 .status
                 .as_ref()

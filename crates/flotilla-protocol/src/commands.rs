@@ -409,6 +409,10 @@ pub struct ExplainedSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_entry: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_settlement: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holds: Vec<ExplainedTurnDeliveryHold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
