@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_forge_forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
@@ -15,8 +16,6 @@ use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
 use crate::providers::types::ChangeRequest;
 use crate::providers::types::ChangeRequestStatus;
-use flotilla_forge_forgejo::ForgejoClient;
-use flotilla_forge_forgejo::ForgejoIssueProviderConfig;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,

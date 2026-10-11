@@ -11,6 +11,7 @@ use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
+use flotilla_forge_forgejo::{ForgejoAuth, ForgejoIssueProviderConfig, FORGEJO_AUTH_PROVIDER};
 use flotilla_forge_github::github::GhApiClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
@@ -23,9 +24,6 @@ use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
 use crate::providers::issue_tracker::github::GitHubIssueProvider;
 use crate::providers::issue_tracker::IssueProvider;
-use flotilla_forge_forgejo::ForgejoAuth;
-use flotilla_forge_forgejo::ForgejoIssueProviderConfig;
-use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
     let mut unmet = vec![];
