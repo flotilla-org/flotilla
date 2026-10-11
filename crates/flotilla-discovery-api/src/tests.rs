@@ -180,6 +180,18 @@ fn provider_descriptor_labeled_simple() {
 #[test]
 fn provider_category_slug_round_trip() {
     let expected = ["vcs", "change_request", "issue_tracker", "cloud_agent", "ai_utility", "terminal_pool", "environment_provider"];
+    // ALL must cover each live category. Exhaustive matching forces any new enum
+    // variant to update this contract even if the author forgets to update ALL.
+    let exhaustive_slugs = ProviderCategory::ALL.map(|category| match category {
+        ProviderCategory::Vcs => "vcs",
+        ProviderCategory::ChangeRequest => "change_request",
+        ProviderCategory::IssueProvider => "issue_tracker",
+        ProviderCategory::CloudAgent => "cloud_agent",
+        ProviderCategory::AiUtility => "ai_utility",
+        ProviderCategory::TerminalPool => "terminal_pool",
+        ProviderCategory::EnvironmentProvider => "environment_provider",
+    });
+    assert_eq!(exhaustive_slugs, expected);
     assert_eq!(ProviderCategory::ALL.map(|category| category.slug()), expected);
 }
 

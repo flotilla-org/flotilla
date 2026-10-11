@@ -9,8 +9,8 @@ license.workspace = true
 [dependencies]
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-protocol = { path = "../flotilla-protocol" }
-flotilla-resources = { path = "../flotilla-resources" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-resources = { path = "../flotilla-resources" }
 async-trait.workspace = true
 serde.workspace = true
 
