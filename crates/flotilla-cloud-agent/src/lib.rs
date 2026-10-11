@@ -1,5 +1,4 @@
 //! Cloud session providers and their discovery contracts.
-#![allow(clippy::double_must_use)]
 pub mod detectors;
 pub mod factories;
 

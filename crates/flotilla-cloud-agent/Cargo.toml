@@ -15,7 +15,6 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-tls = { path = "../flotilla-tls" }
 async-trait.workspace = true
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

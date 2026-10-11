@@ -1,6 +1,7 @@
 //! Private copies of the existing discovery probe primitives. Generic discovery
 //! remains in core until flotilla-discovery is extracted; keeping these local
 //! preserves probe behavior without depending upward or changing foundations.
+//! Consolidation is tracked in https://github.com/flotilla-org/flotilla/issues/3049.
 
 use std::path::{Path, PathBuf};
 

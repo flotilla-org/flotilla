@@ -585,7 +585,7 @@ mod tests {
     // and must not consume the separate missing-auth warning.
     #[tokio::test]
     async fn failed_auth_probe_preserves_cache() {
-        let fixture = fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
+        let fixture = fixture_path("codex_fallback_auth_retry.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let agent = CodexCodingAgent::new(
             "codex".into(),
@@ -608,7 +608,7 @@ mod tests {
         std::fs::write(&auth_path, r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fresh-token","account_id":"acc-1"}}"#)
             .expect("write auth file");
 
-        let fixture = fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
+        let fixture = fixture_path("codex_fallback_auth_retry.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new(auth_path), http);
