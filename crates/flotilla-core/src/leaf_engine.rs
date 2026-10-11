@@ -272,6 +272,10 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.observation_error(subject).await
     }
 
+    pub async fn watch_change_request_convoy_demands(&self, namespace: &str) {
+        self.inner.change_requests.watch_convoy_demands(namespace).await;
+    }
+
     pub async fn refresh_change_request_once(&self, subject: &ChangeRequestRef) -> Result<(), ObservationError> {
         self.inner.change_requests.refresh_once(subject).await
     }
