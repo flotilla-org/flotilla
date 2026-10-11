@@ -3514,8 +3514,10 @@ mod tests {
     #[tokio::test]
     async fn declared_query_plans_use_indexes() {
         let backend = SqliteBackend::open_in_memory().unwrap();
+        // This inspects the complete plan corpus, not one production request.
+        // Keep every plan assertion independent of the request-read deadline.
         backend
-            .read_call("explain declared queries", |connection| {
+            .call("explain declared queries", |connection| {
                 let mut migration_names = std::collections::BTreeSet::new();
                 for kind in crate::declared_resource_kinds() {
                     for replicas in [false, true] {
