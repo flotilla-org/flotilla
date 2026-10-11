@@ -20,6 +20,26 @@ def output(function, *args):
 
 
 class BootstrapHelperTests(unittest.TestCase):
+    # Bootstrap command glue must turn missing binaries and deadline refusal
+    # into one diagnostic and exit 1, without leaking a Python traceback.
+    def test_stop_command_errors_exit_cleanly(self):
+        for failures, ticks in (
+            ([FileNotFoundError("CLI missing")], [0, 0]),
+            ([subprocess.CompletedProcess([], 0), FileNotFoundError("pgrep missing")], [0, 0, 1]),
+            ([], [0, 30]),
+        ):
+            stderr = io.StringIO()
+            with self.subTest(failures=failures, ticks=ticks), \
+                 patch.object(sys, "argv", ["validator", "stop-daemon", "--", "cli", "sock", "config", "state"]), \
+                 patch.object(validation.subprocess, "run", side_effect=failures), \
+                 patch.object(validation.time, "monotonic", side_effect=ticks), \
+                 contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as exit_status:
+                    validation.main()
+                self.assertEqual(exit_status.exception.code, 1)
+                self.assertTrue(stderr.getvalue().startswith("generation validation: "), stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+
     # Subprocess boundary fakes and a monotonic clock cover startup, exit races,
     # hung CLIs, persistent processes, and erroneous pgrep results without launchd.
     def test_stop_retries_until_process_absent(self):

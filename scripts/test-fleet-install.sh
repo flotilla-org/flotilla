@@ -801,6 +801,8 @@ test -f "$darwin_home/launchctl-state.running" || fail 'failed stop left daemon 
 test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
 
 grep -Fq 'then retry fleet-install' "$test_root/darwin-stop-failed.out" || fail 'failed stop omitted installer retry hint'
+grep -Fq 'generation validation: daemon stop deadline expired' "$test_root/darwin-stop-failed.out" || fail 'stop deadline omitted clean diagnostic'
+if grep -Fq Traceback "$test_root/darwin-stop-failed.out"; then fail 'stop deadline leaked Python traceback'; fi
 # If launchd refuses bootout, recovery must kickstart the existing registration.
 if BOOTOUT_FAIL=1 STOP_FAIL=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-bootout-failed.out" 2>&1; then
   fail 'failed bootout and stop were accepted'

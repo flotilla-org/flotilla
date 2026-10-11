@@ -670,7 +670,7 @@ def begin_daemon_install(socket, marker):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise ValueError("daemon spawn lock did not settle within 15s")
+                    raise ValidationError("daemon spawn lock did not settle within 15s")
                 time.sleep(0.05)
         Path(marker).write_text("fleet-install\n")
 
@@ -683,7 +683,7 @@ def stop_daemon_for_install(cli, socket, config_dir, state_dir, timeout=30):
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ValueError("daemon stop deadline expired after 30s")
+            raise ValidationError("daemon stop deadline expired after 30s")
         try:
             subprocess.run(command, timeout=remaining, check=False)
         except subprocess.TimeoutExpired:
@@ -695,7 +695,7 @@ def stop_daemon_for_install(cli, socket, config_dir, state_dir, timeout=30):
         # A daemon on another socket therefore causes a bounded refusal too.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ValueError("daemon stop deadline expired after 30s")
+            raise ValidationError("daemon stop deadline expired after 30s")
         try:
             absent = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "flotillad"],
                                     timeout=remaining, check=False, stdout=subprocess.DEVNULL).returncode == 1
@@ -706,7 +706,7 @@ def stop_daemon_for_install(cli, socket, config_dir, state_dir, timeout=30):
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ValueError("daemon stop deadline expired after 30s")
+            raise ValidationError("daemon stop deadline expired after 30s")
         time.sleep(min(0.25, remaining))
 
 
