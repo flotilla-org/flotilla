@@ -3,6 +3,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,14 +12,13 @@ use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
     actor_obligation, instantiate_exit, instantiate_turn_delivery, select_convoy_children, subject_relationship_conflicts, ChangeRequest,
     Checkout, CheckoutSpec, ControllerRetry, Convoy, ConvoyPhase, Forge, InstantiatedExit, LeafMaker, ResourceError, ResourceObject,
-    RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WatchEvent, WatchStart, WorkPhase,
+    RetryCeiling, StatusPatch, TerminalAttentionSource, TerminalSession, TurnDeliveryOutcome, Vessel, WorkPhase,
 };
 use flotilla_store::{
     controller::{SecondaryWatch, WorkQueueSender},
-    ResourceBackend,
+    ResourceBackend, WatchView,
 };
-use futures::StreamExt;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OnceCell};
 
 use super::durable_message_evidence;
 use super::sources::{change_request_sources, freshest_change_requests};
@@ -30,6 +30,44 @@ use super::{EpisodeKeyFields, LeafSubscriptionRow, LeafSubscriptionTable, LeafWa
 pub(super) struct ReconcilerWake {
     pub(super) subscriptions: LeafSubscriptionTable,
     _marker: PhantomData<Convoy>,
+}
+
+pub(super) struct LeafViews {
+    pub(super) defaults: WatchView<flotilla_resources::CrewDefaults>,
+    pub(super) fleet: WatchView<flotilla_resources::FleetDesignation>,
+    pub(super) projects: WatchView<flotilla_resources::Project>,
+    pub(super) convoys: WatchView<Convoy>,
+    pub(super) ensures: WatchView<flotilla_resources::ConvoyEnsure>,
+    pub(super) sessions: WatchView<TerminalSession>,
+    pub(super) change_requests: WatchView<ChangeRequest>,
+    pub(super) checkouts: WatchView<Checkout>,
+    pub(super) vessels: WatchView<Vessel>,
+    pub(super) messages: WatchView<flotilla_resources::Message>,
+    pub(super) forges: WatchView<Forge>,
+}
+impl LeafViews {
+    async fn start(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
+        Ok(Self {
+            defaults: WatchView::start(backend.clone(), namespace).await?,
+            fleet: WatchView::start(backend.clone(), namespace).await?,
+            projects: WatchView::start(backend.clone(), namespace).await?,
+            convoys: WatchView::start(backend.clone(), namespace).await?,
+            ensures: WatchView::start(backend.clone(), namespace).await?,
+            sessions: WatchView::start(backend.clone(), namespace).await?,
+            change_requests: WatchView::start(backend.clone(), namespace).await?,
+            checkouts: WatchView::start(backend.clone(), namespace).await?,
+            vessels: WatchView::start(backend.clone(), namespace).await?,
+            messages: WatchView::start(backend.clone(), namespace).await?,
+            forges: WatchView::start(backend.clone(), namespace).await?,
+        })
+    }
+    async fn local_convoys(&self) -> Result<HashMap<String, ResourceObject<Convoy>>, String> {
+        self.convoys
+            .query(&flotilla_store::StoreQuery::default())
+            .await
+            .map_err(|error| error.to_string())
+            .map(|listed| listed.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect())
+    }
 }
 
 impl SecondaryWatch for ReconcilerWake {
@@ -54,6 +92,16 @@ impl ReconcilerWake {
         Self { subscriptions, _marker: PhantomData }
     }
 
+    pub(super) async fn views(&self, namespace: &str) -> Result<Arc<OnceCell<LeafViews>>, String> {
+        let cell = self.subscriptions.inner.watch_views.lock().await.entry(namespace.into()).or_default().clone();
+        cell.get_or_try_init(|| LeafViews::start(&self.subscriptions.inner.backend, namespace)).await.map_err(|error| error.to_string())?;
+        Ok(cell)
+    }
+
+    pub(super) async fn local_convoys(&self, namespace: &str) -> Result<HashMap<String, ResourceObject<Convoy>>, String> {
+        self.views(namespace).await?.get().expect("initialized views").local_convoys().await
+    }
+
     pub(super) async fn report_stale_attention(&self, row: &LeafSubscriptionRow, source: TerminalAttentionSource) {
         if self.subscriptions.inner.stale_attention_reported.lock().await.insert(row.id) {
             tracing::warn!(subscription_id = %row.id, ?source, maker = ?row.maker, "terminal attention evidence stale");
@@ -76,6 +124,7 @@ impl ReconcilerWake {
         now.signed_duration_since(episode.1) < delay
     }
 
+    #[cfg(test)]
     pub(super) async fn observe_queued_turns(
         &self,
         namespace: &str,
@@ -83,22 +132,27 @@ impl ReconcilerWake {
         sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
+        let cell = self.views(namespace).await?;
+        let messages = cell.get().expect("initialized views").messages.list().await.map_err(|error| error.to_string())?;
+        self.observe_queued_turns_from_messages(namespace, convoy, sessions, &messages.items, now).await
+    }
+
+    pub(super) async fn observe_queued_turns_from_messages(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<Convoy>,
+        sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
+        messages: &[flotilla_resources::ReadResourceObject<flotilla_resources::Message>],
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
         let Some(status) = &convoy.status else { return Ok(()) };
         let mut observations = Vec::new();
         for (source, delivery) in &status.turn_deliveries {
             for episode in &delivery.episodes {
                 let TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } = &episode.outcome else { continue };
-                let (confirmed, blocking_reason) = match self
-                    .subscriptions
-                    .inner
-                    .backend
-                    .including_replicas::<flotilla_resources::Message>(namespace)
-                    .get(message_id)
-                    .await
-                {
-                    Ok(message) => durable_message_evidence(&message.object),
-                    Err(ResourceError::NotFound { .. }) => queued_turn_evidence(queued_turn_session(sessions, vessel, role), message_id),
-                    Err(error) => return Err(error.to_string()),
+                let (confirmed, blocking_reason) = match messages.iter().find(|message| message.object.metadata.name == *message_id) {
+                    Some(message) => durable_message_evidence(&message.object),
+                    None => queued_turn_evidence(queued_turn_session(sessions, vessel, role), message_id),
                 };
                 observations.push(flotilla_resources::QueuedTurnObservation {
                     source: source.clone(),
@@ -124,25 +178,14 @@ impl ReconcilerWake {
     }
 
     pub(super) async fn run(&self, namespace: String, sender: WorkQueueSender) -> Result<(), String> {
-        let convoys = self.subscriptions.inner.backend.clone().using::<Convoy>(&namespace);
-        let checkouts = self.subscriptions.inner.backend.including_replicas::<Checkout>(&namespace);
-        let listed_convoys = convoys.list().await.map_err(|error| error.to_string())?;
-        let mut convoy_watch = convoys.watch(WatchStart::resuming_from(&listed_convoys)).await.map_err(|error| error.to_string())?;
-        let mut checkout_watch = checkouts.watch().await.map_err(|error| error.to_string())?;
-        let mut change_request_watch = self
-            .subscriptions
-            .inner
-            .backend
-            .including_replicas::<ChangeRequest>(&namespace)
-            .watch()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut vessel_watch =
-            self.subscriptions.inner.backend.including_replicas::<Vessel>(&namespace).watch().await.map_err(|error| error.to_string())?;
-        let mut forge_watch =
-            self.subscriptions.inner.backend.including_replicas::<Forge>(&namespace).watch().await.map_err(|error| error.to_string())?;
-        let mut convoy_objects =
-            listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
+        let cell = self.views(&namespace).await?;
+        let views = cell.get().expect("initialized views");
+        let mut convoy_watch = views.convoys.subscribe();
+        let mut checkout_watch = views.checkouts.subscribe();
+        let mut change_request_watch = views.change_requests.subscribe();
+        let mut vessel_watch = views.vessels.subscribe();
+        let mut forge_watch = views.forges.subscribe();
+        let mut convoy_objects = views.local_convoys().await?;
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
         let mut judge_tick = tokio::time::interval(Duration::from_secs(1));
@@ -152,35 +195,25 @@ impl ReconcilerWake {
                 _ = judge_tick.tick() => {
                     self.judge_stalls(&namespace, &convoy_objects).await?;
                 }
-                event = convoy_watch.next() => {
-                    let event = event.ok_or_else(|| "reconciler wake convoy watch closed".to_string())?.map_err(|error| error.to_string())?;
-                    match event {
-                        WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) => {
-                            convoy_objects.insert(convoy.metadata.name.clone(), convoy);
-                        }
-                        WatchEvent::Deleted(convoy) => {
-                            convoy_objects.remove(&convoy.metadata.name);
-                        }
-                        WatchEvent::DeletedByName(tombstone) => {
-                            convoy_objects.remove(&tombstone.name);
-                        }
-                    }
+                event = convoy_watch.changed() => {
+                    event.map_err(|_| "convoy view stopped".to_string())?;
+                    convoy_objects = views.local_convoys().await?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
-                event = checkout_watch.next() => {
-                    event.ok_or_else(|| "reconciler wake checkout watch closed".to_string())?.map_err(|error| error.to_string())?;
+                event = checkout_watch.changed() => {
+                    event.map_err(|_| "checkout view stopped".to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
-                event = change_request_watch.next() => {
-                    event.ok_or_else(|| "reconciler wake change request watch closed".to_string())?.map_err(|error| error.to_string())?;
+                event = change_request_watch.changed() => {
+                    event.map_err(|_| "change request view stopped".to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
-                event = vessel_watch.next() => {
-                    event.ok_or_else(|| "reconciler wake vessel watch closed".to_string())?.map_err(|error| error.to_string())?;
+                event = vessel_watch.changed() => {
+                    event.map_err(|_| "vessel view stopped".to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
-                event = forge_watch.next() => {
-                    event.ok_or_else(|| "reconciler wake forge watch closed".to_string())?.map_err(|error| error.to_string())?;
+                event = forge_watch.changed() => {
+                    event.map_err(|_| "forge view stopped".to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
                 wake = wake_rx.recv() => match wake {
@@ -199,38 +232,15 @@ impl ReconcilerWake {
     }
 
     pub(super) async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
-        let forges = self
-            .subscriptions
-            .inner
-            .backend
-            .definitions::<Forge>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|forge| forge.spec)
-            .collect::<Vec<_>>();
-        let checkout_sources = self
-            .subscriptions
-            .inner
-            .backend
-            .including_replicas::<Checkout>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
-        let change_request_list = self
-            .subscriptions
-            .inner
-            .backend
-            .including_replicas::<ChangeRequest>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
+        let cell = self.views(namespace).await?;
+        let views = cell.get().expect("initialized views");
+        let forges =
+            views.forges.definitions().await.map_err(|error| error.to_string())?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+        let checkout_sources = views.checkouts.list().await.map_err(|error| error.to_string())?.items;
+        let change_request_list = views.change_requests.list().await.map_err(|error| error.to_string())?;
         let observed_change_requests =
             freshest_change_requests(&change_request_sources(change_request_list)).into_iter().collect::<BTreeMap<_, _>>();
-        let vessel_sources =
-            self.subscriptions.inner.backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let vessel_sources = views.vessels.list().await.map_err(|error| error.to_string())?.items;
         let mut desired = Vec::<LeafSubscriptionRow>::new();
         for convoy in convoys.values().filter(|convoy| {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing))

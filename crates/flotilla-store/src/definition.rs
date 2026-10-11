@@ -315,6 +315,31 @@ impl<T: Resource> DefinitionResolver<T> {
     }
 }
 
+/// Merge a cached set of definition sources using the same causal semantics as
+/// the store-backed resolver. No backing-store reads are needed.
+pub(crate) fn merge_cached_definitions<T: Resource>(
+    items: Vec<crate::ReadResourceObject<T>>,
+    local_root: &NodeId,
+) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+    let mut by_name = BTreeMap::<(String, String), Vec<DefinitionSource<T>>>::new();
+    for item in items {
+        let (origin, synced_at) = match item.provenance {
+            ResourceProvenance::Local => (local_root.clone(), None),
+            ResourceProvenance::Replica { origin_root, last_synced_at } => (origin_root, Some(last_synced_at)),
+        };
+        by_name.entry((item.object.metadata.namespace.clone(), item.object.metadata.name.clone())).or_default().push(DefinitionSource {
+            object: item.object,
+            origin,
+            synced_at,
+        });
+    }
+    by_name
+        .into_values()
+        .map(|sources| merge_sources(&sources))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|objects| objects.into_iter().filter(definition_is_visible).collect())
+}
+
 fn definition_is_visible<T: Resource>(object: &ResourceObject<T>) -> bool {
     let deleted = object
         .metadata

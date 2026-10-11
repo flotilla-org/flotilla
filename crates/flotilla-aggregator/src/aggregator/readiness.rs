@@ -10,21 +10,11 @@ impl Aggregator {
         &mut self,
         resolver: &dyn AggregatorWatchSource<CloneResource>,
     ) -> Result<WatchStream<CloneResource>, ResourceError> {
-        loop {
-            let recovered = async {
-                let listed = resolver.list().await?;
-                let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
-                self.readiness_clones = readiness_resources(
-                    listed.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
-                );
-                Ok(watch)
-            }
-            .await;
-            match recovered {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        let (listed, watch) = recover_local_view(resolver).await?;
+        self.readiness_clones = readiness_resources(
+            listed.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
+        );
+        Ok(watch)
     }
 
     pub(super) fn vessel_readiness(
