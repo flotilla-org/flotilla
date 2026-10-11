@@ -12,6 +12,21 @@ use crate::{
 };
 
 macro_rules! define_resource {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, queryable = $fields:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = $fields;
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+            const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -20,6 +35,7 @@ macro_rules! define_resource {
             type Spec = $spec;
             type Status = $status;
             type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
 
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
@@ -38,6 +54,7 @@ macro_rules! define_resource {
             type Spec = $spec;
             type Status = $status;
             type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
 
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
@@ -55,6 +72,7 @@ macro_rules! define_resource {
             type Spec = $spec;
             type Status = $status;
             type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
 
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
@@ -69,6 +87,7 @@ macro_rules! define_resource {
             type Spec = $spec;
             type Status = $status;
             type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
 
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
@@ -94,6 +113,7 @@ macro_rules! define_resource {
             type Spec = $spec;
             type Status = $status;
             type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
 
             const API_PATHS: $crate::resource::ApiPaths =
                 $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
@@ -117,6 +137,8 @@ pub trait Resource: Send + Sync + 'static {
     type StatusPatch: StatusPatch<Self::Status>;
 
     const API_PATHS: ApiPaths;
+    /// Equality-queryable serialized paths. Backends reject undeclared paths.
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
     const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 
     /// Opt in to sibling validation at the authoritative write boundary.

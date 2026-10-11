@@ -41,6 +41,9 @@ impl Store for HttpBackend {
     async fn record_field_ownership_violation(&self, _violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
         Ok(())
     }
+    async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &StoreQuery) -> Result<QueryResult, ResourceError> {
+        self.query_declared(kind, namespace, query).await
+    }
     async fn query_messages_raw(
         &self,
         namespace: &str,

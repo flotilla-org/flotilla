@@ -24,7 +24,8 @@ define_resource!(
     TerminalSessionSpec,
     TerminalSessionStatus,
     TerminalSessionStatusPatch,
-    replication = ReplicationClass::HomeBoundRuntime
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "status.phase"]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]

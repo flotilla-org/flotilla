@@ -51,6 +51,7 @@ struct ReplicaState {
 
 #[derive(Debug, Default)]
 struct ReplicaPartition {
+    queries: crate::QueryIndex,
     messages: crate::message_query::MessageIndex,
     objects: HashMap<String, Value>,
     digest: flotilla_resources::digest::DigestIndex,
@@ -62,6 +63,7 @@ struct ReplicaPartition {
 
 #[derive(Debug)]
 struct ResourceStore {
+    queries: crate::QueryIndex,
     messages: crate::message_query::MessageIndex,
     objects: HashMap<String, Value>,
     digest: flotilla_resources::digest::DigestIndex,
@@ -99,6 +101,7 @@ impl ResourceStore {
 
     fn push_event(&mut self, event: StoredEvent, max_events: usize) {
         let name = event.object["metadata"]["name"].as_str().expect("encoded event name");
+        self.queries.update(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(&event.object));
         self.messages.update(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(&event.object));
         let version = event.version.to_string();
         self.digest.set(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(version.as_str()));
@@ -117,6 +120,7 @@ impl ResourceStore {
 impl Default for ResourceStore {
     fn default() -> Self {
         Self {
+            queries: Default::default(),
             messages: Default::default(),
             objects: HashMap::new(),
             digest: flotilla_resources::digest::DigestIndex::default(),
@@ -484,6 +488,7 @@ impl InMemoryBackend {
         let mut state = self.replicas.lock().await;
         let mut old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut digest = std::mem::take(&mut old.digest);
+        let mut queries = std::mem::take(&mut old.queries);
         let mut messages = std::mem::take(&mut old.messages);
         // Move the unaffected map intact. Only the selected leaf is compared,
         // cloned, decoded or notified; sparse repair never scans other bodies.
@@ -505,6 +510,7 @@ impl InMemoryBackend {
             let name = &object.metadata.name;
             let encoded = Self::encode_object(resource_kind, object)?;
             let unchanged = old.objects.get(name) == Some(&encoded);
+            queries.update(name, Some(&encoded));
             messages.update(name, Some(&encoded));
             objects.insert(name.clone(), encoded);
             digest.set(name, Some(&object.metadata.resource_version));
@@ -529,6 +535,7 @@ impl InMemoryBackend {
         for (name, value) in old.objects {
             if !objects.contains_key(&name) {
                 // Fence stale relays as well as removing the visible replica.
+                queries.update(&name, None);
                 messages.update(&name, None);
                 digest.set(&name, None);
                 synced_at_by_name.insert(name, synced_at);
@@ -543,6 +550,7 @@ impl InMemoryBackend {
         state.partitions.insert(
             replica_key,
             ReplicaPartition {
+                queries,
                 messages,
                 objects,
                 digest,
@@ -602,12 +610,14 @@ impl InMemoryBackend {
         }
         match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                partition.queries.update(&object.metadata.name, Some(&encoded));
                 partition.messages.update(&object.metadata.name, Some(&encoded));
                 partition.objects.insert(object.metadata.name.clone(), encoded.clone());
                 partition.digest.set(&object.metadata.name, Some(&object.metadata.resource_version));
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
             StoredReplicaEventKind::Deleted => {
+                partition.queries.update(&object.metadata.name, None);
                 partition.messages.update(&object.metadata.name, None);
                 partition.objects.remove(&object.metadata.name);
                 partition.digest.set(&object.metadata.name, None);
@@ -646,6 +656,7 @@ impl InMemoryBackend {
         if unchanged {
             return Ok(());
         }
+        partition.queries.update(&tombstone.name, None);
         partition.messages.update(&tombstone.name, None);
         partition.objects.remove(&tombstone.name);
         partition.digest.set(&tombstone.name, None);
@@ -850,16 +861,10 @@ impl InMemoryBackend {
         }
 
         self.with_store(resource_kind, namespace, |store| {
-            self.count_read(resource_kind, store.objects.len());
-            let mut items = Vec::new();
-            for value in store.objects.values().cloned() {
-                let object = Self::decode_object(resource_kind, value)?;
-                let matches = crate::labels_match(&object.metadata.labels, required);
-                if matches {
-                    items.push(object);
-                }
-            }
-            items.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+            let names = store.queries.names(&crate::StoreQuery::labels(required, false, true));
+            self.count_read(resource_kind, names.len());
+            let items =
+                names.iter().map(|name| Self::decode_object(resource_kind, store.objects[name].clone())).collect::<Result<Vec<_>, _>>()?;
             Ok(ResourceList { items, resource_version: store.current_version().to_string(), generation: self.generation.clone() })
         })
         .await
@@ -1235,6 +1240,69 @@ impl Store for InMemoryBackend {
     async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
         self.record_field_ownership_violation(violation).await;
         Ok(())
+    }
+    async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
+        query.validate(kind)?;
+        let stores = self.stores.lock().await;
+        let key = Self::store_key(kind, namespace);
+        let local = stores.get(&key);
+        let mut items = Vec::new();
+        if let Some(store) = local {
+            let mut names = store.queries.names(query);
+            if let Some(message) = &query.message {
+                let message_names = store.messages.names(message).into_iter().collect();
+                names = names.intersection(&message_names).cloned().collect();
+            }
+            for name in names {
+                items.push(ReadResourceObject {
+                    object: kind.decode_object(store.objects[&name].clone())?,
+                    provenance: ResourceProvenance::Local,
+                });
+            }
+        }
+        if query.include_replicas && kind.replication != crate::ReplicationClass::None {
+            if let Some(durable) = &self.durable_replicas {
+                // Durable replicas use their backing store's pushed-down query.
+                let listed = durable.store().query_raw(kind, namespace, query).await?;
+                items.extend(listed.items.into_iter().filter(|item| matches!(item.provenance, ResourceProvenance::Replica { .. })));
+            } else {
+                let replicas = self.replicas.lock().await;
+                for ((origin, partition_key), partition) in &replicas.partitions {
+                    if partition_key != &key {
+                        continue;
+                    }
+                    let mut names = partition.queries.names(query);
+                    if let Some(message) = &query.message {
+                        let message_names = partition.messages.names(message).into_iter().collect();
+                        names = names.intersection(&message_names).cloned().collect();
+                    }
+                    for name in names {
+                        if query.suppress_self_origin
+                            && origin == &self.local_root()
+                            && local.is_some_and(|store| store.objects.contains_key(&name))
+                        {
+                            continue;
+                        }
+                        items.push(ReadResourceObject {
+                            object: kind.decode_object(partition.objects[&name].clone())?,
+                            provenance: ResourceProvenance::Replica {
+                                origin_root: origin.clone(),
+                                last_synced_at: partition.synced_at_by_name[&name],
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        self.count_read(kind, items.len());
+        items.sort_by(|a, b| a.object.metadata.name.cmp(&b.object.metadata.name));
+        Ok(crate::QueryResult {
+            items,
+            position: crate::ResourcePosition {
+                resource_version: local.map(|store| store.current_version()).unwrap_or_default().to_string(),
+                generation: self.generation.clone(),
+            },
+        })
     }
     async fn query_messages_raw(
         &self,

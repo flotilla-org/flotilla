@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Message, ReadResourceObject, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver};
+use crate::{Message, ReadResourceObject, ResourceBackend, ResourceError, ResourceObject, TypedResolver};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -133,25 +133,18 @@ impl TypedResolver<Message> {
 
 impl ResourceBackend {
     pub async fn query_messages(&self, namespace: &str, query: &MessageQuery) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        let items = self.store().query_messages_typed(namespace, query, true).await?;
-        if self.serves_read_views() {
-            return Ok(items);
-        }
-        let local_root = self.local_root()?;
-        let mut visible = Vec::new();
-        for item in items {
-            if let ResourceProvenance::Replica { origin_root, .. } = &item.provenance {
-                if origin_root == &local_root {
-                    match self.using::<Message>(namespace).get(&item.object.metadata.name).await {
-                        Ok(_) => continue,
-                        Err(ResourceError::NotFound { .. }) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-            visible.push(item);
-        }
-        Ok(visible)
+        Ok(self
+            .query_declared::<Message>(
+                namespace,
+                &crate::StoreQuery {
+                    message: Some(query.clone()),
+                    include_replicas: true,
+                    suppress_self_origin: true,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .items)
     }
 }
 

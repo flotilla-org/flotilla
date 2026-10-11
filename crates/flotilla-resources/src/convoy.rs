@@ -24,7 +24,15 @@ pub use reconcile::{
     ReconcileOutcome, SettlementEvaluation, SettlementMode, SettlementSubject, UnmetSettlementExpectation,
 };
 
-define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
+define_resource!(
+    Convoy,
+    "convoys",
+    ConvoySpec,
+    ConvoyStatus,
+    ConvoyStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "status.phase"]
+);
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";

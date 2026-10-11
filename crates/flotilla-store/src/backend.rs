@@ -249,32 +249,10 @@ impl<T: Resource> ReplicaReadResolver<T> {
         if required.is_empty() {
             return self.list().await;
         }
-        if self.backend.serves_read_views() {
-            let backend = &self.backend;
-            return backend.list_including_replicas_typed_matching_labels::<T>(&self.namespace, required).await;
+        if self.backend.serves_read_views() && self.suppress_self_origin {
+            return self.backend.list_including_replicas_typed_matching_labels::<T>(&self.namespace, required).await;
         }
-        let local = self.backend.using::<T>(&self.namespace).list_matching_labels(required).await?;
-        let mut items =
-            local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
-        let mut replicas = { self.backend.list_replicas_typed::<T>(&self.namespace).await? };
-        replicas.retain(|item| crate::labels_match(&item.object.metadata.labels, required));
-        items.extend(replicas);
-        if self.suppress_self_origin {
-            let local_root = self.backend.local_root()?;
-            let local_names = items
-                .iter()
-                .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
-                .map(|item| item.object.metadata.name.clone())
-                .collect::<HashSet<_>>();
-            items.retain(|item| {
-                !matches!(
-                    &item.provenance,
-                    ResourceProvenance::Replica { origin_root, .. }
-                        if origin_root == &local_root && local_names.contains(&item.object.metadata.name)
-                )
-            });
-        }
-        Ok(ReadResourceList { items })
+        self.backend.query_declared::<T>(&self.namespace, &crate::StoreQuery::labels(required, true, self.suppress_self_origin)).await
     }
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {

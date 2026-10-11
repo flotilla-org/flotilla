@@ -136,7 +136,11 @@ pub(super) async fn serve_resource_http_with_daemon(
     let watch = query.get("watch").is_some_and(|value| value == "true");
 
     if let Some(name) = name {
-        if watch || replica_sources || (all_provenances && include_replicas) {
+        if watch
+            || replica_sources
+            || (all_provenances && include_replicas)
+            || ["storeQuery", "labelSelector", "fieldSelector", "messageQuery"].iter().any(|key| query.contains_key(*key))
+        {
             return write_error(&mut stream, 400, "unsupported resource point read options").await;
         }
         if all_provenances {
@@ -158,6 +162,36 @@ pub(super) async fn serve_resource_http_with_daemon(
 
     if all_provenances {
         return write_error(&mut stream, 400, "allProvenances requires a resource name").await;
+    }
+
+    if query.contains_key("storeQuery") || query.contains_key("labelSelector") || query.contains_key("fieldSelector") {
+        if watch || replica_sources {
+            return write_error(&mut stream, 400, "declared queries require a collection read").await;
+        }
+        let mut filter: flotilla_store::StoreQuery = if let Some(encoded) = query.get("storeQuery") {
+            match serde_json::from_str(encoded) {
+                Ok(query) => query,
+                Err(error) => return write_error(&mut stream, 400, &format!("invalid store query: {error}")).await,
+            }
+        } else {
+            flotilla_store::StoreQuery { include_replicas, suppress_self_origin: true, ..Default::default() }
+        };
+        for (parameter, fields) in [("labelSelector", &mut filter.labels), ("fieldSelector", &mut filter.fields)] {
+            if let Some(selector) = query.get(parameter) {
+                for expression in selector.split(',').filter(|part| !part.is_empty()) {
+                    let Some((key, value)) = expression.split_once('=') else {
+                        return write_error(&mut stream, 400, "selectors require key=value").await;
+                    };
+                    if key.is_empty() || fields.insert(key.into(), value.into()).is_some() {
+                        return write_error(&mut stream, 400, "empty or duplicate selector key").await;
+                    }
+                }
+            }
+        }
+        return match flotilla_store::query_resource_kind(&backend, namespace, kind, &filter).await {
+            Ok(document) => write_json(&mut stream, 200, &document).await,
+            Err(error) => write_resource_error(&mut stream, error).await,
+        };
     }
 
     if let Some(encoded) = query.get("messageQuery") {
@@ -235,12 +269,7 @@ pub(super) async fn serve_resource_http_with_daemon(
 }
 
 fn parse_query(raw_query: &str) -> BTreeMap<String, String> {
-    raw_query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
+    url::form_urlencoded::parse(raw_query.as_bytes()).into_owned().collect()
 }
 
 fn query_flag(query: &BTreeMap<String, String>, names: &[&str]) -> bool {
@@ -309,5 +338,61 @@ fn reason(status: u16) -> &'static str {
         431 => "Request Header Fields Too Large",
         422 => "Unprocessable Entity",
         _ => "Internal Server Error",
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    use flotilla_resources::{Convoy, ConvoySpec, InputMeta};
+    use flotilla_store_memory::InMemoryBackend;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The in-process UnixStream pair stands in for the daemon's HTTP connection,
+    // exercising its real request parser and query dispatch without a live host.
+    async fn request(backend: ResourceBackend, parameters: &str) -> String {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(async move {
+            let first = server.read_u8().await.unwrap();
+            serve_resource_http(server, first, backend).await.unwrap();
+        });
+        client
+            .write_all(
+                format!("GET /apis/flotilla.work/v1/namespaces/flotilla/convoys?{parameters} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap();
+        response
+    }
+    // The server honors selectors instead of returning the entire collection;
+    // malformed and undeclared field queries fail rather than silently broadening.
+    #[tokio::test]
+    async fn resource_http_honors_declared_selectors() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        for (name, label) in [("selected", "target"), ("excluded", "other")] {
+            let meta = InputMeta::builder()
+                .name(name.to_owned())
+                .labels(std::collections::BTreeMap::from([("team".into(), label.into())]))
+                .build();
+            backend
+                .using::<Convoy>("flotilla")
+                .create(&meta, &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+                .await
+                .unwrap();
+        }
+        for parameters in ["labelSelector=team%3Dtarget", "fieldSelector=metadata.name%3Dselected"] {
+            let response = request(backend.clone(), parameters).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["items"].as_array().unwrap().len(), 1);
+            assert_eq!(body["items"][0]["metadata"]["name"], "selected");
+        }
+        for parameters in ["labelSelector=invalid", "fieldSelector=spec.unknown%3Dx"] {
+            assert!(request(backend.clone(), parameters).await.starts_with("HTTP/1.1 400"));
+        }
     }
 }

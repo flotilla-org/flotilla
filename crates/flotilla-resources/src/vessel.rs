@@ -8,7 +8,15 @@ use crate::{
     resource::define_resource, status_patch::StatusPatch, ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, Stance,
 };
 
-define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
+define_resource!(
+    Vessel,
+    "vessels",
+    VesselSpec,
+    VesselStatus,
+    VesselStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "status.phase"]
+);
 
 pub const ACTUATOR_HOST_REF_ANNOTATION: &str = "flotilla.work/actuator-host-ref";
 pub const ACTUATOR_SOURCE_ROOT_ANNOTATION: &str = "flotilla.work/actuator-source-root";
