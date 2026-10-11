@@ -23,6 +23,7 @@ absolute-paths-allowed-crates = [
     "ed25519",
     "ed25519_dalek",
     "flotilla_aggregator",
+    "flotilla_ai_utility",
     "flotilla_build_features",
     "flotilla_client",
     "flotilla_cloud_agent",

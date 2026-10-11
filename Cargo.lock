@@ -1122,6 +1122,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-ai-utility"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-discovery-api",
+ "flotilla-discovery-testkit",
+ "flotilla-paths",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "flotilla-tls",
+ "http",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "flotilla-build-features"
 version = "0.1.0"
 dependencies = [
@@ -1437,6 +1467,7 @@ dependencies = [
  "bon",
  "chrono",
  "dirs",
+ "flotilla-ai-utility",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1493,6 +1524,7 @@ dependencies = [
  "chrono",
  "dirs",
  "ed25519-dalek",
+ "flotilla-ai-utility",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
