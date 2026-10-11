@@ -210,6 +210,7 @@ fn crew_message_sender_headers_snapshot() {
 
 mod capabilities;
 mod delivery;
+mod handler_contract;
 mod message_admission;
 mod orientation;
 mod sender_contract;

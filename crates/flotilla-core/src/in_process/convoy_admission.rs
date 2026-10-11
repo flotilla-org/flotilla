@@ -3980,6 +3980,87 @@ fn require_open_continuation(status: &flotilla_protocol::ChangeRequestStatus, id
 }
 
 #[cfg(test)]
+pub(super) async fn handler_contract_fixture() -> HandlerContractFixture {
+    use crate::testkits::discovery::fake_discovery;
+
+    // Discovery stands in for host/subprocess I/O; orchestration and stores are real.
+    let temp = tempfile::tempdir().expect("config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let discovery = Arc::new(fake_discovery(false));
+    let local_environment_id = EnvironmentId::new("local");
+    let environment_manager = Arc::new(
+        EnvironmentManager::new_local(&discovery, local_environment_id.clone(), flotilla_protocol::qualified_path::HostId::new("host"))
+            .await,
+    );
+    let resource_backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+    let observed_resource_backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+    let provisioning_namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
+    let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
+        resource_backend: resource_backend.clone(),
+        config: config.clone(),
+        discovery: discovery.clone(),
+        environment_manager: environment_manager.clone(),
+        local_environment_id: local_environment_id.clone(),
+    });
+    let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
+        forge_reads: crate::forge_observation::ForgeReads::new(resource_backend.clone(), "flotilla".into()),
+        host_providers: Mutex::new(HashMap::new()),
+        backend: resource_backend.clone(),
+        config: config.clone(),
+        discovery: discovery.clone(),
+        environment_manager: environment_manager.clone(),
+        local_environment_id: local_environment_id.clone(),
+        provisioning_namespace: provisioning_namespace.clone(),
+    });
+    let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), query_port.clone()));
+    let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
+    let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
+    let brief_artifact_writer = Arc::new(RwLock::new(None));
+    let admission_free_space_path = Arc::new(std::sync::RwLock::new(temp.path().to_path_buf()));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let regard_lifecycle = Arc::new(RegardLifecycle::new(resource_backend.clone(), clock.clone(), chrono::Duration::hours(1)));
+    let host_name = HostName::new("host");
+    let admission = ConvoyAdmission::builder()
+        .backend(resource_backend.clone())
+        .observed_backend(observed_resource_backend.clone())
+        .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
+        .config(Arc::clone(&config))
+        .discovery(Arc::clone(&discovery))
+        .environment_manager(Arc::clone(&environment_manager))
+        .local_environment_id(local_environment_id.clone())
+        .provisioning_namespace(Arc::clone(&provisioning_namespace))
+        .repository_change_requests(Arc::clone(&repository_change_requests))
+        .change_request_port(query_port)
+        .issue_port(issue_query_port)
+        .change_request_observation_source(Arc::clone(&observation_source))
+        .brief_artifact_writer(Arc::clone(&brief_artifact_writer))
+        .admission_free_space_path(Arc::clone(&admission_free_space_path))
+        .regard_lifecycle(Arc::clone(&regard_lifecycle))
+        .host_name(host_name.clone())
+        .clock(Arc::clone(&clock))
+        .fulfilment_decider(Arc::new(StaticFulfilmentDecider))
+        .build();
+    HandlerContractFixture {
+        owner: admission,
+        backend: resource_backend,
+        observed: observed_resource_backend,
+        reconciliation: observed_checkout_reconciliation,
+        namespace: provisioning_namespace,
+        temp,
+    }
+}
+
+#[cfg(test)]
+pub(super) struct HandlerContractFixture {
+    pub(super) owner: ConvoyAdmission,
+    pub(super) backend: ResourceBackend,
+    pub(super) observed: ResourceBackend,
+    pub(super) reconciliation: Arc<Mutex<()>>,
+    pub(super) namespace: Arc<std::sync::RwLock<String>>,
+    pub(super) temp: tempfile::TempDir,
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

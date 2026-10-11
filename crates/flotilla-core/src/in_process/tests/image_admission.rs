@@ -34,11 +34,13 @@ async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image()
     policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec).await.expect("reference baseline");
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let error = daemon
+        .convoy_admission
         .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
         .await
         .expect_err("missing baseline must fail");
     assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
     let error = daemon
+        .convoy_admission
         .resolve_convoy_placement("flotilla", None, &[], &workflow, None, false)
         .await
         .expect_err("default selection must reject missing baseline");
@@ -48,10 +50,18 @@ async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image()
         .apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string(), layers: None })
         .await
         .expect("baseline");
-    let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("admit");
+    let admitted = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
+        .await
+        .expect("admit");
     baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v2".to_string(), layers: None }).await.expect("bump");
     assert_eq!(admitted.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v1"));
-    let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("next admission");
+    let next = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
+        .await
+        .expect("next admission");
     assert_eq!(next.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v2"));
 }
 
@@ -114,7 +124,11 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
         .build();
     let workflow =
         WorkflowTemplateSpec::builder().vessels(vec![VesselRequirement::builder().name("work".into()).crew(vec![crew]).build()]).build();
-    let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("admission");
+    let admitted = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
+        .await
+        .expect("admission");
     let image = admitted.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
     let DockerImageSource::Composition { composition } = &image else { panic!("admission must store composition") };
     assert_eq!(composition.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(), ["base", "display"]);
@@ -131,8 +145,11 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
     let mut live = policies.get("crew-policy").await.expect("live policy");
     live.spec.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Composition { composition: bound.clone() };
     let live = policies.update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &live.spec).await.expect("bound policy");
-    let repeated =
-        daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("readmission");
+    let repeated = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
+        .await
+        .expect("readmission");
     let DockerImageSource::Composition { composition: repeated } =
         repeated.selected.expect("selected").spec.docker_per_vessel.expect("docker").image
     else {
@@ -146,7 +163,11 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
         .update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &restored)
         .await
         .expect("restore baseline selection");
-    let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("next admission");
+    let next = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
+        .await
+        .expect("next admission");
     let DockerImageSource::Composition { composition: next } =
         next.selected.expect("selected").spec.docker_per_vessel.expect("docker").image
     else {
@@ -155,7 +176,10 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
     assert_eq!(next.layers[0].spec.revision, "3".repeat(40));
     let mut missing = workflow;
     missing.vessels[0].crew[0].needs = BTreeSet::from(["display:missing".parse().expect("need")]);
-    let error =
-        daemon.resolve_convoy_placement("flotilla", None, &[], &missing, Some("crew-policy"), false).await.expect_err("missing need");
+    let error = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &missing, Some("crew-policy"), false)
+        .await
+        .expect_err("missing need");
     assert!(error.contains("display:missing"));
 }
