@@ -138,6 +138,8 @@ pub trait Resource: Send + Sync + 'static {
 
     const API_PATHS: ApiPaths;
     /// Equality-queryable serialized paths. Backends reject undeclared paths.
+    /// Removing a declaration refuses new queries but retains its additive SQLite
+    /// index and migration record; dropping obsolete indexes needs a named migration.
     const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
     const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 

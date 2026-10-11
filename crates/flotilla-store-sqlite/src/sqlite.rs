@@ -36,6 +36,12 @@ use crate::{
 #[path = "sqlite/digest.rs"]
 mod digest;
 
+#[derive(Clone, Copy)]
+enum QueryColumns {
+    LocalList,
+    ReadRows,
+}
+
 type StoreKey = (String, String, String, String);
 type WatchersByStore = HashMap<StoreKey, WatchChannel<StoredEvent>>;
 type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>;
@@ -565,7 +571,10 @@ impl SqliteBackend {
         query: &crate::StoreQuery,
         replicas: bool,
         root: &str,
+        columns: QueryColumns,
     ) -> (String, Vec<rusqlite::types::Value>) {
+        // All identifiers come from registered static declarations; wire values are bound.
+        debug_assert!(query.validate(kind).is_ok());
         use rusqlite::types::Value as SqlValue;
         let table = if replicas { "replica_objects" } else { "resource_objects" };
         let mut args = vec![
@@ -599,8 +608,15 @@ impl SqliteBackend {
             predicates.push(format!("{candidate} IN (SELECT {columns} FROM {table}_owners l INDEXED BY {table}_owners_lookup WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND l.owner_key=?{}{origin})",args.len()));
         }
         if replicas && query.suppress_self_origin {
-            args.push(SqlValue::Text(root.into()));
-            predicates.push(format!("NOT (o.origin_root=?{} AND EXISTS(SELECT 1 FROM resource_objects local WHERE local.group_name=o.group_name AND local.version=o.version AND local.kind=o.kind AND local.namespace=o.namespace AND local.name=o.name))",args.len()));
+            if let Some(scope) = &query.replica_shadowing {
+                args.push(SqlValue::Text(scope.origin_root.to_string()));
+                let root_arg = args.len();
+                args.push(SqlValue::Text(serde_json::json!(scope.local_names).to_string()));
+                predicates.push(format!("NOT (o.origin_root=?{root_arg} AND o.name IN (SELECT value FROM json_each(?{})))", args.len()));
+            } else {
+                args.push(SqlValue::Text(root.into()));
+                predicates.push(format!("NOT (o.origin_root=?{} AND EXISTS(SELECT 1 FROM resource_objects local WHERE local.group_name=o.group_name AND local.version=o.version AND local.kind=o.kind AND local.namespace=o.namespace AND local.name=o.name))",args.len()));
+            }
         }
         // Specialized Message indexes are kept as the established exemplar.
         let index = if let Some(message) = &query.message {
@@ -613,8 +629,12 @@ impl SqliteBackend {
             query.fields.keys().next().map(|path| Self::field_index(table, kind, path))
         };
         let indexed = index.map(|index: String| format!(" INDEXED BY {index}")).unwrap_or_default();
-        let extra = if replicas { "origin_root,last_synced_at" } else { "NULL,NULL" };
-        (format!("SELECT body_json,{extra} FROM {table} o{indexed} WHERE {} ORDER BY name", predicates.join(" AND ")), args)
+        let projection = match columns {
+            QueryColumns::LocalList => "name,body_json",
+            QueryColumns::ReadRows if replicas => "body_json,origin_root,last_synced_at",
+            QueryColumns::ReadRows => "body_json,NULL,NULL",
+        };
+        (format!("SELECT {projection} FROM {table} o{indexed} WHERE {} ORDER BY name", predicates.join(" AND ")), args)
     }
 
     fn store_key(resource_kind: ResourceKind, namespace: &str) -> StoreKey {
@@ -1709,8 +1729,7 @@ impl SqliteBackend {
         query: &crate::StoreQuery,
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
         query.validate(resource_kind)?;
-        let (sql, args) = Self::declared_sql(resource_kind, namespace, query, false, "");
-        let sql = sql.replacen("SELECT body_json,NULL,NULL", "SELECT name,body_json", 1);
+        let (sql, args) = Self::declared_sql(resource_kind, namespace, query, false, "", QueryColumns::LocalList);
 
         let key = Self::store_key(resource_kind, namespace);
         let quarantine_key = key.clone();
@@ -2447,15 +2466,18 @@ impl Store for SqliteBackend {
         let namespace = namespace.to_owned();
         let query = query.clone();
         let root = self.local_root().to_string();
-        let (items, position) = self
+        let (mut items, position) = self
             .read_call("declared resource query", move |connection| {
                 let tx = connection.transaction().map_err(|e| Self::map_sqlite(e, "begin query snapshot"))?;
                 let mut items = Vec::new();
                 for replicas in [false, true] {
+                    if !replicas && query.replicas_only {
+                        continue;
+                    }
                     if replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None) {
                         continue;
                     }
-                    let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root);
+                    let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::ReadRows);
                     let mut statement = tx.prepare(&sql).map_err(|e| Self::map_sqlite(e, "prepare declared query"))?;
                     let rows = statement
                         .query_map(rusqlite::params_from_iter(args), |r| {
@@ -2489,6 +2511,7 @@ impl Store for SqliteBackend {
         if let Some(observer) = &self.read_observer {
             observer.read(kind.paths.kind, items.len());
         }
+        crate::sort_query_items(&mut items);
         Ok(crate::QueryResult { items, position })
     }
     async fn query_messages_raw(
@@ -3072,9 +3095,28 @@ mod tests {
                                 cases.push((crate::StoreQuery { message: Some(message), ..Default::default() }, index));
                             }
                         }
+                        if kind.paths.kind == "Message" {
+                            let combined = crate::StoreQuery {
+                                fields: BTreeMap::from([
+                                    ("spec.receiver".into(), "receiver".into()),
+                                    ("status.phase".into(), "accepted".into()),
+                                ]),
+                                labels: BTreeMap::from([("team".into(), "target".into())]),
+                                owner: Some(crate::OwnerQuery {
+                                    api_version: "flotilla.work/v1".into(),
+                                    kind: "Project".into(),
+                                    name: "project".into(),
+                                }),
+                                ..Default::default()
+                            };
+                            cases.push((combined.clone(), SqliteBackend::field_index(table, kind, "spec.receiver")));
+                            cases.push((combined.clone(), format!("{table}_labels_lookup")));
+                            cases.push((combined, format!("{table}_owners_lookup")));
+                        }
                         for (query, index) in cases {
                             query.validate(kind)?;
-                            let (sql, args) = SqliteBackend::declared_sql(kind, "flotilla", &query, replicas, "local");
+                            let (sql, args) =
+                                SqliteBackend::declared_sql(kind, "flotilla", &query, replicas, "local", QueryColumns::ReadRows);
                             let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
                             let plans = statement
                                 .query_map(rusqlite::params_from_iter(args), |row| row.get::<_, String>(3))

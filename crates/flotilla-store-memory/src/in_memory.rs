@@ -1247,7 +1247,7 @@ impl Store for InMemoryBackend {
         let key = Self::store_key(kind, namespace);
         let local = stores.get(&key);
         let mut items = Vec::new();
-        if let Some(store) = local {
+        if let Some(store) = local.filter(|_| !query.replicas_only) {
             let mut names = store.queries.names(query);
             if let Some(message) = &query.message {
                 let message_names = store.messages.names(message).into_iter().collect();
@@ -1255,16 +1255,28 @@ impl Store for InMemoryBackend {
             }
             for name in names {
                 items.push(ReadResourceObject {
-                    object: kind.decode_object(store.objects[&name].clone())?,
+                    object: kind.decode_object(
+                        store
+                            .objects
+                            .get(&name)
+                            .ok_or_else(|| ResourceError::other("query index references missing local object"))?
+                            .clone(),
+                    )?,
                     provenance: ResourceProvenance::Local,
                 });
             }
         }
         if query.include_replicas && kind.replication != crate::ReplicationClass::None {
             if let Some(durable) = &self.durable_replicas {
-                // Durable replicas use their backing store's pushed-down query.
-                let listed = durable.store().query_raw(kind, namespace, query).await?;
-                items.extend(listed.items.into_iter().filter(|item| matches!(item.provenance, ResourceProvenance::Replica { .. })));
+                // The composing memory store defines shadowing, not the durable
+                // store's unrelated local rows. Pass names before any decoding.
+                let mut replica_query = query.clone();
+                replica_query.replicas_only = true;
+                replica_query.replica_shadowing = Some(query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
+                    origin_root: self.local_root(),
+                    local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
+                }));
+                items.extend(durable.store().query_raw(kind, namespace, &replica_query).await?.items);
             } else {
                 let replicas = self.replicas.lock().await;
                 for ((origin, partition_key), partition) in &replicas.partitions {
@@ -1277,17 +1289,28 @@ impl Store for InMemoryBackend {
                         names = names.intersection(&message_names).cloned().collect();
                     }
                     for name in names {
-                        if query.suppress_self_origin
-                            && origin == &self.local_root()
-                            && local.is_some_and(|store| store.objects.contains_key(&name))
-                        {
+                        let shadowed = if let Some(scope) = &query.replica_shadowing {
+                            origin == &scope.origin_root && scope.local_names.contains(&name)
+                        } else {
+                            origin == &self.local_root() && local.is_some_and(|store| store.objects.contains_key(&name))
+                        };
+                        if query.suppress_self_origin && shadowed {
                             continue;
                         }
                         items.push(ReadResourceObject {
-                            object: kind.decode_object(partition.objects[&name].clone())?,
+                            object: kind.decode_object(
+                                partition
+                                    .objects
+                                    .get(&name)
+                                    .ok_or_else(|| ResourceError::other("query index references missing replica object"))?
+                                    .clone(),
+                            )?,
                             provenance: ResourceProvenance::Replica {
                                 origin_root: origin.clone(),
-                                last_synced_at: partition.synced_at_by_name[&name],
+                                last_synced_at: *partition
+                                    .synced_at_by_name
+                                    .get(&name)
+                                    .ok_or_else(|| ResourceError::other("replica query object has no sync timestamp"))?,
                             },
                         });
                     }
@@ -1295,7 +1318,7 @@ impl Store for InMemoryBackend {
             }
         }
         self.count_read(kind, items.len());
-        items.sort_by(|a, b| a.object.metadata.name.cmp(&b.object.metadata.name));
+        crate::sort_query_items(&mut items);
         Ok(crate::QueryResult {
             items,
             position: crate::ResourcePosition {

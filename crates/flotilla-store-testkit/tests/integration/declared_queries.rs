@@ -74,7 +74,7 @@ async fn seed(backend: &ResourceBackend) {
     }
 
     let source = ResourceBackend::new(InMemoryBackend::default());
-    for name in ["shadow", "remote"] {
+    for name in ["shadow", "remote", "0-first"] {
         let mut meta = convoy_meta(name);
         meta.labels.insert("team".into(), "target".into());
         source.using::<Convoy>("flotilla").create(&meta, &convoy_spec("template")).await.unwrap();
@@ -120,10 +120,10 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     // Local existence suppresses self-origin replicas even when local labels differ.
     let mut query = StoreQuery::labels(&BTreeMap::from([("team".into(), "target".into())]), true, true);
     let result = backend.query_declared::<Convoy>("flotilla", &query).await.unwrap();
-    assert_eq!(result.items.iter().map(|o| o.object.metadata.name.as_str()).collect::<Vec<_>>(), vec!["a", "remote"]);
+    assert_eq!(result.items.iter().map(|o| o.object.metadata.name.as_str()).collect::<Vec<_>>(), vec!["0-first", "a", "remote"]);
     assert!(result.items.iter().any(|o| matches!(o.provenance, ResourceProvenance::Replica { .. })));
     query.suppress_self_origin = false;
-    assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 3);
+    assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 4);
     // MessageQuery is a case of the same vocabulary on every transport, with
     // history excluded before decoding and an exclusive audit time boundary.
     for (message, expected) in [
@@ -240,6 +240,14 @@ async fn shared_query_contract() {
         seed(backend).await;
         contract(backend, backend).await;
     }
+    // Durable local names deliberately differ from the composing memory store:
+    // remote exists only durably; shadow exists only in the memory local set.
+    let durable = ResourceBackend::new(SqliteBackend::open_in_memory().unwrap());
+    durable.using::<Convoy>("flotilla").create(&convoy_meta("remote"), &convoy_spec("template")).await.unwrap();
+    durable.using::<Convoy>("flotilla").create(&convoy_meta("durable-only"), &convoy_spec("template")).await.unwrap();
+    let hybrid = ResourceBackend::new(InMemoryBackend::observed_with_durable_replicas(durable));
+    seed(&hybrid).await;
+    contract(&hybrid, &hybrid).await;
     let server = ResourceBackend::new(InMemoryBackend::default());
     seed(&server).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

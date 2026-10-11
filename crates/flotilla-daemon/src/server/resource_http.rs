@@ -182,8 +182,12 @@ pub(super) async fn serve_resource_http_with_daemon(
                     let Some((key, value)) = expression.split_once('=') else {
                         return write_error(&mut stream, 400, "selectors require key=value").await;
                     };
-                    if key.is_empty() || fields.insert(key.into(), value.into()).is_some() {
-                        return write_error(&mut stream, 400, "empty or duplicate selector key").await;
+                    if key.is_empty()
+                        || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+                        || value.contains(['=', '(', ')', '!'])
+                        || fields.insert(key.into(), value.into()).is_some()
+                    {
+                        return write_error(&mut stream, 400, "unsupported selector syntax or duplicate selector key").await;
                     }
                 }
             }
@@ -391,8 +395,28 @@ mod query_tests {
             assert_eq!(body["items"].as_array().unwrap().len(), 1);
             assert_eq!(body["items"][0]["metadata"]["name"], "selected");
         }
-        for parameters in ["labelSelector=invalid", "fieldSelector=spec.unknown%3Dx"] {
+        for parameters in [
+            "labelSelector=invalid",
+            "fieldSelector=spec.unknown%3Dx",
+            "labelSelector=a!%3Db",
+            "labelSelector=a%20in%20(x)",
+            "labelSelector=a%3D%3Db",
+        ] {
             assert!(request(backend.clone(), parameters).await.starts_with("HTTP/1.1 400"));
         }
+        let query = flotilla_store::StoreQuery::labels(&std::collections::BTreeMap::from([("team".into(), "target".into())]), false, true);
+        let parameters: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("storeQuery", &serde_json::to_string(&query).unwrap())
+            .append_pair("labelSelector", "team=target")
+            .finish();
+        assert!(request(backend.clone(), &parameters).await.starts_with("HTTP/1.1 400"), "duplicate merged selector key is refused");
+        let parameters: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("storeQuery", &serde_json::to_string(&query).unwrap())
+            .append_pair("fieldSelector", "metadata.name=selected")
+            .finish();
+        let response = request(backend, &parameters).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "distinct query and selector predicates are combined");
+        let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
     }
 }

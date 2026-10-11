@@ -29,9 +29,35 @@ pub struct StoreQuery {
     pub message: Option<MessageQuery>,
     #[serde(default)]
     pub include_replicas: bool,
+    /// Internal source view used by stores with a separate durable replica store.
+    #[serde(default)]
+    pub replicas_only: bool,
+    /// Override which local names shadow replicas when composing two stores.
+    #[serde(default)]
+    pub replica_shadowing: Option<ReplicaShadowing>,
     #[serde(default = "suppress_default")]
     pub suppress_self_origin: bool,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaShadowing {
+    pub origin_root: flotilla_protocol::NodeId,
+    pub local_names: BTreeSet<String>,
+}
+
+/// Stable order across adapters: name, then local before replicas, then origin.
+pub fn sort_query_items(items: &mut [crate::ReadResourceObject<crate::SerializedResource>]) {
+    use crate::ResourceProvenance;
+    items.sort_by(|a, b| {
+        a.object.metadata.name.cmp(&b.object.metadata.name).then_with(|| match (&a.provenance, &b.provenance) {
+            (ResourceProvenance::Local, ResourceProvenance::Local) => std::cmp::Ordering::Equal,
+            (ResourceProvenance::Local, _) => std::cmp::Ordering::Less,
+            (_, ResourceProvenance::Local) => std::cmp::Ordering::Greater,
+            (ResourceProvenance::Replica { origin_root: a, .. }, ResourceProvenance::Replica { origin_root: b, .. }) => a.cmp(b),
+        })
+    });
+}
+
 /// Owner identity uses the stored reference's API version, kind and name (there is no UID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +79,8 @@ impl Default for StoreQuery {
             owner: None,
             message: None,
             include_replicas: false,
+            replicas_only: false,
+            replica_shadowing: None,
             suppress_self_origin: true,
         }
     }
