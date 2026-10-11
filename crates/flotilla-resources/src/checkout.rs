@@ -10,7 +10,8 @@ define_resource!(
     CheckoutSpec,
     CheckoutStatus,
     CheckoutStatusPatch,
-    replication = ReplicationClass::HomeBoundRuntime
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "status.phase"]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

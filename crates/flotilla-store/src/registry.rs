@@ -398,6 +398,77 @@ async fn digest_typed<T: Resource>(
     backend.using::<T>(namespace).digest(query).await
 }
 
+pub fn declared_resource_kinds() -> Vec<crate::ResourceKind> {
+    REGISTERED_RESOURCE_KINDS
+        .iter()
+        .map(|registered| match registered.resource {
+            RegisteredResource::Artifact => crate::ResourceKind::of::<Artifact>(),
+            RegisteredResource::ChangeRequest => crate::ResourceKind::of::<ChangeRequest>(),
+            RegisteredResource::Checkout => crate::ResourceKind::of::<Checkout>(),
+            RegisteredResource::Clone => crate::ResourceKind::of::<CloneResource>(),
+            RegisteredResource::Convoy => crate::ResourceKind::of::<Convoy>(),
+            RegisteredResource::ConvoyEnsure => crate::ResourceKind::of::<ConvoyEnsure>(),
+            RegisteredResource::CredentialGrant => crate::ResourceKind::of::<CredentialGrant>(),
+            RegisteredResource::CredentialSpec => crate::ResourceKind::of::<CredentialSpec>(),
+            RegisteredResource::CrewDefaults => crate::ResourceKind::of::<CrewDefaults>(),
+            RegisteredResource::CrewImageBaseline => crate::ResourceKind::of::<CrewImageBaseline>(),
+            RegisteredResource::Demand => crate::ResourceKind::of::<Demand>(),
+            RegisteredResource::DispatchDeployment => crate::ResourceKind::of::<DispatchDeployment>(),
+            RegisteredResource::DispatchHold => crate::ResourceKind::of::<DispatchHold>(),
+            RegisteredResource::DispatchObservation => crate::ResourceKind::of::<DispatchObservation>(),
+            RegisteredResource::Environment => crate::ResourceKind::of::<Environment>(),
+            RegisteredResource::Event => crate::ResourceKind::of::<Event>(),
+            RegisteredResource::FleetDesignation => crate::ResourceKind::of::<FleetDesignation>(),
+            RegisteredResource::Forge => crate::ResourceKind::of::<Forge>(),
+            RegisteredResource::FulfilmentKind => crate::ResourceKind::of::<FulfilmentKind>(),
+            RegisteredResource::Host => crate::ResourceKind::of::<Host>(),
+            RegisteredResource::ImageBuild => crate::ResourceKind::of::<ImageBuild>(),
+            RegisteredResource::ImageLayer => crate::ResourceKind::of::<ImageLayer>(),
+            RegisteredResource::Issue => crate::ResourceKind::of::<Issue>(),
+            RegisteredResource::ForgeRead => crate::ResourceKind::of::<ForgeRead>(),
+            RegisteredResource::ForgeReadHeartbeat => crate::ResourceKind::of::<ForgeReadHeartbeat>(),
+            RegisteredResource::ManifestRoot => crate::ResourceKind::of::<ManifestRoot>(),
+            RegisteredResource::Message => crate::ResourceKind::of::<Message>(),
+            RegisteredResource::PlacementPolicy => crate::ResourceKind::of::<PlacementPolicy>(),
+            RegisteredResource::Project => crate::ResourceKind::of::<Project>(),
+            RegisteredResource::Regard => crate::ResourceKind::of::<Regard>(),
+            RegisteredResource::Repository => crate::ResourceKind::of::<Repository>(),
+            RegisteredResource::TerminalSession => crate::ResourceKind::of::<TerminalSession>(),
+            RegisteredResource::Usage => crate::ResourceKind::of::<Usage>(),
+            RegisteredResource::Vessel => crate::ResourceKind::of::<Vessel>(),
+            RegisteredResource::WorkflowTemplate => crate::ResourceKind::of::<WorkflowTemplate>(),
+        })
+        .collect()
+}
+
+pub async fn query_resource_kind(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    query: &crate::StoreQuery,
+) -> Result<Value, ResourceError> {
+    let registered = lookup_resource_kind(requested_kind)?;
+    let descriptor = declared_resource_kinds().into_iter().find(|kind| kind.paths.kind == registered.kind).expect("registered descriptor");
+    let listed = backend.store().query_raw(descriptor, namespace, query).await?;
+    let position = listed.position;
+    let items = listed.items;
+    let items = items
+        .iter()
+        .map(|item| {
+            let mut value = read_object_value(item)?;
+            value["apiVersion"] = json!(api_version(descriptor.paths));
+            value["kind"] = json!(descriptor.paths.kind);
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, ResourceError>>()?;
+
+    let mut document = json!({"apiVersion": api_version(descriptor.paths), "kind": format!("{}List", descriptor.paths.kind), "metadata": {"resourceVersion":position.resource_version}, "items":items});
+    if let Some(generation) = position.generation {
+        document["metadata"]["generation"] = json!(generation);
+    }
+    Ok(document)
+}
+
 pub async fn list_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,

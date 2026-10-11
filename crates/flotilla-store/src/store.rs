@@ -40,6 +40,7 @@ type ValidateSiblings = fn(&InputMeta, &Value, &[ResourceObject<SerializedResour
 pub struct ResourceKind {
     pub paths: ApiPaths,
     pub replication: ReplicationClass,
+    pub queryable_fields: &'static [&'static str],
     pub validate_namespace: bool,
     decode: fn(Value) -> Result<ResourceObject<SerializedResource>, ResourceError>,
     validate_spec_fn: fn(&InputMeta, &Value) -> Result<(), ResourceError>,
@@ -58,6 +59,7 @@ impl ResourceKind {
         Self {
             paths: T::API_PATHS,
             replication: T::REPLICATION_CLASS,
+            queryable_fields: T::QUERYABLE_FIELDS,
             validate_namespace: T::VALIDATE_NAMESPACE_SPEC,
             decode: |value| {
                 // Validate the registered type before exposing a stored row as
@@ -202,6 +204,14 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     fn read_observer(&self) -> Option<&dyn ReadObserver>;
     async fn diagnostics(&self) -> Result<Option<ResourceStoreDiagnostics>, ResourceError>;
     async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError>;
+    async fn query_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _query: &crate::StoreQuery,
+    ) -> Result<crate::QueryResult, ResourceError> {
+        Err(self.unsupported_operation("declared queries"))
+    }
     async fn query_messages_raw(
         &self,
         namespace: &str,

@@ -55,6 +55,8 @@ mod status_patch;
 pub use status_patch::*;
 pub mod watch;
 
+pub mod query;
+pub use query::*;
 mod store;
 pub use store::*;
 

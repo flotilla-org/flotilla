@@ -13,6 +13,8 @@ impl Resource for Message {
     type Spec = MessageSpec;
     type Status = MessageStatus;
     type StatusPatch = MessageStatusPatch;
+    const QUERYABLE_FIELDS: &'static [&'static str] =
+        &["metadata.name", "spec.receiver", "spec.in_reply_to", "status.phase", "status.submission.batch_id"];
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "messages", kind: "Message" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
 

@@ -147,6 +147,33 @@ impl HttpBackend {
         Self::decode_response(response, None).await
     }
 
+    pub async fn query_declared(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+    ) -> Result<crate::QueryResult, crate::ResourceError> {
+        query.validate(kind)?;
+        let encoded = serde_json::to_string(query).map_err(|e| crate::ResourceError::invalid(e.to_string()))?;
+        let response = self
+            .http
+            .get(self.namespaced_url(kind.paths, namespace, None, false))
+            .query(&[("storeQuery", encoded)])
+            .send()
+            .await
+            .map_err(|e| crate::ResourceError::other(format!("declared query: {e}")))?;
+        let list: K8sResourceList<SerializedResource> = Self::decode_response(response, None).await?;
+        let position = crate::ResourcePosition {
+            resource_version: list.metadata.resource_version.clone(),
+            generation: list.metadata.generation.clone(),
+        };
+        let items =
+            list.items.into_iter().map(|object| kind.from_k8s(object).and_then(read_resource_object)).collect::<Result<Vec<_>, _>>()?;
+        if let Some(observer) = self.read_observer() {
+            observer.read(kind.paths.kind, items.len());
+        }
+        Ok(crate::QueryResult { items, position })
+    }
     pub async fn query_messages(
         &self,
         namespace: &str,

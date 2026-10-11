@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Message, ReadResourceObject, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver};
+use crate::{Message, ReadResourceObject, ResourceBackend, ResourceError, ResourceObject, TypedResolver};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -35,13 +35,19 @@ impl MessageQuery {
         }
     }
 
-    pub fn sql(&self) -> (&'static str, Option<String>) {
+    pub fn sql(&self) -> (String, Option<String>) {
+        self.sql_at(5)
+    }
+
+    /// Build a predicate using the caller's next bind position.
+    pub fn sql_at(&self, argument_index: usize) -> (String, Option<String>) {
+        let active = "COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered')";
         match self {
-            Self::Active { receiver: None } => ("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered')", None),
-            Self::Active { receiver: Some(receiver) } => ("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered') AND json_extract(body_json, '$.spec.receiver') = ?5", Some(receiver.clone())),
-            Self::ReplyTo { name } => ("json_extract(body_json, '$.spec.in_reply_to') = ?5", Some(name.clone())),
-            Self::AuditBefore { before } => ("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered') AND json_extract(body_json, '$.spec.body_digest') IS NULL AND julianday(json_extract(body_json, '$.status.since')) < julianday(?5)", Some(before.to_rfc3339())),
-            Self::Batch { id } => ("json_extract(body_json, '$.status.submission.batch_id') = ?5", Some(id.clone())),
+            Self::Active { receiver: None } => (active.into(), None),
+            Self::Active { receiver: Some(receiver) } => (format!("{active} AND json_extract(body_json, '$.spec.receiver') = ?{argument_index}"), Some(receiver.clone())),
+            Self::ReplyTo { name } => (format!("json_extract(body_json, '$.spec.in_reply_to') = ?{argument_index}"), Some(name.clone())),
+            Self::AuditBefore { before } => (format!("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered') AND json_extract(body_json, '$.spec.body_digest') IS NULL AND julianday(json_extract(body_json, '$.status.since')) < julianday(?{argument_index})"), Some(before.to_rfc3339())),
+            Self::Batch { id } => (format!("json_extract(body_json, '$.status.submission.batch_id') = ?{argument_index}"), Some(id.clone())),
         }
     }
 }
@@ -133,25 +139,18 @@ impl TypedResolver<Message> {
 
 impl ResourceBackend {
     pub async fn query_messages(&self, namespace: &str, query: &MessageQuery) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        let items = self.store().query_messages_typed(namespace, query, true).await?;
-        if self.serves_read_views() {
-            return Ok(items);
-        }
-        let local_root = self.local_root()?;
-        let mut visible = Vec::new();
-        for item in items {
-            if let ResourceProvenance::Replica { origin_root, .. } = &item.provenance {
-                if origin_root == &local_root {
-                    match self.using::<Message>(namespace).get(&item.object.metadata.name).await {
-                        Ok(_) => continue,
-                        Err(ResourceError::NotFound { .. }) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-            visible.push(item);
-        }
-        Ok(visible)
+        Ok(self
+            .query_declared::<Message>(
+                namespace,
+                &crate::StoreQuery {
+                    message: Some(query.clone()),
+                    include_replicas: true,
+                    suppress_self_origin: true,
+                    ..Default::default()
+                },
+            )
+            .await?
+            .items)
     }
 }
 
