@@ -176,29 +176,28 @@ impl<'a> AttachResolver<'a> {
         } else {
             project_context.map(|project| RoleAddress { project: project.to_string(), role: reference.to_string() })
         };
-        let sources = flotilla_resources::ReadResourceList { items: observations.convoys.clone() };
-        let has_role = sources.items.iter().any(|source| source.object.spec.role == reference);
+        let sources = &observations.convoys;
+        let has_role = sources.iter().any(|source| source.object.spec.role == reference);
         if !explicit && requested.is_none() && !has_role {
             return Ok(None);
         }
 
         let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
-        let matching_convoy_exists = sources.items.iter().any(|source| {
+        let matching_convoy_exists = sources.iter().any(|source| {
             source.object.spec.role == role
                 && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
         });
-        let durable_sessions = flotilla_resources::ReadResourceList { items: observations.sessions.clone() };
+        let durable_sessions = &observations.sessions;
         let mut sessions_by_convoy = HashMap::<String, Vec<_>>::new();
-        for source in durable_sessions.items {
+        for source in durable_sessions {
             if source.object.status.as_ref().and_then(|status| status.session_id.as_ref()).is_some() {
                 if let Some(convoy) = source.object.metadata.labels.get(CONVOY_LABEL).cloned() {
-                    sessions_by_convoy.entry(convoy).or_default().push((source.object, source.provenance));
+                    sessions_by_convoy.entry(convoy).or_default().push((&source.object, &source.provenance));
                 }
             }
         }
         let mut candidates = sources
-            .items
-            .into_iter()
+            .iter()
             .filter(|source| {
                 source.object.spec.role == role
                     && sessions_by_convoy.contains_key(&source.object.metadata.name)
@@ -487,10 +486,7 @@ impl<'a> AttachResolver<'a> {
             }));
         }
 
-        let mut index = AttachCandidateIndex::new(candidates);
-        index.convoys = convoys;
-        index.sessions = sessions;
-        Ok(index)
+        Ok(AttachCandidateIndex::new(candidates, convoys, sessions))
     }
 
     async fn local_checkout_terminal_plan(&self, checkout: &CheckoutRow, seat: AttachMode) -> Result<ResolvedAttachPlan, String> {
@@ -1026,14 +1022,18 @@ impl AttachIndexError {
 }
 
 impl AttachCandidateIndex {
-    fn new(candidates: Vec<AttachCandidate>) -> Self {
+    fn new(
+        candidates: Vec<AttachCandidate>,
+        convoys: Vec<flotilla_resources::ReadResourceObject<ResourceConvoy>>,
+        sessions: Vec<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
+    ) -> Self {
         let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, candidate) in candidates.iter().enumerate() {
             for reference in &candidate.references {
                 exact.entry(reference.clone()).or_default().push(index);
             }
         }
-        Self { candidates, exact, convoys: Vec::new(), sessions: Vec::new() }
+        Self { candidates, exact, convoys, sessions }
     }
 
     async fn resolve(
@@ -1442,6 +1442,16 @@ mod tests {
             for unrelated in [0, 40] {
                 let (daemon, backend, _temp) = attach_fixture().await;
                 create_identity_convoy(&backend, "convoy-main", "coder", Some("flotilla")).await;
+                let convoys = backend.using::<ResourceConvoy>("flotilla");
+                let convoy = convoys.get("convoy-main").await.expect("convoy");
+                convoys
+                    .update_status(
+                        "convoy-main",
+                        &convoy.metadata.resource_version,
+                        &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+                    )
+                    .await
+                    .expect("convoy phase");
                 let host = daemon.local_host_id().expect("host").to_string();
                 backend
                     .using::<ResourceHost>("flotilla")
@@ -1473,7 +1483,9 @@ mod tests {
                 let objects = backend.read_counts();
                 let resolved =
                     daemon.attach_resolver().resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
-                assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("terminal-main".into()));
+                let binding = resolved.binding.expect("binding");
+                assert_eq!(binding.session.as_deref(), Some("terminal-main"));
+                assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
                 let delta = |before: BTreeMap<String, usize>, after: BTreeMap<String, usize>| {
                     after
                         .into_iter()
@@ -1485,11 +1497,17 @@ mod tests {
                         .collect::<BTreeMap<_, _>>()
                 };
                 let reads = delta(calls, backend.read_calls());
-                if reference == "coder" || reference == "coder@flotilla" || reference == "convoy-main" {
+                if reference.starts_with("terminal-") {
+                    // Direct session references select no Convoy candidates. One
+                    // exact parent get restores phase without a namespace read.
+                    assert_eq!(reads.get("Convoy"), Some(&2));
+                } else {
                     assert_eq!(reads.get("Convoy"), Some(&1));
                 }
                 assert_eq!(reads.get("TerminalSession"), Some(&1));
-                samples.push((reads, delta(objects, backend.read_counts())));
+                let decoded = delta(objects, backend.read_counts());
+                assert_eq!(decoded.get("Convoy"), Some(&1));
+                samples.push((reads, decoded));
             }
             assert_eq!(samples[0], samples[1], "{reference}");
         }

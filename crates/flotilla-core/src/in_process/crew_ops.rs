@@ -131,6 +131,7 @@ pub struct CrewRoutingContext {
     pub convoy: String,
 }
 
+// Routing identity excludes the cached observation, which can age independently.
 impl PartialEq for CrewRoutingContext {
     fn eq(&self, other: &Self) -> bool {
         self.command_context == other.command_context && self.session_name == other.session_name && self.convoy == other.convoy
@@ -205,6 +206,22 @@ async fn crew_brief_repo_roots(
         roots.push(PathBuf::from(path));
     }
     roots
+}
+
+// Keep local completion evidence authoritative regardless of query row ordering.
+fn select_crew_artifacts(
+    sources: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Artifact>>,
+) -> BTreeMap<String, ResourceObject<flotilla_resources::Artifact>> {
+    let mut selected = BTreeMap::new();
+    for source in sources {
+        let name = source.object.metadata.name.clone();
+        if matches!(source.provenance, flotilla_resources::ResourceProvenance::Local) {
+            selected.insert(name, source.object);
+        } else {
+            selected.entry(name).or_insert(source.object);
+        }
+    }
+    selected
 }
 
 fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
@@ -622,15 +639,34 @@ impl CrewService {
 
     async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        self.resolve_crew_context_from_routing(&routing).await
+        self.resolve_crew_context_from_routing(&routing, false).await
     }
 
-    async fn resolve_crew_context_from_routing(&self, routing: &CrewRoutingContext) -> Result<ResolvedCrewContext, String> {
+    async fn resolve_crew_context_from_routing(
+        &self,
+        routing: &CrewRoutingContext,
+        refresh_caller: bool,
+    ) -> Result<ResolvedCrewContext, String> {
         let namespace = routing.command_context.namespace.as_ref().expect("routing context always has namespace").clone();
         let convoy = routing.command_context.convoy.as_ref().expect("routing context always has convoy").clone();
         let vessel_ref = routing.command_context.vessel_ref.as_ref().expect("routing context always has vessel ref").clone();
         let role = routing.command_context.role.as_ref().expect("routing context always has role").clone();
-        let caller = routing.caller_session.clone();
+        // Promise/completion acquire a message lock after routing. Refresh only
+        // their named caller so status changes during the wait remain visible.
+        let caller = if refresh_caller {
+            match routing.session_name.as_ref() {
+                Some(name) => self
+                    .resource_backend
+                    .including_replicas::<ResourceTerminalSession>(&namespace)
+                    .get(name)
+                    .await
+                    .ok()
+                    .map(|source| source.object),
+                None => None,
+            }
+        } else {
+            routing.caller_session.clone()
+        };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
     }
 
@@ -913,7 +949,7 @@ impl CrewService {
         let name = routing.command_context.convoy.as_deref().expect("resolved convoy");
         let lock = self.convoy_message_lock(namespace, name).await;
         let _guard = lock.lock().await;
-        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
@@ -1056,7 +1092,7 @@ impl CrewService {
         self.adopt_legacy_convoy_queues_before_command(namespace, convoy_name).await?;
         let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
         let _message_guard = message_lock.lock().await;
-        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let completed_while_crew_active = context.caller_session.as_ref().is_some_and(|session| {
             let Some(status) = session.status.as_ref() else { return false };
             status.phase == ResourceTerminalSessionPhase::Running
@@ -1123,7 +1159,7 @@ impl CrewService {
             }
         }
         let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
-        let promise_artifacts = self
+        let artifact_sources = self
             .resource_backend
             .query_declared::<flotilla_resources::Artifact>(
                 namespace,
@@ -1135,10 +1171,8 @@ impl CrewService {
             )
             .await
             .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .map(|source| (source.object.metadata.name.clone(), source.object))
-            .collect::<BTreeMap<_, _>>();
+            .items;
+        let promise_artifacts = select_crew_artifacts(artifact_sources);
         let ledger_artifact = promise_artifacts.get(&ledger_name);
         let decision_ledger_digest = ledger_artifact.as_ref().map(|artifact| artifact.spec.digest.clone());
         let projected_ledger_ref = ledger_artifact

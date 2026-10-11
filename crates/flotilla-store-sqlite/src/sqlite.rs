@@ -588,17 +588,40 @@ impl SqliteBackend {
             path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>()
         )
     }
+    // Generated queries use positional parameters. Preserve quoted SQL text
+    // and SQLite's numbering of bare parameters while shifting nested queries.
     fn shift_bindings(sql: &str, offset: usize) -> String {
         let mut shifted = String::new();
         let mut chars = sql.chars().peekable();
+        let mut quote = None;
+        let mut largest_binding = 0usize;
         while let Some(c) = chars.next() {
             shifted.push(c);
-            if c == '?' {
+            if let Some(delimiter) = quote {
+                if c == delimiter {
+                    if chars.peek() == Some(&delimiter) {
+                        shifted.push(chars.next().expect("peeked quote"));
+                    } else {
+                        quote = None;
+                    }
+                }
+            } else if matches!(c, '\'' | '"' | '`' | '[') {
+                quote = Some(if c == '[' { ']' } else { c });
+            } else if c == '?' {
                 let mut digits = String::new();
                 while chars.peek().is_some_and(char::is_ascii_digit) {
                     digits.push(chars.next().expect("peeked digit"));
                 }
-                shifted.push_str(&(digits.parse::<usize>().expect("numbered SQL binding") + offset).to_string());
+                let binding = if digits.is_empty() { largest_binding.checked_add(1) } else { digits.parse::<usize>().ok() };
+                if let Some(binding) = binding {
+                    largest_binding = largest_binding.max(binding);
+                    if let Some(number) = binding.checked_add(offset) {
+                        shifted.push_str(&number.to_string());
+                        continue;
+                    }
+                }
+                // Invalid/overflowed bindings are left for SQLite to reject.
+                shifted.push_str(&digits);
             }
         }
         shifted
@@ -617,21 +640,36 @@ impl SqliteBackend {
         root: &str,
         columns: QueryColumns,
     ) -> (String, Vec<rusqlite::types::Value>) {
+        // HTTP query_raw and native entry points validate before SQL assembly.
+        // Keep this assertion before hydration/recursive branches as well.
+        debug_assert!(query.validate(kind).is_ok());
         if query.all_sources_for_matches {
             let selection = crate::StoreQuery { all_sources_for_matches: false, ..query.clone() };
             let outer = crate::StoreQuery { include_replicas: true, suppress_self_origin: false, ..Default::default() };
-            let (sql, mut args) = Self::declared_sql(kind, namespace, &outer, replicas, root, columns);
+            let (_, mut args) = Self::declared_sql_with_names(kind, namespace, &outer, replicas, root, columns, None);
             let mut branches = Vec::new();
             for origin in [false, true] {
                 let (branch, values) = Self::declared_sql(kind, namespace, &selection, origin, root, QueryColumns::Names);
                 branches.push(format!("SELECT name FROM ({})", Self::shift_bindings(&branch, args.len())));
                 args.extend(values);
             }
-            let sql = sql.replace(" ORDER BY name", &format!(" AND o.name IN ({}) ORDER BY name", branches.join(" UNION ")));
+            let names = branches.join(" UNION ");
+            let (sql, _) = Self::declared_sql_with_names(kind, namespace, &outer, replicas, root, columns, Some(&names));
             return (sql, args);
         }
-        // All identifiers come from registered static declarations; wire values are bound.
-        debug_assert!(query.validate(kind).is_ok());
+        Self::declared_sql_with_names(kind, namespace, query, replicas, root, columns, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn declared_sql_with_names(
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+        replicas: bool,
+        root: &str,
+        columns: QueryColumns,
+        names: Option<&str>,
+    ) -> (String, Vec<rusqlite::types::Value>) {
+        // Identifiers come from registered static declarations; wire values are bound.
         use rusqlite::types::Value as SqlValue;
         let table = if replicas { "replica_objects" } else { "resource_objects" };
         let mut args = vec![
@@ -642,6 +680,9 @@ impl SqliteBackend {
         ];
         let mut predicates =
             vec!["o.group_name=?1 AND o.version=?2 AND o.kind=?3 AND o.namespace=?4".to_string(), format!("o.kind='{}'", kind.paths.kind)];
+        if let Some(names) = names {
+            predicates.push(format!("o.name IN ({names})"));
+        }
         for (label, value) in &query.labels {
             args.push(SqlValue::Text(label.clone()));
             let key = args.len();
@@ -3190,6 +3231,18 @@ mod tests {
         }
     }
 
+    // SQL literals/quoted identifiers keep question marks; bare and numbered
+    // bindings preserve their shared positional identity without panicking.
+    #[test]
+    fn nested_sql_binding_shift_preserves_literals() {
+        assert_eq!(
+            SqliteBackend::shift_bindings("SELECT '?1', 'it''s ?', \"?2\", [?3], `?4`, ?1, ?, ?2", 5),
+            "SELECT '?1', 'it''s ?', \"?2\", [?3], `?4`, ?6, ?7, ?7"
+        );
+        assert_eq!(SqliteBackend::shift_bindings("SELECT ?", 0), "SELECT ?1");
+        assert_eq!(SqliteBackend::shift_bindings("SELECT ?9999999999999999999999999999", 5), "SELECT ?9999999999999999999999999999");
+    }
+
     // Every exposed field equality and normalized relation must use its declared
     // index for both authoritative rows and replicas, before decoding any body.
     #[tokio::test]
@@ -3197,10 +3250,15 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().unwrap();
         backend
             .read_call("explain declared queries", |connection| {
+                let mut migration_names = std::collections::BTreeSet::new();
                 for kind in crate::declared_resource_kinds() {
                     for replicas in [false, true] {
                         let table = if replicas { "replica_objects" } else { "resource_objects" };
                         let mut cases = Vec::new();
+                        for path in kind.queryable_fields {
+                            let name = SqliteBackend::field_index(table, kind, path);
+                            assert!(migration_names.insert(name.clone()), "colliding index migration {name}: {} {path}", kind.paths.kind);
+                        }
                         for path in kind.queryable_fields {
                             cases.push((
                                 crate::StoreQuery { fields: BTreeMap::from([(path.to_string(), "value".into())]), ..Default::default() },

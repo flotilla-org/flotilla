@@ -1,6 +1,7 @@
 use super::*;
 use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec, Vessel, VesselSpec};
+use flotilla_store::StoreExt;
 
 fn delta(before: &BTreeMap<String, usize>, after: BTreeMap<String, usize>) -> BTreeMap<String, usize> {
     after
@@ -13,6 +14,32 @@ fn delta(before: &BTreeMap<String, usize>, after: BTreeMap<String, usize>) -> BT
         .collect()
 }
 
+async fn create_vessel(backend: &ResourceBackend) {
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("vessel".into()).build(),
+            &VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("vessel");
+}
+
+fn command_context() -> CrewCommandContext {
+    CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".into()),
+        convoy: Some("crew".into()),
+        vessel_ref: Some("vessel".into()),
+        role: Some("coder".into()),
+    }
+}
+
 // #3042: unrelated convoy/message/PR rows must not change either decoded-object
 // counts or store operations for a request. Empty and populated stores run the
 // same real service scenarios, rather than measuring execution time.
@@ -22,19 +49,7 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
         let mut counts = Vec::new();
         for unrelated in [0, 32] {
             let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-            backend
-                .using::<Vessel>("flotilla")
-                .create(
-                    &InputMeta::builder().name("vessel".into()).build(),
-                    &VesselSpec {
-                        convoy_ref: "crew".into(),
-                        vessel_name: "work".into(),
-                        placement_policy_ref: "test".into(),
-                        adopted_checkout_refs: BTreeMap::new(),
-                    },
-                )
-                .await
-                .expect("vessel");
+            create_vessel(&backend).await;
             for n in 0..unrelated {
                 let name = format!("unrelated-{n}");
                 backend
@@ -171,4 +186,81 @@ async fn interactive_crew_reads_ignore_unrelated_resources() {
             assert_eq!(counts[0].1.get("Artifact"), Some(&1));
         }
     }
+}
+
+// Completion evidence prefers a local Artifact over the same name from any
+// replica origin. Query ordering must not change the durable ledger digest.
+#[tokio::test]
+async fn completion_prefers_local_artifact_evidence() {
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    create_vessel(&backend).await;
+    let name = flotilla_resources::artifact_record_name("crew", "coder", "decision-ledger", "crew");
+    let local = backend
+        .using::<flotilla_resources::Artifact>("flotilla")
+        .create(
+            &InputMeta::builder().name(name).build(),
+            &flotilla_resources::ArtifactSpec::builder()
+                .convoy("crew".into())
+                .producer("coder".into())
+                .kind("decision-ledger".into())
+                .subject("crew".into())
+                .digest("local-digest".into())
+                .size(0)
+                .media_type("text/markdown".into())
+                .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
+                .build(),
+        )
+        .await
+        .expect("local artifact");
+    let mut replica = local;
+    replica.spec.digest = "replica-digest".into();
+    backend
+        .replace_replicas_typed::<flotilla_resources::Artifact>(
+            &flotilla_protocol::NodeId::new("remote"),
+            "flotilla",
+            &flotilla_resources::ResourceList { items: vec![replica], resource_version: "1".into(), generation: None },
+            chrono::Utc::now(),
+            None,
+        )
+        .await
+        .expect("replica artifact");
+    crew.complete(&command_context(), None, None, Some("https://example.test/ledger".into()), false, None).await.expect("complete");
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+    assert_eq!(convoy.status.expect("status").crew_work["work"]["coder"].decision_ledger_digest.as_deref(), Some("local-digest"));
+}
+
+// A completion waiting for the per-convoy lock must observe the caller's
+// current phase after acquiring it, rather than its earlier routing snapshot.
+#[tokio::test]
+async fn completion_refreshes_caller_after_lock_wait() {
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    create_vessel(&backend).await;
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("session").await.expect("session");
+    let running =
+        flotilla_resources::TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Running, ..Default::default() };
+    sessions.update_status("session", &session.metadata.resource_version, &running).await.expect("running");
+    let lock = crew.convoy_message_lock("flotilla", "crew").await;
+    let guard = lock.lock().await;
+    let before = backend.read_calls().get("TerminalSession").copied().unwrap_or_default();
+    let task = tokio::spawn(async move {
+        crew.complete(&command_context(), None, None, Some("https://example.test/ledger".into()), false, None).await
+    });
+    // Read observation synchronizes the interleaving. The timeout is a harness
+    // deadlock guard, not a request-performance assertion.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while backend.read_calls().get("TerminalSession").copied().unwrap_or_default() <= before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completion routed while lock held");
+    let session = sessions.get("session").await.expect("session");
+    let stopped =
+        flotilla_resources::TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Stopped, ..Default::default() };
+    sessions.update_status("session", &session.metadata.resource_version, &stopped).await.expect("stopped during wait");
+    drop(guard);
+    task.await.expect("task").expect("complete");
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+    assert!(!convoy.status.expect("status").crew_work["work"]["coder"].completed_while_crew_active);
 }
