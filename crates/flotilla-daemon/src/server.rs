@@ -915,3 +915,6 @@ async fn run_shutdown_only_session(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::dispatch_request_with_state;

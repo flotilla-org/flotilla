@@ -23,20 +23,23 @@ pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argumen
     // 3. Parse the event
     let parsed = parser.parse_event(event_type, &payload).map_err(|e| color_eyre::eyre::eyre!("parse error: {e}"))?;
 
-    // 4. Resolve attachable_id from env, or allocate a fresh one.
-    // When the daemon receives the event it handles session_id → attachable_id
-    // mapping and persistence.
-    let attachable_id = match std::env::var("FLOTILLA_ATTACHABLE_ID") {
-        Ok(id) if !id.is_empty() => AttachableId::new(id),
-        _ => agents::allocate_attachable_id(),
-    };
-
-    // 5. Build the event
+    // 4. Resolve the managed terminal before the temporary hook identity.
     let terminal = std::env::var("FLOTILLA_NAMESPACE")
         .ok()
         .filter(|value| !value.is_empty())
         .zip(std::env::var("FLOTILLA_TERMINAL_SESSION").ok().filter(|value| !value.is_empty()))
         .map(|(namespace, session_name)| flotilla_protocol::AgentHookTerminalRef { namespace, session_name });
+    let explicit_id = std::env::var("FLOTILLA_ATTACHABLE_ID").ok();
+    let attachable_id = if harness_enum == flotilla_protocol::AgentHarness::Codex {
+        flotilla_core::attachable::codex_hook_id(explicit_id.as_deref(), terminal.as_ref())
+    } else {
+        match explicit_id {
+            Some(id) if !id.is_empty() => AttachableId::new(id),
+            _ => agents::allocate_attachable_id(),
+        }
+    };
+
+    // 5. Build the event.
     let event = AgentHookEvent::builder()
         .attachable_id(attachable_id)
         .harness(harness_enum)

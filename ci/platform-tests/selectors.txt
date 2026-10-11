@@ -20,3 +20,8 @@ macos| -p flotilla-credentials --locked --lib cancelled_host_image_operation_rem
 macos| -p flotilla-credentials --locked --lib registry_pull_admission_is_in_memory
 macos| -p flotilla-core --locked --lib anonymous_config_owns_private_empty_directory
 macos| -p flotilla-client --locked --lib spawn_lock_tests::
+all| -p flotilla-core --locked --lib attachable::tests::codex_notifications_keep_terminal_identity
+all| -p flotilla-resources --locked --lib terminal_session::tests::codex_completion_keeps_each_timestamp_and_respects_acceptance_boundaries
+macos| -p flotilla-daemon --locked --lib managed_hook_turns_update_attention_through_terminal_session
+macos| -p flotilla-daemon --locked --lib codex_idle_hook_confirms_held_submission
+macos| -p flotilla-daemon --locked --lib held_pool_delivery_accepts_following_codex_idle_hook

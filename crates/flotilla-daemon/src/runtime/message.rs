@@ -160,7 +160,19 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
             .map_err(|error| error.to_string())?;
         let status = current.status.as_ref().ok_or("holder status is absent")?;
         let attention = status.attention.as_ref().filter(|attention| !attention.is_stale_at(now));
+        // The observer rereads durable state: reject evidence from a
+        // replacement receiver even when the caller holds an older snapshot.
+        let same_receiver = submission.is_none_or(|submission| {
+            status.session_id.as_deref() == Some(submission.session.as_str())
+                && status.crew.as_ref().map(|crew| crew.id.as_str()) == Some(submission.crew_id.as_str())
+        });
         let evidence = submission.and_then(|submission| {
+            if !same_receiver {
+                return None;
+            }
+            if status.codex_completed_after(submission.started_at, now) {
+                return Some("fresh Codex turn completion after submission".into());
+            }
             if flotilla_resources::delivery_hold::delivery_acceptance_evidence(
                 status.last_tool_activity_at.is_some_and(|at| at > submission.started_at),
                 attention.is_some_and(|attention| {
@@ -180,8 +192,9 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
         let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
         let evidence = if other_delivery { None } else { evidence };
         Ok(flotilla_store::MessageObservation {
-            ready: !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
-            working: !other_delivery
+            ready: same_receiver && !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
+            working: same_receiver
+                && !other_delivery
                 && attention.is_some_and(|attention| {
                     attention.state == TerminalAttentionState::Working
                         && submission.is_some_and(|submission| attention.as_of > submission.started_at)

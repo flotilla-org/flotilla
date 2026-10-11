@@ -1,4 +1,6 @@
 use super::*;
+use flotilla_controllers::reconcilers::TerminalObservation;
+use flotilla_resources::TerminalOccupancy;
 
 #[tokio::test]
 async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_homes() {
@@ -699,6 +701,17 @@ fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
 // observing a held write, acknowledge later output, and never retype it.
 #[tokio::test(start_paused = true)]
 async fn held_pool_delivery_observes_late_consumption_without_resending() {
+    held_pool_delivery_scenario(false).await;
+}
+
+// #3028: an attributed Codex completion settles both the legacy held input
+// and its durable Message representation without submitting another copy.
+#[tokio::test(start_paused = true)]
+async fn held_pool_delivery_accepts_following_codex_idle_hook() {
+    held_pool_delivery_scenario(true).await;
+}
+
+async fn held_pool_delivery_scenario(codex_hook: bool) {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"held-pool-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
@@ -752,6 +765,7 @@ async fn held_pool_delivery_observes_late_consumption_without_resending() {
     status.session_id = Some("agent".into());
     status.crew =
         Some(flotilla_resources::CrewSessionStatus { id: "held-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() });
+    status.started_at = Some(Utc::now() - chrono::Duration::minutes(20));
     session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("running session");
     let runtime = Arc::new(TerminalControllerRuntime {
         state: Arc::new(ControllerRuntimeState::new(
@@ -818,9 +832,61 @@ async fn held_pool_delivery_observes_late_consumption_without_resending() {
     assert_eq!(held.len(), 1);
     assert!(!held[0].status.as_ref().expect("held status").phase.has_delivery_evidence());
     assert!(held[0].status.as_ref().expect("held status").submission.is_some());
-    pool.observations.store(100, Ordering::SeqCst);
-    refresh_message_test_attention(&runtime, &backend, "agent").await;
-    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe late output");
+    if codex_hook {
+        let store = flotilla_core::agents::shared_in_memory_agent_state_store();
+        let (_, parser) = flotilla_core::agents::parser_for_harness("codex").expect("parser");
+        let parsed = parser
+            .parse_event("notify", br#"{"type":"agent-turn-complete","thread-id":"held-thread","cwd":"/workspace"}"#)
+            .expect("notify");
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let response = crate::server::dispatch_request_with_state(
+                &runtime.state.daemon,
+                &store,
+                3028,
+                flotilla_protocol::Request::AgentHook {
+                    event: flotilla_protocol::AgentHookEvent::builder()
+                        .attachable_id(flotilla_core::agents::allocate_attachable_id())
+                        .harness(flotilla_protocol::AgentHarness::Codex)
+                        .event_type(parsed.event_type.clone())
+                        .maybe_session_id(parsed.session_id.clone())
+                        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: NAMESPACE.into(), session_name: "agent".into() })
+                        .build(),
+                },
+            )
+            .await;
+            let flotilla_protocol::Message::Response { response, .. } = response else { panic!("hook response") };
+            assert!(matches!(*response, flotilla_protocol::ResponseResult::Ok { .. }));
+        }
+        let receiver = sessions.get("agent").await.expect("attributed receiver");
+        // The pre-migration representation retains its queued message spec;
+        // the durable Message receiver above has already retired that field.
+        let mut legacy_receiver = receiver.clone();
+        legacy_receiver.spec = spec.clone();
+        let current = legacy_receiver.status.as_ref().expect("status");
+        let mut settled = current.clone();
+        reconciler
+            .reconcile(
+                &legacy_receiver,
+                &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                    attention: None,
+                    occupancy: TerminalOccupancy::Vacant,
+                    output_digest: None,
+                }),
+                Utc::now(),
+            )
+            .patch
+            .expect("idle hook accepts legacy hold")
+            .apply(&mut settled);
+        assert!(settled.degraded.is_none(), "completion resolves the legacy held delivery");
+        assert_eq!(settled.delivered_message_id.as_deref(), Some("held-turn"));
+        let agents = store.lock().expect("agents");
+        assert_eq!(agents.list_agents().len(), 1);
+    } else {
+        pool.observations.store(100, Ordering::SeqCst);
+        refresh_message_test_attention(&runtime, &backend, "agent").await;
+    }
+    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe late acceptance evidence");
     let accepted = messages.list().await.expect("accepted inbox").items;
     assert!(accepted[0].status.as_ref().expect("receipt status").phase.has_delivery_evidence());
     assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
@@ -952,5 +1018,80 @@ async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
             assert_eq!(deliveries.lock().expect("pending transport tasks").len(), 1);
         }
         deliveries.lock().expect("pending transport tasks").remove("agent").expect("retained in-flight task").task.abort();
+    }
+}
+
+// #3028: Codex only emits turn-complete (Idle). A following idle hook on
+// the recorded receiver settles a held submission, without a Working hook.
+#[tokio::test]
+async fn codex_idle_hook_confirms_held_submission() {
+    use flotilla_resources::MessageSubmission;
+    use flotilla_store::MessageTransport;
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"codex-hook-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    let (daemon, _) = crew_daemon(config.clone()).await;
+    let backend = daemon.resource_backend();
+    create_credential_test_session(&backend, "codex-held", "hook", "hook-work", "contained-vessel").await;
+    let runtime = TerminalControllerRuntime {
+        state: Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host".into(),
+            "host-direct".into(),
+        )),
+    };
+    let sessions = backend.using::<TerminalSession>(NAMESPACE);
+    let holder = sessions.get("codex-held").await.expect("holder");
+    let mut initial = holder.status.clone().expect("status");
+    initial.session_id = Some("cleat-codex".into());
+    let holder = sessions.update_status("codex-held", &holder.metadata.resource_version, &initial).await.expect("terminal process");
+    let now = Utc::now();
+    let submitted_at = now - chrono::Duration::seconds(2);
+    let submission = MessageSubmission::builder()
+        .batch_id("batch".into())
+        .crew_id("crew".into())
+        .session("cleat-codex".into())
+        .started_at(submitted_at)
+        .members(vec!["held".into()])
+        .build();
+    // Named boundaries include pre-submission/equal timestamps, old hooks,
+    // screen Idle, another harness, and a replaced process/crew generation.
+    for (offset, source, adapter, session, crew, expected) in [
+        (-1, TerminalAttentionSource::Hook, "codex", "cleat-codex", "crew", false),
+        (0, TerminalAttentionSource::Hook, "codex", "cleat-codex", "crew", false),
+        (1, TerminalAttentionSource::Screen, "codex", "cleat-codex", "crew", false),
+        (1, TerminalAttentionSource::Hook, "claude-code", "cleat-codex", "crew", false),
+        (1, TerminalAttentionSource::Hook, "codex", "replacement", "crew", false),
+        (1, TerminalAttentionSource::Hook, "codex", "cleat-codex", "replacement", false),
+        (1, TerminalAttentionSource::Hook, "codex", "cleat-codex", "crew", true),
+    ] {
+        let current = sessions.get("codex-held").await.expect("current");
+        let mut status = current.status.expect("status");
+        status.phase = flotilla_resources::TerminalSessionPhase::Running;
+        status.started_at = Some(submitted_at - chrono::Duration::seconds(1));
+        status.session_id = Some(session.into());
+        status.crew = Some(
+            flotilla_resources::CrewSessionStatus::builder()
+                .id(crew.into())
+                .adapter(adapter.into())
+                .stance("trusted-implicit".into())
+                .build(),
+        );
+        status.attention = Some(flotilla_resources::TerminalAttention {
+            state: TerminalAttentionState::Idle,
+            source,
+            as_of: submitted_at + chrono::Duration::seconds(offset),
+        });
+        sessions.update_status("codex-held", &current.metadata.resource_version, &status).await.expect("hook evidence");
+        // Observe through the pre-update snapshot too: the runtime must consult
+        // the durable receiver generation before trusting a newly arriving hook.
+        let observed = MessageTransport::observe(&runtime, &holder, Some(&submission)).await.expect("observe hold");
+        assert_eq!(observed.evidence.is_some(), expected, "{adapter} {source:?} offset {offset} session {session} crew {crew}");
+        if session != submission.session || crew != submission.crew_id {
+            assert!(!observed.ready && !observed.working, "replacement attention cannot confirm or release old input");
+        }
     }
 }
