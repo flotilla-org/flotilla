@@ -690,6 +690,9 @@ def stop_daemon_for_install(cli, socket, config_dir, state_dir, timeout=30):
             pass
         # A successful CLI with a missing socket can predate startup awareness.
         # Process absence, rather than CLI exit status, confirms that stop won.
+        # Preserve preflight's user-wide quiescence requirement: another dev
+        # daemon may still have this generation's executable/libraries mapped.
+        # A daemon on another socket therefore causes a bounded refusal too.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ValueError("daemon stop deadline expired after 30s")

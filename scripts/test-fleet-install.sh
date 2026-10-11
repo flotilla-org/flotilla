@@ -158,7 +158,13 @@ add_darwin_derivative() {
     printf '#!/usr/bin/env bash\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<'SH'
-if [[ "${1:-}" == --socket && "${3:-}" == --config-dir ]]; then shift 6; fi
+if [[ "${1:-}" == --socket && "${3:-}" == --config-dir ]]; then
+  [[ "$2" == "$XDG_CONFIG_HOME/flotilla/run/flotilla.sock" ]] || exit 97
+  [[ "$4" == "$XDG_CONFIG_HOME/flotilla" ]] || exit 97
+  [[ "$5" == --state-dir && "$6" == "$XDG_STATE_HOME/flotilla" ]] || exit 97
+  [[ "${7:-}" == daemon && "${8:-}" == stop ]] || exit 97
+  shift 6
+fi
 if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
   if [[ "${STOP_DISAPPEARS:-0}" == 1 ]]; then rm -f "$LAUNCHCTL_STATE.running"; exit 1; fi
   [[ "${STOP_FAIL:-0}" == 0 ]] || exit 1

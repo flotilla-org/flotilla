@@ -171,10 +171,12 @@ pub enum ShutdownOutcome {
 /// Stop without spawning. A daemon that owns its lifecycle lock but has not
 /// published a socket is still starting (or unreachable), not absent. Report
 /// that state distinctly so callers can retry within their own deadline.
-pub async fn shutdown_existing_or_absent(socket_path: &Path, _state_dir: &Path) -> Result<ShutdownOutcome, String> {
+pub async fn shutdown_existing_or_absent(socket_path: &Path, state_dir: &Path) -> Result<ShutdownOutcome, String> {
+    #[cfg(not(unix))]
+    let _ = state_dir;
     if !socket_path.exists() {
         #[cfg(unix)]
-        ensure_no_live_daemon_without_socket(_state_dir, socket_path)
+        ensure_no_live_daemon_without_socket(state_dir, socket_path)
             .map_err(|error| format!("daemon is starting or unreachable; retry shutdown: {error}"))?;
         return Ok(ShutdownOutcome::NotRunning);
     }
@@ -779,10 +781,17 @@ async fn connect_or_spawn_with_optional_surface_using(
 
 #[cfg(unix)]
 fn ensure_no_install_in_progress(config_dir: &Path) -> Result<(), String> {
+    // Creation paths enforce daemon_socket_path(config_dir) before acquiring
+    // the spawn lock (ensure_daemon_socket_belongs_to_config). Thus the marker
+    // and installer/client flock share the same config identity. Custom sockets
+    // may connect to an existing daemon, but cannot create one for this root.
     let marker = config_dir.join("run").join(flotilla_daemon_api::DAEMON_INSTALL_MARKER_FILE);
     match marker.try_exists() {
         Ok(false) => Ok(()),
-        Ok(true) => Err(format!("daemon install in progress ({}); retry after fleet-install finishes", marker.display())),
+        Ok(true) => Err(format!(
+            "daemon install in progress ({}); retry after fleet-install finishes; if an installer was killed, remove this marker only after verifying no fleet-install is running",
+            marker.display()
+        )),
         Err(error) => Err(format!("cannot inspect daemon install marker {}: {error}", marker.display())),
     }
 }
@@ -1542,6 +1551,8 @@ mod spawn_lock_tests {
         let result = connect_or_spawn_with_optional_surface_using(&socket, &config, &state, None, &supervisor, &spawner).await;
         let Err(error) = result else { panic!("install must refuse startup") };
         assert!(error.contains("install in progress"), "{error}");
+        assert!(error.contains("remove this marker only after verifying no fleet-install is running"), "{error}");
+        assert!(error.contains(&config.join("run/install-in-progress").display().to_string()), "{error}");
     }
 
     #[tokio::test]
