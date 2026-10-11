@@ -98,7 +98,7 @@ use flotilla_resources::{
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
     delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, ConvoyReconciler,
-    InMemoryBackend, ResourceBackend, SqliteBackend,
+    ResourceBackend,
 };
 use futures::StreamExt;
 use serde_json::json;

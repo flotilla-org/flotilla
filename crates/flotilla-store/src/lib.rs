@@ -3,7 +3,7 @@
 #![allow(clippy::double_must_use)]
 
 use flotilla_resources::*;
-use flotilla_resources::{digest, error, field_ownership, host, labels, message, resource, retention};
+use flotilla_resources::{error, field_ownership, host, labels, message, resource, retention};
 
 mod artifact;
 pub use artifact::*;
@@ -18,18 +18,14 @@ mod definition;
 pub use definition::*;
 mod event;
 pub use event::*;
-mod http;
-pub use http::*;
 mod image_build;
 pub use image_build::*;
-mod in_memory;
-pub use in_memory::*;
 mod message_conditions;
 mod message_delivery;
 pub use message_delivery::*;
 mod message_inbox;
 pub use message_inbox::*;
-mod message_query;
+pub mod message_query;
 pub use message_query::*;
 mod message_retention;
 mod owner_gc;
@@ -46,7 +42,7 @@ mod project_hierarchy;
 pub use project_hierarchy::*;
 mod registry;
 pub use registry::*;
-mod replica;
+pub mod replica;
 mod repository;
 pub use repository::*;
 mod review_bundle;
@@ -55,21 +51,26 @@ mod role_cascade;
 pub use role_cascade::*;
 mod role_routing;
 pub use role_routing::*;
-mod sqlite;
-pub use sqlite::*;
 mod status_patch;
 pub use status_patch::*;
-mod watch;
+pub mod watch;
+
+mod store;
+pub use store::*;
 
 #[cfg(test)]
-mod change_request_tests;
+#[allow(dead_code)]
+#[path = "../../flotilla-store-memory/src/in_memory.rs"]
+mod in_memory;
 #[cfg(test)]
-mod crew_defaults_tests;
+mod test_store;
+
 #[cfg(test)]
-mod digest_tests;
+#[allow(dead_code)]
+#[path = "../../flotilla-store-sqlite/src/sqlite.rs"]
+mod sqlite;
 #[cfg(test)]
-mod registry_watch_tests;
-#[cfg(test)]
-mod role_cascade_tests;
-#[cfg(test)]
-mod usage_tests;
+use flotilla_resources::digest;
+
+mod serialized_watch;
+pub use serialized_watch::*;

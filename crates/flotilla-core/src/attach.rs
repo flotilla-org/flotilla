@@ -1076,7 +1076,7 @@ mod tests {
     async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"attach-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn placed_session_requires_an_unambiguous_cross_origin_convoy_address() {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let session = backend
             .using::<ResourceTerminalSession>("flotilla")
             .create(

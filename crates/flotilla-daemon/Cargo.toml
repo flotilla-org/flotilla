@@ -7,10 +7,14 @@ license.workspace = true
 [features]
 default = []
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provider", "flotilla-credentials/aws-lc-provider", "flotilla-aggregator/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
+skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-store-testkit/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
 
 [dependencies]
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
+flotilla-store-http = { path = "../flotilla-store-http" }
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }

@@ -1,9 +1,10 @@
 use super::*;
 use crate::providers::change_request::observation;
+use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
 async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let provider = "codex";
     let account = "user@example.com";
     let records = backend.using::<Usage>("flotilla");
@@ -55,8 +56,8 @@ async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path(
 
 #[tokio::test]
 async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request() {
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
-    let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+    let authority = ResourceBackend::new(InMemoryBackend::default());
+    let remote = ResourceBackend::new(InMemoryBackend::default());
     let repo_ref = RepositoryKey("repo".to_string());
     let spec = ConvoySpec::builder()
         .workflow_ref("workflow".to_string())
@@ -230,7 +231,7 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
 
 #[tokio::test(start_paused = true)]
 async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let fixture = fixture_path("change_request", "cr_observation_merge.yaml");
     let session = Session::replaying(fixture, Masks::new());
@@ -267,7 +268,7 @@ async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
 
 #[tokio::test(start_paused = true)]
 async fn unsubscribe_stops_change_request_observation_and_freshness_tightens_cadence() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let calls = Arc::new(AtomicUsize::new(0));
     let source = Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) });
@@ -317,7 +318,7 @@ async fn unsubscribe_stops_change_request_observation_and_freshness_tightens_cad
 
 #[tokio::test]
 async fn replica_reading_evaluator_fires_from_authority_change_request_record() {
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
+    let authority = ResourceBackend::new(InMemoryBackend::default());
     let subject =
         LeafAddress::ChangeRequest { service: "github.com".to_string(), scope: "flotilla-org/flotilla".to_string(), number: 1365 };
     let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1365);
@@ -356,7 +357,7 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
         .await
         .expect("publish authority CR");
 
-    let reader = ResourceBackend::InMemory(InMemoryBackend::default());
+    let reader = ResourceBackend::new(InMemoryBackend::default());
     let authority_list = records.list().await.expect("list authority CR");
     reader
         .replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("feta-root"), "flotilla")
@@ -391,7 +392,7 @@ async fn replica_reading_evaluator_fires_from_authority_change_request_record() 
 
 #[tokio::test(start_paused = true)]
 async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let records = backend.using::<ChangeRequest>("flotilla");
     let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2049);
     records
@@ -438,8 +439,8 @@ async fn foreign_change_request_authority_does_not_fetch_or_write_status() {
 
 #[tokio::test]
 async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
-    let owner = ResourceBackend::InMemory(InMemoryBackend::default());
-    let reader = ResourceBackend::InMemory(InMemoryBackend::default());
+    let owner = ResourceBackend::new(InMemoryBackend::default());
+    let reader = ResourceBackend::new(InMemoryBackend::default());
     let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
@@ -523,8 +524,8 @@ async fn two_hosts_demand_one_change_request_and_only_owner_fetches() {
 
 #[tokio::test]
 async fn former_owner_evaluates_fresher_takeover_replica() {
-    let former_owner = ResourceBackend::InMemory(InMemoryBackend::default());
-    let new_owner = ResourceBackend::InMemory(InMemoryBackend::default());
+    let former_owner = ResourceBackend::new(InMemoryBackend::default());
+    let new_owner = ResourceBackend::new(InMemoryBackend::default());
     let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2052);
     let spec = |authority: &str| {
         flotilla_resources::ChangeRequestSpec::builder()
@@ -647,8 +648,8 @@ async fn former_owner_evaluates_fresher_takeover_replica() {
 
 #[tokio::test]
 async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
-    let former = ResourceBackend::InMemory(InMemoryBackend::default());
-    let takeover = ResourceBackend::InMemory(InMemoryBackend::default());
+    let former = ResourceBackend::new(InMemoryBackend::default());
+    let takeover = ResourceBackend::new(InMemoryBackend::default());
     let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
@@ -731,8 +732,8 @@ async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
 
 #[tokio::test]
 async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
-    let owner = ResourceBackend::InMemory(InMemoryBackend::default());
-    let reader = ResourceBackend::InMemory(InMemoryBackend::default());
+    let owner = ResourceBackend::new(InMemoryBackend::default());
+    let reader = ResourceBackend::new(InMemoryBackend::default());
     let subject = observation::ChangeRequestRef {
         namespace: "flotilla".to_string(),
         service: "github.com".to_string(),
@@ -837,7 +838,7 @@ async fn stale_replicated_change_request_is_claimed_by_demanding_host() {
 
 #[tokio::test]
 async fn observed_issue_change_fires_wait_leaf() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, mut events) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
@@ -882,7 +883,7 @@ async fn observed_issue_change_fires_wait_leaf() {
 
 #[tokio::test]
 async fn issue_leaf_uses_issue_refresher_staleness() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let records = backend.using::<Issue>("flotilla");
     let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
     let created = records

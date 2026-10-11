@@ -1,8 +1,11 @@
+use flotilla_store_http::ensure_crd;
+use flotilla_store_http::ensure_namespace;
+use flotilla_store_http::HttpBackend;
 use std::{env, path::PathBuf, time::Duration};
 
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{Checkout, Convoy, Vessel, WorkflowTemplate};
-use flotilla_store::{controller::ControllerLoop, ensure_crd, ensure_namespace, ConvoyReconciler, HttpBackend, ResourceBackend};
+use flotilla_store::{controller::ControllerLoop, ConvoyReconciler, ResourceBackend};
 use tracing::info;
 
 fn kubeconfig_path() -> PathBuf {
@@ -38,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/convoy.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../../flotilla-resources/src/crds/vessel.crd.yaml")).await?;
 
-    let backend = ResourceBackend::Http(backend);
+    let backend = ResourceBackend::new(backend);
     let convoys = backend.clone().using::<Convoy>(&namespace);
     let templates = backend.definitions::<WorkflowTemplate>(&namespace);
     let vessels = backend.clone().using::<Vessel>(&namespace);

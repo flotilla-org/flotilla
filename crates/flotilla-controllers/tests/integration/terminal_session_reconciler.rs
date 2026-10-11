@@ -138,7 +138,7 @@ impl TerminalRuntime for DeadThenRestoredRuntime {
 
 #[tokio::test]
 async fn dead_generation_is_lost_then_recreated() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -253,7 +253,7 @@ impl TerminalRuntime for BrieflyMissingRuntime {
 
 #[tokio::test]
 async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -300,7 +300,7 @@ async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
 
 #[tokio::test]
 async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let env = environments
@@ -378,7 +378,7 @@ impl TerminalRuntime for FailingTerminalRuntime {
 
 #[tokio::test]
 async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let session = backend
         .clone()
         .using::<TerminalSession>("flotilla")
@@ -431,7 +431,7 @@ impl TerminalRuntime for GoneEnvironmentTerminalRuntime {
 
 #[tokio::test]
 async fn terminal_finalizer_drains_after_its_environment_is_deleted() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -527,7 +527,7 @@ async fn vessel_owned_session(backend: &ResourceBackend, session_name: &str, ves
 
 #[tokio::test]
 async fn managed_terminal_session_is_reclaimed_when_its_vessel_owner_is_gone() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     let session = vessel_owned_session(&backend, "terminal-orphan", "deleted-vessel").await;
     let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
@@ -543,7 +543,7 @@ async fn managed_terminal_session_is_reclaimed_when_its_vessel_owner_is_gone() {
 
 #[tokio::test]
 async fn managed_terminal_session_is_preserved_while_its_vessel_owner_exists() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     backend
         .clone()
@@ -562,7 +562,7 @@ async fn managed_terminal_session_is_preserved_while_its_vessel_owner_exists() {
 
 #[tokio::test]
 async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(
         &backend,
         "flotilla",
@@ -611,7 +611,7 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
 
 #[tokio::test]
 async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runtime() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-failed-convoy").await;
     let convoy =
         create_convoy_with_single_task(&backend, "flotilla", "failed-convoy", "work", "https://github.com/flotilla-org/flotilla", "main")
@@ -665,7 +665,7 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
 
 #[tokio::test]
 async fn failed_environment_terminal_stops_without_probing_its_runtime() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-failed").await;
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let environment = environments.get("env-failed").await.expect("environment");
@@ -732,7 +732,7 @@ impl TerminalRuntime for UnavailableRunningRuntime {
 
 #[tokio::test(start_paused = true)]
 async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -846,7 +846,7 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
 
 #[tokio::test(start_paused = true)]
 async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -935,7 +935,7 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
     type World = GhostRecoveryWorld;
 
     async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
         let env = environments
             .create(
@@ -1144,7 +1144,7 @@ async fn deleted_terminal_session_is_not_resurrected_from_stale_state_after_rest
 
 #[tokio::test]
 async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "host-direct-feta").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let spec = TerminalSessionSpec {
@@ -1216,7 +1216,7 @@ impl TerminalRuntime for RecordingTerminalRuntime {
 
 #[tokio::test]
 async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
@@ -1317,7 +1317,7 @@ impl TerminalRuntime for BriefGateRuntime {
 
 #[tokio::test]
 async fn digest_backed_session_waits_for_blob_then_launches() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     create_ready_environment(&backend, "env-a").await;
     let session = backend
@@ -1400,7 +1400,7 @@ impl TerminalRuntime for TagRecordingRuntime {
 
 #[tokio::test]
 async fn a_disappeared_running_session_is_observed_as_stopped() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "implement", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
@@ -1464,7 +1464,7 @@ struct MissingTerminalRuntime;
 
 #[tokio::test]
 async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let text = "[flotilla · turn: conflicting]\n\nRebase the PR";
     let session = sessions
@@ -1554,7 +1554,7 @@ impl TerminalRuntime for MissingTerminalRuntime {
 
 #[tokio::test]
 async fn a_message_queued_during_startup_is_delivered_before_attention_observation() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
@@ -1698,7 +1698,7 @@ async fn submissions_that_sent_no_bytes_back_off_and_stop_at_the_bound() {
 }
 
 async fn delivery_failure_scenario(startup_not_ready: bool) {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -2047,7 +2047,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
 // repeating the same output is a no-op and cannot keep a hung turn alive.
 #[tokio::test]
 async fn meaningful_output_progress_survives_coalesced_attention() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -2088,7 +2088,7 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
 
 #[tokio::test]
 async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_still_true() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -2145,7 +2145,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
 
 #[tokio::test]
 async fn terminal_finalizer_cleans_agent_artifacts() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -2326,7 +2326,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
 #[tokio::test]
 async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() {
     for source in [TerminalAttentionSource::Hook, TerminalAttentionSource::Screen] {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         create_ready_environment(&backend, "env-a").await;
         let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
         let created = sessions
@@ -2416,7 +2416,7 @@ impl TerminalRuntime for AuthFailedTerminalRuntime {
 
 #[tokio::test]
 async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credential() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
@@ -2461,7 +2461,7 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
 // changing delivery order or leaving delivered bodies in the stored resource.
 #[tokio::test]
 async fn controller_loop_prunes_acknowledged_message_payloads() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -2630,7 +2630,7 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
         (130, TerminalSessionPhase::Running, diagnostic),
         (137, TerminalSessionPhase::Running, diagnostic),
     ] {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         create_ready_environment(&backend, "env-a").await;
         create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -2705,7 +2705,7 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
 // Lost grace permits another launch. A successful probe can still revive it.
 #[tokio::test]
 async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let spec = TerminalSessionSpec {
@@ -2836,7 +2836,7 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
             .await
             .expect("exit receipt");
     }
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -2969,8 +2969,8 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
     #[values(false, true)] initially_refused: bool,
     #[values(LifecycleAuthority::Managed, LifecycleAuthority::Adopted, LifecycleAuthority::Observed)] authority_kind: LifecycleAuthority,
 ) {
-    let backend = ResourceBackend::InMemory(Default::default());
-    let authority = if replicated { ResourceBackend::InMemory(Default::default()) } else { backend.clone() };
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let authority = if replicated { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&authority, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = authority.using::<Convoy>("flotilla");
@@ -3098,7 +3098,7 @@ async fn convoy_reclaim_logs_distinguish_gate_from_session_disposition(
     #[values(false, true)] deleting: bool,
     #[values(false, true)] refused: bool,
 ) {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.get("demo").await.expect("convoy");
@@ -3164,7 +3164,7 @@ async fn convoy_reclaim_logs_distinguish_gate_from_session_disposition(
 // independent session must not acquire a fabricated convoy name in the log.
 #[tokio::test]
 async fn independent_owner_absence_log_does_not_claim_gate_approval() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.using::<TerminalSession>("flotilla");
     let session = sessions
         .create(
@@ -3199,7 +3199,7 @@ async fn independent_owner_absence_log_does_not_claim_gate_approval() {
 // changing the incoming state emits a new decision even with the same resource key.
 #[tokio::test]
 async fn unchanged_attention_decisions_log_once() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let created = sessions
         .create(
@@ -3270,7 +3270,7 @@ async fn unchanged_attention_decisions_log_once() {
 async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
     use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec, MessageStatus, MessageSubmission};
     for (crew, session_id) in [("current-crew", "cleat-session"), ("older-crew", "cleat-session"), ("current-crew", "older-session")] {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         create_ready_environment(&backend, "env-a").await;
         create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
         let sessions = backend.clone().using::<TerminalSession>("flotilla");

@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test(start_paused = true)]
 async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {
@@ -262,7 +263,7 @@ async fn host_description_watch_publishes_offline_replica_updates() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-watch-observer\"\n").expect("daemon config");
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
-    let remote = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("remote-root"));
+    let remote = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("remote-root"));
     let hosts = remote.using::<Host>(NAMESPACE);
     let created = hosts.create(&empty_meta("remote-host"), &HostSpec::default()).await.expect("remote host");
     let summary = HostSummary::builder()
@@ -477,7 +478,7 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
     let pool = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         ensure_host_exists(&backend, NAMESPACE, "host", "test").await.expect("host");
         let realisation =
             if docker { FulfilmentRealisation::DockerPerVessel { image: "crew:test".into() } } else { FulfilmentRealisation::HostDirect };

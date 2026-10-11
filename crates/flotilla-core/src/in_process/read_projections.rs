@@ -1581,7 +1581,7 @@ mod tests {
         ObservedChecks, ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock, TerminalSessionSource,
         TerminalSessionSpec,
     };
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
@@ -1608,8 +1608,8 @@ mod tests {
         let rung = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-            let author = if replicated { ResourceBackend::InMemory(InMemoryBackend::default()) } else { backend.clone() };
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let author = if replicated { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
             let now = Utc::now();
             let began_at = now + ChronoDuration::seconds(if future { 10 } else { -300 });
             for index in 0..count {
@@ -1739,7 +1739,7 @@ mod tests {
     // #2498: a stalled crew remains listed after its visible condition is replaced or absent.
     #[tokio::test]
     async fn crew_stalls_retains_crew_without_current_condition() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.using::<ResourceConvoy>("other-namespace");
         let convoy = convoys
             .create(&InputMeta::builder().name("stalled".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
@@ -1789,7 +1789,7 @@ mod tests {
     impl ProjectionFixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("tempdir");
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
             let config = Arc::new(ConfigStore::with_base(temp.path()));
             let event_sink: Arc<dyn EventSink> = Arc::new(RecordingEventSink::default());
             let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
@@ -1993,7 +1993,7 @@ mod tests {
         let now = Utc::now();
         let last_sync = now - chrono::Duration::seconds(10);
         fixture.register_remote_host("remote-node", "remote", "remote-id").await;
-        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_backend = ResourceBackend::new(InMemoryBackend::default());
         let remote_hosts = remote_backend.using::<ResourceHost>("flotilla");
         remote_hosts.create(&InputMeta::builder().name("remote-id".to_string()).build(), &HostSpec::default()).await.expect("host");
         fixture
@@ -2030,7 +2030,7 @@ mod tests {
         let now = Utc::now();
         let last_sync = now - chrono::Duration::hours(1);
         fixture.register_remote_host("remote-node", "remote", "remote-id").await;
-        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_backend = ResourceBackend::new(InMemoryBackend::default());
         let remote_hosts = remote_backend.using::<ResourceHost>("flotilla");
         remote_hosts.create(&InputMeta::builder().name("remote-id".to_string()).build(), &HostSpec::default()).await.expect("host");
         fixture
@@ -2070,7 +2070,7 @@ mod tests {
         fixture.register_remote_host("remote-node", "remote", "remote-id").await;
         fixture.register_remote_host("free-node", "free", "free-id").await;
 
-        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_backend = ResourceBackend::new(InMemoryBackend::default());
         let remote_hosts = remote_backend.using::<ResourceHost>("flotilla");
         for (name, generation, heartbeat_at) in
             [("remote-id", "trusted", now - chrono::Duration::minutes(3)), ("local-id", "third-party", now)]
@@ -2098,7 +2098,7 @@ mod tests {
             .await
             .expect("replicate remote hosts");
 
-        let free_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let free_backend = ResourceBackend::new(InMemoryBackend::default());
         let free_hosts = free_backend.using::<ResourceHost>("flotilla");
         let created =
             free_hosts.create(&InputMeta::builder().name("free-id".to_string()).build(), &HostSpec::default()).await.expect("free host");
@@ -2152,7 +2152,7 @@ mod tests {
 
         // A second origin with an older heartbeat but newer sync must win in both views.
         fixture.register_remote_host("mirror-node", "remote", "mirror-id").await;
-        let mirror_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mirror_backend = ResourceBackend::new(InMemoryBackend::default());
         let mirror_hosts = mirror_backend.using::<ResourceHost>("flotilla");
         let created = mirror_hosts
             .create(&InputMeta::builder().name("mirror-id".to_string()).build(), &HostSpec::default())
@@ -2196,7 +2196,7 @@ mod tests {
     async fn fleet_rows_skip_unmapped_origins_and_keep_local_snapshot_local() {
         let fixture = ProjectionFixture::new();
         fixture.register_remote_host("remote-node", "remote", "remote-id").await;
-        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_backend = ResourceBackend::new(InMemoryBackend::default());
         let sessions = remote_backend.using::<ResourceTerminalSession>("flotilla");
         sessions
             .create(
@@ -2370,7 +2370,7 @@ mod tests {
         }
         // #2471: a newer replica under a different name beats an older local
         // canonical record. Its Unknown checks must not inherit local Pass.
-        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote = ResourceBackend::new(InMemoryBackend::default());
         let remote_requests = remote.using::<ChangeRequest>("flotilla");
         let duplicate = remote_requests
             .create(
@@ -2650,7 +2650,7 @@ mod tests {
         let replica_first = tc.draw(gs::booleans());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
             let at = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).single().expect("timestamp");
             let name = flotilla_resources::artifact_record_name("claimed", "coder", "decision-ledger", "claimed");
             let mut spec = flotilla_resources::ArtifactSpec::builder()
@@ -2724,7 +2724,7 @@ mod tests {
 
     #[tokio::test]
     async fn credential_alerts_match_the_exact_convoy_and_vessel() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let demand = backend
             .using::<ResourceDemand>("flotilla")
             .create(
@@ -2753,7 +2753,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_and_dispatch_queries_project_in_memory_records() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let projects = backend.clone().definitions::<Project>("flotilla");
         let earlier = Utc::now() - ChronoDuration::minutes(3);
         let observed_at = earlier + ChronoDuration::minutes(2);
@@ -2819,7 +2819,7 @@ mod tests {
         for (n, adopted) in [(10, false), (200, false), (10, true), (200, true)] {
             let mut fixture = ProjectionFixture::new();
             let memory = InMemoryBackend::default().with_read_counts();
-            fixture.backend = ResourceBackend::InMemory(memory.clone());
+            fixture.backend = ResourceBackend::new(memory.clone());
             fixture
                 .backend
                 .using::<ResourceConvoy>("flotilla")
@@ -3002,7 +3002,7 @@ mod tests {
     async fn message_views_preserve_waiting_reasons_and_delivery_identity() {
         use flotilla_resources::{Message, MessageRelation, MessageSpec, MessageStatusPatch, ResolvedMessageReceiver};
         use flotilla_store::MessageInbox;
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let inbox = MessageInbox::new(backend.clone(), "flotilla");
         let intent = MessageSpec::builder()
             .sender("flotilla/test".into())
@@ -3041,7 +3041,8 @@ mod tests {
 #[cfg(test)]
 mod project_hierarchy_projection_tests {
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, Project, ProjectSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::ReadProjections;
 
@@ -3049,7 +3050,7 @@ mod project_hierarchy_projection_tests {
     // parent to it; the fleet's own parent remains absent.
     #[tokio::test]
     async fn project_list_marks_fleet_and_resolved_parent() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         for name in ["root", "product"] {
             backend
                 .definitions::<Project>("flotilla")
@@ -3074,7 +3075,7 @@ mod project_hierarchy_projection_tests {
         assert_eq!(product.parent.as_deref(), Some("root"));
         // An invalid incoming replica must stay visible so operators can repair
         // it; one dangling edge must not suppress every Project list row.
-        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote = ResourceBackend::new(InMemoryBackend::default());
         remote
             .definitions::<Project>("flotilla")
             .apply(

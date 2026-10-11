@@ -44,6 +44,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }

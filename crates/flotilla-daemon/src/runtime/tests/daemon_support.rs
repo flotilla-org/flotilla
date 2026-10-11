@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_store_sqlite::SqliteBackend;
 
 pub(super) async fn publish_merged_change_request(backend: &ResourceBackend, number: u64, authority: &str) {
     let records = backend.clone().using::<flotilla_resources::ChangeRequest>(NAMESPACE);
@@ -199,12 +200,12 @@ pub(super) async fn daemon_with_backend_runner_and_change_requests(
 }
 
 pub(super) async fn in_memory_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
-    daemon_with_backend(tracked_repos, config, ResourceBackend::InMemory(Default::default())).await
+    daemon_with_backend(tracked_repos, config, ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())).await
 }
 
 pub(super) async fn sqlite_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
     std::fs::create_dir_all(config.state_dir()).expect("state dir");
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
+    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
     daemon_with_backend(tracked_repos, config, backend).await
 }
 
@@ -222,7 +223,7 @@ pub(super) fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Co
 }
 
 pub(super) async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
-    crew_daemon_with_backend(config, ResourceBackend::InMemory(Default::default())).await
+    crew_daemon_with_backend(config, ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())).await
 }
 
 pub(super) async fn crew_daemon_with_backend(

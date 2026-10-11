@@ -1,5 +1,6 @@
 //! Integration tests for ProjectAdd/ProjectApply and Project-backed convoy metadata.
 
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
@@ -40,7 +41,7 @@ use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectRepositoryRole,
     ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use tracing::instrument::WithSubscriber;
 
 #[derive(Clone)]
@@ -76,7 +77,7 @@ fn symlinked_fixture(tmp: &tempfile::TempDir) -> PathBuf {
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -226,8 +227,8 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
     let config = test_config(tmp.path().join("config"));
     let kiwi_root = NodeId::new("kiwi-root");
     let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(feta_root);
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
     let canonical = "https://github.com/flotilla-org/flotilla";
     let mirror = "https://forgejo.lab/lab/flotilla";
     let declared =
@@ -287,8 +288,8 @@ async fn independently_observed_same_repository_remains_resolvable_after_replica
     let config = test_config(tmp.path().join("config"));
     let kiwi_root = NodeId::new("kiwi-root");
     let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(feta_root);
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
     let meta = InputMeta::builder().name(repository_key.to_string()).build();
@@ -472,7 +473,7 @@ async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
         .expect("ops entry");
     git(&ops, &["add", "verify.md"]);
     git(&ops, &["commit", "-m", "declare verification"]);
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = Arc::new(
         InProcessDaemon::new_with_resource_backend(
             vec![ops.clone()],
@@ -949,7 +950,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
     )
     .expect("write operational entry");
 
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("project-home"));
+    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("project-home"));
     let mut annotations = BTreeMap::new();
     annotations.insert(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), ops_spec.key().to_string());
     annotations.insert(BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "replica-commit".to_string());
@@ -1168,7 +1169,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
     init_git_repo_with_remote(&checkout_path, "https://github.com/org/tracked.git");
     let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path.clone()],
         config,
@@ -1221,7 +1222,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     let mirror_url = "https://forgejo.lab/lab/flotilla";
     init_git_repo_with_remote(&mirror_root, mirror_url);
     init_git_repo_with_remote(&github_root, canonical_url);
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let config = test_config(tmp.path().join("config"));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
@@ -1307,7 +1308,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
     std::fs::create_dir(&checkout_path).expect("checkout dir");
     let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path.clone()],
         config,
@@ -1662,7 +1663,7 @@ async fn daemon_start_and_restart_do_not_backfill_projects() {
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("backfilled");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path],
         Arc::clone(&config),
@@ -1699,7 +1700,7 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("flotilla");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path.clone()],
         Arc::clone(&config),
@@ -1766,7 +1767,7 @@ async fn daemon_start_skips_a_tracked_repo_that_cannot_be_backfilled() {
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("uninspectable");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![checkout_path],
         Arc::clone(&config),
@@ -1895,7 +1896,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
 
 async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_history: bool) -> Vec<CheckoutSpec> {
     let config = test_config(tmp.path().join(if with_history { "history-config" } else { "cold-config" }));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),

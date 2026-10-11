@@ -1,5 +1,7 @@
 //! Candidate-side validation of durable admission pins. Transport only supplies
 //! an inventory; the checker and probe ports do not depend on a running fleet.
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -531,7 +533,7 @@ mod tests {
     use flotilla_resources::{
         ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, InputMeta, ResolvedSkills, VesselRequirement, WorkflowSnapshot,
     };
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
 
     use super::*;
 
@@ -582,7 +584,7 @@ mod tests {
     }
 
     async fn frozen_store() -> (ResourceBackend, Vec<Value>) {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.clone().using::<Convoy>("fleet");
         let created = convoys
             .create(
@@ -841,7 +843,7 @@ mod tests {
         use flotilla_store::list_resource_kind_including_replicas;
         let (backend, mut inventory) = placed_image_inventory().await;
         let supply = Supply { revision: "1".repeat(40), image_available: true };
-        let replica_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let replica_backend = ResourceBackend::new(InMemoryBackend::default());
         let origin = NodeId::new("root-b");
         replica_backend
             .replica_writer::<Convoy>(origin.clone(), "fleet")
@@ -1086,7 +1088,7 @@ mod tests {
             FrozenImageLayer, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageInputStability,
             ImageLayerParent, ImageLayerSpec, ImageLayerStage, InputMeta, PlacedImageIdentity, ResolvedImageInputs,
         };
-        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let digest = format!("sha256:{}", "a".repeat(64));
         let inputs = ResolvedImageInputs::builder()
             .parent_digest(digest.clone())

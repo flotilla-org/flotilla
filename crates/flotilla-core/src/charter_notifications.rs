@@ -1,4 +1,6 @@
 //! Render changed charters through the same role-template seam as first turns.
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
@@ -95,7 +97,7 @@ mod tests {
         Convoy, ConvoySpec, ConvoyStatus, CrewSpec, InputMeta, Message, Project, ProjectSpec, RoleDefinition, Selector, TerminalBrief,
         TerminalCrewContext, TerminalSession, TerminalSessionSpec, VesselRequirement, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL,
     };
-    use flotilla_store::{reconcile_charter_notifications_with_renderer, InMemoryBackend, MessageInbox};
+    use flotilla_store::{reconcile_charter_notifications_with_renderer, MessageInbox};
 
     use super::*;
 
@@ -103,7 +105,7 @@ mod tests {
     // revisions, and keeps the initial holder's brief and session untouched.
     #[tokio::test]
     async fn latest_charter_message_renders_the_live_role_template() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let config_dir = tempfile::tempdir().expect("config");
         let renderer = LiveCharterBriefRenderer::new(backend.clone(), Arc::new(ConfigStore::with_base(config_dir.path())));
         let projects = backend.definitions::<Project>("flotilla");

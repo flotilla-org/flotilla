@@ -51,7 +51,7 @@ impl DockerEnvironmentRuntime for RecordingDockerRuntime {
 
 #[tokio::test]
 async fn a_provisioning_failure_marks_the_environment_failed() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environments = backend.clone().using::<Environment>("flotilla");
     let environment = environments
         .create(
@@ -88,7 +88,7 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
 
 #[tokio::test]
 async fn finalizer_error_surfaces_as_failed_environment_status() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environment = backend
         .using::<Environment>("flotilla")
         .create(
@@ -112,7 +112,7 @@ async fn finalizer_error_surfaces_as_failed_environment_status() {
 
 #[tokio::test]
 async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environments = backend.clone().using::<Environment>("flotilla");
     let environment = environments
         .create(
@@ -174,7 +174,7 @@ impl DockerEnvironmentRuntime for ForeignEnvironmentRuntime {
 
 #[tokio::test]
 async fn foreign_environment_is_not_actuated_or_finalized() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let hosts = backend.using::<Host>("flotilla");
     for host in ["kiwi", "udder"] {
         hosts
@@ -229,7 +229,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
 
 #[tokio::test]
 async fn orphaned_environment_can_finalize_after_its_host_disappears() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environment = backend
         .using::<Environment>("flotilla")
         .create(
@@ -264,7 +264,7 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
 // must not mark the resource ready merely because its spec names host-direct.
 #[tokio::test]
 async fn host_direct_provider_failure_prevents_readiness() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environment = backend
         .using::<Environment>("flotilla")
         .create(
@@ -287,7 +287,7 @@ async fn host_direct_provider_failure_prevents_readiness() {
 // its provisioning method panics if automatic rehydration is attempted.
 #[tokio::test]
 async fn lost_environment_is_not_reprovisioned() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environments = backend.using::<Environment>("flotilla");
     let environment = environments
         .create(

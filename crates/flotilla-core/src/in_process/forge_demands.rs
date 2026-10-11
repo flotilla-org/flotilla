@@ -1,3 +1,5 @@
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -101,7 +103,7 @@ mod tests {
 
     use flotilla_protocol::{HostName, IssueSource};
     use flotilla_resources::{ForgeReadHeartbeatSpec, ForgeReadSpec, InputMeta, Resource};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use flotilla_store_testkit::ReadCountsBackendExt;
 
     use super::*;
@@ -136,7 +138,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(temp.path())),
             fake_discovery(false),
             HostName::new("owner"),
-            ResourceBackend::InMemory(counted.clone()),
+            ResourceBackend::new(counted.clone()),
         )
         .await;
         let backend = daemon.resource_backend();

@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyStatusPatch, CrewCompletionPending, CrewMessageSender, CrewWorkPhase, InputMeta,
     TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, InMemoryBackend, ResourceBackend};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 
 use super::{fixture, StagingProbe};
 use crate::config::ConfigStore;
@@ -186,7 +187,7 @@ async fn remote_suppression_restores_workflow_before_replication() {
     }
     let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
     probe.fail.store(false, Ordering::SeqCst);
-    let remote = ResourceBackend::InMemory(Default::default());
+    let remote = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let inbox = MessageInbox::new(remote.clone(), "flotilla");
     let subject = MessageReference::ControlRecord {
         resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "crew"),
@@ -272,7 +273,7 @@ async fn turn_admission_uses_canonical_receiver_result_without_reopening_work() 
     for visible in [true, false] {
         let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
         probe.fail.store(false, Ordering::SeqCst);
-        let receiver = if visible { backend.clone() } else { ResourceBackend::InMemory(Default::default()) };
+        let receiver = if visible { backend.clone() } else { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) };
         let inbox = MessageInbox::new(receiver.clone(), "flotilla");
         let subject =
             MessageReference::ChangeRequest { service: "github".into(), scope: "org/repo".into(), number: 1, revision: "head".into() };
@@ -512,7 +513,7 @@ async fn replica_withdraw_preserves_receiver_submission_on_race() {
         }
     }
     let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
-    let receiver = ResourceBackend::InMemory(InMemoryBackend::default());
+    let receiver = ResourceBackend::new(InMemoryBackend::default());
     let spec = flotilla_resources::MessageSpec::builder()
         .sender("principal:operator".into())
         .receiver("flotilla/crew/work/coder".into())

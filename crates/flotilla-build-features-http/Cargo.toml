@@ -8,6 +8,8 @@ publish = false
 
 # Static feature selections only; every consumer already uses these dependencies.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+thiserror = "2"
+itertools = "0.14"
 bitflags = { version = "2", default-features = false, features = ["std"] }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }

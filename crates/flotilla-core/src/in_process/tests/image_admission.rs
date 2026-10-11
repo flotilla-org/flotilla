@@ -1,10 +1,11 @@
 use flotilla_store::DockerImageSourceStoreExt;
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use flotilla_protocol::HostName;
 use flotilla_resources::{CrewSource, CrewSpec, InputMeta, PlacementPolicy, VesselRequirement, WorkflowTemplateSpec};
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, test_meta};
 use crate::config::ConfigStore;
@@ -17,7 +18,7 @@ async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image()
 
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -75,7 +76,7 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
     };
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-image-composition\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

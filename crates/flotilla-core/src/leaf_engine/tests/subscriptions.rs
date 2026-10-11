@@ -1,4 +1,6 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 
 #[test]
 fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
@@ -24,7 +26,7 @@ fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
 #[tokio::test]
 async fn leaf_wait_recovers_after_watch_overflow() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let table = supervision_wake(&backend).subscriptions;
     create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let id = uuid::Uuid::new_v4();
@@ -63,7 +65,7 @@ async fn leaf_wait_recovers_after_watch_overflow() {
 #[tokio::test(start_paused = true)]
 async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let table = supervision_wake(&backend).subscriptions;
     create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let row = overload_row(uuid::Uuid::new_v4());
@@ -115,7 +117,7 @@ async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
 #[tokio::test(start_paused = true)]
 async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let table = supervision_wake(&backend).subscriptions;
     create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let connection_id = uuid::Uuid::new_v4();
@@ -265,17 +267,17 @@ async fn operator_only_supervision_is_consumed_once() {
 
 #[tokio::test]
 async fn in_memory_leaf_subscription_contract() {
-    assert_leaf_subscription_contract(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    assert_leaf_subscription_contract(ResourceBackend::new(InMemoryBackend::default())).await;
 }
 
 #[tokio::test]
 async fn sqlite_leaf_subscription_contract() {
-    assert_leaf_subscription_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("open sqlite"))).await;
+    assert_leaf_subscription_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("open sqlite"))).await;
 }
 
 #[tokio::test]
 async fn diagnostics_retain_the_last_firing_for_an_armed_reconciler_row() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
@@ -336,7 +338,7 @@ fn unchanged_subscription_decisions_log_once() {
 
 #[tokio::test]
 async fn declared_exit_entry_name_is_recorded_when_its_instantiated_leaf_fires() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
@@ -431,14 +433,14 @@ fn leaf_object_routing_counts_only_addressed_rows(tc: hegel::TestCase) {
     let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
     let changes: Vec<usize> = (0..steps).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(63))).collect();
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        routing_count_contract(ResourceBackend::InMemory(InMemoryBackend::default()), &changes).await;
+        routing_count_contract(ResourceBackend::new(InMemoryBackend::default()), &changes).await;
     });
 }
 
 // Run the same counted routing contract against the real SQLite adapter.
 #[tokio::test]
 async fn sqlite_leaf_object_routing_counts_only_addressed_rows() {
-    routing_count_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite")), &[63, 0, 1, 1, 32]).await;
+    routing_count_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), &[63, 0, 1, 1, 32]).await;
 }
 
 async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
@@ -562,7 +564,7 @@ async fn router_processed(table: &LeafSubscriptionTable, previous: usize) {
 #[tokio::test]
 async fn leaf_routing_missing_work_and_restart() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let table = supervision_wake(&backend).subscriptions;
     let mut row = overload_row(uuid::Uuid::new_v4());
     row.leaves = vec![leaf(LeafAddress::Work { convoy: "missing".into(), work: "work".into() }, ".status.phase", "Complete")];
@@ -602,7 +604,7 @@ async fn leaf_routing_missing_work_and_restart() {
 #[tokio::test]
 async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     for name in ["busy", "object-0", "object-1"] {
         create_convoy(&backend, name, ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     }
@@ -666,7 +668,7 @@ async fn leaf_resync_evaluates_each_row_once_then_routes_again() {
 #[tokio::test]
 async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
     let table = supervision_wake(&backend).subscriptions;
     let connection = uuid::Uuid::new_v4();
@@ -703,7 +705,7 @@ async fn slow_leaf_watch_open_does_not_block_other_namespaces() {
 #[tokio::test]
 async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let table = supervision_wake(&backend).subscriptions;
     let row = overload_row(uuid::Uuid::new_v4());
     let mut sibling = row.clone();
@@ -742,7 +744,7 @@ async fn racing_leaf_openers_share_router_and_remove_only_their_addresses() {
 #[tokio::test(start_paused = true)]
 async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
     use futures::FutureExt;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() }).await;
     let table = supervision_wake(&backend).subscriptions;
     let row = overload_row(uuid::Uuid::new_v4());
@@ -788,7 +790,7 @@ async fn leaf_targeted_reads_retry_without_losing_wait_identity() {
 // demand immediately; no read retries occur after cancellation.
 #[tokio::test(start_paused = true)]
 async fn leaf_read_backoff_is_cancelled_by_disconnect() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let table = supervision_wake(&backend).subscriptions;
     let connection = uuid::Uuid::new_v4();
     let row = overload_row(connection);

@@ -1,4 +1,5 @@
 use flotilla_resources::Actuation;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -27,7 +28,7 @@ use flotilla_resources::{
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use flotilla_store::{
-    controller::Reconciler, MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome, ResourceBackend, SqliteBackend,
+    controller::Reconciler, MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome, ResourceBackend,
 };
 use futures::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
@@ -79,9 +80,9 @@ async fn modern_remote_nudge_uses_ordinary_message_admission() {
 }
 
 async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
-    let home = ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("home store")).with_local_root(NodeId::new("home"));
+    let home = ResourceBackend::new(SqliteBackend::open_in_memory().expect("home store")).with_local_root(NodeId::new("home"));
     let placement =
-        ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("placement store")).with_local_root(NodeId::new("placement"));
+        ResourceBackend::new(SqliteBackend::open_in_memory().expect("placement store")).with_local_root(NodeId::new("placement"));
     let home_dir = tempfile::tempdir().expect("home config");
     std::fs::write(home_dir.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("home identity");
     let home_daemon = Arc::new(

@@ -20,7 +20,7 @@ fn timestamp(second: u32) -> chrono::DateTime<Utc> {
 
 #[tokio::test]
 async fn expired_demand_escalates_without_settling() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let clock = Arc::new(VirtualClock::new(timestamp(10)));
     let lifecycle = DemandLifecycle::new(backend.clone(), clock.clone());
     let demands = backend.using::<Demand>("flotilla");

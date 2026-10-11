@@ -1,10 +1,11 @@
 use super::*;
+use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
 async fn builtin_workflow_templates_seeded_at_multiple_roots_do_not_raise_authorship_collisions() {
     assert_eq!(WorkflowTemplate::REPLICATION_CLASS, ReplicationClass::Definitions, "code-seeded builtins share the fleet definitions view");
     for root in ["builtin-root-a", "builtin-root-b", "builtin-root-c"] {
-        let backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new(root));
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new(root));
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("seed builtin workflow templates");
         assert!(
             home_bound_authorship_collisions(&backend, NAMESPACE).await.expect("inspect authored resources").is_empty(),
@@ -17,7 +18,7 @@ async fn builtin_workflow_templates_seeded_at_multiple_roots_do_not_raise_author
 // preserves user-owned templates, and is idempotent across startup sweeps.
 #[tokio::test]
 async fn retired_builtin_records_are_removed_without_deleting_user_templates() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
     for name in ["single-agent-contained", "single-agent-trusted", "unknown-retired"] {
         let mut stale = flotilla_resources::single_agent_workflow_spec();
@@ -37,7 +38,7 @@ async fn retired_builtin_records_are_removed_without_deleting_user_templates() {
 
 #[tokio::test]
 async fn startup_seeding_reconciles_existing_builtin_template_definition() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
     let mut stale = flotilla_resources::single_agent_workflow_spec();
     stale.vessels[0].crew[0].role = "obsolete".to_string();
@@ -79,7 +80,7 @@ async fn startup_seeding_reconciles_existing_builtin_template_definition() {
 
 #[tokio::test]
 async fn deleted_code_owned_builtin_is_reconciled_back() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("initial builtin reconciliation should succeed");
 
     let deleted = flotilla_store::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent")
@@ -97,7 +98,7 @@ async fn deleted_code_owned_builtin_is_reconciled_back() {
 #[tokio::test]
 async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
     const NAMESPACE: &str = "test";
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
     templates
         .create(&empty_meta("single-agent"), &flotilla_resources::single_agent_workflow_spec())
@@ -119,7 +120,7 @@ async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
 
 #[tokio::test]
 async fn startup_reconciles_owned_single_agent_shepherd_builtin() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
 
     reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("builtin reconciliation should succeed");
 
@@ -130,7 +131,7 @@ async fn startup_reconciles_owned_single_agent_shepherd_builtin() {
 
 #[tokio::test]
 async fn migrates_display_name_host_ref_to_canonical_host_id() {
-    let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let host_id = "b2aac222-host-id";
     backend
         .clone()
@@ -238,7 +239,7 @@ async fn migrates_display_name_host_ref_to_canonical_host_id() {
 
 #[tokio::test]
 async fn conflicting_policy_does_not_block_other_host_ref_migrations() {
-    let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let host_id = "host-id";
     let hosts = backend.clone().using::<Host>(NAMESPACE);
     hosts.create(&empty_meta(host_id), &HostSpec { display_name: "kiwi".into(), ..HostSpec::default() }).await.expect("seed host");
@@ -271,7 +272,7 @@ async fn conflicting_policy_does_not_block_other_host_ref_migrations() {
 
 #[tokio::test]
 async fn migrates_live_policy_names_to_fulfilment_kinds() {
-    let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
     for host in ["feta", "kiwi", "udder"] {
         let name = format!("docker-crew-image-{host}");
@@ -417,7 +418,7 @@ async fn policy_registration_preserves_operator_fields_and_corrects_owned_drift(
     let database_path = temp.path().join("resources.sqlite");
     let profile = manual_profile("host-test", false);
     {
-        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("initial sqlite resource backend should open"));
+        let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("initial sqlite resource backend should open"));
         ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
 
         let policies = backend.using::<PlacementPolicy>(NAMESPACE);
@@ -439,7 +440,7 @@ async fn policy_registration_preserves_operator_fields_and_corrects_owned_drift(
             .expect("operator policy apply should succeed");
     }
 
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("restarted sqlite resource backend should open"));
+    let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("restarted sqlite resource backend should open"));
     ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("policy re-registration should succeed");
 
     let reconciled =
@@ -462,7 +463,7 @@ async fn policy_registration_preserves_operator_fields_and_corrects_owned_drift(
 
 #[tokio::test]
 async fn docker_policy_registration_preserves_runtime_configuration_and_corrects_owned_drift() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let profile = manual_profile("host-test", true);
     ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("initial policy registration should succeed");
 
@@ -515,7 +516,7 @@ async fn docker_policy_registration_preserves_runtime_configuration_and_corrects
 
 #[tokio::test]
 async fn policy_registration_leaves_manifest_managed_collision_untouched() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let profile = manual_profile("host-test", false);
     let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
     let manifest_spec = PlacementPolicySpec::builder()

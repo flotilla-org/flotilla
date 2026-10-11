@@ -1,3 +1,5 @@
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -456,7 +458,7 @@ mod tests {
     use std::sync::Arc;
 
     use flotilla_resources::{CheckoutSpec, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, InputMeta, ObservedCheckoutSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
 
     use super::*;
     use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
@@ -505,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkout_matches_the_full_aliased_forge_identity() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let repo_ref = flotilla_protocol::RepositoryKey("project-map".into());
         let repository = ConvoyRepositorySpec {
             url: "https://forge.example/team/robert/project-map".into(),

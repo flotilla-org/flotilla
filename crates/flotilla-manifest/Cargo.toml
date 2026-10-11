@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"
 tracing = { workspace = true }
 
 [dev-dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 tokio = { workspace = true, features = ["test-util"] }

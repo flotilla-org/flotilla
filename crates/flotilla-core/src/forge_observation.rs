@@ -656,12 +656,12 @@ impl ChangeRequestTracker for ObservedChangeRequestTracker {
 #[cfg(test)]
 mod tests {
     use flotilla_resources::{HostSpec, HostStatus, IssueSourceBindingSpec, ProjectSpec, Resource};
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
 
     fn backend(root: &str) -> ResourceBackend {
-        ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new(root))
+        ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new(root))
     }
     fn source() -> IssueSource {
         IssueSource { service: "https://github.com".into(), scope: "org/shared".into() }
@@ -688,7 +688,7 @@ mod tests {
         use flotilla_store_testkit::ReadCountsBackendExt;
         let owner = backend("owner");
         let counted = InMemoryBackend::default().with_read_counts();
-        let peer = ResourceBackend::InMemory(counted.clone()).with_local_root(NodeId::new("peer"));
+        let peer = ResourceBackend::new(counted.clone()).with_local_root(NodeId::new("peer"));
         owner
             .using::<Project>("flotilla")
             .create(

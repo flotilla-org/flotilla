@@ -5,7 +5,14 @@ edition = "2021"
 license.workspace = true
 publish = false
 
+[features]
+default = []
+skip-no-sandbox-tests = []
+
 [dependencies]
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
+flotilla-store-http = { path = "../flotilla-store-http" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 serde = { workspace = true, features = ["derive"] }
@@ -22,4 +29,19 @@ flotilla-resources = { path = "../flotilla-resources" }
 workspace = true
 
 [dev-dependencies]
+url = "2"
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+tracing.workspace = true
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+serde_yml = "0.0.12"
+flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
+object_store = { version = "0.12", features = ["aws"] }
+flotilla-tls = { path = "../flotilla-tls" }
+reqwest = { workspace = true, features = ["json", "stream"] }
+hegeltest = "=0.48.1"
+rstest.workspace = true
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
 tokio = { workspace = true, features = ["test-util"] }

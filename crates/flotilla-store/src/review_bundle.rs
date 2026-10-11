@@ -1,20 +1,24 @@
 use std::{fmt, fs, path::Path, sync::Arc};
 
 use flotilla_resources::*;
-use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
 use serde::{Deserialize, Serialize};
 
-/// Provider-neutral review storage. `object_store`'s S3 implementation accepts
-/// custom endpoints (including rustfs), while its memory and filesystem
-/// implementations exercise the identical contract in tests.
+/// Object bytes only: publication ordering and admissibility belong to ReviewBundleStore.
+#[async_trait::async_trait]
+pub trait ReviewBundleObjects: Send + Sync {
+    async fn put(&self, key: &str, contents: Vec<u8>) -> Result<(), ReviewBundleStoreError>;
+    async fn get(&self, key: &str) -> Result<Vec<u8>, ReviewBundleStoreError>;
+}
+
+/// Review-bundle publication and decoding over a provider-neutral byte port.
 #[derive(Clone)]
 pub struct ReviewBundleStore {
-    objects: Arc<dyn ObjectStore>,
+    objects: Arc<dyn ReviewBundleObjects>,
     public_base_url: String,
 }
 
 impl ReviewBundleStore {
-    pub fn new(objects: Arc<dyn ObjectStore>, public_base_url: impl Into<String>) -> Self {
+    pub fn new(objects: Arc<dyn ReviewBundleObjects>, public_base_url: impl Into<String>) -> Self {
         Self { objects, public_base_url: public_base_url.into().trim_end_matches('/').to_string() }
     }
 
@@ -41,17 +45,13 @@ impl ReviewBundleStore {
     }
 
     async fn put(&self, prefix: &str, relative: &str, contents: Vec<u8>) -> Result<(), ReviewBundleStoreError> {
-        self.objects
-            .put(&ObjectPath::from(format!("{prefix}{relative}")), PutPayload::from_bytes(contents.into()))
-            .await
-            .map_err(ReviewBundleStoreError::Store)?;
+        self.objects.put(&format!("{prefix}{relative}"), contents).await?;
         Ok(())
     }
 
     pub async fn read_index(&self, location: &ReviewBundleLocation) -> Result<ReviewBundleIndex, ReviewBundleStoreError> {
-        let key = ObjectPath::from(format!("{}{REVIEW_BUNDLE_INDEX_FILE}", location.key_prefix()?));
-        let bytes =
-            self.objects.get(&key).await.map_err(ReviewBundleStoreError::Store)?.bytes().await.map_err(ReviewBundleStoreError::Store)?;
+        let key = format!("{}{REVIEW_BUNDLE_INDEX_FILE}", location.key_prefix()?);
+        let bytes = self.objects.get(&key).await?;
         serde_json::from_slice(&bytes).map_err(ReviewBundleStoreError::DecodeIndex)
     }
 }
@@ -97,32 +97,13 @@ impl fmt::Display for ClaimPublicationError {
 }
 
 impl std::error::Error for ClaimPublicationError {}
-pub fn connect_review_bundle(
-    config: &ReviewBundleStoreConfig,
-    credential: &ReviewBundleWriteCredential,
-) -> Result<ReviewBundleStore, ReviewBundleStoreError> {
-    let mut builder = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(&config.endpoint)
-        .with_bucket_name(&config.bucket)
-        .with_region(&config.region)
-        .with_access_key_id(&credential.access_key_id)
-        .with_secret_access_key(&credential.secret_access_key)
-        .with_allow_http(config.allow_http)
-        .with_virtual_hosted_style_request(config.virtual_hosted_style);
-    if let Some(token) = &credential.session_token {
-        builder = builder.with_token(token);
-    }
-    let store = builder.build().map_err(|error| ReviewBundleStoreError::Configuration(error.to_string()))?;
-    Ok(ReviewBundleStore::new(Arc::new(store), &config.public_base_url))
-}
-
 #[derive(Debug)]
 pub enum ReviewBundleStoreError {
     Configuration(String),
     InvalidLocation(String),
     InvalidArtifact(String),
     ReadArtifact { path: String, source: std::io::Error },
-    Store(object_store::Error),
+    Store(Box<dyn std::error::Error + Send + Sync>),
     DecodeIndex(serde_json::Error),
 }
 

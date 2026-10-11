@@ -1,3 +1,6 @@
+use flotilla_store_http::HttpBackend;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::config::ConfigStore;
@@ -9,7 +12,7 @@ use flotilla_resources::{
     single_agent_workflow_spec, Convoy, CrewSource, InputMeta, Project, ProjectSpec, ResourceObject, ResourceProvenance, WorkflowTemplate,
     WorkflowTemplateSpec, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
-use flotilla_store::{HttpBackend, InMemoryBackend, ResourceBackend, SqliteBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_test_support::TestSocketDir;
 use tokio::{io::AsyncReadExt, net::UnixListener, task::JoinSet};
 
@@ -109,9 +112,9 @@ async fn governor_relay_contract(storage: TestBackend) {
         let config = Arc::new(ConfigStore::with_base(config_path));
         let backend = match storage {
             TestBackend::Sqlite => {
-                ResourceBackend::Sqlite(SqliteBackend::open(temp.path().join(format!("{host}.sqlite"))).expect("open store"))
+                ResourceBackend::new(SqliteBackend::open(temp.path().join(format!("{host}.sqlite"))).expect("open store"))
             }
-            TestBackend::InMemory => ResourceBackend::InMemory(InMemoryBackend::default()),
+            TestBackend::InMemory => ResourceBackend::new(InMemoryBackend::default()),
         };
         let daemon = InProcessDaemon::new_with_resource_backend(vec![], config, fake_discovery(false), HostName::new(host), backend).await;
         let path = sockets.socket_path(&format!("{host}.sock"));
@@ -342,7 +345,7 @@ async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
 #[tokio::test]
 async fn http_digest_drill_down_reads_only_the_requested_partition() {
     use flotilla_resources::{digest_bucket, DigestQuery};
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let local = backend.using::<WorkflowTemplate>("flotilla");
     local.create(&InputMeta::builder().name("retained".into()).build(), &single_agent_workflow_spec()).await.expect("create");
     let sockets = TestSocketDir::new();
@@ -355,7 +358,7 @@ async fn http_digest_drill_down_reads_only_the_requested_partition() {
             serve_resource_http(stream, first, backend.clone()).await.expect("serve digest");
         }
     });
-    let remote = ResourceBackend::Http(HttpBackend::from_unix_socket(&path).expect("HTTP client")).using::<WorkflowTemplate>("flotilla");
+    let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&path).expect("HTTP client")).using::<WorkflowTemplate>("flotilla");
     let root = remote.digest(&DigestQuery::Root).await.expect("remote root");
     assert!(root.items.is_none() && root.children.is_none(), "roots transfer no bodies or child hashes");
     let children = remote.digest(&DigestQuery::Children { expected_root: root.root.clone() }).await.expect("remote children");

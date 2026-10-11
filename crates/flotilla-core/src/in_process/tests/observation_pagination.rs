@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use flotilla_protocol::HostName;
 use flotilla_resources::{Repository, RepositorySpec};
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
@@ -80,7 +81,7 @@ impl CommandRunner for BusyObservationRunner {
 async fn source_pagination_fairness_survives_provider_rediscovery() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), r#"machine_id = "fair-pagination-test""#).expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository = RepositorySpec::remote("https://github.com/team/one").expect("repository");
     backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.expect("repository");
     let runner = Arc::new(BusyObservationRunner::default());

@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use flotilla_protocol::{
     PeerConnectionState, StreamKey,
 };
 use flotilla_resources::{Host as ResourceHost, HostSpec, HostStatus, AGENT_ADAPTERS_CAPABILITY};
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use tokio::sync::broadcast;
 
 use super::support::test_meta;
@@ -59,7 +60,7 @@ fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
         if available {
             providers = providers.with_terminal_pool(Arc::new(FakeTerminalPool::new()));
         }
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             roots.clone(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -133,7 +134,7 @@ fn resource_host_descriptions_survive_transport_changes(tc: hegel::TestCase) {
     runtime.block_on(async {
         let temp = tempfile::tempdir().expect("config directory");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-description-observer\"\n").expect("daemon config");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let make_daemon = || {
             InProcessDaemon::new_with_resource_backend(
                 Vec::new(),
@@ -166,7 +167,7 @@ fn resource_host_descriptions_survive_transport_changes(tc: hegel::TestCase) {
             .expect("publish local description");
         let local = daemon.get_host_status_internal(&local_environment).await.expect("local resource description");
         assert_eq!(local.summary, Some(local_summary));
-        let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("remote-root"));
+        let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("remote-root"));
         let hosts = remote.using::<ResourceHost>("flotilla");
         hosts.create(&test_meta("remote-host"), &HostSpec::default()).await.expect("host");
         let writer = backend.replica_writer::<ResourceHost>(NodeId::new("remote-root"), "flotilla");
@@ -318,7 +319,7 @@ async fn event_publication_preserves_context_free_command_order() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let mut first = daemon.subscribe();
@@ -351,7 +352,7 @@ async fn event_publication_preserves_spawned_watch_order() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let mut events = daemon.subscribe();

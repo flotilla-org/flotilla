@@ -1,8 +1,10 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
 async fn reconcile_now_wakes_convoy_controller_resource() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(&empty_meta("teardown"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
@@ -36,7 +38,7 @@ async fn connected_peer_with_replicable_resources_and_zero_cursors_is_degraded()
     .await;
     feta.publish_peer_connection_status(&kiwi, PeerConnectionState::Connected).await;
 
-    let kiwi_store = ResourceBackend::InMemory(Default::default());
+    let kiwi_store = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let kiwi_hosts = kiwi_store.using::<Host>(NAMESPACE);
     kiwi_hosts
         .create(
@@ -100,7 +102,7 @@ async fn home_bound_authorship_collision_is_advisory_and_clears_after_removal() 
         .create(&empty_meta("command-builder"), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
         .await
         .expect("create local authored convoy");
-    let remote_backend = ResourceBackend::InMemory(Default::default()).with_local_root(remote_root.clone());
+    let remote_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(remote_root.clone());
     let remote_convoys = remote_backend.using::<Convoy>(NAMESPACE);
     remote_convoys
         .create(&empty_meta("command-builder"), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
@@ -491,7 +493,7 @@ fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
 // also checks that catching up clears the diagnosis at that same instant.
 #[tokio::test]
 async fn projection_parity_creation_age_boundaries() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let created = backend
         .using::<Convoy>(NAMESPACE)
         .create(&empty_meta("recent"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
@@ -525,7 +527,7 @@ async fn projection_parity_creation_age_boundaries() {
 
 #[tokio::test]
 async fn projection_parity_reports_and_clears_missing_local_convoys() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.using::<Convoy>(NAMESPACE);
     let meta = InputMeta::builder().name("convoy-a".to_string()).finalizers(vec!["flotilla.work/test-finalizer".to_string()]).build();
     let created =
@@ -605,7 +607,7 @@ async fn resource_controller_restart_budget_exhaustion_recovers() {
     let (recovered, recovery) = tokio::sync::oneshot::channel();
     let signal = Arc::new(StdMutex::new(Some(recovered)));
     let task = spawn_resource_controller::<Checkout, _, _>(
-        ResourceBackend::InMemory(Default::default()),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
         NAMESPACE.to_string(),
         ControllerSupervision {
             max_consecutive_failures: 1,

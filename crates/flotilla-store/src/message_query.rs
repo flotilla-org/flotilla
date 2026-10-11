@@ -1,4 +1,5 @@
 // Indexed inbox reads: history is excluded before decoding resource bodies.
+use crate::StoreExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ impl MessageQuery {
     pub fn active() -> Self {
         Self::Active { receiver: None }
     }
-    pub(crate) fn sql_index(&self, replicas: bool) -> &'static str {
+    pub fn sql_index(&self, replicas: bool) -> &'static str {
         match (replicas, self) {
             (false, Self::Active { receiver: None }) => "resource_objects_message_inbox",
             (true, Self::Active { receiver: None }) => "replica_objects_message_inbox",
@@ -34,7 +35,7 @@ impl MessageQuery {
         }
     }
 
-    pub(crate) fn sql(&self) -> (&'static str, Option<String>) {
+    pub fn sql(&self) -> (&'static str, Option<String>) {
         match self {
             Self::Active { receiver: None } => ("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered')", None),
             Self::Active { receiver: Some(receiver) } => ("COALESCE(json_extract(body_json, '$.status.phase'), 'accepted') NOT IN ('satisfied','answered','outcome_met','expired','superseded','dead_lettered') AND json_extract(body_json, '$.spec.receiver') = ?5", Some(receiver.clone())),
@@ -48,7 +49,7 @@ impl MessageQuery {
 type MessageIndexKeys = (Option<String>, Option<String>, Option<String>);
 
 #[derive(Debug, Default)]
-pub(crate) struct MessageIndex {
+pub struct MessageIndex {
     active: BTreeSet<String>,
     audit: BTreeMap<chrono::DateTime<chrono::Utc>, BTreeSet<String>>,
     audit_keys: HashMap<String, chrono::DateTime<chrono::Utc>>,
@@ -59,7 +60,7 @@ pub(crate) struct MessageIndex {
 }
 
 impl MessageIndex {
-    pub(crate) fn update(&mut self, name: &str, value: Option<&Value>) {
+    pub fn update(&mut self, name: &str, value: Option<&Value>) {
         self.active.remove(name);
         if let Some(at) = self.audit_keys.remove(name) {
             if let Some(names) = self.audit.get_mut(&at) {
@@ -109,7 +110,7 @@ impl MessageIndex {
         }
         self.keys.insert(name.into(), (receiver, reply, batch));
     }
-    pub(crate) fn names(&self, query: &MessageQuery) -> Vec<String> {
+    pub fn names(&self, query: &MessageQuery) -> Vec<String> {
         let names = match query {
             MessageQuery::Active { receiver: None } => Some(&self.active),
             MessageQuery::Active { receiver: Some(receiver) } => self.receivers.get(receiver),
@@ -125,22 +126,17 @@ impl MessageIndex {
 
 impl TypedResolver<Message> {
     pub async fn query(&self, query: &MessageQuery) -> Result<Vec<ResourceObject<Message>>, ResourceError> {
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.query_messages(&self.namespace, query, false).await,
-            ResourceBackend::Sqlite(backend) => backend.query_messages(&self.namespace, query, false).await,
-            ResourceBackend::Http(backend) => backend.query_messages(&self.namespace, query, false).await,
-        }
-        .map(|items| items.into_iter().map(|item| item.object).collect())
+        { self.backend.store().query_messages_typed(&self.namespace, query, false).await }
+            .map(|items| items.into_iter().map(|item| item.object).collect())
     }
 }
 
 impl ResourceBackend {
     pub async fn query_messages(&self, namespace: &str, query: &MessageQuery) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
-        let items = match self {
-            Self::InMemory(backend) => backend.query_messages(namespace, query, true).await?,
-            Self::Sqlite(backend) => backend.query_messages(namespace, query, true).await?,
-            Self::Http(backend) => return backend.query_messages(namespace, query, true).await,
-        };
+        let items = self.store().query_messages_typed(namespace, query, true).await?;
+        if self.serves_read_views() {
+            return Ok(items);
+        }
         let local_root = self.local_root()?;
         let mut visible = Vec::new();
         for item in items {

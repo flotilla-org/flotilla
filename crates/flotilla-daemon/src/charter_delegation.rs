@@ -498,7 +498,7 @@ mod tests {
     use std::sync::Mutex;
 
     use flotilla_resources::{ProjectRepositorySpec, RepositoryKey};
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
@@ -520,7 +520,7 @@ mod tests {
         MemoryReader { files, revision: "commit-b".into(), reads: Mutex::default() }
     }
     fn backend() -> ResourceBackend {
-        ResourceBackend::InMemory(InMemoryBackend::default())
+        ResourceBackend::new(InMemoryBackend::default())
     }
 
     // #2777 review: the fetch budget is independent of the document budget,

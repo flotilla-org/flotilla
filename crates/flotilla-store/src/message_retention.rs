@@ -120,10 +120,10 @@ impl MessageInbox {
 
 #[cfg(test)]
 mod tests {
+    use crate::{MessagePhase, MessageRelation, ResourceBackend};
     use chrono::TimeZone;
 
     use super::*;
-    use crate::{MessagePhase, MessageRelation, ResourceBackend, SqliteBackend};
 
     fn before() -> DateTime<Utc> {
         Utc.timestamp_opt(100, 0).unwrap()
@@ -160,7 +160,9 @@ mod tests {
     // the conflicted record without changing its intent or terminal evidence.
     #[tokio::test]
     async fn compaction_continues_after_deleted_and_conflicted_candidates() {
-        for backend in [ResourceBackend::InMemory(Default::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())] {
+        for backend in
+            [ResourceBackend::new(crate::test_store::memory_backend()), ResourceBackend::new(crate::test_store::sqlite_backend().unwrap())]
+        {
             history(&backend, &["a-deleted", "b-conflicted", "c-retained"]).await;
             let inbox = MessageInbox::new(backend.clone(), "messages").with_audit_retention_days(1);
             let messages = backend.using::<Message>("messages");
@@ -181,7 +183,9 @@ mod tests {
     // no-ops with eligible terminal records present; payloads remain unchanged.
     #[tokio::test]
     async fn retention_disabled_or_unrepresentable_is_a_noop() {
-        for backend in [ResourceBackend::InMemory(Default::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())] {
+        for backend in
+            [ResourceBackend::new(crate::test_store::memory_backend()), ResourceBackend::new(crate::test_store::sqlite_backend().unwrap())]
+        {
             history(&backend, &["history"]).await;
             for days in [0, u64::MAX, i64::MAX as u64, 1_000_000_000] {
                 assert_eq!(
@@ -204,7 +208,7 @@ mod tests {
         use futures::StreamExt;
 
         use crate::WatchStart;
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let names: Vec<_> = (0..201).map(|index| format!("history-{index:03}")).collect();
         let refs: Vec<_> = names.iter().map(String::as_str).collect();
         history(&backend, &refs).await;
@@ -244,10 +248,12 @@ mod tests {
         use flotilla_protocol::ResourceRef;
 
         use crate::{ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState};
-        for backend in [ResourceBackend::InMemory(Default::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())] {
+        for backend in
+            [ResourceBackend::new(crate::test_store::memory_backend()), ResourceBackend::new(crate::test_store::sqlite_backend().unwrap())]
+        {
             for replica in [false, true] {
                 history(&backend, &["followup"]).await;
-                let source = if replica { ResourceBackend::InMemory(Default::default()) } else { backend.clone() };
+                let source = if replica { ResourceBackend::new(crate::test_store::memory_backend()) } else { backend.clone() };
                 let convoys = source.using::<Convoy>("workflow");
                 let convoy = convoys
                     .create(

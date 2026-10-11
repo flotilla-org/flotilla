@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use flotilla_resources::{
     Host as ResourceHost, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, RepositoryTrust,
     Selector, VesselRequirement, WorkflowTemplateSpec,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
 use crate::agent_adapter::CapabilityTable;
@@ -24,7 +25,7 @@ use crate::testkits::discovery::fake_discovery;
 async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -60,7 +61,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
 
 #[tokio::test]
 async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_isolation() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let own = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("own repository");
     let fork = RepositorySpec::remote("https://github.com/example/flotilla")
         .expect("fork repository")
@@ -180,7 +181,7 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
         EmptyExplicit,
     }
     for mode in [Mode::Unlisted, Mode::UnlistedNoCap, Mode::Explicit, Mode::Mixed, Mode::EmptyExplicit] {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<CredentialSpec>("flotilla")
             .create(
@@ -256,7 +257,7 @@ async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_mod
 
 #[tokio::test]
 async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -321,7 +322,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
 
 #[tokio::test]
 async fn docker_placement_selects_credentials_for_the_effective_contained_stance() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -366,7 +367,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
 
 #[tokio::test]
 async fn project_grant_entitlement_is_independent_of_vessel_stance() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -410,9 +411,9 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
 
 #[tokio::test]
 async fn remote_placement_uses_replicated_host_capabilities() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
     let now = Utc::now();
-    let feta = ResourceBackend::InMemory(InMemoryBackend::default());
+    let feta = ResourceBackend::new(InMemoryBackend::default());
     let feta_hosts = feta.using::<ResourceHost>("flotilla");
     let fresh = feta_hosts
         .create(
@@ -492,7 +493,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
 
 #[tokio::test]
 async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")
@@ -564,7 +565,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
 
 #[tokio::test]
 async fn ambient_only_adapter_is_refused_when_the_host_login_expired() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
@@ -597,7 +598,7 @@ async fn ambient_only_adapter_is_refused_when_the_host_login_expired() {
 
 #[tokio::test]
 async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_and_host_named() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
         .clone()
         .definitions::<CredentialSpec>("flotilla")

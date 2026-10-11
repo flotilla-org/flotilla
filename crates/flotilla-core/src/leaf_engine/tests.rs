@@ -1,4 +1,5 @@
 use crate::providers::change_request::observation;
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -25,7 +26,7 @@ use flotilla_resources::{
     RepositoryKey, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_store::{controller::ControllerLoop, ConvoyReconciler, InMemoryBackend, SqliteBackend};
+use flotilla_store::{controller::ControllerLoop, ConvoyReconciler};
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
@@ -236,7 +237,7 @@ fn supervision_wake_with_limit(backend: &ResourceBackend, limit: u32) -> Reconci
 }
 
 async fn project_supervision_case(governors: &[(&str, u64, ConvoyPhase)]) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let wake = supervision_wake(&backend);
     let delivery = Arc::new(RecordingTurnDelivery::default());
     wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
@@ -702,7 +703,7 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
 async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
     use flotilla_protocol::Relationship;
     use flotilla_resources::{Observation, ObservedChangeRequestState, SubjectDiscoverySource};
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let wake = supervision_wake(&backend);
     let table = &wake.subscriptions;
     let actuator = Arc::new(RecordingTurnDelivery::default());
@@ -890,7 +891,7 @@ async fn active_checks_scenario(outcomes: &[bool], watch_events: bool, role: &st
     use flotilla_protocol::Relationship;
     use flotilla_resources::{Observation, ObservedChecks, SubjectDiscoverySource};
 
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let wake = supervision_wake(&backend);
     let table = &wake.subscriptions;
     let actuator = Arc::new(RecordingTurnDelivery::default());
@@ -1165,7 +1166,7 @@ async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates
     mergeability: flotilla_resources::ObservedMergeability,
     brief: &str,
 ) {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),

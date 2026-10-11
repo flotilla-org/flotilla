@@ -12,7 +12,7 @@ import sys
 C_FREE_BASE = frozenset({
     "flotilla-protocol", "flotilla-transport", "flotilla-paths",
     "flotilla-daemon-api", "flotilla-relay-protocol",
-    "flotilla-resources", "flotilla-client",
+    "flotilla-resources", "flotilla-client", "flotilla-store", "flotilla-store-memory",
 })
 # Shrink this explicit exemption list with the ADR 0060 step 3 store split.
 # Manifest uses TLS; TUI and the executable still reach store through core.

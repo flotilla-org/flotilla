@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, RepositorySpec, Vessel,
     VesselSpec,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use tokio::sync::Mutex;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
@@ -112,7 +113,7 @@ async fn distinct_cooldowns_block_all_observation_reads() {
     use crate::providers::forge::github::GithubRateLimitKind;
     use crate::providers::forge::github::GithubRetrySource;
     let source =
-        ProviderChangeRequestObservationSource::new(ResourceBackend::InMemory(InMemoryBackend::default()), Arc::new(NoCooldownForgeReads));
+        ProviderChangeRequestObservationSource::new(ResourceBackend::new(InMemoryBackend::default()), Arc::new(NoCooldownForgeReads));
     let now = Utc::now();
     let timed = |seconds| ObservationError::RateLimited {
         budget: format!("reset-{seconds}"),

@@ -165,7 +165,7 @@ fn event_name(event: &ObjectEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Convoy, ConvoySpec, InMemoryBackend, InputMeta};
+    use crate::{Convoy, ConvoySpec, InputMeta};
 
     fn timestamp(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).expect("valid timestamp")
@@ -173,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_occurrences_deduplicate_and_expired_events_are_pruned() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let convoy = backend
             .using::<Convoy>("flotilla")
             .create(

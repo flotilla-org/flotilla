@@ -6,6 +6,7 @@
 
 #![cfg(unix)]
 
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -22,7 +23,7 @@ use flotilla_resources::{
     controller_patches, Convoy, ConvoyPhase, ConvoySpec, InputMeta, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
     WorkflowSnapshot, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
-use flotilla_store::{apply_status_patch, InMemoryBackend, ResourceBackend};
+use flotilla_store::{apply_status_patch, ResourceBackend};
 use flotilla_tui::{app::App, theme::Theme};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -71,7 +72,7 @@ async fn tui_shows_convoys_from_daemon() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -148,7 +149,7 @@ async fn generated_table_action_completes_work() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),

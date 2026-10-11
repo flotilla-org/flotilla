@@ -72,7 +72,7 @@ fn test_vessel_reconciler(backend: ResourceBackend, namespace: &str) -> VesselRe
 
 #[tokio::test]
 async fn landed_convoy_does_not_recreate_a_missing_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-landed", "implement", REPO_URL, GIT_REF).await;
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let mut status = convoy.status.expect("convoy status");
@@ -108,7 +108,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
 
 #[tokio::test]
 async fn repeated_checkout_removal_backs_off_and_reports_the_conflict() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-churn", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-churn", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-churn").await;
@@ -167,7 +167,7 @@ impl ConvoyTeardownRuntime for AlwaysEligible {
 
 #[tokio::test]
 async fn secondary_watches_map_checkout_events_by_convoy_only() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_workspace(&backend, NAMESPACE, "workspace-watch", "convoy-watch", "implement", "policy-a", REPO_URL).await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let spec = CheckoutSpec::Observed(ObservedCheckoutSpec {
@@ -206,7 +206,7 @@ async fn secondary_watches_map_checkout_events_by_convoy_only() {
 
 #[tokio::test]
 async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
@@ -296,7 +296,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
 
 #[tokio::test]
 async fn host_direct_placement_is_not_refused_by_template_stance() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-contained", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-host", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -312,7 +312,7 @@ async fn host_direct_placement_is_not_refused_by_template_stance() {
 
 #[tokio::test]
 async fn ready_vessel_records_requested_and_effective_stance() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stance", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-stance", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -363,7 +363,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
 
 #[tokio::test]
 async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.clone().expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(VesselRequirement {
@@ -464,7 +464,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
 
 #[tokio::test]
 async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retrying() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stuck", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-stuck", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -522,7 +522,7 @@ async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retryi
 
 #[tokio::test]
 async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-one", "implement", REPO_URL, GIT_REF).await;
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-two", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-shared-branch", HOST_REF, "cleat").await;
@@ -558,7 +558,7 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
 
 #[tokio::test]
 async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_workspace_root() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_specs = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
         RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository"),
@@ -795,7 +795,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
 
 #[tokio::test]
 async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repositories = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
         RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository"),
@@ -1109,7 +1109,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
 
 #[tokio::test]
 async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repositories = [
         RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository"),
         RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository"),
@@ -1267,7 +1267,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
 
 #[tokio::test]
 async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
     let cleat = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository");
     for repository in [&flotilla, &cleat] {
@@ -1447,7 +1447,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
 
 #[tokio::test]
 async fn contained_requirement_runs_in_contained_docker_placement() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-docker-stance", "implement", REPO_URL, GIT_REF).await;
     let status = convoy.status.expect("convoy should have status");
 
@@ -1548,7 +1548,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
 
 #[tokio::test]
 async fn contained_docker_placement_propagates_never_pull_policy_to_environment() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-local-image", "implement", REPO_URL, GIT_REF).await;
     create_policy(
         &backend,
@@ -1616,7 +1616,7 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
 
 #[tokio::test]
 async fn missing_placement_policy_marks_workspace_failed() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", REPO_URL, GIT_REF).await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-missing", REPO_URL).await;
 
@@ -1633,7 +1633,7 @@ async fn missing_placement_policy_marks_workspace_failed() {
 
 #[tokio::test]
 async fn reuses_existing_clone_by_deterministic_name() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-b", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-a", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -1664,7 +1664,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
 #[tokio::test]
 // Contained worktrees receive tracking defaults while the shared config and hooks stay read-only.
 async fn docker_worktree_waits_for_checkout_before_creating_environment() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-c", "implement", REPO_URL, GIT_REF).await;
     create_docker_worktree_policy(
         &backend,
@@ -1864,7 +1864,7 @@ fn assert_contained_tracking(env: &BTreeMap<String, String>) {
 
 #[tokio::test]
 async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metadata() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted-docker", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     create_docker_worktree_policy(
@@ -1910,7 +1910,7 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
 
 #[tokio::test]
 async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failure() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-missing-clone", "implement", REPO_URL, GIT_REF).await;
     create_docker_worktree_policy(
         &backend,
@@ -2084,7 +2084,7 @@ async fn terminal_sessions_use_strategy_specific_cwd(
 
 #[tokio::test]
 async fn child_failure_propagates_to_workspace_failure() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-f", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-f", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -2143,7 +2143,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     #[case] work_phase: WorkPhase,
     #[case] crew_phase: CrewWorkPhase,
 ) {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-recover", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew[0].source = CrewSource::Agent {
@@ -2267,7 +2267,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
 
 #[tokio::test]
 async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     create_host_direct_policy(&backend, NAMESPACE, "policy-adopted", HOST_REF, "cleat").await;
@@ -2321,7 +2321,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
 
 #[tokio::test]
 async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents_remain_latent() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-crew", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     let mut status = convoy.status.expect("convoy status");
@@ -2463,7 +2463,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
 
 #[tokio::test]
 async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-artifact", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     let mut status = convoy.status.expect("convoy status");
@@ -2552,7 +2552,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
     )
     .expect("override file");
 
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-repo-override", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     let mut status = convoy.status.expect("convoy status");
@@ -2608,7 +2608,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
 
 #[tokio::test]
 async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let repository_key = repository_spec.key();
     ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec).await.expect("repository create");
@@ -2714,7 +2714,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
 
 #[tokio::test]
 async fn observed_checkout_at_managed_name_marks_workspace_failed() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-observed", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-observed", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -2743,7 +2743,7 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
 
 #[tokio::test]
 async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-finalize", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
     create_labeled_environment(&backend, NAMESPACE, "env-workspace-finalize", "workspace-finalize").await;
@@ -2766,7 +2766,7 @@ async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
 
 #[tokio::test]
 async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_pending() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
@@ -2838,7 +2838,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
 
 #[tokio::test]
 async fn run_finalizer_preserves_adopted_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-adopted", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
     create_labeled_adopted_checkout(&backend, NAMESPACE, "checkout-workspace-adopted", "workspace-adopted").await;
@@ -2858,7 +2858,7 @@ async fn run_finalizer_preserves_adopted_checkout() {
 
 #[tokio::test]
 async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-partial", "convoy-a", "implement", "policy-a", REPO_URL).await;
 
     create_labeled_environment(&backend, NAMESPACE, "env-workspace-partial", "workspace-partial").await;
@@ -2874,7 +2874,7 @@ async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
 
 #[tokio::test]
 async fn terminal_session_actuation_includes_system_and_user_labels() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_labeled_processes(&backend, NAMESPACE, "convoy-labels", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-labels", HOST_REF, "cleat").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -2950,7 +2950,7 @@ async fn assert_terminal_cwd_for_strategy(
     expected_cwd: &str,
     docker_env: Option<DockerEnvironmentSpec>,
 ) {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-cwd", "implement", REPO_URL, GIT_REF).await;
     create_policy(&backend, NAMESPACE, "policy-cwd", policy_spec).await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -3352,14 +3352,14 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
 async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edits(#[case] sqlite: bool) {
     use flotilla_protocol::NodeId;
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, PlacementPolicy, VesselStatusPatch};
-    use flotilla_store::SqliteBackend;
+    use flotilla_store_sqlite::SqliteBackend;
 
     let mut hosts = Vec::new();
     for name in ["kiwi", "feta", "udder"] {
         let backend = if sqlite {
-            ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))
+            ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))
         } else {
-            ResourceBackend::InMemory(Default::default())
+            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
         }
         .with_local_root(NodeId::new(name));
         create_convoy_with_single_task(&backend, NAMESPACE, "convoy", "implement", REPO_URL, GIT_REF).await;
@@ -3438,7 +3438,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, EnvironmentPhase, VesselStatusPatch};
     use flotilla_store::apply_status_patch;
 
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let baselines = backend.definitions::<CrewImageBaseline>(NAMESPACE);
     baselines.apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string(), layers: None }).await.expect("baseline");
     let mut convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy", "implement", REPO_URL, GIT_REF).await;

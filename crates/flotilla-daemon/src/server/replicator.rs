@@ -1,3 +1,5 @@
+use flotilla_store::StoreExt;
+use flotilla_store_http::HttpBackend;
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
@@ -9,7 +11,7 @@ use flotilla_resources::{
     DigestQuery, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceProvenance, WatchEvent, WatchStart,
 };
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
-use flotilla_store::{HttpBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -537,7 +539,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
+    let remote = ResourceBackend::new(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     let mut repaired = false;
@@ -1475,7 +1477,7 @@ mod relay_tests;
 #[cfg(test)]
 mod digest_tests {
     use flotilla_resources::{Convoy, ConvoySpec, InputMeta};
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
 
@@ -1485,8 +1487,8 @@ mod digest_tests {
     async fn concurrent_authority_write_defers_all_bucket_repairs() {
         let peer = NodeId::new("authority");
         let authority =
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(peer.clone()).using::<Convoy>(REPLICATION_NAMESPACE);
-        let holder = ResourceBackend::InMemory(InMemoryBackend::default());
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(peer.clone()).using::<Convoy>(REPLICATION_NAMESPACE);
+        let holder = ResourceBackend::new(InMemoryBackend::default());
         let writer = holder.replica_writer::<Convoy>(peer.clone(), REPLICATION_NAMESPACE);
         let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
         for name in ["gone", "retained"] {

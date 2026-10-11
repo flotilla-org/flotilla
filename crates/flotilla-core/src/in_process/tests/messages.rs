@@ -1,10 +1,11 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_protocol::{CommandAction, HostName, NodeId};
 use flotilla_resources::{Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ResourceError};
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
@@ -18,14 +19,14 @@ use crate::testkits::discovery::fake_discovery;
 #[tokio::test]
 async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
     use crate::testkits::replay::testing::capture_logs;
-    let memory = ResourceBackend::InMemory(InMemoryBackend::default());
+    let memory = ResourceBackend::new(InMemoryBackend::default());
     memory
         .using::<ResourceConvoy>("attribution")
         .create(&test_meta("supervisor"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).role("governor".to_string()).build())
         .await
         .expect("convoy");
     // Real HTTP collaborator with an invalid URL fails before any network request.
-    let invalid = ResourceBackend::Http(flotilla_store::HttpBackend::new(flotilla_tls::client(), "://invalid"));
+    let invalid = ResourceBackend::new(flotilla_store_http::HttpBackend::new(flotilla_tls::client(), "://invalid"));
     for (backend, name, expected, failure) in
         [(&memory, "supervisor", "governor", false), (&memory, "missing", "missing", true), (&invalid, "unavailable", "unavailable", true)]
     {
@@ -52,7 +53,7 @@ async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
 // Formatting glue: these rows exhaust empty/nonempty role and absent/present project.
 #[tokio::test]
 async fn convoy_sender_addresses_preserve_legacy_and_missing_convoy_identity() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     for (name, role, project, expected) in [
         ("legacy", "", None, "legacy"),
@@ -124,7 +125,7 @@ async fn resource_message_mutations_use_durable_inbox_admission() {
     use flotilla_resources::{Message, MessagePhase};
     let temp = tempfile::tempdir().expect("config directory");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -155,7 +156,7 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
     use crate::command_target::TargetHost;
     let temp = tempfile::tempdir().expect("config directory");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -164,7 +165,7 @@ async fn new_message_mutations_route_to_the_absent_receivers_home() {
         backend.clone(),
     )
     .await;
-    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("receiver"));
+    let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("receiver"));
     let remote_convoys = remote.using::<ResourceConvoy>("flotilla");
     remote_convoys
         .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
@@ -194,7 +195,7 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
     use flotilla_resources::{Message, MessageStatusPatch, ResolvedMessageReceiver};
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-review-test\"\n").unwrap();
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -237,7 +238,7 @@ async fn message_admission_qualifies_and_exposes_canonical_suppression() {
 async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-review-test\"\n").unwrap();
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -270,7 +271,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         daemon.message_creation_origin("flotilla", &document("flotilla/governor")).await.expect("declared absent holder must wait"),
         Some(daemon.node_id().clone())
     );
-    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("remote-holder-home"));
+    let remote = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("remote-holder-home"));
     remote
         .using::<flotilla_resources::ConvoyEnsure>("flotilla")
         .create(

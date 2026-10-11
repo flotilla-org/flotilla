@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use flotilla_resources::{
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, TurnDeliveryRung, VesselRequirement, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{resume_staging_fixture, test_meta, RecordingWorkCredentials};
 use crate::config::ConfigStore;
@@ -146,7 +147,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
     for phase in [ResourceTerminalSessionPhase::Running, ResourceTerminalSessionPhase::Starting, ResourceTerminalSessionPhase::Stopped] {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"turn-credential-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),

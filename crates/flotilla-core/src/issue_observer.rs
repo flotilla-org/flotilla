@@ -440,7 +440,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use flotilla_resources::{Observation, ObservedIssueState};
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
 
@@ -467,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_hint_does_not_fetch_and_stale_demand_takes_over() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let records = backend.using::<Issue>("flotilla");
         let subject = subject();
         let spec = IssueSpec::builder()
@@ -522,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_foreign_authority_is_not_refreshed() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let records = backend.using::<Issue>("flotilla");
         let subject = subject();
         let name = subject.record_name();

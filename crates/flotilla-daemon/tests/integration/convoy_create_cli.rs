@@ -1,6 +1,8 @@
 //! Integration tests for the `ConvoyCreate` + `WorkflowTemplateApply` daemon actions
 //! and the bundled WorkflowTemplates registered at startup.
 
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::config::ConfigStore;
@@ -12,7 +14,7 @@ use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostN
 use flotilla_resources::{
     single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InputMeta, PlacementPolicy, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend, SqliteBackend};
+use flotilla_store::ResourceBackend;
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
     backend
@@ -35,7 +37,7 @@ fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
 }
 
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
-    start_daemon_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await
+    start_daemon_with_backend(ResourceBackend::new(InMemoryBackend::default())).await
 }
 
 async fn start_daemon_with_backend(
@@ -67,7 +69,7 @@ async fn start_sqlite_daemon(
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().as_path().join("resources.sqlite")).expect("sqlite open"));
+    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().as_path().join("resources.sqlite")).expect("sqlite open"));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -139,7 +141,7 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
 
 #[tokio::test]
 async fn stale_builtin_is_reconciled_before_dispatch() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
     let mut stale = single_agent_workflow_spec();
     stale.vessels[0].crew[0].role = "obsolete".to_string();

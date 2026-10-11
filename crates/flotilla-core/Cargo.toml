@@ -12,6 +12,8 @@ skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
@@ -50,6 +52,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }

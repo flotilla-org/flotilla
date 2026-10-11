@@ -212,12 +212,13 @@ pub(super) async fn run_manifest_resolution(
 
 #[cfg(test)]
 mod tests {
+    use flotilla_store_memory::InMemoryBackend;
 
     #[tokio::test]
     async fn drifted_batch_selection_decodes_typed_status_and_deduplicates_replicas() {
         use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, InputMeta};
-        use flotilla_store::{InMemoryBackend, ResourceBackend};
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        use flotilla_store::ResourceBackend;
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut ensure = backend
             .using::<ConvoyEnsure>("flotilla")
             .create(

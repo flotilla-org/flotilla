@@ -174,13 +174,13 @@ pub(crate) async fn local_checkouts(
 #[cfg(test)]
 mod tests {
     use flotilla_resources::{InputMeta, ObservedCheckoutSpec, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositorySpec};
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use hegel::generators as gs;
 
     use super::*;
 
     fn backend() -> ResourceBackend {
-        ResourceBackend::InMemory(InMemoryBackend::default())
+        ResourceBackend::new(InMemoryBackend::default())
     }
 
     async fn repository(backend: &ResourceBackend, name: &str, slug: &str) -> RepositoryKey {

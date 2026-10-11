@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }

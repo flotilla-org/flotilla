@@ -1,4 +1,7 @@
 use flotilla_core::provider_config;
+use flotilla_store_http::HttpBackend;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -35,9 +38,7 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart,
     WorkflowTemplate,
 };
-use flotilla_store::{
-    controller::ControllerLoop, list_resource_kind, ConvoyReconciler, HttpBackend, InMemoryBackend, ResourceBackend, SqliteBackend,
-};
+use flotilla_store::{controller::ControllerLoop, list_resource_kind, ConvoyReconciler, ResourceBackend};
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
@@ -225,7 +226,7 @@ async fn daemon_discovery_path_is_independent_of_its_config_and_socket_paths() {
 
 #[tokio::test]
 async fn resource_http_lists_and_watches_over_a_unix_socket() {
-    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = ResourceBackend::new(InMemoryBackend::default());
     let source_convoys = source.using::<Convoy>("flotilla");
     source_convoys
         .create(
@@ -263,7 +264,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
         }
     });
 
-    let remote = ResourceBackend::Http(HttpBackend::from_unix_socket(&socket_path).expect("build Unix-socket resource client"));
+    let remote = ResourceBackend::new(HttpBackend::from_unix_socket(&socket_path).expect("build Unix-socket resource client"));
     let overlay = remote.including_replicas::<Convoy>("flotilla").list().await.expect("list overlay over Unix-socket HTTP");
     assert!(overlay.items.iter().any(|item| {
         item.object.metadata.name == "replica-row"
@@ -308,7 +309,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
 async fn http_replication_resnapshots_after_quarantined_history() {
     let temp = tempfile::tempdir().expect("tempdir");
     let origin_path = temp.path().join("origin.sqlite");
-    let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("open origin store"));
+    let origin = ResourceBackend::new(SqliteBackend::open(&origin_path).expect("open origin store"));
     let origin_convoys = origin.using::<Convoy>("flotilla");
     let first = origin_convoys
         .create(
@@ -352,9 +353,9 @@ async fn http_replication_resnapshots_after_quarantined_history() {
         )
         .expect("remove a now-required field from the historical event");
     drop(connection);
-    let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("reopen origin after schema upgrade"));
+    let origin = ResourceBackend::new(SqliteBackend::open(&origin_path).expect("reopen origin after schema upgrade"));
 
-    let holder_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
     let origin_root = NodeId::new("origin-root");
     holder_backend
         .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
@@ -416,7 +417,7 @@ async fn http_replication_resnapshots_after_quarantined_history() {
 
 #[tokio::test]
 async fn http_replicator_relists_after_an_origin_generation_change() {
-    let old_origin = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let old_origin = ResourceBackend::new(InMemoryBackend::observed());
     old_origin
         .using::<Convoy>("flotilla")
         .create(
@@ -427,7 +428,7 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
         .expect("create old-generation convoy");
     let old_list = old_origin.using::<Convoy>("flotilla").list().await.expect("list old generation");
 
-    let holder_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
     let origin_root = NodeId::new("remote-root");
     holder_backend
         .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
@@ -444,7 +445,7 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     )
     .await;
 
-    let new_origin = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let new_origin = ResourceBackend::new(InMemoryBackend::observed());
     new_origin
         .using::<Convoy>("flotilla")
         .create(
@@ -557,7 +558,7 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
 
 #[tokio::test]
 async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
-    let origin = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let origin = ResourceBackend::new(InMemoryBackend::observed());
     origin
         .using::<Convoy>("flotilla")
         .create(
@@ -568,7 +569,7 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
         .expect("create initial convoy");
     let initial = origin.using::<Convoy>("flotilla").list().await.expect("list initial origin");
 
-    let holder_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let holder_backend = ResourceBackend::new(InMemoryBackend::default());
     let origin_root = NodeId::new("remote-root");
     holder_backend
         .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
@@ -999,7 +1000,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
         .await
         .expect("server should start");
     let backend = server.daemon().resource_backend();
-    assert!(matches!(backend, ResourceBackend::Sqlite(_)));
+    assert!(backend.durable_local());
     assert!(config.state_dir().as_path().join("resources.sqlite").exists());
 
     backend
@@ -1670,7 +1671,7 @@ async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause
     let (_tmp, daemon) = empty_daemon().await;
     let home = HostName::new("feta");
     apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
-    let replica_fixture = ResourceBackend::InMemory(InMemoryBackend::default());
+    let replica_fixture = ResourceBackend::new(InMemoryBackend::default());
     replica_fixture
         .using::<Convoy>("flotilla")
         .create(

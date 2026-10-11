@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, PlacementPolicy, PlacementPolicySpec, WorkflowTemplateSpec,
     GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{create_identity_convoy, placement_policy, test_meta};
 use crate::config::ConfigStore;
@@ -42,7 +43,7 @@ fn qualified_role_address_is_a_typed_project_role_pair() {
 
 #[tokio::test]
 async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_identity_convoy(&backend, "convoy-one", "reviewer", None).await;
     create_identity_convoy(&backend, "convoy-two", "reviewer", Some("beta")).await;
 
@@ -56,7 +57,7 @@ async fn convoy_role_resolution_can_disambiguate_a_projectless_convoy() {
 
 #[tokio::test]
 async fn convoy_resolution_falls_back_to_a_unique_terminal_generation() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys.get("convoy-one").await.expect("terminal convoy");
@@ -74,7 +75,7 @@ async fn convoy_resolution_falls_back_to_a_unique_terminal_generation() {
 
 #[tokio::test]
 async fn convoy_resolution_refuses_multiple_terminal_generations() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_identity_convoy(&backend, "convoy-one", "reviewer", Some("flotilla")).await;
     create_identity_convoy(&backend, "convoy-two", "reviewer", Some("flotilla")).await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -99,7 +100,7 @@ async fn convoy_resolution_refuses_multiple_terminal_generations() {
 
 #[tokio::test]
 async fn convoy_resolution_prefers_an_exact_unlabelled_record_name() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let created = convoys
         .create(
@@ -122,7 +123,7 @@ async fn convoy_resolution_prefers_an_exact_unlabelled_record_name() {
 
 #[tokio::test]
 async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_named_standalone() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let record = convoy_record_name();
     let generation = allocate_convoy_generation(&backend, "flotilla", None, "worker").await.expect("projectless identity");
@@ -141,7 +142,7 @@ async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_name
 async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"canonical-admission-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -229,7 +230,7 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
 async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"fulfilment-join\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -303,7 +304,7 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
 async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_replica() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -314,7 +315,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
     .await;
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
 
-    let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let stale_source = ResourceBackend::new(InMemoryBackend::default());
     stale_source
         .using::<ResourceHost>("flotilla")
         .create(
@@ -393,7 +394,7 @@ async fn resource_host_routing_refuses_unresolved_host_ref() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local-host"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
 
@@ -409,7 +410,7 @@ async fn resource_host_routing_refuses_unresolved_host_ref() {
 async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

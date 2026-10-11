@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
@@ -12,7 +13,7 @@ use flotilla_resources::{
     TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WatchEvent, WatchStart, WorkflowTemplate,
     CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{delete_resource_kind, InMemoryBackend, ResourceBackend, TypedResolver};
+use flotilla_store::{delete_resource_kind, ResourceBackend, TypedResolver};
 use futures::StreamExt;
 use tokio::time::timeout;
 
@@ -256,7 +257,7 @@ fn resource_ref(kind: &str, name: &str) -> ResourceRef {
 }
 
 pub fn in_memory_backend() -> ResourceBackend {
-    ResourceBackend::InMemory(InMemoryBackend::default())
+    ResourceBackend::new(InMemoryBackend::default())
 }
 
 pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
@@ -264,7 +265,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     local.create(&convoy_meta("local"), &convoy_spec("local-template")).await.expect("create local convoy");
 
     let origin = flotilla_protocol::NodeId::new("feta-root");
-    let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote_backend = ResourceBackend::new(InMemoryBackend::default());
     let remote = remote_backend.using::<Convoy>("flotilla");
     remote.create(&convoy_meta("remote"), &convoy_spec("remote-template")).await.expect("create remote convoy");
     remote.create(&convoy_meta("untouched"), &convoy_spec("untouched-template")).await.expect("create untouched remote convoy");
@@ -365,7 +366,7 @@ pub async fn assert_get_all_provenances_contract(backend: ResourceBackend) {
     assert!(read.get_all("missing").await.expect("missing name").items.is_empty());
 
     for (origin, template) in [("peer-a", "first"), ("peer-b", "second")] {
-        let source = ResourceBackend::InMemory(InMemoryBackend::default());
+        let source = ResourceBackend::new(InMemoryBackend::default());
         source.using::<Convoy>(namespace).create(&convoy_meta("shared"), &convoy_spec(template)).await.expect("create source");
         source.using::<Convoy>(namespace).create(&convoy_meta("unrelated"), &convoy_spec(template)).await.expect("create unrelated");
         backend
@@ -398,7 +399,7 @@ pub async fn assert_get_all_provenances_contract(backend: ResourceBackend) {
 
 pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(backend: ResourceBackend) {
     let origin = flotilla_protocol::NodeId::new("feta-root");
-    let source_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source_backend = ResourceBackend::new(InMemoryBackend::default());
     let source = source_backend.using::<Convoy>("flotilla");
     let meta = convoy_meta("remote");
     let first = source.create(&meta, &convoy_spec("first")).await.expect("create source convoy");
@@ -438,7 +439,7 @@ pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(
 pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(backend: ResourceBackend) {
     let origin = flotilla_protocol::NodeId::new("authority-root");
     let backend = backend.with_local_root(origin.clone());
-    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = ResourceBackend::new(InMemoryBackend::default());
     source
         .using::<Convoy>("flotilla")
         .create(&convoy_meta("lost-at-authority"), &convoy_spec("template"))
@@ -489,7 +490,7 @@ pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(bac
 pub async fn assert_local_authority_shadows_self_origin_replica_with_backend(backend: ResourceBackend) {
     let local_root = flotilla_protocol::NodeId::new("local-root");
     let backend = backend.with_local_root(local_root.clone());
-    let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let stale_source = ResourceBackend::new(InMemoryBackend::default());
     let stale_hosts = stale_source.using::<Host>("flotilla");
     stale_hosts
         .create(&InputMeta::builder().name("local-host".to_string()).build(), &HostSpec::default())
@@ -568,7 +569,7 @@ fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {
 pub async fn assert_project_definition_edit_converges_with_backend(backend: ResourceBackend) {
     let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
     let feta_root = flotilla_protocol::NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
     let feta = backend.with_local_root(feta_root.clone());
     let meta = InputMeta::builder().name("widgets".to_string()).build();
 
@@ -625,7 +626,7 @@ pub async fn assert_project_definition_metadata_edit_converges_with_backend(back
 pub async fn assert_project_definition_causal_merge_with_backend(backend: ResourceBackend) {
     let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
     let feta_root = flotilla_protocol::NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
     let feta = backend.with_local_root(feta_root.clone());
     let meta = InputMeta::builder().name("widgets".to_string()).build();
 
@@ -692,7 +693,7 @@ pub async fn assert_project_definition_causal_merge_with_backend(backend: Resour
 pub async fn assert_project_definition_optional_field_can_be_cleared_with_backend(backend: ResourceBackend) {
     let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
     let feta_root = flotilla_protocol::NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
     let feta = backend.with_local_root(feta_root.clone());
     let meta = InputMeta::builder().name("widgets".to_string()).build();
     let mut original = project_spec("Widgets", "default");
@@ -725,7 +726,7 @@ pub async fn assert_project_definition_optional_field_can_be_cleared_with_backen
 pub async fn assert_project_definition_edit_preserves_unrelated_conflict_with_backend(backend: ResourceBackend) {
     let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
     let feta_root = flotilla_protocol::NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
     let feta = backend.with_local_root(feta_root.clone());
     let meta = InputMeta::builder().name("widgets".to_string()).build();
 
@@ -767,7 +768,7 @@ pub async fn assert_project_definition_edit_preserves_unrelated_conflict_with_ba
 pub async fn assert_project_definition_delete_conflicts_with_concurrent_edit_with_backend(backend: ResourceBackend) {
     let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
     let feta_root = flotilla_protocol::NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
     let feta = backend.with_local_root(feta_root.clone());
     let meta = InputMeta::builder().name("widgets".to_string()).build();
 
@@ -1249,7 +1250,7 @@ pub async fn assert_slow_replica_watch_is_bounded(backend: ResourceBackend) {
 // #2636: complete snapshots remove absent keys, preserve unchanged provenance,
 // and fence delayed relay writes. Empty/repeated snapshots are safe as well.
 pub async fn assert_replica_snapshot_reconciliation(backend: ResourceBackend) {
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).using::<Convoy>("flotilla");
+    let authority = ResourceBackend::new(InMemoryBackend::default()).using::<Convoy>("flotilla");
     authority.create(&convoy_meta("gone"), &convoy_spec("template")).await.expect("create");
     authority.create(&convoy_meta("retained"), &convoy_spec("template")).await.expect("create");
     let initial = authority.list().await.expect("initial snapshot");

@@ -1,0 +1,771 @@
+//! Untyped storage seam. Kind descriptors retain resource validation at the
+//! authoritative write boundary, including while a backend holds its transaction.
+use crate::replica::StoredReplicaEventKind;
+use chrono::Utc;
+use flotilla_protocol::NodeId;
+use flotilla_resources::{
+    api_version, ApiPaths, DigestQuery, FieldOwnershipViolation, InputMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
+    MergeMetadata, Message, PartitionDigest, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
+    Resource, ResourceError, ResourceList, ResourceObject, ResourcePosition, ResourceProvenance, ResourceStoreDiagnostics,
+    ResourceTombstone, StatusPatch, WatchEvent, WatchStart, WatchStream,
+};
+use futures::StreamExt;
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
+use std::{collections::BTreeMap, sync::Arc};
+
+#[derive(Debug, Clone)]
+pub struct SerializedResource;
+pub enum SerializedStatusPatch {}
+impl StatusPatch<Value> for SerializedStatusPatch {
+    fn apply(&self, _: &mut Value) {
+        match *self {}
+    }
+}
+impl Resource for SerializedResource {
+    type Spec = Value;
+    type Status = Value;
+    type StatusPatch = SerializedStatusPatch;
+    const API_PATHS: ApiPaths = ApiPaths { group: "", version: "", plural: "", kind: "" };
+}
+
+pub fn transcode<A: Serialize, B: DeserializeOwned>(value: A) -> Result<B, ResourceError> {
+    let value = serde_json::to_value(value).map_err(|e| ResourceError::decode(e.to_string()))?;
+    serde_json::from_value(value).map_err(|e| ResourceError::decode(e.to_string()))
+}
+
+type ValidateSiblings = fn(&InputMeta, &Value, &[ResourceObject<SerializedResource>]) -> Result<(), ResourceError>;
+
+#[derive(Clone, Copy)]
+pub struct ResourceKind {
+    pub paths: ApiPaths,
+    pub replication: ReplicationClass,
+    pub validate_namespace: bool,
+    decode: fn(Value) -> Result<ResourceObject<SerializedResource>, ResourceError>,
+    validate_spec_fn: fn(&InputMeta, &Value) -> Result<(), ResourceError>,
+    validate_spec_update_fn: fn(&Value, &Value) -> Result<(), ResourceError>,
+    validate_status_update_fn: fn(Option<&Value>, &Value) -> Result<(), ResourceError>,
+    validate_siblings_fn: ValidateSiblings,
+    digest_fn: fn(NodeId, &str, Option<String>, String, Vec<String>) -> PartitionDigest,
+}
+impl std::fmt::Debug for ResourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceKind").field("paths", &self.paths).finish()
+    }
+}
+impl ResourceKind {
+    pub fn of<T: Resource>() -> Self {
+        Self {
+            paths: T::API_PATHS,
+            replication: T::REPLICATION_CLASS,
+            validate_namespace: T::VALIDATE_NAMESPACE_SPEC,
+            decode: |value| {
+                // Validate the registered type before exposing a stored row as
+                // serialized data. Keep the raw body so defaults/unknown fields
+                // are not rewritten by this read. Live watches decode only once
+                // in the typed extension; SQLite uses this pass for quarantine.
+                let object: K8sResourceObject<T> =
+                    serde::Deserialize::deserialize(&value).map_err(|e| ResourceError::decode(format!("decode stored object: {e}")))?;
+                ResourceObject::from_k8s_object(object)?;
+                let object: K8sResourceObject<SerializedResource> =
+                    serde_json::from_value(value).map_err(|e| ResourceError::decode(e.to_string()))?;
+                Ok(ResourceObject { metadata: object.metadata.into(), spec: object.spec, status: object.status })
+            },
+            validate_spec_fn: |meta, spec| T::validate_spec(meta, &transcode(spec)?),
+            validate_spec_update_fn: |current, requested| T::validate_spec_update(&transcode(current)?, &transcode(requested)?),
+            validate_status_update_fn: |current, requested| {
+                T::validate_status_update(current.map(transcode).transpose()?.as_ref(), &transcode(requested)?)
+            },
+            validate_siblings_fn: |meta, spec, siblings| {
+                T::validate_spec_with_named_siblings(
+                    meta,
+                    &transcode(spec)?,
+                    &siblings.iter().map(transcode).collect::<Result<Vec<_>, _>>()?,
+                )
+            },
+            digest_fn: PartitionDigest::new::<T>,
+        }
+    }
+    pub fn decode_object(self, value: Value) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        (self.decode)(value)
+    }
+    pub fn from_k8s(self, object: K8sResourceObject<SerializedResource>) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        self.decode_object(serde_json::to_value(object).map_err(|e| ResourceError::decode(e.to_string()))?)
+    }
+    pub fn encode_object(self, object: &ResourceObject<SerializedResource>) -> Result<Value, ResourceError> {
+        serde_json::to_value(K8sResourceObject::<SerializedResource> {
+            api_version: api_version(self.paths),
+            kind: self.paths.kind.into(),
+            metadata: K8sObjectMeta::from(&object.metadata),
+            spec: object.spec.clone(),
+            status: object.status.clone(),
+        })
+        .map_err(|e| ResourceError::decode(e.to_string()))
+    }
+    pub fn decode_watch_object<'de>(
+        self,
+        value: impl serde::Deserializer<'de, Error = serde_json::Error>,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        let value = serde::Deserialize::deserialize(value).map_err(|e| ResourceError::decode(e.to_string()))?;
+        self.decode_object(value)
+    }
+    pub fn validate_spec(self, meta: &InputMeta, spec: &Value) -> Result<(), ResourceError> {
+        (self.validate_spec_fn)(meta, spec)
+    }
+    pub fn validate_spec_update(self, current: &Value, requested: &Value) -> Result<(), ResourceError> {
+        (self.validate_spec_update_fn)(current, requested)
+    }
+    pub fn validate_status_update(self, current: Option<&Value>, requested: &Value) -> Result<(), ResourceError> {
+        (self.validate_status_update_fn)(current, requested)
+    }
+    pub fn validate_spec_with_named_siblings(
+        self,
+        meta: &InputMeta,
+        spec: &Value,
+        siblings: &[ResourceObject<SerializedResource>],
+    ) -> Result<(), ResourceError> {
+        (self.validate_siblings_fn)(meta, spec, siblings)
+    }
+    pub fn partition_digest(
+        self,
+        origin: NodeId,
+        namespace: &str,
+        generation: Option<String>,
+        version: String,
+        hashes: Vec<String>,
+    ) -> PartitionDigest {
+        (self.digest_fn)(origin, namespace, generation, version, hashes)
+    }
+    pub fn resource_list(self, list: K8sResourceList<SerializedResource>) -> Result<ResourceList<SerializedResource>, ResourceError> {
+        Ok(ResourceList {
+            items: list.items.into_iter().map(|o| self.from_k8s(o)).collect::<Result<_, _>>()?,
+            resource_version: list.metadata.resource_version,
+            generation: list.metadata.generation,
+        })
+    }
+}
+
+pub trait ReadObserver: std::fmt::Debug + Send + Sync {
+    fn read(&self, kind: &str, count: usize);
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+pub fn convert_read<A: Resource, B: Resource>(item: ReadResourceObject<A>) -> Result<ReadResourceObject<B>, ResourceError> {
+    Ok(ReadResourceObject { object: transcode(item.object)?, provenance: item.provenance })
+}
+pub fn convert_read_list<A: Resource, B: Resource>(list: ReadResourceList<A>) -> Result<ReadResourceList<B>, ResourceError> {
+    Ok(ReadResourceList { items: list.items.into_iter().map(convert_read).collect::<Result<_, _>>()? })
+}
+pub fn convert_watch<A: Resource, B: Resource>(event: WatchEvent<A>) -> Result<WatchEvent<B>, ResourceError> {
+    Ok(match event {
+        WatchEvent::Added(o) => WatchEvent::Added(transcode(o)?),
+        WatchEvent::Modified(o) => WatchEvent::Modified(transcode(o)?),
+        WatchEvent::Deleted(o) => WatchEvent::Deleted(transcode(o)?),
+        WatchEvent::DeletedByName(t) => WatchEvent::DeletedByName(t),
+    })
+}
+pub fn convert_read_watch<A: Resource, B: Resource>(event: ReadWatchEvent<A>) -> Result<ReadWatchEvent<B>, ResourceError> {
+    Ok(match event {
+        ReadWatchEvent::Added(o) => ReadWatchEvent::Added(convert_read(o)?),
+        ReadWatchEvent::Modified(o) => ReadWatchEvent::Modified(convert_read(o)?),
+        ReadWatchEvent::Deleted(o) => ReadWatchEvent::Deleted(convert_read(o)?),
+        ReadWatchEvent::DeletedByName { tombstone, provenance } => ReadWatchEvent::DeletedByName { tombstone, provenance },
+    })
+}
+
+#[async_trait::async_trait]
+/// Object-safe storage boundary. Requests carry serialized values and a kind
+/// descriptor; adapters apply its validators under their authoritative lock or
+/// transaction. Typed callers use [`StoreExt`] or [`crate::ResourceBackend`].
+/// Observer and local-root builders return isolated handles sharing the data.
+pub trait Store: std::fmt::Debug + Send + Sync {
+    /// Adapter-specific wording may preserve an existing public refusal contract.
+    fn unsupported_operation(&self, operation: &str) -> ResourceError {
+        ResourceError::invalid(format!("this store does not support {operation}"))
+    }
+    fn with_local_root(&self, root: NodeId) -> Arc<dyn Store>;
+    fn local_root(&self) -> Result<NodeId, ResourceError>;
+    /// Remote views already merge definitions and provenance at their origin.
+    fn serves_read_views(&self) -> bool {
+        false
+    }
+    /// Preserve adapters whose serializers previously ran on a storage worker.
+    fn blocking_request_encoding(&self) -> bool {
+        false
+    }
+    fn durable_local(&self) -> bool {
+        false
+    }
+    fn hierarchy_admission(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        None
+    }
+    fn with_read_observer(&self, observer: Arc<dyn ReadObserver>) -> Arc<dyn Store>;
+    fn read_observer(&self) -> Option<&dyn ReadObserver>;
+    async fn diagnostics(&self) -> Result<Option<ResourceStoreDiagnostics>, ResourceError>;
+    async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError>;
+    async fn query_messages_raw(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError>;
+    async fn query_message_replicas_raw(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+        Ok(self
+            .query_messages_raw(namespace, query, true)
+            .await?
+            .into_iter()
+            .filter(|item| matches!(item.provenance, ResourceProvenance::Replica { .. }))
+            .collect())
+    }
+
+    async fn delete_decode_quarantine_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<bool, ResourceError> {
+        Ok(false)
+    }
+    async fn local_namespaces_raw(&self, _resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
+        Err(self.unsupported_operation("enumerating local resource namespaces"))
+    }
+    async fn stored_namespaces_raw(&self, _resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
+        Err(self.unsupported_operation("enumerating stored resource namespaces"))
+    }
+    async fn list_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn get_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn watch_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<crate::SerializedReadWatchEvent, ResourceError>>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn replace_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _listed: &ResourceList<SerializedResource>,
+        _synced_at: chrono::DateTime<Utc>,
+        _bucket: Option<u8>,
+    ) -> Result<(), ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn apply_replica_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _kind: StoredReplicaEventKind,
+        _object: &ResourceObject<SerializedResource>,
+        _synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn apply_replica_tombstone_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _tombstone: &ResourceTombstone,
+        _synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn invalidate_replica_cursor_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+    ) -> Result<(), ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn advance_replica_cursor_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _previous: &ReplicaCursor,
+        _next: &str,
+    ) -> Result<(), ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn replica_cursor_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+    ) -> Result<Option<ReplicaCursor>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn get_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
+    async fn current_position_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourcePosition, ResourceError>;
+    async fn digest_raw(&self, resource_kind: ResourceKind, namespace: &str, query: &DigestQuery)
+        -> Result<PartitionDigest, ResourceError>;
+    async fn confirm_replica_digest_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin: &NodeId,
+        _namespace: &str,
+        _proof: &PartitionDigest,
+        _previous: &ReplicaCursor,
+    ) -> Result<(), ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn replica_digest_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _origin: &NodeId,
+        _namespace: &str,
+        _generation: Option<String>,
+    ) -> Result<PartitionDigest, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError>;
+    async fn list_raw_matching_labels(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<ResourceList<SerializedResource>, ResourceError>;
+    async fn create_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &Value,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
+    async fn create_definition_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _meta: &InputMeta,
+        _spec: &Value,
+        _merge: MergeMetadata,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("authoring definitions"))
+    }
+    async fn update_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &Value,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
+    async fn update_definition_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _meta: &InputMeta,
+        _resource_version: &str,
+        _spec: &Value,
+        _merge: MergeMetadata,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("authoring definitions"))
+    }
+    async fn update_status_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        resource_version: &str,
+        status: &Value,
+    ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
+    async fn delete_raw(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<(), ResourceError>;
+    async fn tombstone_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        minimum_resource_version: Option<&str>,
+    ) -> Result<crate::watch::TombstoneWrite, ResourceError>;
+    async fn watch_raw(
+        &self,
+        resource_kind: ResourceKind,
+        namespace: &str,
+        start: WatchStart,
+    ) -> Result<crate::SerializedWatchStream, ResourceError>;
+    async fn list_including_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn list_including_replicas_raw_matching_labels(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _required: &BTreeMap<String, String>,
+    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn get_including_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<ReadResourceObject<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn get_all_including_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn list_replica_sources_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn list_read_view_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _query_key: &str,
+    ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn watch_including_replicas_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn watch_replica_sources_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+    async fn watch_read_view_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _query_key: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
+        Err(self.unsupported_operation("replicas"))
+    }
+}
+
+/// Typed convenience layer over the untyped store. Backend implementations do
+/// not need to enumerate resource types; the descriptor supplies validation.
+#[async_trait::async_trait]
+pub trait StoreExt: Store {
+    async fn query_messages_typed(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        self.query_messages_raw(namespace, query, include_replicas).await?.into_iter().map(convert_read).collect()
+    }
+    async fn query_message_replicas(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+    ) -> Result<Vec<ReadResourceObject<Message>>, ResourceError> {
+        self.query_message_replicas_raw(namespace, query).await?.into_iter().map(convert_read).collect()
+    }
+    async fn delete_decode_quarantine_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+        Ok(self.delete_decode_quarantine_raw(ResourceKind::of::<T>(), namespace, name).await?)
+    }
+    async fn local_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        Ok(self.local_namespaces_raw(ResourceKind::of::<T>()).await?)
+    }
+    async fn stored_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        Ok(self.stored_namespaces_raw(ResourceKind::of::<T>()).await?)
+    }
+    async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        self.list_replicas_raw(ResourceKind::of::<T>(), namespace).await?.into_iter().map(convert_read).collect()
+    }
+    async fn get_replicas_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        self.get_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?.into_iter().map(convert_read).collect()
+    }
+    async fn watch_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        Ok(self
+            .watch_replicas_raw(ResourceKind::of::<T>(), namespace)
+            .await?
+            .map(|e| e.and_then(crate::SerializedReadWatchEvent::decode))
+            .boxed())
+    }
+    async fn replace_replicas_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        listed: &ResourceList<T>,
+        synced_at: chrono::DateTime<Utc>,
+        bucket: Option<u8>,
+    ) -> Result<(), ResourceError> {
+        let listed = ResourceList::<T> {
+            items: listed.items.iter().map(clone_object).collect(),
+            resource_version: listed.resource_version.clone(),
+            generation: listed.generation.clone(),
+        };
+        let listed = transcode_request(self.blocking_request_encoding(), listed).await?;
+        Ok(self.replace_replicas_raw(ResourceKind::of::<T>(), origin_root, namespace, &listed, synced_at, bucket).await?)
+    }
+    async fn apply_replica_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        kind: StoredReplicaEventKind,
+        object: &ResourceObject<T>,
+        synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let object = transcode_request(self.blocking_request_encoding(), clone_object(object)).await?;
+        Ok(self.apply_replica_raw(ResourceKind::of::<T>(), origin_root, namespace, kind, &object, synced_at).await?)
+    }
+    async fn apply_replica_tombstone_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        tombstone: &ResourceTombstone,
+        synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        Ok(self.apply_replica_tombstone_raw(ResourceKind::of::<T>(), origin_root, namespace, tombstone, synced_at).await?)
+    }
+    async fn invalidate_replica_cursor_typed<T: Resource>(&self, origin_root: &NodeId, namespace: &str) -> Result<(), ResourceError> {
+        Ok(self.invalidate_replica_cursor_raw(ResourceKind::of::<T>(), origin_root, namespace).await?)
+    }
+    async fn advance_replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        previous: &ReplicaCursor,
+        next: &str,
+    ) -> Result<(), ResourceError> {
+        Ok(self.advance_replica_cursor_raw(ResourceKind::of::<T>(), origin_root, namespace, previous, next).await?)
+    }
+    async fn replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+    ) -> Result<Option<ReplicaCursor>, ResourceError> {
+        Ok(self.replica_cursor_raw(ResourceKind::of::<T>(), origin_root, namespace).await?)
+    }
+    async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
+        transcode(self.get_raw(ResourceKind::of::<T>(), namespace, name).await?)
+    }
+    async fn current_position_typed<T: Resource>(&self, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
+        Ok(self.current_position_raw(ResourceKind::of::<T>(), namespace).await?)
+    }
+    async fn digest_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        query: &crate::DigestQuery,
+    ) -> Result<crate::PartitionDigest, ResourceError> {
+        Ok(self.digest_raw(ResourceKind::of::<T>(), namespace, query).await?)
+    }
+    async fn confirm_replica_digest_typed<T: Resource>(
+        &self,
+        origin: &NodeId,
+        namespace: &str,
+        proof: &crate::PartitionDigest,
+        previous: &ReplicaCursor,
+    ) -> Result<(), ResourceError> {
+        Ok(self.confirm_replica_digest_raw(ResourceKind::of::<T>(), origin, namespace, proof, previous).await?)
+    }
+    async fn replica_digest_typed<T: Resource>(
+        &self,
+        origin: &NodeId,
+        namespace: &str,
+        generation: Option<String>,
+    ) -> Result<crate::PartitionDigest, ResourceError> {
+        Ok(self.replica_digest_raw(ResourceKind::of::<T>(), origin, namespace, generation).await?)
+    }
+    async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
+        transcode(self.list_raw(ResourceKind::of::<T>(), namespace).await?)
+    }
+    async fn list_typed_matching_labels<T: Resource>(
+        &self,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<ResourceList<T>, ResourceError> {
+        transcode(self.list_raw_matching_labels(ResourceKind::of::<T>(), namespace, required).await?)
+    }
+    async fn create_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &T::Spec,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        transcode(self.create_raw(ResourceKind::of::<T>(), namespace, meta, &spec).await?)
+    }
+    async fn create_definition_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        spec: &T::Spec,
+        merge: MergeMetadata,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        transcode(self.create_definition_raw(ResourceKind::of::<T>(), namespace, meta, &spec, merge).await?)
+    }
+    async fn update_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &T::Spec,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        transcode(self.update_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec).await?)
+    }
+    async fn update_definition_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        meta: &InputMeta,
+        resource_version: &str,
+        spec: &T::Spec,
+        merge: MergeMetadata,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let spec = transcode_request(self.blocking_request_encoding(), spec.clone()).await?;
+        transcode(self.update_definition_raw(ResourceKind::of::<T>(), namespace, meta, resource_version, &spec, merge).await?)
+    }
+    async fn update_status_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+        resource_version: &str,
+        status: &T::Status,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        let status = transcode_request(self.blocking_request_encoding(), status.clone()).await?;
+        transcode(self.update_status_raw(ResourceKind::of::<T>(), namespace, name, resource_version, &status).await?)
+    }
+    async fn delete_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<(), ResourceError> {
+        Ok(self.delete_raw(ResourceKind::of::<T>(), namespace, name).await?)
+    }
+    async fn tombstone_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+        minimum_resource_version: Option<&str>,
+    ) -> Result<crate::watch::TombstoneWrite, ResourceError> {
+        Ok(self.tombstone_raw(ResourceKind::of::<T>(), namespace, name, minimum_resource_version).await?)
+    }
+    async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
+        let stream = self.watch_raw(ResourceKind::of::<T>(), namespace, start).await?;
+        let generation = stream.generation().map(str::to_owned);
+        Ok(WatchStream::new(generation, stream.map(|e| e.and_then(crate::SerializedWatchEvent::decode)).boxed()))
+    }
+    async fn list_including_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        convert_read_list(self.list_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?)
+    }
+    async fn list_including_replicas_typed_matching_labels<T: Resource>(
+        &self,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<ReadResourceList<T>, ResourceError> {
+        convert_read_list(self.list_including_replicas_raw_matching_labels(ResourceKind::of::<T>(), namespace, required).await?)
+    }
+    async fn get_including_replicas_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ReadResourceObject<T>, ResourceError> {
+        convert_read(self.get_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
+    }
+    async fn get_all_including_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ReadResourceList<T>, ResourceError> {
+        convert_read_list(self.get_all_including_replicas_raw(ResourceKind::of::<T>(), namespace, name).await?)
+    }
+    async fn list_replica_sources_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        convert_read_list(self.list_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?)
+    }
+    async fn list_read_view_typed<T: Resource>(&self, namespace: &str, query_key: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        convert_read_list(self.list_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?)
+    }
+    async fn watch_including_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        Ok(self.watch_including_replicas_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(convert_read_watch)).boxed())
+    }
+    async fn watch_replica_sources_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        Ok(self.watch_replica_sources_raw(ResourceKind::of::<T>(), namespace).await?.map(|e| e.and_then(convert_read_watch)).boxed())
+    }
+    async fn watch_read_view_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        query_key: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        Ok(self.watch_read_view_raw(ResourceKind::of::<T>(), namespace, query_key).await?.map(|e| e.and_then(convert_read_watch)).boxed())
+    }
+}
+#[async_trait::async_trait]
+impl<S: Store + ?Sized> StoreExt for S {}
+
+fn clone_object<T: Resource>(object: &ResourceObject<T>) -> ResourceObject<T> {
+    ResourceObject { metadata: object.metadata.clone(), spec: object.spec.clone(), status: object.status.clone() }
+}
+/// Preserve synchronous memory/HTTP encoding and SQLite worker-thread encoding.
+async fn transcode_request<A: Serialize + Send + 'static, B: DeserializeOwned + Send + 'static>(
+    blocking: bool,
+    value: A,
+) -> Result<B, ResourceError> {
+    if !blocking {
+        return transcode(value);
+    }
+    tokio::task::spawn_blocking(move || transcode(value)).await.map_err(|e| ResourceError::other(format!("encode store request: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PanickingSerializer;
+    impl Serialize for PanickingSerializer {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            panic!("serializer panic fixture");
+        }
+    }
+
+    // A serializer panic becomes a regular store error; it does not poison the
+    // blocking pool or prevent a subsequent request from being encoded.
+    #[tokio::test]
+    async fn encoding_panic_is_an_error_and_the_next_request_succeeds() {
+        let result = transcode_request::<_, Value>(true, PanickingSerializer).await;
+        assert!(
+            matches!(result, Err(ResourceError::Other { message }) if message.contains("encode store request") && message.contains("serializer panic fixture"))
+        );
+        let value = serde_json::json!({"spec":{"value":"next"}});
+        assert_eq!(transcode_request::<_, Value>(true, value.clone()).await.expect("next request"), value);
+    }
+}

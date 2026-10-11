@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use flotilla_resources::{
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL,
     VESSEL_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use futures::{FutureExt, StreamExt};
 
 use super::support::test_meta;
@@ -21,7 +22,7 @@ use crate::testkits::discovery::fake_discovery;
 
 #[tokio::test]
 async fn operator_brief_survives_a_racing_nudge_until_delivery() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions
         .create(
@@ -104,9 +105,9 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
             let temp = tempfile::tempdir().expect("contract directory");
             std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"noop-contract\"\n").expect("daemon identity");
             let backend = if sqlite {
-                ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(temp.path().join("resources.db")).expect("sqlite backend"))
+                ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(temp.path().join("resources.db")).expect("sqlite backend"))
             } else {
-                ResourceBackend::InMemory(InMemoryBackend::default())
+                ResourceBackend::new(InMemoryBackend::default())
             };
             let daemon = InProcessDaemon::new_with_resource_backend(
                 Vec::new(),
@@ -205,11 +206,7 @@ async fn assert_supervisor_turn_passes_are_idle(
     state: &str,
     passes: usize,
 ) {
-    let backend_name = match backend {
-        ResourceBackend::InMemory(_) => "in-memory",
-        ResourceBackend::Sqlite(_) => "sqlite",
-        _ => panic!("unsupported contract backend"),
-    };
+    let backend_name = if backend.durable_local() { "sqlite" } else { "in-memory" };
     let state = format!("{backend_name}: {state}");
     let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
     let convoys = backend.clone().using::<ResourceConvoy>(namespace);
@@ -240,8 +237,8 @@ async fn assert_supervisor_turn_passes_are_idle(
 
 #[tokio::test]
 async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
-    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
-    let placement = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("placement"));
+    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
+    let placement = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("placement"));
     let temp = tempfile::tempdir().expect("config dir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("machine identity");
     let daemon = InProcessDaemon::new_with_resource_backend(

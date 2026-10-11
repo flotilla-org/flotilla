@@ -50,8 +50,8 @@ use flotilla_resources::CONVOY_LABEL;
 use flotilla_store::apply_status_patch;
 use flotilla_store::controller::ControllerLoop;
 use flotilla_store::controller::Reconciler;
-use flotilla_store::InMemoryBackend;
 use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::VirtualClock;
 use tokio::{
     sync::{watch, Notify},
@@ -236,7 +236,7 @@ async fn continued_fresh_clone_recovers_protection_through_controller_loop() {
 }
 
 async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_clone(&backend, NAMESPACE, "clone-recovery", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let repo = RepositoryKey(repo_key(REPO_URL));
@@ -321,7 +321,7 @@ async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
 
 #[tokio::test]
 async fn missing_worktree_observed_on_its_host_becomes_gone() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let checkout = checkouts
         .create(
@@ -365,7 +365,7 @@ async fn missing_worktree_observed_on_its_host_becomes_gone() {
 
 #[tokio::test]
 async fn deleting_checkout_retries_finalizer_without_a_status_change() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "retry-cleanup", "/checkouts/retry").await;
     let current = checkouts.get("retry-cleanup").await.expect("checkout exists");
@@ -411,7 +411,7 @@ async fn deleting_checkout_retries_finalizer_without_a_status_change() {
 
 #[tokio::test(start_paused = true)]
 async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "backoff-cleanup", "/checkouts/backoff").await;
     let runtime = Arc::new(RecordingCheckoutRuntime { transient_removal_failures: AtomicUsize::new(7), ..Default::default() });
@@ -457,7 +457,7 @@ async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds(
 
 #[tokio::test]
 async fn finalizer_error_maps_to_failed_checkout_status() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkout = create_ready_checkout(
         &backend,
         NAMESPACE,
@@ -491,7 +491,7 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
 
 #[tokio::test]
 async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_attempt() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     let clone = clones
         .create(
@@ -552,7 +552,7 @@ async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_
 
 #[tokio::test]
 async fn structural_clone_failure_is_terminal_for_its_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     clones
         .create(
@@ -642,7 +642,7 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
 
 #[tokio::test]
 async fn failed_checkout_teardown_marks_only_that_checkout_failed_and_controller_continues() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "alpha-failing", "/checkouts/alpha").await;
     create_deleting_checkout(&backend, "beta-healthy", "/checkouts/beta").await;
@@ -685,7 +685,7 @@ async fn failed_checkout_teardown_marks_only_that_checkout_failed_and_controller
 
 #[tokio::test]
 async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
@@ -736,7 +736,7 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
 
 #[tokio::test]
 async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_removal() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     convoys
         .create(
@@ -794,7 +794,7 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
 
 #[tokio::test]
 async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbeat() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     convoys
         .create(
@@ -868,7 +868,7 @@ async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbea
 
 #[tokio::test]
 async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
         .create(
@@ -897,7 +897,7 @@ async fn worktree_finalizer_removes_checkout_when_clone_resource_is_already_gone
 
 #[tokio::test]
 async fn ready_checkout_reconciler_patches_integration_conditions() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
@@ -949,7 +949,7 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
 
 #[tokio::test]
 async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fresh_checkouts() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
@@ -1032,8 +1032,8 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
     ] {
         let authority_root = NodeId::new("convoy-authority");
         let checkout_root = NodeId::new("checkout-authority");
-        let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
-        let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(checkout_root);
+        let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(authority_root.clone());
+        let checkout_host = ResourceBackend::new(InMemoryBackend::default()).with_local_root(checkout_root);
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T21:45:00Z").expect("timestamp").with_timezone(&chrono::Utc);
         let clock = Arc::new(VirtualClock::new(now));
 
@@ -1118,8 +1118,8 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
 #[tokio::test]
 async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_landed() {
     let authority_root = NodeId::new("convoy-authority");
-    let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
+    let checkout_host = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
+    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(authority_root.clone());
     let convoys = authority.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(
@@ -1177,7 +1177,7 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
 
 #[tokio::test]
 async fn annotated_checkout_finds_its_local_deleting_convoy() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     convoys
         .create(
@@ -1220,8 +1220,8 @@ async fn annotated_checkout_finds_its_local_deleting_convoy() {
 #[tokio::test]
 async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_reference() {
     let authority_root = NodeId::new("convoy-authority");
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
-    let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
+    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(authority_root.clone());
+    let checkout_host = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
     let convoys = authority.clone().using::<Convoy>(NAMESPACE);
     convoys
         .create(
@@ -1312,7 +1312,7 @@ async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_referen
 
 #[tokio::test]
 async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_retrying() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let now = chrono::DateTime::parse_from_rfc3339("2026-08-03T21:45:00Z").expect("timestamp").with_timezone(&chrono::Utc);
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let convoy = convoys
@@ -1388,7 +1388,7 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
 // branch, including while that other checkout is still pending materialisation.
 #[tokio::test]
 async fn convoy_checkout_refuses_branch_held_by_checkout() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let checkouts = backend.using::<Checkout>(NAMESPACE);
     let spec = CheckoutSpec::Worktree(
         CheckoutWorktreeSpec::builder()
@@ -1476,7 +1476,7 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
         (0..steps).map(|_| phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))]).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let repo = RepositoryKey(repo_key(REPO_URL));
         let convoys = backend.using::<Convoy>(NAMESPACE);
         convoys.create(&meta("old-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).build()).await.expect("old convoy");

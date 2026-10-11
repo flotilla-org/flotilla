@@ -278,7 +278,7 @@ mod tests {
     // minutes of successful absence observations, and only once.
     #[tokio::test]
     async fn orphan_sweep_reaps_after_grace_and_is_idempotent() {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let docker = DockerBoundary::default();
         docker.backings.lock().expect("backings").extend([backing("id"), backing("id")]);
         let mut sweep = EnvironmentOrphanSweep::default();
@@ -294,8 +294,8 @@ mod tests {
     // a backing even while another host has no replicated record at all.
     #[tokio::test]
     async fn orphan_sweep_preserves_startup_and_authority_despite_replication_lag() {
-        let home = ResourceBackend::InMemory(Default::default());
-        let lagging_peer = ResourceBackend::InMemory(Default::default());
+        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let lagging_peer = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let docker = DockerBoundary::default();
         docker.backings.lock().expect("backings").push(backing("id"));
         let mut sweep = EnvironmentOrphanSweep::default();
@@ -317,7 +317,7 @@ mod tests {
     // the destructive boundary, even after the full grace period elapsed.
     #[tokio::test]
     async fn orphan_sweep_rechecks_authority_after_docker_listing() {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let docker = DockerBoundary::default();
         docker.backings.lock().expect("backings").push(backing("id"));
         let mut sweep = EnvironmentOrphanSweep::default();
@@ -335,7 +335,7 @@ mod tests {
     async fn orphan_sweep_preserves_quarantined_environment() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("resources.sqlite");
-        let backend = ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(&path).expect("store"));
+        let backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(&path).expect("store"));
         let connection = rusqlite::Connection::open(&path).expect("raw store");
         connection
             .execute(
@@ -366,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_sweep_retries_cleanup_without_reaping_replacements() {
         for replace in [false, true] {
-            let backend = ResourceBackend::InMemory(Default::default());
+            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let docker = DockerBoundary::default();
             docker.backings.lock().expect("backings").push(backing("old"));
             let mut sweep = EnvironmentOrphanSweep::default();
@@ -400,7 +400,7 @@ mod tests {
             .collect();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
-            let backend = ResourceBackend::InMemory(Default::default());
+            let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let docker = DockerBoundary::default();
             docker.backings.lock().expect("backings").push(backing("id"));
             let mut sweep = EnvironmentOrphanSweep::default();

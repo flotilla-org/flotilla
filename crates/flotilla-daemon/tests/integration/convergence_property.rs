@@ -1,5 +1,7 @@
 //! Seed-replayable convergence schedules over the real resource overlay.
 
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
 
 use chrono::{TimeZone, Utc};
@@ -9,7 +11,7 @@ use flotilla_daemon_testkit::server::{spawn_in_memory_request_mesh, spawn_in_mem
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{Host, HostSpec, HostStatus, InputMeta, ResourceError, ResourceProvenance, WatchEvent};
-use flotilla_store::{collect_resource_replica_kind, delete_resource_kind, InMemoryBackend, ResourceBackend, SqliteBackend};
+use flotilla_store::{collect_resource_replica_kind, delete_resource_kind, ResourceBackend};
 use futures::StreamExt;
 
 const NAMESPACE: &str = "flotilla";
@@ -147,9 +149,9 @@ impl Harness {
             std::fs::write(directory.join("daemon.toml"), format!("machine_id = \"{configured_root}\"\n")).expect("write daemon config");
             let config = Arc::new(ConfigStore::with_base(directory.clone()));
             let backend = match backend_kind {
-                BackendKind::InMemory => ResourceBackend::InMemory(InMemoryBackend::default()),
+                BackendKind::InMemory => ResourceBackend::new(InMemoryBackend::default()),
                 BackendKind::Sqlite => {
-                    ResourceBackend::Sqlite(SqliteBackend::open(directory.join("resources.sqlite")).expect("open sqlite store"))
+                    ResourceBackend::new(SqliteBackend::open(directory.join("resources.sqlite")).expect("open sqlite store"))
                 }
             };
             let daemon = InProcessDaemon::new_with_resource_backend(
@@ -200,7 +202,7 @@ impl Harness {
         let old_status: HostStatus = serde_json::from_value(serde_json::json!({ "ready": true })).expect("decode pre-schema host status");
         assert!(old_status.capabilities.is_empty() && old_status.disk_free_bytes.is_none());
 
-        let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
+        let stale_source = ResourceBackend::new(InMemoryBackend::default());
         let stale = stale_source.using::<Host>(NAMESPACE);
         let stale_object = stale
             .create(
@@ -495,7 +497,7 @@ impl Harness {
         }
         let mut watch = resolver.watch().await.map_err(|error| error.to_string())?;
         while tokio::time::timeout(Duration::from_millis(10), watch.next()).await.is_ok() {}
-        let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
+        let stale_source = ResourceBackend::new(InMemoryBackend::default());
         let stale = stale_source
             .using::<Host>(NAMESPACE)
             .create(

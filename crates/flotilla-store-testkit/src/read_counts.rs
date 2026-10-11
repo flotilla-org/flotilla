@@ -1,4 +1,4 @@
-use flotilla_store::{InMemoryBackend, ReadObserver};
+use flotilla_store::{ReadObserver, ResourceBackend};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -21,26 +21,58 @@ impl ReadObserver for ReadCounts {
 }
 
 pub trait ReadCountsBackendExt {
-    fn with_read_counts(self) -> Self;
+    fn with_read_counts(self) -> ResourceBackend
+    where
+        Self: Sized;
     /// Number of objects decoded by store reads.
     fn read_counts(&self) -> BTreeMap<String, usize>;
     /// Number of store read operations, including reads returning no objects.
     fn read_calls(&self) -> BTreeMap<String, usize>;
 }
-impl ReadCountsBackendExt for InMemoryBackend {
-    fn with_read_counts(self) -> Self {
+fn counts(observer: Option<&dyn ReadObserver>, calls: bool) -> BTreeMap<String, usize> {
+    observer
+        .and_then(|observer| observer.as_any().downcast_ref::<ReadCounts>())
+        .map(
+            |counts| {
+                if calls {
+                    counts.calls.lock().expect("read calls").clone()
+                } else {
+                    counts.objects.lock().expect("read counts").clone()
+                }
+            },
+        )
+        .unwrap_or_default()
+}
+impl ReadCountsBackendExt for ResourceBackend {
+    fn with_read_counts(self) -> ResourceBackend
+    where
+        Self: Sized,
+    {
         self.with_read_observer(Arc::new(ReadCounts::default()))
     }
     fn read_counts(&self) -> BTreeMap<String, usize> {
-        self.read_observer()
-            .and_then(|observer| observer.as_any().downcast_ref::<ReadCounts>())
-            .map(|counts| counts.objects.lock().expect("read counts").clone())
-            .unwrap_or_default()
+        counts(self.read_observer(), false)
     }
     fn read_calls(&self) -> BTreeMap<String, usize> {
-        self.read_observer()
-            .and_then(|observer| observer.as_any().downcast_ref::<ReadCounts>())
-            .map(|counts| counts.calls.lock().expect("read calls").clone())
-            .unwrap_or_default()
+        counts(self.read_observer(), true)
     }
 }
+
+macro_rules! observed_backend {
+    ($backend:ty) => {
+        impl ReadCountsBackendExt for $backend {
+            fn with_read_counts(self) -> ResourceBackend {
+                ResourceBackend::new(self.with_read_observer(Arc::new(ReadCounts::default())))
+            }
+            fn read_counts(&self) -> BTreeMap<String, usize> {
+                counts(self.read_observer(), false)
+            }
+            fn read_calls(&self) -> BTreeMap<String, usize> {
+                counts(self.read_observer(), true)
+            }
+        }
+    };
+}
+observed_backend!(flotilla_store_memory::InMemoryBackend);
+observed_backend!(flotilla_store_sqlite::SqliteBackend);
+observed_backend!(flotilla_store_http::HttpBackend);

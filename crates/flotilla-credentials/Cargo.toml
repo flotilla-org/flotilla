@@ -32,6 +32,7 @@ tempfile = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-credentials-testkit = { path = "../flotilla-credentials-testkit" }

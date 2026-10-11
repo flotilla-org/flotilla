@@ -1534,7 +1534,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use flotilla_resources::SystemClock;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
     use crate::ops_entry::OperationalEntryFile;
@@ -1628,8 +1628,8 @@ mod tests {
                     .with_charter_cache(cache.path().to_path_buf()),
             );
             let operations = FakeProjectOperations { inspector: inspector.clone(), identity_resolutions: AtomicUsize::new(0) };
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let observed = ResourceBackend::new(InMemoryBackend::observed());
             let clock: Arc<dyn Clock> = Arc::new(SystemClock);
             let namespace = std::sync::RwLock::new("flotilla".to_string());
             let service = ProjectService {
@@ -1649,7 +1649,7 @@ mod tests {
             let mut spec = whole_repository_project_spec(repository.key(), "app".into()).expect("project spec");
             spec.repositories[0].roles.extend([ProjectRepositoryRole::Ops, ProjectRepositoryRole::Code]);
             spec.repositories[0].charter_store = Some(CharterStoreBinding { host: "local-host".into(), source });
-            let project_author = if local { ResourceBackend::InMemory(InMemoryBackend::default()) } else { backend.clone() };
+            let project_author = if local { ResourceBackend::new(InMemoryBackend::default()) } else { backend.clone() };
             project_author
                 .using::<Project>("flotilla")
                 .create(&InputMeta::builder().name("app".into()).build(), &spec)
@@ -1774,8 +1774,8 @@ mod tests {
             }),
             identity_resolutions: AtomicUsize::new(0),
         };
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
         let service = ProjectService {
@@ -1849,8 +1849,8 @@ mod tests {
             let temp = tempfile::tempdir().expect("checkout paths");
             let root = temp.path().canonicalize().expect("physical checkout paths");
             for facts in cases {
-                let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-                let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+                let backend = ResourceBackend::new(InMemoryBackend::default());
+                let observed = ResourceBackend::new(InMemoryBackend::observed());
                 let namespace = std::sync::RwLock::new("flotilla".to_string());
                 let key = RepositorySpec::remote("https://github.com/example/ops").expect("repository").key();
                 for (index, (local, main, member)) in facts.iter().enumerate() {

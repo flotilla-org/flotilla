@@ -163,7 +163,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{registry::GC_FULL_KIND_LISTS, Host, HostSpec, InMemoryBackend, InputMeta, WatchEvent, WatchStart};
+    use crate::{registry::GC_FULL_KIND_LISTS, Host, HostSpec, InputMeta, WatchEvent, WatchStart};
 
     #[test]
     fn unchanged_owners_do_not_trigger_repeat_lookups() {
@@ -186,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_a_leaf_does_not_list_resource_kinds() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let hosts = backend.using::<Host>("gc-leaf-list-test");
         let meta = |name: &str| InputMeta::builder().name(name.to_string()).build();
         hosts.create(&meta("leaf"), &HostSpec::default()).await.expect("create leaf");

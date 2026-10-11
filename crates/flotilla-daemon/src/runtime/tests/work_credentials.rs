@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test]
 async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delivery() {
@@ -425,7 +426,7 @@ async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delive
 async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_failure() {
     let temp = TempDir::new().expect("tempdir");
     let sqlite_path = temp.path().join("resources.sqlite");
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&sqlite_path).expect("sqlite store"));
+    let backend = ResourceBackend::new(SqliteBackend::open(&sqlite_path).expect("sqlite store"));
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     environments
         .create(

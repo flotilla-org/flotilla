@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use flotilla_resources::{
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{
     create_host_direct_placement, create_identity_convoy, create_running_session, create_test_environment, placement_policy, test_meta,
@@ -29,7 +30,7 @@ use crate::testkits::discovery::fake_discovery;
 async fn default_remote_placement_resolves_replicated_credentials_before_admission() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -118,7 +119,7 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         )
         .await
         .expect("remote host capabilities");
-    let placement_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let placement_source = ResourceBackend::new(InMemoryBackend::default());
     placement_source
         .using::<PlacementPolicy>("flotilla")
         .create(
@@ -175,8 +176,8 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
 
 #[tokio::test]
 async fn placement_candidates_and_refusals_agree_across_roots() {
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
-    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("feta-root"));
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
+    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("feta-root"));
     placement_policy(&kiwi, "kiwi-policy", "kiwi").await;
     placement_policy(&feta, "feta-policy", "feta").await;
     let synced_at = Utc::now();
@@ -204,7 +205,7 @@ async fn placement_candidates_and_refusals_agree_across_roots() {
 
 #[tokio::test]
 async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host in ["local-host", "replica-host"] {
         hosts
@@ -228,7 +229,7 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
         )
         .await
         .expect("local home policy");
-    let replica_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let replica_source = ResourceBackend::new(InMemoryBackend::default());
     replica_source
         .using::<PlacementPolicy>("flotilla")
         .create(
@@ -268,7 +269,7 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
 
 #[tokio::test]
 async fn placement_target_host_rejects_unknown_display_name() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let policy = placement_policy(&backend, "unknown-host", "missing-host").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("unknown host alias must be rejected");
     assert_eq!(error, "placement `unknown-host` references unknown host `missing-host`");
@@ -276,7 +277,7 @@ async fn placement_target_host_rejects_unknown_display_name() {
 
 #[tokio::test]
 async fn placement_target_host_rejects_ambiguous_display_name() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host_id in ["host-id-a", "host-id-b"] {
         hosts
@@ -294,7 +295,7 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 
 #[tokio::test]
 async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
         .create(
@@ -386,7 +387,7 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
 
 #[tokio::test]
 async fn default_placement_prefers_local_host_referenced_by_display_name() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
@@ -421,7 +422,7 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
 
 #[tokio::test]
 async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     placement_policy(&backend, "a-unknown-host", "deleted-host").await;
     create_host_direct_placement(&backend, "z-clean", "clean-host", BTreeSet::new()).await;
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
@@ -441,7 +442,7 @@ async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow()
 
 #[tokio::test]
 async fn default_placement_error_lists_each_refusal_and_failed_host_condition_reason() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     for (policy_name, host_name, condition_reason, condition_message) in [
         ("host-direct-feta", "feta", "StoredObjectDecodeFailed", "ConvoyEnsure/quarantined-record failed typed decode"),
         ("host-direct-udder", "udder", "RestartBudgetExhausted", "resource controller stopped after repeated failures"),
@@ -488,7 +489,7 @@ RestartBudgetExhausted: resource controller stopped after repeated failures"
 
 #[tokio::test]
 async fn default_placement_accepts_a_host_with_an_authorship_collision() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     create_host_direct_placement(&backend, "host-direct-feta", "feta", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("feta").await.expect("host");
@@ -530,7 +531,7 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let local_host = daemon.local_host_id().expect("local host id").to_string();
@@ -564,7 +565,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let host = daemon.local_host_id().expect("local host id").to_string();

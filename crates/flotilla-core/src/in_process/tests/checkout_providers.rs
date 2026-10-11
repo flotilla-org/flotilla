@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
     RepositorySpec,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
@@ -67,7 +68,7 @@ async fn checkout_vcs_discovery_is_cached_per_checkout() {
 async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-watch-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repositories = backend.clone().using::<Repository>("flotilla");
     let first = RepositorySpec::remote("https://github.com/example/first").expect("first repository");
     let second = RepositorySpec::remote("https://github.com/example/second").expect("second repository");

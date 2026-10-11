@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
 
@@ -7,7 +8,7 @@ use flotilla_resources::{
     Convoy as ResourceConvoy, CrewWorkPhase, InputMeta, Project, Repository, RepositoryKey, TerminalSession as ResourceTerminalSession,
     Vessel,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::fixture;
 
@@ -72,7 +73,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
             .expect("live Repository");
         let origin_root = flotilla_protocol::NodeId::new("project-home");
         let origin = if replicated {
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(origin_root.clone())
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(origin_root.clone())
         } else {
             backend.clone()
         };
@@ -190,7 +191,7 @@ async fn crew_list_never_reads_message_history() {
         vessel_ref: Some("crew-work".into()),
         role: Some("coder".into()),
     };
-    let ResourceBackend::InMemory(memory) = &backend else { unreachable!() };
+    let memory = &backend;
     let before = memory.read_counts();
     let expected = crew.crew_list_internal(&context).await.unwrap();
     assert_eq!(expected.members[0].role, "coder");

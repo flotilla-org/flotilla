@@ -1,3 +1,4 @@
+use flotilla_store_sqlite::SqliteBackend;
 mod caller;
 mod client_connection;
 pub mod environment_sockets;
@@ -27,7 +28,7 @@ use flotilla_protocol::{
     ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
 
-use flotilla_store::{ResourceBackend, SqliteBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,
@@ -249,7 +250,7 @@ async fn build_embedded_resource_backend(config: &ConfigStore) -> Result<Resourc
     }
     SqliteBackend::open_async(&path)
         .await
-        .map(ResourceBackend::Sqlite)
+        .map(ResourceBackend::new)
         .map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
 }
 
