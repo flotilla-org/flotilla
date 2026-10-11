@@ -1,4 +1,6 @@
 use flotilla_resources::Actuation;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -10,7 +12,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
-    ConvoyReconciler, InMemoryBackend, ResourceBackend, SqliteBackend,
+    ConvoyReconciler, ResourceBackend,
 };
 use futures::StreamExt;
 use tempfile::tempdir;
@@ -97,11 +99,11 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
 
 #[tokio::test]
 async fn memory_vessel_finalizer() {
-    vessel_finalizer_contract(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+    vessel_finalizer_contract(ResourceBackend::new(InMemoryBackend::default())).await;
 }
 #[tokio::test]
 async fn sqlite_vessel_finalizer() {
-    vessel_finalizer_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))).await;
+    vessel_finalizer_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))).await;
 }
 
 struct AlwaysEligible;
@@ -121,7 +123,7 @@ impl ConvoyTeardownRuntime for AlwaysEligible {
 async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_vessel_finalizer() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("resources.sqlite");
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+    let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("sqlite backend should open"));
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
@@ -182,7 +184,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
     drop(convoys);
     drop(backend);
 
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
+    let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");

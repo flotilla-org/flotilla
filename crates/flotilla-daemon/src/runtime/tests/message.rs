@@ -190,7 +190,7 @@ async fn captured_scrollback_delivery_and_bounded_hold() {
                 },
             )
             .await;
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let inbox = flotilla_store::MessageInbox::new(backend, NAMESPACE);
         inbox
             .accept(
@@ -254,7 +254,7 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
             .build()])
         .await;
     pool.inner.set_captured_screen("agent", "unobservable screen").await;
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = backend.using::<Convoy>(NAMESPACE);
     let convoy = convoys.create(&empty_meta("subject"), &ConvoySpec::builder().workflow_ref("workflow".into()).build()).await.unwrap();
     convoys
@@ -412,7 +412,8 @@ async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_neve
     // Cross-host delivery waits until the sender authority's convoy is
     // replicated. The receiver's real inbox then submits all three records
     // through the same terminal-pool boundary exactly once.
-    let sender_backend = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("message-sender"));
+    let sender_backend =
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("message-sender"));
     sender_backend
         .using::<Convoy>(NAMESPACE)
         .create(

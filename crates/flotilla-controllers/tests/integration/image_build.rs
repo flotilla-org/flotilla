@@ -145,7 +145,7 @@ fn concurrent_demands_join_one_execution(tc: hegel::TestCase) {
     let count = tc.draw(hegel::generators::integers::<usize>().min_value(2).max_value(8));
     let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         host(&backend, "local", "amd64", None).await;
         let admission = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs));
         let composition = composition();
@@ -175,7 +175,7 @@ fn concurrent_demands_join_one_execution(tc: hegel::TestCase) {
 #[tokio::test]
 async fn failure_waits_and_retry_classification_preserves_execution_evidence() {
     for class in [ImageBuildFailureClass::Transient, ImageBuildFailureClass::Deterministic] {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         host(&backend, "local", "amd64", None).await;
         let names = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs)).join("local", &composition()).await.expect("join");
         let runner = Arc::new(Runner { calls: AtomicUsize::new(0), failure: Some(class) });
@@ -228,7 +228,7 @@ async fn failure_waits_and_retry_classification_preserves_execution_evidence() {
 // a declared same-architecture builder. A wrong architecture is structural.
 #[tokio::test]
 async fn builder_selection_is_same_architecture_and_prefers_placement_host() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     host(&backend, "local", "amd64", None).await;
     let admission = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs));
     let names = admission.join("local", &composition()).await.expect("placement builds");
@@ -268,7 +268,7 @@ async fn builder_selection_is_same_architecture_and_prefers_placement_host() {
 fn stages_freeze_realised_parent_identity_before_building(tc: hegel::TestCase) {
     let stages = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         host(&backend, "local", "amd64", None).await;
         let inputs = Arc::new(Inputs);
         let admission = ImageBuildAdmission::new(backend.clone(), "test", inputs.clone());
@@ -340,7 +340,7 @@ async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_iden
             Ok(())
         }
     }
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     host(&backend, "builder", "amd64", None).await;
     host(&backend, "small", "amd64", Some(ImageBuildCapacity::None)).await;
     let admission = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs));

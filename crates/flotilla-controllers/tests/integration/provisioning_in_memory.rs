@@ -211,7 +211,7 @@ impl TerminalRuntime for FakeTerminalRuntime {
 
 #[tokio::test]
 async fn controller_loops_drive_host_direct_workspace_to_ready() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-a", "01HXYZ", "cleat").await;
@@ -272,7 +272,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
 
 #[tokio::test]
 async fn controller_materializes_a_missing_repository_for_a_multi_repository_convoy() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host(&backend, "01HXYZ").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-multi", "01HXYZ", "cleat").await;
@@ -390,7 +390,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
 
 #[tokio::test]
 async fn clone_controller_marks_clone_ready() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     let repository_spec = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     flotilla_store::ensure_repository(
@@ -440,7 +440,7 @@ async fn clone_controller_marks_clone_ready() {
 
 #[tokio::test]
 async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
         .await
@@ -535,7 +535,7 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
 
 #[tokio::test]
 async fn environment_controller_marks_docker_environment_ready() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     environments
         .create(
@@ -591,7 +591,7 @@ async fn environment_controller_marks_docker_environment_ready() {
 
 #[tokio::test]
 async fn checkout_controller_marks_worktree_checkout_ready() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_clone(
         &backend,
         NAMESPACE,
@@ -638,7 +638,7 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
 
 #[tokio::test]
 async fn checkout_controller_requeues_when_first_completion_is_dropped() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_clone(
         &backend,
         NAMESPACE,
@@ -701,7 +701,7 @@ async fn checkout_controller_requeues_when_first_completion_is_dropped() {
 
 #[tokio::test]
 async fn terminal_session_controller_marks_session_running() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     sessions
@@ -740,7 +740,7 @@ async fn terminal_session_controller_marks_session_running() {
 
 #[tokio::test]
 async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     create_workspace(
         &backend,
         NAMESPACE,

@@ -635,6 +635,7 @@ fn parse_documents(path: &Path, content: &str) -> Result<Vec<Value>> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use flotilla_store_memory::InMemoryBackend;
     // HTTP audit (#1512): inventory/resource validation speaks the owned daemon
     // API over a local Unix socket. The socket integration tests below exercise
     // its actual server; no external-service stand-in or recorded replay applies.
@@ -784,7 +785,7 @@ mod tests {
         };
         flotilla_tls::install_default_provider();
         for legacy in [false, true] {
-            let backend = flotilla_store::ResourceBackend::InMemory(Default::default());
+            let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let record = backend
                 .using::<TerminalSession>("flotilla")
                 .create(
@@ -860,7 +861,7 @@ mod tests {
         };
         flotilla_tls::install_default_provider();
         for mode in 0..6 {
-            let backend = flotilla_store::ResourceBackend::InMemory(Default::default());
+            let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
             let project = backend
                 .using::<Project>("flotilla")
                 .create(
@@ -1199,7 +1200,7 @@ mod tests {
         )
         .expect("uncommitted edit");
         let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
-        let backend = flotilla_store::ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let project = backend
             .using::<Project>("flotilla")
             .create(
@@ -1279,7 +1280,7 @@ mod tests {
             .expect("commit fixture")
             .success());
         let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
-        let backend = flotilla_store::ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = flotilla_store::ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let project = backend
             .using::<Project>("flotilla")
             .create(
@@ -1435,7 +1436,7 @@ mod tests {
         use std::collections::BTreeSet;
 
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositoryKey};
-        use flotilla_store::{InMemoryBackend, ResourceBackend};
+        use flotilla_store::ResourceBackend;
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
@@ -1443,7 +1444,7 @@ mod tests {
         // A previous-generation daemon refuses its inventory under rules the
         // candidate fixes (#2579): on the daemon's own host the candidate's
         // inspection decides; validating a peer without local roots fails closed.
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let project = backend
             .using::<Project>("flotilla")
             .create(

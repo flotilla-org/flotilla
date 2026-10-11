@@ -1,5 +1,6 @@
 use super::*;
 use crate::providers::change_request::observation;
+use flotilla_store_memory::InMemoryBackend;
 
 // #2560: the inactivity bound follows the newest tool/hook evidence, not
 // total turn age or refreshed screen timestamps. Generated ages straddle
@@ -1093,7 +1094,7 @@ async fn stalled_work_ignores_terminal_ensure_attempt_and_uses_highest_live_gene
 
 #[tokio::test]
 async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_not() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
@@ -1188,7 +1189,7 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
 
 #[tokio::test]
 async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_and_exhausted_failures() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
@@ -1328,7 +1329,7 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
             Err(self.0.clone())
         }
     }
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let now = Utc::now();
     let retry_at = now + chrono::Duration::seconds(60);
     let error = ObservationError::RateLimited {

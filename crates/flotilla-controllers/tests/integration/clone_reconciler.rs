@@ -59,7 +59,7 @@ impl CloneRuntime for FailOnceCloneRuntime {
 
 #[tokio::test]
 async fn mismatched_clone_name_fails() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
@@ -87,7 +87,7 @@ async fn mismatched_clone_name_fails() {
 
 #[tokio::test]
 async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
@@ -119,7 +119,7 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
 
 #[tokio::test]
 async fn clone_failures_remain_retryable() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/private").expect("repository spec");
     let repository_key = repository_spec.key();
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
@@ -169,7 +169,7 @@ async fn clone_failures_remain_retryable() {
 
 #[tokio::test]
 async fn transient_clone_failure_remains_retryable_and_converges() {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     let repository_key = repository_spec.key();
     flotilla_store::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)

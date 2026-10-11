@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use flotilla_resources::{
     CrewWorkState, HoldAct, InputMeta, TerminalSession as ResourceTerminalSession, TerminalSessionPhase, TerminalSessionStatus,
     CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, InMemoryBackend, ResourceBackend};
+use flotilla_store::{apply_status_patch as apply_resource_status_patch, ResourceBackend};
 use tokio::sync::RwLock;
 
 use super::fixture;
@@ -84,7 +85,7 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
             .crew_work
             .insert("review".into(), BTreeMap::from([("reviewer".into(), CrewWorkState::builder().phase(receiver_phase).build())]));
         convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("second vessel");
-        let home = if remote { ResourceBackend::InMemory(Default::default()) } else { backend.clone() };
+        let home = if remote { ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()) } else { backend.clone() };
         let publisher: Arc<dyn ResourceIntentPublisher> =
             Arc::new(ReceiverHome { inbox: MessageInbox::new(home.clone(), "flotilla"), fail: publication_fails });
         if remote || publication_fails {
@@ -483,7 +484,7 @@ async fn remote_session_hold_retries_through_existing_mutation_router() {
     let (crew, backend, _, _dir) = fixture(CrewWorkPhase::Done).await;
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let source = sessions.get("session").await.expect("source session");
-    let receiver = ResourceBackend::InMemory(InMemoryBackend::default());
+    let receiver = ResourceBackend::new(InMemoryBackend::default());
     let remote = receiver
         .using::<ResourceTerminalSession>("flotilla")
         .create(&InputMeta::from(&source.metadata), &source.spec)

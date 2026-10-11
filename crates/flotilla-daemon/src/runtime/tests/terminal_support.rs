@@ -256,7 +256,7 @@ pub(super) async fn run_message_batch_pool_case(operator_closes: bool) {
         Arc::new(ConfigStore::with_base(sender_temp.path())),
         fake_discovery(false),
         HostName::new("message-sender"),
-        ResourceBackend::InMemory(Default::default()),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
     )
     .await;
     let topology = spawn_in_memory_request_topology_stateful(sender.clone(), daemon.clone())

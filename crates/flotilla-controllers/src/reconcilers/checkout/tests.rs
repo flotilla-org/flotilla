@@ -1,3 +1,5 @@
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::BTreeSet,
     fs,
@@ -14,7 +16,7 @@ use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_resources::{CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
-use flotilla_store::{InMemoryBackend, ResourceBackend, SqliteBackend};
+use flotilla_store::ResourceBackend;
 use tempfile::TempDir;
 
 use super::*;
@@ -267,7 +269,7 @@ async fn convoy_parent_cleanup_contract() {
 #[tokio::test]
 async fn empty_convoy_sweep_respects_namespaces_and_hosts() {
     let temp = TempDir::new().expect("test fixture operation succeeds");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let local = temp.path().join("local");
     let remote = temp.path().join("remote");
     fs::create_dir_all(local.join("convoy-live")).expect("test fixture operation succeeds");
@@ -311,7 +313,7 @@ async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
         let candidate = root.join("convoy-orphan");
         fs::create_dir_all(&candidate).expect("empty stale convoy directory");
         let database = temp.path().join("resources.sqlite");
-        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database).expect("resource store"));
+        let backend = ResourceBackend::new(SqliteBackend::open(&database).expect("resource store"));
         backend
             .using::<Environment>(NAMESPACE)
             .create(

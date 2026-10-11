@@ -1,3 +1,5 @@
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 
 use color_eyre::Result;
@@ -103,7 +105,7 @@ pub(super) fn preview(templates: &[Value], projects: &[Value], designations: &[V
 #[cfg(test)]
 mod tests {
     use flotilla_resources::{InputMeta, ProjectSpec, WorkflowTemplateSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
 
     use super::*;
 
@@ -111,7 +113,7 @@ mod tests {
     // definitions survive. Preview exports restorable specs without any writes.
     #[tokio::test]
     async fn retirement_preview_preserves_store_and_exports_definitions() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let templates = backend.clone().definitions::<WorkflowTemplate>("fleet");
         let projects = backend.clone().using::<Project>("fleet");
         for (name, builtin) in

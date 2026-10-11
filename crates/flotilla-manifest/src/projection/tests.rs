@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use flotilla_protocol::{
@@ -1484,8 +1485,8 @@ fn live_role_carries_its_attempts_vessel_attention() {
 fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     use flotilla_protocol::{Relationship, RepositoryAlias, Subject, SubjectKind};
     use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Forge, ForgeKind, ForgeSpec, InputMeta};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    use flotilla_store::ResourceBackend;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let record = runtime.block_on(async {
         backend
@@ -1507,7 +1508,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
         // Independently authored legacy input may still overlap after federation.
         // The exact Forge ID must win, irrespective of input order.
         for id in ["aaa", "github"] {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
             let object = backend
                 .using::<Forge>("flotilla")
                 .create(
@@ -1577,8 +1578,8 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
 fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
     use flotilla_protocol::{Relationship, Subject, SubjectKind};
     use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InputMeta};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    use flotilla_store::ResourceBackend;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let mut record = runtime
         .block_on(
@@ -1717,12 +1718,12 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         ForgeSpec, InputMeta, Issue, IssueSpec, IssueStatus, ObservedIssueState, Resource, ResourceObject, SubjectDiscoverySource,
         WatchEvent,
     };
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     async fn create<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> ResourceObject<T> {
         backend.using::<T>("flotilla").create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("create fixture")
     }
-    let author = ResourceBackend::InMemory(InMemoryBackend::default());
-    let replica = ResourceBackend::InMemory(InMemoryBackend::default());
+    let author = ResourceBackend::new(InMemoryBackend::default());
+    let replica = ResourceBackend::new(InMemoryBackend::default());
     let now = "2026-10-02T12:00:00Z".parse().expect("time");
     let gh = create::<Forge>(
         &author,
@@ -1962,7 +1963,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
 fn subject_project_is_unambiguous(tc: hegel::TestCase) {
     use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
     use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InputMeta, Issue, IssueSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use hegel::generators as gs;
 
     // Empty through repeated and conflicting projects, missing project refs,
@@ -1975,7 +1976,7 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() },
         Subject { kind: SubjectKind::Issue, source: source.clone(), id: "42".into() },
     ];
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let observations = runtime.block_on(async {
         SubjectCatalogInput {
@@ -2108,7 +2109,7 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
 fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
     use flotilla_protocol::Relationship;
     use flotilla_resources::{select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InputMeta};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use hegel::generators as gs;
 
     // Cover empty/single/many records, equal and unequal timestamps, multiple
@@ -2116,7 +2117,7 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
     let offset = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
     let now: Timestamp = "2026-10-02T12:00:00Z".parse().expect("time");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let mut records = Vec::new();
     let mut expected = BTreeMap::new();
@@ -2255,8 +2256,8 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
 fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
     use flotilla_protocol::Relationship;
     use flotilla_resources::{ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InputMeta};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    use flotilla_store::ResourceBackend;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let now = "2026-10-02T12:00:00Z".parse().expect("time");
     let mut record = runtime
@@ -2322,7 +2323,7 @@ fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
 fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
     use flotilla_resources::{ChangeRequestSpec, ForgeKind, ForgeSpec, InputMeta, IssueSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use hegel::generators as gs;
 
     // Cover absent, unrelated, installation-URL and host-alias
@@ -2341,7 +2342,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
     }
     for mode in [Coverage::Absent, Coverage::Unrelated, Coverage::InstallationUrl, Coverage::HostAlias] {
         let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut observations = runtime.block_on(async {
             SubjectCatalogInput {
                 change_requests: vec![backend
@@ -3022,7 +3023,7 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
         Artifact, ArtifactSpec, Convoy, ConvoyAttention, ConvoySpec, ConvoyStatus, InputMeta, Message, MessagePhase, MessageRelation,
         MessageSpec, MessageStatus,
     };
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use hegel::generators as gs;
     let held = tc.draw(gs::booleans());
     let ledger = tc.draw(gs::booleans());
@@ -3042,7 +3043,7 @@ fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
     let phase = phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut convoy = backend
             .using::<Convoy>("dev")
             .create(&InputMeta::builder().name("inbox".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())

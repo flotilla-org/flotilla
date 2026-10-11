@@ -1,3 +1,7 @@
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
+#[cfg(test)]
+use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
@@ -333,7 +337,7 @@ impl ArtifactService<'_> {
 mod tests {
     use flotilla_protocol::CallerCrew;
     use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSpec, TerminalSessionStatus};
-    use flotilla_store::{apply_resource_document, InMemoryBackend, SqliteBackend};
+    use flotilla_store::apply_resource_document;
 
     use super::{ArtifactBody, *};
     use crate::blob_store::MemoryBlobStore;
@@ -346,7 +350,7 @@ mod tests {
         let fleet: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
         let home_blobs = Arc::new(TieredBlobStore::new(home_dir.path(), vec![("fleet".into(), Arc::clone(&fleet))]));
         let remote_blobs = TieredBlobStore::new(remote_dir.path(), vec![("fleet".into(), fleet)]);
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let namespace = "flotilla";
         let convoy = "convoy-cross-host";
         backend
@@ -501,7 +505,7 @@ mod tests {
         assert_eq!(second.metadata.name, first.metadata.name);
         assert_eq!(service.list(Some("demo"), Some("review-round"), Some("head-1")).await.expect("list").len(), 1);
         assert_eq!(service.get(&second.metadata.name).await.expect("get latest"), b"two");
-        let remote_home = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_home = ResourceBackend::new(InMemoryBackend::default());
         let (remote_name, remote_spec, remote_owner) =
             service.prepare_put(&caller, input("head-2", BTreeMap::new(), b"remote"), &retention).await.expect("prepare remote envelope");
         apply_resource_document(
@@ -546,11 +550,11 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_contract_in_memory() {
-        contract(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+        contract(ResourceBackend::new(InMemoryBackend::default())).await;
     }
 
     #[tokio::test]
     async fn artifact_contract_sqlite() {
-        contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))).await;
+        contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))).await;
     }
 }

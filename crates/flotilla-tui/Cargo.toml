@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 humantime = "2"

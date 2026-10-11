@@ -1,3 +1,4 @@
+use crate::StoreExt;
 use std::{
     collections::{BTreeMap, HashSet},
     marker::PhantomData,
@@ -13,83 +14,64 @@ use crate::{
     definition::DefinitionResolver,
     error::ResourceError,
     field_ownership::merge_owned_spec,
-    http::HttpBackend,
-    in_memory::InMemoryBackend,
     replica::StoredReplicaEventKind,
     resource::{InputMeta, Resource, ResourceObject},
     retention::ResourceStoreDiagnostics,
-    sqlite::SqliteBackend,
     FieldOwnedResource, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity,
 };
 
 macro_rules! dispatch_backend {
     ($self:expr, $method:ident $(, $args:expr)*) => {
-        match &$self.backend {
-            ResourceBackend::InMemory(backend) => backend.$method::<T>(&$self.namespace $(, $args)*).await,
-            ResourceBackend::Http(backend) => backend.$method::<T>(&$self.namespace $(, $args)*).await,
-            ResourceBackend::Sqlite(backend) => backend.$method::<T>(&$self.namespace $(, $args)*).await,
-        }
+        $self.backend.$method::<T>(&$self.namespace $(, $args)*).await
     };
 }
 
+/// Cloneable handle chosen by the composition root.
 #[derive(Debug, Clone)]
-pub enum ResourceBackend {
-    InMemory(InMemoryBackend),
-    Http(HttpBackend),
-    Sqlite(SqliteBackend),
-}
-
+pub struct ResourceBackend(std::sync::Arc<dyn crate::Store>);
 impl ResourceBackend {
+    pub fn new(store: impl Into<Self>) -> Self {
+        store.into()
+    }
+    pub fn from_arc(store: std::sync::Arc<dyn crate::Store>) -> Self {
+        Self(store)
+    }
+    pub fn store(&self) -> &dyn crate::Store {
+        &*self.0
+    }
+    pub fn with_read_observer(self, observer: std::sync::Arc<dyn crate::ReadObserver>) -> Self {
+        Self(self.0.with_read_observer(observer))
+    }
+    pub fn read_observer(&self) -> Option<&dyn crate::ReadObserver> {
+        self.0.read_observer()
+    }
     pub(crate) async fn hierarchy_admission(&self, kind: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if !crate::project_hierarchy::is_hierarchy_kind(kind) {
             return None;
         }
-        let lock = match self {
-            Self::InMemory(backend) => &backend.hierarchy_admission,
-            Self::Sqlite(backend) => &backend.hierarchy_admission,
-            // DefinitionResolver rejects HTTP authoring; no admission lock is
-            // needed for this read-only Definitions backend.
-            Self::Http(_) => return None,
-        };
-        Some(lock.clone().lock_owned().await)
+        Some(self.0.hierarchy_admission()?.lock_owned().await)
     }
-
-    pub fn with_local_root(self, local_root: NodeId) -> Self {
-        match self {
-            Self::InMemory(backend) => Self::InMemory(backend.with_local_root(local_root)),
-            Self::Http(backend) => Self::Http(backend),
-            Self::Sqlite(backend) => Self::Sqlite(backend.with_local_root(local_root)),
-        }
+    pub fn with_local_root(self, root: NodeId) -> Self {
+        Self(self.0.with_local_root(root))
     }
-
     pub fn local_root(&self) -> Result<NodeId, ResourceError> {
-        match self {
-            Self::InMemory(backend) => Ok(backend.local_root()),
-            Self::Sqlite(backend) => Ok(backend.local_root()),
-            Self::Http(_) => Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-        }
+        self.0.local_root()
     }
-
+    pub fn serves_read_views(&self) -> bool {
+        self.0.serves_read_views()
+    }
     pub fn using<T: Resource>(&self, namespace: &str) -> TypedResolver<T> {
         TypedResolver { backend: self.clone(), namespace: namespace.to_string(), _marker: PhantomData }
     }
 
     /// Namespaces containing locally-authored objects of this kind.
     pub async fn local_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
-        match self {
-            Self::InMemory(backend) => backend.local_namespaces_typed::<T>().await,
-            Self::Sqlite(backend) => backend.local_namespaces_typed::<T>().await,
-            Self::Http(_) => Err(ResourceError::invalid("HTTP backends cannot enumerate local resource namespaces")),
-        }
+        self.local_namespaces_typed::<T>().await
     }
 
     /// Namespaces containing a local or replicated source of this kind.
     pub async fn stored_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
-        match self {
-            Self::InMemory(backend) => backend.stored_namespaces_typed::<T>().await,
-            Self::Sqlite(backend) => backend.stored_namespaces_typed::<T>().await,
-            Self::Http(_) => Err(ResourceError::invalid("HTTP backends cannot enumerate stored resource namespaces")),
-        }
+        self.stored_namespaces_typed::<T>().await
     }
 
     pub fn definitions<T: Resource>(&self, namespace: &str) -> DefinitionResolver<T> {
@@ -109,32 +91,13 @@ impl ResourceBackend {
     }
 
     pub async fn diagnostics(&self) -> Result<Option<ResourceStoreDiagnostics>, ResourceError> {
-        match self {
-            Self::InMemory(backend) => backend.diagnostics().await.map(Some),
-            Self::Http(_) => Ok(None),
-            Self::Sqlite(backend) => backend.diagnostics().await.map(Some),
-        }
+        self.0.diagnostics().await
     }
-
     pub(crate) async fn delete_decode_quarantine<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
-        match self {
-            Self::Sqlite(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
-            Self::InMemory(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
-            Self::Http(_) => Ok(false),
-        }
+        self.0.delete_decode_quarantine_typed::<T>(namespace, name).await
     }
-
     async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
-        match self {
-            Self::InMemory(backend) => {
-                backend.record_field_ownership_violation(violation).await;
-                Ok(())
-            }
-            Self::Sqlite(backend) => backend.record_field_ownership_violation(violation).await,
-            // HTTP clients cannot publish authoritative host diagnostics. The
-            // enrolled write paths currently execute against embedded stores.
-            Self::Http(_) => Ok(()),
-        }
+        self.0.record_field_ownership_violation(violation).await
     }
 }
 
@@ -176,7 +139,8 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local });
         }
         ensure_replication_enabled::<T>()?;
-        if let ResourceBackend::Http(backend) = &self.backend {
+        if self.backend.serves_read_views() {
+            let backend = &self.backend;
             return backend.get_including_replicas_typed::<T>(&self.namespace, name).await;
         }
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
@@ -190,11 +154,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
         match self.backend.using::<T>(&self.namespace).get(name).await {
             Ok(object) => Ok(ReadResourceObject { object, provenance: ResourceProvenance::Local }),
             Err(ResourceError::NotFound { .. }) => {
-                let replicas = match &self.backend {
-                    ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
-                    ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
-                    ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
-                };
+                let replicas = { self.backend.get_replicas_typed::<T>(&self.namespace, name).await? };
                 replicas.into_iter().next().ok_or_else(|| ResourceError::not_found(name))
             }
             Err(error) => Err(error),
@@ -212,7 +172,8 @@ impl<T: Resource> ReplicaReadResolver<T> {
             };
         }
         ensure_replication_enabled::<T>()?;
-        if let ResourceBackend::Http(backend) = &self.backend {
+        if self.backend.serves_read_views() {
+            let backend = &self.backend;
             return backend.get_all_including_replicas_typed::<T>(&self.namespace, name).await;
         }
         let mut items = match self.backend.using::<T>(&self.namespace).get(name).await {
@@ -220,11 +181,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
             Err(ResourceError::NotFound { .. }) => Vec::new(),
             Err(error) => return Err(error),
         };
-        let replicas = match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
-            ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
-            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
-        };
+        let replicas = { self.backend.get_replicas_typed::<T>(&self.namespace, name).await? };
         items.extend(replicas);
         let listed = ReadResourceList { items };
         if self.suppress_self_origin {
@@ -248,7 +205,8 @@ impl<T: Resource> ReplicaReadResolver<T> {
             return Ok(ReadResourceList { items });
         }
         ensure_replication_enabled::<T>()?;
-        if let ResourceBackend::Http(backend) = &self.backend {
+        if self.backend.serves_read_views() {
+            let backend = &self.backend;
             return backend.list_including_replicas_typed::<T>(&self.namespace).await;
         }
         if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
@@ -291,17 +249,14 @@ impl<T: Resource> ReplicaReadResolver<T> {
         if required.is_empty() {
             return self.list().await;
         }
-        if let ResourceBackend::Http(backend) = &self.backend {
+        if self.backend.serves_read_views() {
+            let backend = &self.backend;
             return backend.list_including_replicas_typed_matching_labels::<T>(&self.namespace, required).await;
         }
         let local = self.backend.using::<T>(&self.namespace).list_matching_labels(required).await?;
         let mut items =
             local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
-        let mut replicas = match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
-        };
+        let mut replicas = { self.backend.list_replicas_typed::<T>(&self.namespace).await? };
         replicas.retain(|item| crate::labels_match(&item.object.metadata.labels, required));
         items.extend(replicas);
         if self.suppress_self_origin {
@@ -324,17 +279,13 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
         ensure_replication_enabled::<T>()?;
-        if matches!(&self.backend, ResourceBackend::Http(_)) {
+        if self.backend.serves_read_views() {
             return Err(ResourceError::invalid("HTTP replica-source lists use the resource API"));
         }
         let local = self.backend.using::<T>(&self.namespace).list().await?;
         let mut items =
             local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
-        let replicas = match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
-        };
+        let replicas = { self.backend.list_replicas_typed::<T>(&self.namespace).await? };
         items.extend(replicas);
         items.sort_by(|left, right| {
             left.object.metadata.name.cmp(&right.object.metadata.name).then_with(|| match (&left.provenance, &right.provenance) {
@@ -366,7 +317,8 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     pub async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         ensure_replication_enabled::<T>()?;
-        if let ResourceBackend::Http(backend) = &self.backend {
+        if self.backend.serves_read_views() {
+            let backend = &self.backend;
             return backend.watch_including_replicas_typed::<T>(&self.namespace).await;
         }
         let raw = self.watch_sources().await?;
@@ -450,14 +402,10 @@ impl<T: Resource> ReplicaReadResolver<T> {
         &self,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         ensure_replication_enabled::<T>()?;
-        if matches!(&self.backend, ResourceBackend::Http(_)) {
+        if self.backend.serves_read_views() {
             return Err(ResourceError::invalid("HTTP replica-source watches use the resource API"));
         }
-        let replicas = match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.watch_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Sqlite(backend) => backend.watch_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
-        };
+        let replicas = { self.backend.watch_replicas_typed::<T>(&self.namespace).await? };
         let local = self.backend.using::<T>(&self.namespace).watch(WatchStart::Now).await?.map(|event| event.map(ReadWatchEvent::local));
         Ok(stream::select(local, replicas).boxed())
     }
@@ -476,15 +424,7 @@ pub struct ReplicaWriter<T: Resource> {
 impl<T: Resource> ReplicaWriter<T> {
     pub async fn replace(&self, listed: &ResourceList<T>, synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
         ensure_replication_enabled::<T>()?;
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => {
-                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, None).await
-            }
-            ResourceBackend::Sqlite(backend) => {
-                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, None).await
-            }
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, None).await
     }
 
     /// Replace only one complete authoritative hash bucket; never move the log cursor.
@@ -497,15 +437,7 @@ impl<T: Resource> ReplicaWriter<T> {
         {
             return Err(ResourceError::invalid("snapshot contains keys outside its partition"));
         }
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => {
-                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, Some(bucket)).await
-            }
-            ResourceBackend::Sqlite(backend) => {
-                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, Some(bucket)).await
-            }
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, Some(bucket)).await
     }
 
     /// A repaired, complete hierarchy proves a log cut. Confirm it atomically
@@ -518,24 +450,12 @@ impl<T: Resource> ReplicaWriter<T> {
         {
             return Err(ResourceError::invalid("digest prefix identity mismatch"));
         }
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => {
-                backend.confirm_replica_digest_typed::<T>(&self.origin_root, &self.namespace, proof, previous).await
-            }
-            ResourceBackend::Sqlite(backend) => {
-                backend.confirm_replica_digest_typed::<T>(&self.origin_root, &self.namespace, proof, previous).await
-            }
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.confirm_replica_digest_typed::<T>(&self.origin_root, &self.namespace, proof, previous).await
     }
 
     pub async fn digest(&self, generation: Option<String>) -> Result<crate::PartitionDigest, ResourceError> {
         ensure_replication_enabled::<T>()?;
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.replica_digest_typed::<T>(&self.origin_root, &self.namespace, generation).await,
-            ResourceBackend::Sqlite(backend) => backend.replica_digest_typed::<T>(&self.origin_root, &self.namespace, generation).await,
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.replica_digest_typed::<T>(&self.origin_root, &self.namespace, generation).await
     }
 
     pub async fn apply(&self, event: crate::WatchEvent<T>, synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
@@ -545,26 +465,10 @@ impl<T: Resource> ReplicaWriter<T> {
             crate::WatchEvent::Modified(object) => (StoredReplicaEventKind::Modified, object),
             crate::WatchEvent::Deleted(object) => (StoredReplicaEventKind::Deleted, object),
             crate::WatchEvent::DeletedByName(tombstone) => {
-                return match &self.backend {
-                    ResourceBackend::InMemory(backend) => {
-                        backend.apply_replica_tombstone_typed::<T>(&self.origin_root, &self.namespace, &tombstone, synced_at).await
-                    }
-                    ResourceBackend::Sqlite(backend) => {
-                        backend.apply_replica_tombstone_typed::<T>(&self.origin_root, &self.namespace, &tombstone, synced_at).await
-                    }
-                    ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-                };
+                return self.backend.apply_replica_tombstone_typed::<T>(&self.origin_root, &self.namespace, &tombstone, synced_at).await;
             }
         };
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => {
-                backend.apply_replica_typed(&self.origin_root, &self.namespace, kind, &object, synced_at).await
-            }
-            ResourceBackend::Sqlite(backend) => {
-                backend.apply_replica_typed(&self.origin_root, &self.namespace, kind, &object, synced_at).await
-            }
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.apply_replica_typed(&self.origin_root, &self.namespace, kind, &object, synced_at).await
     }
 
     /// Apply a direct origin event, then commit its contiguous prefix. Relay
@@ -584,34 +488,18 @@ impl<T: Resource> ReplicaWriter<T> {
             return Err(ResourceError::invalid("replica sequence gap; snapshot required"));
         }
         self.apply(event, synced_at).await?;
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => {
-                backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
-            }
-            ResourceBackend::Sqlite(backend) => {
-                backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
-            }
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
     }
 
     /// Require a new authoritative snapshot without removing cached objects.
     pub async fn invalidate_cursor(&self) -> Result<(), ResourceError> {
         ensure_replication_enabled::<T>()?;
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.invalidate_replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await,
-            ResourceBackend::Sqlite(backend) => backend.invalidate_replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await,
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.invalidate_replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await
     }
 
     pub async fn cursor(&self) -> Result<Option<ReplicaCursor>, ResourceError> {
         ensure_replication_enabled::<T>()?;
-        match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await,
-            ResourceBackend::Sqlite(backend) => backend.replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await,
-            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
-        }
+        self.backend.replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await
     }
 }
 
@@ -769,5 +657,18 @@ impl<T: Resource> TypedResolver<T> {
     /// The backing store and namespace used by this typed resolver.
     pub fn context(&self) -> (&ResourceBackend, &str) {
         (&self.backend, &self.namespace)
+    }
+}
+
+impl std::ops::Deref for ResourceBackend {
+    type Target = dyn crate::Store;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl<S: crate::Store + 'static> From<S> for ResourceBackend {
+    fn from(store: S) -> Self {
+        Self(std::sync::Arc::new(store))
     }
 }

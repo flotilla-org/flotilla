@@ -337,7 +337,7 @@ mod tests {
         FleetDesignationSpec, FrozenImageLayer, HostSpec, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus,
         ImageInputStability, ImageLayerParent, ImageLayerSpec, ImageLayerStage, InputMeta, ResolvedImageInputs,
     };
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
 
@@ -395,7 +395,7 @@ mod tests {
         let id = format!("sha256:{:02x}", byte).to_string();
         let id = format!("sha256:{}", id.trim_start_matches("sha256:").repeat(32));
         let manifest = format!("sha256:{}", "e".repeat(64));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         for name in ["builder", "destination"] {
             backend
                 .using::<Host>("test")

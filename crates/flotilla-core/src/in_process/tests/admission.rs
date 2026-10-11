@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +17,7 @@ use flotilla_resources::{
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Repository, RepositorySpec, ResourceObject,
     VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
 use crate::admission::AvailableSpaceProbe;
@@ -42,7 +43,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     .expect("daemon config");
     let token_path = temp.path().join("forgejo-token");
     std::fs::write(&token_path, "test-token").expect("token file");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let forge = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".to_string())
         .kind(flotilla_resources::ForgeKind::Forgejo)
@@ -266,7 +267,7 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
         Arc::new(ConfigStore::with_base(temp.path())),
         discovery,
         HostName::local(),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     daemon.set_repository_inspector(Arc::new(ConcurrentCreateRepositoryInspector)).await;
@@ -330,8 +331,8 @@ async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_chec
 async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
     let home_root = NodeId::new("snapshot-home");
     let driver_root = NodeId::new("snapshot-driver");
-    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver_root);
+    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
     let spec = flotilla_resources::single_agent_workflow_spec();
     let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
 
@@ -350,8 +351,8 @@ async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
 async fn prepared_placement_snapshot_reuses_an_identical_replica() {
     let home_root = NodeId::new("snapshot-home");
     let driver_root = NodeId::new("snapshot-driver");
-    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver_root);
+    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver_root);
     let spec = PlacementPolicySpec::builder().pool("passthrough".to_string()).build();
     let name = prepared_snapshot_name("placement", &serde_json::to_value(&spec).expect("serialize placement")).expect("snapshot name");
 
@@ -369,8 +370,8 @@ async fn prepared_placement_snapshot_reuses_an_identical_replica() {
 #[tokio::test]
 async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
     let home_root = NodeId::new("snapshot-home");
-    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
-    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("snapshot-driver"));
+    let home = ResourceBackend::new(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("snapshot-driver"));
     let name = "placement-snapshot-collision";
     let authored = PlacementPolicySpec::builder().pool("passthrough".to_string()).build();
     let requested = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
@@ -398,7 +399,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         Err("remote rejected".to_string()),
         Ok("archived stale head".to_string()),
     ]));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let mut discovery = fake_discovery_with_runner(false, runner.clone());
     discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -474,7 +475,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
 async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_checkout() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"bound-pr-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla")
         .expect("repository spec")
         .with_remotes(["https://github.com/flotilla-org/flotilla".to_string(), "https://forgejo.example/flotilla/flotilla".to_string()])

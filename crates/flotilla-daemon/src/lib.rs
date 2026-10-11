@@ -34,3 +34,11 @@ extern crate self as flotilla_daemon;
 #[allow(dead_code)]
 #[path = "../../flotilla-daemon-testkit/src/lib.rs"]
 mod testkits;
+
+/// Compose the default review-bundle byte adapter from host configuration.
+pub fn review_bundle_store(
+    config: &flotilla_resources::ReviewBundleStoreConfig,
+    credential: &flotilla_resources::ReviewBundleWriteCredential,
+) -> Result<flotilla_store::ReviewBundleStore, flotilla_store::ReviewBundleStoreError> {
+    flotilla_review_bundle_object_store::connect_review_bundle(config, credential)
+}

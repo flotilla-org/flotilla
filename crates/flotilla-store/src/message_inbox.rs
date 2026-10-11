@@ -180,10 +180,7 @@ impl MessageInbox {
             // Kubernetes resource versions are opaque on older or extension
             // API servers and can exceed u64. Their creation timestamps and
             // immutable names give a deterministic fallback without refusing admission.
-            .maybe_accepted_sequence(match &self.backend {
-                ResourceBackend::Http(_) => None,
-                _ => message.metadata.resource_version.parse().ok(),
-            })
+            .maybe_accepted_sequence(if self.backend.serves_read_views() { None } else { message.metadata.resource_version.parse().ok() })
             .reason("waiting for receiver resolution".into())
             .build();
         let message = self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await?;

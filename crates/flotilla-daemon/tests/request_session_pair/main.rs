@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -82,8 +83,7 @@ use flotilla_resources::{
     HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{
-    controller::ControllerLoop, list_resource_kind, ConvoyReconciler, InMemoryBackend, OwnerGarbageCollector, ResourceBackend,
-    REGISTERED_RESOURCE_KINDS,
+    controller::ControllerLoop, list_resource_kind, ConvoyReconciler, OwnerGarbageCollector, ResourceBackend, REGISTERED_RESOURCE_KINDS,
 };
 use hegel::generators as gs;
 
@@ -3023,7 +3023,7 @@ async fn hostless_convoy_command_explains_missing_home_route() {
     let convoy_name = "stranded";
 
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, HostName::new("feta")).await;
-    let replica_fixture = ResourceBackend::InMemory(InMemoryBackend::default());
+    let replica_fixture = ResourceBackend::new(InMemoryBackend::default());
     replica_fixture
         .using::<Convoy>(namespace)
         .create(

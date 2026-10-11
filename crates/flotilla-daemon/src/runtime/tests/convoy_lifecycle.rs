@@ -1,4 +1,6 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 
 #[test]
 fn live_github_scope_expands_only_project_grants_without_explicit_repositories() {
@@ -54,7 +56,7 @@ fn live_github_scope_expands_only_project_grants_without_explicit_repositories()
 
 #[tokio::test]
 async fn standing_ensure_dependency_changes_emit_wakes() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     for kind in ["Clone", "Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
         let mut watch = if kind == "Clone" {
             watch_resource_kind(&backend, NAMESPACE, kind).await
@@ -616,8 +618,8 @@ async fn checkout_authority_observes_replicated_landing_and_convoy_authority_set
     let temp = TempDir::new().expect("tempdir");
     let authority_root = flotilla_protocol::NodeId::new("authority-root");
     let checkout_root = flotilla_protocol::NodeId::new("checkout-root");
-    let authority = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default()).with_local_root(authority_root.clone());
-    let checkout_host = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default()).with_local_root(checkout_root.clone());
+    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(authority_root.clone());
+    let checkout_host = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(checkout_root.clone());
     let authority_config_base = temp.path().join("authority-config");
     fs::create_dir_all(&authority_config_base).expect("config directory");
     fs::write(authority_config_base.join("daemon.toml"), "machine_id = \"checkout-authority-evidence-test\"\n").expect("daemon config");
@@ -789,11 +791,11 @@ async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"orphan-startup-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let (initial, _) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
     let registry = probe_local_provider_registry(&initial, &config).await.expect("registry");
     let profile = build_local_profile(&initial, &registry).expect("profile");
-    let coordinator = ResourceBackend::InMemory(Default::default());
+    let coordinator = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let convoys = coordinator.using::<Convoy>(NAMESPACE);
     let created =
         convoys.create(&empty_meta("old-landed"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
@@ -968,7 +970,7 @@ async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::InMemory(Default::default()),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
         runner,
         Some(Arc::new(FakeChangeRequest::new())),
     )
@@ -993,7 +995,7 @@ async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend")),
+        ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend")),
         runner,
         Some(Arc::new(FakeChangeRequest::new())),
     )
@@ -1030,7 +1032,7 @@ async fn passing_teardown_gate_removes_the_managed_worktree_path() {
     let daemon = daemon_with_backend_runner_and_change_requests(
         vec![repo.clone()],
         Arc::clone(&config),
-        ResourceBackend::InMemory(Default::default()),
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
         Arc::new(Stage4aGitRunner { inner: Arc::new(MergedPrProcessRunner::new(884)), upstream: repo.clone() }),
         Some(requests),
     )

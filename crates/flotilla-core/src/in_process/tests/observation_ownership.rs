@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use flotilla_protocol::HostName;
 use flotilla_resources::{
     ConvoyRepositorySpec, Host as ResourceHost, HostSpec, HostStatus, InputMeta, Project, ProjectSpec, Repository, RepositorySpec,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::{test_meta, SuspendedBoardProvider};
@@ -79,7 +80,7 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
                 FakeDiscoveryProviders::default().with_issue_tracker(provider.clone()).with_change_request(requests.clone()),
             ),
             HostName::new(name),
-            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::new(InMemoryBackend::default()),
         )
         .await;
         temps.push(temp);

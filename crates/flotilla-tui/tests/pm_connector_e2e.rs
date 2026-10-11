@@ -2,6 +2,7 @@
 //! and Aggregator queries. No watch-accepting daemon mock is involved.
 #![cfg(unix)]
 
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -25,7 +26,7 @@ use flotilla_resources::{
     DeclaredSubject, InputMeta, Observation, ObservedChangeRequestState, Project, ProjectSpec, ResourceObject, WatchEvent,
     ENSURED_FROM_ANNOTATION,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use flotilla_tui::pm_connect::Connector;
 
 #[derive(Default)]
@@ -187,8 +188,8 @@ async fn lifecycle(forward: Option<WheelhouseHttpSink>) {
     let tmp = tempfile::tempdir().expect("config");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-e2e-2523\"\n").expect("config");
     let config = Arc::new(ConfigStore::with_base(tmp.path()));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let source = ResourceBackend::new(InMemoryBackend::default());
     let remote = seed(&source, "flotilla").await;
     // Only the observation is replicated; the runtime graph is local.
     let local = seed(&backend, "flotilla").await;

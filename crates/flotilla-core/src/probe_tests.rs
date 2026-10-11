@@ -14,7 +14,7 @@ async fn blocked_probe_does_not_block_resource_store() {
         blocked.recv().map_err(|error| error.to_string())
     }));
     observed.await.expect("probe started");
-    let store = ResourceBackend::InMemory(Default::default());
+    let store = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let result = tokio::time::timeout(Duration::from_millis(100), store.using::<Host>("test").list()).await;
     let timed_out = task.await.expect("probe task");
     release.send(()).expect("release blocked probe");

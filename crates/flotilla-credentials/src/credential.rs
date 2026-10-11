@@ -2426,7 +2426,7 @@ mod tests {
     use flotilla_resources::ProjectRepositorySpec;
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::RepositorySpec;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
@@ -2506,7 +2506,7 @@ mod tests {
         )
         .expect("manifest");
         std::fs::write(temp.path().join("fetches.capture-token"), "").expect("capture marker");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<CredentialSpec>("flotilla")
             .create(
@@ -2669,7 +2669,7 @@ mod tests {
         });
         let runner = Arc::new(RecordingRunner::default());
         let store = CredentialStore::new_with_github_app_minter(
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -2738,7 +2738,7 @@ mod tests {
         });
         let runner = Arc::new(RecordingRunner::default());
         let store = CredentialStore::new_with_github_app_minter(
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -2817,7 +2817,7 @@ mod tests {
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
         backend
             .using::<Repository>("flotilla")
@@ -2876,7 +2876,7 @@ mod tests {
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let first = RepositorySpec::remote("https://github.com/flotilla-org/first").expect("first repository");
         let second = RepositorySpec::remote("https://github.com/flotilla-org/second").expect("second repository");
         for (name, spec) in [("first", &first), ("second", &second)] {
@@ -3215,7 +3215,7 @@ mod tests {
             tokio::fs::write(path, "abandoned material").await.expect("write staging file");
         }
         let store = CredentialStore::new(
-            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::new(InMemoryBackend::default()),
             "flotilla",
             Arc::new(TestEnv(BTreeMap::from([("XDG_RUNTIME_DIR".to_string(), runtime.path().to_string_lossy().into_owned())]))),
             EnvironmentBag::new(),
@@ -3298,7 +3298,7 @@ mod tests {
 
     fn store_with_env(env: BTreeMap<String, String>) -> CredentialStore {
         CredentialStore::new(
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
             "flotilla",
             Arc::new(TestEnv(env)),
             EnvironmentBag::new(),
@@ -3422,7 +3422,7 @@ mod tests {
         tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
             .await
             .expect("write App private key");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
         backend
@@ -3549,7 +3549,7 @@ interactions:
             .await
             .expect("write App private key");
 
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
         backend
@@ -3666,7 +3666,7 @@ interactions:
         tokio::fs::write(&private_key_path, flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY)
             .await
             .expect("write App private key");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -3901,8 +3901,8 @@ interactions:
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let repository_root = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("repository-root"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("minting-root"));
+        let repository_root = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("repository-root"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("minting-root"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
         repository_root
@@ -4054,7 +4054,7 @@ interactions:
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 10);
 
         let missing_store = CredentialStore::new_with_github_app_minter(
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -4081,7 +4081,7 @@ interactions:
             refresh_started: tokio::sync::Notify::new(),
             release_refresh: tokio::sync::Notify::new(),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
         backend
@@ -4189,7 +4189,7 @@ interactions:
         }
 
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
         let repository_key = repository_spec.key();
         backend
@@ -4259,7 +4259,7 @@ interactions:
 
     #[tokio::test]
     async fn github_app_repository_scope_rejections_fail_before_minting() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let non_github_spec = RepositorySpec::remote("https://gitlab.example/flotilla-org/flotilla").expect("non-GitHub repository spec");
         let non_github_key = non_github_spec.key();
         backend
@@ -4317,7 +4317,7 @@ interactions:
 
     #[tokio::test]
     async fn mixed_forge_scope_selects_only_github_repositories_for_app() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let github = ForgeSpec::builder()
             .forge_id("github".to_string())
             .kind(ForgeKind::Github)
@@ -4368,7 +4368,7 @@ interactions:
 
     #[tokio::test]
     async fn codex_material_is_transformed_by_stdin_login_and_never_passed_through_as_env() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -4431,7 +4431,7 @@ interactions:
 
     #[tokio::test]
     async fn claude_oauth_material_is_delivered_as_an_env_token_without_owning_agent_config() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let secret = "sk-ant-oat01-test-token-never-in-argv";
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
@@ -4482,7 +4482,7 @@ interactions:
 
     #[tokio::test]
     async fn claude_oauth_preflight_scratch_dir_prefers_the_user_runtime_dir_over_absolute_run() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
@@ -4509,7 +4509,7 @@ interactions:
 
     #[tokio::test]
     async fn a_blank_user_runtime_dir_falls_back_to_the_daemon_state_dir() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
@@ -4529,7 +4529,7 @@ interactions:
 
     #[tokio::test]
     async fn a_dangling_user_runtime_dir_falls_back_to_the_daemon_state_dir() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
@@ -4552,7 +4552,7 @@ interactions:
 
     #[tokio::test]
     async fn user_runtime_dir_is_rechecked_for_each_claude_oauth_preflight() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_CLAUDE_TOKEN".to_string(), "sk-ant-oat01-test-token".to_string()),
@@ -4577,7 +4577,7 @@ interactions:
 
     #[tokio::test]
     async fn two_claude_accounts_coexist_across_environments_but_never_share_one() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-alice", "alice@example.com", "TEST_CLAUDE_TOKEN_A").await;
         create_claude_oauth_spec(&backend, "claude-bob", "bob@example.com", "TEST_CLAUDE_TOKEN_B").await;
         backend
@@ -4635,7 +4635,7 @@ interactions:
 
     #[tokio::test]
     async fn rotating_named_claude_oauth_material_reuses_the_stable_config_directory() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -4712,7 +4712,7 @@ interactions:
 
     #[tokio::test]
     async fn a_dead_claude_oauth_token_fails_preparation_loudly_without_leaking_material() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let secret = "sk-ant-oat01-expired-token";
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
@@ -4773,7 +4773,7 @@ interactions:
 
     #[tokio::test]
     async fn exhausted_headless_credits_do_not_reject_a_valid_claude_oauth_token() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_claude_oauth_spec(&backend, "claude-max", "ops@example.com", "TEST_CLAUDE_TOKEN").await;
         let secret = "sk-ant-oat01-valid-token";
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_CLAUDE_TOKEN".to_string(), secret.to_string())])));
@@ -4799,7 +4799,7 @@ interactions:
 
     #[tokio::test]
     async fn held_credentials_are_about_host_local_material_not_vessel_binaries() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -4829,7 +4829,7 @@ interactions:
 
     #[tokio::test]
     async fn forgetting_an_environment_evicts_material_and_preflight_state() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let store = CredentialStore::new(
             backend,
             "flotilla",
@@ -4870,7 +4870,7 @@ interactions:
     #[tokio::test]
     async fn work_delivery_reconciles_running_complete_and_reactivated_turns() {
         let state = tempfile::tempdir().expect("state directory");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -4940,7 +4940,7 @@ interactions:
 
     #[tokio::test]
     async fn gh_material_authenticates_both_gh_and_git_without_interactive_prompts() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -4990,7 +4990,7 @@ interactions:
 
     #[tokio::test]
     async fn github_and_git_http_token_helpers_compose_without_cross_talk() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -5057,7 +5057,7 @@ interactions:
 
     #[tokio::test]
     async fn gitconfig_keeps_fragments_from_disjoint_preparations_of_one_environment() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -5101,7 +5101,7 @@ interactions:
 
     #[tokio::test]
     async fn git_http_token_is_delivered_as_a_protected_file_and_persisted_helper() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -5165,7 +5165,7 @@ interactions:
 
     #[tokio::test]
     async fn review_store_credential_is_staged_as_a_scoped_file() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -5237,7 +5237,7 @@ interactions:
 
     #[tokio::test]
     async fn git_http_token_host_rejects_a_url() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_git_http_token_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
@@ -5261,7 +5261,7 @@ interactions:
 
     #[tokio::test]
     async fn git_http_token_host_must_parse() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_git_http_token_spec(&backend, "lab-forgejo", "not a host", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
@@ -5279,7 +5279,7 @@ interactions:
 
     #[tokio::test]
     async fn git_http_token_helper_and_config_agree_on_an_explicit_port() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
@@ -5304,7 +5304,7 @@ interactions:
 
     #[tokio::test]
     async fn git_http_token_credentials_for_multiple_hosts_coexist() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_git_http_token_spec(&backend, "lab-a", "forgejo.lab", "TEST_TOKEN_A").await;
         create_git_http_token_spec(&backend, "lab-b", "other.lab", "TEST_TOKEN_B").await;
         let runner = Arc::new(RecordingRunner::default());
@@ -5335,7 +5335,7 @@ interactions:
 
     #[tokio::test]
     async fn git_http_token_credentials_for_the_same_canonical_host_fail_before_delivery() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_git_http_token_spec(&backend, "lab-a", "FORGEJO.LAB", "TEST_TOKEN_A").await;
         create_git_http_token_spec(&backend, "lab-b", "forgejo.lab/", "TEST_TOKEN_B").await;
         let runner = Arc::new(RecordingRunner::default());
@@ -5362,7 +5362,7 @@ interactions:
 
     #[tokio::test]
     async fn forgejo_and_git_http_token_credentials_for_the_same_host_fail_before_delivery() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<Forge>("flotilla")
             .create(
@@ -5416,7 +5416,7 @@ interactions:
 
     #[tokio::test]
     async fn forgejo_delivery_derives_urls_from_referenced_forge() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         let forge = ForgeSpec::builder()
             .forge_id("lab".to_string())
             .kind(ForgeKind::Forgejo)
@@ -5469,7 +5469,7 @@ interactions:
 
     #[tokio::test]
     async fn github_and_git_http_token_credentials_for_github_fail_before_delivery() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         create_git_http_token_spec(&backend, "git-only", "GITHUB.COM/", "TEST_GIT_TOKEN").await;
         backend
             .clone()
@@ -5516,7 +5516,7 @@ interactions:
             CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, Host, HostActionSelector, HostImageAction, HostSpec,
             ImageBuildCapacity, ImageBuildReservation,
         };
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .definitions::<CredentialSpec>("flotilla")
             .create(
@@ -5658,7 +5658,7 @@ interactions:
     // disk files. A retained handle remains usable after environment cleanup.
     #[tokio::test]
     async fn registry_pull_admission_is_in_memory() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .definitions::<CredentialSpec>("flotilla")
             .create(
@@ -5707,7 +5707,7 @@ interactions:
         }
         std::fs::create_dir_all(&legacy).expect("legacy cache directory");
         let store = CredentialStore::new(
-            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),

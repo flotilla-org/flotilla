@@ -277,8 +277,8 @@ mod tests {
     // at its own authority, and replication returns that evidence to admission.
     #[tokio::test]
     async fn declared_builder_projects_demand_and_returns_execution_evidence() {
-        let home = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("home"));
-        let builder = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("builder-root"));
+        let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
+        let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
         let inputs = ResolvedImageInputs::builder()
             .parent_digest(format!("sha256:{}", "1".repeat(64)))
             .content_hashes(vec![format!("sha256:{}", "2".repeat(64))])
@@ -513,7 +513,7 @@ mod runner_contract {
             runner.clone(),
             GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner.clone()))),
         ));
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![("memory".into(), Arc::new(MemoryBlobStore::default()))]));
         let builder = LocalImageBuildRunner {
             distributor: None,

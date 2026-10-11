@@ -1,4 +1,8 @@
 use crate::providers::change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
+#[cfg(test)]
+use flotilla_store_http::HttpBackend;
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
@@ -762,7 +766,7 @@ mod tests {
         wire::{MetadataTarget, MetadataValue},
     };
 
-    use flotilla_store::{HttpBackend, InMemoryBackend, ResourceBackend, TypedResolver};
+    use flotilla_store::{ResourceBackend, TypedResolver};
 
     use super::*;
     use crate::providers::forge::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
@@ -796,7 +800,7 @@ mod tests {
         let source = Arc::new(RecoveringSource(Mutex::new(Err(error.clone()))));
         let refresher = ChangeRequestRefresher::new(
             "fleet".into(),
-            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::new(InMemoryBackend::default()),
             "node".into(),
             source.clone(),
             ChangeRequestRefreshCadence::default(),
@@ -1063,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_first_demands_converge_on_one_authority_record() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
             backend.clone(),
@@ -1094,8 +1098,8 @@ mod tests {
         use flotilla_protocol::{IssueSource, NodeId, Relationship, Subject, SubjectKind};
         use flotilla_resources::{Convoy, ConvoySpec, DeclaredSubject};
         for via_replica in [false, true] {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-            let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
+            let remote = ResourceBackend::new(InMemoryBackend::default());
             let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
             let remote_records = remote.using::<ChangeRequest>("ops");
             let record = remote_records
@@ -1253,7 +1257,7 @@ mod tests {
     // without a server or a live request. Cleanup errors must not retire monitoring.
     #[tokio::test]
     async fn failed_collection_keeps_retained_monitoring() {
-        let backend = ResourceBackend::Http(HttpBackend::new(flotilla_tls::client(), "invalid://resource-store"));
+        let backend = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), "invalid://resource-store"));
         let refresher = ChangeRequestRefresher::new(
             "kiwi".into(),
             backend,
@@ -1277,7 +1281,7 @@ mod tests {
     async fn produced_request_survives_release_and_restart_until_terminal() {
         use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, SubjectDiscoverySource};
         for terminal in [ObservedChangeRequestState::Merged, ObservedChangeRequestState::Closed] {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
             let observed_at = Utc::now();
             let opened = parse_gh_observation(
                 r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
@@ -1401,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_released_demand_garbage_collects_observed_record() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
             backend.clone(),
@@ -1430,7 +1434,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_garbage_collection_covers_non_default_namespaces() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
             backend.clone(),
@@ -1455,7 +1459,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn identical_polls_do_not_write_status() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -1489,7 +1493,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn relay_health_slows_polling_and_disconnect_restores_normal_cadence() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -1521,7 +1525,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn relay_hint_matches_demands_in_each_namespace_without_recreating_missing_records() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -1563,7 +1567,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn freshness_demand_heartbeats_identical_observations() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -1593,7 +1597,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_freshness_demand_preempts_existing_state_cadence_sleep() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -1625,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn observation_failure_is_available_to_settlement_diagnostics() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
             backend,

@@ -83,7 +83,7 @@ mod tests {
     use flotilla_resources::HostDirectPlacementPolicyCheckout;
     use flotilla_resources::HostDirectPlacementPolicySpec;
     use flotilla_resources::ResourceObject;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use flotilla_store_testkit::run_transition_sequence;
     use flotilla_store_testkit::FixpointPredicate;
     use flotilla_store_testkit::LivenessEnrollment;
@@ -129,7 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_registration_preserves_operator_priority_without_false_violations() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let policies = backend.using::<PlacementPolicy>(NAMESPACE);
         reconcile_registered_policy(&backend, NAMESPACE, "host-direct-shared", &host_direct("local", "local"))
             .await
@@ -165,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn docker_registration_preserves_operator_runtime_configuration_without_false_violations() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let policies = backend.using::<PlacementPolicy>(NAMESPACE);
         reconcile_registered_policy(&backend, NAMESPACE, "docker-shared", &docker("local", "local")).await.expect("initial registration");
         let created = policies.get("docker-shared").await.expect("registered policy");
@@ -250,7 +250,7 @@ mod tests {
 
         async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
             Ok(PolicyWorld {
-                backend: ResourceBackend::InMemory(InMemoryBackend::default()),
+                backend: ResourceBackend::new(InMemoryBackend::default()),
                 role: self.role,
                 desired: host_direct(self.role.pool(), self.role.host_ref()),
                 current: None,

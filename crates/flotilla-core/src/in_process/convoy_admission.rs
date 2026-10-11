@@ -1,6 +1,8 @@
 //! Convoy admission state and transaction boundary.
 
 use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 
 use super::*;
 use crate::{
@@ -4156,7 +4158,7 @@ mod tests {
         std::fs::write(temp.path().join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source", "repository":"https://github.com/owner/repo.git", "revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
         let mut discovery = fake_discovery(false);
         discovery.env = Arc::new(TestEnvVars::new([("FLOTILLA_SKILLS_DIR", temp.path().display().to_string())]));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -4229,7 +4231,7 @@ mod tests {
         use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
         let temp = tempfile::tempdir().expect("config");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"cascade-test\"\n").expect("machine identity");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -4317,7 +4319,7 @@ mod tests {
 
     #[tokio::test]
     async fn observed_change_request_uses_injected_repository_query() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let repository = RepositorySpec::remote("https://github.com/acme/repo").expect("repository");
         let key = repository.key();
         backend
@@ -4362,7 +4364,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(temp.path())),
             fake_discovery(false),
             HostName::new("test-host"),
-            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::new(InMemoryBackend::default()),
         )
         .await;
         let mut project = ProjectSpec::builder().display_name("Example".to_string()).default_workflow_ref("work".to_string()).build();
@@ -4390,7 +4392,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(temp.path())),
             fake_discovery(false),
             HostName::new("test-host"),
-            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::new(InMemoryBackend::default()),
         )
         .await;
         let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
@@ -4419,7 +4421,7 @@ mod tests {
         let legacy = tc.draw(hegel::generators::booleans());
         let other_instance = tc.draw(hegel::generators::booleans());
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
             let hosts = backend.using::<ResourceHost>("test");
             let host = hosts
                 .create(&InputMeta::builder().name("host".into()).build(), &flotilla_resources::HostSpec::default())

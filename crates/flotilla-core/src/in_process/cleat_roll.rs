@@ -1,3 +1,5 @@
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
@@ -157,7 +159,7 @@ mod tests {
     use async_trait::async_trait;
     use flotilla_protocol::{qualified_path::HostId, EnvironmentId, EnvironmentStatus, HostName, ImageId};
     use flotilla_resources::{ConditionValue, InputMeta, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
 
     use super::*;
     use crate::config::ConfigStore;
@@ -210,7 +212,7 @@ mod tests {
     async fn inventory_includes_contained_and_named_crew_roots_but_excludes_remote_hosts() {
         let directory = tempfile::tempdir().expect("config");
         std::fs::write(directory.path().join("daemon.toml"), "machine_id = \"cleat-roll-test\"\n").expect("daemon identity");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             vec![],
             Arc::new(ConfigStore::with_base(directory.path())),
@@ -433,7 +435,7 @@ mod tests {
             Arc::new(ConfigStore::with_base(directory.path())),
             fake_discovery_with_runner(false, runner),
             HostName::new("host"),
-            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::new(InMemoryBackend::default()),
         )
         .await;
         let bag = EnvironmentBag::new()

@@ -1201,7 +1201,7 @@ mod tests {
     use flotilla_resources::ConvoyStatus;
     use flotilla_resources::ProjectSpec;
     use flotilla_resources::WorkflowTemplateSpec;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     use flotilla_store_testkit::VirtualClock;
 
     use super::*;
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     async fn fixture() -> (EnsureReconciler, Admission, Arc<VirtualClock>) {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let clock = Arc::new(VirtualClock::new(Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).single().expect("fixture timestamp")));
         backend
             .using::<Project>("test")

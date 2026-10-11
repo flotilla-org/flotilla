@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use flotilla_resources::{
 };
 use flotilla_store::{
     controller::{ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
-    ConvoyReconciler, InMemoryBackend, ResourceBackend,
+    ConvoyReconciler, ResourceBackend,
 };
 
 use flotilla_store_testkit::fixtures as common;
@@ -30,7 +31,7 @@ struct AlwaysEligible;
 
 #[test]
 fn convoy_finalizer_does_not_treat_arbitrary_error_text_as_a_teardown_wait() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
     let error = flotilla_resources::ResourceError::other("teardown waiting on checkout misleading-error");
@@ -39,7 +40,7 @@ fn convoy_finalizer_does_not_treat_arbitrary_error_text_as_a_teardown_wait() {
 
 #[test]
 fn convoy_finalizer_renders_multiple_typed_waits_at_the_status_boundary() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
     let error = flotilla_resources::ResourceError::FinalizerWait {
@@ -428,8 +429,8 @@ impl ConvoyTeardownRuntime for AlwaysEligible {
 #[tokio::test]
 async fn convoy_reconciler_bootstraps_from_a_replica_only_workflow_snapshot() {
     let source_root = flotilla_protocol::NodeId::new("snapshot-source");
-    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(source_root.clone());
-    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("driver"));
+    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(source_root.clone());
+    let driver = ResourceBackend::new(InMemoryBackend::default()).with_local_root(flotilla_protocol::NodeId::new("driver"));
     let snapshot_name = "workflow-snapshot-replica";
     let template = valid_workflow_template_object(snapshot_name);
     source
@@ -468,7 +469,7 @@ async fn reconcile_once_with_resources(
     workspaces: Vec<flotilla_resources::ResourceObject<Vessel>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
@@ -533,7 +534,7 @@ async fn reconcile_with_observed_change_request(
     observed_target_ref: Option<&str>,
     observed_at: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
@@ -644,7 +645,7 @@ async fn reconcile_with_observed_digest(
     existing_attention: bool,
 ) -> flotilla_store::controller::ReconcileOutcome<Convoy> {
     let now = timestamp(40);
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let repo_ref = RepositoryKey("repo-a".to_string());
@@ -764,7 +765,7 @@ async fn observed_digest_attention_clears_when_mismatch_is_no_longer_observed() 
 
 #[tokio::test]
 async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
     let convoy = convoys.create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("convoy create should succeed");
@@ -797,8 +798,8 @@ async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
 
 #[tokio::test]
 async fn convoy_finalizer_waits_for_remote_checkout_authority() {
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
-    let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+    let authority = ResourceBackend::new(InMemoryBackend::default());
+    let remote = ResourceBackend::new(InMemoryBackend::default());
     let convoy =
         authority.clone().using::<Convoy>("flotilla").create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("create convoy");
     let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
@@ -1475,7 +1476,7 @@ fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr
 async fn produced_subject_discovery_completes_branch_scan_from_every_source() {
     use flotilla_protocol::{provider_data::IssueSource, Relationship, Subject, SubjectKind};
     use flotilla_resources::SubjectDiscoverySource;
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let convoys = backend.using::<Convoy>("flotilla");
     let mut current = convoys.create(&convoy_meta("discovery"), &valid_convoy_spec()).await.expect("create");
     let subject = Subject {
@@ -1504,7 +1505,7 @@ async fn produced_subject_discovery_completes_branch_scan_from_every_source() {
 #[tokio::test]
 async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
     for known_subject in [false, true] {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.clone().using::<Convoy>("flotilla");
         let requests = backend.clone().using::<ChangeRequest>("flotilla");
         let mut spec = task_provisioning_convoy_spec();
@@ -1702,7 +1703,7 @@ async fn reconcile_terminal_bound_change_request(
     vessel_present: bool,
     untouched_checkout: bool,
 ) -> TerminalChangeRequestReconcile {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
@@ -1960,8 +1961,8 @@ async fn landed_with_reopened_change_request_does_not_write_phase() {
 
 #[tokio::test]
 async fn federated_open_checkout_holds_landing_on_authority_host() {
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default());
-    let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+    let authority = ResourceBackend::new(InMemoryBackend::default());
+    let remote = ResourceBackend::new(InMemoryBackend::default());
     let convoys = authority.clone().using::<Convoy>("flotilla");
     let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
     let mut status = bootstrapped_convoy_status();
@@ -2563,7 +2564,7 @@ impl DockerEnvironmentRuntime for FailedSkillStaging {
 }
 
 async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy>) -> flotilla_resources::ResourceObject<Vessel> {
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     backend.using::<Convoy>("flotilla").create(&convoy_meta(&convoy.metadata.name), &convoy.spec).await.expect("convoy");
     let environments = backend.using::<flotilla_resources::Environment>("flotilla");
     let environment = environments
@@ -2940,7 +2941,7 @@ impl ConvoyTeardownRuntime for NeverEligible {
 /// convoy is terminal.
 #[tokio::test]
 async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let mut status = bootstrapped_tool_only_convoy_status();
@@ -2975,7 +2976,7 @@ async fn refused_reclaim_requeues_at_the_evidence_staleness_horizon() {
 
 #[tokio::test]
 async fn abandoned_convoy_reclaims_managed_checkout_but_retains_adopted_owner_record() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
@@ -3210,7 +3211,7 @@ fn terminal_session_cleanup_respects_reclaim_and_authority(tc: hegel::TestCase) 
     let eligible = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let sessions = backend.using::<TerminalSession>("flotilla");
         sessions
             .create(
@@ -3310,7 +3311,7 @@ fn three_pr_promises_hold_completion_and_landing(tc: hegel::TestCase) {
     use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission};
     let duplicates = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.using::<Convoy>("flotilla");
         let requests = backend.using::<ChangeRequest>("flotilla");
         let mut workflow = implement_review_workflow_spec();

@@ -229,7 +229,7 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"environment-readoption-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let first = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::clone(&config),

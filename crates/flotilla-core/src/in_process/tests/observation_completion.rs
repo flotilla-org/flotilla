@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use flotilla_resources::{
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
@@ -173,7 +174,7 @@ async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
     });
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"typed-admission-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -215,7 +216,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
     });
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"batch-observation-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -371,7 +372,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         merged: std::sync::atomic::AtomicBool::new(false),
         conflicting: std::sync::atomic::AtomicBool::new(true),
     });
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

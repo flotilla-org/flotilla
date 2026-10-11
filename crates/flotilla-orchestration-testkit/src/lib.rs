@@ -8,7 +8,8 @@ use flotilla_resources::{
     Host as ResourceHost, InputMeta, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec, ResourceError, ResourceObject,
     WorkflowTemplate,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 use std::{sync::Arc, time::Duration};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -198,7 +199,7 @@ async fn standing_ensure_fixture_for(
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), format!("machine_id = \"standing-{host}\"\n")).expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let now = Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).single().expect("timestamp");
     let clock = Arc::new(VirtualClock::new(now));
     let daemon = InProcessDaemon::new_with_resource_backend_and_clock(

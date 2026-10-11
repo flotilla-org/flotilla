@@ -941,7 +941,7 @@ mod tests {
         blockers: Vec<Issue>,
         policy: DispatchPolicy,
     ) -> (ResourceBackend, Arc<FakeIssues>, Arc<VirtualClock>, DispatchReconciler) {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         backend
             .clone()
             .using::<Project>(NAMESPACE)
@@ -1136,7 +1136,8 @@ mod tests {
         let (home, issues, _, reconciler) = harness(vec![issue("1", &["ready"], None, IssueState::Open)], Vec::new(), policy(3600)).await;
         let project = home.using::<Project>(NAMESPACE).get("widgets").await.unwrap();
         for root in ["second-reconciler", "third-reconciler"] {
-            let other = ResourceBackend::InMemory(Default::default()).with_local_root(flotilla_protocol::NodeId::new(root));
+            let other = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default())
+                .with_local_root(flotilla_protocol::NodeId::new(root));
             other.using::<Project>(NAMESPACE).create(&InputMeta::builder().name("widgets".into()).build(), &project.spec).await.unwrap();
             other
                 .replica_writer::<Project>(home.local_root().unwrap(), NAMESPACE)
@@ -1315,7 +1316,8 @@ mod tests {
         let (backend, _, clock, reconciler) = harness(vec![ready.clone()], vec![], policy(300)).await;
         reconciler.reconcile_once().await.expect("queue pass");
         let workflow_root = flotilla_protocol::NodeId::new("workflow-authority");
-        let workflow_authority = ResourceBackend::InMemory(Default::default()).with_local_root(workflow_root.clone());
+        let workflow_authority =
+            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(workflow_root.clone());
         workflow_authority
             .definitions::<WorkflowTemplate>(NAMESPACE)
             .apply(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_workflow_spec())

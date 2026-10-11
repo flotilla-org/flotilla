@@ -266,7 +266,8 @@ mod tests {
         Checkout, HostName, ProviderData,
     };
     use flotilla_resources::{Checkout as ResourceCheckout, RepositoryKey};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::{observed_checkout_name, reconcile_checkouts};
 
@@ -285,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_repository_identity_supports_remote_less_observations() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let backend = ResourceBackend::new(InMemoryBackend::observed());
         let checkouts = backend.using::<ResourceCheckout>("flotilla");
         let repository_key = RepositoryKey("local-repository".to_string());
         let path = QualifiedPath::host(HostId::new("host-01"), "/workspace/repo");
@@ -342,8 +343,8 @@ mod tests {
                 let authority = authorities[(authority_start + offset) % authorities.len()];
                 for observed_present in [false, true] {
                     for durable_authority in [None, Some(LifecycleAuthority::Managed), Some(LifecycleAuthority::Adopted)] {
-                        let durable = ResourceBackend::InMemory(InMemoryBackend::default());
-                        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+                        let durable = ResourceBackend::new(InMemoryBackend::default());
+                        let observed = ResourceBackend::new(InMemoryBackend::observed());
                         let mut meta = InputMeta::builder().name("checkout".to_string()).build();
                         if let Some(authority) = authority {
                             meta = meta.with_lifecycle_authority(authority);

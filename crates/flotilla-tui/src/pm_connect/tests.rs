@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
@@ -719,7 +720,7 @@ async fn connector_uses_project_aliases_for_previous_generation_remote_repositor
         Forge, ForgeKind, ForgeSpec, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository,
         RepositorySpec, Resource,
     };
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     async fn envelope<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> flotilla_protocol::ResourceReadEnvelope {
         let object = backend.using::<T>("flotilla").create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("resource");
         flotilla_protocol::ResourceReadEnvelope::builder()
@@ -735,7 +736,7 @@ async fn connector_uses_project_aliases_for_previous_generation_remote_repositor
             }])
             .build()
     }
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let spec = RepositorySpec::remote("https://github.com/org/flotilla").expect("remote repository");
     let repository = envelope::<Repository>(&backend, &spec.key().0, &spec).await;
     let forge = envelope::<Forge>(
@@ -936,7 +937,7 @@ async fn connector_real_daemon_stays_subscribed() {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
 
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     let tmp = tempfile::tempdir().expect("config directory");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-2523\"\n").expect("machine id");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -944,7 +945,7 @@ async fn connector_real_daemon_stays_subscribed() {
         Arc::new(ConfigStore::with_base(tmp.path().to_path_buf())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let baseline = daemon.aggregator_projection_state().await.subscribed_queries();
@@ -970,7 +971,7 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
 
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     let tmp = tempfile::tempdir().expect("config directory");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-refusal-2523\"\n").expect("machine id");
     let daemon = InProcessDaemon::new_with_resource_backend(
@@ -978,7 +979,7 @@ async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
         Arc::new(ConfigStore::with_base(tmp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let attempts = AtomicUsize::new(0);
@@ -1020,10 +1021,10 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_discovery_testkit::fake_discovery;
     use flotilla_resources::{ChangeRequest, K8sResourceObject, ResourceObject, WatchEvent};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     let tmp = tempfile::tempdir().expect("config");
     std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-namespace-2523\"\n").expect("config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon: Arc<dyn DaemonHandle> = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::new(ConfigStore::with_base(tmp.path())),

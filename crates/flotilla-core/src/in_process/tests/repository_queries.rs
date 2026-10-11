@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use flotilla_resources::{
     ConvoySpec, ConvoyStatus, ObjectMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Repository,
     RepositorySpec, ResourceObject, VesselRequirement,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
@@ -24,7 +25,7 @@ use flotilla_daemon_api::daemon::DaemonHandle;
 async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository = RepositorySpec::remote("https://github.com/team/repo.git").expect("repository");
     let key = repository.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository record");
@@ -170,7 +171,7 @@ async fn cli_lists_include_active_provider_sessions() {
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("local"),
-        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::new(InMemoryBackend::default()),
     )
     .await;
     let mut registry = ProviderRegistry::new();

@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11,7 +12,7 @@ use flotilla_resources::{
     SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
     TerminalSessionSpec, WorkState, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 use tokio::sync::RwLock;
 
 use crate::change_request_observer::ChangeRequestRefreshCadence;
@@ -66,7 +67,7 @@ impl WorkCredentialReconciler for StagingProbe {
 }
 
 async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Arc<StagingProbe>, tempfile::TempDir) {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default().with_read_counts());
+    let backend = ResourceBackend::new(InMemoryBackend::default().with_read_counts());
     let config_dir = tempfile::tempdir().expect("config directory");
     let config = Arc::new(ConfigStore::with_base(config_dir.path()));
     let discovery = Arc::new(fake_discovery(false));
@@ -76,7 +77,7 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
     let providers = Arc::new(
         CheckoutProviders::builder()
             .resource_backend(backend.clone())
-            .observed_resource_backend(ResourceBackend::InMemory(InMemoryBackend::default()))
+            .observed_resource_backend(ResourceBackend::new(InMemoryBackend::default()))
             .config(config.clone())
             .discovery(discovery)
             .environment_manager(environment_manager.clone())

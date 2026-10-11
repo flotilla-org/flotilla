@@ -1,8 +1,9 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
 async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     environments
         .create(
@@ -276,7 +277,7 @@ async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace
     credential_mapping_config(temp.path(), Some("lab"));
     let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
     assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
-    let authority = ResourceBackend::InMemory(Default::default());
+    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     declare_mapping_forge(&authority, "other").await;
     daemon
         .resource_backend()
@@ -337,7 +338,7 @@ async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
         .await;
     daemon.publish_peer_connection_status(&peer, PeerConnectionState::Connected).await;
     let backend = daemon.resource_backend();
-    let authority = ResourceBackend::InMemory(Default::default());
+    let authority = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     backend
         .replica_writer::<Host>(peer_id.clone(), NAMESPACE)
         .replace(&authority.using::<Host>(NAMESPACE).list().await.expect("host snapshot"), Utc::now())

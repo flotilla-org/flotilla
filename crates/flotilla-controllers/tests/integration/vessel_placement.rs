@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
@@ -7,7 +8,7 @@ use flotilla_resources::{
     Convoy, ConvoySpec, ConvoyStatus, InputMeta, ResourceError, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 const NAMESPACE: &str = "flotilla";
 
@@ -15,8 +16,8 @@ const NAMESPACE: &str = "flotilla";
 async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
     let kiwi_root = NodeId::new("kiwi-root");
     let feta_root = NodeId::new("feta-root");
-    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
-    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(feta_root);
+    let kiwi = ResourceBackend::new(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = ResourceBackend::new(InMemoryBackend::default()).with_local_root(feta_root);
 
     let convoys = kiwi.using::<Convoy>(NAMESPACE);
     let convoy = convoys
@@ -131,8 +132,8 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
 #[tokio::test]
 async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
     let admitting_root = NodeId::new("admitting-root");
-    let admitting = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(admitting_root.clone());
-    let owner = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("owning-root"));
+    let admitting = ResourceBackend::new(InMemoryBackend::default()).with_local_root(admitting_root.clone());
+    let owner = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("owning-root"));
     let convoys = admitting.using::<Convoy>(NAMESPACE);
     let convoy = convoys
         .create(
@@ -227,8 +228,8 @@ async fn placement_status_churn_does_not_spin() {
         }
     }
     let origin = NodeId::new("admitting");
-    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(origin.clone());
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("actuator"));
+    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(origin.clone());
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("actuator"));
     let convoys = source.using::<Convoy>(NAMESPACE);
     let mut convoy = convoys
         .create(

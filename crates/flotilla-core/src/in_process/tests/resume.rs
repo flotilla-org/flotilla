@@ -128,8 +128,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
 
     let database_dir = tempfile::tempdir().expect("resource database");
     let database_path = database_dir.path().join("resources.db");
-    let (mut daemon, mut backend, probe) = resume_staging_fixture_with_backend(ResourceBackend::Sqlite(
-        flotilla_store::SqliteBackend::open(&database_path).expect("resource store"),
+    let (mut daemon, mut backend, probe) = resume_staging_fixture_with_backend(ResourceBackend::new(
+        flotilla_store_sqlite::SqliteBackend::open(&database_path).expect("resource store"),
     ))
     .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -302,7 +302,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     task.abort();
     let _ = task.await;
     drop(daemon);
-    backend = ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(&database_path).expect("reopen stored resources"));
+    backend = ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(&database_path).expect("reopen stored resources"));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let restart_config = tempfile::tempdir().expect("restart config");

@@ -25,8 +25,8 @@ impl ForgeDefaultBranchResolver for FixedForgeDefaultBranch {
 
 #[tokio::test]
 async fn repository_status_groups_typed_checkout_associations_by_explicit_host() {
-    let durable = ResourceBackend::InMemory(Default::default());
-    let observed = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::observed());
+    let durable = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let observed = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::observed());
     let repository_spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
     let repository_key = repository_spec.key();
     let repository = durable
@@ -138,8 +138,8 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
 
 #[tokio::test]
 async fn repository_with_no_checkouts_projects_empty_status_without_deletion() {
-    let durable = ResourceBackend::InMemory(Default::default());
-    let observed = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::observed());
+    let durable = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let observed = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::observed());
     let spec = RepositorySpec::remote("https://github.com/org/empty.git").expect("repository spec");
     let repository =
         durable.clone().using::<Repository>(NAMESPACE).create(&meta(&spec.key().to_string()), &spec).await.expect("repository create");

@@ -1,3 +1,4 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use flotilla_resources::{
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use super::support::{
     claim_crew, resume_staging_fixture, stall_test_daemon, stall_test_session, stall_workflow_snapshot, test_meta, wait_for_stall,
@@ -536,7 +537,7 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
 
 #[tokio::test]
 async fn replica_wake_engine_does_not_write_stalled_condition() {
-    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("authority"));
+    let authority = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("authority"));
     let convoys = authority.clone().using::<ResourceConvoy>("flotilla");
     let created =
         convoys.create(&test_meta("replicated"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
@@ -548,7 +549,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         )
         .await
         .expect("landing status");
-    let replica = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("replica"));
+    let replica = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("replica"));
     replica
         .replica_writer::<ResourceConvoy>(NodeId::new("authority"), "flotilla")
         .replace(&convoys.list().await.expect("authority list"), Utc::now())

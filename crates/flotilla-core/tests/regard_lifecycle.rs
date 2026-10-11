@@ -1,10 +1,11 @@
+use flotilla_store_memory::InMemoryBackend;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use flotilla_core::regard_lifecycle::{Clock, RegardLifecycle, SurfaceGestureOutcome};
 use flotilla_protocol::{PrincipalRef, ResourceRef, SurfaceCharacter, SurfaceDeclaration};
 use flotilla_resources::{InputMeta, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatusPatch};
-use flotilla_store::{apply_status_patch, InMemoryBackend, ResourceBackend};
+use flotilla_store::{apply_status_patch, ResourceBackend};
 
 #[derive(Debug)]
 struct ManualClock {
@@ -38,7 +39,7 @@ fn target() -> ResourceRef {
 
 #[tokio::test]
 async fn focal_observation_decays_only_after_the_target_has_left_every_surface() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let lifecycle = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
     let surface_id = uuid::Uuid::new_v4();
@@ -65,7 +66,7 @@ async fn focal_observation_decays_only_after_the_target_has_left_every_surface()
 
 #[tokio::test]
 async fn disconnecting_the_last_focal_surface_starts_the_decay_window() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let lifecycle = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
     let first = uuid::Uuid::new_v4();
@@ -94,7 +95,7 @@ async fn disconnecting_the_last_focal_surface_starts_the_decay_window() {
 
 #[tokio::test]
 async fn implicit_emission_records_its_policy_and_visible_decay_window() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let lifecycle = RegardLifecycle::new(backend.clone(), clock, Duration::seconds(45));
 
@@ -108,7 +109,7 @@ async fn implicit_emission_records_its_policy_and_visible_decay_window() {
 
 #[tokio::test]
 async fn ambient_observations_emit_nothing_and_pins_never_expire() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let lifecycle = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
     let ambient = uuid::Uuid::new_v4();
@@ -143,7 +144,7 @@ async fn ambient_observations_emit_nothing_and_pins_never_expire() {
 
 #[tokio::test]
 async fn expressed_focus_promotes_an_existing_implicit_regard_without_duplication() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let lifecycle = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
 
@@ -159,7 +160,7 @@ async fn expressed_focus_promotes_an_existing_implicit_regard_without_duplicatio
 
 #[tokio::test]
 async fn mesh_resident_heartbeats_prevent_another_daemon_from_expiring_remote_focus() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let sweeper = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
     let observer = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
@@ -181,7 +182,7 @@ async fn mesh_resident_heartbeats_prevent_another_daemon_from_expiring_remote_fo
 
 #[tokio::test]
 async fn expiry_sweeps_target_namespaces_observed_by_cross_host_gestures() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let clock = Arc::new(ManualClock::new(Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()));
     let lifecycle = RegardLifecycle::new(backend.clone(), clock.clone(), Duration::seconds(30));
     let remote_target = ResourceRef::new("flotilla.work/v1", "Convoy", "remote-host", "demo");

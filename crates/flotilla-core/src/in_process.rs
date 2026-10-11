@@ -4,6 +4,7 @@
 //! and broadcasts events — all within the same process.
 
 use flotilla_store::ResolvedCascadeStoreExt;
+use flotilla_store_memory::InMemoryBackend;
 
 mod action_events;
 mod action_namespace;
@@ -92,7 +93,7 @@ use flotilla_resources::{
 use flotilla_store::resolve_project_issue_sources;
 use flotilla_store::{
     apply_resource_document, apply_status_patch as apply_resource_status_patch, get_resource_kind, get_resource_kind_including_replicas,
-    InMemoryBackend, ResourceBackend,
+    ResourceBackend,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1596,7 +1597,14 @@ impl InProcessDaemon {
     /// Returns `Arc<Self>` because daemon-owned background controllers retain
     /// weak references to the process state.
     pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>, discovery: DiscoveryRuntime, host_name: HostName) -> Arc<Self> {
-        Self::new_with_resource_backend(repo_paths, config, discovery, host_name, ResourceBackend::InMemory(Default::default())).await
+        Self::new_with_resource_backend(
+            repo_paths,
+            config,
+            discovery,
+            host_name,
+            ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        )
+        .await
     }
 
     pub async fn new_with_resource_backend(
@@ -1637,17 +1645,17 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
-        let observed = if matches!(&resource_backend, ResourceBackend::Sqlite(_)) {
+        let observed = if resource_backend.durable_local() {
             let path = config.state_dir().as_path().join("observation-replicas.sqlite");
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.expect("create observation replica directory");
             }
-            let replicas = flotilla_store::SqliteBackend::open_async(&path).await.expect("open durable observation replicas");
-            InMemoryBackend::observed_with_durable_replicas(replicas)
+            let replicas = flotilla_store_sqlite::SqliteBackend::open_async(&path).await.expect("open durable observation replicas");
+            InMemoryBackend::observed_with_durable_replicas(ResourceBackend::new(replicas))
         } else {
             InMemoryBackend::observed()
         };
-        let observed_resource_backend = ResourceBackend::InMemory(observed).with_local_root(local_node_id.clone());
+        let observed_resource_backend = ResourceBackend::new(observed).with_local_root(local_node_id.clone());
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
@@ -5588,28 +5596,27 @@ impl InProcessDaemon {
                     // when the declaration exists only at a remote origin.
                     // Keep the merged spec for selection, but recover the home
                     // from the original stored declaration sources.
-                    let home = match &self.resource_backend {
-                        ResourceBackend::Http(_) => home,
-                        _ => {
-                            let sources = self
-                                .resource_backend
-                                .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
-                                .list_replica_sources()
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            sources
-                                .items
-                                .into_iter()
-                                .filter(|source| source.object.metadata.name == home.object.metadata.name)
-                                .min_by_key(|source| {
-                                    let origin = match &source.provenance {
-                                        ResourceProvenance::Local => self.node_id.clone(),
-                                        ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
-                                    };
-                                    (source.object.metadata.creation_timestamp, origin)
-                                })
-                                .ok_or_else(|| "project role declaration has no stored origin".to_string())?
-                        }
+                    let home = if self.resource_backend.serves_read_views() {
+                        home
+                    } else {
+                        let sources = self
+                            .resource_backend
+                            .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
+                            .list_replica_sources()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        sources
+                            .items
+                            .into_iter()
+                            .filter(|source| source.object.metadata.name == home.object.metadata.name)
+                            .min_by_key(|source| {
+                                let origin = match &source.provenance {
+                                    ResourceProvenance::Local => self.node_id.clone(),
+                                    ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
+                                };
+                                (source.object.metadata.creation_timestamp, origin)
+                            })
+                            .ok_or_else(|| "project role declaration has no stored origin".to_string())?
                     };
                     return Ok(Some(match home.provenance {
                         ResourceProvenance::Local => self.node_id.clone(),

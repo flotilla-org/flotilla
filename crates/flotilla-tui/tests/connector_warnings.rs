@@ -6,7 +6,8 @@ use flotilla_protocol::{
     ResourceRecordProvenance, ResourceRecordType, ResourceRef, Subject, SubjectKind,
 };
 use flotilla_resources::{Forge, ForgeKind, ForgeSpec, InputMeta};
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 use flotilla_tui::pm_connect::ConnectorState;
 use tracing::instrument::WithSubscriber;
 
@@ -42,7 +43,7 @@ async fn connector_rebuilds_warn_only_on_gap_transitions() {
         rows: Rows::Convoys { scope: None, rows: vec![convoy] },
         state: Default::default(),
     }));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let forge = backend
         .using::<Forge>("dev")
         .create(

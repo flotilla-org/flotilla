@@ -1,8 +1,9 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 #[tokio::test]
 async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
@@ -146,7 +147,7 @@ fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
 
 #[tokio::test]
 async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
     let refresher = ChangeRequestRefresher::new(
@@ -215,7 +216,7 @@ async fn zero_subject_landing_settles_as_claim_exit_through_engine() {
 
 #[tokio::test]
 async fn change_request_bound_after_claims_instantiates_and_settles() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
     let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {

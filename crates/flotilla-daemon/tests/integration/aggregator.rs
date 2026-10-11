@@ -3,6 +3,7 @@
 //! Verifies that creating a Convoy resource causes a ResultSet event to
 //! reach subscribed clients through the daemon's broadcast event bus.
 
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -37,7 +38,7 @@ use flotilla_resources::{
     RepositorySpec, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
     VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
@@ -88,7 +89,7 @@ fn independent_rows(result_set: &ResultSet) -> &[IndependentRow] {
 async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
     let repository_key = repository_spec.key();
     backend
@@ -286,7 +287,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
 async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootstrap() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
     let repository_key = repository_spec.key();
     backend
@@ -370,7 +371,7 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
 async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
     let repository_key = repository_spec.key();
     backend
@@ -480,7 +481,7 @@ async fn aggregator_emits_result_set_events() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -535,7 +536,7 @@ async fn aggregator_emits_result_set_events() {
 async fn running_convoyless_session_emits_attachable_independent_row() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
     let repository_key = repository_spec.key();
     backend
@@ -950,7 +951,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -1114,7 +1115,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
     use flotilla_resources::{CrewSource, CrewSpec, WorkflowTemplate, WorkflowTemplateSpec};
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),

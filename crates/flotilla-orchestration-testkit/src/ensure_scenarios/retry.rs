@@ -1,6 +1,7 @@
 //! Retry scenarios using the shared daemon harness.
 
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 pub async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_attention_is_cleared(
     factory: &dyn EnsureScenarioController,
@@ -147,7 +148,7 @@ pub async fn declared_driver_derives_bounded_backoff_from_its_homed_generations(
             .expect("replicate ensures");
     }
 
-    let host_origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
+    let host_origin = ResourceBackend::new(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
     let hosts = host_origin.using::<ResourceHost>("flotilla");
     let host = hosts
         .create(
@@ -344,7 +345,7 @@ pub async fn resolved_default_branch_dependency_change_retries_admission_before_
 
     let repository =
         backend.using::<Repository>("flotilla").list().await.expect("repositories").items.into_iter().next().expect("repository");
-    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = ResourceBackend::new(InMemoryBackend::default());
     let source_repositories = source.using::<Repository>("flotilla");
     let source_repository =
         source_repositories.create(&test_meta(&repository.metadata.name), &repository.spec).await.expect("replica repository source");

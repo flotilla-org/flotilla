@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
 use flotilla_core::provider_config;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -110,7 +111,7 @@ use flotilla_resources::{
     WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
     HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{apply_status_patch, ResourceBackend, SqliteBackend, TypedResolver};
+use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
 use futures::StreamExt;
 use tokio::sync::Notify;
 
@@ -1560,7 +1561,7 @@ async fn deleting_a_missing_authoritative_resource_converges_across_peer_relay_c
     )
     .await;
     let origin = authority.node_id().clone();
-    let fixture_backend = ResourceBackend::InMemory(Default::default());
+    let fixture_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let fixture = fixture_backend.using::<ResourceConvoy>("flotilla");
     fixture
         .create(
@@ -6204,7 +6205,7 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config = test_config_store(temp.path().join("config"));
     let database_path = temp.path().join("resources.sqlite");
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("open resource store"));
+    let backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("open resource store"));
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::clone(&config),
@@ -6269,7 +6270,7 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
     drop(terminals);
     drop(backend);
 
-    let restarted_backend = ResourceBackend::Sqlite(SqliteBackend::open(&database_path).expect("reopen resource store"));
+    let restarted_backend = ResourceBackend::new(SqliteBackend::open(&database_path).expect("reopen resource store"));
     let _restarted =
         InProcessDaemon::new_with_resource_backend(Vec::new(), config, fake_discovery(false), HostName::local(), restarted_backend.clone())
             .await;
@@ -6622,10 +6623,10 @@ impl RepositoryInspector for ForgeAliasInspector {
 #[tokio::test]
 async fn forge_alias_observations_from_two_hosts_record_canonical_live_remote_additively() {
     use flotilla_resources::Forge;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     let temp = tempfile::tempdir().expect("create tempdir");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let forge = lab_forge_spec();
     backend
         .definitions::<Forge>("flotilla")
@@ -7055,14 +7056,14 @@ async fn forge_identity_sweep_merges_records_whose_bookkeeping_annotations_diffe
 #[tokio::test]
 async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
     use flotilla_resources::Forge;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
     std::fs::create_dir_all(&repo).expect("create repository path");
     let source_root = NodeId::new("source-root");
-    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(source_root.clone());
-    let target = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("target-root"));
+    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(source_root.clone());
+    let target = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("target-root"));
     let old = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops")
         .expect("legacy Repository")
         .with_allow_reviewless_workflows(true);
@@ -9460,13 +9461,13 @@ async fn startup_forgejo_case(
     daemon_credential: Option<&str>,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     use flotilla_resources::Forge;
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
     let (temp, fixture) = symlinked_fixture();
     let repo = fixture.join("repo");
     let healthy = fixture.join("healthy");
     std::fs::create_dir_all(&repo).expect("create Forgejo checkout directory");
     std::fs::create_dir_all(&healthy).expect("create healthy checkout directory");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     backend
         .definitions::<Forge>("flotilla")
         .create(&InputMeta::builder().name("flotilla-lab".into()).build(), &lab_forge_spec())

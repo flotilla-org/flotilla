@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 #[test]
 fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
@@ -12,7 +13,7 @@ fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
 
 #[tokio::test]
 async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
     let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::host_account_reach()]);
     let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())]);
@@ -144,7 +145,7 @@ async fn convoy_holds_and_recovers_when_terminal_pool_is_transiently_unavailable
     std::fs::create_dir_all(&config_path).expect("config dir");
     std::fs::write(config_path.join("daemon.toml"), "machine_id = \"transient-pool-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_path));
-    let backend = ResourceBackend::InMemory(Default::default());
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let pool = Arc::new(TransientTerminalPool::new());
 
     let initial = daemon_with_transient_terminal_pool(Arc::clone(&config), backend.clone(), Arc::clone(&pool)).await;

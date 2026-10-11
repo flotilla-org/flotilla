@@ -360,7 +360,7 @@ macro_rules! dispatch_manifest_apply_resource_kind {
 /// representation no longer decodes under the running schema. Other backends
 /// cannot contain an untyped local row and need no scan.
 pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, namespace: &str) -> Result<(), ResourceError> {
-    if !matches!(backend, ResourceBackend::Sqlite(_)) {
+    if !backend.durable_local() {
         return Ok(());
     }
     for registered in REGISTERED_RESOURCE_KINDS {
@@ -1542,13 +1542,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InMemoryBackend, InputMeta, PrincipalRef, Regard,
-        RegardExpiryPolicy, RegardSource, RegardSpec,
+        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InputMeta, PrincipalRef, Regard, RegardExpiryPolicy,
+        RegardSource, RegardSpec,
     };
 
     #[tokio::test]
     async fn replica_source_wire_provenance_comes_from_the_store() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let local = backend.using::<Convoy>("flotilla");
         let mut watch = watch_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("watch sources");
         let stale_annotations = BTreeMap::from([
@@ -1611,7 +1611,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_resource_kind_returns_k8s_wire_list() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
             .using::<Convoy>("flotilla")
             .create(&InputMeta::builder().name("demo".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
@@ -1628,7 +1628,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_resource_status_decodes_the_registered_kind() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
             .using::<Usage>("flotilla")
             .create(
@@ -1662,8 +1662,8 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_delete_emits_the_normal_event_and_drops_an_in_memory_peer_replica() {
-        let source = ResourceBackend::InMemory(InMemoryBackend::default());
-        let peer = ResourceBackend::InMemory(InMemoryBackend::default());
+        let source = ResourceBackend::new(crate::test_store::memory_backend());
+        let peer = ResourceBackend::new(crate::test_store::memory_backend());
         let convoys = source.using::<Convoy>("flotilla");
         convoys
             .create(&InputMeta::builder().name("ghost".to_string()).build(), &ConvoySpec::builder().workflow_ref("wf".to_string()).build())
@@ -1691,7 +1691,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_resource_list_marks_stale_heartbeat_not_ready() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let hosts = backend.using::<Host>("flotilla");
         let host = hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default()).await.expect("create host");
         hosts
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_replica_resource_list_derives_ready_from_origin_heartbeat() {
-        let source = ResourceBackend::InMemory(InMemoryBackend::default());
+        let source = ResourceBackend::new(crate::test_store::memory_backend());
         let source_hosts = source.using::<Host>("flotilla");
         let host = source_hosts
             .create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default())
@@ -1738,7 +1738,7 @@ mod tests {
             .await
             .expect("write source stale heartbeat");
         let source_list = source_hosts.list().await.expect("list source hosts");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
             .replica_writer::<Host>(NodeId::new("feta-node"), "flotilla")
             .replace(&source_list, Utc::now())
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_kind_reports_registered_plural_names() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let error = list_resource_kind(&backend, "flotilla", "nope").await.expect_err("unknown kind should fail");
         let message = error.to_string();
         assert!(message.contains("unknown resource kind 'nope'"));
@@ -1762,7 +1762,7 @@ mod tests {
 
     #[tokio::test]
     async fn attention_resource_kinds_are_registered_for_dynamic_listing() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         backend
             .using::<Regard>("flotilla")
             .create(
@@ -1800,7 +1800,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_resource_document_creates_registered_resources() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let applied = apply_resource_document(
             &backend,
             "flotilla",
@@ -1835,7 +1835,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_resource_document_reapply_preserves_existing_metadata_when_omitted() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(crate::test_store::memory_backend());
         let resolver = backend.using::<Demand>("flotilla");
         let owner_reference = OwnerReference {
             api_version: "flotilla.work/v1".to_string(),

@@ -2,6 +2,7 @@
 //! registry is process-wide and parallel projection tests register the same
 //! callsite without a subscriber while this test installs a scoped capture.
 
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 
 use flotilla_manifest::{
@@ -22,7 +23,7 @@ fn uncovered_subject_service_warns_with_service() {
 
     use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
     use flotilla_resources::{ChangeRequestSpec, InputMeta, IssueSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use tracing::{
         field::{Field, Visit},
         span::{Attributes, Id, Record},
@@ -60,7 +61,7 @@ fn uncovered_subject_service_warns_with_service() {
         fn enter(&self, _: &Id) {}
         fn exit(&self, _: &Id) {}
     }
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let observations = runtime.block_on(async {
         SubjectCatalogInput {

@@ -1795,7 +1795,7 @@ mod tests {
                 self.0.clone()
             }
         }
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let namespace = "test-mounts";
         let repo_ref = RepositoryKey("test-repo".into());
         backend
@@ -1905,8 +1905,8 @@ mod tests {
 
     #[tokio::test]
     async fn vessel_resolves_prepared_placement_snapshot_from_a_third_origin() {
-        let author = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("author"));
-        let driver = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("driver"));
+        let author = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("author"));
+        let driver = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("driver"));
         let snapshot_name = "placement-snapshot-012345abcdef";
         author
             .using::<PlacementPolicy>("flotilla")
@@ -1962,7 +1962,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_checkout_names_are_scoped_by_placement_and_dispatch_attempt() {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let convoy = backend
             .using::<Convoy>("flotilla")
             .create(
@@ -2065,7 +2065,7 @@ mod tests {
 
     #[test]
     fn missing_host_local_environment_warns_with_store_and_host_context() {
-        let backend = ResourceBackend::InMemory(Default::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let reconciler = VesselReconciler::new(backend.clone(), "flotilla")
             .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
         let log_output = Arc::new(Mutex::new(Vec::new()));

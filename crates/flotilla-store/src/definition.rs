@@ -1,3 +1,4 @@
+use crate::StoreExt;
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
@@ -44,7 +45,7 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
-        if matches!(&self.backend, ResourceBackend::Http(_)) {
+        if self.backend.serves_read_views() {
             return self.backend.using::<T>(&self.namespace).get(name).await;
         }
         let sources = self.sources_for_name(name).await?;
@@ -60,7 +61,7 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn list(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
-        if matches!(&self.backend, ResourceBackend::Http(_)) {
+        if self.backend.serves_read_views() {
             return self.backend.using::<T>(&self.namespace).list().await.map(|list| list.items);
         }
         let mut by_name = BTreeMap::<String, Vec<DefinitionSource<T>>>::new();
@@ -187,28 +188,14 @@ impl<T: Resource> DefinitionResolver<T> {
         merge.conflicts.clear();
 
         match self.backend.using::<T>(&self.namespace).get(&meta.name).await {
-            Ok(local) => match &self.backend {
-                ResourceBackend::InMemory(backend) => {
-                    backend
-                        .update_definition_typed::<T>(&self.namespace, &admitted_meta, &local.metadata.resource_version, spec, merge)
-                        .await?;
-                }
-                ResourceBackend::Sqlite(backend) => {
-                    backend
-                        .update_definition_typed::<T>(&self.namespace, &admitted_meta, &local.metadata.resource_version, spec, merge)
-                        .await?;
-                }
-                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-            },
-            Err(ResourceError::NotFound { .. }) => match &self.backend {
-                ResourceBackend::InMemory(backend) => {
-                    backend.create_definition_typed::<T>(&self.namespace, &admitted_meta, spec, merge).await?;
-                }
-                ResourceBackend::Sqlite(backend) => {
-                    backend.create_definition_typed::<T>(&self.namespace, &admitted_meta, spec, merge).await?;
-                }
-                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-            },
+            Ok(local) => {
+                self.backend
+                    .update_definition_typed::<T>(&self.namespace, &admitted_meta, &local.metadata.resource_version, spec, merge)
+                    .await?;
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                self.backend.create_definition_typed::<T>(&self.namespace, &admitted_meta, spec, merge).await?;
+            }
             Err(error) => return Err(error),
         }
         self.get(&meta.name).await
@@ -253,28 +240,14 @@ impl<T: Resource> DefinitionResolver<T> {
         meta.deletion_timestamp = Some(Utc::now());
 
         match self.backend.using::<T>(&self.namespace).get(name).await {
-            Ok(local) => match &self.backend {
-                ResourceBackend::InMemory(backend) => {
-                    backend
-                        .update_definition_typed::<T>(&self.namespace, &meta, &local.metadata.resource_version, &current.spec, merge)
-                        .await?;
-                }
-                ResourceBackend::Sqlite(backend) => {
-                    backend
-                        .update_definition_typed::<T>(&self.namespace, &meta, &local.metadata.resource_version, &current.spec, merge)
-                        .await?;
-                }
-                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-            },
-            Err(ResourceError::NotFound { .. }) => match &self.backend {
-                ResourceBackend::InMemory(backend) => {
-                    backend.create_definition_typed::<T>(&self.namespace, &meta, &current.spec, merge).await?;
-                }
-                ResourceBackend::Sqlite(backend) => {
-                    backend.create_definition_typed::<T>(&self.namespace, &meta, &current.spec, merge).await?;
-                }
-                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-            },
+            Ok(local) => {
+                self.backend
+                    .update_definition_typed::<T>(&self.namespace, &meta, &local.metadata.resource_version, &current.spec, merge)
+                    .await?;
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                self.backend.create_definition_typed::<T>(&self.namespace, &meta, &current.spec, merge).await?;
+            }
             Err(error) => return Err(error),
         }
         Ok(())
@@ -293,28 +266,14 @@ impl<T: Resource> DefinitionResolver<T> {
             conflicts: BTreeMap::new(),
         });
         match self.backend.using::<T>(&self.namespace).get(&meta.name).await {
-            Ok(local) => match &self.backend {
-                ResourceBackend::InMemory(backend) => {
-                    backend
-                        .update_definition_typed::<T>(&self.namespace, meta, &local.metadata.resource_version, &current.spec, merge)
-                        .await?;
-                }
-                ResourceBackend::Sqlite(backend) => {
-                    backend
-                        .update_definition_typed::<T>(&self.namespace, meta, &local.metadata.resource_version, &current.spec, merge)
-                        .await?;
-                }
-                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-            },
-            Err(ResourceError::NotFound { .. }) => match &self.backend {
-                ResourceBackend::InMemory(backend) => {
-                    backend.create_definition_typed::<T>(&self.namespace, meta, &current.spec, merge).await?;
-                }
-                ResourceBackend::Sqlite(backend) => {
-                    backend.create_definition_typed::<T>(&self.namespace, meta, &current.spec, merge).await?;
-                }
-                ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP backends cannot author definitions")),
-            },
+            Ok(local) => {
+                self.backend
+                    .update_definition_typed::<T>(&self.namespace, meta, &local.metadata.resource_version, &current.spec, merge)
+                    .await?;
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                self.backend.create_definition_typed::<T>(&self.namespace, meta, &current.spec, merge).await?;
+            }
             Err(error) => return Err(error),
         }
         self.get(&meta.name).await
@@ -327,11 +286,7 @@ impl<T: Resource> DefinitionResolver<T> {
             Err(ResourceError::NotFound { .. }) => Vec::new(),
             Err(error) => return Err(error),
         };
-        let replicas = match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
-            ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
-            ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP definition views are served by the origin store")),
-        };
+        let replicas = { self.backend.get_replicas_typed::<T>(&self.namespace, name).await? };
         sources.extend(replicas.into_iter().filter_map(|replica| match replica.provenance {
             ResourceProvenance::Replica { origin_root, last_synced_at } => {
                 Some(DefinitionSource { object: replica.object, origin: origin_root, synced_at: Some(last_synced_at) })
@@ -349,11 +304,7 @@ impl<T: Resource> DefinitionResolver<T> {
             .into_iter()
             .map(|object| DefinitionSource { object, origin: local_root.clone(), synced_at: None })
             .collect::<Vec<_>>();
-        let replicas = match &self.backend {
-            ResourceBackend::InMemory(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP definition views are served by the origin store")),
-        };
+        let replicas = { self.backend.list_replicas_typed::<T>(&self.namespace).await? };
         sources.extend(replicas.into_iter().filter_map(|replica| match replica.provenance {
             ResourceProvenance::Replica { origin_root, last_synced_at } => {
                 Some(DefinitionSource { object: replica.object, origin: origin_root, synced_at: Some(last_synced_at) })

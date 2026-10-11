@@ -1,3 +1,5 @@
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::config::ConfigStore;
@@ -13,7 +15,7 @@ use flotilla_resources::{
     ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceProvenance, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{watch_resource_kind_replica_sources, InMemoryBackend, ResourceBackend, SqliteBackend};
+use flotilla_store::{watch_resource_kind_replica_sources, ResourceBackend};
 use futures::StreamExt;
 
 fn config(path: std::path::PathBuf, machine_id: &str) -> Arc<ConfigStore> {
@@ -23,12 +25,12 @@ fn config(path: std::path::PathBuf, machine_id: &str) -> Arc<ConfigStore> {
 }
 
 async fn daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -> Arc<InProcessDaemon> {
-    daemon_with_backend(path, machine_id, host, ResourceBackend::InMemory(InMemoryBackend::default())).await
+    daemon_with_backend(path, machine_id, host, ResourceBackend::new(InMemoryBackend::default())).await
 }
 
 async fn sqlite_daemon(path: std::path::PathBuf, machine_id: &str, host: &str) -> Arc<InProcessDaemon> {
     std::fs::create_dir_all(&path).expect("create sqlite daemon directory");
-    let backend = ResourceBackend::Sqlite(SqliteBackend::open(path.join("resources.sqlite")).expect("open sqlite backend"));
+    let backend = ResourceBackend::new(SqliteBackend::open(path.join("resources.sqlite")).expect("open sqlite backend"));
     daemon_with_backend(path, machine_id, host, backend).await
 }
 
@@ -371,7 +373,7 @@ async fn lost_authority_record_tombstone_converges_through_two_peers() {
     let gouda = daemon(temp.path().join("gouda"), "gouda-root", "gouda").await;
     let origin = kiwi.node_id().clone();
 
-    let fixture_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let fixture_backend = ResourceBackend::new(InMemoryBackend::default());
     let fixture = fixture_backend.using::<TerminalSession>("flotilla");
     fixture
         .create(
@@ -1329,7 +1331,7 @@ async fn reconnect_uses_log_until_horizon_or_quarantine_requires_one_snapshot() 
         let temp = tempfile::tempdir().expect("tempdir");
         let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
         let origin_path = temp.path().join("origin.sqlite");
-        let backend = ResourceBackend::Sqlite(
+        let backend = ResourceBackend::new(
             SqliteBackend::open_with_event_retention(&origin_path, EventRetention::new(2).expect("retention")).expect("origin store"),
         );
         let feta = daemon_with_backend(temp.path().join("feta"), "feta-root", "feta", backend).await;

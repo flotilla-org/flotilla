@@ -1,6 +1,7 @@
 //! Shared scenario fixtures and stand-ins for credential-controller and forge I/O.
 
 use crate::provider_config;
+use flotilla_store_memory::InMemoryBackend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,7 @@ use flotilla_resources::{
     VesselRequirement, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
     VESSEL_LABEL, VESSEL_REF_LABEL,
 };
-use flotilla_store::{InMemoryBackend, ResourceBackend};
+use flotilla_store::ResourceBackend;
 
 use crate::config::ConfigStore;
 use crate::discovery_api::EnvironmentBag;
@@ -108,7 +109,7 @@ impl WorkCredentialReconciler for SessionStagingProbe {
 }
 
 pub(super) async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
-    resume_staging_fixture_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await
+    resume_staging_fixture_with_backend(ResourceBackend::new(InMemoryBackend::default())).await
 }
 
 pub(super) async fn resume_staging_fixture_with_backend(
@@ -563,7 +564,7 @@ pub(super) async fn set_host_credential_expiry(backend: &ResourceBackend, host_r
 pub(super) async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir, tokio::task::JoinHandle<()>) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"stall-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),

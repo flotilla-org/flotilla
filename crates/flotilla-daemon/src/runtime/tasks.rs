@@ -1084,7 +1084,7 @@ mod forge_demand_tests {
     // Both deletion representations release the same replica dedup key.
     #[tokio::test]
     async fn demand_deletion_events_release_key() {
-        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let now = Utc::now();
         let object = backend
             .using::<ForgeRead>("flotilla")

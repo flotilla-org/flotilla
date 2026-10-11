@@ -3,6 +3,8 @@
 //! This reconciler intentionally does not prune objects whose source documents
 //! disappear. Deletion and adoption are separate, explicit lifecycle acts.
 
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
@@ -1120,7 +1122,7 @@ mod tests {
     use flotilla_protocol::{HostName, NodeId};
     use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_resources::{InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, WatchStart, WorkflowTemplate};
-    use flotilla_store::{patch_resource_annotation, InMemoryBackend, ResourceBackend, MANIFEST_WRITER_SOURCE};
+    use flotilla_store::{patch_resource_annotation, ResourceBackend, MANIFEST_WRITER_SOURCE};
     use futures::StreamExt;
 
     use super::*;
@@ -1139,7 +1141,7 @@ mod tests {
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-m", "charter subtree"]);
         let cache = tempfile::tempdir().expect("charter cache");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let source = CharterSource::Repository {
             repo: repo.path().to_string_lossy().into_owned(),
             branch: "main".into(),
@@ -1228,7 +1230,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("local source");
         let cache = tempfile::tempdir().expect("unused cache");
         write(&dir.path().join("policy.yaml"), &manifest("laptop", "local"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, cache.path())
             .with_binding(Some(CharterSource::LocalDirectory { directory: dir.path().to_string_lossy().into_owned() }));
         reconciler.reconcile_once_for_test().await.expect("apply directory");
@@ -1367,7 +1369,7 @@ mod tests {
             &dir.path().join("beta.json"),
             r#"{"apiVersion":"flotilla.work/v1","kind":"PlacementPolicy","metadata":{"name":"beta"},"spec":{"pool":"two","priority":100}}"#,
         );
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
@@ -1401,7 +1403,7 @@ mod tests {
         let feta_dir = tempfile::tempdir().expect("feta tempdir");
         write(&kiwi_dir.path().join("policy.yaml"), &manifest("shared", "current"));
         write(&feta_dir.path().join("policy.yaml"), &manifest("shared", "stale"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
 
         let mut kiwi = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, kiwi_dir.path())
             .with_declared_source("project-map", "kiwi")
@@ -1422,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn clean_manifest_tree_resolves_head_revision() {
         let dir = committed_manifest_repo();
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = versioned_reconciler(dir.path(), backend.clone()).await;
 
         reconciler.reconcile_once_for_test().await.expect("clean revision");
@@ -1435,7 +1437,7 @@ mod tests {
     async fn dirty_manifest_tree_is_rejected_as_unversioned_input() {
         let dir = committed_manifest_repo();
         write(&dir.path().join("untracked.yaml"), &manifest("draft", "uncommitted"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = versioned_reconciler(dir.path(), backend).await;
 
         let error = reconciler.reconcile_once_for_test().await.expect_err("dirty tree must be rejected");
@@ -1450,7 +1452,7 @@ mod tests {
         git(dir.path(), &["add", ".gitignore"]);
         git(dir.path(), &["commit", "-m", "ignore local manifests"]);
         write(&dir.path().join("draft.local.yaml"), &manifest("draft", "ignored"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = versioned_reconciler(dir.path(), backend).await;
 
         let error = reconciler.reconcile_once_for_test().await.expect_err("ignored manifest must be rejected");
@@ -1461,7 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_tree_outside_git_is_rejected() {
         let dir = tempfile::tempdir_in("/tmp").expect("non-git tempdir");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = versioned_reconciler(dir.path(), backend).await;
 
         let error = reconciler.reconcile_once_for_test().await.expect_err("non-repository must be rejected");
@@ -1473,7 +1475,7 @@ mod tests {
     async fn steady_state_and_restart_perform_no_writes_or_events() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut first = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         first.reconcile_once_for_test().await.expect("initial pass");
         let before = backend.using::<PlacementPolicy>(NAMESPACE).get("steady").await.expect("policy");
@@ -1492,7 +1494,7 @@ mod tests {
     async fn unrelated_source_revision_does_not_rewrite_unchanged_object() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("steady-revision", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path())
             .with_declared_source("project-map", "kiwi")
             .with_revision("revision-one");
@@ -1513,7 +1515,7 @@ mod tests {
     async fn loop_recovers_when_manifest_directory_appears_later() {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = parent.path().join("not-created-yet");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         materialize_manifest_root(&backend, NAMESPACE, &root, "local", "local").await.expect("materialize root");
         let task = tokio::spawn(ResourceManifestReconciler::new(backend.clone(), NAMESPACE, root.clone()).run(Duration::from_millis(5)));
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1539,7 +1541,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("moving", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
@@ -1587,7 +1589,7 @@ mod tests {
             )
         };
         write(&path, &workflow("echo-one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
 
@@ -1641,7 +1643,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("drifted", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
@@ -1673,7 +1675,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("atomic-refusal", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
@@ -1699,7 +1701,7 @@ mod tests {
     async fn convergent_live_spec_repairs_any_baseline_and_ownership() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("convergent", "same"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         resolver
             .create(
@@ -1725,7 +1727,7 @@ mod tests {
     async fn fresh_object_has_persisted_baseline_on_following_pass() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("fresh-baseline", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("creation pass").created, 1);
@@ -1743,7 +1745,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("suspended", "manifest"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
@@ -1775,7 +1777,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("sync-me", "manifest"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
@@ -1822,7 +1824,7 @@ mod tests {
     async fn claimed_resolution_is_not_replayed_after_reconciler_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("interrupted", "manifest"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
@@ -1863,8 +1865,8 @@ mod tests {
         let current_dir = tempfile::tempdir().expect("current manifest dir");
         write(&current_dir.path().join("project.json"), &project_manifest("single-agent", true));
 
-        let current = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("current-root"));
-        let stale = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("stale-root"));
+        let current = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("current-root"));
+        let stale = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("stale-root"));
         let mut current_reconciler = ResourceManifestReconciler::new(current.clone(), NAMESPACE, current_dir.path());
         current_reconciler.reconcile_once_for_test().await.expect("current creation");
         let stale_document = serde_json::from_str(&project_manifest("single-agent", false)).expect("stale manifest document");
@@ -1935,7 +1937,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("adopt-me", "manifest"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("creation");
@@ -1962,7 +1964,7 @@ mod tests {
     async fn unmanaged_object_is_never_adopted() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .using::<PlacementPolicy>(NAMESPACE)
             .create(
@@ -2001,7 +2003,7 @@ mod tests {
     async fn unmanaged_warning_is_rearmed_after_ownership_is_restored() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("unmanaged", "manifest"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         resolver
             .create(
@@ -2039,7 +2041,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("broken.yaml"), "kind: [");
         write(&dir.path().join("valid.yaml"), &manifest("valid", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
 
         let report = reconciler.reconcile_once_for_test().await.expect("manifest pass");
@@ -2060,7 +2062,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.yaml");
         write(&path, &manifest("retained", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
         std::fs::remove_file(path).expect("remove manifest");
@@ -2077,7 +2079,7 @@ mod tests {
     async fn legacy_state_annotations_decode_and_are_stripped_on_apply() {
         let dir = tempfile::tempdir().expect("tempdir");
         write(&dir.path().join("policy.yaml"), &manifest("legacy", "one"));
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
         let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
         reconciler.reconcile_once_for_test().await.expect("initial pass");
@@ -2109,7 +2111,7 @@ mod registered_charter_tests {
         CharterPointer, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, RepositoryKey,
         ResourceProvenance,
     };
-    use flotilla_store::InMemoryBackend;
+    use flotilla_store_memory::InMemoryBackend;
 
     use super::*;
     use crate::testkits::server::spawn_in_memory_request_topology;
@@ -2132,7 +2134,7 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn scope_refusal_preserves_the_entire_last_applied_candidate() {
         let directory = tempfile::tempdir().expect("fleet directory");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let pointer = CharterPointer::Inline { documents: vec![], files: BTreeMap::new() };
         let good = project(pointer);
         std::fs::write(directory.path().join("project.json"), serde_json::to_string(&good).expect("encode")).expect("write");
@@ -2166,7 +2168,7 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn unbound_source_refreshes_charter_provenance_and_can_return_to_legacy() {
         let directory = tempfile::tempdir().expect("fleet input");
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let ensure = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "ConvoyEnsure", "metadata": {"name": "app-governor"}, "spec": {"project_ref": "app", "role": "governor", "workflow_ref": "govern", "repositories": ["app-repo"]}});
         let mut registration = project(CharterPointer::Inline { documents: vec![ensure.clone()], files: BTreeMap::new() });
         let mut legacy_spec: ProjectSpec = serde_json::from_value(registration["spec"].clone()).expect("legacy spec");
@@ -2217,8 +2219,8 @@ mod registered_charter_tests {
     #[tokio::test]
     async fn fleet_placement_policy_federates_alongside_host_local_policy() {
         let directory = tempfile::tempdir().expect("fleet input");
-        let fleet_backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let host_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let fleet_backend = ResourceBackend::new(InMemoryBackend::default());
+        let host_backend = ResourceBackend::new(InMemoryBackend::default());
         for (name, machine) in [("fleet-config", "fleet-root"), ("host-config", "host-root")] {
             let config = directory.path().join(name);
             std::fs::create_dir_all(&config).expect("config directory");

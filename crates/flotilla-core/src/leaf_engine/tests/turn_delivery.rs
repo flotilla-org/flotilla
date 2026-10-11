@@ -1,4 +1,5 @@
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 // #2684: queue acceptance remains queued for every attention state. Only an
 // exact terminal receipt confirms submission; age raises advisory attention.
@@ -516,7 +517,7 @@ async fn conflicting_mergeability_delivers_once_per_episode_and_escalates_to_hol
 
 #[tokio::test]
 async fn issue_turn_delivery_fires_once_for_changed_issue() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(4);
     let refresher = ChangeRequestRefresher::new(
         "fleet".to_string(),
@@ -675,7 +676,7 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         use flotilla_resources::promises::{PromiseKind, PromiseOperation, PromiseSource, Submission};
         use flotilla_resources::{Observation, ObservedChangeRequestState};
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let wake = supervision_wake(&backend);
         let table = &wake.subscriptions;
         let actuator = Arc::new(RecordingTurnDelivery::default());

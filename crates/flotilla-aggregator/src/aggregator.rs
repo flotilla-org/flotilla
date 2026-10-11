@@ -1,5 +1,7 @@
 //! Resource-store Aggregator maintaining named-query result sets.
 
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -2842,7 +2844,7 @@ mod tests {
         PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus, RepositorySpec, TerminalAttention,
         TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
     use uuid::Uuid;
@@ -3607,8 +3609,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_bootstraps_materialization_and_subscribed_fleet_awareness() {
-        let durable = ResourceBackend::InMemory(InMemoryBackend::default());
-        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let mut convoy = convoy_with_vessel("convoy-a").await;
         convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
             Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
@@ -3747,7 +3749,7 @@ mod tests {
     }
 
     async fn convoy_ensure_object(role: &str, status: Option<flotilla_resources::ConvoyEnsureStatus>) -> ResourceObject<ConvoyEnsure> {
-        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let mut ensure = backend
             .using::<ConvoyEnsure>("flotilla")
             .create(
@@ -4201,7 +4203,7 @@ mod tests {
     }
 
     async fn convoy_object(name: &str) -> ResourceObject<Convoy> {
-        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         backend
             .using::<Convoy>("flotilla")
             .create(
@@ -4213,7 +4215,7 @@ mod tests {
     }
 
     async fn project_object(name: &str) -> ResourceObject<Project> {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .using::<Project>("flotilla")
             .create(
@@ -4229,7 +4231,7 @@ mod tests {
     }
 
     async fn convoy_with_branch(name: &str) -> ResourceObject<Convoy> {
-        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         backend
             .using::<Convoy>("flotilla")
             .create(
@@ -4252,7 +4254,7 @@ mod tests {
     }
 
     pub(super) async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
-        let backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let resolver = backend.using::<Convoy>("flotilla");
         let created = resolver
             .create(
@@ -4278,7 +4280,7 @@ mod tests {
     }
 
     async fn session_object(name: &str) -> ResourceObject<TerminalSession> {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let resolver = backend.using::<TerminalSession>("flotilla");
         let created = resolver
             .create(
@@ -4304,7 +4306,7 @@ mod tests {
     }
 
     async fn environment_object(name: &str) -> ResourceObject<Environment> {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .using::<Environment>("flotilla")
             .create(
@@ -4320,7 +4322,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_catalog_reads_replicas_and_retains_other_origins_after_deletion() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let repository = repository_object("https://github.com/flotilla-org/remote-only").await;
         let key = repository.spec.key();
         let now = Utc::now();
@@ -4392,7 +4394,7 @@ mod tests {
     }
 
     async fn repository_object(url: &str) -> ResourceObject<Repository> {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let spec = RepositorySpec::remote(url).expect("valid repository URL");
         backend
             .using::<Repository>("flotilla")
@@ -4402,7 +4404,7 @@ mod tests {
     }
 
     async fn checkout_object(name: &str, path: &str, repo_ref: RepositoryKey) -> ResourceObject<Checkout> {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         backend
             .using::<Checkout>("flotilla")
             .create(
@@ -4533,7 +4535,7 @@ mod tests {
         let awareness_query =
             QueryId::Awareness { scope: None, grouping: flotilla_protocol::AwarenessGrouping::Convoy, limit: Default::default() };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: awareness_query.clone(), since: None }]);
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let reason = "checkout checkout-orphan: Pushed=False (1 unpushed commit)";
         let demand = backend
             .using::<Demand>("flotilla")
@@ -5625,7 +5627,7 @@ mod tests {
         use flotilla_resources::{VesselPhase, VesselSpec, VesselStatus};
         for remote in [false, true] {
             for phase in [ResourceWorkPhase::Running, ResourceWorkPhase::Interrupted] {
-                let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+                let backend = ResourceBackend::new(InMemoryBackend::default());
                 let convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call();
                 let (events, _) = broadcast::channel(128);
                 let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
@@ -5694,7 +5696,7 @@ mod tests {
             .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(6)))
             .collect::<Vec<_>>();
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
-            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let backend = ResourceBackend::new(InMemoryBackend::default());
             let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
             if governor {
                 convoy.spec.role = "governor".into();
@@ -6070,8 +6072,8 @@ mod tests {
 
     #[tokio::test]
     async fn restart_relist_removes_local_rows_missing_from_stores() {
-        let durable = ResourceBackend::InMemory(InMemoryBackend::default());
-        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
         let state = AggregatorProjectionState::new();
         let stale_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "deleted-during-outage");
         state.write().await.local_rows.insert(
@@ -6428,11 +6430,11 @@ mod tests {
         for sqlite in [false, true] {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let durable = if sqlite {
-                ResourceBackend::Sqlite(flotilla_store::SqliteBackend::open(temp.path().join("gate.sqlite")).expect("sqlite"))
+                ResourceBackend::new(flotilla_store_sqlite::SqliteBackend::open(temp.path().join("gate.sqlite")).expect("sqlite"))
             } else {
-                ResourceBackend::InMemory(InMemoryBackend::default())
+                ResourceBackend::new(InMemoryBackend::default())
             };
-            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+            let observed = ResourceBackend::new(InMemoryBackend::observed());
             let sessions = durable.using::<TerminalSession>("flotilla");
             let session = session_object("terminal-probe").await;
             let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6528,7 +6530,7 @@ mod tests {
 #[cfg(test)]
 mod project_parent_tests {
     use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InputMeta, ProjectSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
 
     use super::*;
 
@@ -6536,7 +6538,7 @@ mod project_parent_tests {
     // explicit intermediate Project is published using the shared resolver.
     #[tokio::test]
     async fn designation_watch_rebuilds_project_parents() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         for (name, parent) in [("root", None), ("group", None), ("child", Some("group"))] {
             backend
                 .definitions::<Project>("flotilla")

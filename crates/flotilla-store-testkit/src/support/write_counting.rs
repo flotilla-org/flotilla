@@ -22,7 +22,7 @@ impl WriteCountingBackend {
     }
 
     pub fn in_memory() -> Self {
-        Self::new(ResourceBackend::InMemory(Default::default()))
+        Self::new(ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()))
     }
 
     pub fn inner(&self) -> ResourceBackend {

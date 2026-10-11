@@ -1,3 +1,5 @@
+#[cfg(test)]
+use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::BTreeSet,
     process::{Output, Stdio},
@@ -566,7 +568,7 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{CanonicalHostId, NodeId, PlacementDecision, PlacementTargetHost, PrincipalRef};
     use flotilla_resources::{ConvoySpec, ConvoyStatus, HostSpec, InputMeta, VesselSpec};
-    use flotilla_store::{InMemoryBackend, ResourceBackend};
+    use flotilla_store::ResourceBackend;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -698,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_reacquires_for_an_existing_active_convoy() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
@@ -725,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn releases_only_after_the_last_convoy_becomes_terminal() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
@@ -767,8 +769,8 @@ mod tests {
 
     #[tokio::test]
     async fn remotely_dispatched_convoy_placed_here_holds_inhibition() {
-        let local = ResourceBackend::InMemory(InMemoryBackend::default());
-        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        let local = ResourceBackend::new(InMemoryBackend::default());
+        let remote = ResourceBackend::new(InMemoryBackend::default());
         let hosts = local.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         let remote_convoys = remote.using::<Convoy>(NAMESPACE);
@@ -792,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn locally_dispatched_convoy_placed_elsewhere_does_not_hold_inhibition() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         create_convoy(&backend.using::<Convoy>(NAMESPACE), "remote-work", ConvoyPhase::Active, Some("other-host")).await;
@@ -814,7 +816,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_placement_holds_until_replica_catches_up() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         let convoys = backend.using::<Convoy>(NAMESPACE);
@@ -861,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_vessel_holds_after_its_convoy_no_longer_requires_inhibition() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         let vessels = backend.using::<Vessel>(NAMESPACE);
         create_host(&hosts).await;
@@ -915,7 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_work_does_not_require_inhibition_when_the_host_cannot_sleep() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
@@ -940,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn capability_probe_failure_conservatively_requires_inhibition() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
@@ -966,7 +968,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sleep_capable_host_with_failing_inhibitor_becomes_degraded() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         create_convoy(&backend.using::<Convoy>(NAMESPACE), "active", ConvoyPhase::Active, Some("test-host")).await;
@@ -998,7 +1000,7 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_failure_publishes_a_host_condition_that_recovery_clears() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let backend = ResourceBackend::new(InMemoryBackend::default());
         let hosts = backend.using::<Host>(NAMESPACE);
         create_host(&hosts).await;
         let mut inhibitor = ScriptedInhibitor {

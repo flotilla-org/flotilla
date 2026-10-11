@@ -1,6 +1,7 @@
 //! Admission scenarios using the shared daemon harness.
 
 use super::*;
+use flotilla_store_memory::InMemoryBackend;
 
 pub async fn two_origins_admit_identical_placements_without_authorship_collision(factory: &dyn EnsureScenarioController) {
     assert_independent_placement_snapshots(factory, false).await;
@@ -410,7 +411,7 @@ pub async fn admission_rejects_agent_roles_reused_across_vessels_before_writing_
 pub async fn generation_allocation_sees_live_and_terminal_replicated_convoys(factory: &dyn EnsureScenarioController) {
     let (daemon, source, clock, _temp) = standing_ensure_fixture(factory).await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let backend = ResourceBackend::new(InMemoryBackend::default());
     let writer = backend.replica_writer::<ResourceConvoy>(NodeId::new("other-root"), "flotilla");
     writer.replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source convoys"), Utc::now()).await.expect("replicate");
     let error = allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster")
@@ -436,7 +437,7 @@ pub async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes(f
     let mut ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
     ensure.spec.placement_policy = Some("remote-policy".to_string());
     let absent = factory.dependency_hash(&daemon, "flotilla", &ensure).await.expect("absent fingerprint");
-    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = ResourceBackend::new(InMemoryBackend::default());
     let mut policy = placement_policy(&source, "remote-policy", "other-host").await;
     let writer = backend.replica_writer::<PlacementPolicy>(NodeId::new("other-root"), "flotilla");
     writer
@@ -467,7 +468,7 @@ pub async fn replicated_ensure_is_not_reconciled_away_from_its_project_home(fact
     backend.using::<Project>("flotilla").delete("standing-project").await.expect("remove local project");
 
     let remote_root = NodeId::new("remote-root");
-    let origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(remote_root.clone());
+    let origin = ResourceBackend::new(InMemoryBackend::default()).with_local_root(remote_root.clone());
     origin.using::<Project>("flotilla").create(&InputMeta::from(&project.metadata), &project.spec).await.expect("remote project");
     origin.using::<ConvoyEnsure>("flotilla").create(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("remote ensure");
     backend
@@ -593,7 +594,7 @@ pub async fn foreign_statusless_generation_at_ensure_address_blocks_admission_wi
 pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driver_root(factory: &dyn EnsureScenarioController) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"root-b\"\n").expect("daemon config");
-    let target = ResourceBackend::InMemory(InMemoryBackend::default());
+    let target = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -612,7 +613,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         )
         .await
         .expect("root B host resource");
-    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let source = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
     let source_repository = source
@@ -726,7 +727,7 @@ pub async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_
         .expect("admitted convoy on root B");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
 
-    let conflicting_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let conflicting_source = ResourceBackend::new(InMemoryBackend::default());
     let conflicting_repository = conflicting_source
         .using::<Repository>("flotilla")
         .create(&test_meta(&repository_key.to_string()), &repository_spec)
@@ -849,7 +850,7 @@ pub async fn off_home_driver_admits_an_ensure_from_replicated_project_definition
     let (_home, home_backend, _clock, _home_temp) = standing_ensure_fixture(factory).await;
     let driver_temp = tempfile::tempdir().expect("driver tempdir");
     std::fs::write(driver_temp.path().join("daemon.toml"), "machine_id = \"driver-test\"\n").expect("driver config");
-    let driver_backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
+    let driver_backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("driver-root"));
     let home_root = NodeId::new("home-root");
     driver_backend
         .replica_writer::<Project>(home_root.clone(), "flotilla")
