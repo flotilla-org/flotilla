@@ -1,29 +1,24 @@
 use flotilla_discovery_api::provider_config::{ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig};
 use flotilla_paths::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
-pub struct TestConfig(DaemonHostPath);
-
-impl TestConfig {
-    pub fn new(path: &std::path::Path) -> Self {
-        Self(DaemonHostPath::new(path))
-    }
-}
+// AI factories use environment assertions and must not read configuration.
+pub struct TestConfig;
 
 #[async_trait::async_trait]
 impl ProviderConfigView for TestConfig {
     fn base_path(&self) -> &DaemonHostPath {
-        &self.0
+        panic!("AI utility factories must not read config paths")
     }
 
     fn state_dir(&self) -> &DaemonHostPath {
-        &self.0
+        panic!("AI utility factories must not read config paths")
     }
 
     fn resolve_checkout_config(&self, _: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
-        ResolvedCheckoutConfig { path: String::new() }
+        panic!("AI utility factories must not resolve checkout config")
     }
 
     async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
-        Ok(ProviderConfig::default())
+        panic!("AI utility factories must not load config")
     }
 }

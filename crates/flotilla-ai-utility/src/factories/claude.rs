@@ -109,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn claude_api_ai_utility_factory_succeeds_with_api_key() {
         let bag = bag_with_api_key();
-        let config = TestConfig::new(std::path::Path::new("/config"));
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
@@ -118,7 +118,7 @@ mod tests {
     #[tokio::test]
     async fn claude_api_ai_utility_factory_fails_without_api_key() {
         let bag = EnvironmentBag::new();
-        let config = TestConfig::new(std::path::Path::new("/config"));
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without API key");
@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn claude_cli_ai_utility_factory_succeeds_with_binary() {
         let bag = bag_with_claude_binary();
-        let config = TestConfig::new(std::path::Path::new("/config"));
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
@@ -147,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn claude_cli_ai_utility_factory_fails_without_binary() {
         let bag = EnvironmentBag::new();
-        let config = TestConfig::new(std::path::Path::new("/config"));
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without claude binary");

@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+# The HTTP Messages contract binds a loopback listener; core forwards its skip.
 skip-no-sandbox-tests = []
 
 [dependencies]
