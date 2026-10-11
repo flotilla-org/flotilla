@@ -4,11 +4,10 @@ use std::fmt::Write;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{arg::shell_quote, Leaf, LeafAddress, LeafOperator};
 use flotilla_resources::{
-    actor_obligation, select_convoy_children, ChangeRequest, Checkout, Convoy, ConvoyAttention, ConvoyEnsure, ConvoyPhase, ConvoyStatus,
-    CrewCompletionRefusal, CrewCompletionRefusalCause, LeafMaker, NudgeObligation, Project, ResourceObject, StallEvidenceSource,
-    StallNudge, StallRung, StallSupervisor, StalledCondition, SupervisionTarget, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule, Vessel, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    actor_obligation, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal,
+    CrewCompletionRefusalCause, LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor,
+    StalledCondition, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
 use super::sources::{change_request_sources, freshest_change_requests};
@@ -229,6 +228,32 @@ impl ReconcilerWake {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let backend = &self.subscriptions.inner.backend;
+        let cell = self.views(namespace).await?;
+        let views = cell.get().expect("initialized views");
+        let projects = views.projects.list().await.map_err(|error| error.to_string())?.items;
+        let available_convoys = views.convoys.list().await.map_err(|error| error.to_string())?.items;
+        let available_ensures = views.ensures.list().await.map_err(|error| error.to_string())?.items;
+        let sessions = views.sessions.list().await.map_err(|error| error.to_string())?.items;
+        let observation_list = views.change_requests.list().await.map_err(|error| error.to_string())?;
+        let progress_observations = freshest_change_requests(&change_request_sources(observation_list.clone()));
+        let observations = observation_list.items;
+        let checkouts = views.checkouts.list().await.map_err(|error| error.to_string())?.items;
+        let vessels = views.vessels.list().await.map_err(|error| error.to_string())?.items;
+        let messages = views.messages.list().await.map_err(|error| error.to_string())?.items;
+        // Routing helpers retain their public Store-based interface, but all
+        // their reads come from the same request snapshot of the watched kinds.
+        let mut snapshot = flotilla_store::ViewSnapshot::new(backend.local_root().ok());
+        snapshot.insert(namespace, flotilla_resources::ReadResourceList { items: projects.clone() }).map_err(|error| error.to_string())?;
+        snapshot
+            .insert(namespace, flotilla_resources::ReadResourceList { items: available_convoys.clone() })
+            .map_err(|error| error.to_string())?;
+        snapshot
+            .insert(namespace, flotilla_resources::ReadResourceList { items: available_ensures.clone() })
+            .map_err(|error| error.to_string())?;
+        snapshot.insert(namespace, flotilla_resources::ReadResourceList { items: sessions.clone() }).map_err(|error| error.to_string())?;
+        snapshot.insert(namespace, views.defaults.list().await.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        snapshot.insert(namespace, views.fleet.list().await.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        let read_backend = flotilla_store::ResourceBackend::from_arc(std::sync::Arc::new(snapshot));
         let inbox = self
             .subscriptions
             .inner
@@ -238,31 +263,20 @@ impl ReconcilerWake {
             .entry(namespace.to_string())
             .or_insert_with(|| flotilla_store::MessageInbox::new(backend.clone(), namespace))
             .clone();
-        flotilla_store::reconcile_charter_notifications_with_renderer(
+        flotilla_store::reconcile_charter_notifications_with_view(
             &inbox,
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
             now,
+            &read_backend,
         )
         .await
         .map_err(|error| error.to_string())?;
-        let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let available_convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let available_ensures =
-            backend.including_replicas::<ConvoyEnsure>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let sessions = backend.including_replicas::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let observation_list = backend.including_replicas::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?;
-        let progress_observations = freshest_change_requests(&change_request_sources(observation_list.clone()));
-        let observations = observation_list.items;
-        let checkouts = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let vessels = backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let messages =
-            backend.including_replicas::<flotilla_resources::Message>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let rows = self.subscriptions.rows().await;
         self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
         for convoy in convoys.values() {
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, &sessions);
-            self.observe_queued_turns(namespace, convoy, &selected_sessions, now).await?;
+            self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, &messages, now).await?;
             let selected_vessels = select_convoy_children(convoy, &vessels);
             let selected_checkouts = select_convoy_children(convoy, &checkouts);
             let mut obligations = status.nudge_obligations.clone();
@@ -816,8 +830,9 @@ impl ReconcilerWake {
                     .and_then(stalled_source_actor)
                     .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
                     .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
-                let path =
-                    flotilla_store::supervision_path(backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
+                let path = flotilla_store::supervision_path(&read_backend, namespace, project, &sender)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 if !path.is_empty() {
                     // Explicit convoy supervision remains first; Project and fleet
                     // routing comes from subscriptions, not role-name guesses.
@@ -1190,7 +1205,7 @@ impl ReconcilerWake {
                                     supervisor
                                 }
                                 SupervisionTarget::Address { address } => {
-                                    flotilla_store::resolve_message_receiver(backend, namespace, address)
+                                    flotilla_store::resolve_message_receiver(&read_backend, namespace, address)
                                         .await
                                         .map_err(|error| error.to_string())?
                                         .map(|holder| {

@@ -131,6 +131,7 @@ pub struct LeafSubscriptionTable {
 
 struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
+    watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
     charter_brief_renderer: Arc<dyn flotilla_store::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
@@ -207,6 +208,7 @@ impl LeafSubscriptionTable {
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
                 backend,
+                watch_views: Default::default(),
                 message_inboxes: Default::default(),
                 charter_brief_renderer: Arc::new(flotilla_store::CharterProseRenderer),
                 event_sink,
@@ -236,18 +238,8 @@ impl LeafSubscriptionTable {
     /// Step locally authored convoys once. Supervisor and child context is read
     /// from the replica view during judgement; replica convoys are never actuated.
     pub async fn reconcile_stalls_once(&self, namespace: &str) -> Result<(), String> {
-        let convoys = self
-            .inner
-            .backend
-            .using::<Convoy>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .map(|convoy| (convoy.metadata.name.clone(), convoy))
-            .collect();
         let wake = ReconcilerWake::new(self.clone());
+        let convoys = wake.local_convoys(namespace).await?;
         wake.sync_rows(namespace, &convoys).await?;
         wake.judge_stalls(namespace, &convoys).await
     }

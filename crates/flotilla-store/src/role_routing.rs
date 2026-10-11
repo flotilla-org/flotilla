@@ -315,11 +315,21 @@ pub async fn reconcile_charter_notifications_with_renderer(
     renderer: &dyn CharterBriefRenderer,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), ResourceError> {
+    reconcile_charter_notifications_with_view(inbox, renderer, now, &inbox.backend).await
+}
+
+/// Use watch-maintained reads for charter routing while retaining the durable
+/// inbox for admission and writes.
+pub async fn reconcile_charter_notifications_with_view(
+    inbox: &crate::MessageInbox,
+    renderer: &dyn CharterBriefRenderer,
+    now: chrono::DateTime<chrono::Utc>,
+    backend: &ResourceBackend,
+) -> Result<(), ResourceError> {
     use crate::{InputMeta, MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, TerminalSessionSource};
     use sha2::{Digest, Sha256};
     // Keep charter passes ordered without blocking unrelated Message producers.
     let _charter_pass = inbox.charter_notifications.lock().await;
-    let backend = &inbox.backend;
     let namespace = inbox.namespace.as_str();
     let receivers = MessageReceiverSnapshot::load(backend, namespace).await?;
     let projects = backend.definitions::<Project>(namespace).list().await?;

@@ -31,10 +31,15 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
     Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, DemandAddressee, DemandState, Environment, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
-    RegardExpiryPolicy, Repository, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance, StallRung, StalledCondition,
-    TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement, WatchEvent, WatchStart,
-    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    Demand, DemandAddressee, DemandState, Environment, Project, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy, Repository,
+    Resource, ResourceError, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, Vessel, VesselRequirement, WatchEvent, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
+    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+#[cfg(test)]
+use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
+use flotilla_store::{
+    recover_indexed_view, recover_local_view, LocalViewSource as AggregatorWatchSource, ViewSource as AggregatorReplicaWatchSource,
 };
 use flotilla_store::{ReplicaReadResolver, TypedResolver};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
@@ -108,43 +113,6 @@ enum LocalSource {
 
 const LOCAL_SOURCE_PRECEDENCE: [LocalSource; 2] = [LocalSource::Durable, LocalSource::Observed];
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
-
-#[async_trait]
-trait AggregatorWatchSource<T: Resource>: Send + Sync {
-    async fn list(&self) -> Result<ResourceList<T>, ResourceError>;
-    async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError>;
-}
-
-#[async_trait]
-impl<T: Resource> AggregatorWatchSource<T> for TypedResolver<T> {
-    async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
-        self.list().await
-    }
-
-    async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
-        self.watch(start).await
-    }
-}
-
-#[async_trait]
-trait AggregatorReplicaWatchSource<T: Resource>: Send + Sync {
-    async fn list_and_watch(
-        &self,
-    ) -> Result<(ReadResourceList<T>, BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>), ResourceError>;
-}
-
-#[async_trait]
-impl<T: Resource> AggregatorReplicaWatchSource<T> for ReplicaReadResolver<T> {
-    async fn list_and_watch(
-        &self,
-    ) -> Result<(ReadResourceList<T>, BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>), ResourceError> {
-        // The aggregate replica view has no single resumable cursor. Subscribe
-        // first so a racing write is present in the list, the watch, or both.
-        let watch = self.watch().await?;
-        let listed = self.list().await?;
-        Ok((listed, watch))
-    }
-}
 
 #[async_trait]
 pub(crate) trait AttachCapabilityResolver: Send + Sync {
@@ -322,8 +290,6 @@ impl Default for ChangeRequestRefreshQueue {
 }
 
 impl Aggregator {
-    const WATCH_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
-
     #[cfg(test)]
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
         let event_rx = event_tx.subscribe();
@@ -811,12 +777,7 @@ impl Aggregator {
         source: LocalSource,
         resolver: &dyn AggregatorWatchSource<Convoy>,
     ) -> Result<WatchStream<Convoy>, ResourceError> {
-        loop {
-            match self.list_and_watch_convoys(source, resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        self.list_and_watch_convoys(source, resolver).await
     }
 
     async fn recover_replica_convoy_watch(
@@ -829,33 +790,18 @@ impl Aggregator {
     }
 
     async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        loop {
-            match self.list_and_watch_demands(resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        self.list_and_watch_demands(resolver).await
     }
 
     async fn recover_regard_watch(&mut self, resolver: &dyn AggregatorWatchSource<Regard>) -> Result<WatchStream<Regard>, ResourceError> {
-        loop {
-            match self.list_and_watch_regards(resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        self.list_and_watch_regards(resolver).await
     }
 
     async fn recover_environment_watch(
         &mut self,
         resolver: &dyn AggregatorWatchSource<Environment>,
     ) -> Result<WatchStream<Environment>, ResourceError> {
-        loop {
-            match self.list_and_watch_environments(resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        self.list_and_watch_environments(resolver).await
     }
 
     async fn recover_observed_session_watch(
@@ -879,13 +825,8 @@ impl Aggregator {
     async fn recover_replica_watch<T: Resource>(
         resolver: &dyn AggregatorReplicaWatchSource<T>,
     ) -> Result<(Vec<ReadResourceObject<T>>, BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>), ResourceError> {
-        loop {
-            match resolver.list_and_watch().await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                Ok((listed, watch)) => return Ok((listed.items, watch)),
-                Err(error) => return Err(error),
-            }
-        }
+        let (listed, watch) = recover_indexed_view(resolver).await?;
+        Ok((listed.items, watch))
     }
 
     async fn recover_fleet_designation_watch(
@@ -990,12 +931,7 @@ impl Aggregator {
         &mut self,
         resolver: &dyn AggregatorWatchSource<Checkout>,
     ) -> Result<WatchStream<Checkout>, ResourceError> {
-        loop {
-            match self.list_and_watch_checkouts(resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        self.list_and_watch_checkouts(resolver).await
     }
 
     async fn list_and_watch_convoys(
@@ -1003,16 +939,13 @@ impl Aggregator {
         source: LocalSource,
         resolver: &dyn AggregatorWatchSource<Convoy>,
     ) -> Result<WatchStream<Convoy>, ResourceError> {
-        let listed = resolver.list().await?;
-        let start = WatchStart::resuming_from(&listed);
-        let watch = resolver.watch(start).await?;
+        let (listed, watch) = recover_local_view(resolver).await?;
         self.replace_convoy_source(source, listed.items).await;
         Ok(watch)
     }
 
     async fn list_and_watch_demands(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
-        let listed = resolver.list().await?;
-        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
+        let (listed, watch) = recover_local_view(resolver).await?;
         self.demands =
             listed.items.into_iter().map(|demand| (self.demand_ref(&demand.metadata.namespace, &demand.metadata.name), demand)).collect();
         if self.rebuild_salience_projection().await && !self.bootstrapping {
@@ -1022,8 +955,7 @@ impl Aggregator {
     }
 
     async fn list_and_watch_regards(&mut self, resolver: &dyn AggregatorWatchSource<Regard>) -> Result<WatchStream<Regard>, ResourceError> {
-        let listed = resolver.list().await?;
-        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
+        let (listed, watch) = recover_local_view(resolver).await?;
         self.regards =
             listed.items.into_iter().map(|regard| (self.regard_ref(&regard.metadata.namespace, &regard.metadata.name), regard)).collect();
         if self.rebuild_salience_projection().await && !self.bootstrapping {
@@ -1068,8 +1000,7 @@ impl Aggregator {
         &mut self,
         resolver: &dyn AggregatorWatchSource<Environment>,
     ) -> Result<WatchStream<Environment>, ResourceError> {
-        let listed = resolver.list().await?;
-        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
+        let (_listed, watch) = recover_local_view(resolver).await?;
         self.rebuild_independents_projection().await;
         Ok(watch)
     }
@@ -1078,8 +1009,7 @@ impl Aggregator {
         &mut self,
         resolver: &dyn AggregatorWatchSource<Checkout>,
     ) -> Result<WatchStream<Checkout>, ResourceError> {
-        let listed = resolver.list().await?;
-        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
+        let (listed, watch) = recover_local_view(resolver).await?;
         self.observed_checkouts = listed
             .items
             .into_iter()

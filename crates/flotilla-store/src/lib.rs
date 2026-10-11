@@ -53,7 +53,11 @@ mod role_routing;
 pub use role_routing::*;
 mod status_patch;
 pub use status_patch::*;
+mod view;
 pub mod watch;
+pub use view::*;
+mod view_snapshot;
+pub use view_snapshot::*;
 
 pub mod query;
 pub use query::*;

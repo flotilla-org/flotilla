@@ -1386,3 +1386,46 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
         assert_eq!(status.stalled.is_some(), at >= retry_at, "only the expired unrecovered wait can stall");
     }
 }
+
+// #3044: populated kinds are bootstrapped once; repeated no-op judgements
+// perform zero backing-store reads, including indirect supervisor routing reads.
+#[tokio::test]
+async fn steady_state_stall_judgements_do_not_read_the_store() {
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+    let wake = supervision_wake(&backend);
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("project".into()).build(),
+            &flotilla_resources::ProjectSpec::builder().display_name("Project".into()).build(),
+        )
+        .await
+        .expect("project");
+    for index in 0..32 {
+        create_convoy(&backend, &format!("convoy-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    }
+    for index in 0..32 {
+        let resolver = backend.using::<Convoy>("flotilla");
+        let convoy = resolver.get(&format!("convoy-{index}")).await.expect("convoy");
+        let mut spec = convoy.spec;
+        spec.project_ref = Some("project".into());
+        resolver.update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &spec).await.expect("project membership");
+    }
+    let objects = backend
+        .using::<Convoy>("flotilla")
+        .list()
+        .await
+        .expect("snapshot")
+        .items
+        .into_iter()
+        .map(|convoy| (convoy.metadata.name.clone(), convoy))
+        .collect();
+    let now = Utc::now();
+    wake.judge_stalls_at("flotilla", &objects, now).await.expect("bootstrap");
+    let before = backend.read_calls();
+    for _ in 0..64 {
+        wake.judge_stalls_at("flotilla", &objects, now).await.expect("steady state judgement");
+    }
+    assert_eq!(backend.read_calls(), before, "judgements must use views, including nested routing helpers");
+}
