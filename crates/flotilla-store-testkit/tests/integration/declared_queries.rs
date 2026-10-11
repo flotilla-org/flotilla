@@ -35,6 +35,7 @@ async fn seed(backend: &ResourceBackend) {
         let mut meta = convoy_meta(name);
         meta.labels.insert("team".into(), label.into());
         meta.labels.insert("role".into(), "coder".into());
+        meta.labels.insert("literal".into(), format!("{name}+value"));
         meta.owner_references.push(OwnerReference {
             api_version: "flotilla.work/v1".into(),
             kind: "Project".into(),
@@ -94,6 +95,12 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     // Equality predicates combine with AND; empty selections return all local rows.
     let query = StoreQuery::default();
     assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 3);
+    let plus = backend
+        .query_declared::<Convoy>("flotilla", &StoreQuery::labels(&BTreeMap::from([("literal".into(), "a+value".into())]), false, true))
+        .await
+        .unwrap();
+    assert_eq!(plus.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), vec!["a"]);
+
     for (fields, labels, expected) in [
         (BTreeMap::new(), BTreeMap::from([("team".into(), "target".into()), ("role".into(), "coder".into())]), vec!["a"]),
         (BTreeMap::from([("metadata.name".into(), "b".into())]), BTreeMap::new(), vec!["b"]),

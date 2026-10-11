@@ -184,7 +184,7 @@ pub(super) async fn serve_resource_http_with_daemon(
                     };
                     if key.is_empty()
                         || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-                        || value.contains(['=', '(', ')', '!'])
+                        || (parameter == "labelSelector" && value.contains(['=', '(', ')', '!']))
                         || fields.insert(key.into(), value.into()).is_some()
                     {
                         return write_error(&mut stream, 400, "unsupported selector syntax or duplicate selector key").await;
@@ -377,7 +377,7 @@ mod query_tests {
     #[tokio::test]
     async fn resource_http_honors_declared_selectors() {
         let backend = ResourceBackend::new(InMemoryBackend::default());
-        for (name, label) in [("selected", "target"), ("excluded", "other")] {
+        for (name, label) in [("selected", "target"), ("excluded", "other"), ("punctuation()!", "a+b")] {
             let meta = InputMeta::builder()
                 .name(name.to_owned())
                 .labels(std::collections::BTreeMap::from([("team".into(), label.into())]))
@@ -394,6 +394,14 @@ mod query_tests {
             let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
             assert_eq!(body["items"].as_array().unwrap().len(), 1);
             assert_eq!(body["items"][0]["metadata"]["name"], "selected");
+        }
+        for (parameter, selector) in [("labelSelector", "team=a+b"), ("fieldSelector", "metadata.name=punctuation()!")] {
+            let parameters = url::form_urlencoded::Serializer::new(String::new()).append_pair(parameter, selector).finish();
+            let response = request(backend.clone(), &parameters).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["items"].as_array().unwrap().len(), 1);
+            assert_eq!(body["items"][0]["metadata"]["name"], "punctuation()!");
         }
         for parameters in [
             "labelSelector=invalid",
