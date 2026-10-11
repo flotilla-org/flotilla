@@ -13,10 +13,10 @@ use tokio::sync::Mutex;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::crew_capabilities::CAPABILITIES_HEADING;
-use crate::providers::terminal::TerminalEnvVars;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_terminal::TerminalEnvVars;
 
 mod fleet_canary;
 

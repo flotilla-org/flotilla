@@ -19,7 +19,7 @@ async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
     registry.terminal_pools.insert(
         "passthrough",
         ProviderDescriptor::named(ProviderCategory::TerminalPool, "passthrough"),
-        Arc::new(flotilla_core::providers::terminal::passthrough::PassthroughTerminalPool),
+        Arc::new(flotilla_terminal::passthrough::PassthroughTerminalPool),
     );
 
     let profile = build_local_profile(&daemon, &registry).expect("local profile");

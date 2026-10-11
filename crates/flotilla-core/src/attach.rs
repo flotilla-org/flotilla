@@ -35,9 +35,10 @@ use crate::{
         Hop, HopPlan, ResolutionContext,
     },
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
-    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry, terminal::TerminalSessionLiveness},
+    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_terminal::TerminalSessionLiveness;
 
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,

@@ -21,6 +21,7 @@ members = [
     "crates/flotilla-orchestration-testkit",
     "crates/flotilla-paths",
     "crates/flotilla-provider-runtime",
+    "crates/flotilla-terminal",
     "crates/flotilla-protocol",
     "crates/flotilla-protocol-testkit",
     "crates/flotilla-relay",

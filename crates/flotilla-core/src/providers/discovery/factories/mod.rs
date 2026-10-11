@@ -1,16 +1,15 @@
 pub mod claude;
-pub mod cleat;
 pub mod codex;
 pub mod cursor;
 pub mod docker;
 pub mod github;
 pub mod host_direct;
-pub mod passthrough;
 
 use super::FactoryRegistry;
+use flotilla_terminal::factories::{cleat::CleatTerminalPoolFactory, passthrough::PassthroughTerminalPoolFactory};
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
-    vec![Box::new(cleat::CleatTerminalPoolFactory), Box::new(passthrough::PassthroughTerminalPoolFactory)]
+    vec![Box::new(CleatTerminalPoolFactory), Box::new(PassthroughTerminalPoolFactory)]
 }
 
 fn vcs_factories() -> Vec<Box<super::VcsFactory>> {

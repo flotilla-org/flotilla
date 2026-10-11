@@ -94,6 +94,9 @@ current resource-backed crew:
 
 ### What passthrough means for a crew
 
+The passthrough implementation moved to `crates/flotilla-terminal/src/passthrough.rs`
+in #3036; the source citations below describe the layout at the time of this research.
+
 The daemon seeds Docker placement policies with `pool: passthrough` when that
 pool is available (`crates/flotilla-daemon/src/runtime.rs:248-273`). The
 passthrough pool:

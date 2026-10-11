@@ -402,7 +402,7 @@ pub(super) async fn crew_provisioning_recovery_scenario() {
         .into_iter()
         .filter(|session| session.metadata.name != coder.metadata.name)
         .map(|session| {
-            flotilla_core::providers::terminal::TerminalSession::builder()
+            flotilla_terminal::TerminalSession::builder()
                 .session_name(session.metadata.name)
                 .status(TerminalStatus::Running)
                 .command("persisted process".to_string())

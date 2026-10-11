@@ -36,10 +36,9 @@ use crate::providers::coding_agent::CloudAgentService;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::registry::ProviderSet;
-use crate::providers::scan_cache::SharedTerminalPool;
-use crate::providers::terminal::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_terminal::{scan_cache::SharedTerminalPool, TerminalPool};
 use flotilla_vcs::vcs::Vcs;
 
 pub type ProviderFactory<T> = dyn Factory<Descriptor = ProviderDescriptor, Output = T>;

@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use crate::providers::terminal::environment::ControlledTerminalEnvironment;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_terminal::environment::ControlledTerminalEnvironment;
 
 #[derive(bon::Builder)]
 pub struct CleatEnvironment {

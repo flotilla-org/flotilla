@@ -16,7 +16,7 @@ ci/cleat-environment/build.sh "$scratch/source" "$scratch/bin"
 unset TMPDIR
 FLOTILLA_TEST_CLEAT_OLD="$scratch/bin/old/cleat" \
 FLOTILLA_TEST_CLEAT_NEW="$scratch/bin/new/cleat" \
-  cargo test -p flotilla-core --locked --lib --features cleat-environment-contract launch_environment_contract -- --nocapture
+  cargo test -p flotilla-terminal --locked --lib --features cleat-environment-contract launch_environment_contract -- --nocapture
 ```
 
 The build checks out both pins in the caller's scratch clone and leaves it detached

@@ -34,13 +34,15 @@ const TERMINAL_RUNTIME_KEYS: &[&str] = &[
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
-pub(crate) struct ControlledTerminalEnvironment {
+/// Declared environment for terminal children and Cleat clients.
+/// Public so core's `cleat_roll` can reuse the same controlled runner.
+pub struct ControlledTerminalEnvironment {
     host: TerminalEnvVars,
     client: TerminalEnvVars,
 }
 
 impl ControlledTerminalEnvironment {
-    pub(crate) fn from_bag(bag: &EnvironmentBag) -> Self {
+    pub fn from_bag(bag: &EnvironmentBag) -> Self {
         let mut host = BTreeMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
         if let Some(configured) = bag.provisioned_environment() {
             host.extend(configured.iter().map(|(key, value)| (key.clone(), value.clone())));
@@ -85,7 +87,7 @@ impl ControlledTerminalEnvironment {
 
     /// Clearing at the execution-environment runner seam works for local,
     /// SSH and container runners and controls on-demand daemon startup too.
-    pub(crate) fn runner(&self, inner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+    pub fn runner(&self, inner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
         Arc::new(ControlledCommandRunner { inner, environment: self.client.clone() })
     }
 }

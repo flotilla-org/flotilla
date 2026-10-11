@@ -1,18 +1,18 @@
-use crate::providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize};
+use crate::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSize};
 use async_trait::async_trait;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::commands::AttachMode;
 use flotilla_provider_runtime::scan_cache::SharedScan;
 use std::{sync::Arc, time::Duration};
 
-/// Stays in core because it implements the core-owned TerminalPool provider trait.
-pub(crate) struct SharedTerminalPool {
+/// Shares discovery scans while mutations invalidate the cached session list.
+pub struct SharedTerminalPool {
     inner: Arc<dyn TerminalPool>,
     sessions: SharedScan<Vec<TerminalSession>>,
 }
 
 impl SharedTerminalPool {
-    pub(crate) fn new(inner: Arc<dyn TerminalPool>, ttl: Duration) -> Self {
+    pub fn new(inner: Arc<dyn TerminalPool>, ttl: Duration) -> Self {
         Self { inner, sessions: SharedScan::new(ttl) }
     }
 }
@@ -38,7 +38,7 @@ impl TerminalPool for SharedTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
-        tags: &[super::terminal::TerminalSessionTag],
+        tags: &[crate::TerminalSessionTag],
     ) -> Result<(), String> {
         let result = self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await;
         if result.is_ok() {
@@ -53,7 +53,7 @@ impl TerminalPool for SharedTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
-        tags: &[super::terminal::TerminalSessionTag],
+        tags: &[crate::TerminalSessionTag],
         initial_size: Option<TerminalSize>,
     ) -> Result<(), String> {
         let result = self.inner.ensure_session_with_size(session_name, command, cwd, env_vars, tags, initial_size).await;
