@@ -158,9 +158,21 @@ add_darwin_derivative() {
     printf '#!/usr/bin/env bash\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<'SH'
+if [[ "${1:-}" == --socket && "${3:-}" == --config-dir ]]; then
+  [[ "$2" == "$XDG_CONFIG_HOME/flotilla/run/flotilla.sock" ]] || exit 97
+  [[ "$4" == "$XDG_CONFIG_HOME/flotilla" ]] || exit 97
+  [[ "$5" == --state-dir && "$6" == "$XDG_STATE_HOME/flotilla" ]] || exit 97
+  [[ "${7:-}" == daemon && "${8:-}" == stop ]] || exit 97
+  shift 6
+fi
 if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
   if [[ "${STOP_DISAPPEARS:-0}" == 1 ]]; then rm -f "$LAUNCHCTL_STATE.running"; exit 1; fi
   [[ "${STOP_FAIL:-0}" == 0 ]] || exit 1
+  if [[ -f "$LAUNCHCTL_STATE.starting" ]]; then
+    rm -f "$LAUNCHCTL_STATE.starting"
+    echo "daemon is still starting; retry shutdown" >&2
+    exit 1
+  fi
   rm -f "$LAUNCHCTL_STATE.running"
 fi
 if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; then
@@ -319,6 +331,21 @@ case "$1" in
     [[ "${BOOTOUT_FAIL:-0}" == 0 ]] || exit 1
     rm -f "$LAUNCHCTL_STATE.loaded"
     [[ "${STOP_FAIL:-0}" == 1 ]] || rm -f "$LAUNCHCTL_STATE.running"
+    if [[ "${CLIENT_AFTER_BOOTOUT:-0}" == 1 ]]; then
+      # Process boundary double: a client respects the install marker.
+      if [[ ! -f "$HOME/.config/flotilla/run/install-in-progress" ]]; then
+        printf '%s\n' "$current" >"$LAUNCHCTL_STATE.running"
+        touch "$LAUNCHCTL_STATE.starting"
+        echo spawned >>"$LAUNCHCTL_STATE.client"
+      else
+        echo refused >>"$LAUNCHCTL_STATE.client"
+      fi
+    fi
+    # A spawn admitted before the marker may finish after bootout.
+    if [[ "${LATE_SPAWN_AFTER_BOOTOUT:-0}" == 1 ]]; then
+      printf '%s\n' "$current" >"$LAUNCHCTL_STATE.running"
+      touch "$LAUNCHCTL_STATE.starting"
+    fi
     if [[ "${ABORT_AFTER_BOOTOUT:-0}" == 1 ]]; then kill -"${ABORT_SIGNAL:-TERM}" "$PPID"; fi
     ;;
   bootstrap)
@@ -742,6 +769,18 @@ assert_darwin_tcc_payload() {
 
 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-install-one.out"
 assert_darwin_tcc_payload "$generation_one"
+# A client arriving between bootout and preflight must not resurrect the old
+# daemon. A spawn already admitted must survive a transient startup stop error.
+CLIENT_AFTER_BOOTOUT=1 LATE_SPAWN_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install-window.out" 2>&1 \
+  || fail 'daemon arriving after bootout required a second install attempt'
+grep -Fxq refused "$darwin_home/launchctl-state.client" || fail 'install window permitted a client spawn'
+test ! -e "$darwin_home/.config/flotilla/run/install-in-progress" || fail 'successful install leaked marker'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_two" || fail 'install window ran old generation'
+# Reinstalling the selected generation must also stop a late bare daemon.
+CLIENT_AFTER_BOOTOUT=1 LATE_SPAWN_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-reinstall-window.out" 2>&1 \
+  || fail 'late daemon prevented exact-generation reinstall'
+test ! -e "$darwin_home/launchctl-state.starting" || fail 'reinstall skipped daemon preflight'
+run_darwin_installer "$darwin_home" rollback >/dev/null
 # Refusing validation leaves the old service untouched and available.
 if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-validation.out" 2>&1; then
   fail 'Darwin validation refusal was accepted'
@@ -756,11 +795,14 @@ if STOP_FAIL=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_roo
   fail 'Darwin failed stop was accepted'
 fi
 test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'failed stop switched generation'
+test ! -e "$darwin_home/.config/flotilla/run/install-in-progress" || fail 'failed stop leaked marker'
 test -f "$darwin_home/launchctl-state.loaded" || fail 'failed stop left launch agent unloaded'
 test -f "$darwin_home/launchctl-state.running" || fail 'failed stop left daemon down'
 test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
 
 grep -Fq 'then retry fleet-install' "$test_root/darwin-stop-failed.out" || fail 'failed stop omitted installer retry hint'
+grep -Fq 'generation validation: daemon stop deadline expired' "$test_root/darwin-stop-failed.out" || fail 'stop deadline omitted clean diagnostic'
+if grep -Fq Traceback "$test_root/darwin-stop-failed.out"; then fail 'stop deadline leaked Python traceback'; fi
 # If launchd refuses bootout, recovery must kickstart the existing registration.
 if BOOTOUT_FAIL=1 STOP_FAIL=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-bootout-failed.out" 2>&1; then
   fail 'failed bootout and stop were accepted'
@@ -776,6 +818,7 @@ for abort_signal in TERM INT; do
   if ABORT_AFTER_BOOTOUT=1 ABORT_SIGNAL="$abort_signal" run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-abort-$abort_signal.out" 2>&1; then
     fail "Darwin handoff interrupted by $abort_signal succeeded"
   fi
+  test ! -e "$darwin_home/.config/flotilla/run/install-in-progress" || fail 'interrupted install leaked marker'
   test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'aborted handoff switched generation'
   test -f "$darwin_home/launchctl-state.loaded" || fail 'aborted handoff left agent unloaded'
   test -f "$darwin_home/launchctl-state.running" || fail 'aborted handoff left daemon down'

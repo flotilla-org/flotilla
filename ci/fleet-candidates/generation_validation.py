@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 from xml.parsers.expat import ExpatError
 
@@ -657,6 +658,58 @@ def release_install_lock(path, owner):
         pass
 
 
+def begin_daemon_install(socket, marker):
+    """Serialize marker publication with clients admitted to the spawn path."""
+    import fcntl  # macOS bootstrap only; keep Windows validator imports usable.
+    Path(marker).parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 15
+    with open(socket + ".lock", "a") as lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValidationError("daemon spawn lock did not settle within 15s")
+                time.sleep(0.05)
+        Path(marker).write_text("fleet-install\n")
+
+
+def stop_daemon_for_install(cli, socket, config_dir, state_dir, timeout=30):
+    """Retry startup/transport failures; bound both attempts and CLI execution."""
+    deadline = time.monotonic() + timeout
+    command = [cli, "--socket", socket, "--config-dir", config_dir,
+               "--state-dir", state_dir, "daemon", "stop"]
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError("daemon stop deadline expired after 30s")
+        try:
+            subprocess.run(command, timeout=remaining, check=False)
+        except subprocess.TimeoutExpired:
+            pass
+        # A successful CLI with a missing socket can predate startup awareness.
+        # Process absence, rather than CLI exit status, confirms that stop won.
+        # Preserve preflight's user-wide quiescence requirement: another dev
+        # daemon may still have this generation's executable/libraries mapped.
+        # A daemon on another socket therefore causes a bounded refusal too.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError("daemon stop deadline expired after 30s")
+        try:
+            absent = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "flotillad"],
+                                    timeout=remaining, check=False, stdout=subprocess.DEVNULL).returncode == 1
+        except subprocess.TimeoutExpired:
+            absent = False
+        if absent:
+            print("fleet-install: daemon is no longer running; continuing installation")
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError("daemon stop deadline expired after 30s")
+        time.sleep(min(0.25, remaining))
+
+
 def bootstrap_nonce():
     print(secrets.token_hex(8))
 
@@ -798,6 +851,14 @@ def main():
     helper = sub.add_parser("release-lock")
     helper.add_argument("path")
     helper.add_argument("owner")
+    helper = sub.add_parser("begin-install")
+    helper.add_argument("socket")
+    helper.add_argument("marker")
+    helper = sub.add_parser("stop-daemon")
+    helper.add_argument("cli")
+    helper.add_argument("socket")
+    helper.add_argument("config_dir")
+    helper.add_argument("state_dir")
     sub.add_parser("nonce")
     for command in ("mode", "realpath"):
         helper = sub.add_parser(command)
@@ -830,6 +891,10 @@ def main():
     try:
         if args.command == "release-lock":
             release_install_lock(args.path, args.owner)
+        elif args.command == "begin-install":
+            begin_daemon_install(args.socket, args.marker)
+        elif args.command == "stop-daemon":
+            stop_daemon_for_install(args.cli, args.socket, args.config_dir, args.state_dir)
         elif args.command == "nonce":
             bootstrap_nonce()
         elif args.command == "mode":

@@ -13,6 +13,7 @@ readonly LAUNCH_AGENT_DIR="${FLEET_INSTALL_LAUNCH_AGENT_DIR:-$HOME/Library/Launc
 readonly LAUNCH_AGENT_LABEL="work.flotilla.flotillad"
 readonly DAEMON_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flotilla"
 readonly DAEMON_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flotilla"
+readonly DAEMON_INSTALL_MARKER="$DAEMON_CONFIG_DIR/run/install-in-progress"
 readonly DAEMON_SOCKET="$DAEMON_CONFIG_DIR/run/flotilla.sock"
 readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
@@ -40,6 +41,7 @@ CANARY_ONLY=0
 INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
+DAEMON_INSTALL_MARKER_HELD=0
 DAEMON_SERVICE_DISABLED=0
 DARWIN_RECOVERY_GENERATION=""
 CONFIRMATION_PID=""
@@ -68,6 +70,7 @@ cleanup() {
       status=1
     fi
   fi
+  end_darwin_install_window
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
   if ((INSTALL_LOCK_HELD)); then
     python3 "$GENERATION_VALIDATOR" release-lock -- "$INSTALL_LOCK_PATH" "$INSTALL_LOCK_OWNER"
@@ -477,6 +480,13 @@ write_launchd_agent() {
   mv -f "$temporary" "$plist"
 }
 
+end_darwin_install_window() {
+  if ((DAEMON_INSTALL_MARKER_HELD)); then
+    rm -f -- "$DAEMON_INSTALL_MARKER"
+    DAEMON_INSTALL_MARKER_HELD=0
+  fi
+}
+
 prepare_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   command -v launchctl >/dev/null || die "cannot install $LAUNCH_AGENT_LABEL: launchctl is not available"
@@ -487,6 +497,11 @@ prepare_darwin_daemon_service() {
   if grep -Fq "\"$LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
     DAEMON_SERVICE_DISABLED=1
   fi
+  # Publish under the same flock used by clients. Previously admitted spawns
+  # finish before bootout; later contenders recheck the marker under that lock.
+  DAEMON_INSTALL_MARKER_HELD=1
+  python3 "$GENERATION_VALIDATOR" begin-install -- "$DAEMON_SOCKET" "$DAEMON_INSTALL_MARKER" \
+    || die 'could not establish daemon install window'
   # Unload before publishing the refreshed plist. Enabled clients then defer
   # to launchd, whose kickstart cannot race the generation flip while the job
   # is absent from the domain.
@@ -675,6 +690,16 @@ daemon_preflight() {
     cli="$(command -v flotilla || true)"
   fi
   [[ -n "$cli" ]] || die 'flotillad is running; install a usable flotilla command and run `flotilla daemon stop`'
+  if [[ "$PLATFORM" == darwin-* ]]; then
+    if python3 "$GENERATION_VALIDATOR" stop-daemon -- "$cli" "$DAEMON_SOCKET" "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR"; then
+      return 0
+    fi
+    printf -v invocation '%q daemon stop' "$cli"
+    if ((!DAEMON_SERVICE_DISABLED)); then
+      die "flotillad is still running and could not be stopped; restoring the previous launch agent; resolve the stop failure, then retry fleet-install"
+    fi
+    die "flotillad is running and could not be stopped; run \`$invocation\`, then retry"
+  fi
   if ! "$cli" daemon stop; then
     # The process can exit between the initial probe and the stop request.
     if ! pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1; then
@@ -705,6 +730,7 @@ switch_to() {
   local old
   old="$(current_generation)"
   if [[ "$old" == "$generation" ]]; then
+    if [[ "$PLATFORM" == darwin-* ]]; then daemon_preflight "$generation"; fi
     arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
     if ((!DAEMON_SERVICE_DISABLED)); then
       start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
@@ -752,6 +778,7 @@ activate_staged_generation() {
   switch_to "$generation" "$rollback_generation" "$confirmation_token"
   restart_linux_daemon_service
   restart_darwin_daemon_service
+  end_darwin_install_window
   if ((DAEMON_SERVICE_DISABLED)); then
     disarm_health_confirmation "$confirmation_token"
     printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
@@ -932,6 +959,7 @@ rollback() {
   atomic_link "releases/$current" "$PREVIOUS_LINK"
   restart_linux_daemon_service
   restart_darwin_daemon_service
+  end_darwin_install_window
 }
 
 # Selection and deletion share the install lock. Always delegate to the active

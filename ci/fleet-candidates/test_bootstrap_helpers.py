@@ -20,6 +20,88 @@ def output(function, *args):
 
 
 class BootstrapHelperTests(unittest.TestCase):
+    # Bootstrap command glue must turn missing binaries and deadline refusal
+    # into one diagnostic and exit 1, without leaking a Python traceback.
+    def test_stop_command_errors_exit_cleanly(self):
+        for failures, ticks in (
+            ([FileNotFoundError("CLI missing")], [0, 0]),
+            ([subprocess.CompletedProcess([], 0), FileNotFoundError("pgrep missing")], [0, 0, 1]),
+            ([], [0, 30]),
+        ):
+            stderr = io.StringIO()
+            with self.subTest(failures=failures, ticks=ticks), \
+                 patch.object(sys, "argv", ["validator", "stop-daemon", "--", "cli", "sock", "config", "state"]), \
+                 patch.object(validation.subprocess, "run", side_effect=failures), \
+                 patch.object(validation.time, "monotonic", side_effect=ticks), \
+                 contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as exit_status:
+                    validation.main()
+                self.assertEqual(exit_status.exception.code, 1)
+                self.assertTrue(stderr.getvalue().startswith("generation validation: "), stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+
+    # Subprocess boundary fakes and a monotonic clock cover startup, exit races,
+    # hung CLIs, persistent processes, and erroneous pgrep results without launchd.
+    def test_stop_retries_until_process_absent(self):
+        for first_status in (0, 1):
+            calls = [subprocess.CompletedProcess([], first_status),
+                     subprocess.CompletedProcess([], 0),
+                     subprocess.CompletedProcess([], 0),
+                     subprocess.CompletedProcess([], 1)]
+            with self.subTest(first_status=first_status), \
+                 patch.object(validation.subprocess, "run", side_effect=calls) as run, \
+                 patch.object(validation.time, "monotonic", return_value=0), \
+                 patch.object(validation.time, "sleep") as sleep:
+                validation.stop_daemon_for_install("cli", "sock", "config", "state")
+                self.assertEqual(run.call_count, 4)
+                self.assertEqual(run.call_args_list[0].args[0],
+                                 ["cli", "--socket", "sock", "--config-dir", "config",
+                                  "--state-dir", "state", "daemon", "stop"])
+                sleep.assert_called_once_with(0.25)
+
+    # A timeout or failed probe cannot turn an alive/unknown process into success.
+    def test_stop_has_one_deadline_including_subprocesses(self):
+        for cli_result in (subprocess.TimeoutExpired("cli", 30),
+                           subprocess.CompletedProcess([], 1)):
+            for probe_status in (0, 2):
+                with self.subTest(cli_result=cli_result, probe_status=probe_status), \
+                     patch.object(validation.subprocess, "run", side_effect=[
+                         cli_result, subprocess.CompletedProcess([], probe_status)]) as run, \
+                     patch.object(validation.time, "monotonic", side_effect=[0, 0, 1, 30]), \
+                     patch.object(validation.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(ValueError, "stop deadline expired"):
+                        validation.stop_daemon_for_install("cli", "sock", "config", "state")
+                    self.assertEqual(run.call_args_list[0].kwargs["timeout"], 30)
+                    self.assertEqual(run.call_args_list[1].kwargs["timeout"], 29)
+                    sleep.assert_not_called()
+
+    # The marker is published only once an admitted client releases its spawn
+    # lock. Failure to acquire the lock leaves no new install marker.
+    @unittest.skipUnless(os.name == "posix", "macOS bootstrap flock")
+    def test_install_marker_serializes_with_spawn_lock(self):
+        import fcntl
+        for settle in (True, False):
+            with self.subTest(settle=settle), tempfile.TemporaryDirectory() as root:
+                socket = str(Path(root) / "run/flotilla.sock")
+                marker = str(Path(root) / "run/install-in-progress")
+                def flock(*args):
+                    self.assertFalse(Path(marker).exists())
+                    if flock.first or not settle:
+                        flock.first = False
+                        raise BlockingIOError()
+                flock.first = True
+                ticks = [0, 0] if settle else [0, 15]
+                with patch.object(fcntl, "flock", side_effect=flock), \
+                     patch.object(validation.time, "monotonic", side_effect=ticks), \
+                     patch.object(validation.time, "sleep"):
+                    if settle:
+                        validation.begin_daemon_install(socket, marker)
+                        self.assertTrue(Path(marker).is_file())
+                    else:
+                        with self.assertRaisesRegex(ValueError, "spawn lock did not settle"):
+                            validation.begin_daemon_install(socket, marker)
+                        self.assertFalse(Path(marker).exists())
+
     # The OS boundary stands in for the bootstrap filesystem and entropy source.
     # Every ownership/entry shape is exercised without a process or live fleet.
     def test_release_only_matching_symlink_owner(self):
