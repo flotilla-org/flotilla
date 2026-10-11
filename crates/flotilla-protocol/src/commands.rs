@@ -407,13 +407,18 @@ pub struct ExplainedSettlement {
     pub unmet: Vec<ExplainedUnmetExpectation>,
 }
 
-/// Provenance of the admitted convoy name.
+/// Provenance of the admitted convoy name only. Branch generation is independent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum ConvoyNaming {
+    /// An explicit convoy name; its branch may still come from AI or fallback.
     Explicit,
-    AiUtility { utility: String },
-    DeterministicFallback { reason: String },
+    AiUtility {
+        utility: String,
+    },
+    DeterministicFallback {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

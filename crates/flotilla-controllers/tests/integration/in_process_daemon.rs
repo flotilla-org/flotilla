@@ -4320,7 +4320,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(
         fallback_result,
         CommandValue::ConvoyStarted {
-            naming: Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: offline".into() }),
+            naming: Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: utility unavailable".into() }),
             name: "start-convoy-from-an-issue-732@flotilla".into(),
             attach_plan: None,
             binding: None
@@ -4329,7 +4329,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let fallback = admitted_convoy(&backend, "start-convoy-from-an-issue-732").await;
     assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
     // Admission persists provenance and explain returns the same diagnostic.
-    let expected_naming = Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: offline".into() });
+    let expected_naming =
+        Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: utility unavailable".into() });
     assert_eq!(fallback.status.as_ref().expect("admitted status").naming, expected_naming);
     let explanation = daemon.explain_convoy_internal(Some("flotilla"), &fallback.metadata.name).await.expect("explain naming");
     assert_eq!(explanation.naming, expected_naming);
@@ -9772,3 +9773,39 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
 }
 
 use flotilla_discovery_testkit::InProcessDiscoveryExt;
+
+// Explicit naming means the convoy name, independently of AI/fallback branch generation.
+#[tokio::test]
+async fn explicit_convoy_name_survives_failed_branch_generation() {
+    let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(true) });
+    let mut discovery = fake_discovery(false);
+    discovery.factories.ai_utilities.push(Box::new(CountingConvoyAiUtilityFactory { utility: Arc::clone(&utility) }));
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".into())
+                            .name("explicit-branch-fallback".into())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("start");
+    assert!(matches!(
+        recv_command_finished(&mut events, id).await,
+        CommandValue::ConvoyStarted { naming: Some(flotilla_protocol::ConvoyNaming::Explicit), .. }
+    ));
+    let convoy = admitted_convoy(&backend, "explicit-branch-fallback").await;
+    assert_eq!(convoy.status.as_ref().expect("status").naming, Some(flotilla_protocol::ConvoyNaming::Explicit));
+    assert_eq!(convoy.spec.r#ref.as_deref(), Some("flotilla-flotilla"));
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+}

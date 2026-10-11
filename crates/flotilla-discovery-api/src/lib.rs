@@ -33,6 +33,26 @@ pub enum UnmetRequirement {
     },
 }
 
+impl std::fmt::Display for UnmetRequirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingBinary(name) => write!(f, "missing binary {}", bounded_requirement_name(name)),
+            Self::MissingEnvVar(name) => write!(f, "missing environment variable {}", bounded_requirement_name(name)),
+            Self::MissingAuth(_) => f.write_str("authentication unavailable"),
+            Self::MissingConfig(_) => f.write_str("configuration unavailable"),
+            Self::MissingRemoteHost(name) => write!(f, "missing remote host {}", bounded_requirement_name(name)),
+            Self::NoVcsCheckout => f.write_str("no VCS checkout"),
+            Self::UnknownProviderPreference { category, key } => {
+                write!(f, "unknown {} provider {}", category.display_name(), bounded_requirement_name(key))
+            }
+        }
+    }
+}
+
+fn bounded_requirement_name(name: &str) -> String {
+    name.chars().take(80).collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderCategory {
     Vcs,
@@ -189,3 +209,20 @@ pub trait Factory: Send + Sync {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod requirement_display_tests {
+    use super::*;
+    // Human diagnostics use bounded requirement names; auth/config details may contain secrets.
+    #[test]
+    fn requirements_use_safe_human_descriptions() {
+        assert_eq!(UnmetRequirement::MissingBinary("claude".into()).to_string(), "missing binary claude");
+        assert_eq!(
+            UnmetRequirement::MissingEnvVar("ANTHROPIC_API_KEY".into()).to_string(),
+            "missing environment variable ANTHROPIC_API_KEY"
+        );
+        assert_eq!(UnmetRequirement::MissingAuth("private-token".into()).to_string(), "authentication unavailable");
+        assert_eq!(UnmetRequirement::MissingConfig("private-token".into()).to_string(), "configuration unavailable");
+        assert!(UnmetRequirement::MissingBinary("x".repeat(10000)).to_string().len() <= 100);
+    }
+}
