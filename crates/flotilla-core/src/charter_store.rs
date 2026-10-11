@@ -399,7 +399,11 @@ mod tests {
         let tree = LocalDirectoryTree::new(dir.path().to_path_buf());
         let revision = tree.resolve("main").await.expect("revision");
         let ignored = std::ffi::OsString::from_vec(b"\xff.bin".to_vec());
-        std::fs::write(dir.path().join(ignored), [0xff]).expect("ignored binary");
+        // APFS refuses non-UTF-8 names (EILSEQ), so such files cannot exist there.
+        match std::fs::write(dir.path().join(ignored), [0xff]) {
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+            result => result.expect("ignored binary"),
+        }
         assert_eq!(tree.resolve("main").await.expect("ignored filename"), revision);
         assert_eq!(tree.read_files(&revision, ".").await.expect("charter"), BTreeMap::from([("policy.yaml".into(), "policy".into())]));
     }
