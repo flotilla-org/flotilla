@@ -234,6 +234,25 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     terminals.update(&next_meta, &terminal.metadata.resource_version, &terminal.spec).await.unwrap();
     assert!(backend.query_declared::<TerminalSession>("flotilla", &query).await.unwrap().items.is_empty());
 
+    // Membership selects a named inventory once, with empty sets selecting
+    // nothing and local shadowing independent of the selected predicates.
+    for (names, expected) in
+        [(vec!["a", "remote", "shadow", "missing"], vec!["a", "remote", "shadow"]), (vec![], vec![]), (vec!["a", "a"], vec!["a"])]
+    {
+        let query = StoreQuery::names(names.into_iter().map(str::to_string), true);
+        let result = backend.query_declared::<Convoy>("flotilla", &query).await.expect("named inventory");
+        assert_eq!(result.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), expected);
+    }
+    // Membership intersects other selectors rather than broadening them.
+    let mut query = StoreQuery::names(["a".into(), "b".into()], true);
+    query.labels.insert("team".into(), "target".into());
+    let result = backend.query_declared::<Convoy>("flotilla", &query).await.expect("combined membership");
+    assert_eq!(result.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    query.fields.insert("metadata.name".into(), "b".into());
+    assert!(backend.query_declared::<Convoy>("flotilla", &query).await.expect("contradictory selectors").items.is_empty());
+    let mut query = StoreQuery::names(["a".into()], true);
+    query.field_values.insert("spec.undeclared".into(), ["value".into()].into());
+    assert!(query.validate(flotilla_store::ResourceKind::of::<Convoy>()).is_err());
     // Equality predicates combine with AND; empty selections return all local rows.
     let query = StoreQuery::default();
     assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 3);
@@ -460,6 +479,13 @@ fn inverted_index_tracks_mutations(tc: hegel::TestCase) {
         for name in ["n0", "n1", "n2", "n3"] {
             let query = StoreQuery { fields: BTreeMap::from([("metadata.name".into(), name.into())]), ..Default::default() };
             let expected = objects.keys().filter(|key| key.as_str() == name).cloned().collect();
+            assert_eq!(index.names(&query), expected);
+        }
+        // Generated mutations maintain membership indexes too, including empty
+        // sets and values that disappear after an update or deletion.
+        for names in [vec![], vec!["n0"], vec!["n1", "n3"], vec!["missing"]] {
+            let query = StoreQuery::names(names.iter().map(|name| (*name).into()), false);
+            let expected = objects.keys().filter(|name| names.contains(&name.as_str())).cloned().collect();
             assert_eq!(index.names(&query), expected);
         }
     }

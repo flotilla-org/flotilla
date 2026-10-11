@@ -771,6 +771,10 @@ impl SqliteBackend {
                 predicates.push(format!("{identity} IN ({})", selections.join(" UNION ")));
             }
         }
+        for (path, values) in &query.field_values {
+            args.push(SqlValue::Text(serde_json::json!(values).to_string()));
+            predicates.push(format!("json_extract(o.body_json,'$.{path}') IN (SELECT value FROM json_each(?{}))", args.len()));
+        }
         if let Some(owner) = &query.owner {
             args.push(SqlValue::Text(owner.key()));
             let (candidate, columns, origin) =
@@ -3260,6 +3264,13 @@ mod tests {
                             assert!(migration_names.insert(name.clone()), "colliding index migration {name}: {} {path}", kind.paths.kind);
                         }
                         for path in kind.queryable_fields {
+                            cases.push((
+                                crate::StoreQuery {
+                                    field_values: BTreeMap::from([(path.to_string(), ["first".into(), "second".into()].into())]),
+                                    ..Default::default()
+                                },
+                                SqliteBackend::field_index(table, kind, path),
+                            ));
                             cases.push((
                                 crate::StoreQuery { fields: BTreeMap::from([(path.to_string(), "value".into())]), ..Default::default() },
                                 SqliteBackend::field_index(table, kind, path),

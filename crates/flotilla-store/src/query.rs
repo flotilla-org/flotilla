@@ -24,6 +24,10 @@ pub struct StoreQuery {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub fields: BTreeMap<String, String>,
+    /// Indexed membership: each field must equal one of its supplied values.
+    /// An empty value set selects no rows.
+    #[serde(default)]
+    pub field_values: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub owner: Option<OwnerQuery>,
     /// Alternatives are ORed, then intersected with this query.
@@ -92,6 +96,7 @@ impl Default for StoreQuery {
         Self {
             labels: BTreeMap::new(),
             fields: BTreeMap::new(),
+            field_values: BTreeMap::new(),
             owner: None,
             any_of: None,
             field_values: BTreeMap::new(),
@@ -114,6 +119,10 @@ impl StoreQuery {
     pub fn with_replicas(mut self) -> Self {
         self.include_replicas = true;
         self
+    }
+    /// Read a named inventory in one indexed query, retaining replica evidence.
+    pub fn names(names: impl IntoIterator<Item = String>, include_replicas: bool) -> Self {
+        Self { field_values: BTreeMap::from([("metadata.name".into(), names.into_iter().collect())]), include_replicas, ..Self::default() }
     }
     pub fn labels(labels: &BTreeMap<String, String>, include_replicas: bool, suppress_self_origin: bool) -> Self {
         Self { labels: labels.clone(), include_replicas, suppress_self_origin, ..Self::default() }
