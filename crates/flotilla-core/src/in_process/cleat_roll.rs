@@ -7,11 +7,12 @@ use flotilla_protocol::result_set::CleatEndpoint;
 use flotilla_resources::{Environment, HostCondition, TerminalSession, TerminalSessionPhase};
 
 use super::InProcessDaemon;
-use crate::{
-    cleat_roll::{self, CleatEnvironment, CleatTarget, RollReport},
-    environment_manager::ManagedEnvironmentKind,
-    providers::ChannelLabel,
-};
+use crate::cleat_roll;
+use crate::cleat_roll::CleatEnvironment;
+use crate::cleat_roll::CleatTarget;
+use crate::cleat_roll::RollReport;
+use crate::environment_manager::ManagedEnvironmentKind;
+use flotilla_provider_runtime::ChannelLabel;
 
 #[derive(Default)]
 struct CleatInventory {
@@ -164,11 +165,11 @@ mod tests {
     use crate::discovery_api::EnvironmentBag;
     use crate::providers::environment::ProvisionedEnvironment;
     use crate::providers::environment::ProvisionedMount;
-    use crate::providers::CommandRunner;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::fake_discovery_with_runner;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_provider_runtime::CommandRunner;
 
     struct Contained {
         id: EnvironmentId,

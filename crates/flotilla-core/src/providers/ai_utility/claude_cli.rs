@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use tracing::info;
 
 use super::Model;
-use crate::providers::{run, CommandRunner};
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
 
 pub struct ClaudeCliAiUtility {
     claude_bin: String,

@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
-use flotilla_core::providers::{discovery::EnvVars, environment::EnvironmentProvider, ChannelLabel, CommandRunner};
+use flotilla_core::providers::environment::EnvironmentProvider;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::{
     CachedModelProbe, FulfilmentFacts, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelFact,
     ModelFactSource, ModelProbeState, Platform,
@@ -38,7 +41,7 @@ async fn run_in_realisation(
     binary: &str,
     args: &[&str],
     scratch: &Path,
-) -> Result<flotilla_core::providers::CommandOutput, String> {
+) -> Result<flotilla_provider_runtime::CommandOutput, String> {
     tokio::time::timeout(Duration::from_secs(15), target.provider.detect(target.image, binary, args, scratch))
         .await
         .map_err(|_| format!("timed out probing {binary}"))?
@@ -510,7 +513,7 @@ mod tests {
             args: &[&str],
             cwd: &Path,
             _label: &ChannelLabel,
-        ) -> Result<flotilla_core::providers::CommandOutput, String> {
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
             let stdout = match (cmd, args.first().copied()) {
                 ("mkdir", _) => String::new(),
                 ("claude", Some("--version")) => {
@@ -524,7 +527,7 @@ mod tests {
                 }
                 _ => return Err("unavailable".into()),
             };
-            Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
+            Ok(flotilla_provider_runtime::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {

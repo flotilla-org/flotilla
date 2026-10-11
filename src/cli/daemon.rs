@@ -5,17 +5,14 @@ use std::{
 };
 
 use color_eyre::Result;
-use flotilla_core::{
-    config::ConfigStore,
-    providers::{
-        vcs::{git::GitVcs, VcsInspection},
-        ProcessCommandRunner,
-    },
-};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::providers::vcs::git::GitVcs;
+use flotilla_core::providers::vcs::VcsInspection;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{commands::CommandValue, Command, CommandAction, ProjectListResponse, RepoIdentity, RepoInfo, ViewAddress};
+use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_tui::{
     app, event_log,
     socket::{DaemonEndpoint, SshEndpoint},

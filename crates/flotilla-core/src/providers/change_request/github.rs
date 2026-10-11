@@ -5,18 +5,20 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 use chrono::Utc;
 
-use crate::providers::{
-    change_request::observation::{parse_gh_observation_value_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
-    forge::{
-        github::{clamp_per_page, GhApi},
-        observation_error::ObservationError,
-    },
-    gh_api_channel_label, gh_api_get,
-    github_observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape},
-    run, run_output,
-    types::*,
-    CommandRunner,
-};
+use crate::providers::change_request::observation::parse_gh_observation_value_with_crew_identity;
+use crate::providers::change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
+use crate::providers::forge::github::clamp_per_page;
+use crate::providers::forge::github::GhApi;
+use crate::providers::forge::observation_error::ObservationError;
+use crate::providers::github_observation::ObservationTelemetry;
+use crate::providers::github_observation::ParsedObservationResponse;
+use crate::providers::github_observation::QueryShape;
+use crate::providers::types::*;
+use flotilla_provider_runtime::gh_api_channel_label;
+use flotilla_provider_runtime::gh_api_get;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::run_output;
+use flotilla_provider_runtime::CommandRunner;
 
 fn execution_root() -> &'static Path {
     Path::new("/")
@@ -554,10 +556,10 @@ mod tests {
     use crate::providers::change_request::ChangeRequestTracker;
     use crate::providers::forge::github::GhApiClient;
     use crate::providers::forge::github::GithubRetrySource;
-    use crate::providers::CommandOutput;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_provider_runtime::CommandOutput;
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };

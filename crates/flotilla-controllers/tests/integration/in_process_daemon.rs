@@ -36,8 +36,6 @@ use flotilla_core::providers::types::ChangeRequest;
 use flotilla_core::providers::types::CloudAgentSession;
 use flotilla_core::providers::types::RepoCriteria;
 use flotilla_core::providers::types::SessionStatus;
-use flotilla_core::providers::ChannelLabel;
-use flotilla_core::providers::CommandRunner;
 use flotilla_core::repository_inspection::LocalCheckoutInspection;
 use flotilla_core::repository_inspection::RepositoryContinuity;
 use flotilla_core::repository_inspection::RepositoryInspection;
@@ -96,6 +94,8 @@ use flotilla_protocol::SystemInfo;
 use flotilla_protocol::ToolInventory;
 use flotilla_protocol::TopologyRoute;
 use flotilla_protocol_testkit::TestIssue;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     controller_patches as convoy_controller_patches, implement_review_workflow_spec, single_agent_shepherd_workflow_spec,
     single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -220,8 +220,8 @@ impl RepoDetector for FixedRemoteHostDetector {
     async fn detect(
         &self,
         _repo_root: &ExecutionEnvironmentPath,
-        _runner: &dyn flotilla_core::providers::CommandRunner,
-        _env: &dyn flotilla_core::providers::discovery::EnvVars,
+        _runner: &dyn flotilla_provider_runtime::CommandRunner,
+        _env: &dyn flotilla_provider_runtime::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
         vec![EnvironmentAssertion::remote_host("github.com", self.owner, self.repo, "origin")]
     }
@@ -232,8 +232,8 @@ impl RepoDetector for MutableRemoteHostDetector {
     async fn detect(
         &self,
         _repo_root: &ExecutionEnvironmentPath,
-        _runner: &dyn flotilla_core::providers::CommandRunner,
-        _env: &dyn flotilla_core::providers::discovery::EnvVars,
+        _runner: &dyn flotilla_provider_runtime::CommandRunner,
+        _env: &dyn flotilla_provider_runtime::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
         let repo = self.repo.read().expect("mutable remote detector should not be poisoned").clone();
         vec![EnvironmentAssertion::remote_host("github.com", self.owner, repo, "origin")]
@@ -247,11 +247,7 @@ struct RunnerEchoHostDetector {
 
 #[async_trait]
 impl HostDetector for RunnerEchoHostDetector {
-    async fn detect(
-        &self,
-        runner: &dyn CommandRunner,
-        _env: &dyn flotilla_core::providers::discovery::EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn flotilla_provider_runtime::EnvVars) -> Vec<EnvironmentAssertion> {
         match runner.run("probe-env", &[self.probe], Path::new("/"), &ChannelLabel::Default).await {
             Ok(value) => vec![EnvironmentAssertion::env_var(self.assertion_key, value.trim())],
             Err(_) => Vec::new(),
@@ -271,22 +267,14 @@ struct FixedEnvVarHostDetector {
 
 #[async_trait]
 impl HostDetector for FixedEnvVarHostDetector {
-    async fn detect(
-        &self,
-        _runner: &dyn CommandRunner,
-        _env: &dyn flotilla_core::providers::discovery::EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, _runner: &dyn CommandRunner, _env: &dyn flotilla_provider_runtime::EnvVars) -> Vec<EnvironmentAssertion> {
         vec![EnvironmentAssertion::env_var(self.key, self.value)]
     }
 }
 
 #[async_trait]
 impl HostDetector for EnvVarEchoHostDetector {
-    async fn detect(
-        &self,
-        _runner: &dyn CommandRunner,
-        env: &dyn flotilla_core::providers::discovery::EnvVars,
-    ) -> Vec<EnvironmentAssertion> {
+    async fn detect(&self, _runner: &dyn CommandRunner, env: &dyn flotilla_provider_runtime::EnvVars) -> Vec<EnvironmentAssertion> {
         env.get(self.env_var).map(|value| vec![EnvironmentAssertion::env_var(self.assertion_key, value)]).unwrap_or_default()
     }
 }
@@ -317,10 +305,10 @@ impl CommandRunner for HangingSshRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<flotilla_core::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
-            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
-            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
+            Ok(stdout) => Ok(flotilla_provider_runtime::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+            Err(stderr) => Ok(flotilla_provider_runtime::CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
         }
     }
 
@@ -394,7 +382,7 @@ impl Factory for SlowCloudAgentFactory {
         _: &EnvironmentBag,
         _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
-        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+        _: Arc<dyn flotilla_provider_runtime::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
     }
@@ -453,7 +441,7 @@ impl Factory for SlowAiUtilityFactory {
         _: &EnvironmentBag,
         _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
-        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+        _: Arc<dyn flotilla_provider_runtime::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         if let Some(probes) = &self.probes {
             probes.fetch_add(1, Ordering::SeqCst);
@@ -504,7 +492,7 @@ impl Factory for PanicOnceAiUtilityFactory {
         _: &EnvironmentBag,
         _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
-        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+        _: Arc<dyn flotilla_provider_runtime::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
@@ -550,7 +538,7 @@ impl Factory for CountingConvoyAiUtilityFactory {
         _: &EnvironmentBag,
         _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
-        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+        _: Arc<dyn flotilla_provider_runtime::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
@@ -624,7 +612,7 @@ impl Factory for EnvGatedTerminalPoolFactory {
         env: &EnvironmentBag,
         _: &dyn provider_config::ProviderConfigView,
         _: &ExecutionEnvironmentPath,
-        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+        _: Arc<dyn flotilla_provider_runtime::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         if env.find_env_var(self.required_env_var).is_some() {
             Ok(Arc::clone(&self.pool))
@@ -5192,7 +5180,7 @@ fn static_ssh_test_discovery(runner: Arc<dyn CommandRunner>) -> DiscoveryRuntime
 
 fn static_ssh_test_discovery_with_env_and_detectors(
     runner: Arc<dyn CommandRunner>,
-    env: Arc<dyn flotilla_core::providers::discovery::EnvVars>,
+    env: Arc<dyn flotilla_provider_runtime::EnvVars>,
     host_detectors: Vec<Box<dyn HostDetector>>,
 ) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
@@ -9455,10 +9443,10 @@ impl CommandRunner for StartupForgeRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<flotilla_core::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
-            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
-            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
+            Ok(stdout) => Ok(flotilla_provider_runtime::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+            Err(stderr) => Ok(flotilla_provider_runtime::CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
         }
     }
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {

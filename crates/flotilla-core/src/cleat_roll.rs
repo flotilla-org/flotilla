@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{terminal::environment::ControlledTerminalEnvironment, ChannelLabel, CommandOutput, CommandRunner},
-};
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::terminal::environment::ControlledTerminalEnvironment;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 #[derive(bon::Builder)]
 pub struct CleatEnvironment {

@@ -119,10 +119,11 @@ impl RuntimeHealth {
         let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
         conditions.extend(self.issue_polling.condition());
         if let Some(state_dir) = self.restart_history_dir.clone() {
-            let frequency = flotilla_core::probe::blocking("restart history", flotilla_core::probe::PROBE_TIMEOUT, move || {
-                crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now())
-            })
-            .await;
+            let frequency =
+                flotilla_provider_runtime::probe::blocking("restart history", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+                    crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now())
+                })
+                .await;
             let condition = match frequency {
                 Ok(frequency) if frequency.count > 0 => Some(
                     HostCondition::builder()

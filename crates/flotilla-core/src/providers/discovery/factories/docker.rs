@@ -13,9 +13,9 @@ use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::discovery::UnmetRequirement;
 use crate::providers::environment::docker::DockerEnvironmentProvider;
 use crate::providers::environment::EnvironmentProvider;
-use crate::providers::ChannelLabel;
-use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 pub struct DockerEnvironmentFactory;
 

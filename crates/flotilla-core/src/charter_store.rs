@@ -51,7 +51,11 @@ impl LocalDirectoryTree {
 impl RevisionedTree for LocalDirectoryTree {
     async fn resolve(&self, _reference: &str) -> Result<String, String> {
         let directory = self.directory.clone();
-        let local = crate::probe::blocking("local charter", crate::probe::PROBE_TIMEOUT, move || local_tree_snapshot(&directory)).await?;
+        let local =
+            flotilla_provider_runtime::probe::blocking("local charter", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+                local_tree_snapshot(&directory)
+            })
+            .await?;
         let revision = local.snapshot.revision.clone();
         self.snapshots.lock().expect("local tree snapshots poisoned").insert(revision.clone(), local);
         Ok(revision)
@@ -262,12 +266,14 @@ pub fn ops_root_name(project: &str, member: &flotilla_resources::ProjectReposito
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        providers::{vcs::clone::ReferenceCloneStrategy, ChannelLabel, CommandRunner, ProcessCommandRunner},
-        testkits::discovery::FakeCheckoutManager,
-        vcs::{FlotillaVcs, GitCheckoutStrategy},
-    };
+    use crate::providers::vcs::clone::ReferenceCloneStrategy;
+    use crate::testkits::discovery::FakeCheckoutManager;
+    use crate::vcs::FlotillaVcs;
+    use crate::vcs::GitCheckoutStrategy;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandRunner;
+    use flotilla_provider_runtime::ProcessCommandRunner;
 
     async fn fixture_git(root: &Path, args: &[&str]) {
         ProcessCommandRunner.run("git", args, root, &ChannelLabel::Default).await.expect("fixture git");
@@ -414,7 +420,7 @@ mod tests {
             args: &[&str],
             cwd: &Path,
             label: &ChannelLabel,
-        ) -> Result<crate::providers::CommandOutput, String> {
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
             ProcessCommandRunner.run_output(cmd, args, cwd, label).await
         }
         async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
@@ -470,7 +476,7 @@ mod tests {
             _args: &[&str],
             _cwd: &Path,
             _label: &ChannelLabel,
-        ) -> Result<crate::providers::CommandOutput, String> {
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
             unreachable!("tree fetch uses run")
         }
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {

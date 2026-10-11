@@ -13,15 +13,16 @@ use std::{
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::clone::runtime::CloneFlights;
 use flotilla_controllers::reconcilers::CheckoutRemoval;
-use flotilla_core::{
-    agent_process::ExitReceiptObserver,
-    config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
-    in_process::{InProcessDaemon, StandingConvoyBackingInspector},
-    providers::{registry::ProviderRegistry, ChannelLabel},
-};
+use flotilla_core::agent_process::ExitReceiptObserver;
+use flotilla_core::config::ConfigStore;
+use flotilla_core::config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::in_process::StandingConvoyBackingInspector;
+use flotilla_core::providers::registry::ProviderRegistry;
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
+use flotilla_provider_runtime::ChannelLabel;
 use flotilla_resources::{Convoy, ConvoyProvisioningState, Environment, Host, HostSpec, ResourceError, ResourceObject};
 use tokio::sync::{Mutex, Semaphore};
 

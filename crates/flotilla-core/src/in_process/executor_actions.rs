@@ -45,11 +45,11 @@ use crate::config::ConfigStore;
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::EventSink;
 use crate::executor;
-use crate::providers::discovery::EnvVars;
 use crate::providers::registry::ProviderRegistry;
-use crate::providers::CommandRunner;
 use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepExecutor;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 #[async_trait]
 pub(super) trait ExecutorActionPort: Send + Sync {

@@ -10,7 +10,8 @@ use std::{
 use sha2::{Digest, Sha256};
 use tokio::{sync::Mutex, time::Instant};
 
-use crate::providers::{ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 const OBSERVATION_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_RECEIPTS_PER_CALL: usize = 128;
@@ -134,7 +135,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::providers::{CommandOutput, ProcessCommandRunner};
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::ProcessCommandRunner;
 
     // The real shell is the process boundary: exit receipts must work for both
     // successful and failed child processes, without an agent-provided hook.

@@ -8,15 +8,15 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_core::discovery_api::EnvironmentBag;
-use flotilla_core::providers::discovery::EnvVars;
 use flotilla_core::providers::environment::{
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
     PreparedEnvironmentAuth, RegistryAuth,
 };
-use flotilla_core::providers::ChannelLabel;
-use flotilla_core::providers::CommandRunner;
-use flotilla_core::providers::HttpClient;
-use flotilla_core::providers::ReqwestHttpClient;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
+use flotilla_provider_runtime::HttpClient;
+use flotilla_provider_runtime::ReqwestHttpClient;
 use flotilla_resources::{
     capped_github_app_permissions, Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec,
     CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceError, SystemClock,
@@ -2414,9 +2414,9 @@ mod tests {
 
     use async_trait::async_trait;
     use flotilla_core::discovery_api::EnvironmentAssertion;
-    use flotilla_core::providers::CommandOutput;
-    use flotilla_core::providers::ProcessCommandRunner;
     use flotilla_protocol::NodeId;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_replay_testkit::Masks;
     use flotilla_replay_testkit::ReplayHttpClient;
     use flotilla_replay_testkit::Session;
@@ -4885,7 +4885,7 @@ interactions:
             )
             .await
             .expect("create issued credential");
-        let runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
+        let runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let store = CredentialStore::new(
             backend,
             "flotilla",

@@ -13,7 +13,9 @@ use std::{
 use async_trait::async_trait;
 use tracing::instrument::WithSubscriber;
 
-use flotilla_core::providers::*;
+#[cfg(test)]
+use flotilla_provider_runtime::ProcessCommandRunner;
+use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
 
 #[derive(Clone)]
 struct LogWriter(Arc<Mutex<Vec<u8>>>);

@@ -7,10 +7,15 @@ use std::{
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::providers::{
-    atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
-    CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
-};
+use flotilla_provider_runtime::atomic_write_script;
+use flotilla_provider_runtime::helper_exec_script;
+use flotilla_provider_runtime::install_managed_helper_script;
+use flotilla_provider_runtime::rename_command_timeout;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::FLOTILLA_HELPER_NAME;
+use flotilla_provider_runtime::FLOTILLA_HELPER_SCRIPT;
 
 /// Persistent writable base reserved inside provisioned containers. Unlike a
 /// user's home, this location is known before container creation, so writable
@@ -172,13 +177,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
-    use crate::providers::command_timeout_message;
-    use crate::providers::ChannelLabel;
-    use crate::providers::CommandOutput;
-    use crate::providers::CommandRunner;
-    use crate::providers::ProcessCommandRunner;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::testing::TimeoutOnlyRunner;
+    use flotilla_provider_runtime::command_timeout_message;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
+    use flotilla_provider_runtime::ProcessCommandRunner;
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_docker_exec() {

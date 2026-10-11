@@ -9,15 +9,16 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_core::{
-    crew_capabilities::{CredentialCapability, SessionCapabilitySource},
-    in_process::{InProcessDaemon, WorkCredentialReconciler},
-    providers::{discovery::EnvVars, CommandRunner},
-};
+use flotilla_core::crew_capabilities::CredentialCapability;
+use flotilla_core::crew_capabilities::SessionCapabilitySource;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::in_process::WorkCredentialReconciler;
 use flotilla_credentials::{
     codex_central_auth_path, compose_agent_environment, AgentMaterialRegistry, CodexCentralRefresher, CredentialRefreshError,
     CredentialStore, GithubAppScope,
 };
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 use flotilla_resources::Resource;
 use flotilla_resources::{
     ControllerRetry, ControllerRetryDisposition, Convoy, Demand, DemandKind, DemandSpec, Environment, EnvironmentPhase,

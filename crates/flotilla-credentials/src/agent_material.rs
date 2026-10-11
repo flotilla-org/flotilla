@@ -6,15 +6,17 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::providers::{
-    discovery::EnvVars,
-    environment::{
-        runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE},
-        ProvisionedMount, ProvisionedMountMode,
-    },
-    vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX, STAGE_RETRYABLE_PREFIX, STAGE_SOURCE_PREFIX},
-    ChannelLabel, CommandRunner,
-};
+use flotilla_core::providers::environment::runner::CONTAINED_CODEX_HOME;
+use flotilla_core::providers::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
+use flotilla_core::providers::environment::ProvisionedMount;
+use flotilla_core::providers::environment::ProvisionedMountMode;
+use flotilla_core::providers::vcs::skill_source::stage_git_skill_sources;
+use flotilla_core::providers::vcs::skill_source::STAGE_DIAGNOSTIC_PREFIX;
+use flotilla_core::providers::vcs::skill_source::STAGE_RETRYABLE_PREFIX;
+use flotilla_core::providers::vcs::skill_source::STAGE_SOURCE_PREFIX;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 use futures::future::BoxFuture;
 use tokio::{fs, io::AsyncWriteExt};
 use tracing::{info, warn};
@@ -1091,8 +1093,8 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 pub(crate) mod tests {
     use std::{io, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::Mutex};
 
-    use flotilla_core::providers::CommandOutput;
     use flotilla_discovery_testkit::TestEnvVars;
+    use flotilla_provider_runtime::CommandOutput;
 
     use super::*;
 
@@ -1129,8 +1131,8 @@ pub(crate) mod tests {
             args: &[&str],
             cwd: &Path,
             label: &ChannelLabel,
-        ) -> Result<flotilla_core::providers::CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_core::providers::CommandOutput {
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
                 stdout,
                 stderr: String::new(),
                 exit_code: Some(0),
@@ -1195,11 +1197,11 @@ pub(crate) mod tests {
         }
 
         async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-            flotilla_core::providers::ProcessCommandRunner.write_file(path, content).await
+            flotilla_provider_runtime::ProcessCommandRunner.write_file(path, content).await
         }
 
         async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
-            flotilla_core::providers::ProcessCommandRunner.write_file_with_mode(path, content, mode).await
+            flotilla_provider_runtime::ProcessCommandRunner.write_file_with_mode(path, content, mode).await
         }
     }
 

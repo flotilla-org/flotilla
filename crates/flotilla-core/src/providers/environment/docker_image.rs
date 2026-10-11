@@ -12,7 +12,8 @@ use super::{
     image::{BuiltImage, ImageComposition, ImageLayerBuild},
     ImageBuilder, LocalImageCache, RegistryAuth,
 };
-use crate::providers::{ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 pub fn validate_digest(reference: &str) -> Result<(), String> {
     if is_image_digest(reference) || reference.rsplit_once('@').is_some_and(|(repo, digest)| !repo.is_empty() && is_image_digest(digest)) {
@@ -141,7 +142,7 @@ impl BuildxImageBuilder {
         args: &[&str],
         context: &Path,
         timeout: Duration,
-    ) -> Result<crate::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         tokio::time::timeout(timeout, self.runner.run_output("docker", args, context, &ChannelLabel::Default))
             .await
             .map_err(|_| format!("Docker process exceeded wall-clock deadline of {} seconds", timeout.as_secs()))?

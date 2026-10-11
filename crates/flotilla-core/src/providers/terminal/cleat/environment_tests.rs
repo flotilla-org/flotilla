@@ -10,10 +10,10 @@ use super::CleatTerminalPool;
 use crate::discovery_api::EnvironmentAssertion;
 use crate::discovery_api::EnvironmentBag;
 use crate::providers::terminal::TerminalPool;
-use crate::providers::ChannelLabel;
-use crate::providers::CommandOutput;
-use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 // Process boundary: emulate Cleat's additive/default and declared
 // spawn contracts, with an already-running daemon polluted independently of
@@ -141,7 +141,7 @@ impl CommandRunner for PollutedProcessRunner {
             cmd,
         ];
         polluted.extend_from_slice(args);
-        crate::providers::ProcessCommandRunner.run_output("/usr/bin/env", &polluted, cwd, label).await
+        flotilla_provider_runtime::ProcessCommandRunner.run_output("/usr/bin/env", &polluted, cwd, label).await
     }
 
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {

@@ -13,8 +13,9 @@ use super::support::test_meta;
 use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
-use crate::providers::{CommandOutput, CommandRunner};
 use crate::testkits::discovery::fake_discovery;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {
@@ -48,7 +49,13 @@ pub(super) struct AdmissionRestRunner {
 
 #[async_trait::async_trait]
 impl CommandRunner for AdmissionRestRunner {
-    async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &crate::providers::ChannelLabel) -> Result<String, String> {
+    async fn run(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &flotilla_provider_runtime::ChannelLabel,
+    ) -> Result<String, String> {
         panic!("admission REST reads use run_output")
     }
 
@@ -57,7 +64,7 @@ impl CommandRunner for AdmissionRestRunner {
         cmd: &str,
         args: &[&str],
         _cwd: &Path,
-        _label: &crate::providers::ChannelLabel,
+        _label: &flotilla_provider_runtime::ChannelLabel,
     ) -> Result<CommandOutput, String> {
         assert_eq!(cmd, "gh");
         self.calls.fetch_add(1, Ordering::SeqCst);

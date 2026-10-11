@@ -1585,13 +1585,14 @@ mod tests {
     use hegel::generators as gs;
 
     use super::*;
-    use crate::{
-        aggregator_projection::AggregatorProjectionState,
-        change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher},
-        discovery_api::EnvironmentBag,
-        event_sink::{EventSink, RecordingEventSink},
-        providers::{change_request::observation::GhChangeRequestObservationSource, ProcessCommandRunner},
-    };
+    use crate::aggregator_projection::AggregatorProjectionState;
+    use crate::change_request_observer::ChangeRequestRefreshCadence;
+    use crate::change_request_observer::ChangeRequestRefresher;
+    use crate::discovery_api::EnvironmentBag;
+    use crate::event_sink::EventSink;
+    use crate::event_sink::RecordingEventSink;
+    use crate::providers::change_request::observation::GhChangeRequestObservationSource;
+    use flotilla_provider_runtime::ProcessCommandRunner;
 
     // #2498: every distinct stalled actor is visible across namespaces and replica stores.
     // Generate empty through multi-convoy fleets, duplicate leaves, all rungs, shared and distinct
@@ -1791,7 +1792,7 @@ mod tests {
             let backend = ResourceBackend::InMemory(InMemoryBackend::default());
             let config = Arc::new(ConfigStore::with_base(temp.path()));
             let event_sink: Arc<dyn EventSink> = Arc::new(RecordingEventSink::default());
-            let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
+            let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
             let host_name = HostName::new("local");
             let host_id = HostId::new("local-id");
             let node_id = NodeId::new("local-node");

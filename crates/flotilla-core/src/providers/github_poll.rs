@@ -10,7 +10,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::{forge::github::GhApi, gh_api_channel_label};
+use super::forge::github::GhApi;
+use flotilla_provider_runtime::gh_api_channel_label;
 
 pub(super) fn persist(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().ok_or("poll cache has no parent")?;
@@ -193,10 +194,10 @@ mod tests {
 
     use super::*;
     use crate::providers::forge::github::GhApiClient;
-    use crate::providers::ChannelLabel;
-    use crate::providers::CommandOutput;
-    use crate::providers::CommandRunner;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
 
     // Stand-in at the gh/HTTP boundary: refuse requests with an incorrect
     // route, ordering, cursor or conditional header instead of accepting any argv.

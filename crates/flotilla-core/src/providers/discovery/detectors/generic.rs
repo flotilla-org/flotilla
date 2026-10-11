@@ -3,13 +3,11 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::{
-    discovery_api::EnvironmentAssertion,
-    providers::{
-        discovery::{EnvVars, HostDetector},
-        run, CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::providers::discovery::HostDetector;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 pub type VersionParser = fn(&str) -> Option<String>;
 
@@ -83,7 +81,7 @@ pub(super) async fn resolve_binary_path(runner: &dyn CommandRunner, command: &st
             "sh",
             &["-c", "command -v \"$1\"", "flotilla-binary-discovery", command],
             Path::new("/"),
-            &crate::providers::ChannelLabel::Default,
+            &flotilla_provider_runtime::ChannelLabel::Default,
         )
         .await
     {

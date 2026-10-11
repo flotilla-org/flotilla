@@ -4,16 +4,13 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentAssertion,
-    providers::{
-        discovery::{
-            detectors::generic::{parse_first_dotted_version, resolve_binary_path},
-            EnvVars, HostDetector,
-        },
-        run, CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
+use crate::providers::discovery::detectors::generic::resolve_binary_path;
+use crate::providers::discovery::HostDetector;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 /// Detects the `claude` CLI, checking PATH first, then known install locations.
 pub struct ClaudeDetector;

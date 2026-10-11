@@ -18,18 +18,24 @@ use self::{
     checkout::{checkout_is_local_owned, resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     session_actions::ReadOnlySessionActionService,
 };
+use crate::data;
+use crate::environment_manager::CreateProvisionedEnvironmentRequest;
+use crate::environment_manager::EnvironmentManager;
+use crate::provider_data::ProviderData;
 use crate::providers::environment::{legacy_environment_spec, EnvironmentKind};
-use crate::{
-    data,
-    environment_manager::{CreateProvisionedEnvironmentRequest, EnvironmentManager},
-    provider_data::ProviderData,
-    providers::{
-        discovery::EnvVars, issue_tracker::forge_issue_source, registry::ProviderRegistry, vcs::write_branch_issue_links, CommandRunner,
-    },
-    step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
-};
+use crate::providers::issue_tracker::forge_issue_source;
+use crate::providers::registry::ProviderRegistry;
+use crate::providers::vcs::write_branch_issue_links;
+use crate::step::Step;
+use crate::step::StepAction;
+use crate::step::StepExecutionContext;
+use crate::step::StepOutcome;
+use crate::step::StepPlan;
+use crate::step::StepResolver;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 #[derive(Clone)]
 pub struct RepoExecutionContext {

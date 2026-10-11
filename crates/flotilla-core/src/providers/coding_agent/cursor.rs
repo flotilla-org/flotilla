@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::providers::{http_execute, scan_cache::SharedScan, types::*, HttpClient};
+use crate::providers::types::*;
+use flotilla_provider_runtime::http_execute;
+use flotilla_provider_runtime::scan_cache::SharedScan;
+use flotilla_provider_runtime::HttpClient;
 
 const AGENTS_CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -294,18 +297,18 @@ mod tests {
     struct MockHttpClient;
 
     #[async_trait::async_trait]
-    impl crate::providers::HttpClient for MockHttpClient {
+    impl flotilla_provider_runtime::HttpClient for MockHttpClient {
         async fn execute(
             &self,
             _request: reqwest::Request,
-            _label: &crate::providers::ChannelLabel,
+            _label: &flotilla_provider_runtime::ChannelLabel,
         ) -> Result<http::Response<bytes::Bytes>, String> {
             Err("mock: not called".into())
         }
     }
 
     fn cursor_service() -> CursorCodingAgent {
-        let http: Arc<dyn crate::providers::HttpClient> = Arc::new(MockHttpClient);
+        let http: Arc<dyn flotilla_provider_runtime::HttpClient> = Arc::new(MockHttpClient);
         CursorCodingAgent::new("cursor".into(), "test-key".into(), http)
     }
 
@@ -314,11 +317,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::providers::HttpClient for CountingCursorHttp {
+    impl flotilla_provider_runtime::HttpClient for CountingCursorHttp {
         async fn execute(
             &self,
             _request: reqwest::Request,
-            _label: &crate::providers::ChannelLabel,
+            _label: &flotilla_provider_runtime::ChannelLabel,
         ) -> Result<http::Response<bytes::Bytes>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

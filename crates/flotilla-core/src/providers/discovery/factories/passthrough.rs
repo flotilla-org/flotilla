@@ -13,8 +13,8 @@ use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::discovery::UnmetRequirement;
 use crate::providers::terminal::passthrough::PassthroughTerminalPool;
 use crate::providers::terminal::TerminalPool;
-use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
 
 pub struct PassthroughTerminalPoolFactory;
 

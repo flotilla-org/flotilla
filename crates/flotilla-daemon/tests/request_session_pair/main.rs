@@ -19,9 +19,6 @@ use flotilla_core::in_process::WorkCredentialReconciler;
 use flotilla_core::providers::environment::ProvisionedEnvironment;
 use flotilla_core::providers::environment::ProvisionedMount;
 use flotilla_core::providers::issue_tracker::IssueProvider;
-use flotilla_core::providers::ChannelLabel;
-use flotilla_core::providers::CommandOutput;
-use flotilla_core::providers::CommandRunner;
 use flotilla_daemon::blob_store::TieredBlobStore;
 use flotilla_daemon::runtime::DaemonRuntime;
 use flotilla_daemon::runtime::RuntimeOptions;
@@ -68,6 +65,9 @@ use flotilla_protocol::ResourceRef;
 use flotilla_protocol::SurfaceCharacter;
 use flotilla_protocol::SurfaceDeclaration;
 use flotilla_protocol_testkit::TestIssue;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     api_version, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
     ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector,

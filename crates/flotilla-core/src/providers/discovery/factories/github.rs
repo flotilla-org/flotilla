@@ -24,9 +24,9 @@ use crate::providers::forge::github::GhApiClient;
 use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
 use crate::providers::issue_tracker::github::GitHubIssueProvider;
 use crate::providers::issue_tracker::IssueProvider;
-use crate::providers::CommandRunner;
-use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ReqwestHttpClient;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
     let mut unmet = vec![];
@@ -198,9 +198,11 @@ async fn bounded_forgejo_provider_config(
     let env = env.clone();
     let settings = settings.clone();
     let config = config.base_path().clone();
-    crate::probe::blocking("Forgejo credential", crate::probe::PROBE_TIMEOUT, move || Ok(forgejo_provider_config(&env, &config, &settings)))
-        .await
-        .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?
+    flotilla_provider_runtime::probe::blocking("Forgejo credential", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+        Ok(forgejo_provider_config(&env, &config, &settings))
+    })
+    .await
+    .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?
 }
 
 fn forgejo_provider_config(

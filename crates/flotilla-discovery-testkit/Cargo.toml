@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-protocol = { path = "../flotilla-protocol" }

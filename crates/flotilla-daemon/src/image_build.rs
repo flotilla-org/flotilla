@@ -360,11 +360,13 @@ mod tests {
 
 #[cfg(test)]
 mod runner_contract {
-    use flotilla_core::{
-        providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandOutput, CommandRunner},
-        vcs::{FlotillaVcs, GitCheckoutStrategy},
-    };
+    use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
+    use flotilla_core::vcs::FlotillaVcs;
+    use flotilla_core::vcs::GitCheckoutStrategy;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
     use flotilla_resources::{
         ImageBuildReason, ImageBuildReservation, ImageInputStability, ImageLayerSpec, ImageLayerStage, ResolvedImageInputs,
     };

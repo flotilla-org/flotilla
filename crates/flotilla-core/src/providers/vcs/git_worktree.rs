@@ -5,8 +5,11 @@ use std::{
 
 use tracing::info;
 
-use crate::providers::{run, types::*, CommandRunner, TaskId};
+use crate::providers::types::*;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::TaskId;
 
 /// Resolve `.` and `..` components in-place without touching the filesystem.
 fn normalize_path(path: &Path) -> PathBuf {
@@ -295,9 +298,9 @@ mod tests {
 
     use super::*;
     use crate::providers::vcs::parse_porcelain_status;
-    use crate::providers::CommandRunner;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_provider_runtime::CommandRunner;
 
     #[test]
     fn parse_porcelain_normal_worktrees() {

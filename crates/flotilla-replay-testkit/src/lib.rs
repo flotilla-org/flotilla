@@ -10,14 +10,22 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use flotilla_core::providers::{
-    forge::github::{
-        github_rate_limit, rate_limit_error, rate_limit_reset, GhApi, GhApiFailure, GhApiFailureResponse, GhApiResponse, GithubRateLimit,
-        GithubRateLimitKind,
-    },
-    forge::observation_error::ObservationError,
-    ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
-};
+use flotilla_core::providers::forge::github::github_rate_limit;
+use flotilla_core::providers::forge::github::rate_limit_error;
+use flotilla_core::providers::forge::github::rate_limit_reset;
+use flotilla_core::providers::forge::github::GhApi;
+use flotilla_core::providers::forge::github::GhApiFailure;
+use flotilla_core::providers::forge::github::GhApiFailureResponse;
+use flotilla_core::providers::forge::github::GhApiResponse;
+use flotilla_core::providers::forge::github::GithubRateLimit;
+use flotilla_core::providers::forge::github::GithubRateLimitKind;
+use flotilla_core::providers::forge::observation_error::ObservationError;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::ChannelLabeler;
+use flotilla_provider_runtime::ChannelRequest;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::DefaultLabeler;
 
 /// A single recorded interaction with an external system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,8 +459,8 @@ pub fn test_session(fixture_path: &str, masks: Masks) -> Session {
 /// - Replay: returns a `ReplayRunner`.
 pub fn test_runner(session: &Session) -> Arc<dyn CommandRunner> {
     match session {
-        Session::Recording(_) => Arc::new(RecordingRunner::new(session.clone(), Arc::new(flotilla_core::providers::ProcessCommandRunner))),
-        Session::Passthrough => Arc::new(flotilla_core::providers::ProcessCommandRunner),
+        Session::Recording(_) => Arc::new(RecordingRunner::new(session.clone(), Arc::new(flotilla_provider_runtime::ProcessCommandRunner))),
+        Session::Passthrough => Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
         Session::Replaying(_) => Arc::new(ReplayRunner::new(session.clone())),
     }
 }
@@ -638,7 +646,7 @@ impl ReplayHttpClient {
 }
 
 #[async_trait]
-impl flotilla_core::providers::HttpClient for ReplayHttpClient {
+impl flotilla_provider_runtime::HttpClient for ReplayHttpClient {
     async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
         let interaction = self.session.next(label);
         let Interaction::Http {
@@ -914,7 +922,7 @@ impl CommandRunner for RecordingRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<Box<dyn flotilla_core::providers::CommandProcess>, String> {
+    ) -> Result<Box<dyn flotilla_provider_runtime::CommandProcess>, String> {
         // Lifecycle recording needs distinct spawn/kill/wait interactions.
         // Until that fixture shape is introduced, preserve the shared runner
         // boundary by delegating rather than bypassing the wrapped runner.
@@ -1113,12 +1121,12 @@ pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
             // Use a raw ProcessCommandRunner — NOT the passed-in runner, which is a
             // RecordingRunner.  GhApiClient shells out via its runner, so using a
             // RecordingRunner here would double-record (once as Command, once as GhApi).
-            let raw_runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
+            let raw_runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
             let real_api = Arc::new(flotilla_core::providers::forge::github::GhApiClient::new(raw_runner));
             Arc::new(RecordingGhApi::new(session.clone(), real_api))
         }
         Session::Passthrough => {
-            let raw_runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
+            let raw_runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
             Arc::new(flotilla_core::providers::forge::github::GhApiClient::new(raw_runner))
         }
         Session::Replaying(_) => Arc::new(ReplayGhApi::new(session.clone())),
@@ -1128,17 +1136,17 @@ pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
 /// An `HttpClient` that delegates to a real `HttpClient` and records all interactions.
 pub struct RecordingHttpClient {
     session: Session,
-    inner: Arc<dyn flotilla_core::providers::HttpClient>,
+    inner: Arc<dyn flotilla_provider_runtime::HttpClient>,
 }
 
 impl RecordingHttpClient {
-    pub fn new(session: Session, inner: Arc<dyn flotilla_core::providers::HttpClient>) -> Self {
+    pub fn new(session: Session, inner: Arc<dyn flotilla_provider_runtime::HttpClient>) -> Self {
         Self { session, inner }
     }
 }
 
 #[async_trait]
-impl flotilla_core::providers::HttpClient for RecordingHttpClient {
+impl flotilla_provider_runtime::HttpClient for RecordingHttpClient {
     async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
         let method = request.method().to_string();
         let url = request.url().to_string();
@@ -1189,13 +1197,13 @@ impl flotilla_core::providers::HttpClient for RecordingHttpClient {
 /// - Recording: wraps a real `ReqwestHttpClient` with recording.
 /// - Passthrough: returns a bare `ReqwestHttpClient`.
 /// - Replay: returns a `ReplayHttpClient`.
-pub fn test_http_client(session: &Session) -> Arc<dyn flotilla_core::providers::HttpClient> {
+pub fn test_http_client(session: &Session) -> Arc<dyn flotilla_provider_runtime::HttpClient> {
     match session {
         Session::Recording(_) => {
-            let real_client = Arc::new(flotilla_core::providers::ReqwestHttpClient::new());
+            let real_client = Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new());
             Arc::new(RecordingHttpClient::new(session.clone(), real_client))
         }
-        Session::Passthrough => Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
+        Session::Passthrough => Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new()),
         Session::Replaying(_) => Arc::new(ReplayHttpClient::new(session.clone())),
     }
 }

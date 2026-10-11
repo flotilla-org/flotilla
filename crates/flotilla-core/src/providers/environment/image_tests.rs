@@ -15,7 +15,9 @@ use super::{
     image::{BuiltImage, ImageComposition},
     EnvironmentProvider, ImageBuilder,
 };
-use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 fn digest(index: usize) -> String {
     format!("sha256:{index:064x}")

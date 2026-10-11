@@ -4,17 +4,15 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::{EnvironmentAssertion, VcsKind},
-    providers::{
-        discovery::{
-            detectors::generic::{parse_first_dotted_version, CommandDetector},
-            EnvVars, RepoDetector,
-        },
-        run, CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::VcsKind;
+use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
+use crate::providers::discovery::detectors::generic::CommandDetector;
+use crate::providers::discovery::RepoDetector;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 pub fn git_binary_detector() -> CommandDetector {
     CommandDetector::new("git", &["--version"], parse_first_dotted_version)

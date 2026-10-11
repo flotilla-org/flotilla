@@ -9,7 +9,7 @@ use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
 use super::{EnvironmentHandle, EnvironmentKind, EnvironmentProvider, PreparedEnvironment, ProvisionedEnvironment, ProvisionedMount};
 use crate::providers::environment::{PrepareOpts, ProvisionOpts};
-use crate::providers::CommandRunner;
+use flotilla_provider_runtime::CommandRunner;
 
 /// Legacy handles require an image id even for image-free adoption.
 const HOST_DIRECT_IMAGE_SENTINEL: &str = "host-direct:no-image";
@@ -39,11 +39,11 @@ impl EnvironmentProvider for HostDirectEnvironmentProvider {
         binary: &str,
         args: &[&str],
         scratch: &std::path::Path,
-    ) -> Result<crate::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         if image.is_some() {
             return Err("host-direct detection does not accept an image".into());
         }
-        self.runner.run_output(binary, args, scratch, &crate::providers::ChannelLabel::Default).await
+        self.runner.run_output(binary, args, scratch, &flotilla_provider_runtime::ChannelLabel::Default).await
     }
 
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String> {

@@ -5,7 +5,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ProcessCommandRunner;
 use tokio::sync::Notify;
 
 pub(crate) struct FailFirstCloneProcessRunner {

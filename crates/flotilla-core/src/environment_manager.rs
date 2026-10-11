@@ -31,9 +31,9 @@ use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::ProvisionedMountMode;
 use crate::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
 use crate::providers::registry::ProviderRegistry;
-use crate::providers::CommandRunner;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Clone)]
 pub enum ManagedEnvironmentKind {
@@ -606,9 +606,9 @@ mod tests {
     use crate::providers::environment::ProvisionedEnvironment;
     use crate::providers::environment::ProvisionedMount;
     use crate::providers::registry::ProviderRegistry;
-    use crate::providers::CommandRunner;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_provider_runtime::CommandRunner;
 
     struct MockProvisionedEnvironment {
         id: EnvironmentId,

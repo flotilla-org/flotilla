@@ -5,8 +5,8 @@ use flotilla_client::{
     build_id,
     reconnect::{should_reexec_for_incompatible_daemon, REEXEC_BUILD_ENV},
 };
-use flotilla_core::providers::ProcessCommandRunner;
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
+use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_tui::cli::args::{
     attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, EventsArgs, FleetSubCommand, HookArgs,
     LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,

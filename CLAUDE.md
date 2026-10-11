@@ -130,6 +130,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | Crate | Role |
 |-------|------|
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
+| `flotilla-provider-runtime` | Command and HTTP runners, invocation macros, environment variables, shared scans and bounded host probes |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
@@ -168,7 +169,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-core/src/agents/` | Agent hook handling and state management |
 | `crates/flotilla-core/src/attachable/` | Agent-hook identity shim pending AgentSession |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
-| `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, and replay support |
+| `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry and discovery |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |
 | `crates/flotilla-core/src/template.rs` | `.flotilla/workspace.yaml` pane templates |
 | `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |

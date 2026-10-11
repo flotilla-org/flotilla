@@ -31,6 +31,24 @@ def graph(*packages):
 
 
 class BuildGraphContract(unittest.TestCase):
+    def test_provider_runtime_is_native_and_independent(self):
+        # ADR 0060: runtime is native, but cannot reach composition or store crates.
+        self.assertEqual(layer("flotilla-provider-runtime"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-provider-runtime", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-provider-runtime: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-provider-runtime", normal=("flotilla-protocol", "flotilla-tls")),
+            package("flotilla-core", normal=("flotilla-provider-runtime",)),
+            package("flotilla-protocol"), package("flotilla-tls"),
+        )), [])
+
     def test_testkit_names(self):
         for name in ("flotilla-store-testkit", "future-testkit", "flotilla-test-support"):
             self.assertTrue(is_testkit(name))

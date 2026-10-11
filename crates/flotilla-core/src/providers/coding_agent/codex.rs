@@ -11,8 +11,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::providers::{http_execute, types::*, HttpClient};
+use crate::providers::types::*;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::http_execute;
+use flotilla_provider_runtime::HttpClient;
 
 // --- Auth ---
 
@@ -235,7 +237,10 @@ impl CodexCodingAgent {
 
     async fn refresh_auth(&self) -> Result<Option<CodexAuth>, String> {
         let path = self.auth_path.clone();
-        let result = crate::probe::blocking("Codex auth", crate::probe::PROBE_TIMEOUT, move || Ok(read_auth(&path))).await;
+        let result = flotilla_provider_runtime::probe::blocking("Codex auth", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+            Ok(read_auth(&path))
+        })
+        .await;
         self.cache_auth_probe(result)
     }
 

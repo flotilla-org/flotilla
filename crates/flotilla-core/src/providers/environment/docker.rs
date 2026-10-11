@@ -13,7 +13,8 @@ use super::{
     EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::environment::{PrepareOpts, ProvisionOpts};
-use crate::providers::{ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 /// The `PATH` Docker gives a container whose image does not set one.
 const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -75,7 +76,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         binary: &str,
         args: &[&str],
         scratch: &Path,
-    ) -> Result<crate::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         let image = image.ok_or("detection requires an image reference")?;
         let mut command = vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", image, binary];
         command.extend_from_slice(args);

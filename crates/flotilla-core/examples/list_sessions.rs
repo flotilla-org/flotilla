@@ -24,8 +24,8 @@ async fn main() {
             "claude",
             Arc::new(ClaudeCodingAgent::new(
                 "claude".to_string(),
-                Arc::new(flotilla_core::providers::ProcessCommandRunner),
-                Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
+                Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
+                Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new()),
             )),
         ),
         (
@@ -33,7 +33,7 @@ async fn main() {
             Arc::new(CursorCodingAgent::new(
                 "cursor".to_string(),
                 std::env::var("CURSOR_API_KEY").expect("CURSOR_API_KEY must be set"),
-                Arc::new(flotilla_core::providers::ReqwestHttpClient::new()),
+                Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new()),
             )),
         ),
     ];

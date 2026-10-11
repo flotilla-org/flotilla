@@ -11,7 +11,12 @@ use reqwest;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::providers::{http_execute, run, scan_cache::SharedScan, types::*, CommandRunner, HttpClient};
+use crate::providers::types::*;
+use flotilla_provider_runtime::http_execute;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::scan_cache::SharedScan;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::HttpClient;
 
 pub struct ClaudeCodingAgent {
     provider_name: String,

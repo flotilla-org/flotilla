@@ -11,18 +11,21 @@
 
 use std::{path::Path, sync::Arc};
 
-use flotilla_core::{
-    config::ConfigStore,
-    discovery_api::{EnvironmentAssertion, EnvironmentBag},
-    providers::{
-        discovery::{detectors::default_host_detectors, run_host_detectors, FactoryRegistry, ProcessEnvVars},
-        environment::{CreateOpts, EnvironmentKind},
-        ChannelLabel, CommandRunner, ProcessCommandRunner,
-    },
-    vcs::RepositoryRead,
-};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::discovery_api::EnvironmentAssertion;
+use flotilla_core::discovery_api::EnvironmentBag;
+use flotilla_core::providers::discovery::detectors::default_host_detectors;
+use flotilla_core::providers::discovery::run_host_detectors;
+use flotilla_core::providers::discovery::FactoryRegistry;
+use flotilla_core::providers::environment::CreateOpts;
+use flotilla_core::providers::environment::EnvironmentKind;
+use flotilla_core::vcs::RepositoryRead;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ProcessCommandRunner;
+use flotilla_provider_runtime::ProcessEnvVars;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

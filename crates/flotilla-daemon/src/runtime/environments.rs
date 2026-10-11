@@ -7,8 +7,10 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::providers::{environment::EnvironmentHandle, ChannelLabel, CommandRunner};
+use flotilla_core::providers::environment::EnvironmentHandle;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     Checkout, Environment, EnvironmentPhase, EnvironmentStatusPatch, ResourceError, ResourceObject, Vessel, VesselStatusPatch,
 };

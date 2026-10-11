@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::providers::{discovery::EnvVars, ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 /// Resolve a machine-scoped state directory under `base_state_dir`.
 ///
@@ -500,9 +502,9 @@ async fn resolve_or_create_remote_environment_id_at(runner: &dyn CommandRunner, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::ProcessCommandRunner;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::discovery::TestEnvVars;
+    use flotilla_provider_runtime::ProcessCommandRunner;
 
     #[test]
     fn generates_and_persists_host_id() {

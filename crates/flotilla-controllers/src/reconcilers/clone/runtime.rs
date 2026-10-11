@@ -7,8 +7,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::providers::{ChannelLabel, CommandRunner};
 use flotilla_core::vcs::Vcs;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{canonicalize_repo_url, ForgeSpec};
 use tokio::sync::Mutex;
 

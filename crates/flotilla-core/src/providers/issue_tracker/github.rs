@@ -11,16 +11,16 @@ use flotilla_protocol::{
 use crate::providers::forge::github::clamp_per_page;
 use crate::providers::forge::github::rate_limit_error_for;
 use crate::providers::forge::github::GhApi;
-use crate::providers::gh_api_get;
-use crate::providers::gh_api_get_with_headers;
 use crate::providers::github_observation::ObservationTelemetry;
 use crate::providers::github_observation::ParsedObservationResponse;
 use crate::providers::github_observation::QueryShape;
 use crate::providers::github_poll::PendingBoard;
 use crate::providers::github_poll::PollCache;
-use crate::providers::run;
-use crate::providers::run_output;
-use crate::providers::CommandRunner;
+use flotilla_provider_runtime::gh_api_get;
+use flotilla_provider_runtime::gh_api_get_with_headers;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::run_output;
+use flotilla_provider_runtime::CommandRunner;
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
 
@@ -518,7 +518,7 @@ impl super::IssueProvider for GitHubIssueProvider {
     }
 
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
-        use crate::providers::ChannelLabel;
+        use flotilla_provider_runtime::ChannelLabel;
         let mut values = Vec::new();
         for page in 1.. {
             let endpoint = format!("repos/{}/issues/{}/issue-field-values?per_page=100&page={page}", reference.source.scope, reference.id);
@@ -659,12 +659,12 @@ mod tests {
     use crate::providers::github_test_support::build_api_and_runner;
     use crate::providers::github_test_support::repo_root_for_recording;
     use crate::providers::issue_tracker::IssueProvider;
-    use crate::providers::ChannelLabel;
     use crate::testkits::discovery::assert_provider_contract;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::Masks;
+    use flotilla_provider_runtime::ChannelLabel;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {

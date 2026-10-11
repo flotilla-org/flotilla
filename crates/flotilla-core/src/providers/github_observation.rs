@@ -2,13 +2,13 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use crate::providers::{
-    forge::{
-        github::{github_rate_limit_from_document, parse_gh_api_response, response_header, GhApiResponse, GithubRateLimit},
-        observation_error::ObservationError,
-    },
-    CommandOutput,
-};
+use crate::providers::forge::github::github_rate_limit_from_document;
+use crate::providers::forge::github::parse_gh_api_response;
+use crate::providers::forge::github::response_header;
+use crate::providers::forge::github::GhApiResponse;
+use crate::providers::forge::github::GithubRateLimit;
+use crate::providers::forge::observation_error::ObservationError;
+use flotilla_provider_runtime::CommandOutput;
 
 /// Every observer call derives accounting and decoding from this one JSON parse.
 #[derive(bon::Builder)]

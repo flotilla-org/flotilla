@@ -4,8 +4,8 @@ use flotilla_core::in_process::discover_repo_for_environment;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::providers::discovery::DiscoveryResult;
 use flotilla_core::providers::environment::EnvironmentHandle;
-use flotilla_core::providers::CommandRunner;
 use flotilla_protocol::EnvironmentId;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::Repository;
 use std::{path::Path, sync::Arc};
 
