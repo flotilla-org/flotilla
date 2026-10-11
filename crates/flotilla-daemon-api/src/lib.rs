@@ -5,3 +5,6 @@ pub mod daemon;
 
 /// File name for the lock serializing daemon lifecycle operations.
 pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";
+
+/// Marker beneath the config run directory while fleet-install replaces macOS binaries.
+pub const DAEMON_INSTALL_MARKER_FILE: &str = "install-in-progress";
