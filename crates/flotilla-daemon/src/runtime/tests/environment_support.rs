@@ -491,7 +491,8 @@ pub(super) fn register_host_adoption(registry: &mut ProviderRegistry) {
 }
 
 pub(super) fn passthrough_registry() -> Arc<ProviderRegistry> {
-    use flotilla_core::providers::{registry::ProviderRegistry, terminal::passthrough::PassthroughTerminalPool};
+    use flotilla_core::providers::registry::ProviderRegistry;
+    use flotilla_terminal::passthrough::PassthroughTerminalPool;
 
     let mut registry = ProviderRegistry::new();
     register_host_adoption(&mut registry);
@@ -504,7 +505,8 @@ pub(super) fn passthrough_registry() -> Arc<ProviderRegistry> {
 }
 
 pub(super) fn passthrough_registry_with_environment(handle: EnvironmentHandle) -> Arc<ProviderRegistry> {
-    use flotilla_core::providers::{registry::ProviderRegistry, terminal::passthrough::PassthroughTerminalPool};
+    use flotilla_core::providers::registry::ProviderRegistry;
+    use flotilla_terminal::passthrough::PassthroughTerminalPool;
 
     let mut registry = ProviderRegistry::new();
     register_host_adoption(&mut registry);

@@ -1,11 +1,9 @@
+use flotilla_terminal::TerminalPool;
 use std::{path::PathBuf, sync::Arc};
 
-use flotilla_core::providers::{
-    environment::{
-        contained_daemon_socket_path, CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-        EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
-    },
-    terminal::TerminalPool,
+use flotilla_core::providers::environment::{
+    contained_daemon_socket_path, CreateOpts, EnvironmentProvider, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
+    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
 };
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;

@@ -237,7 +237,6 @@ async fn contract(real: bool, supports_clear: bool, scenario: Scenario) {
         ("CARGO_PROFILE_DEV_DEBUG".to_string(), "line-tables-only".to_string()),
     ]);
     if matches!(scenario, Scenario::Vessel | Scenario::EmptyVessel) {
-        use crate::providers::discovery::run_provisioned_host_detectors;
         let mut vessel = std::collections::HashMap::from([
             ("CLEAT_RUNTIME_DIR".into(), runtime.clone()),
             ("CLEAT_DAEMON".into(), "contract".into()),
@@ -260,7 +259,7 @@ async fn contract(real: bool, supports_clear: bool, scenario: Scenario) {
             vessel.insert("PATH".into(), "".into());
             expected.insert("PATH".into(), "".into());
         }
-        bag = bag.merge(&run_provisioned_host_detectors(&[], harness.runner.as_ref(), &vessel).await);
+        bag = bag.merge(&EnvironmentBag::provisioned(vessel.clone()));
     }
     let pool = CleatTerminalPool::new(harness.runner.clone(), &harness.binary, &bag);
     let declared = vec![

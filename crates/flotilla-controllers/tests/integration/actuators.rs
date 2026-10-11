@@ -1,9 +1,9 @@
+use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_core::providers::{
-    environment::{EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
-    terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSession},
+use flotilla_core::providers::environment::{
+    EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -61,7 +61,7 @@ impl TerminalPool for FakeTerminalPool {
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
-        _tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
+        _tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }

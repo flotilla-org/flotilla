@@ -1,5 +1,5 @@
 pub mod cleat;
-pub(crate) mod environment;
+pub mod environment;
 pub mod passthrough;
 
 use async_trait::async_trait;
@@ -173,3 +173,9 @@ pub trait TerminalPool: Send + Sync {
         self.deliver(session_name, text).await
     }
 }
+
+pub mod factories;
+pub mod scan_cache;
+
+#[cfg(test)]
+mod test_support;

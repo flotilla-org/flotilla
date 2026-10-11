@@ -11,6 +11,7 @@ skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/
 
 [dependencies]
 flotilla-vcs = { path = "../flotilla-vcs" }
+flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }

@@ -18,10 +18,6 @@ use flotilla_core::agent_adapter::AgentLaunchRequest;
 use flotilla_core::agent_adapter::CapabilityTable;
 use flotilla_core::crew_capabilities::SessionCapabilitySource;
 use flotilla_core::providers::registry::ProviderRegistry;
-use flotilla_core::providers::terminal::ScreenActivity;
-use flotilla_core::providers::terminal::TerminalPool;
-use flotilla_core::providers::terminal::TerminalSessionLiveness;
-use flotilla_core::providers::terminal::TerminalSize;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
@@ -32,6 +28,10 @@ use flotilla_resources::{
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 use flotilla_store::ResourceBackend;
+use flotilla_terminal::ScreenActivity;
+use flotilla_terminal::TerminalPool;
+use flotilla_terminal::TerminalSessionLiveness;
+use flotilla_terminal::TerminalSize;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 

@@ -26,8 +26,6 @@ use tokio::sync::Mutex as TokioMutex;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
 use flotilla_core::providers::issue_tracker::IssueProvider;
-use flotilla_core::providers::terminal::TerminalPool;
-use flotilla_core::providers::terminal::TerminalSessionLiveness;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
@@ -42,6 +40,8 @@ use flotilla_vcs::vcs::FlotillaVcs;
 use flotilla_vcs::vcs::GitCheckoutStrategy;
 use flotilla_vcs::vcs::Vcs;
 use flotilla_vcs::BranchInfo;
+use flotilla_terminal::TerminalPool;
+use flotilla_terminal::TerminalSessionLiveness;
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
 
@@ -822,7 +822,7 @@ pub struct FakeChangeRequest {
 }
 
 pub struct FakeTerminalPool {
-    pub sessions: Arc<TokioMutex<Vec<flotilla_core::providers::terminal::TerminalSession>>>,
+    pub sessions: Arc<TokioMutex<Vec<flotilla_terminal::TerminalSession>>>,
     liveness_override: Arc<TokioMutex<Option<Result<TerminalSessionLiveness, String>>>>,
     pub killed: Arc<TokioMutex<Vec<String>>>,
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
@@ -835,8 +835,8 @@ pub struct EnsuredTerminalSession {
     pub session_name: String,
     pub command: String,
     pub cwd: ExecutionEnvironmentPath,
-    pub env_vars: flotilla_core::providers::terminal::TerminalEnvVars,
-    pub initial_size: Option<flotilla_core::providers::terminal::TerminalSize>,
+    pub env_vars: flotilla_terminal::TerminalEnvVars,
+    pub initial_size: Option<flotilla_terminal::TerminalSize>,
 }
 
 impl Default for FakeTerminalPool {
@@ -858,7 +858,7 @@ impl FakeTerminalPool {
         }
     }
 
-    pub async fn add_sessions(&self, sessions: Vec<flotilla_core::providers::terminal::TerminalSession>) {
+    pub async fn add_sessions(&self, sessions: Vec<flotilla_terminal::TerminalSession>) {
         self.sessions.lock().await.extend(sessions);
     }
 
@@ -896,7 +896,7 @@ impl TerminalPool for FakeTerminalPool {
         true
     }
 
-    async fn list_sessions(&self) -> Result<Vec<flotilla_core::providers::terminal::TerminalSession>, String> {
+    async fn list_sessions(&self) -> Result<Vec<flotilla_terminal::TerminalSession>, String> {
         Ok(self.sessions.lock().await.clone())
     }
 
@@ -905,8 +905,8 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         command: &str,
         cwd: &ExecutionEnvironmentPath,
-        env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
-        tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
+        env_vars: &flotilla_terminal::TerminalEnvVars,
+        tags: &[flotilla_terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         self.ensure_session_with_size(session_name, command, cwd, env_vars, tags, None).await
     }
@@ -916,9 +916,9 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         command: &str,
         cwd: &ExecutionEnvironmentPath,
-        env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
-        _tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
-        initial_size: Option<flotilla_core::providers::terminal::TerminalSize>,
+        env_vars: &flotilla_terminal::TerminalEnvVars,
+        _tags: &[flotilla_terminal::TerminalSessionTag],
+        initial_size: Option<flotilla_terminal::TerminalSize>,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
@@ -931,7 +931,7 @@ impl TerminalPool for FakeTerminalPool {
             env_vars: env_vars.clone(),
             initial_size,
         });
-        sessions.push(flotilla_core::providers::terminal::TerminalSession {
+        sessions.push(flotilla_terminal::TerminalSession {
             session_name: session_name.to_string(),
             status: TerminalStatus::Running,
             command: Some(command.to_string()),
@@ -946,7 +946,7 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
+        _env_vars: &flotilla_terminal::TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach {session_name}"))])
     }
@@ -963,7 +963,7 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &flotilla_core::providers::terminal::TerminalEnvVars,
+        _env_vars: &flotilla_terminal::TerminalEnvVars,
         mode: flotilla_protocol::commands::AttachMode,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         let flag = match mode {

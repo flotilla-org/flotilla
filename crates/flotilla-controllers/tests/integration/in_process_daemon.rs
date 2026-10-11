@@ -23,7 +23,6 @@ use flotilla_core::providers::coding_agent::CloudAgentService;
 use flotilla_core::providers::discovery::DiscoveryRuntime;
 use flotilla_core::providers::environment::EnvironmentHandle;
 use flotilla_core::providers::environment::ProvisionedEnvironment;
-use flotilla_core::providers::terminal::TerminalPool;
 use flotilla_core::providers::types::ChangeRequest;
 use flotilla_core::providers::types::CloudAgentSession;
 use flotilla_core::providers::types::RepoCriteria;
@@ -112,6 +111,7 @@ use flotilla_resources::{
     HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::{apply_status_patch, ResourceBackend, TypedResolver};
+use flotilla_terminal::TerminalPool;
 use futures::StreamExt;
 use tokio::sync::Notify;
 

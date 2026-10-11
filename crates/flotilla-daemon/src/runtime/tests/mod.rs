@@ -40,13 +40,6 @@ use flotilla_core::providers::environment::ProvisionedEnvironment;
 use flotilla_core::providers::environment::ProvisionedMount;
 use flotilla_core::providers::environment::ProvisionedMountMode;
 use flotilla_core::providers::registry::ProviderRegistry;
-use flotilla_core::providers::terminal::ScreenActivity;
-use flotilla_core::providers::terminal::TerminalEnvVars;
-use flotilla_core::providers::terminal::TerminalPool;
-use flotilla_core::providers::terminal::TerminalSession as ProviderTerminalSession;
-use flotilla_core::providers::terminal::TerminalSessionLiveness;
-use flotilla_core::providers::terminal::TerminalSessionTag;
-use flotilla_core::providers::terminal::TerminalSize;
 use flotilla_core::providers::types::ChangeRequest as ProviderChangeRequest;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_credentials::AgentMaterialRegistry;
@@ -100,6 +93,13 @@ use flotilla_store::{
     delete_resource_kind, home_bound_authorship_collisions, watch_resource_kind, watch_resource_kind_including_replicas, ConvoyReconciler,
     ResourceBackend,
 };
+use flotilla_terminal::ScreenActivity;
+use flotilla_terminal::TerminalEnvVars;
+use flotilla_terminal::TerminalPool;
+use flotilla_terminal::TerminalSession as ProviderTerminalSession;
+use flotilla_terminal::TerminalSessionLiveness;
+use flotilla_terminal::TerminalSessionTag;
+use flotilla_terminal::TerminalSize;
 use futures::StreamExt;
 use serde_json::json;
 use tempfile::TempDir;

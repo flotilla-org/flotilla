@@ -130,6 +130,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | Crate | Role |
 |-------|------|
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
+| `flotilla-terminal` | Terminal pool traits, Cleat and passthrough adapters, factories and shared session scans |
 | `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
 | `flotilla-provider-runtime` | Command and HTTP runners, invocation macros, environment variables, shared scans and bounded host probes |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
@@ -205,14 +206,14 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 
 ### Provider Traits
 
-Provider traits live with their implementations; VCS lives in `flotilla-vcs`, and other provider types remain in core:
+Provider traits live in their type crates as they are extracted, with remaining traits under `crates/flotilla-core/src/providers/`:
 
 - **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
 - **ChangeRequestTracker** (`crates/flotilla-core/src/providers/change_request/github.rs`)
 - **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
 - **CloudAgentService** (`crates/flotilla-core/src/providers/coding_agent/claude.rs`, `crates/flotilla-core/src/providers/coding_agent/codex.rs`, `crates/flotilla-core/src/providers/coding_agent/cursor.rs`)
 - **AiUtility** (`crates/flotilla-core/src/providers/ai_utility/claude_api.rs`, `crates/flotilla-core/src/providers/ai_utility/claude_cli.rs`)
-- **TerminalPool** (`crates/flotilla-core/src/providers/terminal/cleat.rs`, `crates/flotilla-core/src/providers/terminal/passthrough.rs`)
+- **TerminalPool** (`crates/flotilla-terminal/src/cleat.rs`, `crates/flotilla-terminal/src/passthrough.rs`)
 
 Provider labels and implementation names live in the `ProviderDescriptor` registered alongside each implementation: `section_label`, `item_noun`, `abbreviation`, and `display_name`.
 

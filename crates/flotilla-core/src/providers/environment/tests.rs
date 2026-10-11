@@ -1230,11 +1230,11 @@ async fn destroy_calls_docker_rm() {
 #[tokio::test]
 async fn environment_runner_supports_factory_probe() {
     use crate::config::ConfigStore;
-    use crate::providers::discovery::factories::cleat::CleatTerminalPoolFactory;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_terminal::factories::cleat::CleatTerminalPoolFactory;
 
     // A runner that succeeds for any docker exec call (simulates cleat present in container)
     let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
@@ -1261,12 +1261,12 @@ async fn environment_runner_supports_factory_probe() {
 #[tokio::test]
 async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
     use crate::config::ConfigStore;
-    use crate::providers::discovery::factories::cleat::CleatTerminalPoolFactory;
     use crate::testkits::replay::testing::MockRunner;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_terminal::factories::cleat::CleatTerminalPoolFactory;
 
     let inner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("--env-clear --env".into()), Ok("{}".into())]));
     let env_runner = Arc::new(DockerEnvironmentRunner::new("test-container".to_string(), inner.clone()));

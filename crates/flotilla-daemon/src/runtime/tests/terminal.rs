@@ -319,7 +319,7 @@ async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtim
         profile.host_direct_environment_name(),
     ));
     let session_name = "terminal-demo-implement-coder";
-    pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession {
+    pool.add_sessions(vec![flotilla_terminal::TerminalSession {
         session_name: session_name.to_string(),
         status: flotilla_protocol::TerminalStatus::Running,
         command: Some("old codex process with stale crew identity".to_string()),
@@ -418,7 +418,7 @@ async fn terminal_teardown_kills_a_persisted_session_after_runtime_restart() {
         env: Default::default(),
         pool: "fake-terminals".to_string(),
     };
-    pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession::builder()
+    pool.add_sessions(vec![flotilla_terminal::TerminalSession::builder()
         .session_name(session_name.to_string())
         .status(TerminalStatus::Running)
         .command("codex".to_string())
@@ -469,7 +469,7 @@ async fn codex_interactive_prompt_is_observed_as_needing_input() {
         ),
     };
     let session_name = "terminal-demo-work-coder";
-    pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession {
+    pool.add_sessions(vec![flotilla_terminal::TerminalSession {
         session_name: session_name.to_string(),
         status: TerminalStatus::Running,
         command: Some("codex".to_string()),

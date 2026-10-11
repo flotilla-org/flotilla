@@ -232,7 +232,7 @@ pub(super) async fn crew_daemon_with_backend(
 ) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
     let pool = Arc::new(FakeTerminalPool::new());
     let mut discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
+        FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_terminal::TerminalPool>),
     );
     discovery.factories.vcs.push(Box::new(flotilla_vcs::factory::GitVcsFactory));
     let daemon =
@@ -254,7 +254,7 @@ pub(super) async fn crew_daemon_with_process_runner(config: Arc<ConfigStore>) ->
     let pool = Arc::new(FakeTerminalPool::new());
     let codex_home = config.base_path().join("codex-home");
     let mut discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
+        FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_terminal::TerminalPool>),
     );
     discovery.factories.vcs.push(Box::new(flotilla_vcs::factory::GitVcsFactory));
     discovery.runner = Arc::new(ProcessCommandRunner);

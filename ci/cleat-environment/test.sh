@@ -5,5 +5,5 @@ set -euo pipefail
 : "${FLOTILLA_TEST_CLEAT_NEW:?select the pinned new cleat}"
 unset TMPDIR
 ci/toolchain/assert.sh
-cargo clippy -p flotilla-core --all-targets --locked --features cleat-environment-contract -- -D warnings
-cargo test -p flotilla-core --locked --lib --features cleat-environment-contract launch_environment_contract -- --nocapture
+cargo clippy -p flotilla-terminal --all-targets --locked --features cleat-environment-contract -- -D warnings
+cargo test -p flotilla-terminal --locked --lib --features cleat-environment-contract launch_environment_contract -- --nocapture

@@ -10,8 +10,8 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::terminal::passthrough::PassthroughTerminalPool;
-use crate::providers::terminal::TerminalPool;
+use crate::passthrough::PassthroughTerminalPool;
+use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
@@ -42,10 +42,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::PassthroughTerminalPoolFactory;
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::test_support::TestConfig as ConfigStore;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 
 use super::CleatTerminalPool;
-use crate::providers::terminal::TerminalPool;
+use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
@@ -154,7 +154,7 @@ impl CommandRunner for PollutedProcessRunner {
 #[cfg(unix)]
 #[tokio::test]
 async fn controlled_runner_replaces_the_real_process_environment() {
-    use crate::providers::terminal::environment::ControlledTerminalEnvironment;
+    use crate::environment::ControlledTerminalEnvironment;
     use flotilla_discovery_api::EnvironmentAssertion;
 
     let value = "/host with 'quotes' $() `literal`\nsecond-line";
@@ -181,8 +181,6 @@ async fn controlled_runner_replaces_the_real_process_environment() {
 #[hegel::test]
 fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
     use hegel::generators as gs;
-
-    use crate::providers::discovery::run_provisioned_host_detectors;
 
     // Generate both Cleat versions, empty/nonempty vessel maps, absent/present PATH,
     // both bag merge orders, and empty, ordinary and shell-special values.
@@ -229,7 +227,7 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
         if configured_path {
             vessel.insert("PATH".into(), value.into());
         }
-        let provisioned = run_provisioned_host_detectors(&[], &*runner, &vessel).await;
+        let provisioned = EnvironmentBag::provisioned(vessel.clone());
         let host = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("ARBITRARY_AMBIENT", "host"))
             .with(EnvironmentAssertion::env_var("HOME", "/host-home"))

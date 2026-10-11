@@ -10,8 +10,8 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::terminal::cleat::CleatTerminalPool;
-use crate::providers::terminal::TerminalPool;
+use crate::cleat::CleatTerminalPool;
+use crate::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
@@ -47,20 +47,20 @@ mod tests {
     use std::sync::Arc;
 
     use super::CleatTerminalPoolFactory;
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::test_support::TestConfig as ConfigStore;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_discovery_api::UnmetRequirement;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // #2706: factory discovery supplies the execution host baseline, while
     // Cleat owns terminal identity and ambient harness values never transfer.
     #[tokio::test]
     async fn session_factory_uses_declared_host_baseline_and_leaves_vt_identity_to_cleat() {
-        use crate::testkits::replay::testing::MockRunner;
         use flotilla_provider_runtime::CommandRunner;
+        use flotilla_replay_testkit::testing::MockRunner;
 
         for outer_identity in [None, Some(("screen-256color", "truecolor"))] {
             let mut bag = EnvironmentBag::new()

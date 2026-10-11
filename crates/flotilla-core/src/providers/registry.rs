@@ -1,5 +1,6 @@
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_vcs::vcs::Vcs;
+use flotilla_terminal::TerminalPool;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -13,7 +14,6 @@ use crate::{
         coding_agent::CloudAgentService,
         environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
-        terminal::TerminalPool,
     },
 };
 use flotilla_vcs::providers::CloneProvisioner;

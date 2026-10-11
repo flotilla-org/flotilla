@@ -1,5 +1,7 @@
 //! Attach target indexing, role resolution, and plan construction.
 
+use flotilla_terminal::TerminalSessionLiveness;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
@@ -35,7 +37,7 @@ use crate::{
         Hop, HopPlan, ResolutionContext,
     },
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
-    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry, terminal::TerminalSessionLiveness},
+    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 

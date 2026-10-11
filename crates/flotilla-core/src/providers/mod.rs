@@ -7,8 +7,6 @@ pub(crate) mod github_observation;
 pub(crate) mod github_poll;
 pub mod issue_tracker;
 pub mod registry;
-pub(crate) mod scan_cache;
-pub mod terminal;
 pub mod types;
 
 #[cfg(test)]
