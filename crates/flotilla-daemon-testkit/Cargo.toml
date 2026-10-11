@@ -14,7 +14,7 @@ flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 
 flotilla-daemon = { path = "../flotilla-daemon" }
 

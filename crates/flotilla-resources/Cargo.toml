@@ -20,7 +20,7 @@ futures = "0.3"
 indexmap = { workspace = true, features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tracing = "0.1"
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [dev-dependencies]
 serde_yml = "0.0.12"
@@ -28,7 +28,7 @@ flotilla-build-features-logging = { path = "../flotilla-build-features-logging" 
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = "=0.48.1"
 rstest = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]

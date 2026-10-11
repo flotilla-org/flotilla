@@ -1,9 +1,11 @@
-#[cfg(test)]
-use crate::CommandRunner;
 use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+
+#[cfg(test)]
+use crate::CommandRunner;
+
 /// Check host-owned repository configuration before a local Git process can
 /// interpret it. A contained worktree can write refs in the shared gitdir, so
 /// the host must treat config there as untrusted even with read-only overlays.

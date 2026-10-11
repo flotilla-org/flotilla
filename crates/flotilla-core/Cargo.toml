@@ -31,8 +31,8 @@ dirs = "6"
 toml = "0.8"
 toml_edit = "0.22"
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
-http = "1"
-bytes = "1"
+http = { workspace = true }
+bytes = { workspace = true }
 minijinja = "2"
 serde_yml = "0.0.12"
 futures = "0.3"
@@ -41,13 +41,13 @@ url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.38.4"
 tokio-util = { version = "0.7", features = ["rt"] }
-uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
+uuid = { workspace = true, features = ["v4"] }
+sha2 = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
@@ -61,7 +61,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 hegeltest = "=0.48.1"
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
-tempfile = "3"
+tempfile = { workspace = true }
 insta = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 

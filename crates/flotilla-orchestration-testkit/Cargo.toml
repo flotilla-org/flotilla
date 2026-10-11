@@ -14,11 +14,11 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 toml = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-sha2 = "0.10"
+sha2 = { workspace = true }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -18,7 +18,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["auxve
 # rustix uses libc/errno on macOS rather than Linux's raw syscall backend.
 [target.'cfg(target_os = "macos")'.dependencies]
 errno = "0.3"
-libc = "0.2"
+libc = { workspace = true }
 
 [dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }

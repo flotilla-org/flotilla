@@ -34,14 +34,14 @@ time = { version = "0.3.47", features = ["local-offset"] }
 futures = "0.3"
 comfy-table = "7.2.2"
 clap = { version = "4", features = ["derive"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 indexmap = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
 flotilla-store = { path = "../flotilla-store" }
@@ -53,7 +53,7 @@ async-trait = { workspace = true }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 insta = "1"
-tempfile = "3"
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 flotilla-daemon = { path = "../flotilla-daemon" }

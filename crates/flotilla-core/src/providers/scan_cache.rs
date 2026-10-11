@@ -4,6 +4,8 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::commands::AttachMode;
 use flotilla_provider_runtime::scan_cache::SharedScan;
 use std::{sync::Arc, time::Duration};
+
+/// Stays in core because it implements the core-owned TerminalPool provider trait.
 pub(crate) struct SharedTerminalPool {
     inner: Arc<dyn TerminalPool>,
     sessions: SharedScan<Vec<TerminalSession>>,
