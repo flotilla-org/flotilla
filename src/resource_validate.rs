@@ -10,20 +10,18 @@ use std::{collections::BTreeMap, sync::Arc};
 use color_eyre::{eyre::eyre, Result};
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
-use flotilla_core::ops_entry::parse_operational_entry;
-use flotilla_core::ops_entry::OperationalEntryFile;
-use flotilla_core::providers::environment::command_provider;
-use flotilla_core::providers::environment::EnvironmentKind;
-use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
-use flotilla_core::repository_inspection::inspect_project_ops_entries;
-use flotilla_core::repository_inspection::GitRepositoryInspector;
-use flotilla_core::repository_inspection::OperationalEntryInventory;
-use flotilla_core::repository_inspection::RepositoryInspector;
-use flotilla_core::vcs::FixedVcsResolver;
-use flotilla_core::vcs::FlotillaVcs;
-use flotilla_core::vcs::GitCheckoutStrategy;
+use flotilla_core::{
+    ops_entry::{parse_operational_entry, OperationalEntryFile},
+    providers::{
+        environment::{command_provider, EnvironmentKind},
+        vcs::git_worktree::GitWorktreeStrategy,
+    },
+    repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
+    vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
+};
 #[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+#[cfg(unix)]
 use flotilla_provider_runtime::ProcessCommandRunner;
 #[cfg(unix)]
 use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject};
