@@ -38,7 +38,6 @@ use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
 
-
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
 }

@@ -221,6 +221,9 @@ pub struct GithubRateLimit {
 
 impl GithubRateLimit {
     /// Keep GitHub diagnostics at the adapter boundary; consumers see a neutral failure.
+    /// The `kind=value,` and `retry_source=value,` fields are also the replay
+    /// provenance contract consumed by `from_observation_error`. Preserve their
+    /// spelling and delimiters; the round-trip and display tests pin this shape.
     pub fn observation_error(&self, budget: String) -> ObservationError {
         let detail = format!(
             "github rate limited (budget={budget}, identity=host gh login, kind={}, retry_source={}, retry_at={})",
