@@ -201,3 +201,16 @@ async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
     assert_eq!(observed.read_calls().get("Convoy"), Some(&2));
     assert!(plain.read_counts().is_empty());
 }
+
+// Default refusal messages describe the port; the HTTP adapter preserves its
+// legacy public errors for operations it cannot author locally.
+#[tokio::test]
+async fn unsupported_defaults_are_neutral_and_http_refusals_are_unchanged() {
+    let memory = ResourceBackend::new(InMemoryBackend::default());
+    assert_eq!(memory.store().unsupported_operation("replicas"), ResourceError::invalid("this store does not support replicas"));
+    let http = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), "http://127.0.0.1:1"));
+    assert!(matches!(http.store().list_replicas_raw(ResourceKind::of::<Convoy>(), "flotilla").await,
+        Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot hold replicas"));
+    assert!(matches!(http.local_namespaces::<Convoy>().await,
+        Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot enumerate local resource namespaces"));
+}

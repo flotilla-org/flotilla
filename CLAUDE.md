@@ -142,7 +142,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-aggregator` | Durable/observed resource query projection and demand-backed issue materialization |
 | `flotilla-resources` | Resource kinds, lifecycle authority, pure helpers, and typed list/watch shapes; no storage dependencies |
 | `flotilla-store` | Object-safe `Store`, typed resolvers, replica/watch machinery, store queries, and the generic controller runtime |
-| `flotilla-store-memory`, `flotilla-store-sqlite`, `flotilla-store-http` | Concrete storage adapters selected at composition |
+| `flotilla-store-memory` | In-memory storage and observed replicas; no native persistence dependencies |
+| `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
+| `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |
+| `flotilla-store-testkit` | Shared backend contracts, fixtures and per-request read counters |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
 | `flotilla-tls` | Shared TLS provider selection and HTTP client construction |
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |

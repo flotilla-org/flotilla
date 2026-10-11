@@ -1,10 +1,18 @@
 //! Untyped storage seam. Kind descriptors retain resource validation at the
 //! authoritative write boundary, including while a backend holds its transaction.
+use crate::replica::StoredReplicaEventKind;
+use chrono::Utc;
 use flotilla_protocol::NodeId;
-use flotilla_resources::*;
+use flotilla_resources::{
+    api_version, ApiPaths, DigestQuery, FieldOwnershipViolation, InputMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
+    MergeMetadata, Message, PartitionDigest, ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass,
+    Resource, ResourceError, ResourceList, ResourceObject, ResourcePosition, ResourceProvenance, ResourceStoreDiagnostics,
+    ResourceTombstone, StatusPatch, WatchEvent, WatchStart, WatchStream,
+};
+use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct SerializedResource;
@@ -22,8 +30,8 @@ impl Resource for SerializedResource {
 }
 
 pub fn transcode<A: Serialize, B: DeserializeOwned>(value: A) -> Result<B, ResourceError> {
-    let bytes = serde_json::to_vec(&value).map_err(|e| ResourceError::decode(e.to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|e| ResourceError::decode(e.to_string()))
+    let value = serde_json::to_value(value).map_err(|e| ResourceError::decode(e.to_string()))?;
+    serde_json::from_value(value).map_err(|e| ResourceError::decode(e.to_string()))
 }
 
 type ValidateSiblings = fn(&InputMeta, &Value, &[ResourceObject<SerializedResource>]) -> Result<(), ResourceError>;
@@ -52,6 +60,10 @@ impl ResourceKind {
             replication: T::REPLICATION_CLASS,
             validate_namespace: T::VALIDATE_NAMESPACE_SPEC,
             decode: |value| {
+                // Validate the registered type before exposing a stored row as
+                // serialized data. Keep the raw body so defaults/unknown fields
+                // are not rewritten by this read. Live watches decode only once
+                // in the typed extension; SQLite uses this pass for quarantine.
                 let object: K8sResourceObject<T> =
                     serde::Deserialize::deserialize(&value).map_err(|e| ResourceError::decode(format!("decode stored object: {e}")))?;
                 ResourceObject::from_k8s_object(object)?;
@@ -160,18 +172,16 @@ pub fn convert_read_watch<A: Resource, B: Resource>(event: ReadWatchEvent<A>) ->
     })
 }
 
-use crate::replica::StoredReplicaEventKind;
-use chrono::Utc;
-use futures::StreamExt;
-use std::collections::BTreeMap;
-
-#[allow(unused_variables)]
 #[async_trait::async_trait]
 /// Object-safe storage boundary. Requests carry serialized values and a kind
 /// descriptor; adapters apply its validators under their authoritative lock or
 /// transaction. Typed callers use [`StoreExt`] or [`crate::ResourceBackend`].
 /// Observer and local-root builders return isolated handles sharing the data.
 pub trait Store: std::fmt::Debug + Send + Sync {
+    /// Adapter-specific wording may preserve an existing public refusal contract.
+    fn unsupported_operation(&self, operation: &str) -> ResourceError {
+        ResourceError::invalid(format!("this store does not support {operation}"))
+    }
     fn with_local_root(&self, root: NodeId) -> Arc<dyn Store>;
     fn local_root(&self) -> Result<NodeId, ResourceError>;
     /// Remote views already merge definitions and provenance at their origin.
@@ -211,94 +221,99 @@ pub trait Store: std::fmt::Debug + Send + Sync {
             .collect())
     }
 
-    async fn delete_decode_quarantine_raw(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+    async fn delete_decode_quarantine_raw(
+        &self,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
+    ) -> Result<bool, ResourceError> {
         Ok(false)
     }
-    async fn local_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot enumerate local resource namespaces"))
+    async fn local_namespaces_raw(&self, _resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
+        Err(self.unsupported_operation("enumerating local resource namespaces"))
     }
-    async fn stored_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot enumerate stored resource namespaces"))
+    async fn stored_namespaces_raw(&self, _resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
+        Err(self.unsupported_operation("enumerating stored resource namespaces"))
     }
     async fn list_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn get_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        name: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn watch_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<crate::SerializedReadWatchEvent, ResourceError>>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn replace_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin_root: &NodeId,
-        namespace: &str,
-        listed: &ResourceList<SerializedResource>,
-        synced_at: chrono::DateTime<Utc>,
-        bucket: Option<u8>,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _listed: &ResourceList<SerializedResource>,
+        _synced_at: chrono::DateTime<Utc>,
+        _bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn apply_replica_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin_root: &NodeId,
-        namespace: &str,
-        kind: StoredReplicaEventKind,
-        object: &ResourceObject<SerializedResource>,
-        synced_at: chrono::DateTime<Utc>,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _kind: StoredReplicaEventKind,
+        _object: &ResourceObject<SerializedResource>,
+        _synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn apply_replica_tombstone_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin_root: &NodeId,
-        namespace: &str,
-        tombstone: &ResourceTombstone,
-        synced_at: chrono::DateTime<Utc>,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _tombstone: &ResourceTombstone,
+        _synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn invalidate_replica_cursor_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin_root: &NodeId,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
     ) -> Result<(), ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn advance_replica_cursor_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin_root: &NodeId,
-        namespace: &str,
-        previous: &ReplicaCursor,
-        next: &str,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
+        _previous: &ReplicaCursor,
+        _next: &str,
     ) -> Result<(), ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn replica_cursor_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin_root: &NodeId,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _origin_root: &NodeId,
+        _namespace: &str,
     ) -> Result<Option<ReplicaCursor>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn get_raw(
         &self,
@@ -311,22 +326,22 @@ pub trait Store: std::fmt::Debug + Send + Sync {
         -> Result<PartitionDigest, ResourceError>;
     async fn confirm_replica_digest_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        proof: &PartitionDigest,
-        previous: &ReplicaCursor,
+        _resource_kind: ResourceKind,
+        _origin: &NodeId,
+        _namespace: &str,
+        _proof: &PartitionDigest,
+        _previous: &ReplicaCursor,
     ) -> Result<(), ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn replica_digest_raw(
         &self,
-        resource_kind: ResourceKind,
-        origin: &NodeId,
-        namespace: &str,
-        generation: Option<String>,
+        _resource_kind: ResourceKind,
+        _origin: &NodeId,
+        _namespace: &str,
+        _generation: Option<String>,
     ) -> Result<PartitionDigest, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError>;
     async fn list_raw_matching_labels(
@@ -344,13 +359,13 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
     async fn create_definition_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        meta: &InputMeta,
-        spec: &Value,
-        merge: MergeMetadata,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _meta: &InputMeta,
+        _spec: &Value,
+        _merge: MergeMetadata,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot author definitions"))
+        Err(self.unsupported_operation("authoring definitions"))
     }
     async fn update_raw(
         &self,
@@ -362,14 +377,14 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<ResourceObject<SerializedResource>, ResourceError>;
     async fn update_definition_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        meta: &InputMeta,
-        resource_version: &str,
-        spec: &Value,
-        merge: MergeMetadata,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _meta: &InputMeta,
+        _resource_version: &str,
+        _spec: &Value,
+        _merge: MergeMetadata,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot author definitions"))
+        Err(self.unsupported_operation("authoring definitions"))
     }
     async fn update_status_raw(
         &self,
@@ -395,71 +410,71 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<crate::SerializedWatchStream, ResourceError>;
     async fn list_including_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn list_including_replicas_raw_matching_labels(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        required: &BTreeMap<String, String>,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _required: &BTreeMap<String, String>,
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn get_including_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        name: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
     ) -> Result<ReadResourceObject<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn get_all_including_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        name: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _name: &str,
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn list_replica_sources_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn list_read_view_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query_key: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _query_key: &str,
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn watch_including_replicas_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn watch_replica_sources_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
     async fn watch_read_view_raw(
         &self,
-        resource_kind: ResourceKind,
-        namespace: &str,
-        query_key: &str,
+        _resource_kind: ResourceKind,
+        _namespace: &str,
+        _query_key: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<SerializedResource>, ResourceError>>, ResourceError> {
-        Err(ResourceError::invalid("HTTP backends cannot hold replicas"))
+        Err(self.unsupported_operation("replicas"))
     }
 }
 
@@ -729,4 +744,28 @@ async fn transcode_request<A: Serialize + Send + 'static, B: DeserializeOwned + 
         return transcode(value);
     }
     tokio::task::spawn_blocking(move || transcode(value)).await.map_err(|e| ResourceError::other(format!("encode store request: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PanickingSerializer;
+    impl Serialize for PanickingSerializer {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            panic!("serializer panic fixture");
+        }
+    }
+
+    // A serializer panic becomes a regular store error; it does not poison the
+    // blocking pool or prevent a subsequent request from being encoded.
+    #[tokio::test]
+    async fn encoding_panic_is_an_error_and_the_next_request_succeeds() {
+        let result = transcode_request::<_, Value>(true, PanickingSerializer).await;
+        assert!(
+            matches!(result, Err(ResourceError::Other { message }) if message.contains("encode store request") && message.contains("serializer panic fixture"))
+        );
+        let value = serde_json::json!({"spec":{"value":"next"}});
+        assert_eq!(transcode_request::<_, Value>(true, value.clone()).await.expect("next request"), value);
+    }
 }

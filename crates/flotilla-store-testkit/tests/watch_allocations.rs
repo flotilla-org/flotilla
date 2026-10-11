@@ -70,6 +70,19 @@ async fn delivered_watch_allocation_workload() {
         let resolver = backend.using::<Convoy>("allocation");
         let mut local = resolver.watch(WatchStart::Now).await.expect("local watch");
         let object = resolver.create(&meta, &spec).await.expect("create");
+        // Typed conversion preserves the object and requests fewer allocation bytes than
+        // the former serialize-to-bytes/parse path, for the same large payload.
+        let (legacy_object, bytes_cost) = measured(&format!("{name}/typed-conversion-bytes"), async {
+            let bytes = serde_json::to_vec(&object).expect("serialize legacy conversion");
+            serde_json::from_slice::<flotilla_resources::ResourceObject<Convoy>>(&bytes).expect("parse legacy conversion")
+        })
+        .await;
+        let (converted, value_cost) = measured(&format!("{name}/typed-conversion-value"), async {
+            flotilla_store::transcode::<_, flotilla_resources::ResourceObject<Convoy>>(&object).expect("convert typed object")
+        })
+        .await;
+        assert_eq!(serde_json::to_value(&converted).unwrap(), serde_json::to_value(&legacy_object).unwrap());
+        assert!(value_cost.1 < bytes_cost.1, "typed conversion avoids the serialized byte buffer");
         let stored = serde_json::to_value(object.to_k8s_object()).expect("stored JSON");
         let (_, legacy_cost) = measured(&format!("{name}/legacy-clone-decode"), async {
             let decoded: flotilla_resources::K8sResourceObject<Convoy> = serde_json::from_value(stored.clone()).expect("legacy decode");

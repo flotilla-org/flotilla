@@ -3997,8 +3997,8 @@ pub(super) async fn handler_contract_fixture() -> HandlerContractFixture {
         EnvironmentManager::new_local(&discovery, local_environment_id.clone(), flotilla_protocol::qualified_path::HostId::new("host"))
             .await,
     );
-    let resource_backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
-    let observed_resource_backend = ResourceBackend::InMemory(flotilla_store::InMemoryBackend::default());
+    let resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let observed_resource_backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
     let provisioning_namespace = Arc::new(std::sync::RwLock::new("flotilla".into()));
     let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
         resource_backend: resource_backend.clone(),

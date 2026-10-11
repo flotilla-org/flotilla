@@ -10,6 +10,16 @@ pub use http::*;
 
 #[async_trait::async_trait]
 impl Store for HttpBackend {
+    fn unsupported_operation(&self, operation: &str) -> ResourceError {
+        let message = match operation {
+            "replicas" => "HTTP backends cannot hold replicas".to_string(),
+            "authoring definitions" => "HTTP backends cannot author definitions".to_string(),
+            "enumerating local resource namespaces" => "HTTP backends cannot enumerate local resource namespaces".to_string(),
+            "enumerating stored resource namespaces" => "HTTP backends cannot enumerate stored resource namespaces".to_string(),
+            other => format!("this store does not support {other}"),
+        };
+        ResourceError::invalid(message)
+    }
     fn with_local_root(&self, _root: NodeId) -> std::sync::Arc<dyn Store> {
         std::sync::Arc::new(self.clone())
     }
