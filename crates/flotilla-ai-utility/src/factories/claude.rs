@@ -10,9 +10,9 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::ai_utility::claude_api::ClaudeApiAiUtility;
-use crate::providers::ai_utility::claude_cli::ClaudeCliAiUtility;
-use crate::providers::ai_utility::AiUtility;
+use crate::claude_api::ClaudeApiAiUtility;
+use crate::claude_cli::ClaudeCliAiUtility;
+use crate::AiUtility;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;
@@ -88,12 +88,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testing::TestConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_discovery_api::UnmetRequirement;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_claude_binary() -> EnvironmentBag {
@@ -109,8 +109,7 @@ mod tests {
     #[tokio::test]
     async fn claude_api_ai_utility_factory_succeeds_with_api_key() {
         let bag = bag_with_api_key();
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
@@ -119,8 +118,7 @@ mod tests {
     #[tokio::test]
     async fn claude_api_ai_utility_factory_fails_without_api_key() {
         let bag = EnvironmentBag::new();
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeApiAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without API key");
@@ -140,8 +138,7 @@ mod tests {
     #[tokio::test]
     async fn claude_cli_ai_utility_factory_succeeds_with_binary() {
         let bag = bag_with_claude_binary();
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
@@ -150,8 +147,7 @@ mod tests {
     #[tokio::test]
     async fn claude_cli_ai_utility_factory_fails_without_binary() {
         let bag = EnvironmentBag::new();
-        let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig;
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = ClaudeCliAiUtilityFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without claude binary");

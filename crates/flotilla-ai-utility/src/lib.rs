@@ -1,5 +1,7 @@
+//! AI utility providers and their discovery factories.
 pub mod claude_api;
 pub mod claude_cli;
+pub mod factories;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -49,7 +51,7 @@ pub trait AiUtility: Send + Sync {
     }
 }
 
-pub(super) fn parse_convoy_names(output: &str) -> Result<ConvoyNames, String> {
+pub(crate) fn parse_convoy_names(output: &str) -> Result<ConvoyNames, String> {
     let output = output.trim().trim_matches('`').trim();
     let output = output.strip_prefix("json").map(str::trim).unwrap_or(output);
     let names: ConvoyNames = serde_json::from_str(output).map_err(|error| format!("invalid convoy names response: {error}"))?;
@@ -59,3 +61,6 @@ pub(super) fn parse_convoy_names(output: &str) -> Result<ConvoyNames, String> {
         Ok(names)
     }
 }
+
+#[cfg(test)]
+mod testing;

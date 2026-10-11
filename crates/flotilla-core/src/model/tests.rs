@@ -1,3 +1,4 @@
+use flotilla_ai_utility::AiUtility;
 use flotilla_cloud_agent::{CloudAgentService, RepoCriteria};
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use async_trait::async_trait;
@@ -9,7 +10,6 @@ use flotilla_protocol::{
 use super::*;
 use flotilla_vcs::vcs::Vcs;
 use crate::{providers::{
-        ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         issue_tracker::IssueProvider,
         types::{
