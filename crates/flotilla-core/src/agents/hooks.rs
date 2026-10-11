@@ -270,7 +270,8 @@ pub fn parser_for_harness(harness: &str) -> Result<(AgentHarness, Box<dyn Harnes
 
 /// Native command input schema: openai/codex rust-v0.160.0,
 /// codex-rs/hooks/src/schema.rs. SubagentStop is deliberately not subscribed:
-/// its session_id belongs to the parent, whose turn is still running.
+/// its session_id belongs to the parent, whose turn is still running. It is
+/// still parsed as NoChange in case an external configuration subscribes it.
 const CODEX_HOOK_SUBSCRIPTIONS: &[(&str, &str, AgentEventType)] = &[
     ("SessionStart", "session-start", AgentEventType::Started),
     ("SessionEnd", "session-end", AgentEventType::Ended),
@@ -288,6 +289,8 @@ pub fn codex_hook_overrides() -> Vec<String> {
     }
     // Codex splits CLI override paths on dots without unquoting components.
     // Put path-bearing keys inside an inline table rather than the dotted path.
+    // rust-v0.160.0 codex-rs/hooks/src/engine/discovery.rs:
+    // config_toml_source_path(SessionFlags) and synthetic_layer_path define this.
     let source = if cfg!(windows) { r"C:\<session-flags>\config.toml" } else { "/<session-flags>/config.toml" };
     let states = CODEX_HOOK_SUBSCRIPTIONS
         .iter()
@@ -340,6 +343,8 @@ pub fn update_codex_hooks(document: &mut toml_edit::DocumentMut, install: bool, 
     }
     let Some(hooks) = document.get_mut("hooks") else { return Ok(()) };
     let hooks = hooks.as_table_like_mut().ok_or("Codex hooks must be a table")?;
+    // Codex discovery uses the configured User file path verbatim, not its
+    // canonical symlink target. Keep that spelling for trust identity.
     // Clear only our matching trust records; matcher indices are kept stable.
     if let Some(state) = hooks.get_mut("state") {
         let state = state.as_table_like_mut().ok_or("Codex hook state must be a table")?;

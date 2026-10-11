@@ -40,6 +40,12 @@ for pair in \
   fi
 done
 
+# Hook trust defaults/fingerprints are versioned upstream. A pin bump must
+# refresh the first-party hooks/list recording consumed by the Rust trust test.
+codex_hook_fixture="codex-hooks-list-$(workflow_input_default codex_version).json"
+test -f "$repo_root/crates/flotilla-core/src/agents/fixtures/$codex_hook_fixture"
+grep -Fq "include_str!(\"fixtures/$codex_hook_fixture\")" "$repo_root/crates/flotilla-core/src/agents/hooks.rs"
+
 grep -Fq 'runs-on: crew-image-builder' "$workflow"
 grep -Fqe '--platform linux/amd64,linux/arm64' "$workflow"
 grep -Fq '.flotilla/Dockerfile.crew' "$workflow"
