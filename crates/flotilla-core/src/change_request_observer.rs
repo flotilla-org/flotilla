@@ -97,6 +97,8 @@ impl ChangeRequestRefresher {
     /// Only the source owner arms refreshes; forge reads stay in the ordinary
     /// observer loop and observations reach consumers through store replication.
     pub async fn watch_convoy_demands(&self, namespace: &str) {
+        // Keep demands across resubscriptions: only a successful re-list can
+        // prove that a consumer disappeared and release its standing demand.
         let mut demands = HashMap::new();
         let mut retry_delay = Duration::from_secs(1);
         loop {
@@ -705,6 +707,8 @@ impl ChangeRequestRefresher {
                 // Declared source ownership is authoritative immediately. The
                 // legacy stale-record election below applies only without it.
                 // Even a fresher foreign claim cannot override the declared owner.
+                // Hosts may briefly disagree while source ownership replicates;
+                // claims converge once their views agree on the declared owner.
                 let mut spec = current.spec.clone();
                 spec.observing_authority = self.inner.authority.clone();
                 match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
