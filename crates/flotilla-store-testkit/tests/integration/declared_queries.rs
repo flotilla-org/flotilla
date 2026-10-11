@@ -331,6 +331,78 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
             .unwrap();
         assert_eq!(selected.items.iter().map(|source| source.object.metadata.name.clone()).collect::<Vec<_>>(), [name], "{number}");
     }
+    // Explicit JSON null is missing in numeric indexes on every backend. A
+    // semijoin projects the raw source name without decoding its invalid spec.
+    let null_source = ResourceBackend::new(InMemoryBackend::default());
+    null_source
+        .using::<flotilla_resources::ChangeRequest>("flotilla")
+        .create(
+            &InputMeta::builder().name("a".into()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("null-contract".into())
+                .scope("scope".into())
+                .number(1)
+                .observing_authority("query".into())
+                .build(),
+        )
+        .await
+        .unwrap();
+    let mut raw = serde_json::to_value(null_source.using::<flotilla_resources::ChangeRequest>("flotilla").list().await.unwrap()).unwrap();
+    raw["items"][0]["spec"]["number"] = serde_json::Value::Null;
+    authority
+        .replace_replicas_raw(
+            flotilla_store::ResourceKind::of::<flotilla_resources::ChangeRequest>(),
+            &NodeId::new("null-source"),
+            "flotilla",
+            &serde_json::from_value(raw).unwrap(),
+            chrono::Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    let selected = backend
+        .query_declared::<Convoy>(
+            "flotilla",
+            &StoreQuery {
+                field_matches_query: BTreeMap::from([(
+                    "metadata.name".into(),
+                    flotilla_store::FieldQuery {
+                        source_kind: Some("ChangeRequest".into()),
+                        field: "metadata.name".into(),
+                        query: Box::new(StoreQuery {
+                            missing_fields: std::collections::BTreeSet::from(["spec.number".into()]),
+                            include_replicas: true,
+                            ..Default::default()
+                        }),
+                    },
+                )]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.items.iter().map(|row| row.object.metadata.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    // Scalar object equality uses canonical key order, just like array values.
+    let charter = serde_json::json!({"kind":"repository", "repo":"catalog", "branch":"main", "path":"projects"});
+    authority
+        .definitions::<flotilla_resources::Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("object-contract".into()).build(),
+            &flotilla_resources::ProjectSpec::builder()
+                .display_name("Object contract".into())
+                .charter(serde_json::from_value(charter.clone()).unwrap())
+                .build(),
+        )
+        .await
+        .unwrap();
+    let selected = backend
+        .query_declared::<flotilla_resources::Project>(
+            "flotilla",
+            &StoreQuery { fields: BTreeMap::from([("spec.charter".into(), charter.to_string())]), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.items.iter().map(|row| row.object.metadata.name.as_str()).collect::<Vec<_>>(), ["object-contract"]);
     // Array selectors implement membership and absence over empty/wildcard
     // grants, and updates immediately replace old indexed values.
     use flotilla_resources::{CredentialGrant, CredentialGrantSelector, CredentialGrantSpec};
@@ -675,7 +747,10 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
 async fn shared_query_contract() {
     let sqlite = ResourceBackend::new(SqliteBackend::open_in_memory().unwrap());
     let memory = ResourceBackend::new(InMemoryBackend::default());
-    for backend in [&sqlite, &memory] {
+    let directory = tempfile::tempdir().unwrap();
+    let file = ResourceBackend::new(SqliteBackend::open(directory.path().join("sync.sqlite")).unwrap());
+    let asynchronous = ResourceBackend::new(SqliteBackend::open_async(directory.path().join("async.sqlite")).await.unwrap());
+    for backend in [&sqlite, &memory, &file, &asynchronous] {
         seed(backend).await;
         contract(backend, backend).await;
     }

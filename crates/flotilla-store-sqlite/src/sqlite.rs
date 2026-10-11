@@ -193,6 +193,7 @@ impl SqliteBackend {
         let read = RusqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
         Self::register_digest_functions(&read)?;
+        Self::register_query_functions(&read)?;
         read.busy_timeout(READ_BUSY_TIMEOUT)
             .map_err(|err| ResourceError::other(format!("configure sqlite resource read busy timeout: {err}")))?;
         backend.read_connection = Some(read.into());
@@ -207,6 +208,7 @@ impl SqliteBackend {
             .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
         read.call(|connection| {
             Self::register_digest_functions(connection)?;
+            Self::register_query_functions(connection)?;
             connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| ResourceError::other(format!("configure sqlite read timeout: {err}")))
         })
         .await
@@ -286,7 +288,7 @@ impl SqliteBackend {
                     Ok(serde_json::json!(values).to_string())
                 },
             )
-            .map_err(|error| Self::map_sqlite(error, "register declared array projection"))?;
+            .map_err(|error| Self::map_sqlite(error, "register declared field projection"))?;
         Ok(())
     }
 
@@ -572,6 +574,12 @@ impl SqliteBackend {
                 .map_err(|e| Self::map_sqlite(e, "record query migration"))?;
         }
         for kind in crate::declared_resource_kinds() {
+            let names = kind
+                .queryable_fields
+                .iter()
+                .map(|path| Self::field_index("resource_objects", kind, path))
+                .collect::<std::collections::BTreeSet<_>>();
+            debug_assert_eq!(names.len(), kind.queryable_fields.len(), "declared field index names must be unique");
             for path in kind.queryable_fields {
                 for table in ["resource_objects", "replica_objects"] {
                     let index = Self::field_index(table, kind, path);
@@ -616,21 +624,26 @@ impl SqliteBackend {
         if kind.queryable_numeric_fields.contains(&path) {
             // json_extract rounds unsigned integers above i64::MAX through a
             // SQLite REAL. The JSON operator retains their exact decimal text.
-            format!("CAST({body} -> '$.{path}' AS TEXT)")
+            format!("NULLIF(CAST({body} -> '$.{path}' AS TEXT),'null')")
         } else {
-            expression
+            // Object text must use the same canonical key order as memory,
+            // regardless of how an external author ordered stored JSON keys.
+            format!("CASE WHEN json_type({body},'$.{path}')='object' THEN json_extract(flotilla_declared_values({body},'{path}'),'$[0]') ELSE {expression} END")
         }
     }
     fn field_index(table: &str, kind: ResourceKind, path: &str) -> String {
         format!(
-            "{}_{}_{}",
+            "{}_{}_{}{}",
             table,
             kind.paths.kind,
-            path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>() + if path.contains("[].") { "_collection_v2" } else { "" }
+            path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>(),
+            // Existing scalar migrations used raw json_extract expressions.
+            // A distinct additive migration is required for canonical/null semantics.
+            if path.contains("[].") { "_collection_v2" } else if crate::array_field_path(path).is_some() { "" } else { "_scalar_v2" }
         )
     }
-    // Generated queries use positional parameters. Preserve quoted SQL text
-    // and SQLite's numbering of bare parameters while shifting nested queries.
+    // Generated SQL contains only static declared paths and bound user values;
+    // never inline a literal containing a ?<digits> token into this SQL.
     fn shift_bindings(sql: &str, offset: usize) -> String {
         let mut shifted = String::new();
         let mut chars = sql.chars().peekable();
@@ -3189,6 +3202,19 @@ mod latency_tests {
         assert_eq!(position.resource_version, created.metadata.resource_version);
         assert_eq!(position.generation, None);
         assert!(backend.diagnostics().await.expect("diagnostics").decode_quarantines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn independent_writer_requires_declared_query_functions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resources.sqlite");
+        let backend = ResourceBackend::new(SqliteBackend::open(&path).unwrap());
+        backend.using::<Host>("flotilla").create(&InputMeta::builder().name("writer".into()).build(), &HostSpec::default()).await.unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let error = connection.execute("UPDATE resource_objects SET body_json=body_json WHERE name='writer'", []).unwrap_err();
+        assert!(error.to_string().contains("flotilla_declared_values"), "{error}");
+        SqliteBackend::register_query_functions(&connection).unwrap();
+        assert_eq!(connection.execute("UPDATE resource_objects SET body_json=body_json WHERE name='writer'", []).unwrap(), 1);
     }
 
     #[tokio::test]
