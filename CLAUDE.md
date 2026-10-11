@@ -137,6 +137,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
 | `flotilla-ai-utility` | AI utility trait, Claude API/CLI implementations and factories |
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |
+| `flotilla-forge-forgejo` | Shared Forgejo HTTP client and authentication values |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |

@@ -157,6 +157,24 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
         )), [])
 
+    def test_forgejo_is_native_and_independent(self):
+        # Issue #3040 / ADR 0060: forge-forgejo is native and cannot reach composition or storage.
+        self.assertEqual(layer("flotilla-forge-forgejo"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-forge-forgejo", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-forge-forgejo: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-forge-forgejo", normal=("flotilla-protocol", "flotilla-provider-runtime")),
+            package("flotilla-core", normal=("flotilla-forge-forgejo",)),
+            package("flotilla-protocol"), package("flotilla-provider-runtime"),
+        )), [])
+
     def test_testkit_names(self):
         for name in ("flotilla-store-testkit", "future-testkit", "flotilla-test-support"):
             self.assertTrue(is_testkit(name))

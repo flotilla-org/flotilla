@@ -1,0 +1,27 @@
+[package]
+name = "flotilla-forge-forgejo"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-tls = { path = "../flotilla-tls" }
+reqwest = { workspace = true, features = ["json"] }
+serde_json.workspace = true
+urlencoding = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+
+[lints]
+workspace = true

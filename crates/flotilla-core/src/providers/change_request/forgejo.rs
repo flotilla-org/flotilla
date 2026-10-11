@@ -13,10 +13,10 @@ use flotilla_resources::{
 
 use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
-use crate::providers::forge::forgejo::ForgejoClient;
-use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
 use crate::providers::types::ChangeRequest;
 use crate::providers::types::ChangeRequestStatus;
+use flotilla_forge_forgejo::ForgejoClient;
+use flotilla_forge_forgejo::ForgejoIssueProviderConfig;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,
@@ -336,11 +336,11 @@ mod tests {
     use flotilla_provider_runtime::ChannelLabel;
 
     use super::*;
-    use crate::providers::forge::forgejo::ForgejoAuth;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::Masks;
+    use flotilla_forge_forgejo::ForgejoAuth;
 
     // Boundary double: Forgejo HTTP requests, including the body update.
     struct LinkHttp {

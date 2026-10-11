@@ -20,12 +20,12 @@ use flotilla_resources::ForgeKind;
 use crate::providers::change_request::forgejo::ForgejoChangeRequestProvider;
 use crate::providers::change_request::github::GitHubChangeRequest;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::FORGEJO_AUTH_PROVIDER;
-use crate::providers::forge::forgejo::ForgejoAuth;
-use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
 use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
 use crate::providers::issue_tracker::github::GitHubIssueProvider;
 use crate::providers::issue_tracker::IssueProvider;
+use flotilla_forge_forgejo::ForgejoAuth;
+use flotilla_forge_forgejo::ForgejoIssueProviderConfig;
+use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
     let mut unmet = vec![];

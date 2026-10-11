@@ -1,6 +1,10 @@
 //! Shared Forgejo connection and credential values.
-use flotilla_provider_runtime::http_execute;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
+
+use flotilla_provider_runtime::{http_execute, HttpClient};
+
+/// Authentication assertion key used by Forgejo discovery and admission.
+pub const FORGEJO_AUTH_PROVIDER: &str = "forgejo";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ForgejoAuth {
@@ -28,16 +32,13 @@ impl ForgejoIssueProviderConfig {
     }
 }
 
-use flotilla_provider_runtime::HttpClient;
-use std::sync::Arc;
-
-pub(crate) struct ForgejoClient {
-    pub(crate) http: Arc<dyn HttpClient>,
+pub struct ForgejoClient {
+    pub http: Arc<dyn HttpClient>,
     client: reqwest::Client,
-    pub(crate) config: ForgejoIssueProviderConfig,
+    pub config: ForgejoIssueProviderConfig,
 }
 impl ForgejoClient {
-    pub(crate) fn new(http: Arc<dyn HttpClient>, config: ForgejoIssueProviderConfig) -> Self {
+    pub fn new(http: Arc<dyn HttpClient>, config: ForgejoIssueProviderConfig) -> Self {
         let client = flotilla_tls::client_builder().build().expect("build Forgejo request client");
         Self { http, client, config }
     }
@@ -60,7 +61,7 @@ impl ForgejoClient {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<(serde_json::Value, bool), String> {
+    pub async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<(serde_json::Value, bool), String> {
         let response = http_execute!(self.http, self.issue_request(path, query)?)?;
         let status = response.status();
         let has_more = response
@@ -75,7 +76,7 @@ impl ForgejoClient {
         serde_json::from_str(&body).map(|value| (value, has_more)).map_err(|error| error.to_string())
     }
 
-    pub(crate) fn repository_request(
+    pub fn repository_request(
         &self,
         repo_slug: &str,
         method: reqwest::Method,
@@ -105,7 +106,7 @@ impl ForgejoClient {
         request.build().map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn execute(
+    pub async fn execute(
         &self,
         repo_slug: &str,
         method: reqwest::Method,
