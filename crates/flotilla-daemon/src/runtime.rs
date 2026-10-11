@@ -566,6 +566,11 @@ impl StartupRestoration {
         ))];
         let (forge_demands, _) = spawn_forge_read_demand_task(Arc::clone(daemon), options.namespace.clone());
         controller_tasks.push(AbortOnDropHandle::new(forge_demands));
+        let observation_daemon = Arc::clone(daemon);
+        let observation_namespace = options.namespace.clone();
+        controller_tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+            observation_daemon.watch_change_request_convoy_demands(&observation_namespace).await;
+        })));
         let Some(state) = self.state.as_ref() else {
             return futures::future::pending::<Result<(), ResourceError>>().await;
         };

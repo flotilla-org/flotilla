@@ -4452,6 +4452,7 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     assert_eq!(response.rows[0].evidence, "GitHub rate limit");
 }
 
+mod change_request_observation;
 mod forge_reads;
 mod image_layers;
 

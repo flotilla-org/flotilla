@@ -1,6 +1,6 @@
 use crate::providers::change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -13,7 +13,8 @@ use flotilla_resources::{
     ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, InputMeta, ObservedChangeRequestState, ObservedChecks, ResourceError,
     ResourceProvenance,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
+use futures::StreamExt;
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -89,6 +90,98 @@ impl ChangeRequestRefresher {
                 relay_wake: Notify::new(),
             }),
         }
+    }
+
+    /// Convoys are durable observation demand, including those homed on peers.
+    /// Subscribe before listing so startup and watch recovery cannot lose demand.
+    /// Only the source owner arms refreshes; forge reads stay in the ordinary
+    /// observer loop and observations reach consumers through store replication.
+    pub async fn watch_convoy_demands(&self, namespace: &str) {
+        let mut demands = HashMap::new();
+        loop {
+            let mut streams = Vec::new();
+            let mut subscription_error = None;
+            for kind in ["Convoy", "Project", "Repository", "Host", "Forge"] {
+                match watch_resource_kind_including_replicas(&self.inner.backend, namespace, kind).await {
+                    Ok(watch) => streams.push(
+                        watch
+                            .stream
+                            .chain(futures::stream::once(
+                                async move { Err(ResourceError::other(format!("{kind} convoy demand watch closed"))) },
+                            ))
+                            .boxed(),
+                    ),
+                    Err(error) => {
+                        subscription_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = subscription_error {
+                tracing::warn!(%error, "change request convoy demand watch subscription failed");
+            } else {
+                let mut events = futures::stream::select_all(streams);
+                loop {
+                    if let Err(error) = self.reconcile_convoy_demands(namespace, &mut demands).await {
+                        tracing::warn!(%error, "change request convoy demand reconciliation failed");
+                        break;
+                    }
+                    match events.next().await {
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, "change request convoy demand watch failed; relisting");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn reconcile_convoy_demands(&self, namespace: &str, demands: &mut HashMap<ChangeRequestRef, uuid::Uuid>) -> Result<(), String> {
+        let convoys = self.inner.backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
+        let mut wanted = HashSet::new();
+        let mut owners = HashMap::new();
+        for copy in convoys.items {
+            if copy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                continue;
+            }
+            for row in convoy_subject_rows(&copy.object, &ReferenceContext::default()) {
+                let Some(subject) = row.subject.leaf().ok().and_then(|address| ChangeRequestRef::from_address(namespace, &address)) else {
+                    continue;
+                };
+                let subject = subject.normalized();
+                let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
+                let owned = if let Some(owned) = owners.get(&source) {
+                    *owned
+                } else {
+                    let owned = crate::forge_observation::source_owner(&self.inner.backend, namespace, &source)
+                        .await?
+                        .is_some_and(|owner| owner.to_string() == self.inner.authority);
+                    owners.insert(source, owned);
+                    owned
+                };
+                if owned {
+                    wanted.insert(subject);
+                }
+            }
+        }
+        for subject in &wanted {
+            if let std::collections::hash_map::Entry::Vacant(entry) = demands.entry(subject.clone()) {
+                let id = uuid::Uuid::new_v4();
+                self.demand(id, subject.clone(), None).await?;
+                entry.insert(id);
+            }
+        }
+        let released = demands.keys().filter(|subject| !wanted.contains(*subject)).cloned().collect::<Vec<_>>();
+        for subject in released {
+            if let Some(id) = demands.remove(&subject) {
+                self.release(id).await;
+            }
+        }
+        Ok(())
     }
 
     async fn subject_lock(&self, subject: &ChangeRequestRef) -> Arc<Mutex<()>> {
@@ -579,11 +672,30 @@ impl ChangeRequestRefresher {
             if owner.to_string() != self.inner.authority {
                 return Ok(false);
             }
-            if !create_missing {
-                return Ok(self.inner.backend.using::<ChangeRequest>(&subject.namespace).get(&subject.record_name()).await.is_ok());
+            let name = subject.record_name();
+            let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+            if create_missing {
+                self.get_or_create_record(subject, &name).await?;
             }
-            self.get_or_create_record(subject, &subject.record_name()).await?;
-            return Ok(true);
+            loop {
+                let current = match records.get(&name).await {
+                    Ok(current) => current,
+                    Err(ResourceError::NotFound { .. }) => return Ok(false),
+                    Err(error) => return Err(error.to_string()),
+                };
+                if current.spec.observing_authority == self.inner.authority {
+                    return Ok(true);
+                }
+                // Declared source ownership is authoritative immediately. The
+                // legacy stale-record election below applies only without it.
+                let mut spec = current.spec.clone();
+                spec.observing_authority = self.inner.authority.clone();
+                match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
+                    Ok(_) => return Ok(true),
+                    Err(ResourceError::Conflict { .. }) => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
         }
         let name = subject.record_name();
         let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
@@ -693,6 +805,10 @@ impl ChangeRequestRefresher {
         subject: &ChangeRequestRef,
         name: &str,
     ) -> Result<flotilla_resources::ResourceObject<ChangeRequest>, String> {
+        let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
+        let authority = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source)
+            .await?
+            .map_or_else(|| self.inner.authority.clone(), |owner| owner.to_string());
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         match records.get(name).await {
             Ok(current) => Ok(current),
@@ -717,7 +833,7 @@ impl ChangeRequestRefresher {
                     .service(subject.service.clone())
                     .scope(subject.scope.clone())
                     .number(subject.number)
-                    .observing_authority(self.inner.authority.clone())
+                    .observing_authority(authority)
                     .build();
                 match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
                     Ok(created) => Ok(created),

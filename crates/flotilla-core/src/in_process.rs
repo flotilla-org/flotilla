@@ -2846,6 +2846,10 @@ impl InProcessDaemon {
         Ok(())
     }
 
+    pub async fn watch_change_request_convoy_demands(&self, namespace: &str) {
+        self.crew_ops.watch_change_request_convoy_demands(namespace).await;
+    }
+
     pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
         self.crew_ops.refresh_demanded_owned_change_requests().await
     }
