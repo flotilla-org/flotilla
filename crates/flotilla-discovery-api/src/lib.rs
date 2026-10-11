@@ -1,4 +1,9 @@
 //! Provider construction contracts shared by discovery and provider components.
+//!
+//! ADR 0060 (`docs/adr/0060-component-crates-and-composition-root.md`): depend
+//! only on base types and provider-runtime; never on core, provider components,
+//! discovery assembly, storage or composition roots. The build-graph gate
+//! enforces the same upward-dependency prohibition as provider-runtime.
 pub mod environment;
 pub mod provider_config;
 
@@ -181,3 +186,6 @@ pub trait Factory: Send + Sync {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>>;
 }
+
+#[cfg(test)]
+mod tests;

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
     change_request_record_name, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec,
@@ -25,8 +27,6 @@ use crate::in_process::InProcessDaemon;
 use crate::providers::change_request::observation::ChangeRequestObservationSource;
 use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::discovery::fake_discovery_with_runner;
-use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_discovery_api::EnvironmentBag;
 
 // #2585: the real convoy resolver shares proven branch absence across callers
 // while preserving ordered repository selection and refreshing after five minutes.

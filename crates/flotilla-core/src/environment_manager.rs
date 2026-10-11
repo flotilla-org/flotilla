@@ -4,6 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::HostDetector;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     EnvironmentId, EnvironmentInfo, EnvironmentStatus,
@@ -29,8 +31,6 @@ use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::ProvisionedMountMode;
 use crate::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
 use crate::providers::registry::ProviderRegistry;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_discovery_api::HostDetector;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;

@@ -1,7 +1,6 @@
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
-use flotilla_discovery_api::provider_config;
 use std::{
     collections::{BTreeMap, HashMap},
     os::unix::fs::MetadataExt,
@@ -17,6 +16,7 @@ use flotilla_core::agents::AgentEntry;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery_api::provider_config;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;

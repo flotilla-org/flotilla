@@ -1,10 +1,10 @@
-use flotilla_discovery_api::UnmetRequirement;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::EnvironmentId;
 
 use crate::{model::RepoModel, providers::registry::ProviderRegistry};

@@ -5,11 +5,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 
 use super::CleatTerminalPool;
 use crate::providers::terminal::TerminalPool;
-use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;

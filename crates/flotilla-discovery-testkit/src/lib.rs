@@ -4,9 +4,6 @@
 //! responses keyed by `(cmd, args)` and tracks which `cwd` paths and
 //! `exists` calls were made.
 
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -16,6 +13,9 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     AheadBehind, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
@@ -36,7 +36,6 @@ use flotilla_core::vcs::EnumeratedCheckout;
 use flotilla_core::vcs::FlotillaVcs;
 use flotilla_core::vcs::GitCheckoutStrategy;
 use flotilla_core::vcs::Vcs;
-use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;

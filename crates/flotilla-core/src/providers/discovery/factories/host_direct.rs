@@ -1,19 +1,18 @@
 //! Host adoption factory.
 
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
-
-use crate::providers::environment::host_direct::HostDirectEnvironmentProvider;
-use crate::providers::environment::EnvironmentProvider;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
+
+use crate::providers::environment::host_direct::HostDirectEnvironmentProvider;
+use crate::providers::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 

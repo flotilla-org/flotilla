@@ -1,7 +1,6 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
 use flotilla_store_sqlite::SqliteBackend;
-use flotilla_discovery_api::provider_config;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -34,6 +33,7 @@ use flotilla_core::repository_inspection::RepositoryContinuity;
 use flotilla_core::repository_inspection::RepositoryInspection;
 use flotilla_core::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery_api::provider_config;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::Factory;

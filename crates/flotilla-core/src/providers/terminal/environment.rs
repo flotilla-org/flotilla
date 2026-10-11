@@ -7,10 +7,10 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-
-use super::TerminalEnvVars;
 use flotilla_discovery_api::host_environment_keys;
 use flotilla_discovery_api::EnvironmentBag;
+
+use super::TerminalEnvVars;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;

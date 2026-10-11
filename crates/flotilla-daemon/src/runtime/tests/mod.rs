@@ -1,3 +1,7 @@
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_resources::Actuation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -52,10 +56,6 @@ use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
 use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_discovery_api::ProviderCategory;
-use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::DiscoveryMockRunner;

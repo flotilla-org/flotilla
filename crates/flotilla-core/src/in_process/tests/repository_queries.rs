@@ -1,9 +1,9 @@
 use flotilla_store_memory::InMemoryBackend;
-use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy,

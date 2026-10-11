@@ -1,3 +1,5 @@
+# ADR 0060: only base types and provider-runtime; no upward component dependencies.
+# See docs/adr/0060-component-crates-and-composition-root.md and ci/build-graph/check.py.
 [package]
 name = "flotilla-discovery-api"
 version = "0.1.0"

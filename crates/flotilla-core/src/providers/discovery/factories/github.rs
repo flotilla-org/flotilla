@@ -1,10 +1,16 @@
 //! GitHub and Forgejo factories for change request and issue tracker providers.
 
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
+use flotilla_discovery_api::provider_config::ProviderConfig;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_resources::ForgeKind;
 
 use crate::providers::change_request::forgejo::ForgejoChangeRequestProvider;
@@ -17,13 +23,6 @@ use crate::providers::forge::github::GhApiClient;
 use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
 use crate::providers::issue_tracker::github::GitHubIssueProvider;
 use crate::providers::issue_tracker::IssueProvider;
-use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
-use flotilla_discovery_api::provider_config::ProviderConfig;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_discovery_api::Factory;
-use flotilla_discovery_api::ProviderCategory;
-use flotilla_discovery_api::ProviderDescriptor;
-use flotilla_discovery_api::UnmetRequirement;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;

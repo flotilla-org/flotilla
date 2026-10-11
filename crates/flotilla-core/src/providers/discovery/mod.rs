@@ -5,6 +5,10 @@
 //! producing `EnvironmentAssertion` values collected into an `EnvironmentBag`.
 //! Factories consume the bag to construct typed provider instances.
 
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::VcsKind;
 use flotilla_discovery_api::{Factory, HostDetector, ProviderCategory, ProviderDescriptor, RepoDetector, UnmetRequirement};
 use flotilla_provider_runtime::{EnvVars, ProcessEnvVars};
 use futures::StreamExt;
@@ -35,10 +39,6 @@ use crate::providers::registry::ProviderSet;
 use crate::providers::scan_cache::SharedTerminalPool;
 use crate::providers::terminal::TerminalPool;
 use crate::vcs::Vcs;
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_discovery_api::VcsKind;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 

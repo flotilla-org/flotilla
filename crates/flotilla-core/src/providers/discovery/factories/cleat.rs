@@ -1,18 +1,17 @@
 //! Terminal pool factory for cleat.
 
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
-
-use crate::providers::terminal::cleat::CleatTerminalPool;
-use crate::providers::terminal::TerminalPool;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
+
+use crate::providers::terminal::cleat::CleatTerminalPool;
+use crate::providers::terminal::TerminalPool;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 

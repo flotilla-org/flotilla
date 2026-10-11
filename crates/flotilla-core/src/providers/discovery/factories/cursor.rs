@@ -1,18 +1,17 @@
 //! Cloud agent factory for Cursor-based provider.
 
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
-
-use crate::providers::coding_agent::cursor::CursorCodingAgent;
-use crate::providers::coding_agent::CloudAgentService;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
+
+use crate::providers::coding_agent::cursor::CursorCodingAgent;
+use crate::providers::coding_agent::CloudAgentService;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;

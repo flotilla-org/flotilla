@@ -1,4 +1,3 @@
-use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 pub mod docker;
 pub mod docker_image;
 pub mod host_direct;
@@ -19,6 +18,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 

@@ -1,21 +1,20 @@
 //! Cloud agent and AI utility factories for Claude-based providers.
 
-use flotilla_discovery_api::provider_config::ProviderConfigView;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 
 use crate::providers::ai_utility::claude_api::ClaudeApiAiUtility;
 use crate::providers::ai_utility::claude_cli::ClaudeCliAiUtility;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
 use crate::providers::coding_agent::CloudAgentService;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_discovery_api::Factory;
-use flotilla_discovery_api::ProviderCategory;
-use flotilla_discovery_api::ProviderDescriptor;
-use flotilla_discovery_api::UnmetRequirement;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;

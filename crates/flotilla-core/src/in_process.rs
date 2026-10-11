@@ -3,6 +3,8 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -166,8 +168,6 @@ use crate::step::RemoteStepProgressSink;
 use crate::step::StepOutcome;
 use crate::step::StepResolver;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
-use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;

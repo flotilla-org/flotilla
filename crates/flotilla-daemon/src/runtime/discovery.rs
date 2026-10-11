@@ -1,5 +1,6 @@
 //! Local and agentless-SSH discovery and fulfilment observations.
 
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_store::DockerImageSourceStoreExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,7 +15,6 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::providers::environment::EnvironmentKind;
 use flotilla_core::providers::registry::ProviderRegistry;
 use flotilla_credentials::CredentialStore;
-use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;

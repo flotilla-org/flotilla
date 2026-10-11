@@ -7,9 +7,9 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::HostDetector;
+
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 

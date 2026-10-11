@@ -3,9 +3,9 @@
 //! This module is the serialization boundary between the rich in-process
 //! core types and the flat, serde-friendly protocol types.
 
-use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag, UnmetRequirement};
 use std::collections::HashMap;
 
+use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag, UnmetRequirement};
 use flotilla_protocol::{DiscoveryEntry, DiscoveryFact, HostProviderStatus, ToolInventory, UnmetRequirementInfo};
 
 pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> DiscoveryEntry {
