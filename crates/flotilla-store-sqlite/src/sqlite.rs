@@ -620,9 +620,9 @@ impl SqliteBackend {
         }
         // Specialized Message indexes are kept as the established exemplar.
         let index = if let Some(message) = &query.message {
-            let (predicate, argument) = message.sql();
+            let (predicate, argument) = message.sql_at(args.len() + 1);
             args.push(argument.map(SqlValue::Text).unwrap_or(SqlValue::Null));
-            predicates.push(predicate.replace("?5", &format!("?{}", args.len())));
+            predicates.push(predicate);
             predicates.push(format!("(?{} IS NULL OR ?{} IS NOT NULL)", args.len(), args.len()));
             Some(message.sql_index(replicas).into())
         } else {
@@ -3112,6 +3112,49 @@ mod tests {
                             cases.push((combined.clone(), SqliteBackend::field_index(table, kind, "spec.receiver")));
                             cases.push((combined.clone(), format!("{table}_labels_lookup")));
                             cases.push((combined, format!("{table}_owners_lookup")));
+                        }
+                        // Exhaust every declared-field subset and relation combination.
+                        // Forced partial indexes must remain usable even when additional
+                        // fields/relations/Message variants are residual predicates.
+                        for mask in 0..(1usize << kind.queryable_fields.len()) {
+                            let fields: BTreeMap<String, String> = kind
+                                .queryable_fields
+                                .iter()
+                                .enumerate()
+                                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                                .map(|(_, path)| ((*path).into(), "value".into()))
+                                .collect();
+                            for relations in 0..4 {
+                                let query = crate::StoreQuery {
+                                    fields: fields.clone(),
+                                    labels: if relations & 1 != 0 {
+                                        BTreeMap::from([("team".into(), "target".into())])
+                                    } else {
+                                        BTreeMap::new()
+                                    },
+                                    owner: (relations & 2 != 0).then(|| crate::OwnerQuery {
+                                        api_version: "flotilla.work/v1".into(),
+                                        kind: "Project".into(),
+                                        name: "project".into(),
+                                    }),
+                                    ..Default::default()
+                                };
+                                if let Some(path) = fields.keys().next() {
+                                    cases.push((query.clone(), SqliteBackend::field_index(table, kind, path)));
+                                }
+                                if kind.paths.kind == "Message" {
+                                    for message in [
+                                        crate::MessageQuery::active(),
+                                        crate::MessageQuery::Active { receiver: Some("r".into()) },
+                                        crate::MessageQuery::ReplyTo { name: "n".into() },
+                                        crate::MessageQuery::Batch { id: "b".into() },
+                                        crate::MessageQuery::AuditBefore { before: Utc::now() },
+                                    ] {
+                                        let index = message.sql_index(replicas).to_string();
+                                        cases.push((crate::StoreQuery { message: Some(message), ..query.clone() }, index));
+                                    }
+                                }
+                            }
                         }
                         for (query, index) in cases {
                             query.validate(kind)?;

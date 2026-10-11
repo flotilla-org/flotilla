@@ -53,7 +53,15 @@ async fn seed(backend: &ResourceBackend) {
             .body("body".into())
             .in_reply_to("parent".into())
             .build();
-        let created = messages.create(&InputMeta::builder().name(name.into()).build(), &spec).await.unwrap();
+        let mut meta = InputMeta::builder().name(name.into()).build();
+        meta.labels.insert("team".into(), "target".into());
+        meta.owner_references.push(OwnerReference {
+            api_version: "flotilla.work/v1".into(),
+            kind: "Project".into(),
+            name: "project".into(),
+            controller: false,
+        });
+        let created = messages.create(&meta, &spec).await.unwrap();
         let mut status = MessageStatus::builder()
             .phase(if name == "active" { MessagePhase::Accepted } else { MessagePhase::Expired })
             .since(at)
@@ -136,10 +144,24 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
         (MessageQuery::AuditBefore { before: chrono::DateTime::from_timestamp(2, 0).unwrap() }, 1),
     ] {
         let observed = backend.clone().with_read_counts();
-        let result =
-            observed.query_declared::<Message>("flotilla", &StoreQuery { message: Some(message), ..Default::default() }).await.unwrap();
+        let result = observed
+            .query_declared::<Message>("flotilla", &StoreQuery { message: Some(message.clone()), ..Default::default() })
+            .await
+            .unwrap();
         assert_eq!(result.items.len(), expected);
         assert_eq!(observed.read_counts().get("Message"), Some(&expected));
+        let combined = StoreQuery {
+            message: Some(message),
+            fields: BTreeMap::from([("spec.receiver".into(), "flotilla/receiver".into())]),
+            labels: BTreeMap::from([("team".into(), "target".into())]),
+            owner: Some(OwnerQuery { api_version: "flotilla.work/v1".into(), kind: "Project".into(), name: "project".into() }),
+            ..Default::default()
+        };
+        assert_eq!(
+            backend.query_declared::<Message>("flotilla", &combined).await.unwrap().items.len(),
+            expected,
+            "combined Message predicates"
+        );
     }
     for (path, value, expected) in [
         ("spec.receiver", "flotilla/receiver", 2),
