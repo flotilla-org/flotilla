@@ -10,9 +10,9 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::vcs::clone::ReferenceCloneStrategy;
-use crate::providers::vcs::detection::reference_clone_available;
-use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+use crate::providers::clone::ReferenceCloneStrategy;
+use crate::providers::detection::reference_clone_available;
+use crate::providers::git_worktree::GitWorktreeStrategy;
 use crate::vcs::FlotillaVcs;
 use crate::vcs::GitCheckoutStrategy;
 use crate::vcs::Vcs;
@@ -64,19 +64,42 @@ mod tests {
     use std::sync::Arc;
 
     use super::GitVcsFactory;
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery_api::provider_config::{ProviderConfig, ResolvedCheckoutConfig};
+    use flotilla_paths::path_context::DaemonHostPath;
+    // In-memory configuration view keeps factory tests independent of core persistence.
+    struct TestConfig(DaemonHostPath);
+    impl TestConfig {
+        fn with_base(path: &std::path::Path) -> Self {
+            Self(DaemonHostPath::new(path))
+        }
+    }
+    #[async_trait::async_trait]
+    impl super::ProviderConfigView for TestConfig {
+        fn base_path(&self) -> &DaemonHostPath {
+            &self.0
+        }
+        fn state_dir(&self) -> &DaemonHostPath {
+            &self.0
+        }
+        fn resolve_checkout_config(&self, _: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
+            ResolvedCheckoutConfig { path: crate::default_checkout_path() }
+        }
+        async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
+            Ok(ProviderConfig::default())
+        }
+    }
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_discovery_api::UnmetRequirement;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn git_factory_succeeds_when_binary_available() {
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         assert!(GitVcsFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await.is_ok());
     }
@@ -87,7 +110,7 @@ mod tests {
             .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
             .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "env-1"));
         let dir = tempfile::tempdir().expect("config dir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         let runner = Arc::new(
             DiscoveryMockRunner::builder()
                 .on_run("git", &["--git-dir", "/ref/repo", "rev-parse", "--git-dir"], Ok("/ref/repo".into()))
@@ -104,7 +127,7 @@ mod tests {
             .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
             .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "env-1"));
         let dir = tempfile::tempdir().expect("config dir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         let runner =
             Arc::new(DiscoveryMockRunner::builder().on_run("git", &["worktree", "list", "--porcelain"], Ok(String::new())).build());
         let vcs = GitVcsFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await.expect("git provider");
@@ -115,7 +138,7 @@ mod tests {
     async fn git_factory_fails_without_binary() {
         let bag = EnvironmentBag::new();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let unmet = GitVcsFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await.err().expect("missing git");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("git".into())));

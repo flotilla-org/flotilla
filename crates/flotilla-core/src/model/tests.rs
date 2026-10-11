@@ -6,6 +6,7 @@ use flotilla_protocol::{
 };
 
 use super::*;
+use flotilla_vcs::vcs::Vcs;
 use crate::{providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
@@ -14,7 +15,6 @@ use crate::{providers::{
         types::{
             ChangeRequest, Checkout, CloudAgentSession, Issue,
         },
-        vcs::Vcs,
     }};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 

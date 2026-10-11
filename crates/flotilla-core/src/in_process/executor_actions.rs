@@ -61,7 +61,7 @@ pub(super) trait ExecutorActionPort: Send + Sync {
         generation: &str,
         diagnostics_dir: &Path,
     ) -> Result<crate::cleat_roll::RollReport, String>;
-    fn vcs_resolver(&self) -> Result<Arc<dyn crate::vcs::CheckoutVcsResolver>, String>;
+    fn vcs_resolver(&self) -> Result<Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>, String>;
     async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String>;
     async fn repository_registry(&self, repository: &ResourceObject<Repository>) -> Result<Arc<ProviderRegistry>, String>;
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData;

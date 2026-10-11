@@ -45,8 +45,7 @@ def exempt(path, production=False):
         or Path(path).name == "build.rs"
         or path == "crates/build_identity.rs"
         or path == "crates/flotilla-provider-runtime/src/git_config_guard.rs"
-        or path == VCS + "vcs.rs"
-        or path.startswith(VCS + "providers/vcs/")
+        or path.startswith("crates/flotilla-vcs/src/")
     )
 
 

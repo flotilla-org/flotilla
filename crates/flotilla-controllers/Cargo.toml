@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }

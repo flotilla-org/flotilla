@@ -17,7 +17,6 @@ use flotilla_core::providers::discovery::run_host_detectors;
 use flotilla_core::providers::discovery::FactoryRegistry;
 use flotilla_core::providers::environment::CreateOpts;
 use flotilla_core::providers::environment::EnvironmentKind;
-use flotilla_core::vcs::RepositoryRead;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -26,6 +25,7 @@ use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_provider_runtime::ProcessEnvVars;
+use flotilla_vcs::vcs::RepositoryRead;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

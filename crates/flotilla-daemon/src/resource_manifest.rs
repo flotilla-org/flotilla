@@ -15,7 +15,6 @@ use std::{
 };
 
 use flotilla_core::charter_store::read_charter_source;
-use flotilla_core::vcs::Vcs;
 use flotilla_resources::{
     CharterSource, ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
     ManifestRootSpec, ManifestRootStatus, ObjectEvent, ResolutionAction, ResolutionOutcome, ResourceError, RetryCeiling,
@@ -25,6 +24,7 @@ use flotilla_store::{
     apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, EventRecorder,
     ResourceBackend,
 };
+use flotilla_vcs::vcs::Vcs;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -1112,7 +1112,6 @@ mod tests {
     use chrono::Utc;
     use flotilla_core::config::ConfigStore;
     use flotilla_core::in_process::InProcessDaemon;
-    use flotilla_core::providers::discovery::factories::git::GitVcsFactory;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
@@ -1123,6 +1122,7 @@ mod tests {
     use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_resources::{InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, WatchStart, WorkflowTemplate};
     use flotilla_store::{patch_resource_annotation, ResourceBackend, MANIFEST_WRITER_SOURCE};
+    use flotilla_vcs::factory::GitVcsFactory;
     use futures::StreamExt;
 
     use super::*;

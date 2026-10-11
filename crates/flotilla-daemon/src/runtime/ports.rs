@@ -17,9 +17,6 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::checkout_integration::checkout_path_from_status_and_spec;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::OperatorReconciler;
-use flotilla_core::vcs::CheckoutMaterialisationError;
-use flotilla_core::vcs::CheckoutRegistration;
-use flotilla_core::vcs::WorktreeMetadata;
 use flotilla_protocol::RepoSelector;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -28,6 +25,9 @@ use flotilla_resources::{
     DemandSpec, Forge, ForgeIdentity, InputMeta, ManifestRoot, Resource, ResourceError, ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
+use flotilla_vcs::vcs::CheckoutMaterialisationError;
+use flotilla_vcs::vcs::CheckoutRegistration;
+use flotilla_vcs::vcs::WorktreeMetadata;
 use tracing::{info, warn};
 
 use super::credentials::{reconcile_work_credentials_for_environment, record_credential_delivery_retry};

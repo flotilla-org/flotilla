@@ -7,10 +7,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::vcs::Vcs;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{canonicalize_repo_url, ForgeSpec};
+use flotilla_vcs::vcs::Vcs;
 use tokio::sync::Mutex;
 
 use crate::reconcilers::CloneRuntime;
@@ -50,11 +50,11 @@ pub(crate) fn controller_vcs(
     }
     #[cfg(test)]
     {
-        use flotilla_core::{
-            providers::vcs::git_worktree::GitWorktreeStrategy,
+        use flotilla_paths::path_context::ExecutionEnvironmentPath;
+        use flotilla_vcs::{
+            providers::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        use flotilla_paths::path_context::ExecutionEnvironmentPath;
         Ok(Arc::new(FlotillaVcs::new(
             ExecutionEnvironmentPath::new(_checkout),
             Arc::clone(_runner),

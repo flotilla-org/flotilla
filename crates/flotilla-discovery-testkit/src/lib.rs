@@ -28,20 +28,20 @@ use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
 use flotilla_core::providers::issue_tracker::IssueProvider;
 use flotilla_core::providers::terminal::TerminalPool;
 use flotilla_core::providers::terminal::TerminalSessionLiveness;
-use flotilla_core::providers::types::BranchInfo;
-use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
-use flotilla_core::providers::vcs::VcsInspection;
-use flotilla_core::vcs::CheckoutVcsResolver;
-use flotilla_core::vcs::EnumeratedCheckout;
-use flotilla_core::vcs::FlotillaVcs;
-use flotilla_core::vcs::GitCheckoutStrategy;
-use flotilla_core::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::ProcessCommandRunner;
+use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+use flotilla_vcs::providers::VcsInspection;
+use flotilla_vcs::vcs::CheckoutVcsResolver;
+use flotilla_vcs::vcs::EnumeratedCheckout;
+use flotilla_vcs::vcs::FlotillaVcs;
+use flotilla_vcs::vcs::GitCheckoutStrategy;
+use flotilla_vcs::vcs::Vcs;
+use flotilla_vcs::BranchInfo;
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
 
@@ -51,10 +51,7 @@ impl CheckoutVcsResolver for TestVcsResolver {
         Ok(Arc::new(FlotillaVcs::new(
             ExecutionEnvironmentPath::new(path),
             Arc::clone(&self.0),
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(
-                flotilla_core::config::default_checkout_path(),
-                Arc::clone(&self.0),
-            ))),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), Arc::clone(&self.0)))),
         )))
     }
 }

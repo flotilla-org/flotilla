@@ -11,10 +11,3 @@ pub struct RepoCriteria {
     /// "owner/repo" from git remote (e.g. "changedirection/reticulate")
     pub repo_slug: Option<String>,
 }
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchInfo {
-    pub name: String,
-    pub is_trunk: bool,
-}

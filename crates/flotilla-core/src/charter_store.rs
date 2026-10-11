@@ -8,7 +8,7 @@ use std::{
 use flotilla_resources::CharterSource;
 use sha2::{Digest, Sha256};
 
-use crate::vcs::{TreeEntry, Vcs, REVISION_FETCH_TIMEOUT, REVISION_FETCH_UNAVAILABLE};
+use flotilla_vcs::vcs::{TreeEntry, Vcs, REVISION_FETCH_TIMEOUT, REVISION_FETCH_UNAVAILABLE};
 
 /// Bound source I/O while namespace authoring is excluded. This applies to
 /// injected inspectors too, rather than relying on a particular VCS timeout.
@@ -266,14 +266,14 @@ pub fn ops_root_name(project: &str, member: &flotilla_resources::ProjectReposito
 
 #[cfg(test)]
 mod tests {
-    use crate::providers::vcs::clone::ReferenceCloneStrategy;
     use crate::testkits::discovery::FakeCheckoutManager;
-    use crate::vcs::FlotillaVcs;
-    use crate::vcs::GitCheckoutStrategy;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandRunner;
     use flotilla_provider_runtime::ProcessCommandRunner;
+    use flotilla_vcs::providers::clone::ReferenceCloneStrategy;
+    use flotilla_vcs::vcs::FlotillaVcs;
+    use flotilla_vcs::vcs::GitCheckoutStrategy;
 
     async fn fixture_git(root: &Path, args: &[&str]) {
         ProcessCommandRunner.run("git", args, root, &ChannelLabel::Default).await.expect("fixture git");

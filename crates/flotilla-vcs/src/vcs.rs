@@ -17,12 +17,12 @@ use flotilla_resources::{canonicalize_repo_url, CheckoutBranchProvenance};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::providers::types::Checkout;
-use crate::providers::vcs::clone::ReferenceCloneStrategy;
-use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-use crate::providers::vcs::CloneProvisioner;
-use crate::providers::vcs::GitCloneProvisioner;
+use crate::providers::clone::ReferenceCloneStrategy;
+use crate::providers::git_worktree::GitWorktreeStrategy;
+use crate::providers::CloneProvisioner;
+use crate::providers::GitCloneProvisioner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::Checkout;
 use flotilla_provider_runtime::command_channel_label;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
@@ -1952,9 +1952,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::testkits::replay;
-    use crate::testkits::replay::testing::fixture_path;
-    use crate::testkits::replay::testing::TimeoutOnlyRunner;
+    use crate::fixture_path;
+    use flotilla_replay_testkit as replay;
+    use flotilla_replay_testkit::testing::TimeoutOnlyRunner;
 
     // A subprocess double holds fetch open. Cache contention must not consume
     // its 60-second deadline; the fetch itself still expires after exactly 60s.
@@ -2024,7 +2024,7 @@ mod tests {
 
     fn test_fl(cwd: &Path, runner: Arc<dyn CommandRunner>, explicit: bool) -> FlotillaVcs {
         let strategy =
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), Arc::clone(&runner))));
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::default_checkout_path(), Arc::clone(&runner))));
         let mut vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(cwd), runner, strategy);
         vcs.explicit_checkout = explicit;
         vcs

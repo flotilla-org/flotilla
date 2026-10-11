@@ -142,9 +142,9 @@ mod seed;
 mod terminal;
 mod work_credentials;
 
-fn test_controller_vcs(runner: Arc<dyn CommandRunner>, checkout: &str) -> Arc<dyn flotilla_core::vcs::Vcs> {
-    use flotilla_core::{
-        providers::vcs::git_worktree::GitWorktreeStrategy,
+fn test_controller_vcs(runner: Arc<dyn CommandRunner>, checkout: &str) -> Arc<dyn flotilla_vcs::vcs::Vcs> {
+    use flotilla_vcs::{
+        providers::git_worktree::GitWorktreeStrategy,
         vcs::{FlotillaVcs, GitCheckoutStrategy},
     };
     Arc::new(FlotillaVcs::new(

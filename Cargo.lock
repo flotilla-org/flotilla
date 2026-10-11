@@ -1069,6 +1069,7 @@ dependencies = [
  "flotilla-test-support",
  "flotilla-tls",
  "flotilla-tui",
+ "flotilla-vcs",
  "hegeltest",
  "libc",
  "ratatui",
@@ -1429,6 +1430,7 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
+ "flotilla-vcs",
  "futures",
  "hegeltest",
  "rstest",
@@ -1484,6 +1486,7 @@ dependencies = [
  "flotilla-store-sqlite",
  "flotilla-store-testkit",
  "flotilla-tls",
+ "flotilla-vcs",
  "futures",
  "hegeltest",
  "http",
@@ -1545,6 +1548,7 @@ dependencies = [
  "flotilla-store-memory",
  "flotilla-store-testkit",
  "flotilla-tls",
+ "flotilla-vcs",
  "futures",
  "hegeltest",
  "http",
@@ -1618,6 +1622,7 @@ dependencies = [
  "flotilla-test-support",
  "flotilla-tls",
  "flotilla-transport",
+ "flotilla-vcs",
  "futures",
  "hegeltest",
  "hmac",
@@ -1703,6 +1708,7 @@ dependencies = [
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
  "flotilla-resources",
+ "flotilla-vcs",
  "tokio",
 ]
 
@@ -1884,6 +1890,7 @@ dependencies = [
  "flotilla-paths",
  "flotilla-provider-runtime",
  "flotilla-tls",
+ "flotilla-vcs",
  "hegeltest",
  "http",
  "libc",
@@ -2234,6 +2241,34 @@ dependencies = [
  "unicode-width",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "flotilla-vcs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-types",
+ "flotilla-discovery-api",
+ "flotilla-discovery-testkit",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "flotilla-resources",
+ "futures",
+ "minijinja",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

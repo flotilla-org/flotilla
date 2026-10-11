@@ -5,8 +5,8 @@ use std::{
 
 use tracing::info;
 
-use crate::providers::types::*;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::*;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::TaskId;
@@ -297,10 +297,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::providers::vcs::parse_porcelain_status;
-    use crate::testkits::replay::testing::fixture_path;
-    use crate::testkits::replay::testing::MockRunner;
+    use crate::fixture_path;
+    use crate::providers::parse_porcelain_status;
     use flotilla_provider_runtime::CommandRunner;
+    use flotilla_replay_testkit::testing::MockRunner;
 
     #[test]
     fn parse_porcelain_normal_worktrees() {
@@ -374,7 +374,7 @@ branch refs/heads/feature
     #[test]
     fn render_worktree_path_default_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
-        let checkout_path = crate::config::default_checkout_path();
+        let checkout_path = crate::default_checkout_path();
         let mgr = GitWorktreeStrategy::new(checkout_path, runner);
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
@@ -410,8 +410,8 @@ branch refs/heads/feature
 
     #[tokio::test]
     async fn record_replay_create_checkout_tracks_remote_branch() {
-        use crate::providers::vcs::checkout_test_support;
-        use crate::testkits::replay;
+        use crate::providers::checkout_test_support;
+        use flotilla_replay_testkit as replay;
 
         let live = replay::is_live();
         let temp = if live { Some(checkout_test_support::setup_remote_only_branch()) } else { None };
@@ -423,7 +423,7 @@ branch refs/heads/feature
         let session = replay::test_session(&fixture("git_create_remote_branch.yaml"), masks);
         let runner = replay::test_runner(&session);
 
-        let checkout_path = crate::config::default_checkout_path();
+        let checkout_path = crate::default_checkout_path();
         let strategy = GitWorktreeStrategy::new(checkout_path, runner.clone());
         let vcs = crate::vcs::FlotillaVcs::new(repo_path, runner.clone(), crate::vcs::GitCheckoutStrategy::Worktree(Box::new(strategy)));
 

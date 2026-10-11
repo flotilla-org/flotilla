@@ -10,7 +10,6 @@ pub mod registry;
 pub(crate) mod scan_cache;
 pub mod terminal;
 pub mod types;
-pub mod vcs;
 
 #[cfg(test)]
 pub(crate) mod github_test_support {

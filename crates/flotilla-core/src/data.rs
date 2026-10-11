@@ -2,9 +2,9 @@ use std::path::Path;
 
 use flotilla_protocol::CheckoutStatus;
 
-use crate::vcs::RepositoryRead;
-use crate::vcs::Vcs;
 use flotilla_provider_runtime::run;
+use flotilla_vcs::vcs::RepositoryRead;
+use flotilla_vcs::vcs::Vcs;
 
 pub async fn fetch_checkout_status(
     branch: &str,

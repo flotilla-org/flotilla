@@ -12,12 +12,8 @@ use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
-    providers::{
-        environment::{command_provider, EnvironmentKind},
-        vcs::git_worktree::GitWorktreeStrategy,
-    },
+    providers::environment::{command_provider, EnvironmentKind},
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
-    vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
 #[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -28,6 +24,11 @@ use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceO
 use flotilla_store::validate_resource_document;
 #[cfg(unix)]
 use flotilla_store::{validate_message_migration_complete, REGISTERED_RESOURCE_KINDS};
+#[cfg(unix)]
+use flotilla_vcs::{
+    providers::git_worktree::GitWorktreeStrategy,
+    vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -1162,14 +1163,14 @@ mod tests {
     async fn candidate_reads_ops_entries_from_a_detached_checkout_with_ambiguous_remotes() {
         use std::sync::Arc;
 
-        use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
         use flotilla_core::repository_inspection::GitRepositoryInspector;
-        use flotilla_core::vcs::FixedVcsResolver;
-        use flotilla_core::vcs::FlotillaVcs;
-        use flotilla_core::vcs::GitCheckoutStrategy;
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_provider_runtime::ProcessCommandRunner;
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
+        use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+        use flotilla_vcs::vcs::FixedVcsResolver;
+        use flotilla_vcs::vcs::FlotillaVcs;
+        use flotilla_vcs::vcs::GitCheckoutStrategy;
         let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
         let tmp = tmp_guard.path().to_path_buf();
         let git = |args: &[&str]| {
@@ -1249,14 +1250,14 @@ mod tests {
         flotilla_tls::install_default_provider();
         use std::sync::Arc;
 
-        use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
         use flotilla_core::repository_inspection::GitRepositoryInspector;
-        use flotilla_core::vcs::FixedVcsResolver;
-        use flotilla_core::vcs::FlotillaVcs;
-        use flotilla_core::vcs::GitCheckoutStrategy;
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
         use flotilla_provider_runtime::ProcessCommandRunner;
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
+        use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+        use flotilla_vcs::vcs::FixedVcsResolver;
+        use flotilla_vcs::vcs::FlotillaVcs;
+        use flotilla_vcs::vcs::GitCheckoutStrategy;
         let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
         let tmp = tmp_guard.path().to_path_buf();
         for args in [

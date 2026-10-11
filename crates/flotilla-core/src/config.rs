@@ -1,3 +1,4 @@
+use flotilla_vcs::default_checkout_path;
 use std::{
     collections::{BTreeMap, HashMap},
     num::NonZeroUsize,
@@ -64,10 +65,6 @@ impl Default for GitConfig {
     fn default() -> Self {
         Self { checkout_path: default_checkout_path() }
     }
-}
-
-pub fn default_checkout_path() -> String {
-    "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}".to_string()
 }
 
 /// Raw key binding overrides from config.toml.

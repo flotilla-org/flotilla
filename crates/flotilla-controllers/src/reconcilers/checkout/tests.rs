@@ -569,8 +569,8 @@ async fn checkout_runtime_prunes_base_clone_after_removing_worktree() {
 // nested at several depths beneath both clean and dirty enclosing checkouts.
 #[hegel::test]
 fn checkout_root_inspection_does_not_inherit_enclosing_repository(tc: hegel::TestCase) {
-    use flotilla_core::{
-        providers::vcs::{CloneProvisioner, GitCloneProvisioner},
+    use flotilla_vcs::{
+        providers::{CloneProvisioner, GitCloneProvisioner},
         vcs::{GitCliBackend, VcsBackend},
     };
     use hegel::generators as gs;

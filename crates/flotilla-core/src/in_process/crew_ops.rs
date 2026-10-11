@@ -462,7 +462,7 @@ impl CrewService {
         self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 
-    async fn local_vcs_for_checkout(&self, path: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+    async fn local_vcs_for_checkout(&self, path: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
         self.checkout_providers.vcs_for_checkout(&self.local_environment_id, path).await
     }
     /// Resolve enough local identity to route to the convoy authority without

@@ -14,11 +14,11 @@ use flotilla_resources::{
     RemoteRefObservation, ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
-use crate::vcs::RepositoryRead;
-use crate::vcs::Vcs;
-use crate::vcs::VcsCheck;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_vcs::vcs::RepositoryRead;
+use flotilla_vcs::vcs::Vcs;
+use flotilla_vcs::vcs::VcsCheck;
 
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
 pub const LANDING_EVIDENCE_TTL: Duration = Duration::from_secs(30);
@@ -461,11 +461,11 @@ mod tests {
     use flotilla_store::ResourceBackend;
 
     use super::*;
-    use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
     use crate::testkits::replay::testing::MockRunner;
-    use crate::vcs::FlotillaVcs;
-    use crate::vcs::GitCheckoutStrategy;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+    use flotilla_vcs::vcs::FlotillaVcs;
+    use flotilla_vcs::vcs::GitCheckoutStrategy;
 
     #[test]
     fn claim_links_a_pr_from_a_different_branch_and_forge() {

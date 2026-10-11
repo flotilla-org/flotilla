@@ -42,11 +42,13 @@ class GitBoundaryTests(unittest.TestCase):
     def test_paths(self):
         source = 'fn a() { Command::new("git"); }'
         for path in ['build.rs', 'crates/a/build.rs', 'crates/build_identity.rs',
-                     'crates/a/tests/fixture.rs', check.VCS + 'vcs.rs',
+                     'crates/a/tests/fixture.rs', 'crates/flotilla-vcs/src/vcs.rs',
                      'crates/flotilla-provider-runtime/src/git_config_guard.rs',
-                     check.VCS + 'providers/vcs/git.rs', 'crates/flotilla-discovery-testkit/src/lib.rs']:
+                     'crates/flotilla-vcs/src/providers/git.rs', 'crates/flotilla-discovery-testkit/src/lib.rs']:
             self.assertEqual(check.violations(source, path), [])
-        for path in ['src/build.rs.bak', 'src/tests_like.rs', check.VCS + 'vcs_extra.rs',
+        for path in ['src/build.rs.bak', 'src/tests_like.rs', check.VCS + 'vcs.rs', check.VCS + 'providers/vcs/git.rs',
+                     'crates/flotilla-vcs-extra/src/git.rs', 'crates/flotilla-vcs/tests_like/git.rs',
+                     check.VCS + 'vcs_extra.rs',
                      'crates/flotilla-provider-runtime/src/lib.rs',
                      'crates/flotilla-provider-runtime/src/git_config_guard_extra.rs',
                      check.VCS + 'providers/vcs_extra/git.rs', 'crates/other/src/vcs.rs', 'src/tests/fixture.rs', 'crates/a/src/tests/fixture.rs']:

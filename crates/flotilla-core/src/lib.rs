@@ -61,7 +61,6 @@ mod scoped_store;
 mod standing_roles;
 pub mod step;
 pub mod terminal_health;
-pub mod vcs;
 
 // Re-export shared infrastructure and host types for convenience.
 pub use flotilla_protocol::HostName;

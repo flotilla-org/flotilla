@@ -12,8 +12,9 @@ use flotilla_protocol::CheckoutIntent;
 pub use provisioning::{CloneInspection, CloneProvisioner, GitCloneProvisioner};
 use tracing::warn;
 
-use crate::providers::types::*;
+use crate::BranchInfo;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::*;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -81,7 +82,7 @@ pub(crate) fn parse_ahead_behind(output: &str) -> Option<AheadBehind> {
 
 /// Write issue links to git config for a specific branch.
 /// Errors are logged and ignored because issue linking is best-effort metadata.
-pub(crate) async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
+pub async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
     use std::collections::HashMap;
 
     let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();

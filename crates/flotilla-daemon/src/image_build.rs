@@ -10,14 +10,12 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{ImageBuildResult, ImageBuildRunner};
-use flotilla_core::{
-    image_build::{ImageBuildInputResolver, ImageBuildSourceInputs},
-    vcs::Vcs,
-};
+use flotilla_core::image_build::{ImageBuildInputResolver, ImageBuildSourceInputs};
 use flotilla_resources::{
     Artifact, ArtifactSpec, FrozenImageLayer, ImageBuildFailure, ImageBuildFailureClass, ImageBuildSpec, InputMeta, PlacedImageIdentity,
 };
 use flotilla_store::ResourceBackend;
+use flotilla_vcs::vcs::Vcs;
 use sha2::{Digest, Sha256};
 
 use crate::blob_store::{BlobStore, TieredBlobStore};
@@ -360,9 +358,6 @@ mod tests {
 
 #[cfg(test)]
 mod runner_contract {
-    use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
-    use flotilla_core::vcs::FlotillaVcs;
-    use flotilla_core::vcs::GitCheckoutStrategy;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandOutput;
@@ -370,6 +365,9 @@ mod runner_contract {
     use flotilla_resources::{
         ImageBuildReason, ImageBuildReservation, ImageInputStability, ImageLayerSpec, ImageLayerStage, ResolvedImageInputs,
     };
+    use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+    use flotilla_vcs::vcs::FlotillaVcs;
+    use flotilla_vcs::vcs::GitCheckoutStrategy;
 
     use super::*;
     use crate::blob_store::{BlobDigest, MemoryBlobStore};

@@ -6,8 +6,6 @@ use std::{
 
 use color_eyre::Result;
 use flotilla_core::config::ConfigStore;
-use flotilla_core::providers::vcs::git::GitVcs;
-use flotilla_core::providers::vcs::VcsInspection;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -18,6 +16,8 @@ use flotilla_tui::{
     socket::{DaemonEndpoint, SshEndpoint},
     theme,
 };
+use flotilla_vcs::providers::git::GitVcs;
+use flotilla_vcs::providers::VcsInspection;
 use tracing::info;
 
 use flotilla_tui::cli::args::{Cli, CliPaths, DevModeSubCommand};

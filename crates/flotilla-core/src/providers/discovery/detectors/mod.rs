@@ -4,11 +4,10 @@ pub mod claude;
 pub mod cmux;
 pub mod codex;
 pub mod generic;
-pub mod git;
 
 use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
-use crate::providers::vcs::detection::git_binary_detector;
+use flotilla_vcs::providers::detection::{git_binary_detector, VcsRepoDetector};
 
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     let mut detectors: Vec<Box<dyn HostDetector>> = vec![
@@ -39,7 +38,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
 }
 
 pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {
-    vec![Box::new(git::VcsRepoDetector)]
+    vec![Box::new(VcsRepoDetector)]
 }
 
 #[cfg(test)]

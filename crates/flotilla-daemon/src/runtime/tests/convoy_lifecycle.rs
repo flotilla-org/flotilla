@@ -403,7 +403,7 @@ async fn checkout_archive_catalog_keeps_custom_roots_after_checkout_resources_ar
         .expect("restore archive roots after controller restart");
     assert!(roots.contains(&CheckoutArchiveRoot { env_ref: "host-direct-test-host".to_string(), path: custom_root.clone() }));
     for root in roots {
-        flotilla_core::vcs::prune_checkout_archives(&ProcessCommandRunner, &root.path, 14).await.expect("retention sweep");
+        flotilla_vcs::vcs::prune_checkout_archives(&ProcessCommandRunner, &root.path, 14).await.expect("retention sweep");
     }
     assert!(!expired.exists());
     assert!(recent.exists());

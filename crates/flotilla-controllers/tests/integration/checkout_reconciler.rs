@@ -15,7 +15,6 @@ use common::{create_ready_checkout, create_ready_clone, meta};
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
-use flotilla_core::vcs::CheckoutMaterialisationError;
 use flotilla_protocol::NodeId;
 use flotilla_resources::repo_key;
 use flotilla_resources::Actuation;
@@ -53,6 +52,7 @@ use flotilla_store::controller::Reconciler;
 use flotilla_store::ResourceBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_testkit::VirtualClock;
+use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use tokio::{
     sync::{watch, Notify},
     time::timeout,

@@ -9,6 +9,7 @@ members = [
     "crates/flotilla-commands",
     "crates/flotilla-controllers",
     "crates/flotilla-core",
+    "crates/flotilla-vcs",
     "crates/flotilla-credentials",
     "crates/flotilla-credentials-testkit",
     "crates/flotilla-daemon",
@@ -47,6 +48,8 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
+minijinja = "2"
+futures = "0.3"
 sha2 = "0.10"
 http = "1"
 bytes = "1"
@@ -79,6 +82,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
 [dependencies]
+flotilla-vcs = { path = "crates/flotilla-vcs" }
 flotilla-provider-runtime = { path = "crates/flotilla-provider-runtime" }
 flotilla-store-memory = { path = "crates/flotilla-store-memory" }
 flotilla-tls = { path = "crates/flotilla-tls" }

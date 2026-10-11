@@ -2,8 +2,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 
-use crate::providers::types::*;
+use crate::BranchInfo;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::*;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 
@@ -101,10 +102,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::providers::vcs::checkout_test_support::git;
-    use crate::providers::vcs::VcsInspection;
-    use crate::testkits::replay;
-    use crate::testkits::replay::testing::fixture_path;
+    use crate::fixture_path;
+    use crate::providers::checkout_test_support::git;
+    use crate::providers::VcsInspection;
+    use flotilla_replay_testkit as replay;
 
     // ── Setup helpers (only called in record mode) ──
 

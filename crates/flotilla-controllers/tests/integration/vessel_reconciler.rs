@@ -12,7 +12,7 @@ use common::{
     labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::{vessel::WorktreeMetadataResolver, VesselReconciler};
-use flotilla_core::{in_process::BRIEF_ARTIFACTS_ANNOTATION, vcs::WorktreeMetadata};
+use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     artifact_record_name, canonicalize_repo_url, clone_key, interactive_single_workflow_spec, Artifact, ArtifactSpec, BoundChangeRequest,
@@ -30,6 +30,7 @@ use flotilla_store::{
     controller::{ControllerLoop, Reconciler},
     ensure_repository, patch_resource_annotation, ConvoyReconciler, ResourceBackend,
 };
+use flotilla_vcs::vcs::WorktreeMetadata;
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
 

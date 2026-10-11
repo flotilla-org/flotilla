@@ -20,7 +20,6 @@ use crate::providers::terminal::TerminalPool;
 use crate::providers::terminal::TerminalSession;
 use crate::providers::terminal::TerminalSessionTag;
 use crate::providers::types::*;
-use crate::providers::vcs::write_branch_issue_links;
 use crate::step::StepAction;
 use crate::step::StepExecutionContext;
 use crate::step::StepOutcome;
@@ -30,14 +29,15 @@ use crate::testkits::discovery::test_vcs_resolver;
 use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
-use crate::vcs::EnumeratedCheckout;
-use crate::vcs::Vcs;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_vcs::providers::write_branch_issue_links;
+use flotilla_vcs::vcs::EnumeratedCheckout;
+use flotilla_vcs::vcs::Vcs;
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
@@ -1173,10 +1173,10 @@ async fn run_build_plan_to_completion_with(
     let providers_data = Arc::new(providers_data);
     let runner: Arc<dyn CommandRunner> = Arc::new(runner);
 
-    let vcs_resolver: Arc<dyn crate::vcs::CheckoutVcsResolver> = match registry.vcs.preferred() {
-        Some(vcs) => Arc::new(crate::vcs::FixedVcsResolver(vcs.clone())),
+    let vcs_resolver: Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver> = match registry.vcs.preferred() {
+        Some(vcs) => Arc::new(flotilla_vcs::vcs::FixedVcsResolver(vcs.clone())),
         None if matches!(action, CommandAction::Checkout { .. } | CommandAction::RemoveCheckout { .. }) => {
-            Arc::new(crate::vcs::FixedVcsResolver(Arc::new(MockCheckoutManager::failing("No VCS provider available"))))
+            Arc::new(flotilla_vcs::vcs::FixedVcsResolver(Arc::new(MockCheckoutManager::failing("No VCS provider available"))))
         }
         None => test_vcs_resolver(runner.clone()),
     };
