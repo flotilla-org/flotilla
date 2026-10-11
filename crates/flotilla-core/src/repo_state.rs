@@ -1,3 +1,4 @@
+use flotilla_discovery_api::UnmetRequirement;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -6,10 +7,7 @@ use std::{
 
 use flotilla_protocol::EnvironmentId;
 
-use crate::{
-    model::RepoModel,
-    providers::{discovery::UnmetRequirement, registry::ProviderRegistry},
-};
+use crate::{model::RepoModel, providers::registry::ProviderRegistry};
 
 pub(crate) struct RepoRootState {
     pub(crate) path: PathBuf,

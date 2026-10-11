@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::crew_capabilities::CAPABILITIES_HEADING;
-use crate::discovery_api::EnvironmentBag;
 use crate::providers::terminal::TerminalEnvVars;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -1239,11 +1239,11 @@ mod tests {
     use crate::agent_adapter::CrewBriefTemplateResolver;
     use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
     use crate::crew_capabilities::CAPABILITIES_HEADING;
-    use crate::discovery_api::EnvironmentAssertion;
-    use crate::discovery_api::EnvironmentBag;
     use crate::providers::discovery::factories::git::GitVcsFactory;
-    use crate::providers::discovery::Factory;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ProcessCommandRunner;
 

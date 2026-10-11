@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
-use flotilla_core::provider_config;
 use flotilla_store_sqlite::SqliteBackend;
+use flotilla_discovery_api::provider_config;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -15,8 +15,6 @@ use std::{
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::config::ConfigStore;
-use flotilla_core::discovery_api::EnvironmentAssertion;
-use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::model::RepoModel;
 use flotilla_core::providers::ai_utility::AiUtility;
@@ -24,12 +22,6 @@ use flotilla_core::providers::ai_utility::ConvoyNames;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::coding_agent::CloudAgentService;
 use flotilla_core::providers::discovery::DiscoveryRuntime;
-use flotilla_core::providers::discovery::Factory;
-use flotilla_core::providers::discovery::HostDetector;
-use flotilla_core::providers::discovery::ProviderCategory;
-use flotilla_core::providers::discovery::ProviderDescriptor;
-use flotilla_core::providers::discovery::RepoDetector;
-use flotilla_core::providers::discovery::UnmetRequirement;
 use flotilla_core::providers::environment::EnvironmentHandle;
 use flotilla_core::providers::environment::ProvisionedEnvironment;
 use flotilla_core::providers::terminal::TerminalPool;
@@ -42,6 +34,14 @@ use flotilla_core::repository_inspection::RepositoryContinuity;
 use flotilla_core::repository_inspection::RepositoryInspection;
 use flotilla_core::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::HostDetector;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::RepoDetector;
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::fake_discovery_with_providers;
@@ -5762,7 +5762,7 @@ hostname = "buildbox.example"
         .await
         .expect("discover repo in remote direct environment");
 
-    assert!(result.repo_bag.find_vcs_checkout(flotilla_core::discovery_api::VcsKind::Git).is_none());
+    assert!(result.repo_bag.find_vcs_checkout(flotilla_discovery_api::VcsKind::Git).is_none());
     assert!(
         result.registry.provider_infos().iter().all(|(category, name)| { !(category == ProviderCategory::Vcs.slug() && name == "Git") }),
         "remote discovery should not activate git from the daemon-local checkout path"

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 
-use crate::provider_config::{
+use flotilla_discovery_api::provider_config::{
     AiUtilityConfig, ChangeRequestConfig, CloudAgentConfig, IssueTrackerConfig, ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig,
     TerminalPoolConfig,
 };

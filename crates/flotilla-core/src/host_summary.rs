@@ -99,12 +99,12 @@ mod tests {
         assert!(daemon_rss_bytes().is_some_and(|bytes| bytes > 0));
     }
 
-    use crate::discovery_api::EnvironmentAssertion;
-    use crate::discovery_api::EnvironmentBag;
     use crate::environment_manager::EnvironmentManager;
     use crate::providers::environment::EnvironmentHandle;
     use crate::providers::environment::ProvisionedEnvironment;
     use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
     use flotilla_provider_runtime::CommandRunner;
 
     #[test]

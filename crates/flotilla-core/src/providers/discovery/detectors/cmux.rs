@@ -7,8 +7,8 @@
 
 use async_trait::async_trait;
 
-use crate::discovery_api::EnvironmentAssertion;
-use crate::providers::discovery::HostDetector;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::HostDetector;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 

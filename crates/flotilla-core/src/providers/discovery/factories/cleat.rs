@@ -1,18 +1,18 @@
 //! Terminal pool factory for cleat.
 
-use crate::provider_config::ProviderConfigView;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::discovery_api::EnvironmentBag;
-use crate::providers::discovery::Factory;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::discovery::UnmetRequirement;
 use crate::providers::terminal::cleat::CleatTerminalPool;
 use crate::providers::terminal::TerminalPool;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 
@@ -49,11 +49,11 @@ mod tests {
 
     use super::CleatTerminalPoolFactory;
     use crate::config::ConfigStore;
-    use crate::discovery_api::EnvironmentAssertion;
-    use crate::discovery_api::EnvironmentBag;
-    use crate::providers::discovery::Factory;
-    use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
+    use flotilla_discovery_api::UnmetRequirement;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     // #2706: factory discovery supplies the execution host baseline, while

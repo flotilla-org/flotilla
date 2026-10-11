@@ -1,12 +1,7 @@
 //! Repository capabilities are independent of observation roots and working copies.
 use super::*;
-use crate::{
-    in_process::convoy_admission::repository_provider_bag,
-    providers::{
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        registry::ProviderSet,
-    },
-};
+use crate::{in_process::convoy_admission::repository_provider_bag, providers::registry::ProviderSet};
+use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 
 /// Forge identity or Repository key identifies a row independently of any
 /// execution location, including repositories that have no forge.

@@ -181,16 +181,7 @@ fn provider_descriptor_labeled_simple() {
 
 #[test]
 fn provider_category_slug_round_trip() {
-    let expected = [
-        "vcs",
-        "change_request",
-        "issue_tracker",
-        "cloud_agent",
-        "ai_utility",
-        "workspace_manager",
-        "terminal_pool",
-        "environment_provider",
-    ];
+    let expected = ["vcs", "change_request", "issue_tracker", "cloud_agent", "ai_utility", "terminal_pool", "environment_provider"];
     assert_eq!(ProviderCategory::ALL.map(|category| category.slug()), expected);
 }
 

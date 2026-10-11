@@ -5,15 +5,12 @@ use super::{
     checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     ExecutorStepResolver, PlannerRefusal, RepoExecutionContext,
 };
-use crate::discovery_api::EnvironmentBag;
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use crate::providers::issue_tracker::IssueProvider;
@@ -35,6 +32,9 @@ use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
 use crate::vcs::EnumeratedCheckout;
 use crate::vcs::Vcs;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;

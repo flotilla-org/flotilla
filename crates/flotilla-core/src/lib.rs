@@ -76,8 +76,6 @@ pub mod forge_budget;
 // testkit crates directly. No helper is included in the production library.
 #[cfg(test)]
 extern crate self as flotilla_core;
-pub mod discovery_api;
-pub mod provider_config;
 #[cfg(test)]
 mod testkits;
 

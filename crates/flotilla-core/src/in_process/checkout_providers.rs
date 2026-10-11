@@ -1,6 +1,7 @@
 //! Observed Checkout lifetimes own discovered VCS capabilities. Active commands
 //! retain leases; presentation rows retain descriptors, never provider instances.
 
+use flotilla_discovery_api::ProviderDescriptor;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -20,12 +21,7 @@ use tokio::sync::{watch, OnceCell};
 use tracing::warn;
 
 use super::{checkout_path, discover_vcs_for_checkout, InProcessDaemon};
-use crate::{
-    config::ConfigStore,
-    environment_manager::ManagedEnvironmentKind,
-    providers::{discovery::ProviderDescriptor, registry::ProviderRegistry},
-    vcs::Vcs,
-};
+use crate::{config::ConfigStore, environment_manager::ManagedEnvironmentKind, providers::registry::ProviderRegistry, vcs::Vcs};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) struct CheckoutProvider {

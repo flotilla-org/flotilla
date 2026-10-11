@@ -1,21 +1,21 @@
 //! Cloud agent and AI utility factories for Claude-based providers.
 
-use crate::provider_config::ProviderConfigView;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::discovery_api::EnvironmentBag;
 use crate::providers::ai_utility::claude_api::ClaudeApiAiUtility;
 use crate::providers::ai_utility::claude_cli::ClaudeCliAiUtility;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::coding_agent::claude::ClaudeCodingAgent;
 use crate::providers::coding_agent::CloudAgentService;
-use crate::providers::discovery::Factory;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::discovery::UnmetRequirement;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;
@@ -129,11 +129,11 @@ mod tests {
 
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory, ClaudeCodingAgentFactory};
     use crate::config::ConfigStore;
-    use crate::discovery_api::EnvironmentAssertion;
-    use crate::discovery_api::EnvironmentBag;
-    use crate::providers::discovery::Factory;
-    use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
+    use flotilla_discovery_api::UnmetRequirement;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_claude_binary() -> EnvironmentBag {

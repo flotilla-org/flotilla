@@ -1,3 +1,4 @@
+use flotilla_discovery_api::ProviderDescriptor;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -9,7 +10,6 @@ use crate::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
-        discovery::ProviderDescriptor,
         environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
         terminal::TerminalPool,
@@ -242,7 +242,7 @@ impl ProviderSet<dyn EnvironmentProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::discovery::ProviderCategory;
+    use flotilla_discovery_api::ProviderCategory;
 
     #[test]
     fn provider_infos_from_empty_registry() {

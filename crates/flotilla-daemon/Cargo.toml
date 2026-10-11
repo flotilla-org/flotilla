@@ -10,6 +10,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provide
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests", "flotilla-store-testkit/skip-no-sandbox-tests", "flotilla-credentials/skip-no-sandbox-tests", "flotilla-aggregator/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
 flotilla-store-http = { path = "../flotilla-store-http" }

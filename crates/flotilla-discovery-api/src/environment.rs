@@ -67,12 +67,18 @@ pub struct EnvironmentBag {
     assertions: Vec<EnvironmentAssertion>,
     // Only provisioned discovery supplies this baseline. Keep its provenance
     // separate from observations subsequently merged into the bag.
-    pub(crate) provisioned_environment: Option<HashMap<String, String>>,
+    provisioned_environment: Option<HashMap<String, String>>,
 }
 
 impl EnvironmentBag {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a bag with the configured baseline for provisioned discovery.
+    /// Subsequent observations do not replace this baseline.
+    pub fn provisioned(environment: HashMap<String, String>) -> Self {
+        Self { assertions: Vec::new(), provisioned_environment: Some(environment) }
     }
 
     /// Public read access to the raw assertions, for conversion to protocol types.
@@ -98,7 +104,7 @@ impl EnvironmentBag {
     }
 
     /// Configured vessel environment, absent for host-direct discovery.
-    pub(crate) fn provisioned_environment(&self) -> Option<&HashMap<String, String>> {
+    pub fn provisioned_environment(&self) -> Option<&HashMap<String, String>> {
         self.provisioned_environment.as_ref()
     }
 
@@ -204,7 +210,7 @@ impl EnvironmentBag {
     }
 }
 
-pub(crate) const HOST_ENVIRONMENT_KEYS: &[&str] = &[
+const HOST_ENVIRONMENT_KEYS: &[&str] = &[
     "PATH",
     "HOME",
     "USER",
@@ -222,3 +228,8 @@ pub(crate) const HOST_ENVIRONMENT_KEYS: &[&str] = &[
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
 ];
+
+/// Host variables preserved when constructing provider execution environments.
+pub fn host_environment_keys() -> &'static [&'static str] {
+    HOST_ENVIRONMENT_KEYS
+}

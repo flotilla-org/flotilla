@@ -1,3 +1,5 @@
+use flotilla_discovery_api::host_environment_keys;
+use flotilla_discovery_api::{HostDetector, RepoDetector};
 pub mod claude;
 pub mod cmux;
 pub mod codex;
@@ -6,8 +8,7 @@ pub mod git;
 
 use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
-use super::{HostDetector, RepoDetector};
-use crate::{discovery_api::HOST_ENVIRONMENT_KEYS, providers::vcs::detection::git_binary_detector};
+use crate::providers::vcs::detection::git_binary_detector;
 
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     let mut detectors: Vec<Box<dyn HostDetector>> = vec![
@@ -33,7 +34,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(EnvVarDetector::new("TERM")),
         Box::new(EnvVarDetector::new("COLORTERM")),
     ];
-    detectors.extend(HOST_ENVIRONMENT_KEYS.iter().map(|&key| Box::new(EnvVarDetector::new(key)) as Box<dyn HostDetector>));
+    detectors.extend(host_environment_keys().iter().map(|&key| Box::new(EnvVarDetector::new(key)) as Box<dyn HostDetector>));
     detectors
 }
 
@@ -44,9 +45,9 @@ pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery_api::EnvironmentAssertion;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::testkits::discovery::TestEnvVars;
+    use flotilla_discovery_api::EnvironmentAssertion;
 
     #[test]
     fn default_host_detectors_non_empty() {

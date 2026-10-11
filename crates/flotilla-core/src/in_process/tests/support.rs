@@ -1,7 +1,7 @@
 //! Shared scenario fixtures and stand-ins for credential-controller and forge I/O.
 
-use crate::provider_config;
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_discovery_api::provider_config;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,18 +22,18 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use crate::config::ConfigStore;
-use crate::discovery_api::EnvironmentBag;
 use crate::in_process::dispatch_board::tests::board;
 use crate::in_process::input_meta_from_resource;
 use crate::in_process::InProcessDaemon;
 use crate::in_process::WorkCredentialReconciler;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::Factory;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::discovery::UnmetRequirement;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;

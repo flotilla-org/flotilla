@@ -606,7 +606,7 @@ fn retired_presentation_manager_config_is_accepted_and_dropped(tc: hegel::TestCa
 // Glue: the provider view preserves every provider field and delegates paths to the store.
 #[tokio::test]
 async fn provider_config_view_preserves_settings_and_paths() {
-    use crate::provider_config::ProviderConfigView;
+    use flotilla_discovery_api::provider_config::ProviderConfigView;
     let directory = tempfile::tempdir().expect("config directory");
     let store = ConfigStore::with_base(directory.path());
     std::fs::write(

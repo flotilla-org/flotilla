@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }

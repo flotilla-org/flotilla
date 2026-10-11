@@ -1588,10 +1588,10 @@ mod tests {
     use crate::aggregator_projection::AggregatorProjectionState;
     use crate::change_request_observer::ChangeRequestRefreshCadence;
     use crate::change_request_observer::ChangeRequestRefresher;
-    use crate::discovery_api::EnvironmentBag;
     use crate::event_sink::EventSink;
     use crate::event_sink::RecordingEventSink;
     use crate::providers::change_request::observation::GhChangeRequestObservationSource;
+    use flotilla_discovery_api::EnvironmentBag;
     use flotilla_provider_runtime::ProcessCommandRunner;
 
     // #2498: every distinct stalled actor is visible across namespaces and replica stores.

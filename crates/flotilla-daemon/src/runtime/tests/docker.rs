@@ -1,9 +1,8 @@
 use super::*;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 
 #[tokio::test]
 async fn local_profile_does_not_advertise_docker_without_interior_cleat() {
-    use flotilla_core::providers::discovery::{ProviderCategory, ProviderDescriptor};
-
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");
@@ -43,10 +42,7 @@ async fn docker_provisioning_mounts_interior_control_binaries_and_durable_cleat_
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
     let state = Arc::new(
@@ -143,10 +139,7 @@ async fn docker_provisioning_fails_loudly_without_interior_cleat_assets() {
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
     let state = Arc::new(
@@ -221,10 +214,7 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
         let mut local_registry = ProviderRegistry::new();
         local_registry.environment_providers.insert(
             "sandbox",
-            flotilla_core::providers::discovery::ProviderDescriptor::named(
-                flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-                "sandbox",
-            ),
+            flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "sandbox"),
             Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
         );
         let registry_runner = Arc::new(RegistryPreflightRunner { outcome, calls: AtomicUsize::new(0), directory: Mutex::new(None) });
@@ -319,10 +309,7 @@ async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(ListingEnvironmentProvider { handle }),
     );
     let home = temp.path().join("home");
@@ -404,10 +391,7 @@ async fn docker_orphan_cleanup_without_persisted_status_reaps_backing() {
     let mut registry = ProviderRegistry::new();
     registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(AdoptionEnvironmentProvider { handles: vec![Arc::clone(&handle)] }),
     );
     let state =
@@ -495,10 +479,7 @@ async fn docker_provisioning_rejects_mounts_targeting_reserved_tool_assets() {
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
     let state = Arc::new(
@@ -988,10 +969,7 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::new(TestInteriorEnvironmentProvider { handle: Mutex::new(Some(handle)) }),
     );
     let state = Arc::new(

@@ -4,7 +4,8 @@
 //! responses keyed by `(cmd, args)` and tracks which `cwd` paths and
 //! `exists` calls were made.
 
-use flotilla_core::provider_config::ProviderConfigView;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 
 use std::{
     collections::HashMap,
@@ -22,11 +23,8 @@ use flotilla_protocol::{
 };
 use tokio::sync::Mutex as TokioMutex;
 
-use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
-use flotilla_core::providers::discovery::{
-    DiscoveryRuntime, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement,
-};
+use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
 use flotilla_core::providers::issue_tracker::IssueProvider;
 use flotilla_core::providers::terminal::TerminalPool;
 use flotilla_core::providers::terminal::TerminalSessionLiveness;
@@ -38,6 +36,7 @@ use flotilla_core::vcs::EnumeratedCheckout;
 use flotilla_core::vcs::FlotillaVcs;
 use flotilla_core::vcs::GitCheckoutStrategy;
 use flotilla_core::vcs::Vcs;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
@@ -1359,8 +1358,8 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
-    use flotilla_core::discovery_api::EnvironmentAssertion;
     use flotilla_core::providers::discovery::run_host_detectors;
+    use flotilla_discovery_api::EnvironmentAssertion;
 
     #[tokio::test]
     async fn fake_discovery_uses_only_git_host_detector() {

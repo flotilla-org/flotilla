@@ -4,11 +4,11 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use crate::discovery_api::EnvironmentAssertion;
-use crate::discovery_api::VcsKind;
 use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
 use crate::providers::discovery::detectors::generic::CommandDetector;
-use crate::providers::discovery::RepoDetector;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::RepoDetector;
+use flotilla_discovery_api::VcsKind;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;

@@ -1415,6 +1415,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-core",
  "flotilla-daemon-api",
+ "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-orchestration-testkit",
@@ -1467,6 +1468,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-daemon-api",
+ "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",
@@ -1533,6 +1535,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-core",
  "flotilla-credentials-testkit",
+ "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-protocol",
  "flotilla-provider-runtime",
@@ -1597,6 +1600,7 @@ dependencies = [
  "flotilla-credentials-testkit",
  "flotilla-daemon-api",
  "flotilla-daemon-testkit",
+ "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1670,12 +1674,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-discovery-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-types",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-resources",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-discovery-testkit"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
  "flotilla-core",
+ "flotilla-discovery-api",
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
@@ -2186,6 +2208,7 @@ dependencies = [
  "flotilla-core",
  "flotilla-daemon",
  "flotilla-daemon-api",
+ "flotilla-discovery-api",
  "flotilla-discovery-testkit",
  "flotilla-manifest",
  "flotilla-paths",

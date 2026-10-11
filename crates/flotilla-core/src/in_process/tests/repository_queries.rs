@@ -1,4 +1,5 @@
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -112,11 +113,7 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
 
 #[tokio::test]
 async fn cli_lists_include_active_provider_sessions() {
-    use crate::providers::{
-        coding_agent::CloudAgentService,
-        discovery::{ProviderCategory, ProviderDescriptor},
-        types::RepoCriteria,
-    };
+    use crate::providers::{coding_agent::CloudAgentService, types::RepoCriteria};
 
     struct Sessions;
     struct BrokenSessions;

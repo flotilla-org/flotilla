@@ -11,12 +11,10 @@ use flotilla_protocol::{
 use flotilla_resources::host_direct_environment_name;
 
 use crate::config::ConfigStore;
-use crate::discovery_api::EnvironmentBag;
 use crate::providers::discovery::run_host_detectors;
 use crate::providers::discovery::run_provisioned_host_detectors;
 use crate::providers::discovery::DiscoveryRuntime;
 use crate::providers::discovery::FactoryRegistry;
-use crate::providers::discovery::HostDetector;
 use crate::providers::environment::contained_daemon_socket_path;
 use crate::providers::environment::CreateOpts;
 use crate::providers::environment::EnvironmentHandle;
@@ -31,6 +29,8 @@ use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::ProvisionedMountMode;
 use crate::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
 use crate::providers::registry::ProviderRegistry;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::HostDetector;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
@@ -597,10 +597,7 @@ mod tests {
     use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
     use super::*;
-    use crate::discovery_api::EnvironmentAssertion;
     use crate::providers::discovery::detectors::default_host_detectors;
-    use crate::providers::discovery::ProviderCategory;
-    use crate::providers::discovery::ProviderDescriptor;
     use crate::providers::environment::EnvironmentHandle;
     use crate::providers::environment::EnvironmentProvider;
     use crate::providers::environment::ProvisionedEnvironment;
@@ -608,6 +605,9 @@ mod tests {
     use crate::providers::registry::ProviderRegistry;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::ProviderCategory;
+    use flotilla_discovery_api::ProviderDescriptor;
     use flotilla_provider_runtime::CommandRunner;
 
     struct MockProvisionedEnvironment {

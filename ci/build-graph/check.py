@@ -68,11 +68,11 @@ def violations(metadata):
     errors = []
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
-    runtime = "flotilla-provider-runtime"
-    for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
-                   "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
-        if runtime in packages and target in packages and reaches(runtime, target):
-            errors.append(f"{runtime}: must not depend on {target}, directly or transitively")
+    for component in ("flotilla-provider-runtime", "flotilla-discovery-api"):
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            if component in packages and target in packages and reaches(component, target):
+                errors.append(f"{component}: must not depend on {target}, directly or transitively")
     for name, package in sorted(packages.items()):
         # A dev-only testkit may depend on the library it tests, closing a
         # Cargo dev cycle without introducing an upward production edge.
