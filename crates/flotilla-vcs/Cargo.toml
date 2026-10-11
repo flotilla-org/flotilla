@@ -16,8 +16,8 @@ bon.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 sha2.workspace = true
-minijinja = "2"
-futures = "0.3"
+minijinja.workspace = true
+futures.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]

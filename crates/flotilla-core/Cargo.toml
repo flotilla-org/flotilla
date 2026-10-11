@@ -37,9 +37,9 @@ toml_edit = "0.22"
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
 http = { workspace = true }
 bytes = { workspace = true }
-minijinja = "2"
+minijinja.workspace = true
 serde_yml = "0.0.12"
-futures = "0.3"
+futures.workspace = true
 urlencoding = "2"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
