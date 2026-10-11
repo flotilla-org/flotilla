@@ -1029,7 +1029,10 @@ fn held_delivery_consumed(
         status.attention.as_ref().is_some_and(|attention| working(attention) && attention.source == TerminalAttentionSource::Hook);
     // Tool hooks retain positive evidence after the turn ends and a Stop hook
     // replaces Working with Idle, including holds recovered after an upgrade.
-    if stored_hook || status.last_tool_activity_at.is_some_and(|at| at > held_at) {
+    if stored_hook
+        || status.last_tool_activity_at.is_some_and(|at| at > held_at)
+        || status.last_hook_working_at.is_some_and(|at| at > held_at)
+    {
         return delivery_acceptance_evidence(true, false, false, false, false);
     }
     let TerminalPrepared::Attention(observation) = prepared else { return false };

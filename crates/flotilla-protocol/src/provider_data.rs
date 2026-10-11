@@ -256,6 +256,13 @@ pub struct AgentHookEvent {
     pub model: Option<String>,
     /// Current working directory (if reported).
     pub cwd: Option<String>,
+    /// Native transcript location, recorded without reading or copying the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    /// Distinguishes native lifecycle hooks from the one-roll notify decoder.
+    #[serde(default)]
+    #[builder(default)]
+    pub native_codex_hook: bool,
     /// Control-plane identity injected into managed crew sessions. Legacy
     /// observer hooks omit it and continue through their old path.
     #[serde(default, skip_serializing_if = "Option::is_none")]

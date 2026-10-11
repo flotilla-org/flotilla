@@ -15,6 +15,9 @@ pub struct AgentEntry {
     pub harness: AgentHarness,
     pub status: AgentStatus,
     pub model: Option<String>,
+    /// Decoder default may be removed one fleet roll after #3051 (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub session_title: Option<String>,
     /// The agent's native session ID (e.g., Claude's `session_id`).
     pub session_id: Option<String>,
@@ -238,6 +241,7 @@ mod tests {
             harness: AgentHarness::ClaudeCode,
             status: AgentStatus::Active,
             model: Some("opus-4".into()),
+            transcript_path: None,
             session_title: Some("Debug login flow".into()),
             session_id: Some("sess-abc".into()),
             last_event_epoch_secs: 1710000000,
@@ -249,6 +253,7 @@ mod tests {
             harness: AgentHarness::Codex,
             status: AgentStatus::Idle,
             model: None,
+            transcript_path: None,
             session_title: None,
             session_id: None,
             last_event_epoch_secs: 1710000100,

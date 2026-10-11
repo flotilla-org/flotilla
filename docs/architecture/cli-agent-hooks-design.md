@@ -70,7 +70,7 @@ Flow:
    - `attachable_id`: from env (or allocated if absent — see below)
    - `harness`: from CLI arg
    - `event_type`: normalized enum
-   - Key extracted fields: status, model, session title, session_id
+   - Key extracted fields: status, model, session title, session_id, transcript_path
 4. Sends event to daemon via socket (new protocol message type)
 5. Exits quickly (agents block on hooks)
 
@@ -100,11 +100,47 @@ Claude Code provides `session_id` in every hook event's stdin, plus `cwd`,
 | Notification (permission_prompt) | AgentWaitingPermission | → waiting-for-permission |
 | SessionEnd | AgentGone | → removed |
 
+### Codex native hooks
+
+Codex 0.160.0's command inputs (`codex-rs/hooks/src/schema.rs`) use
+`session_id`, nullable `transcript_path`, `cwd`, and `hook_event_name`.
+Turn-scoped inputs also include `turn_id`; SessionStart does not. Flotilla
+records the transcript location and optional model without reading the file.
+SessionStart/SessionEnd map to Started/Ended, UserPromptSubmit to Active,
+PreToolUse/PostToolUse to ToolActive, and top-level Stop to Idle.
+Subagent hooks carry the parent's session ID: child tool/prompt events and
+SubagentStop are NoChange, and SubagentStop is not subscribed.
+
+Both crew preparation and `flotilla hooks install codex` write native hooks
+under `[hooks]`. Managed invocations additionally carry configuration overrides
+and disable notify, so previous-generation homes pick up native hooks on launch.
+Codex checks trust even for session-flag hooks; only Flotilla's own handlers are
+trusted using Codex's normalized SHA-256 identity and source/event/index keys.
+Other user handlers remain intact. Install/uninstall remove Flotilla's legacy
+notify command while preserving unrelated notify integrations.
+
+Native Working evidence survives the following Stop in `last_hook_working_at`,
+so prompt-only turns acknowledge held input without requiring tool use. The
+first native lifecycle observation sets `codex_native_hooks` and disables the
+Idle-only acceptance fallback. For one roll, an already-running notify-only
+crew still uses that fallback: it cannot gain native hooks without relaunching.
+Both added status fields have decoder defaults for N→N+1 stored records.
+
+First-party sources are pinned to [openai/codex rust-v0.160.0](https://github.com/openai/codex/tree/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/hooks):
+`types.rs`, `schema.rs`, `engine/discovery.rs`, `config_rules.rs`,
+`codex-rs/config/src/hook_config.rs`, and `fingerprint.rs`. The recorded
+`agents/fixtures/codex-hooks-list-0.160.0.json` is a hooks/list response from
+that version in an isolated Codex home, without running a model or live-host gate.
+`ci/crew-image/test-workflow.sh` requires the recorded fixture consumed by the
+Rust trust test to match the current crew-image Codex pin. On a pin upgrade,
+repeat the isolated hooks/list probe and confirm every handler is trusted
+before refreshing the fixture; a filename change alone is insufficient.
+
 ### Persistent AgentStateStore
 
 File-backed persistent store at `agents/state.json` beneath the daemon config directory:
 - Keyed by `AttachableId`
-- Holds: harness, current status, model, session title, claude session_id, last event timestamp
+- Holds: harness, current status, model, session title, native session_id, transcript_path, last event timestamp
 - `InMemoryAgentStateStore` for tests
 - On daemon restart, loads existing state — can reconcile with terminals still running
 - Expiry: if no event for configurable duration, mark as gone

@@ -10,7 +10,7 @@ use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_resources::{Convoy, FulfilmentGrant, ResourceObject, TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use toml_edit::{value, Array, DocumentMut, Item, Table};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::crew_capabilities::CAPABILITIES_HEADING;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
@@ -728,9 +728,9 @@ impl CliAgentAdapter {
         }
         if matches!(&self.flavor, AdapterFlavor::Codex { .. }) {
             args.push(Arg::Literal("--no-daemon".into()));
-            // Bind the hook to every invocation, independently of mutable config files.
-            let notify = serde_json::to_string(crate::agents::CODEX_NOTIFY_COMMAND).expect("static notify command");
-            args.extend([Arg::Literal("-c".into()), Arg::Quoted(format!("notify={notify}"))]);
+            for override_value in crate::agents::codex_hook_overrides() {
+                args.extend([Arg::Literal("-c".into()), Arg::Quoted(override_value)]);
+            }
         }
         if let Some(model) = &request.model {
             args.extend([Arg::Literal("--model".into()), Arg::Quoted(model.clone())]);
@@ -1017,21 +1017,8 @@ async fn seed_codex_workspace_trust(
     }
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
-    // Preserve existing settings, including legacy keys written by older crews.
-    // Codex owns their interpretation; Flotilla only writes trust and its hook.
-    let needs_notify = contained
-        && document.get("notify").and_then(Item::as_array).is_none_or(|array| {
-            array.iter().map(|entry| entry.as_str()).ne(crate::agents::CODEX_NOTIFY_COMMAND.iter().map(|entry| Some(*entry)))
-        });
-    tracing::info!(contained, config_path = %config.path.display(), notify_repair_needed = needs_notify,
-        reason = if contained { "contained_notify_configuration" } else { "host_direct_invocation_override" },
-        "Codex turn hook configuration");
-    if needs_notify {
-        let mut notify = Array::new();
-        for entry in crate::agents::CODEX_NOTIFY_COMMAND {
-            notify.push(*entry);
-        }
-        document["notify"] = value(notify);
+    if contained {
+        crate::agents::update_codex_hooks(&mut document, true, &config.path)?;
     }
     let projects = document
         .as_table_mut()
@@ -1044,11 +1031,12 @@ async fn seed_codex_workspace_trust(
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
         .ok_or_else(|| format!("Codex config {} has a non-table project entry for {canonical_cwd}", config.path.display()))?;
-    if project.get("trust_level").and_then(Item::as_str) == Some("trusted") && !needs_notify {
+    project["trust_level"] = value("trusted");
+    let updated = document.to_string();
+    if updated == source {
         return Ok(());
     }
-    project["trust_level"] = value("trusted");
-    runner.write_file(&config.path, &document.to_string()).await
+    runner.write_file(&config.path, &updated).await
 }
 
 async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, config: &ClaudeStateConfig) -> Result<(), String> {
@@ -2022,10 +2010,10 @@ mod tests {
                 environment: Vec::new(),
             })
             .expect("codex launch plan");
-        assert_eq!(
-            plan.command,
-            "/tools/codex --dangerously-bypass-approvals-and-sandbox --no-daemon -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]' 'protocol preamble\n\nImplement the issue.\n\nThis is also at `.flotilla/briefs/coder.md`; re-read that file after a context compaction.'"
-        );
+        assert!(plan.command.starts_with("/tools/codex --dangerously-bypass-approvals-and-sandbox --no-daemon"));
+        for override_value in crate::agents::codex_hook_overrides() {
+            assert!(plan.command.contains(&format!("-c '{override_value}'")));
+        }
         assert!(plan.command.contains("Implement the issue"));
         assert_eq!(plan.stance, "trusted-implicit");
         let restricted = codex
@@ -2390,7 +2378,7 @@ mod tests {
     // #2634: every Codex launch carries the hook, regardless of confinement,
     // model selection, credential home, or permission grants. No prepare is needed.
     #[hegel::test]
-    fn codex_launch_always_overrides_notify(tc: hegel::TestCase) {
+    fn codex_launch_always_installs_native_hooks(tc: hegel::TestCase) {
         use hegel::generators as gs;
         // Both confinement/grant states, absent/present model, and missing/different homes.
         let contained = tc.draw(gs::booleans());
@@ -2422,13 +2410,14 @@ mod tests {
                 environment: vec![("CODEX_HOME".into(), "/launch-home".into())],
             })
             .expect("launch");
-        assert_eq!(plan.command.matches("-c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]'").count(), 1);
+        assert_eq!(plan.command.matches("-c 'notify=[]'").count(), 1);
+        assert!(plan.command.contains("flotilla hook codex stop"));
         assert!(plan.command.contains("--no-daemon"));
         assert_eq!(super::minimum_harness_version("codex"), Some("0.160.0"));
     }
 
     #[tokio::test]
-    async fn contained_codex_seeds_notify_for_an_already_trusted_workspace() {
+    async fn contained_codex_seeds_native_hooks_for_an_already_trusted_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_home = temp.path().join("codex-home");
         let workspace = temp.path().join("workspace");
@@ -2456,17 +2445,14 @@ mod tests {
             .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
             .expect("contained Codex launch");
         assert!(plan.command.contains("--no-daemon"));
-        // #2634: contained launches must carry notify even if the config is later rewritten.
-        assert!(plan.command.contains(" -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]'"));
+        // #3051: invocation hooks remain wired if the home config is later rewritten.
+        assert!(plan.command.contains("flotilla hook codex stop"));
 
         let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
         assert!(parsed.get("commit_attribution").is_none());
-        let notify = parsed["notify"].as_array().expect("notify command array");
-        assert_eq!(
-            notify.iter().map(|entry| entry.as_str()).collect::<Vec<_>>(),
-            vec![Some("flotilla"), Some("hook"), Some("codex"), Some("notify")]
-        );
+        assert!(parsed.get("notify").is_none());
+        assert!(parsed["hooks"]["Stop"].as_array().is_some());
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
     }
 

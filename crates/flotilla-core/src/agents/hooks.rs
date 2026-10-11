@@ -23,6 +23,8 @@ pub struct ParsedHookEvent {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub cwd: Option<String>,
+    pub transcript_path: Option<String>,
+    pub native_codex_hook: bool,
 }
 
 // ---------- Claude Code parser ----------
@@ -40,15 +42,58 @@ struct CodexNotifyPayload {
     cwd: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CodexNativePayload {
+    session_id: String,
+    hook_event_name: String,
+    cwd: String,
+    model: Option<String>,
+    agent_id: Option<String>,
+    transcript_path: Option<String>,
+}
+
 impl HarnessHookParser for CodexParser {
     fn parse_event(&self, event_type: &str, payload: &[u8]) -> Result<ParsedHookEvent, String> {
         if event_type != "notify" {
-            return Err(format!("unknown Codex event type: {event_type}"));
+            let (native, normalized) = if event_type == "subagent-stop" {
+                ("SubagentStop", AgentEventType::NoChange)
+            } else {
+                CODEX_HOOK_SUBSCRIPTIONS
+                    .iter()
+                    .find(|(_, event, _)| *event == event_type)
+                    .map(|(native, _, normalized)| (*native, normalized.clone()))
+                    .ok_or_else(|| format!("unknown Codex event type: {event_type}"))?
+            };
+            let parsed: CodexNativePayload =
+                serde_json::from_slice(payload).map_err(|error| format!("failed to parse Codex hook payload: {error}"))?;
+            if parsed.session_id.is_empty() || parsed.hook_event_name != native {
+                return Err("Codex hook requires a session_id and matching hook_event_name".into());
+            }
+            // Child tool/prompt hooks carry the parent's session_id. They must
+            // not change the parent's lifecycle or acknowledge its held input.
+            let event_type = if parsed.agent_id.is_some() { AgentEventType::NoChange } else { normalized };
+            return Ok(ParsedHookEvent {
+                event_type,
+                session_id: Some(parsed.session_id),
+                model: parsed.model,
+                cwd: Some(parsed.cwd),
+                transcript_path: parsed.transcript_path,
+                native_codex_hook: true,
+            });
         }
+        // N→N+1: accept homes and running crews from the notify generation.
+        // Remove after the next fleet roll.
         let parsed: CodexNotifyPayload =
             serde_json::from_slice(payload).map_err(|error| format!("failed to parse Codex notify payload: {error}"))?;
         let event_type = if parsed.kind == "agent-turn-complete" { AgentEventType::Idle } else { AgentEventType::NoChange };
-        Ok(ParsedHookEvent { event_type, session_id: parsed.thread_id, model: None, cwd: parsed.cwd })
+        Ok(ParsedHookEvent {
+            event_type,
+            session_id: parsed.thread_id,
+            model: None,
+            cwd: parsed.cwd,
+            transcript_path: None,
+            native_codex_hook: false,
+        })
     }
 }
 
@@ -90,12 +135,21 @@ impl HarnessHookParser for ClaudeCodeParser {
                     session_id: parsed.common.session_id,
                     model: parsed.model,
                     cwd: parsed.common.cwd,
+                    transcript_path: None,
+                    native_codex_hook: false,
                 })
             }
             "session-end" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse SessionEnd payload: {e}"))?;
-                Ok(ParsedHookEvent { event_type: AgentEventType::Ended, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
+                Ok(ParsedHookEvent {
+                    event_type: AgentEventType::Ended,
+                    session_id: parsed.session_id,
+                    model: None,
+                    cwd: parsed.cwd,
+                    transcript_path: None,
+                    native_codex_hook: false,
+                })
             }
             "user-prompt-submit" | "pre-tool-use" | "post-tool-use" => {
                 let parsed: ClaudeCommonPayload =
@@ -105,12 +159,21 @@ impl HarnessHookParser for ClaudeCodeParser {
                     session_id: parsed.session_id,
                     model: None,
                     cwd: parsed.cwd,
+                    transcript_path: None,
+                    native_codex_hook: false,
                 })
             }
             "stop" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse Stop payload: {e}"))?;
-                Ok(ParsedHookEvent { event_type: AgentEventType::Idle, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
+                Ok(ParsedHookEvent {
+                    event_type: AgentEventType::Idle,
+                    session_id: parsed.session_id,
+                    model: None,
+                    cwd: parsed.cwd,
+                    transcript_path: None,
+                    native_codex_hook: false,
+                })
             }
             "notification" => {
                 let parsed: ClaudeNotificationPayload =
@@ -123,7 +186,14 @@ impl HarnessHookParser for ClaudeCodeParser {
                 } else {
                     AgentEventType::NoChange
                 };
-                Ok(ParsedHookEvent { event_type, session_id: parsed.common.session_id, model: None, cwd: parsed.common.cwd })
+                Ok(ParsedHookEvent {
+                    event_type,
+                    session_id: parsed.common.session_id,
+                    model: None,
+                    cwd: parsed.common.cwd,
+                    transcript_path: None,
+                    native_codex_hook: false,
+                })
             }
             other => Err(format!("unknown Claude Code event type: {other}")),
         }
@@ -196,6 +266,162 @@ pub fn parser_for_harness(harness: &str) -> Result<(AgentHarness, Box<dyn Harnes
         "codex" => Ok((AgentHarness::Codex, Box::new(CodexParser))),
         other => Err(format!("unknown harness: {other}")),
     }
+}
+
+/// Native command input schema: openai/codex rust-v0.160.0,
+/// codex-rs/hooks/src/schema.rs. SubagentStop is deliberately not subscribed:
+/// its session_id belongs to the parent, whose turn is still running. It is
+/// still parsed as NoChange in case an external configuration subscribes it.
+const CODEX_HOOK_SUBSCRIPTIONS: &[(&str, &str, AgentEventType)] = &[
+    ("SessionStart", "session-start", AgentEventType::Started),
+    ("SessionEnd", "session-end", AgentEventType::Ended),
+    ("UserPromptSubmit", "user-prompt-submit", AgentEventType::Active),
+    ("PreToolUse", "pre-tool-use", AgentEventType::ToolActive),
+    ("PostToolUse", "post-tool-use", AgentEventType::ToolActive),
+    ("Stop", "stop", AgentEventType::Idle),
+];
+
+/// Invocation overrides keep hooks wired even when an old crew home has notify.
+pub fn codex_hook_overrides() -> Vec<String> {
+    let mut overrides = vec!["notify=[]".into(), "features.hooks=true".into()];
+    for (native, event, _) in CODEX_HOOK_SUBSCRIPTIONS {
+        overrides.push(format!("hooks.{native}=[{{hooks=[{{type=\"command\",command=\"flotilla hook codex {event}\"}}]}}]"));
+    }
+    // Codex splits CLI override paths on dots without unquoting components.
+    // Put path-bearing keys inside an inline table rather than the dotted path.
+    // rust-v0.160.0 codex-rs/hooks/src/engine/discovery.rs:
+    // config_toml_source_path(SessionFlags) and synthetic_layer_path define this.
+    let source = if cfg!(windows) { r"C:\<session-flags>\config.toml" } else { "/<session-flags>/config.toml" };
+    let states = CODEX_HOOK_SUBSCRIPTIONS
+        .iter()
+        .map(|(native, event, _)| {
+            let key = codex_hook_state_key(source, event, 0);
+            format!("{key:?}={{enabled=true,trusted_hash={:?}}}", codex_hook_hash(native, event))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    overrides.push(format!("hooks.state={{{states}}}"));
+    overrides
+}
+
+// Mirrors rust-v0.160.0 hooks/engine/discovery.rs and config/fingerprint.rs.
+// Optional TOML fields disappear before canonical JSON hashing; timeout is normalized.
+fn codex_hook_hash(native: &str, event: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = serde_json::json!({
+        "event_name": event.replace('-', "_"),
+        "hooks": [{"type": "command", "command": format!("flotilla hook codex {event}"),
+            "timeout": if native == "SessionEnd" { 1 } else { 600 }, "async": false}],
+    });
+    format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&identity).expect("hook identity")))
+}
+
+fn codex_hook_state_key(source: &str, event: &str, group: usize) -> String {
+    format!("{source}:{}:{group}:0", event.replace('-', "_"))
+}
+
+/// Install/remove only Flotilla's handlers, preserving other native hooks and
+/// unrelated notify integrations. Accept the previous generation's own notify.
+pub fn update_codex_hooks(document: &mut toml_edit::DocumentMut, install: bool, source: &std::path::Path) -> Result<(), String> {
+    use toml_edit::{Array, InlineTable, Item, Value};
+    let own_notify = document
+        .get("notify")
+        .and_then(Item::as_array)
+        .is_some_and(|array| array.iter().map(Value::as_str).eq(CODEX_NOTIFY_COMMAND.iter().copied().map(Some)));
+    if own_notify {
+        document.remove("notify");
+    }
+    if install {
+        if document.get("hooks").is_none() {
+            document["hooks"] = Item::Table(toml_edit::Table::new());
+        }
+        if document.get("features").is_none() {
+            document["features"] = Item::Table(toml_edit::Table::new());
+        }
+        let features = document["features"].as_table_like_mut().ok_or("Codex features must be a table")?;
+        features.insert("hooks", toml_edit::value(true));
+    }
+    let Some(hooks) = document.get_mut("hooks") else { return Ok(()) };
+    let hooks = hooks.as_table_like_mut().ok_or("Codex hooks must be a table")?;
+    // Codex discovery uses the configured User file path verbatim, not its
+    // canonical symlink target. Keep that spelling for trust identity.
+    // Clear only our matching trust records; matcher indices are kept stable.
+    if let Some(state) = hooks.get_mut("state") {
+        let state = state.as_table_like_mut().ok_or("Codex hook state must be a table")?;
+        let owned = state
+            .iter()
+            .filter(|(key, value)| {
+                CODEX_HOOK_SUBSCRIPTIONS.iter().any(|(native, event, _)| {
+                    key.starts_with(&format!("{}:{}:", source.display(), event.replace('-', "_")))
+                        && value.get("trusted_hash").and_then(Item::as_str) == Some(codex_hook_hash(native, event).as_str())
+                })
+            })
+            .map(|(key, _)| key.to_string())
+            .collect::<Vec<_>>();
+        for key in owned {
+            state.remove(&key);
+        }
+    }
+    let mut states = Vec::new();
+    for (native, event, _) in CODEX_HOOK_SUBSCRIPTIONS {
+        if !install && hooks.get(native).is_none() {
+            continue;
+        }
+        if hooks.get(native).is_none() {
+            hooks.insert(native, toml_edit::value(Array::new()));
+        }
+        let event_item = hooks.get_mut(native).expect("event");
+        event_item.make_value();
+        let groups = event_item.as_array_mut().ok_or("Codex hook event must be an array")?;
+        for group in groups.iter_mut() {
+            let group = group.as_inline_table_mut().ok_or("Codex hook matcher must be a table")?;
+            if let Some(handlers) = group.get_mut("hooks") {
+                let handlers = handlers.as_array_mut().ok_or("Codex hook handlers must be an array")?;
+                handlers.retain(|handler| {
+                    !handler.as_inline_table().and_then(|h| h.get("command")).and_then(Value::as_str).is_some_and(|command| {
+                        command
+                            .strip_prefix("flotilla hook codex ")
+                            .is_some_and(|event| CODEX_HOOK_SUBSCRIPTIONS.iter().any(|(_, known, _)| *known == event))
+                    })
+                });
+            }
+        }
+        // Keep matcher positions stable: Codex's trust keys include their indices.
+        let reusable = groups
+            .iter()
+            .position(|group| group.as_inline_table().and_then(|g| g.get("hooks")).and_then(Value::as_array).is_some_and(Array::is_empty));
+        if install {
+            states.push((
+                codex_hook_state_key(&source.display().to_string(), event, reusable.unwrap_or(groups.len())),
+                codex_hook_hash(native, event),
+            ));
+            let mut handler = InlineTable::new();
+            handler.insert("type", "command".into());
+            handler.insert("command", format!("flotilla hook codex {event}").into());
+            let mut handlers = Array::new();
+            handlers.push(handler);
+            let mut group = InlineTable::new();
+            group.insert("hooks", handlers.into());
+            if let Some(index) = reusable {
+                groups.replace(index, group);
+            } else {
+                groups.push(group);
+            }
+        }
+    }
+    if install {
+        if hooks.get("state").is_none() {
+            hooks.insert("state", Item::Table(toml_edit::Table::new()));
+        }
+        let state = hooks.get_mut("state").expect("state").as_table_like_mut().ok_or("Codex hook state must be a table")?;
+        for (key, hash) in states {
+            let mut trust = InlineTable::new();
+            trust.insert("enabled", true.into());
+            trust.insert("trusted_hash", hash.into());
+            state.insert(&key, toml_edit::value(trust));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -339,6 +565,122 @@ mod tests {
         // attention rather than a healthy-looking phase.
         assert_eq!(hooks["Notification"][0]["matcher"], "permission_prompt");
         assert_eq!(hooks["Notification"][1]["matcher"], "elicitation_dialog");
+    }
+
+    // Real command input shapes from openai/codex rust-v0.160.0 schema.rs:
+    // SessionStart has no turn_id; transcript paths are nullable. Generate every
+    // lifecycle, both model/transcript presence states, and parent/child tools.
+    #[hegel::test]
+    fn native_codex_payloads_preserve_identity_and_isolate_subagents(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        for (native, event, expected) in CODEX_HOOK_SUBSCRIPTIONS {
+            let mut payload = serde_json::json!({
+                "session_id": "session-1", "cwd": "/tmp", "hook_event_name": native,
+                "transcript_path": null, "permission_mode": "default",
+            });
+            if tc.draw(gs::booleans()) {
+                payload["model"] = "gpt-test".into();
+            }
+            if tc.draw(gs::booleans()) {
+                payload["transcript_path"] = "/tmp/transcript.jsonl".into();
+            }
+            match *native {
+                "SessionStart" => payload["source"] = "startup".into(),
+                "SessionEnd" => payload["reason"] = "other".into(),
+                _ => payload["turn_id"] = "turn-1".into(),
+            }
+            match *native {
+                "UserPromptSubmit" => payload["prompt"] = "fix the bug".into(),
+                "PreToolUse" | "PostToolUse" => {
+                    payload["tool_name"] = "Bash".into();
+                    payload["tool_input"] = serde_json::json!({"command": "echo hello"});
+                    payload["tool_use_id"] = "tool-1".into();
+                    if *native == "PostToolUse" {
+                        payload["tool_response"] = serde_json::json!({"output": "hello"});
+                    }
+                }
+                "Stop" => {
+                    payload["stop_hook_active"] = false.into();
+                    payload["last_assistant_message"] = serde_json::Value::Null;
+                }
+                _ => {}
+            }
+            let child = matches!(*native, "UserPromptSubmit" | "PreToolUse" | "PostToolUse") && tc.draw(gs::booleans());
+            if child {
+                payload["agent_id"] = "agent-1".into();
+                payload["agent_type"] = "worker".into();
+            }
+            let parsed = CodexParser.parse_event(event, &serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_eq!(parsed.event_type, if child { AgentEventType::NoChange } else { expected.clone() });
+            assert_eq!(parsed.session_id.as_deref(), Some("session-1"));
+            assert_eq!(parsed.model.as_deref(), payload["model"].as_str());
+            assert_eq!(parsed.transcript_path.as_deref(), payload["transcript_path"].as_str());
+            assert!(parsed.native_codex_hook);
+            payload["session_id"] = "".into();
+            assert!(CodexParser.parse_event(event, &serde_json::to_vec(&payload).unwrap()).is_err());
+        }
+        let child_stop = br#"{"session_id":"parent","turn_id":"turn-1","cwd":"/tmp","hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"worker","transcript_path":null,"agent_transcript_path":"/tmp/child.jsonl","permission_mode":"default","stop_hook_active":false,"last_assistant_message":null}"#;
+        assert_eq!(CodexParser.parse_event("subagent-stop", child_stop).unwrap().event_type, AgentEventType::NoChange);
+        // The native event name alone must prevent parent Idle even when
+        // optional subagent metadata is absent in a future/partial payload.
+        let mut no_agent_metadata: serde_json::Value = serde_json::from_slice(child_stop).unwrap();
+        no_agent_metadata.as_object_mut().unwrap().remove("agent_id");
+        assert_eq!(
+            CodexParser.parse_event("subagent-stop", &serde_json::to_vec(&no_agent_metadata).unwrap()).unwrap().event_type,
+            AgentEventType::NoChange
+        );
+        assert!(CodexParser.parse_event("stop", child_stop).is_err());
+        assert!(CodexParser.parse_event("stop", b"not json").is_err());
+        assert!(CodexParser.parse_event("stop", br#"{"hook_event_name":"Stop","cwd":"/tmp"}"#).is_err());
+    }
+
+    // Recorded via hooks/list on the crew image's codex-cli 0.160.0, with
+    // isolated CODEX_HOME and our session overrides. No model/host work ran.
+    #[test]
+    fn codex_trust_overrides_match_first_party_discovery() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!("fixtures/codex-hooks-list-0.160.0.json")).unwrap();
+        let state_override = codex_hook_overrides().pop().unwrap();
+        let document = state_override.parse::<toml_edit::DocumentMut>().unwrap();
+        for hook in recorded["data"][0]["hooks"].as_array().unwrap() {
+            // The recording is Linux; only the synthetic source path differs
+            // on Windows. Handler identities and trust hashes are portable.
+            let key = hook["key"].as_str().unwrap();
+            let key = if cfg!(windows) {
+                key.replace("/<session-flags>/config.toml", r"C:\<session-flags>\config.toml")
+            } else {
+                key.to_string()
+            };
+            assert_eq!(hook["trustStatus"], "trusted");
+            assert_eq!(document["hooks"]["state"][&key]["trusted_hash"].as_str(), hook["currentHash"].as_str());
+            assert_eq!(document["hooks"]["state"][&key]["enabled"].as_bool(), Some(true));
+        }
+    }
+
+    // Configuration glue: both supported TOML spellings preserve unrelated
+    // commands, migrate legacy notify, remain idempotent, and trust only ours.
+    #[test]
+    fn native_codex_install_migrates_and_preserves_user_hooks() {
+        for custom in [
+            "[hooks]\nStop = [{hooks=[{type=\"command\",command=\"custom\"}]}]\n",
+            "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype=\"command\"\ncommand=\"custom\"\n",
+        ] {
+            let source = format!("notify = [\"flotilla\",\"hook\",\"codex\",\"notify\"]\n# user config\nmodel=\"gpt-test\"\n{custom}");
+            let mut document = source.parse::<toml_edit::DocumentMut>().unwrap();
+            let path = std::path::Path::new("/home/user/.codex/config.toml");
+            update_codex_hooks(&mut document, true, path).unwrap();
+            let first = document.to_string();
+            update_codex_hooks(&mut document, true, path).unwrap();
+            assert_eq!(document.to_string(), first);
+            assert!(document.get("notify").is_none());
+            assert_eq!(document["hooks"]["Stop"].as_array().unwrap().len(), 2);
+            assert!(first.contains("trusted_hash"));
+            update_codex_hooks(&mut document, false, path).unwrap();
+            let removed = document.to_string();
+            assert!(removed.contains("custom"));
+            assert!(!removed.contains("flotilla hook codex "));
+            assert!(removed.contains("# user config"));
+            assert_eq!(document["model"].as_str(), Some("gpt-test"));
+        }
     }
 
     #[test]
