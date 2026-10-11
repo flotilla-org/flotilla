@@ -151,7 +151,6 @@ use crate::providers::forge::observation_error::ObservationError;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::RepoCriteria;
-use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
 use crate::regard_lifecycle::RegardLifecycle;
 use crate::regard_lifecycle::SurfaceGestureOutcome;
 use crate::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
@@ -173,6 +172,7 @@ use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
+use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
 
 type ObservationScope = (String, String, String);
 const OBSERVATION_CACHE_FALLBACK_DELAY: Duration = Duration::from_secs(9);
@@ -1368,8 +1368,8 @@ fn convoy_home_unreachable_message(
 }
 
 #[async_trait::async_trait]
-impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
-    async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+impl flotilla_vcs::vcs::CheckoutVcsResolver for InProcessDaemon {
+    async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
         self.vcs_for_checkout(environment.unwrap_or(&self.local_environment_id), path).await
     }
 }
@@ -1693,7 +1693,7 @@ impl InProcessDaemon {
                 Ok(vcs) => {
                     GitRepositoryInspector::new(
                         discovery.runner.clone(),
-                        Arc::new(crate::vcs::FixedVcsResolver(Arc::clone(&vcs.vcs))),
+                        Arc::new(flotilla_vcs::vcs::FixedVcsResolver(Arc::clone(&vcs.vcs))),
                         local_host_id.to_string(),
                     )
                     .inspect_path(&path, None)
@@ -2184,7 +2184,8 @@ impl InProcessDaemon {
         Ok(Arc::new(
             GitRepositoryInspector::new(
                 runner,
-                self.self_weak.upgrade().ok_or("repository inspector daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
+                self.self_weak.upgrade().ok_or("repository inspector daemon unavailable")?
+                    as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
                 host_ref.to_string(),
             )
             .with_forges(forges.into_iter().map(|forge| forge.spec).collect())
@@ -2644,16 +2645,16 @@ impl InProcessDaemon {
 
     /// VCS operations for a private charter object cache do not require a
     /// discovered checkout or a worktree registration.
-    pub fn local_charter_vcs(&self) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+    pub fn local_charter_vcs(&self) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
         let runner = self.local_command_runner().ok_or("local charter runner unavailable")?;
-        Ok(Arc::new(crate::vcs::FlotillaVcs::new(
+        Ok(Arc::new(flotilla_vcs::vcs::FlotillaVcs::new(
             ExecutionEnvironmentPath::new("/"),
             runner.clone(),
-            crate::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner))),
+            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner))),
         )))
     }
 
-    pub async fn local_vcs_for_checkout(&self, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+    pub async fn local_vcs_for_checkout(&self, checkout: &Path) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, String> {
         self.vcs_for_checkout(&self.local_environment_id, checkout).await
     }
 
@@ -3465,16 +3466,16 @@ impl InProcessDaemon {
     pub async fn resolve_live_checkout_change_request(
         &self,
         checkout: &ResourceObject<ResourceCheckout>,
-        vcs: &dyn crate::vcs::Vcs,
+        vcs: &dyn flotilla_vcs::vcs::Vcs,
         path: &Path,
     ) -> Result<Option<String>, String> {
         if !self.checkout_has_network_forge(checkout).await? {
             return Ok(None);
         }
-        let branch = vcs.read_repository(path, crate::vcs::RepositoryRead::CurrentBranch).await?;
+        let branch = vcs.read_repository(path, flotilla_vcs::vcs::RepositoryRead::CurrentBranch).await?;
         let mut branches = vec![branch.trim().to_string()];
-        if let Ok(upstream) = vcs.read_repository(path, crate::vcs::RepositoryRead::UpstreamOf("@{upstream}")).await {
-            let remote = vcs.read_repository(path, crate::vcs::RepositoryRead::TrackedRemote(branch.trim())).await?;
+        if let Ok(upstream) = vcs.read_repository(path, flotilla_vcs::vcs::RepositoryRead::UpstreamOf("@{upstream}")).await {
+            let remote = vcs.read_repository(path, flotilla_vcs::vcs::RepositoryRead::TrackedRemote(branch.trim())).await?;
             let upstream = upstream.trim();
             // Git uses remote "." for a local upstream; its full branch name has no remote prefix.
             let upstream_branch =
@@ -4533,9 +4534,9 @@ impl InProcessDaemon {
     /// Returns `(resolved_path, Some(original_path))` if normalization changed
     /// the path, or `(original_path, None)` if no change was needed.
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
-        use crate::providers::vcs::git::GitVcs;
-        use crate::providers::vcs::VcsInspection;
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
+        use flotilla_vcs::providers::git::GitVcs;
+        use flotilla_vcs::providers::VcsInspection;
 
         let vcs = GitVcs::new(self.discovery.runner.clone());
         let ee_path = ExecutionEnvironmentPath::new(path);
@@ -5773,7 +5774,8 @@ impl InProcessDaemon {
 
             local_host: self.host_name.clone(),
             environment_manager: Arc::clone(&self.environment_manager),
-            vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
+            vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")?
+                as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
         };
 
         execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await
@@ -6451,8 +6453,8 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     ) -> Result<crate::cleat_roll::RollReport, String> {
         InProcessDaemon::post_install_cleat(self, incoming, generation, diagnostics_dir).await
     }
-    fn vcs_resolver(&self) -> Result<Arc<dyn crate::vcs::CheckoutVcsResolver>, String> {
-        Ok(self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>)
+    fn vcs_resolver(&self) -> Result<Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>, String> {
+        Ok(self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>)
     }
     async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String> {
         InProcessDaemon::resolve_repo_for_command(self, command).await

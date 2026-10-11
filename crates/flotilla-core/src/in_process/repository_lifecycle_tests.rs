@@ -28,7 +28,7 @@ struct CountingVcsFactory {
 #[async_trait]
 impl Factory for CountingVcsFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn crate::vcs::Vcs;
+    type Output = dyn flotilla_vcs::vcs::Vcs;
 
     fn descriptor(&self) -> ProviderDescriptor {
         self.inner.descriptor()
@@ -40,7 +40,7 @@ impl Factory for CountingVcsFactory {
         config: &dyn provider_config::ProviderConfigView,
         path: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn crate::vcs::Vcs>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn flotilla_vcs::vcs::Vcs>, Vec<UnmetRequirement>> {
         self.probes.fetch_add(1, Ordering::SeqCst);
         // Real discovery awaits subprocess I/O. Keep this fake probe in flight
         // so concurrent callers exercise OnceCell initialization, not just hits.

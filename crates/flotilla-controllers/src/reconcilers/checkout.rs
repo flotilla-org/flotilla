@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 use flotilla_core::{
     checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
     config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
-    vcs::CheckoutMaterialisationError,
 };
 use flotilla_resources::{
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
@@ -23,6 +22,7 @@ use flotilla_store::{
     },
     EventRecorder, ReplicaReadResolver, ResourceBackend, TypedResolver,
 };
+use flotilla_vcs::vcs::CheckoutMaterialisationError;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, warn};
 

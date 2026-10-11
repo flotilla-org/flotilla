@@ -19,7 +19,6 @@ use flotilla_core::{
         environment::{command_provider_registry, EnvironmentKind},
         registry::ProviderRegistry,
     },
-    vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
 };
 use flotilla_credentials::CredentialStore;
 use flotilla_protocol::{CanonicalHostId, NodeId};
@@ -28,6 +27,7 @@ use flotilla_resources::{
     ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
 };
 use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
+use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
 use futures::stream::{BoxStream, SelectAll};
 use futures::FutureExt;
 use futures::StreamExt;
@@ -148,9 +148,9 @@ pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, namespace:
                 if let Some(environment) = archive_sweep.daemon.resolve_environment_ref(&root.env_ref) {
                     let runner = environment.runner;
                     let result = if environment.id == *archive_sweep.daemon.local_environment_id() {
-                        flotilla_core::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
+                        flotilla_vcs::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
                     } else {
-                        flotilla_core::vcs::prune_remote_checkout_archives(
+                        flotilla_vcs::vcs::prune_remote_checkout_archives(
                             &*runner,
                             &root.path,
                             archive_sweep.retention_days,

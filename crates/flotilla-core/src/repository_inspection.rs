@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use flotilla_resources::{ForgeSpec, Project, ProjectRepositoryRole, RepositoryKey, RepositorySpec, ResourceObject};
 
 use crate::ops_entry::OperationalEntryFile;
-use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-use crate::vcs::CheckoutVcsResolver;
-use crate::vcs::RepositoryRead;
-use crate::vcs::Vcs;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+use flotilla_vcs::vcs::CheckoutVcsResolver;
+use flotilla_vcs::vcs::RepositoryRead;
+use flotilla_vcs::vcs::Vcs;
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct LocalCheckoutInspection {
@@ -397,10 +397,10 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn charter_snapshot(&self, source: &flotilla_resources::CharterSource) -> Result<crate::charter_store::CharterSnapshot, String> {
-        let vcs = crate::vcs::FlotillaVcs::new(
+        let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
             flotilla_paths::path_context::ExecutionEnvironmentPath::new("/"),
             self.runner.clone(),
-            crate::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
+            flotilla_vcs::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
         );
         crate::charter_store::read_charter_source(source, &self.charter_cache, Some(&vcs)).await
     }
@@ -562,11 +562,11 @@ mod tests {
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::testkits::discovery::test_vcs_resolver;
     use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::vcs::EnumeratedCheckout;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandOutput;
     use flotilla_provider_runtime::CommandRunner;
+    use flotilla_vcs::vcs::EnumeratedCheckout;
 
     // Process boundary: count and reject every Git command except worktree enumeration.
     struct ObservationRunner {

@@ -379,8 +379,8 @@ impl DaemonRuntime {
             .await;
         if options.start_controllers {
             let image_build_runner = {
-                use flotilla_core::{
-                    providers::vcs::git_worktree::GitWorktreeStrategy,
+                use flotilla_vcs::{
+                    providers::git_worktree::GitWorktreeStrategy,
                     vcs::{FlotillaVcs, GitCheckoutStrategy},
                 };
                 let runner = daemon.local_command_runner().ok_or("image build command runner unavailable")?;

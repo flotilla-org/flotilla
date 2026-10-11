@@ -132,6 +132,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
 | `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
 | `flotilla-provider-runtime` | Command and HTTP runners, invocation macros, environment variables, shared scans and bounded host probes |
+| `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
@@ -204,9 +205,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 
 ### Provider Traits
 
-Each trait lives under `crates/flotilla-core/src/providers/` with implementations alongside:
+Provider traits live with their implementations; VCS lives in `flotilla-vcs`, and other provider types remain in core:
 
-- **Vcs** + **CheckoutManager** (`crates/flotilla-core/src/providers/vcs/git.rs`, `crates/flotilla-core/src/providers/vcs/wt.rs`)
+- **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
 - **ChangeRequestTracker** (`crates/flotilla-core/src/providers/change_request/github.rs`)
 - **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
 - **CloudAgentService** (`crates/flotilla-core/src/providers/coding_agent/claude.rs`, `crates/flotilla-core/src/providers/coding_agent/codex.rs`, `crates/flotilla-core/src/providers/coding_agent/cursor.rs`)
@@ -230,7 +231,7 @@ Checkout VCS providers are demand-discovered through `vcs_for_checkout` and cach
 
 ### VCS operation boundary
 
-Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-core/src/vcs.rs` and `crates/flotilla-core/src/providers/vcs/`. Add a typed operation to the trait when a caller needs a new VCS action. Each VCS provider chooses its implementation: a CLI through the environment runner, or a library. ADR 0060 removed the earlier rule that the CLI is the universal implementation, because an environment may run a minimal flotilla agent beside cleat.
+Use the checkout-scoped `flotilla_vcs::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-vcs/src/`. Add a typed operation to the trait when a caller needs a new VCS action. Each VCS provider chooses its implementation: a CLI through the environment runner, or a library. ADR 0060 removed the earlier rule that the CLI is the universal implementation, because an environment may run a minimal flotilla agent beside cleat.
 
 Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 

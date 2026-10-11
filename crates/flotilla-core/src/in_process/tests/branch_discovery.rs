@@ -12,10 +12,10 @@ use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, Re
 use super::support::test_meta;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::types::ChangeRequest;
-use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
 use crate::testkits::discovery::FakeChangeRequest;
-use crate::vcs::GitCheckoutStrategy;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+use flotilla_vcs::vcs::GitCheckoutStrategy;
 
 // #2698: automatic branch discovery must not bind an already terminal PR
 // to a newly created convoy. Explicit adoption remains a separate operation.
@@ -69,7 +69,7 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
 // stores the new PR as a produced subject and respects operator unlink.
 #[tokio::test]
 async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
-    use crate::vcs::Vcs;
+    use flotilla_vcs::vcs::Vcs;
     let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
     let root = tempfile::tempdir().expect("git fixture");
     let git = |args: &[&str]| {
@@ -149,7 +149,7 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
         fixture.daemon.validate_new_checkout_branch(&checkout).await.expect("forge lookup").expect("old merged head must refuse creation");
     assert!(conflict.contains("requested") && conflict.contains("#7"), "{conflict}");
     let runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
-    let vcs = crate::vcs::FlotillaVcs::new(
+    let vcs = flotilla_vcs::vcs::FlotillaVcs::new(
         ExecutionEnvironmentPath::new(root.path()),
         runner.clone(),
         GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner))),

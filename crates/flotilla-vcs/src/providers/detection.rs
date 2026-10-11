@@ -7,15 +7,29 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::RepoDetector;
 use flotilla_discovery_api::VcsKind;
 
-use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
-use crate::providers::discovery::detectors::generic::CommandDetector;
+use flotilla_discovery_api::HostDetector;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 
-pub fn git_binary_detector() -> CommandDetector {
-    CommandDetector::new("git", &["--version"], parse_first_dotted_version)
+pub struct GitBinaryDetector;
+
+pub fn git_binary_detector() -> GitBinaryDetector {
+    GitBinaryDetector
+}
+
+#[async_trait]
+impl HostDetector for GitBinaryDetector {
+    async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
+        let Ok(output) = run!(runner, "git", &["--version"], Path::new("/")) else {
+            return Vec::new();
+        };
+        match parse_first_dotted_version(&output) {
+            Some(version) => vec![EnvironmentAssertion::versioned_binary("git", "git", version)],
+            None => vec![EnvironmentAssertion::binary("git", "git")],
+        }
+    }
 }
 
 /// Bootstrap probes used before checkout-scoped provider construction.
@@ -77,10 +91,54 @@ fn extract_owner_repo(url: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
-pub(crate) fn remote_assertion(url: &str, remote_name: &str) -> Option<EnvironmentAssertion> {
+pub fn remote_assertion(url: &str, remote_name: &str) -> Option<EnvironmentAssertion> {
     let host = detect_host_from_url(url)?;
     let (owner, repo) = extract_owner_repo(url)?;
     Some(EnvironmentAssertion::remote_host(host, owner, repo, remote_name))
+}
+
+fn parse_first_dotted_version(output: &str) -> Option<String> {
+    let mut start = None;
+    let mut dot_count = 0;
+    let mut saw_digit = false;
+
+    for (idx, ch) in output.char_indices() {
+        if start.is_none() {
+            if ch.is_ascii_digit() {
+                start = Some(idx);
+                saw_digit = true;
+            }
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+
+        if ch == '.' {
+            dot_count += 1;
+            saw_digit = false;
+            continue;
+        }
+
+        if dot_count > 0 && saw_digit {
+            let start = start.expect("version start must exist");
+            return Some(output[start..idx].to_string());
+        }
+
+        start = if ch.is_ascii_digit() { Some(idx) } else { None };
+        dot_count = 0;
+        saw_digit = ch.is_ascii_digit();
+    }
+
+    if let Some(start) = start {
+        if dot_count > 0 && saw_digit {
+            return Some(output[start..].trim().to_string());
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -90,9 +148,31 @@ pub(crate) fn remote_assertion(url: &str, remote_name: &str) -> Option<Environme
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::testkits::discovery::TestEnvVars;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
+    use flotilla_discovery_testkit::TestEnvVars;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+
+    // Extraction must preserve binary path, version parsing, unversioned success
+    // and failed probes. This finite table covers each outcome of the probe port.
+    #[tokio::test]
+    async fn git_binary_probe_preserves_discovery_facts() {
+        for (output, version) in [
+            (Ok("git version 2.43.0\n".into()), Some("2.43.0")),
+            (Ok("git version 2.39.3 (Apple Git-146)\n".into()), Some("2.39.3")),
+            (Ok(String::new()), None),
+            (Ok("git version unknown".into()), None),
+        ] {
+            let runner = DiscoveryMockRunner::builder().on_run("git", &["--version"], output).build();
+            let assertions = git_binary_detector().detect(&runner, &TestEnvVars::default()).await;
+            let expected = match version {
+                Some(version) => EnvironmentAssertion::versioned_binary("git", "git", version),
+                None => EnvironmentAssertion::binary("git", "git"),
+            };
+            assert_eq!(assertions, vec![expected]);
+        }
+        let runner = DiscoveryMockRunner::builder().on_run("git", &["--version"], Err("unavailable".into())).build();
+        assert!(git_binary_detector().detect(&runner, &TestEnvVars::default()).await.is_empty());
+    }
 
     // -- VcsRepoDetector --
 

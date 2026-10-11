@@ -608,7 +608,7 @@ pub trait AgentAdapter: Send + Sync {
         cwd: &ExecutionEnvironmentPath,
         brief: &TerminalBrief,
         environment: &TerminalEnvVars,
-        _vcs: &dyn crate::vcs::Vcs,
+        _vcs: &dyn flotilla_vcs::vcs::Vcs,
     ) -> Result<(), String> {
         self.prepare_with_environment(cwd, brief, environment).await
     }
@@ -771,7 +771,7 @@ impl AgentAdapter for CliAgentAdapter {
         cwd: &ExecutionEnvironmentPath,
         brief: &TerminalBrief,
         environment: &TerminalEnvVars,
-        vcs: &dyn crate::vcs::Vcs,
+        vcs: &dyn flotilla_vcs::vcs::Vcs,
     ) -> Result<(), String> {
         self.prepare_impl(cwd, brief, environment, Some(vcs)).await
     }
@@ -858,7 +858,7 @@ impl CliAgentAdapter {
         cwd: &ExecutionEnvironmentPath,
         brief: &TerminalBrief,
         environment: &TerminalEnvVars,
-        vcs: Option<&dyn crate::vcs::Vcs>,
+        vcs: Option<&dyn flotilla_vcs::vcs::Vcs>,
     ) -> Result<(), String> {
         // Install the exclusion before writing any runtime files or launching an agent.
         if let Some(vcs) = vcs {
@@ -1091,7 +1091,7 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
 /// holds tracked files as ignored), while the runtime files must stay untracked.
 async fn ensure_flotilla_git_exclude(
     runner: &dyn CommandRunner,
-    vcs: &dyn crate::vcs::Vcs,
+    vcs: &dyn flotilla_vcs::vcs::Vcs,
     cwd: &Path,
     runtime_paths: &[&str],
 ) -> Result<(), String> {
@@ -1239,13 +1239,13 @@ mod tests {
     use crate::agent_adapter::CrewBriefTemplateResolver;
     use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
     use crate::crew_capabilities::CAPABILITIES_HEADING;
-    use crate::providers::discovery::factories::git::GitVcsFactory;
     use crate::testkits::replay::testing::MockRunner;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ProcessCommandRunner;
+    use flotilla_vcs::factory::GitVcsFactory;
 
     const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";
 
@@ -2692,9 +2692,9 @@ gpt-6.1-sol · /workspace"
     // must refuse launch rather than silently expose runtime files.
     #[tokio::test]
     async fn runtime_exclusion_handles_existing_patterns_and_refuses_overrides() {
-        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-        use crate::vcs::FlotillaVcs;
-        use crate::vcs::GitCheckoutStrategy;
+        use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+        use flotilla_vcs::vcs::FlotillaVcs;
+        use flotilla_vcs::vcs::GitCheckoutStrategy;
         const RUNTIME_PATHS: &[&str] = &[".flotilla/briefs/coder.md", CLAUDE_MANAGED_SETTINGS_PATH];
         for (existing, ignore, overridden, tracks_declarations) in [
             ("previous-pattern", None, false, false),
@@ -2732,7 +2732,7 @@ gpt-6.1-sol · /workspace"
             let vcs = FlotillaVcs::new(
                 cwd,
                 runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
             );
             let (result, concurrent) = tokio::join!(
                 super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path(), RUNTIME_PATHS),
@@ -2770,15 +2770,15 @@ gpt-6.1-sol · /workspace"
     // exclusion while each repository it holds still proves its own.
     #[tokio::test]
     async fn runtime_exclusion_skips_a_plain_workspace_directory() {
-        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-        use crate::vcs::FlotillaVcs;
-        use crate::vcs::GitCheckoutStrategy;
+        use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+        use flotilla_vcs::vcs::FlotillaVcs;
+        use flotilla_vcs::vcs::GitCheckoutStrategy;
         let workspace = tempfile::tempdir().expect("workspace root");
         let runner = Arc::new(ProcessCommandRunner);
         let vcs = FlotillaVcs::new(
             ExecutionEnvironmentPath::new(workspace.path()),
             runner.clone(),
-            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
         );
         super::ensure_flotilla_git_exclude(&*runner, &vcs, workspace.path(), &[".flotilla/briefs/governor.md"])
             .await
@@ -2790,9 +2790,9 @@ gpt-6.1-sol · /workspace"
     // expose runtime files to git add -A. This is the lowest falsifying seam.
     #[tokio::test]
     async fn runtime_exclusion_refuses_discovery_and_write_failures() {
-        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-        use crate::vcs::FlotillaVcs;
-        use crate::vcs::GitCheckoutStrategy;
+        use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+        use flotilla_vcs::vcs::FlotillaVcs;
+        use flotilla_vcs::vcs::GitCheckoutStrategy;
         for responses in [
             vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
             vec![Ok("true\n".to_string()), Ok(String::new())],
@@ -2807,7 +2807,7 @@ gpt-6.1-sol · /workspace"
             let vcs = FlotillaVcs::new(
                 cwd.clone(),
                 runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
             );
             assert!(super::ensure_flotilla_git_exclude(&*runner, &vcs, cwd.as_path(), &[".flotilla/briefs/coder.md"]).await.is_err());
             assert_eq!(runner.remaining(), 0);
@@ -2818,9 +2818,9 @@ gpt-6.1-sol · /workspace"
     // any runtime file is written. This example covers the two subprocess edges.
     #[tokio::test]
     async fn preparation_refuses_unavailable_runtime_file_exclusion() {
-        use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-        use crate::vcs::FlotillaVcs;
-        use crate::vcs::GitCheckoutStrategy;
+        use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
+        use flotilla_vcs::vcs::FlotillaVcs;
+        use flotilla_vcs::vcs::GitCheckoutStrategy;
         for responses in [
             vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
             vec![Ok("true\n".to_string()), Ok(String::new())],
@@ -2839,7 +2839,7 @@ gpt-6.1-sol · /workspace"
             let vcs = FlotillaVcs::new(
                 cwd.clone(),
                 runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(flotilla_vcs::default_checkout_path(), runner.clone()))),
             );
             let brief = flotilla_resources::TerminalBrief {
                 path: ".flotilla/briefs/coder.md".into(),

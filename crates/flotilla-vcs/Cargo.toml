@@ -1,0 +1,38 @@
+# ADR 0060: provider component; no composition-root or store dependencies.
+[package]
+name = "flotilla-vcs"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+async-trait.workspace = true
+bon.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+sha2.workspace = true
+minijinja = "2"
+futures = "0.3"
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

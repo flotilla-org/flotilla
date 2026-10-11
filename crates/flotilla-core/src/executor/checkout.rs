@@ -1,8 +1,9 @@
 pub use flotilla_protocol::CheckoutIntent;
 use flotilla_protocol::{provider_data::Checkout, qualified_path::QualifiedPath, CheckoutSelector, HostName};
 
-use crate::{provider_data::ProviderData, vcs::Vcs};
+use crate::provider_data::ProviderData;
 use flotilla_paths::path_context::{canonical_or_original, ExecutionEnvironmentPath};
+use flotilla_vcs::vcs::Vcs;
 
 pub(super) struct CheckoutService<'a> {
     vcs: &'a dyn Vcs,

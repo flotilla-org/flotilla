@@ -234,7 +234,7 @@ pub(super) async fn crew_daemon_with_backend(
     let mut discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
     );
-    discovery.factories.vcs.push(Box::new(flotilla_core::providers::discovery::factories::git::GitVcsFactory));
+    discovery.factories.vcs.push(Box::new(flotilla_vcs::factory::GitVcsFactory));
     let daemon =
         InProcessDaemon::new_with_resource_backend(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy"), backend)
             .await;
@@ -256,7 +256,7 @@ pub(super) async fn crew_daemon_with_process_runner(config: Arc<ConfigStore>) ->
     let mut discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
     );
-    discovery.factories.vcs.push(Box::new(flotilla_core::providers::discovery::factories::git::GitVcsFactory));
+    discovery.factories.vcs.push(Box::new(flotilla_vcs::factory::GitVcsFactory));
     discovery.runner = Arc::new(ProcessCommandRunner);
     let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
     daemon

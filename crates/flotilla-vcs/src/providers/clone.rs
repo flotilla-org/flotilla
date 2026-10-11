@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use flotilla_resources::CheckoutBranchProvenance;
 use tracing::info;
 
-use crate::providers::types::Checkout;
 use crate::vcs::existing_checkout_branch_error;
 use crate::vcs::CheckoutMaterialisation;
 use crate::vcs::EnumeratedCheckout;
 use crate::vcs::GitCliBackend;
 use crate::vcs::VcsBackend;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::Checkout;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 
@@ -296,7 +296,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::providers::vcs::checkout_test_support::git;
+    use crate::providers::checkout_test_support::git;
     use crate::vcs::FlotillaVcs;
     use crate::vcs::GitCheckoutStrategy;
     use crate::vcs::Vcs;

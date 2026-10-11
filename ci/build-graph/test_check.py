@@ -67,6 +67,24 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
         )), [])
 
+    def test_vcs_is_native_and_independent(self):
+        # ADR 0060: VCS is native, but cannot reach composition or store crates.
+        self.assertEqual(layer("flotilla-vcs"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-vcs", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-vcs: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-vcs", normal=("flotilla-protocol", "flotilla-provider-runtime")),
+            package("flotilla-core", normal=("flotilla-vcs",)),
+            package("flotilla-protocol"), package("flotilla-provider-runtime"),
+        )), [])
+
     def test_testkit_names(self):
         for name in ("flotilla-store-testkit", "future-testkit", "flotilla-test-support"):
             self.assertTrue(is_testkit(name))

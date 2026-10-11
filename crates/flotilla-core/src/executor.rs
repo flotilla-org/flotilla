@@ -25,7 +25,6 @@ use crate::provider_data::ProviderData;
 use crate::providers::environment::{legacy_environment_spec, EnvironmentKind};
 use crate::providers::issue_tracker::forge_issue_source;
 use crate::providers::registry::ProviderRegistry;
-use crate::providers::vcs::write_branch_issue_links;
 use crate::step::Step;
 use crate::step::StepAction;
 use crate::step::StepExecutionContext;
@@ -36,6 +35,7 @@ use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
+use flotilla_vcs::providers::write_branch_issue_links;
 
 #[derive(Clone)]
 pub struct RepoExecutionContext {
@@ -48,7 +48,7 @@ struct CheckoutFlow<'a> {
     create_branch: bool,
     intent: CheckoutIntent,
     repo_root: &'a ExecutionEnvironmentPath,
-    vcs: &'a dyn crate::vcs::Vcs,
+    vcs: &'a dyn flotilla_vcs::vcs::Vcs,
     providers_data: &'a ProviderData,
     local_host: &'a HostName,
     new_checkout_qualifier: PathQualifier,
@@ -429,7 +429,7 @@ pub(crate) struct ExecutorStepResolver {
     pub daemon_socket_path: Option<DaemonHostPath>,
     pub local_host: HostName,
     pub environment_manager: Arc<EnvironmentManager>,
-    pub vcs_resolver: Arc<dyn crate::vcs::CheckoutVcsResolver>,
+    pub vcs_resolver: Arc<dyn flotilla_vcs::vcs::CheckoutVcsResolver>,
 }
 
 #[async_trait::async_trait]
@@ -587,7 +587,7 @@ impl StepResolver for ExecutorStepResolver {
                 let yaml = vcs
                     .read_repository(
                         self.repo.root.as_path(),
-                        crate::vcs::RepositoryRead::FileAtRevision("HEAD:.flotilla/environment.yaml"),
+                        flotilla_vcs::vcs::RepositoryRead::FileAtRevision("HEAD:.flotilla/environment.yaml"),
                     )
                     .await
                     .map_err(|e| format!("failed to read .flotilla/environment.yaml from HEAD: {e}"))?;
@@ -656,7 +656,7 @@ impl ExecutorStepResolver {
     // preparation rather than living on the executor.
     async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
         let vcs = self.vcs_resolver.vcs_for(None, self.repo.root.as_path()).await.ok()?;
-        let result = vcs.read_repository(self.repo.root.as_path(), crate::vcs::RepositoryRead::SharedMetadataDir).await;
+        let result = vcs.read_repository(self.repo.root.as_path(), flotilla_vcs::vcs::RepositoryRead::SharedMetadataDir).await;
         match result {
             Ok(path) => {
                 let git_dir = std::path::Path::new(path.trim());

@@ -7,9 +7,6 @@ use flotilla_core::checkout_integration::checkout_path_from_status_and_spec;
 use flotilla_core::checkout_integration::convoy_change_request_id_for_checkout;
 use flotilla_core::checkout_integration::inspect_checkout_integration;
 use flotilla_core::checkout_integration::inspect_convoy_checkout_integration;
-use flotilla_core::vcs as core_vcs;
-use flotilla_core::vcs::CheckoutRegistration;
-use flotilla_core::vcs::Vcs;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
@@ -17,6 +14,9 @@ use flotilla_resources::{
     ResourceObject,
 };
 use flotilla_store::{ReplicaReadResolver, ResourceBackend};
+use flotilla_vcs::vcs as core_vcs;
+use flotilla_vcs::vcs::CheckoutRegistration;
+use flotilla_vcs::vcs::Vcs;
 use tracing::{debug, warn};
 
 use crate::reconcilers::{

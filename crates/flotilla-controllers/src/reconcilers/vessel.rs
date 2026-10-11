@@ -76,7 +76,7 @@ fn git_mounts_match(existing: &[EnvironmentMount], desired: &[EnvironmentMount])
 /// Environment-scoped VCS inspection used to plan contained Git mounts.
 #[async_trait::async_trait]
 pub trait WorktreeMetadataResolver: Send + Sync {
-    async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<flotilla_core::vcs::WorktreeMetadata, String>;
+    async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<flotilla_vcs::vcs::WorktreeMetadata, String>;
 }
 
 #[derive(bon::Builder)]
@@ -1785,8 +1785,8 @@ mod tests {
     // refuse invalid/unavailable metadata instead of granting writable siblings.
     #[tokio::test]
     async fn contained_mounts_cover_empty_duplicate_and_invalid_metadata() {
-        use flotilla_core::vcs::WorktreeMetadata;
         use flotilla_resources::{Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, EnvironmentMountMode, RepositoryKey};
+        use flotilla_vcs::vcs::WorktreeMetadata;
         struct Metadata(Result<WorktreeMetadata, String>);
         // VCS process boundary fake; stores and mount planning are real.
         #[async_trait::async_trait]

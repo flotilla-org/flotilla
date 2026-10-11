@@ -1,4 +1,5 @@
 use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_vcs::vcs::Vcs;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -13,10 +14,9 @@ use crate::{
         environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
         terminal::TerminalPool,
-        vcs::CloneProvisioner,
     },
-    vcs::Vcs,
 };
+use flotilla_vcs::providers::CloneProvisioner;
 
 /// Common accessors shared by all descriptor types.
 ///

@@ -3,7 +3,6 @@ pub mod cleat;
 pub mod codex;
 pub mod cursor;
 pub mod docker;
-pub mod git;
 pub mod github;
 pub mod host_direct;
 pub mod passthrough;
@@ -15,7 +14,7 @@ fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
 }
 
 fn vcs_factories() -> Vec<Box<super::VcsFactory>> {
-    vec![Box::new(git::GitVcsFactory)]
+    vec![Box::new(flotilla_vcs::factory::GitVcsFactory)]
 }
 
 impl FactoryRegistry {

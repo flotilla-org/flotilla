@@ -32,7 +32,7 @@ pub(crate) trait CharterReader: Send + Sync {
 
 pub(crate) struct BoundCharterReader<'a> {
     pub cache: &'a Path,
-    pub vcs: Option<&'a dyn flotilla_core::vcs::Vcs>,
+    pub vcs: Option<&'a dyn flotilla_vcs::vcs::Vcs>,
 }
 
 #[async_trait]
