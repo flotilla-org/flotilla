@@ -214,6 +214,19 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
                 .source(TerminalSessionSource::Tool { command: "sh".into() })
                 .cwd("/work".into())
                 .pool("pool".into())
+    // Cross-kind scope discovery uses source indexes and never decodes an
+    // unrelated source body. Quoted label keys retain their literal spelling.
+    use flotilla_resources::{TerminalSession, TerminalSessionSource, TerminalSessionSpec};
+    authority
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder().name("scope-source".into()).labels(BTreeMap::from([("flotilla.work/convoy".into(), "a".into())])).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("host".into())
+                .role("coder".into())
+                .cwd("/workspace".into())
+                .pool("cleat".into())
+                .source(TerminalSessionSource::Tool { command: "true".into() })
                 .build(),
         )
         .await
@@ -233,6 +246,117 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     next_meta.annotations.clear();
     terminals.update(&next_meta, &terminal.metadata.resource_version, &terminal.spec).await.unwrap();
     assert!(backend.query_declared::<TerminalSession>("flotilla", &query).await.unwrap().items.is_empty());
+    let query = StoreQuery::related_kind(
+        "metadata.name",
+        "TerminalSession",
+        "metadata.labels.\"flotilla.work/convoy\"",
+        StoreQuery::names(["scope-source".into()], true),
+    );
+    let result = backend.query_declared::<Convoy>("flotilla", &query).await.unwrap();
+    assert_eq!(result.items.iter().map(|source| source.object.metadata.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    let mut invalid = query.clone();
+    invalid.field_matches_query.get_mut("metadata.name").unwrap().source_kind = Some("undeclared-kind".into());
+    assert!(invalid.validate(flotilla_store::ResourceKind::of::<Convoy>()).is_err());
+
+    // Virtual repository aliases retain exactly the catalog matching semantics
+    // without adding fields to stored bodies.
+    let repository = flotilla_resources::RepositorySpec::remote("https://github.com/acme/repo").unwrap();
+    authority
+        .using::<flotilla_resources::Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .unwrap();
+    for target in [repository.leaf_slug(), repository.catalog_slug(), "acme/repo".into(), "missing".into()] {
+        let selected = backend
+            .query_declared::<flotilla_resources::Repository>(
+                "flotilla",
+                &StoreQuery { fields: BTreeMap::from([("spec.catalog_targets.*".into(), target.clone())]), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.items.len(), usize::from(repository.matches_catalog_target(&target)), "{target}");
+    }
+    // Canonical and aliased Forge hosts preserve case-insensitive remote
+    // matching without decoding unrelated installations.
+    let forge = flotilla_resources::ForgeSpec::builder()
+        .forge_id("query-forge".into())
+        .kind(flotilla_resources::ForgeKind::Forgejo)
+        .hosts(["Forge.Example".into()].into())
+        .https_url("https://canonical.example/git".into())
+        .git_ssh_host("ssh-alias".into())
+        .build();
+    authority
+        .definitions::<flotilla_resources::Forge>("flotilla")
+        .create(&InputMeta::builder().name("query-forge".into()).build(), &forge)
+        .await
+        .unwrap();
+    for host in ["forge.example", "canonical.example", "ssh-alias", "unrelated.example"] {
+        let selected = backend
+            .query_declared::<flotilla_resources::Forge>(
+                "flotilla",
+                &StoreQuery { fields: BTreeMap::from([("spec.remote_hosts.*".into(), host.into())]), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.items.len(), usize::from(forge.matches_host(host)), "{host}");
+    }
+    // Numeric equality preserves the complete u64 domain, including values
+    // above SQLite's signed integer range. Stored JSON is canonical decimal.
+    for number in [0, 1, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+        let spec = flotilla_resources::ChangeRequestSpec::builder()
+            .service("numeric-contract".into())
+            .scope("scope".into())
+            .number(number)
+            .observing_authority("query".into())
+            .build();
+        let name = format!("numeric-{number}");
+        authority
+            .using::<flotilla_resources::ChangeRequest>("flotilla")
+            .create(&InputMeta::builder().name(name.clone()).build(), &spec)
+            .await
+            .unwrap();
+        let selected = backend
+            .query_declared::<flotilla_resources::ChangeRequest>(
+                "flotilla",
+                &StoreQuery {
+                    fields: BTreeMap::from([
+                        ("spec.service".into(), "numeric-contract".into()),
+                        ("spec.scope".into(), "scope".into()),
+                        ("spec.number".into(), number.to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.items.iter().map(|source| source.object.metadata.name.clone()).collect::<Vec<_>>(), [name], "{number}");
+    }
+    // Array selectors implement membership and absence over empty/wildcard
+    // grants, and updates immediately replace old indexed values.
+    use flotilla_resources::{CredentialGrant, CredentialGrantSelector, CredentialGrantSpec};
+    for (name, projects) in [("wildcard", vec![]), ("selected", vec!["app", "other"]), ("unrelated", vec!["elsewhere"])] {
+        authority
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.into()).build(),
+                &CredentialGrantSpec::builder()
+                    .credentials(["token".into()].into())
+                    .selector(CredentialGrantSelector::builder().projects(projects.into_iter().map(str::to_string).collect()).build())
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+    for (query, expected) in [
+        (
+            StoreQuery { fields: BTreeMap::from([("spec.selector.projects.*".into(), "app".into())]), ..Default::default() },
+            vec!["selected"],
+        ),
+        (StoreQuery { missing_fields: ["spec.selector.projects.*".into()].into(), ..Default::default() }, vec!["wildcard"]),
+    ] {
+        let selected = backend.query_declared::<CredentialGrant>("flotilla", &query).await.unwrap();
+        assert_eq!(selected.items.iter().map(|source| source.object.metadata.name.as_str()).collect::<Vec<_>>(), expected);
+    }
 
     // Membership selects a named inventory once, with empty sets selecting
     // nothing and local shadowing independent of the selected predicates.
@@ -253,6 +377,68 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     let mut query = StoreQuery::names(["a".into()], true);
     query.field_values.insert("spec.undeclared".into(), ["value".into()].into());
     assert!(query.validate(flotilla_store::ResourceKind::of::<Convoy>()).is_err());
+    // Literal prefix, absence and alternatives intersect the outer selector;
+    // related values span partitions even when only a replica supplies a source.
+    for (query, expected) in [
+        (
+            StoreQuery {
+                field_prefixes: BTreeMap::from([("metadata.name".into(), "sh".into())]),
+                include_replicas: true,
+                ..Default::default()
+            },
+            vec!["shadow"],
+        ),
+        (StoreQuery { missing_fields: ["spec.continuation".into()].into(), ..Default::default() }, vec!["a", "b", "shadow"]),
+        (
+            StoreQuery {
+                any_of: vec![StoreQuery::names(["a".into()], false), StoreQuery::names(["remote".into()], true)],
+                include_replicas: true,
+                ..Default::default()
+            },
+            vec!["a", "remote"],
+        ),
+        (
+            StoreQuery {
+                field_matches_query: BTreeMap::from([(
+                    "metadata.name".into(),
+                    flotilla_store::FieldQuery {
+                        source_kind: None,
+                        field: "metadata.name".into(),
+                        query: Box::new(StoreQuery::names(["remote".into()], true)),
+                    },
+                )]),
+                include_replicas: true,
+                ..Default::default()
+            },
+            vec!["remote"],
+        ),
+    ] {
+        let records = backend.query_declared::<Convoy>("flotilla", &query).await.expect("composed selectors");
+        assert_eq!(records.items.iter().map(|record| record.object.metadata.name.as_str()).collect::<Vec<_>>(), expected);
+    }
+    // A replica-only source's shared role also selects local target rows;
+    // source scope controls which partitions may contribute join values.
+    let mut related = StoreQuery::related("spec.role", "spec.role", StoreQuery::names(["remote".into()], true));
+    related.include_replicas = true;
+    let names = backend
+        .query_declared::<Convoy>("flotilla", &related)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|record| record.object.metadata.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["0-first", "a", "b", "remote", "shadow"]);
+    related.field_matches_query.get_mut("spec.role").unwrap().query.include_replicas = false;
+    assert!(backend.query_declared::<Convoy>("flotilla", &related).await.unwrap().items.is_empty());
+    // Undeclared nested fields and excessive nesting are refused before access.
+    let mut nested = StoreQuery::related("metadata.name", "spec.invalid", StoreQuery::default());
+    assert!(backend.query_declared::<Convoy>("flotilla", &nested).await.is_err());
+    nested = StoreQuery::default();
+    for _ in 0..10 {
+        nested = StoreQuery { any_of: vec![nested], ..Default::default() };
+    }
+    assert!(backend.query_declared::<Convoy>("flotilla", &nested).await.is_err());
     // Equality predicates combine with AND; empty selections return all local rows.
     let query = StoreQuery::default();
     assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 3);
@@ -359,6 +545,69 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
         .unwrap()
         .items
         .is_empty());
+    // Named definition inventories merge every author using the ordinary causal
+    // resolver semantics; query pushdown may not omit conflicts or tombstones.
+    let projects = authority.definitions::<flotilla_resources::Project>("flotilla");
+    projects
+        .create(
+            &InputMeta::builder().name("declared".into()).build(),
+            &flotilla_resources::ProjectSpec::builder().display_name("local".into()).build(),
+        )
+        .await
+        .unwrap();
+    let peer = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("peer"));
+    peer.definitions::<flotilla_resources::Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("declared".into()).build(),
+            &flotilla_resources::ProjectSpec::builder().display_name("remote".into()).build(),
+        )
+        .await
+        .unwrap();
+    authority
+        .replace_replicas_typed::<flotilla_resources::Project>(
+            &NodeId::new("peer"),
+            "flotilla",
+            &peer.using::<flotilla_resources::Project>("flotilla").list().await.unwrap(),
+            chrono::Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    let merged = backend.definitions::<flotilla_resources::Project>("flotilla").list_names(["declared".into()]).await.unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(serde_json::to_value(&merged[0]).unwrap(), serde_json::to_value(projects.get("declared").await.unwrap()).unwrap());
+    // Numeric declared identity fields distinguish alternate record names with
+    // the same subject from other requests in that repository.
+    for (name, number) in [("request", 42), ("alternate", 42), ("unrelated", 43)] {
+        authority
+            .using::<flotilla_resources::ChangeRequest>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.into()).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("owner/repo".into())
+                    .number(number)
+                    .observing_authority("local".into())
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+    let result = backend
+        .query_declared::<flotilla_resources::ChangeRequest>(
+            "flotilla",
+            &StoreQuery {
+                fields: BTreeMap::from([
+                    ("spec.service".into(), "github.com".into()),
+                    ("spec.scope".into(), "owner/repo".into()),
+                    ("spec.number".into(), "42".into()),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.items.iter().map(|item| item.object.metadata.name.as_str()).collect::<Vec<_>>(), ["alternate", "request"]);
     // Indexed queries decode only selected rows, and updates/deletes remove old
     // label, owner and field index entries in the same write transaction.
     let observed = backend.clone().with_read_counts();

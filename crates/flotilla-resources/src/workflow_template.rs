@@ -18,7 +18,8 @@ define_resource!(
     WorkflowTemplateSpec,
     (),
     NoStatusPatch,
-    replication = ReplicationClass::Definitions
+    replication = ReplicationClass::Definitions,
+    queryable = &["metadata.name", "metadata.annotations.\"flotilla.work/materialized-project\""]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

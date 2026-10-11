@@ -11,7 +11,8 @@ define_resource!(
     ManifestRootSpec,
     ManifestRootStatus,
     ManifestRootStatusPatch,
-    replication = ReplicationClass::HomeBoundRuntime
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "spec.host", "status.stalled"]
 );
 
 /// A path and the identity declared by one document. The JSON tuple encoding

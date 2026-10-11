@@ -36,12 +36,13 @@ use crate::{
 #[path = "sqlite/digest.rs"]
 mod digest;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum QueryColumns {
     Identity,
     Names,
     LocalList,
     ReadRows,
+    Field(String),
 }
 
 type StoreKey = (String, String, String, String);
@@ -266,7 +267,31 @@ impl SqliteBackend {
         self.local_root.clone().unwrap_or_else(|| NodeId::new("local"))
     }
 
+    /// Configure auxiliary SQL writers with the functions required by declared
+    /// relation-index triggers. This neither migrates the schema nor edits bodies.
+    /// An older writer must remove the additive relation migrations before use.
+    pub fn register_query_functions(connection: &RusqliteConnection) -> Result<(), ResourceError> {
+        connection
+            .create_scalar_function(
+                "flotilla_declared_values",
+                2,
+                rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |context| {
+                    let body: String = context.get(0)?;
+                    let field: String = context.get(1)?;
+                    let values = serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .map(|value| crate::declared_field_values(&value, &field))
+                        .unwrap_or_default();
+                    Ok(serde_json::json!(values).to_string())
+                },
+            )
+            .map_err(|error| Self::map_sqlite(error, "register declared array projection"))?;
+        Ok(())
+    }
+
     fn initialize_connection(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
+        Self::register_query_functions(connection)?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|err| ResourceError::other(format!("configure sqlite resource store busy timeout: {err}")))?;
@@ -556,22 +581,28 @@ impl SqliteBackend {
                     if done {
                         continue;
                     }
-                    if let Some((prefix, suffix)) = path.split_once("[].") {
-                        let members = format!("{index}_members");
+                    if crate::array_field_path(path).is_some() {
+                        let values = format!("{index}_values");
                         let origin = if table == "replica_objects" { "origin_root" } else { "''" };
-                        let new_origin: String = if origin == "''" { "''".into() } else { "NEW.origin_root".into() };
-                        let old_origin: String = if origin == "''" { "''".into() } else { "OLD.origin_root".into() };
-                        let deletion = format!("group_name=OLD.group_name AND version=OLD.version AND kind=OLD.kind AND namespace=OLD.namespace AND name=OLD.name AND origin={old_origin}");
-                        let insertion = format!("INSERT OR IGNORE INTO {members} SELECT NEW.group_name,NEW.version,NEW.kind,NEW.namespace,NEW.name,{new_origin},json_extract(j.value,'$.{suffix}') FROM json_each(CASE WHEN json_valid(NEW.body_json) THEN NEW.body_json ELSE '{{}}' END,'$.{prefix}') j WHERE NEW.kind='{}' AND json_type(j.value,'$.{suffix}')='text';", kind.paths.kind);
+                        let new_origin = if table == "replica_objects" { "NEW.origin_root" } else { "''" };
+                        let old_origin = if table == "replica_objects" { "OLD.origin_root" } else { "''" };
+                        let extracted = "j.value";
+                        // The write-only function shares canonical array/legacy
+                        // normalization with memory. Reads search persisted values.
+                        let rows = |body: &str| format!("json_each(flotilla_declared_values({body},'{path}')) j WHERE j.type='text'");
+                        let delete = format!("DELETE FROM {values} WHERE group_name=OLD.group_name AND version=OLD.version AND kind=OLD.kind AND namespace=OLD.namespace AND name=OLD.name AND origin={old_origin};");
+                        let insert = format!("INSERT OR IGNORE INTO {values} SELECT NEW.group_name,NEW.version,NEW.kind,NEW.namespace,NEW.name,{new_origin},{extracted} FROM {}", rows("NEW.body_json"));
                         tx.execute_batch(&format!("
-                            CREATE TABLE {members}(group_name TEXT,version TEXT,kind TEXT,namespace TEXT,name TEXT,origin TEXT,value TEXT,PRIMARY KEY(group_name,version,kind,namespace,name,origin,value));
-                            CREATE INDEX {index} ON {members}(group_name,version,kind,namespace,value,name,origin);
-                            CREATE TRIGGER {index}_insert AFTER INSERT ON {table} BEGIN {insertion} END;
-                            CREATE TRIGGER {index}_update AFTER UPDATE ON {table} BEGIN DELETE FROM {members} WHERE {deletion}; {insertion} END;
-                            CREATE TRIGGER {index}_delete AFTER DELETE ON {table} BEGIN DELETE FROM {members} WHERE {deletion}; END;
-                            INSERT OR IGNORE INTO {members} SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},json_extract(j.value,'$.{suffix}') FROM {table} o,json_each(CASE WHEN json_valid(o.body_json) THEN o.body_json ELSE '{{}}' END,'$.{prefix}') j WHERE o.kind='{}' AND json_type(j.value,'$.{suffix}')='text';",kind.paths.kind)).map_err(|e| Self::map_sqlite(e,"create collection index"))?;
+                            CREATE TABLE {values} (group_name TEXT,version TEXT,kind TEXT,namespace TEXT,name TEXT,origin TEXT,value TEXT,PRIMARY KEY(group_name,version,kind,namespace,name,origin,value));
+                            CREATE INDEX {index} ON {values}(group_name,version,kind,namespace,value,name,origin);
+                            CREATE TRIGGER {index}_insert AFTER INSERT ON {table} WHEN NEW.kind='{}' BEGIN {insert}; END;
+                            CREATE TRIGGER {index}_update AFTER UPDATE ON {table} WHEN NEW.kind='{}' BEGIN {delete} {insert}; END;
+                            CREATE TRIGGER {index}_delete AFTER DELETE ON {table} WHEN OLD.kind='{}' BEGIN {delete} END;
+                            INSERT OR IGNORE INTO {values} SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},{extracted} FROM {table} o,{} AND o.kind='{}';
+                        ", kind.paths.kind,kind.paths.kind,kind.paths.kind,rows("o.body_json"),kind.paths.kind)).map_err(|e| Self::map_sqlite(e,"create array field index"))?;
                     } else {
-                        tx.execute_batch(&format!("CREATE INDEX {index} ON {table}(group_name,version,kind,namespace,json_extract(body_json,'$.{path}'),name) WHERE kind='{}' AND json_valid(body_json)", kind.paths.kind)).map_err(|e| Self::map_sqlite(e, "create field index"))?;
+                        let expression = Self::field_expression(kind, "body_json", path);
+                        tx.execute_batch(&format!("CREATE INDEX {index} ON {table}(group_name,version,kind,namespace,{expression},name) WHERE kind='{}' AND json_valid(body_json)", kind.paths.kind)).map_err(|e| Self::map_sqlite(e, "create field index"))?;
                     }
                     tx.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [&index])
                         .map_err(|e| Self::map_sqlite(e, "record field migration"))?;
@@ -580,12 +611,22 @@ impl SqliteBackend {
         }
         tx.commit().map_err(|e| Self::map_sqlite(e, "commit query indexes"))
     }
+    fn field_expression(kind: ResourceKind, body: &str, path: &str) -> String {
+        let expression = format!("json_extract({body},'$.{path}')");
+        if kind.queryable_numeric_fields.contains(&path) {
+            // json_extract rounds unsigned integers above i64::MAX through a
+            // SQLite REAL. The JSON operator retains their exact decimal text.
+            format!("CAST({body} -> '$.{path}' AS TEXT)")
+        } else {
+            expression
+        }
+    }
     fn field_index(table: &str, kind: ResourceKind, path: &str) -> String {
         format!(
             "{}_{}_{}",
             table,
             kind.paths.kind,
-            path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>()
+            path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>() + if path.contains("[].") { "_collection_v2" } else { "" }
         )
     }
     // Generated queries use positional parameters. Preserve quoted SQL text
@@ -632,6 +673,7 @@ impl SqliteBackend {
         let projection = if replicas { "name,origin" } else { "name" };
         format!("{identity} IN (SELECT {projection} FROM {index}_members INDEXED BY {index} WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND value{comparison})")
     }
+    fn shift_binds(sql: &str, offset: usize) -> String { Self::shift_bindings(sql, offset) }
     fn declared_sql(
         kind: ResourceKind,
         namespace: &str,
@@ -692,88 +734,112 @@ impl SqliteBackend {
                 if replicas { ("(o.name,o.origin_root)", "l.name,l.origin", "") } else { ("o.name", "l.name", " AND l.origin='' ") };
             predicates.push(format!("{candidate} IN (SELECT {columns} FROM {table}_labels l INDEXED BY {table}_labels_lookup WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND l.key=?{key} AND l.value=?{val}{origin})"));
         }
-        if !query.fields.is_empty() || !query.field_values.is_empty() || !query.present.is_empty() || !query.field_prefixes.is_empty() {
+        if !query.fields.is_empty()
+            || !query.field_values.is_empty()
+            || !query.field_prefixes.is_empty()
+            || !query.present.is_empty() || !query.label_prefixes.is_empty() || !query.missing_fields.is_empty()
+            || !query.field_matches_query.is_empty()
+        {
             predicates.push("json_valid(o.body_json)".into());
         }
+        let field_expression = |path: &str| {
+            if crate::array_field_path(path).is_some() {
+                "l.value".to_string()
+            } else {
+                Self::field_expression(kind, "o.body_json", path)
+            }
+        };
+        let field_predicate = |path: &str, predicate: String| {
+            if crate::array_field_path(path).is_some() {
+                let index = Self::field_index(table, kind, path);
+                let candidate = if replicas { "(o.name,o.origin_root)" } else { "o.name" };
+                let columns = if replicas { "l.name,l.origin" } else { "l.name" };
+                format!("{candidate} IN (SELECT {columns} FROM {index}_values l INDEXED BY {index} WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND {predicate})")
+            } else {
+                predicate
+            }
+        };
         for (path, value) in &query.fields {
             args.push(SqlValue::Text(value.clone()));
-            if path.contains("[].") {
-                predicates.push(Self::member_predicate(table, kind, path, replicas, &format!("=?{}", args.len())));
-            } else {
-                predicates.push(format!("json_extract(o.body_json,'$.{path}')=?{}", args.len()));
-            }
-        }
-        for (path, values) in &query.field_values {
-            args.push(SqlValue::Text(serde_json::to_string(values).expect("string values")));
-            let comparison = format!(" IN (SELECT value FROM json_each(?{}))", args.len());
-            if path.contains("[].") {
-                predicates.push(Self::member_predicate(table, kind, path, replicas, &comparison));
-            } else {
-                predicates.push(format!("json_extract(o.body_json,'$.{path}'){comparison}"));
-            }
-        }
-        for (path, prefix) in &query.field_prefixes {
-            args.push(SqlValue::Text(prefix.clone()));
-            let n = args.len();
-            if path.contains("[].") {
-                predicates.push(Self::member_predicate(
-                    table,
-                    kind,
-                    path,
-                    replicas,
-                    &format!(">=?{n} AND substr(value,1,length(?{n}))=?{n}"),
-                ));
-            } else {
-                predicates.push(format!(
-                    "json_extract(o.body_json,'$.{path}')>=?{n} AND substr(json_extract(o.body_json,'$.{path}'),1,length(?{n}))=?{n}"
-                ));
-            }
-        }
-        for (label, prefix) in &query.label_prefixes {
-            args.push(SqlValue::Text(label.clone()));
-            let key = args.len();
-            args.push(SqlValue::Text(prefix.clone()));
-            let n = args.len();
-            let identity = if replicas { "(o.name,o.origin_root)" } else { "o.name" };
-            let projection = if replicas { "name,origin" } else { "name" };
-            predicates.push(format!("{identity} IN (SELECT {projection} FROM {table}_labels INDEXED BY {table}_labels_lookup WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND key=?{key} AND value>=?{n} AND substr(value,1,length(?{n}))=?{n})"));
-        }
-        for path in &query.present {
-            if path.contains("[].") {
-                predicates.push(Self::member_predicate(table, kind, path, replicas, " IS NOT NULL"));
-            } else {
-                predicates.push(format!("json_extract(o.body_json,'$.{path}') IS NOT NULL"));
-            }
-        }
-        if let Some(alternatives) = &query.any_of {
-            let mut selections = Vec::new();
-            for alternative in alternatives {
-                let (sql, values) = Self::declared_sql(
-                    kind,
-                    namespace,
-                    &crate::StoreQuery {
-                        suppress_self_origin: query.suppress_self_origin,
-                        replica_shadowing: query.replica_shadowing.clone(),
-                        ..alternative.clone()
-                    },
-                    replicas,
-                    root,
-                    QueryColumns::Identity,
-                );
-                let shifted = Self::shift_bindings(&sql, args.len());
-                args.extend(values);
-                selections.push(format!("SELECT * FROM ({shifted})"));
-            }
-            let identity = if replicas { "(o.name,o.origin_root)" } else { "o.name" };
-            if selections.is_empty() {
-                predicates.push("0".into());
-            } else {
-                predicates.push(format!("{identity} IN ({})", selections.join(" UNION ")));
-            }
+            predicates.push(field_predicate(path, format!("{}=?{}", field_expression(path), args.len())));
         }
         for (path, values) in &query.field_values {
             args.push(SqlValue::Text(serde_json::json!(values).to_string()));
-            predicates.push(format!("json_extract(o.body_json,'$.{path}') IN (SELECT value FROM json_each(?{}))", args.len()));
+            predicates.push(field_predicate(path, format!("{} IN (SELECT value FROM json_each(?{}))", field_expression(path), args.len())));
+        }
+        for (path, prefix) in &query.field_prefixes {
+            let pattern = prefix
+                .chars()
+                .map(|c| match c {
+                    '*' => "[*]".into(),
+                    '?' => "[?]".into(),
+                    '[' => "[[]".into(),
+                    c => c.to_string(),
+                })
+                .collect::<String>()
+                + "*";
+            args.push(SqlValue::Text(pattern));
+            predicates.push(field_predicate(path, format!("{} GLOB ?{}", field_expression(path), args.len())));
+        }
+        for path in &query.present {
+            predicates.push(field_predicate(path, format!("{} IS NOT NULL", field_expression(path))));
+        }
+        for (label, prefix) in &query.label_prefixes {
+            args.push(SqlValue::Text(label.clone())); let key=args.len();
+            args.push(SqlValue::Text(prefix.clone())); let n=args.len();
+            let identity=if replicas { "(o.name,o.origin_root)" } else { "o.name" };
+            let projection=if replicas { "name,origin" } else { "name" };
+            predicates.push(format!("{identity} IN (SELECT {projection} FROM {table}_labels INDEXED BY {table}_labels_lookup WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND key=?{key} AND value>=?{n} AND substr(value,1,length(?{n}))=?{n})"));
+        }
+        for path in &query.missing_fields {
+            if crate::array_field_path(path).is_some() {
+                let index = Self::field_index(table, kind, path);
+                let origin = if replicas { "o.origin_root" } else { "''" };
+                predicates.push(format!("NOT EXISTS(SELECT 1 FROM {index}_values l WHERE l.group_name=o.group_name AND l.version=o.version AND l.kind=o.kind AND l.namespace=o.namespace AND l.name=o.name AND l.origin={origin})"));
+            } else {
+                predicates.push(format!("{} IS NULL", field_expression(path)));
+            }
+        }
+        for (path, selection) in &query.field_matches_query {
+            let source_kind = selection.kind(kind).expect("validated source kind");
+            let mut source = (*selection.query).clone();
+            if let Some(scope) = &query.replica_shadowing {
+                source.replica_shadowing = Some(scope.clone());
+                source.replicas_only = query.replicas_only;
+            }
+            let mut projections = Vec::new();
+            for source_replicas in [false, true] {
+                if (!source_replicas && source.replicas_only)
+                    || (source_replicas && (!source.include_replicas || source_kind.replication == crate::ReplicationClass::None))
+                {
+                    continue;
+                }
+                let (sql, values) = Self::declared_sql(
+                    source_kind,
+                    namespace,
+                    &source,
+                    source_replicas,
+                    root,
+                    QueryColumns::Field(selection.field.clone()),
+                );
+                projections.push(format!("SELECT * FROM ({})", Self::shift_binds(&sql, args.len())));
+                args.extend(values);
+            }
+            let sql = if projections.is_empty() { "SELECT NULL WHERE 0".into() } else { projections.join(" UNION ") };
+            predicates.push(field_predicate(path, format!("{} IN ({sql})", field_expression(path))));
+        }
+        if let Some(queries) = &query.any_of {
+            let mut alternatives = Vec::new();
+            for alternative in queries {
+                let mut alternative = alternative.clone();
+                alternative.replica_shadowing = query.replica_shadowing.clone();
+                let (sql, values) = Self::declared_sql(kind, namespace, &alternative, replicas, root, QueryColumns::Identity);
+                let shifted = Self::shift_binds(&sql, args.len());
+                alternatives.push(format!("SELECT * FROM ({shifted})"));
+                args.extend(values);
+            }
+            let candidate = if replicas { "(o.name,o.origin_root)" } else { "o.name" };
+            if alternatives.is_empty() { predicates.push("0".into()); } else { predicates.push(format!("{candidate} IN ({})", alternatives.join(" UNION "))); }
         }
         if let Some(owner) = &query.owner {
             args.push(SqlValue::Text(owner.key()));
@@ -806,12 +872,28 @@ impl SqliteBackend {
                 .chain(query.field_values.keys())
                 .chain(query.present.iter())
                 .chain(query.field_prefixes.keys())
-                .find(|path| !path.contains("[]."))
+                .chain(query.missing_fields.iter())
+                .find(|path| crate::array_field_path(path).is_none())
                 .map(|path| Self::field_index(table, kind, path))
         };
         let indexed = index.map(|index: String| format!(" INDEXED BY {index}")).unwrap_or_default();
+        if let QueryColumns::Field(path) = &columns {
+            if crate::array_field_path(path).is_some() {
+                let index = Self::field_index(table, kind, path);
+                let (selection, values) = Self::declared_sql(kind, namespace, query, replicas, root, QueryColumns::Identity);
+                let candidate = if replicas { "(l.name,l.origin)" } else { "l.name" };
+                return (format!("SELECT l.value FROM {index}_values l INDEXED BY {index} WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND {candidate} IN ({selection})"),values);
+            }
+        }
+        let field_projection;
         let projection = match columns {
             QueryColumns::Names => "name",
+            QueryColumns::Identity if replicas => "name,origin_root",
+            QueryColumns::Identity => "name",
+            QueryColumns::Field(path) => {
+                field_projection = Self::field_expression(kind, "body_json", &path);
+                field_projection.as_str()
+            }
             QueryColumns::Identity if replicas => "name,origin_root",
             QueryColumns::Identity => "name",
             QueryColumns::LocalList => "name,body_json",
@@ -2649,6 +2731,7 @@ impl Store for SqliteBackend {
         query.validate(kind)?;
         let namespace = namespace.to_owned();
         let query = query.clone();
+        let completion_query = query.clone();
         let root = self.local_root().to_string();
         let (mut items, position) = self
             .read_call("declared resource query", move |connection| {
@@ -2695,8 +2778,47 @@ impl Store for SqliteBackend {
         if let Some(observer) = &self.read_observer {
             observer.read(kind.paths.kind, items.len());
         }
+        items = crate::merge_query_definitions(&completion_query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult { items, position, local_root: Some(self.local_root()) })
+    }
+    async fn query_values_raw(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+        field: &str,
+    ) -> Result<std::collections::BTreeSet<String>, ResourceError> {
+        query.validate(kind)?;
+        if !kind.queryable_fields.contains(&field) {
+            return Err(ResourceError::invalid("undeclared field projection"));
+        }
+        let namespace = namespace.to_owned();
+        let query = query.clone();
+        let field = field.to_owned();
+        let root = self.local_root().to_string();
+        self.read_call("indexed field projection", move |connection| {
+            let mut values = std::collections::BTreeSet::new();
+            for replicas in [false, true] {
+                if (!replicas && query.replicas_only)
+                    || (replicas && (!query.include_replicas || kind.replication == crate::ReplicationClass::None))
+                {
+                    continue;
+                }
+                let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::Field(field.clone()));
+                let mut statement = connection.prepare(&sql).map_err(|e| Self::map_sqlite(e, "prepare field projection"))?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(args), |row| row.get::<_, Option<String>>(0))
+                    .map_err(|e| Self::map_sqlite(e, "query field projection"))?;
+                for row in rows {
+                    if let Some(value) = row.map_err(|e| Self::map_sqlite(e, "read field projection"))? {
+                        values.insert(value);
+                    }
+                }
+            }
+            Ok(values)
+        })
+        .await
     }
     async fn query_messages_raw(
         &self,
@@ -3129,6 +3251,7 @@ mod latency_tests {
         assert_eq!(backend.pending_cleanups.lock().expect("cleanup set").len(), 1);
 
         let repair = rusqlite::Connection::open(&path).expect("open independent writer");
+        SqliteBackend::register_query_functions(&repair).expect("configure independent writer");
         repair
             .execute(
                 "UPDATE resource_objects SET body_json = ?1 WHERE kind = ?2 AND name = 'repaired'",
@@ -3196,7 +3319,20 @@ mod tests {
         let meta = InputMeta::builder().name("stored".into()).labels(BTreeMap::from([("team".into(), "target".into())])).build();
         let local = backend
             .using::<crate::Convoy>("flotilla")
-            .create(&meta, &crate::ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .create(
+                &meta,
+                &crate::ConvoySpec::builder()
+                    .workflow_ref("workflow".into())
+                    .repositories(vec![crate::ConvoyRepositorySpec::builder()
+                        .url("https://example.com/repo".into())
+                        .repo_ref(crate::RepositoryKey("repository".into()))
+                        .source_ref("main".into())
+                        .target_ref("main".into())
+                        .workspace_slug("repo".into())
+                        .subpaths(Vec::new())
+                        .build()])
+                    .build(),
+            )
             .await
             .unwrap();
         backend
@@ -3218,6 +3354,16 @@ mod tests {
             connection.execute_batch(&format!("DROP TABLE {table}_labels; DROP TABLE {table}_owners;")).unwrap();
         }
         connection.execute("DELETE FROM resource_store_migrations WHERE name IN ('resource-labels-v1','replica-labels-v1')", []).unwrap();
+        let kind = crate::ResourceKind::of::<crate::Convoy>();
+        for table in ["resource_objects", "replica_objects"] {
+            let index = SqliteBackend::field_index(table, kind, "spec.repositories.*.repo_ref");
+            for action in ["insert", "update", "delete"] {
+                connection.execute_batch(&format!("DROP TRIGGER {index}_{action}")).unwrap();
+            }
+            connection.execute_batch(&format!("DROP TABLE {index}_values")).unwrap();
+            connection.execute("DELETE FROM resource_store_migrations WHERE name=?1", [index]).unwrap();
+        }
+
         drop(connection);
         for _ in 0..2 {
             let reopened = crate::ResourceBackend::new(SqliteBackend::open(&path).unwrap());
@@ -3229,6 +3375,19 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(selected.items.len(), 2);
+            let indexed = reopened
+                .query_declared::<crate::Convoy>(
+                    "flotilla",
+                    &crate::StoreQuery {
+                        fields: BTreeMap::from([("spec.repositories.*.repo_ref".into(), "repository".into())]),
+                        include_replicas: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(indexed.items.len(), 2, "named array migration backfills both partitions");
+
             let connection = rusqlite::Connection::open(&path).unwrap();
             let after: String = connection.query_row("SELECT body_json FROM resource_objects", [], |r| r.get(0)).unwrap();
             assert_eq!(before, after);
@@ -3279,29 +3438,39 @@ mod tests {
                         for path in kind.queryable_fields {
                             cases.push((
                                 crate::StoreQuery {
-                                    field_values: BTreeMap::from([(path.to_string(), vec!["a".into(), "b".into()])]),
+                                    field_prefixes: BTreeMap::from([((*path).into(), "prefix".into())]),
                                     ..Default::default()
                                 },
                                 SqliteBackend::field_index(table, kind, path),
                             ));
                             cases.push((
-                                crate::StoreQuery {
-                                    field_prefixes: BTreeMap::from([(path.to_string(), "a".into())]),
-                                    ..Default::default()
+                                crate::StoreQuery { missing_fields: [(*path).into()].into(), ..Default::default() },
+                                if crate::array_field_path(path).is_some() {
+                                    format!("sqlite_autoindex_{}_values_1", SqliteBackend::field_index(table, kind, path))
+                                } else {
+                                    SqliteBackend::field_index(table, kind, path)
                                 },
-                                SqliteBackend::field_index(table, kind, path),
                             ));
-                            if !path.contains("[].") {
-                                cases.push((
-                                    crate::StoreQuery { present: vec![path.to_string()], ..Default::default() },
-                                    SqliteBackend::field_index(table, kind, path),
-                                ));
-                            }
-                            let alternative =
-                                crate::StoreQuery { fields: BTreeMap::from([(path.to_string(), "a".into())]), ..Default::default() };
+                            let source = crate::StoreQuery::names(["source".into()], true);
+                            let related =
+                                crate::StoreQuery { any_of: vec![crate::StoreQuery::related(path, path, source)], ..Default::default() };
+                            // Source identities use their name index; array target membership
+                            // also searches the additive relation index.
+                            cases.push((related, SqliteBackend::field_index("resource_objects", kind, "metadata.name")));
+                        }
+                        if kind.paths.kind == "Convoy" {
+                            let source = crate::ResourceKind::of::<crate::TerminalSession>();
                             cases.push((
-                                crate::StoreQuery { any_of: Some(vec![alternative.clone(), alternative]), ..Default::default() },
-                                SqliteBackend::field_index(table, kind, path),
+                                crate::StoreQuery::related_kind(
+                                    "metadata.name",
+                                    "TerminalSession",
+                                    "metadata.labels.\"flotilla.work/convoy\"",
+                                    crate::StoreQuery {
+                                        fields: BTreeMap::from([("status.crew.id".into(), "crew".into())]),
+                                        ..Default::default()
+                                    },
+                                ),
+                                SqliteBackend::field_index("resource_objects", source, "status.crew.id"),
                             ));
                         }
                         cases.push((
@@ -3364,9 +3533,19 @@ mod tests {
                             }
                         }
                         // Exhaust every declared-field subset and relation combination.
+                        // Cover individual fields, pairs and the full conjunction.
                         // Forced partial indexes must remain usable even when additional
                         // fields/relations/Message variants are residual predicates.
-                        for mask in 0..(1usize << kind.queryable_fields.len()) {
+                        // Each field, each pair, and the complete conjunction cover
+                        // index choice without an exponential plan corpus.
+                        let mut masks = std::collections::BTreeSet::from([0, (1usize << kind.queryable_fields.len()) - 1]);
+                        for a in 0..kind.queryable_fields.len() {
+                            masks.insert(1 << a);
+                            for b in a + 1..kind.queryable_fields.len() {
+                                masks.insert((1 << a) | (1 << b));
+                            }
+                        }
+                        for mask in masks {
                             let fields: BTreeMap<String, String> = kind
                                 .queryable_fields
                                 .iter()
@@ -3389,7 +3568,9 @@ mod tests {
                                     }),
                                     ..Default::default()
                                 };
-                                if let Some(path) = fields.keys().next() {
+                                if let Some(path) =
+                                    fields.keys().find(|path| crate::array_field_path(path).is_none()).or_else(|| fields.keys().next())
+                                {
                                     cases.push((query.clone(), SqliteBackend::field_index(table, kind, path)));
                                 }
                                 if kind.paths.kind == "Message" {
@@ -3417,6 +3598,12 @@ mod tests {
                                 .collect::<Result<Vec<_>, _>>()
                                 .unwrap();
                             assert!(plans.iter().any(|plan| plan.contains(&index) && plan.contains("SEARCH")), "{index}: {plans:?}");
+                            if index.starts_with("sqlite_autoindex_") {
+                                assert!(
+                                    plans.iter().any(|plan| plan.contains(&index) && plan.contains("name=?") && plan.contains("origin=?")),
+                                    "absence must probe the complete row identity: {plans:?}"
+                                );
+                            }
                         }
                     }
                 }

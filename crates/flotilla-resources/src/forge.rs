@@ -15,6 +15,8 @@ impl Resource for Forge {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "forges", kind: "Forge" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
 
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "spec.remote_hosts.*"];
+
     const VALIDATE_NAMESPACE_SPEC: bool = true;
 
     fn validate_spec_with_siblings(spec: &Self::Spec, siblings: &[Self::Spec]) -> Result<(), ResourceError> {

@@ -1979,7 +1979,6 @@ impl InProcessDaemon {
             aggregator_projection_state: aggregator_projection_state.clone(),
             provisioning_namespace: Arc::clone(&provisioning_namespace),
             fleet: FleetService::new(
-                resource_backend.clone(),
                 aggregator_projection_state.clone(),
                 host_name.clone(),
                 Some(CanonicalHostId::resolved(environment_manager.local_host_id().as_str())),
@@ -3032,13 +3031,17 @@ impl InProcessDaemon {
     /// HostRegistry holds a presentation cache only: descriptions originate in
     /// the resource store, connectivity and routes originate in the transport.
     pub async fn refresh_resource_host_summaries(&self) -> Result<(), String> {
+        self.refresh_resource_host_summaries_with_backend(&self.resource_backend).await
+    }
+
+    async fn refresh_resource_host_summaries_with_backend(&self, backend: &ResourceBackend) -> Result<(), String> {
         use flotilla_protocol::qualified_path::HostId;
 
         // Serialize list-and-project passes so a slower old read cannot replace a
         // newer description published by the watch or a concurrent query.
         let _projection = self.host_registry.description_projection.lock().await;
         let namespace = self.provisioning_namespace().await;
-        let statuses = self.read_projections().host_statuses(&namespace).await?;
+        let statuses = self.read_projections().with_backend(backend).host_statuses(&namespace).await?;
         let details = statuses
             .iter()
             .map(|(name, status)| {
@@ -4098,12 +4101,7 @@ impl InProcessDaemon {
             )
             .await?;
         self.check_local_free_space_floor().await?;
-        if admission.vessel_placements.is_empty() {
-            self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
-        }
-        for (_, decision) in admission.vessel_placements.values() {
-            self.check_remote_placement_free_space_floor(namespace, Some(decision)).await?;
-        }
+        self.convoy_admission.check_prepared_placement_floors(namespace, &admission).await?;
         if admission.workflow.exit.is_some() {
             return Err(format!(
                 "workflow template {} declares an exit table; standing convoys require no exit declaration",
@@ -4159,6 +4157,7 @@ impl InProcessDaemon {
         self.convoy_admission.admission_free_space_floor_bytes()
     }
 
+    #[cfg(test)]
     async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
         self.convoy_admission.check_remote_placement_free_space_floor(namespace, placement).await
     }
@@ -4979,17 +4978,13 @@ impl InProcessDaemon {
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
-        let host_list = self.list_hosts_internal().await?;
-        let rows = self.fleet.rows(&namespace, &self.host_registry).await?;
-        let mut response =
-            self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await?;
-        for host in self.resource_backend.including_replicas::<ResourceHost>(&namespace).list().await.map_err(|e| e.to_string())?.items {
-            if let Some(value) = host.object.status.and_then(|status| status.capabilities.get("forge_budgets").cloned()) {
-                if let Ok(rows) = serde_json::from_value::<Vec<flotilla_protocol::ForgeBudgetRow>>(value) {
-                    response.forge_budgets.extend(rows);
-                }
-            }
-        }
+        let (reads, _, _) = self.read_projections().fleet_inventory(&namespace, None, None, None).await?;
+        self.refresh_resource_host_summaries_with_backend(&reads).await?;
+        let host_list = self.host_registry.list_hosts(&self.local_host_counts().await).await;
+        let mut response = self
+            .read_projections()
+            .fleet_health_request(&reads, &namespace, host_list, self.local_host_id().map(|id| id.to_string()), now)
+            .await?;
         response.forge_budgets.retain(|row| row.host != self.host_name().as_str());
         response.forge_budgets.extend(self.forge_budget_rows());
         Ok(response)
@@ -5201,8 +5196,7 @@ impl InProcessDaemon {
 
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
         let namespace = self.provisioning_namespace().await;
-        let rows = self.fleet.rows(&namespace, &self.host_registry).await?;
-        self.read_projections().fleet_list(&namespace, rows, Utc::now()).await
+        self.read_projections().fleet_request(&namespace, None, None, None).await
     }
 
     async fn scoped_fleet_list(
@@ -5211,11 +5205,10 @@ impl InProcessDaemon {
         crew_id: Option<&str>,
         convoy: Option<&str>,
     ) -> Result<FleetListResponse, String> {
-        let fleet = self.fleet_list_internal().await?;
         if project.is_none() && crew_id.is_none() && convoy.is_none() {
-            return Ok(fleet);
+            return self.fleet_list_internal().await;
         }
-        self.read_projections().scoped_fleet_list(&self.provisioning_namespace().await, fleet, project, crew_id, convoy).await
+        self.read_projections().fleet_request(&self.provisioning_namespace().await, project, crew_id, convoy).await
     }
 
     pub async fn resolve_crew_routing_context(&self, requested: &CrewCommandContext) -> Result<CrewRoutingContext, String> {

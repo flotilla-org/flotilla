@@ -12,7 +12,7 @@ define_resource!(
     DemandStatus,
     DemandStatusPatch,
     replication = crate::ReplicationClass::None,
-    queryable = &["metadata.name", "spec.originating_work_ref.name"]
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name","spec.originating_work_ref.name","status.state","spec.originating_work_ref.kind"];
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

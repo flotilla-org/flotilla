@@ -94,6 +94,8 @@ impl Store for ViewSnapshot {
         if query.message.is_some() || query.replica_shadowing.is_some() {
             return Err(ResourceError::invalid("snapshot queries support labels, declared fields and owners"));
         }
+        let resolved = crate::resolve_semijoins(self, kind, namespace, query).await?;
+        let query = &resolved;
         let partition = self
             .objects
             .get(&(kind.paths.kind.into(), namespace.into()))
@@ -121,6 +123,38 @@ impl Store for ViewSnapshot {
             items,
             position: ResourcePosition { resource_version: "0".into(), generation: None },
         })
+    }
+    async fn query_values_raw(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+        field: &str,
+    ) -> Result<std::collections::BTreeSet<String>, ResourceError> {
+        query.validate(kind)?;
+        if !kind.queryable_fields.contains(&field) {
+            return Err(ResourceError::invalid("undeclared field projection"));
+        }
+        if query.message.is_some() {
+            return Err(ResourceError::invalid("snapshot does not index Message history"));
+        }
+        let query = crate::resolve_semijoins(self, kind, namespace, query).await?;
+        let partition = self
+            .objects
+            .get(&(kind.paths.kind.into(), namespace.into()))
+            .ok_or_else(|| ResourceError::invalid("source kind missing from view snapshot"))?;
+        let names = partition
+            .index
+            .names(&query)
+            .into_iter()
+            .filter(|identity| {
+                let item = &partition.items[identity.parse::<usize>().expect("snapshot identity")];
+                (!query.suppress_self_origin || !self.shadowed(item, partition))
+                    && (query.include_replicas || matches!(item.provenance, ResourceProvenance::Local))
+                    && (!query.replicas_only || matches!(item.provenance, ResourceProvenance::Replica { .. }))
+            })
+            .collect();
+        Ok(partition.index.values(field, &names))
     }
     async fn query_messages_raw(
         &self,

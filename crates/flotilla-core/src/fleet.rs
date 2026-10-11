@@ -77,7 +77,6 @@ pub(crate) async fn replicated_host_reports(
     reports
 }
 pub(crate) struct FleetService {
-    resource_backend: ResourceBackend,
     aggregator_projection_state: AggregatorProjectionState,
     host_name: HostName,
     canonical_local_host_id: Option<CanonicalHostId>,
@@ -86,18 +85,11 @@ pub(crate) struct FleetService {
 
 impl FleetService {
     pub(crate) fn new(
-        resource_backend: ResourceBackend,
         aggregator_projection_state: AggregatorProjectionState,
         host_name: HostName,
         canonical_local_host_id: Option<CanonicalHostId>,
     ) -> Self {
-        Self {
-            resource_backend,
-            aggregator_projection_state,
-            host_name,
-            canonical_local_host_id,
-            resource_replication_failures: RwLock::new(HashMap::new()),
-        }
+        Self { aggregator_projection_state, host_name, canonical_local_host_id, resource_replication_failures: RwLock::new(HashMap::new()) }
     }
 
     pub(crate) async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
@@ -129,20 +121,21 @@ impl FleetService {
         }
     }
 
-    pub(crate) async fn rows(&self, namespace: &str, host_registry: &HostRegistry) -> Result<Vec<FleetListRow>, String> {
+    /// Project an explicit request inventory. Selection and storage reads belong
+    /// to the caller; the same row/provenance logic serves scoped and full views.
+    pub(crate) async fn rows_with_backend(
+        &self,
+        backend: &ResourceBackend,
+        namespace: &str,
+        host_registry: &HostRegistry,
+    ) -> Result<Vec<FleetListRow>, String> {
         let now = Utc::now();
-        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let environments = backend.clone().using::<ResourceEnvironment>(namespace);
+        let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
 
-        let session_list = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(namespace)
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
-        let host_sources =
-            self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
+        let session_list =
+            backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|err| err.to_string())?.items;
+        let host_sources = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
         let result_sets = vec![self.aggregator_projection_state.result_set().await];
         let placement_by_convoy = result_sets
             .iter()
@@ -169,8 +162,7 @@ impl FleetService {
             .into_iter()
             .map(|environment| (environment.metadata.name.clone(), environment))
             .collect();
-        let convoy_items = self
-            .resource_backend
+        let convoy_items = backend
             .including_replicas::<ResourceConvoy>(namespace)
             .list()
             .await

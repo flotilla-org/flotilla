@@ -31,7 +31,7 @@ define_resource!(
     ConvoyStatus,
     ConvoyStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
-    queryable = &["metadata.name", "status.phase", "spec.role", "spec.project_ref"]
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name","status.phase","spec.role","spec.project_ref","status.stalled","status.crew_work.*.*.phase","spec.ref","spec.continuation","spec.subjects.*.subject","status.subjects.*.subject","spec.repositories.*.repo_ref","metadata.annotations.\"flotilla.work/ensured-from\""];
 );
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";

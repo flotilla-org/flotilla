@@ -1243,6 +1243,8 @@ impl Store for InMemoryBackend {
     }
     async fn query_raw(&self, kind: ResourceKind, namespace: &str, query: &crate::StoreQuery) -> Result<crate::QueryResult, ResourceError> {
         query.validate(kind)?;
+        let resolved = crate::resolve_semijoins(self, kind, namespace, query).await?;
+        let query = &resolved;
         let stores = self.stores.lock().await;
         let key = Self::store_key(kind, namespace);
         let local = stores.get(&key);
@@ -1306,6 +1308,7 @@ impl Store for InMemoryBackend {
                 // store's unrelated local rows. Pass names before any decoding.
                 let mut replica_query = query.clone();
                 replica_query.replicas_only = true;
+                replica_query.merged_definitions = false;
                 replica_query.replica_shadowing = Some(query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
                     origin_root: self.local_root(),
                     local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
@@ -1358,6 +1361,7 @@ impl Store for InMemoryBackend {
             }
         }
         self.count_read(kind, items.len());
+        let mut items = crate::merge_query_definitions(query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult {
             local_root: Some(self.local_root()),
@@ -1367,6 +1371,52 @@ impl Store for InMemoryBackend {
                 generation: self.generation.clone(),
             },
         })
+    }
+    async fn query_values_raw(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        query: &crate::StoreQuery,
+        field: &str,
+    ) -> Result<std::collections::BTreeSet<String>, ResourceError> {
+        query.validate(kind)?;
+        if !kind.queryable_fields.contains(&field) {
+            return Err(ResourceError::invalid("undeclared field projection"));
+        }
+        let query = crate::resolve_semijoins(self, kind, namespace, query).await?;
+        let key = Self::store_key(kind, namespace);
+        let stores = self.stores.lock().await;
+        let local = stores.get(&key);
+        let mut values = std::collections::BTreeSet::new();
+        if let Some(local) = local.filter(|_| !query.replicas_only) {
+            values.extend(local.queries.values(field, &local.queries.names(&query)));
+        }
+        let shadowing = query.replica_shadowing.clone().unwrap_or_else(|| crate::ReplicaShadowing {
+            origin_root: self.local_root(),
+            local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
+        });
+        if query.include_replicas && kind.replication != crate::ReplicationClass::None {
+            if let Some(durable) = &self.durable_replicas {
+                let mut replica_query = query.clone();
+                replica_query.replicas_only = true;
+                replica_query.replica_shadowing = Some(shadowing);
+                drop(stores);
+                values.extend(durable.store().query_values_raw(kind, namespace, &replica_query, field).await?);
+            } else {
+                let replicas = self.replicas.lock().await;
+                for ((origin, partition_key), partition) in &replicas.partitions {
+                    if partition_key != &key {
+                        continue;
+                    }
+                    let mut names = partition.queries.names(&query);
+                    if query.suppress_self_origin && origin == &shadowing.origin_root {
+                        names.retain(|name| !shadowing.local_names.contains(name));
+                    }
+                    values.extend(partition.queries.values(field, &names));
+                }
+            }
+        }
+        Ok(values)
     }
     async fn query_messages_raw(
         &self,
