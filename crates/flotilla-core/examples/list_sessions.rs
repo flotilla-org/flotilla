@@ -6,10 +6,7 @@
 
 use std::sync::Arc;
 
-use flotilla_core::providers::{
-    coding_agent::{claude::ClaudeCodingAgent, cursor::CursorCodingAgent, CloudAgentService},
-    types::RepoCriteria,
-};
+use flotilla_cloud_agent::{claude::ClaudeCodingAgent, cursor::CursorCodingAgent, CloudAgentService, RepoCriteria};
 
 #[tokio::main]
 async fn main() {

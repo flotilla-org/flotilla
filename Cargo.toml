@@ -6,6 +6,7 @@ members = [
     "crates/flotilla-aggregator",
     "crates/flotilla-build-features",
     "crates/flotilla-client",
+    "crates/flotilla-cloud-agent",
     "crates/flotilla-commands",
     "crates/flotilla-controllers",
     "crates/flotilla-core",

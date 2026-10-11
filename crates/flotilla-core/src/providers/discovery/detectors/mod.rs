@@ -1,8 +1,7 @@
+use flotilla_cloud_agent::detectors::{self as cloud_agent, claude, codex, cursor};
 use flotilla_discovery_api::host_environment_keys;
 use flotilla_discovery_api::{HostDetector, RepoDetector};
-pub mod claude;
 pub mod cmux;
-pub mod codex;
 pub mod generic;
 
 use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
@@ -16,14 +15,14 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),
         Box::new(codex::CodexAuthDetector),
-        Box::new(CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path()),
+        Box::new(cloud_agent::codex_binary_detector()),
         Box::new(EnvVarDetector::new("CLEAT_RUNTIME_DIR")),
         Box::new(EnvVarDetector::new("CLEAT_DAEMON")),
         Box::new(EnvVarDetector::new("CODEX_HOME")),
         Box::new(EnvVarDetector::new("FLOTILLA_FLEET_CANARY")),
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
-        Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
-        Box::new(CommandDetector::new("agent", &["--version"], parse_first_dotted_version)),
+        Box::new(cursor::api_key_detector()),
+        Box::new(cursor::binary_detector()),
         Box::new(cmux::CmuxDetector),
         Box::new(EnvVarDetector::new("ZELLIJ")),
         Box::new(EnvVarDetector::new("ZELLIJ_SESSION_NAME")),

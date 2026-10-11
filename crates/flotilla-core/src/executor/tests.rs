@@ -1,3 +1,4 @@
+use flotilla_cloud_agent::RepoCriteria;
 use std::{path::PathBuf, sync::Arc};
 
 use super::{
@@ -10,7 +11,6 @@ use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::coding_agent::CloudAgentService;
 use crate::providers::environment::ProvisionedMount;
 use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use crate::providers::issue_tracker::IssueProvider;
@@ -25,6 +25,7 @@ use crate::testkits::discovery::test_vcs_resolver;
 use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_cloud_agent::CloudAgentService;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;

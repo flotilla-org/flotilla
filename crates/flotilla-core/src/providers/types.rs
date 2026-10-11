@@ -4,10 +4,3 @@ pub use flotilla_protocol::{
     AheadBehind, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, Issue, IssueChangeset, SessionStatus,
     WorkingTreeStatus, Workspace,
 };
-
-/// Criteria passed to coding agents so they can filter results to a specific repo.
-#[derive(Debug, Clone, Default)]
-pub struct RepoCriteria {
-    /// "owner/repo" from git remote (e.g. "changedirection/reticulate")
-    pub repo_slug: Option<String>,
-}

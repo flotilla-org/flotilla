@@ -11,7 +11,8 @@ use reqwest;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::providers::types::*;
+use crate::RepoCriteria;
+use flotilla_protocol::{CloudAgentSession, SessionStatus};
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::scan_cache::SharedScan;

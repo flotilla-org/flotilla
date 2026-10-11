@@ -103,6 +103,24 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
         )), [])
 
+    def test_cloud_agent_is_native_and_independent(self):
+        # Issue #3037 / ADR 0060: cloud-agent is native and cannot reach composition or storage.
+        self.assertEqual(layer("flotilla-cloud-agent"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-cloud-agent", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-cloud-agent: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-cloud-agent", normal=("flotilla-protocol", "flotilla-provider-runtime")),
+            package("flotilla-core", normal=("flotilla-cloud-agent",)),
+            package("flotilla-protocol"), package("flotilla-provider-runtime"),
+        )), [])
+
     def test_testkit_names(self):
         for name in ("flotilla-store-testkit", "future-testkit", "flotilla-test-support"):
             self.assertTrue(is_testkit(name))

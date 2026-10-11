@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::providers::types::*;
+use crate::RepoCriteria;
+use flotilla_protocol::{CloudAgentSession, SessionStatus};
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::scan_cache::SharedScan;
 use flotilla_provider_runtime::HttpClient;
@@ -224,7 +225,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::providers::coding_agent::CloudAgentService;
+    use crate::CloudAgentService;
 
     fn cursor_agent(status: &str, repository: &str, branch: &str) -> CursorAgent {
         CursorAgent {
@@ -371,7 +372,7 @@ mod tests {
         use axum::{routing::get, Router};
         use http::{HeaderMap, StatusCode, Uri};
 
-        use crate::testkits::replay::http_contract::StandIn;
+        use flotilla_replay_testkit::http_contract::StandIn;
         async fn receive(headers: HeaderMap, uri: Uri) -> (StatusCode, &'static str) {
             if headers.get("authorization").is_some_and(|v| v == "Basic dGVzdC1rZXk6") && uri.query() == Some("limit=100") {
                 (StatusCode::OK, r#"{"agents":[]}"#)

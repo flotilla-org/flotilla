@@ -1,0 +1,47 @@
+[package]
+name = "flotilla-cloud-agent"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[features]
+default = []
+skip-no-sandbox-tests = []
+
+[dependencies]
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-tls = { path = "../flotilla-tls" }
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+urlencoding = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+bytes.workspace = true
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
+tempfile.workspace = true
+http.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+
+[lints]
+workspace = true
