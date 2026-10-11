@@ -7,6 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::NodeId;
+use flotilla_resources::{
+    ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicationClass, Resource, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, WatchStart, WatchStream,
+};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
     sync::{watch, RwLock},
@@ -14,10 +18,6 @@ use tokio::{
 };
 
 use crate::{QueryIndex, ResourceBackend, ResourceKind, StoreExt, StoreQuery};
-use flotilla_resources::{
-    ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicationClass, Resource, ResourceError, ResourceList, ResourceObject,
-    ResourceProvenance, WatchStart, WatchStream,
-};
 
 type Events<T> = BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>;
 const VIEW_RESTART_BACKOFF: Duration = Duration::from_millis(100);
@@ -280,16 +280,17 @@ impl RecoveryWarnings {
 // Both normal consumption and a flush drain use this path. Any lost event or
 // failed application invalidates the cache: retry a complete snapshot/watch
 // handoff with backoff, never acknowledge a read using the incomplete state.
+// Return true after replacement so a flush stops at that coherent snapshot.
 async fn handle_view_event<T: Resource>(
     event: Option<Result<ReadWatchEvent<T>, ResourceError>>,
     source: &dyn ViewSource<T>,
     state: &RwLock<ViewState<T>>,
     events: &mut Events<T>,
     warnings: &mut RecoveryWarnings,
-) {
+) -> bool {
     let error = match event {
         Some(Ok(event)) => match state.write().await.apply(event) {
-            Ok(()) => return,
+            Ok(()) => return false,
             Err(error) => error,
         },
         Some(Err(error)) => error,
@@ -302,7 +303,7 @@ async fn handle_view_event<T: Resource>(
             Ok((listed, watch)) => match state.write().await.replace(listed) {
                 Ok(()) => {
                     *events = watch;
-                    return;
+                    return true;
                 }
                 Err(error) => error,
             },
@@ -341,6 +342,9 @@ impl<T: Resource> WatchView<T> {
     pub async fn start_at_root(backend: ResourceBackend, namespace: &str, root: NodeId) -> Result<Self, ResourceError> {
         Self::from_source(Arc::new(StoreViewSource::<T>::new(backend, namespace)), Some(root)).await
     }
+    /// Initial setup retries expired handoffs but fails fast on other errors,
+    /// so startup can report refusal or unavailable storage. Once running, the
+    /// informer retries resync failures to keep existing consumers recoverable.
     pub async fn from_source(source: Arc<dyn ViewSource<T>>, root: Option<NodeId>) -> Result<Self, ResourceError> {
         let (listed, mut events) = recover_view(source.as_ref()).await?;
         let mut initial = ViewState::new(root);
@@ -360,8 +364,11 @@ impl<T: Resource> WatchView<T> {
                         let Some(request) = request else { break };
                         let mut changed = false;
                         while let Some(event) = events.next().now_or_never() {
-                            handle_view_event(event, source.as_ref(), &worker_state, &mut events, &mut warnings).await;
+                            let recovered = handle_view_event(event, source.as_ref(), &worker_state, &mut events, &mut warnings).await;
                             changed = true;
+                            // A fresh snapshot is a coherent read boundary. Do
+                            // not chase immediately ended replacement streams.
+                            if recovered { break; }
                         }
                         // Coalesce drained events into one invalidation.
                         if changed { tx.send_modify(|revision| *revision = revision.wrapping_add(1)); }
@@ -374,7 +381,8 @@ impl<T: Resource> WatchView<T> {
         });
         Ok(Self { state, changes, task: Arc::new(ViewTask(task)), flush })
     }
-    /// Drain queued events before reading. This avoids scheduler-dependent
+    /// Drain queued events before reading, stopping at a fresh resync snapshot.
+    /// This avoids scheduler-dependent
     /// read-your-writes behavior, at the cost of a worker round-trip; reads wait
     /// behind event handling and resync rather than returning an incomplete view.
     pub async fn flush(&self) -> Result<(), ResourceError> {
@@ -525,6 +533,26 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].object.spec.value, "resynced");
         assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // Transport boundary source that repeatedly supplies a valid snapshot but
+    // immediately ends its watch. Flush must return after one resync, rather
+    // than draining and recovering each replacement stream forever.
+    struct EndedSource(ApplyFailureSource);
+    #[async_trait]
+    impl ViewSource<CountedDefinition> for EndedSource {
+        async fn list_and_watch(&self) -> Result<(ReadResourceList<CountedDefinition>, Events<CountedDefinition>), ResourceError> {
+            let (listed, _) = self.0.list_and_watch().await?;
+            Ok((listed, futures::stream::empty().boxed()))
+        }
+    }
+    #[tokio::test]
+    async fn flush_returns_snapshot_when_replacement_watch_ends() {
+        let source = Arc::new(EndedSource(ApplyFailureSource(std::sync::atomic::AtomicUsize::new(1))));
+        let view = WatchView::from_source(source, Some(NodeId::new("root"))).await.unwrap();
+        let listed = tokio::time::timeout(Duration::from_secs(5), view.list()).await.expect("flush must terminate").unwrap();
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].object.spec.value, "resynced");
     }
 
     // Generate different collection sizes and churned identities. An event for
