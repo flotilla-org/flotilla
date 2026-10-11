@@ -1,5 +1,3 @@
-use crate::providers::change_request::observation;
-use flotilla_store_memory::InMemoryBackend;
 use std::{
     collections::BTreeMap,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,8 +7,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_forge_github::github::GithubRateLimit;
+use flotilla_forge_github::github::GithubRateLimitKind;
+use flotilla_forge_github::github::GithubRetrySource;
 use flotilla_protocol::{DaemonEvent, Leaf, LeafFire, NodeId, WaitSubscriptionRequest};
 use flotilla_protocol::{LeafAddress, LeafOperator};
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::StatusPatch;
 use flotilla_resources::{
     external_patches, Artifact, ChangeRequest, Checkout, Convoy, ConvoyAttention, ConvoyEnsure, CrewCompletionRefusal,
@@ -27,6 +29,7 @@ use flotilla_resources::{
 };
 use flotilla_store::ResourceBackend;
 use flotilla_store::{controller::ControllerLoop, ConvoyReconciler};
+use flotilla_store_memory::InMemoryBackend;
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
@@ -39,15 +42,12 @@ use crate::change_request_observer::ChangeRequestRefresher;
 use crate::event_sink::broadcast_test_sink;
 use crate::issue_observer::IssueRefreshCadence;
 use crate::issue_observer::IssueRefresher;
+use crate::providers::change_request::observation;
 use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::testing::fixture_path;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
-use flotilla_forge_github::github::GithubRateLimit;
-use flotilla_forge_github::github::GithubRateLimitKind;
-use flotilla_forge_github::github::GithubRetrySource;
-use flotilla_provider_runtime::ObservationError;
 
 #[derive(Clone)]
 struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);

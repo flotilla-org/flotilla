@@ -1,11 +1,11 @@
 //! Short-lived, daemon-local observations of proven branch absence.
 
-use flotilla_provider_runtime::ObservationError;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
 };
 
+use flotilla_provider_runtime::ObservationError;
 use tokio::time::{Duration, Instant};
 
 use crate::providers::{change_request::ChangeRequestTracker, types::ChangeRequest};

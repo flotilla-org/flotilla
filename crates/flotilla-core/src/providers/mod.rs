@@ -9,9 +9,10 @@ pub mod types;
 pub(crate) mod github_test_support {
     use std::{path::PathBuf, sync::Arc};
 
-    use crate::testkits::replay;
     use flotilla_forge_github::github::GhApi;
     use flotilla_provider_runtime::CommandRunner;
+
+    use crate::testkits::replay;
 
     pub fn repo_root_for_recording() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

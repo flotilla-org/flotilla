@@ -1,4 +1,10 @@
 //! Change-request observation interface and GitHub observation decoding.
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::LeafAddress;
@@ -9,11 +15,6 @@ use flotilla_relay_protocol::Subject;
 use flotilla_resources::{
     change_request_record_name, ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState,
     ObservedChecks, ObservedMergeability, ObservedReviewDecision,
-};
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
 };
 
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";

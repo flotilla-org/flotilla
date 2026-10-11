@@ -8,11 +8,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
-
-use super::{GitHubIssueProvider, BOARD_BATCH_SIZE};
-
-use crate::providers::issue_tracker::IssueProvider;
 use flotilla_forge_github::github::rate_limit_reset;
 use flotilla_forge_github::github::GhApiClient;
 use flotilla_forge_github::github_poll::BoardState;
@@ -20,6 +15,10 @@ use flotilla_protocol::IssueSource;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
+use serde_json::{json, Value};
+
+use super::{GitHubIssueProvider, BOARD_BATCH_SIZE};
+use crate::providers::issue_tracker::IssueProvider;
 
 // Stand-in for the gh/HTTP boundary. Enforce the actual REST routes and
 // bounded GraphQL selection, and return GitHub's connection-shaped responses.

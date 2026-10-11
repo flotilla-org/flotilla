@@ -1,22 +1,22 @@
 //! REST observation fixture shared by admission, completion, branch, and cooldown scenarios.
 
-use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use flotilla_protocol::HostName;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{Repository, RepositoryKey, RepositorySpec};
 use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
-use flotilla_provider_runtime::CommandOutput;
-use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {
@@ -131,8 +131,9 @@ pub(super) struct RestAdmissionFixture {
 }
 
 pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lookup: RestAdmissionLookup) -> RestAdmissionFixture {
-    use crate::providers::change_request::github::GitHubChangeRequest;
     use flotilla_forge_github::github::GhApiClient;
+
+    use crate::providers::change_request::github::GitHubChangeRequest;
     let config = tempfile::tempdir().expect("tempdir");
     std::fs::write(config.path().join("daemon.toml"), "machine_id = \"rest-admission-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());

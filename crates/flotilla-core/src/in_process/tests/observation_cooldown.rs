@@ -1,4 +1,3 @@
-use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -6,12 +5,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext};
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, RepositorySpec, Vessel,
     VesselSpec,
 };
 use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 use tokio::sync::Mutex;
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
@@ -27,18 +29,15 @@ use crate::providers::change_request::observation::ChangeRequestObservationSourc
 use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::providers::change_request::BoundObservations;
 use crate::providers::change_request::ChangeRequestTracker;
-use flotilla_daemon_api::daemon::DaemonHandle;
-use flotilla_provider_runtime::ObservationError;
 
 // #2543: scope waits use the latest deadline independently of batch ordering;
 // hard errors and untimed limits remain substantive refusals for their subjects.
 #[hegel::test]
 fn observation_cooldown_is_deterministic(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-
     use flotilla_forge_github::github::GithubRateLimit;
     use flotilla_forge_github::github::GithubRateLimitKind;
     use flotilla_forge_github::github::GithubRetrySource;
+    use hegel::generators as gs;
     // Deadlines span expired, current and future resets; duplicates exercise the
     // lowest-subject tie break. Generated permutations, their reversals and fresh HashMaps vary order.
     let now = Utc.timestamp_opt(1800000000, 0).single().expect("now");
@@ -46,12 +45,12 @@ fn observation_cooldown_is_deterministic(tc: hegel::TestCase) {
         .map(|_| tc.draw(gs::integers::<i64>().min_value(-2).max_value(2)))
         .collect();
     let timed = |number: u64, offset: Option<i64>| {
-        (GithubRateLimit {
+        let limit = GithubRateLimit {
             kind: GithubRateLimitKind::Primary,
             retry_at: offset.map(|offset| now + chrono::Duration::seconds(offset)),
             retry_source: if offset.is_some() { GithubRetrySource::RateLimitReset } else { GithubRetrySource::Unavailable },
-        })
-        .observation_error(format!("subject-{number}"))
+        };
+        limit.observation_error(format!("subject-{number}"))
     };
     let expected = offsets
         .iter()
@@ -116,12 +115,12 @@ async fn distinct_cooldowns_block_all_observation_reads() {
         ProviderChangeRequestObservationSource::new(ResourceBackend::new(InMemoryBackend::default()), Arc::new(NoCooldownForgeReads));
     let now = Utc::now();
     let timed = |seconds| {
-        (GithubRateLimit {
+        let limit = GithubRateLimit {
             kind: GithubRateLimitKind::Primary,
             retry_at: Some(now + chrono::Duration::seconds(seconds)),
             retry_source: GithubRetrySource::RateLimitReset,
-        })
-        .observation_error(format!("reset-{seconds}"))
+        };
+        limit.observation_error(format!("reset-{seconds}"))
     };
     let controlling = timed(60);
     let successful = flotilla_resources::ChangeRequestStatus {

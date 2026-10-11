@@ -5,13 +5,13 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_provider_runtime::gh_api_channel_label;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::github::GhApi;
-use flotilla_provider_runtime::gh_api_channel_label;
 
 pub fn persist(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().ok_or("poll cache has no parent")?;
@@ -191,13 +191,13 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     use async_trait::async_trait;
-
-    use super::*;
-    use crate::github::GhApiClient;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandOutput;
     use flotilla_provider_runtime::CommandRunner;
     use flotilla_replay_testkit::testing::MockRunner;
+
+    use super::*;
+    use crate::github::GhApiClient;
 
     // Stand-in at the gh/HTTP boundary: refuse requests with an incorrect
     // route, ordering, cursor or conditional header instead of accepting any argv.

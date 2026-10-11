@@ -1,10 +1,9 @@
 //! Convoy admission state and transaction boundary.
 
-use flotilla_vcs::providers::detection::remote_assertion;
-
 use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_vcs::providers::detection::remote_assertion;
 
 use super::*;
 use crate::{

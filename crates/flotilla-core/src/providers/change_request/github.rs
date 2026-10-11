@@ -1,24 +1,23 @@
-use flotilla_forge_github::github_poll::PollCache;
-
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
-
-use crate::providers::change_request::observation::parse_gh_observation_value_with_crew_identity;
-use crate::providers::change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
-use crate::providers::types::*;
 use flotilla_forge_github::gh_api_get;
 use flotilla_forge_github::github::clamp_per_page;
 use flotilla_forge_github::github::GhApi;
 use flotilla_forge_github::github_observation::ObservationTelemetry;
 use flotilla_forge_github::github_observation::ParsedObservationResponse;
 use flotilla_forge_github::github_observation::QueryShape;
+use flotilla_forge_github::github_poll::PollCache;
 use flotilla_provider_runtime::gh_api_channel_label;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
+
+use crate::providers::change_request::observation::parse_gh_observation_value_with_crew_identity;
+use crate::providers::change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
+use crate::providers::types::*;
 
 fn execution_root() -> &'static Path {
     Path::new("/")
@@ -245,7 +244,7 @@ impl GitHubChangeRequest {
         call.finish(parsed.as_ref().ok());
         let parsed = parsed?;
         if let Some(limit) = &parsed.limit {
-            return Err((limit.clone()).observation_error("GraphQL".into()));
+            return Err(limit.observation_error("GraphQL".into()));
         }
         Ok(parsed)
     }
@@ -552,14 +551,15 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 mod tests {
     use std::collections::BTreeMap;
 
+    use flotilla_forge_github::github::GhApiClient;
+    use flotilla_forge_github::github::GithubRetrySource;
+    use flotilla_provider_runtime::CommandOutput;
+
     use super::*;
     use crate::providers::change_request::ChangeRequestTracker;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
-    use flotilla_forge_github::github::GhApiClient;
-    use flotilla_forge_github::github::GithubRetrySource;
-    use flotilla_provider_runtime::CommandOutput;
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };

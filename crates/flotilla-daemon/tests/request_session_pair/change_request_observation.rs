@@ -1,4 +1,3 @@
-use super::*;
 use flotilla_core::{
     change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher},
     providers::change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef},
@@ -11,6 +10,8 @@ use flotilla_resources::{
     Observation, ObservedChangeRequestState, ObservedChecks, Project, ProjectSpec,
 };
 use tokio_util::task::AbortOnDropHandle;
+
+use super::*;
 
 // External forge boundary: the owner sees complete observations; any nonowner
 // read is a failure. Transport, replication, convoys and observers are real.

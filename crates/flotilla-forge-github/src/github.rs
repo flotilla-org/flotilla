@@ -1,5 +1,3 @@
-use crate::github_poll;
-use flotilla_provider_runtime::run_output;
 use std::{
     collections::HashMap,
     path::Path,
@@ -8,10 +6,12 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-
+use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
+
+use crate::github_poll;
 
 const MAX_PER_PAGE: usize = 100;
 const MIN_REMAINING_BUDGET: u32 = 100;
@@ -235,7 +235,11 @@ impl GithubRateLimit {
     /// Runtime consumers use the neutral retry deadline, never these text fields.
     pub fn from_observation_error(error: &ObservationError) -> Option<Self> {
         let ObservationError::RateLimited { retry_at, detail, .. } = error else { return None };
-        let kind = if detail.contains("kind=secondary") { GithubRateLimitKind::Secondary } else { GithubRateLimitKind::Primary };
+        let kind = match detail.split_once("kind=")?.1.split(',').next()? {
+            "primary" => GithubRateLimitKind::Primary,
+            "secondary" => GithubRateLimitKind::Secondary,
+            _ => return None,
+        };
         let retry_source = detail.split_once("retry_source=")?.1.split(',').next()?.parse().ok()?;
         Some(Self { kind, retry_at: *retry_at, retry_source })
     }
@@ -565,8 +569,66 @@ pub fn classified_rate_error(error: String) -> ObservationError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use flotilla_replay_testkit::testing::MockRunner;
+
+    use super::*;
+
+    // #3039: GitHub owns diagnostic provenance; every kind/source/deadline combination
+    // must survive conversion through the neutral error, including untimed limits.
+    // Finite generator: exhaust both kinds, all four sources, absent deadlines,
+    // the epoch and a modern deadline. Budget strings include empty and named quotas.
+    #[test]
+    fn rate_limit_provenance_round_trips_through_neutral_error() {
+        for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
+            for retry_source in [
+                GithubRetrySource::RateLimitReset,
+                GithubRetrySource::RetryAfter,
+                GithubRetrySource::SecondaryFallback,
+                GithubRetrySource::Unavailable,
+            ] {
+                for retry_at in [None, DateTime::from_timestamp(0, 0), DateTime::from_timestamp(1893456000, 0)] {
+                    for budget in ["", "GraphQL", "REST core"] {
+                        let limit = GithubRateLimit { kind, retry_at, retry_source };
+                        let error = limit.observation_error(budget.into());
+                        assert_eq!(GithubRateLimit::from_observation_error(&error), Some(limit));
+                        assert_eq!(error.retry_at(), retry_at);
+                        let ObservationError::RateLimited { budget: actual_budget, .. } = error else { panic!("classified limit") };
+                        assert_eq!(actual_budget, budget);
+                    }
+                }
+            }
+        }
+    }
+
+    // #3039: extraction preserves the exact externally visible GitHub diagnostic.
+    // Glue: fixed formatting contract, including the existing untimed-limit spelling.
+    #[test]
+    fn neutral_rate_limit_keeps_existing_display_text() {
+        let limit = GithubRateLimit {
+            kind: GithubRateLimitKind::Secondary,
+            retry_source: GithubRetrySource::RetryAfter,
+            retry_at: DateTime::from_timestamp(1893456000, 0),
+        };
+        assert_eq!(limit.observation_error("GraphQL".into()).to_string(),
+            "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at=2030-01-01T00:00:00+00:00)");
+        let untimed = GithubRateLimit { kind: GithubRateLimitKind::Primary, retry_source: GithubRetrySource::Unavailable, retry_at: None };
+        assert_eq!(
+            untimed.observation_error("REST core".into()).to_string(),
+            "github rate limited (budget=REST core, identity=host gh login, kind=primary, retry_source=unavailable, retry_at=unavailable)"
+        );
+    }
+
+    // Diagnostic conversion must reject unknown provenance rather than invent a primary limit.
+    #[test]
+    fn unknown_or_missing_provenance_is_rejected() {
+        assert_eq!(GithubRateLimit::from_observation_error(&ObservationError::Failed("failure".into())), None);
+        for detail in
+            ["kind=unknown, retry_source=retry-after,", "kind=primary, retry_source=unknown,", "kind=primary,", "retry_source=retry-after,"]
+        {
+            let error = ObservationError::RateLimited { budget: "quota".into(), retry_at: None, detail: detail.into() };
+            assert_eq!(GithubRateLimit::from_observation_error(&error), None);
+        }
+    }
 
     #[test]
     fn parse_200_response_extracts_etag_and_body() {

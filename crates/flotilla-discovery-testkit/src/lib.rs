@@ -13,20 +13,18 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_core::providers::change_request::ChangeRequestTracker;
+use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
+use flotilla_core::providers::issue_tracker::IssueProvider;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     AheadBehind, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
     RepoIdentity, TerminalStatus, WorkingTreeStatus,
 };
-use tokio::sync::Mutex as TokioMutex;
-
-use flotilla_core::providers::change_request::ChangeRequestTracker;
-use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
-use flotilla_core::providers::issue_tracker::IssueProvider;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
@@ -41,6 +39,7 @@ use flotilla_vcs::vcs::FlotillaVcs;
 use flotilla_vcs::vcs::GitCheckoutStrategy;
 use flotilla_vcs::vcs::Vcs;
 use flotilla_vcs::BranchInfo;
+use tokio::sync::Mutex as TokioMutex;
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
 
@@ -1348,10 +1347,10 @@ pub use in_process::InProcessDiscoveryExt;
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-
-    use super::*;
     use flotilla_core::providers::discovery::run_host_detectors;
     use flotilla_discovery_api::EnvironmentAssertion;
+
+    use super::*;
 
     #[tokio::test]
     async fn fake_discovery_uses_only_git_host_detector() {

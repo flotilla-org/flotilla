@@ -1,5 +1,3 @@
-use flotilla_store_memory::InMemoryBackend;
-use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -7,12 +5,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::{EnvironmentId, HostName};
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     ChangeRequestStatus, Convoy as ResourceConvoy, ConvoySpec, ConvoyStatus, CrewSource, CrewWorkPhase, CrewWorkState, InputMeta, Selector,
     SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionSource,
     TerminalSessionSpec, WorkState, WorkflowSnapshot, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_testkit::ReadCountsBackendExt;
 use tokio::sync::RwLock;
 
 use crate::change_request_observer::ChangeRequestRefreshCadence;
@@ -30,7 +31,6 @@ use crate::leaf_engine::LeafSubscriptionTable;
 use crate::providers::change_request::observation::ChangeRequestObservationSource;
 use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::discovery::fake_discovery;
-use flotilla_provider_runtime::ObservationError;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;

@@ -1,13 +1,7 @@
-use crate::providers::issue_tracker::mission_fields;
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{
-    issue_query::{IssueQuery, IssueResultPage},
-    Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
-};
-
 use flotilla_forge_github::gh_api_get;
 use flotilla_forge_github::gh_api_get_with_headers;
 use flotilla_forge_github::github::clamp_per_page;
@@ -18,9 +12,15 @@ use flotilla_forge_github::github_observation::ParsedObservationResponse;
 use flotilla_forge_github::github_observation::QueryShape;
 use flotilla_forge_github::github_poll::PendingBoard;
 use flotilla_forge_github::github_poll::PollCache;
+use flotilla_protocol::{
+    issue_query::{IssueQuery, IssueResultPage},
+    Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
+};
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
+
+use crate::providers::issue_tracker::mission_fields;
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
 
@@ -652,6 +652,11 @@ mod tests {
         },
     };
 
+    use flotilla_forge_github::github::GhApi;
+    use flotilla_forge_github::github::GhApiClient;
+    use flotilla_forge_github::github::GhApiResponse;
+    use flotilla_provider_runtime::ChannelLabel;
+
     use super::*;
     use crate::providers::github_test_support::build_api_and_runner;
     use crate::providers::github_test_support::repo_root_for_recording;
@@ -661,10 +666,6 @@ mod tests {
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::Masks;
-    use flotilla_forge_github::github::GhApi;
-    use flotilla_forge_github::github::GhApiClient;
-    use flotilla_forge_github::github::GhApiResponse;
-    use flotilla_provider_runtime::ChannelLabel;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {

@@ -1,6 +1,7 @@
+use std::path::Path;
+
 use flotilla_forge_github::{gh_api_get, gh_api_get_with_headers};
 use flotilla_provider_runtime::{ChannelLabel, TaskId};
-use std::path::Path;
 
 // In-memory gh invocation boundary: return each macro's label.
 struct Invocation;

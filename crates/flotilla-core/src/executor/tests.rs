@@ -1,5 +1,18 @@
-use flotilla_cloud_agent::RepoCriteria;
 use std::{path::PathBuf, sync::Arc};
+
+use flotilla_ai_utility::AiUtility;
+use flotilla_cloud_agent::CloudAgentService;
+use flotilla_cloud_agent::RepoCriteria;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
+use flotilla_vcs::providers::write_branch_issue_links;
+use flotilla_vcs::vcs::EnumeratedCheckout;
+use flotilla_vcs::vcs::Vcs;
 
 use super::{
     build_plan,
@@ -24,18 +37,7 @@ use crate::testkits::discovery::test_vcs_resolver;
 use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
-use flotilla_ai_utility::AiUtility;
-use flotilla_cloud_agent::CloudAgentService;
-use flotilla_discovery_api::EnvironmentBag;
-use flotilla_discovery_api::ProviderCategory;
-use flotilla_discovery_api::ProviderDescriptor;
-use flotilla_paths::path_context::DaemonHostPath;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_provider_runtime::CommandRunner;
-use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
-use flotilla_vcs::providers::write_branch_issue_links;
-use flotilla_vcs::vcs::EnumeratedCheckout;
-use flotilla_vcs::vcs::Vcs;
+
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
@@ -830,8 +832,9 @@ fn link_request_response(body: &str) -> String {
 }
 
 fn install_link_provider(registry: &mut ProviderRegistry, runner: MockRunner) {
-    use crate::providers::change_request::github::GitHubChangeRequest;
     use flotilla_forge_github::github::GhApiClient;
+
+    use crate::providers::change_request::github::GitHubChangeRequest;
     let runner: Arc<dyn CommandRunner> = Arc::new(runner);
     let provider = GitHubChangeRequest::new("github".into(), "owner/repo".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
     registry.change_requests.insert("github", desc("github"), Arc::new(provider));

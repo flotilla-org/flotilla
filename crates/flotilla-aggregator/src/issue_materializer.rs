@@ -2,7 +2,6 @@
 //! family. External provider I/O lives in per-query tasks so it cannot stall
 //! the resource-store Aggregator loop.
 
-use flotilla_forge_github::github::{core_rate_limit_reset, rate_limit_reset};
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -16,6 +15,7 @@ use flotilla_core::{
     aggregator_projection::AggregatorProjectionState, event_sink::EventSink, in_process::InProcessDaemon,
     providers::issue_tracker::IssueProvider,
 };
+use flotilla_forge_github::github::{core_rate_limit_reset, rate_limit_reset};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     DaemonEvent, DemandBackedMetadata, IssueChangeset, IssueRef, IssueRow, IssueSource, IssueState, QueryId, QueryScope,

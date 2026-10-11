@@ -606,12 +606,14 @@ fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String,
         };
         let retry_source =
             headers.get("observation-retry-source").expect("recorded retry source").parse().expect("known recorded retry source");
-        return (GithubRateLimit {
-            kind,
-            retry_source,
-            retry_at: headers.get("observation-retry-at").map(|at| at.parse().expect("recorded retry deadline")),
-        })
-        .observation_error(headers.get("observation-budget").expect("recorded budget").clone());
+        return {
+            let limit = GithubRateLimit {
+                kind,
+                retry_source,
+                retry_at: headers.get("observation-retry-at").map(|at| at.parse().expect("recorded retry deadline")),
+            };
+            limit.observation_error(headers.get("observation-budget").expect("recorded budget").clone())
+        };
     }
     let raw =
         format!("HTTP/2 {status}\r\n{}\r\n{body}", headers.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect::<String>());

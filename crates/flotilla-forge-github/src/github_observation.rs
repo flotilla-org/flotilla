@@ -1,14 +1,14 @@
 use std::time::Instant;
 
 use chrono::Utc;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::ObservationError;
 
 use crate::github::github_rate_limit_from_document;
 use crate::github::parse_gh_api_response;
 use crate::github::response_header;
 use crate::github::GhApiResponse;
 use crate::github::GithubRateLimit;
-use flotilla_provider_runtime::CommandOutput;
-use flotilla_provider_runtime::ObservationError;
 
 /// Every observer call derives accounting and decoding from this one JSON parse.
 #[derive(bon::Builder)]
