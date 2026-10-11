@@ -1542,6 +1542,7 @@ dependencies = [
  "flotilla-daemon-api",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-forge-forgejo",
  "flotilla-forge-github",
  "flotilla-manifest",
  "flotilla-paths",
@@ -1784,6 +1785,25 @@ dependencies = [
  "flotilla-terminal",
  "flotilla-vcs",
  "tokio",
+]
+
+[[package]]
+name = "flotilla-forge-forgejo"
+version = "0.1.0"
+dependencies = [
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-provider-runtime",
+ "flotilla-tls",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tokio",
+ "urlencoding",
 ]
 
 [[package]]

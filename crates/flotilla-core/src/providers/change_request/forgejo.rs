@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_forge_forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
@@ -13,8 +14,6 @@ use flotilla_resources::{
 
 use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
-use crate::providers::forge::forgejo::ForgejoClient;
-use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
 use crate::providers::types::ChangeRequest;
 use crate::providers::types::ChangeRequestStatus;
 
@@ -336,11 +335,11 @@ mod tests {
     use flotilla_provider_runtime::ChannelLabel;
 
     use super::*;
-    use crate::providers::forge::forgejo::ForgejoAuth;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::Masks;
+    use flotilla_forge_forgejo::ForgejoAuth;
 
     // Boundary double: Forgejo HTTP requests, including the body update.
     struct LinkHttp {

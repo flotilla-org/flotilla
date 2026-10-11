@@ -1,8 +1,8 @@
-use crate::providers::forge::forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_forge_forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
@@ -179,7 +179,7 @@ impl super::IssueProvider for ForgejoIssueProvider {
 
 #[cfg(test)]
 mod tests {
-    use crate::providers::forge::forgejo::ForgejoAuth;
+    use flotilla_forge_forgejo::ForgejoAuth;
     use std::path::PathBuf;
     use std::{
         collections::HashMap,

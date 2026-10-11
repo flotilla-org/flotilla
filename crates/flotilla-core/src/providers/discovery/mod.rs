@@ -287,9 +287,6 @@ impl DiscoveryRuntime {
 // Discovery result and orchestrator functions
 // ---------------------------------------------------------------------------
 
-/// Authentication slot shared by Forgejo discovery and its provider factories.
-pub(crate) const FORGEJO_AUTH_PROVIDER: &str = "forgejo";
-
 pub struct DiscoveryResult {
     pub registry: ProviderRegistry,
     pub host_repo_bag: EnvironmentBag,
