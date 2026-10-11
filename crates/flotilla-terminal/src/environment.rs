@@ -34,6 +34,8 @@ const TERMINAL_RUNTIME_KEYS: &[&str] = &[
 ];
 const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// Declared environment for terminal children and Cleat clients.
+/// Public so core's `cleat_roll` can reuse the same controlled runner.
 pub struct ControlledTerminalEnvironment {
     host: TerminalEnvVars,
     client: TerminalEnvVars,

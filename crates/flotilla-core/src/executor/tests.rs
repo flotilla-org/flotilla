@@ -31,13 +31,10 @@ use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
 use flotilla_vcs::providers::write_branch_issue_links;
 use flotilla_vcs::vcs::EnumeratedCheckout;
 use flotilla_vcs::vcs::Vcs;
-use flotilla_terminal::TerminalEnvVars;
-use flotilla_terminal::TerminalPool;
-use flotilla_terminal::TerminalSession;
-use flotilla_terminal::TerminalSessionTag;
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)

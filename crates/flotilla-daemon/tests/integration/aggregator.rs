@@ -37,8 +37,7 @@ use flotilla_resources::{
     VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_terminal::TerminalSession as PoolTerminalSession;
-use flotilla_terminal::TerminalSessionLiveness;
+use flotilla_terminal::{TerminalSession as PoolTerminalSession, TerminalSessionLiveness};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");

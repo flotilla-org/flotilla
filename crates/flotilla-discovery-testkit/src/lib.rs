@@ -32,6 +32,7 @@ use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 use flotilla_provider_runtime::ProcessCommandRunner;
+use flotilla_terminal::{TerminalPool, TerminalSessionLiveness};
 use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
 use flotilla_vcs::providers::VcsInspection;
 use flotilla_vcs::vcs::CheckoutVcsResolver;
@@ -40,8 +41,6 @@ use flotilla_vcs::vcs::FlotillaVcs;
 use flotilla_vcs::vcs::GitCheckoutStrategy;
 use flotilla_vcs::vcs::Vcs;
 use flotilla_vcs::BranchInfo;
-use flotilla_terminal::TerminalPool;
-use flotilla_terminal::TerminalSessionLiveness;
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
 

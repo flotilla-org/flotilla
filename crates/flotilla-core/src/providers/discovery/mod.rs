@@ -38,9 +38,8 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::registry::ProviderSet;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_terminal::{scan_cache::SharedTerminalPool, TerminalPool};
 use flotilla_vcs::vcs::Vcs;
-use flotilla_terminal::scan_cache::SharedTerminalPool;
-use flotilla_terminal::TerminalPool;
 
 pub type ProviderFactory<T> = dyn Factory<Descriptor = ProviderDescriptor, Output = T>;
 pub type VcsFactory = ProviderFactory<dyn Vcs>;

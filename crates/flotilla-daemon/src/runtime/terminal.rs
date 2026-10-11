@@ -28,10 +28,7 @@ use flotilla_resources::{
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 use flotilla_store::ResourceBackend;
-use flotilla_terminal::ScreenActivity;
-use flotilla_terminal::TerminalPool;
-use flotilla_terminal::TerminalSessionLiveness;
-use flotilla_terminal::TerminalSize;
+use flotilla_terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 

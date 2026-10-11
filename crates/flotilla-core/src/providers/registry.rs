@@ -1,6 +1,6 @@
 use flotilla_discovery_api::ProviderDescriptor;
-use flotilla_vcs::vcs::Vcs;
 use flotilla_terminal::TerminalPool;
+use flotilla_vcs::vcs::Vcs;
 use std::sync::Arc;
 
 use indexmap::IndexMap;

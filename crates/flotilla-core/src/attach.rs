@@ -1,7 +1,5 @@
 //! Attach target indexing, role resolution, and plan construction.
 
-use flotilla_terminal::TerminalSessionLiveness;
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
@@ -40,6 +38,7 @@ use crate::{
     providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
 };
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_terminal::TerminalSessionLiveness;
 
 pub(super) struct AttachResolver<'a> {
     pub(super) resource_backend: &'a ResourceBackend,
