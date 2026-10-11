@@ -116,13 +116,13 @@ impl ReadProjections<'_> {
                             "status.phase".into(),
                             ["Pending", "Active", "Interrupted", "Landing"].map(str::to_string).into(),
                         )]),
-                        any_of: vec![
+                        any_of: Some(vec![
                             StoreQuery { field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]), ..Default::default() },
                             StoreQuery {
                                 fields: BTreeMap::from([("status.crew_work.*.*.phase".into(), "Stalled".into())]),
                                 ..Default::default()
                             },
-                        ],
+                        ]),
                         include_replicas: true,
                         ..Default::default()
                     },
@@ -956,7 +956,7 @@ impl ReadProjections<'_> {
             .query_declared::<ManifestRoot>(
                 namespace,
                 &StoreQuery {
-                    field_values: BTreeMap::from([("spec.host".into(), host_names.clone())]),
+                    field_values: BTreeMap::from([("spec.host".into(), host_names.clone().into_iter().collect())]),
                     field_prefixes: BTreeMap::from([("status.stalled".into(), "{".into())]),
                     include_replicas: true,
                     ..Default::default()
@@ -969,7 +969,7 @@ impl ReadProjections<'_> {
             .query_declared::<FulfilmentKind>(
                 namespace,
                 &StoreQuery {
-                    field_values: BTreeMap::from([("spec.host_ref".into(), host_names)]),
+                    field_values: BTreeMap::from([("spec.host_ref".into(), host_names.into_iter().collect())]),
                     include_replicas: true,
                     ..Default::default()
                 },
@@ -1059,7 +1059,9 @@ impl ReadProjections<'_> {
             )
         };
         let convoy_query = match context.as_ref() {
-            Some(context) => StoreQuery { any_of: vec![context.clone(), scope.clone()], include_replicas: true, ..Default::default() },
+            Some(context) => {
+                StoreQuery { any_of: Some(vec![context.clone(), scope.clone()]), include_replicas: true, ..Default::default() }
+            }
             None => scope.clone(),
         };
         let mut terminal_query = StoreQuery {
@@ -1072,10 +1074,10 @@ impl ReadProjections<'_> {
         } else if project.is_none() {
             if let Some(crew_id) = crew_id {
                 terminal_query = StoreQuery {
-                    any_of: vec![
+                    any_of: Some(vec![
                         terminal_query,
                         StoreQuery { fields: BTreeMap::from([("status.crew.id".into(), crew_id.into())]), ..Default::default() },
-                    ],
+                    ]),
                     include_replicas: true,
                     ..Default::default()
                 };
@@ -1182,7 +1184,10 @@ impl ReadProjections<'_> {
             .query_declared::<ResourceCheckout>(
                 namespace,
                 &StoreQuery {
-                    field_values: BTreeMap::from([("metadata.labels.\"flotilla.work/convoy\"".into(), matching.clone())]),
+                    field_values: BTreeMap::from([(
+                        "metadata.labels.\"flotilla.work/convoy\"".into(),
+                        matching.clone().into_iter().collect(),
+                    )]),
                     ..Default::default()
                 },
             )
@@ -1237,7 +1242,8 @@ impl ReadProjections<'_> {
             }
             candidates.push(StoreQuery::labels(&labels, true, true));
         }
-        let selected_query = StoreQuery { any_of: candidates, include_replicas: true, ..Default::default() };
+        let selected_query =
+            StoreQuery { any_of: (!candidates.is_empty()).then_some(candidates), include_replicas: true, ..Default::default() };
         let mut linked = Vec::new();
         for target in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
             for source in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
@@ -1251,14 +1257,14 @@ impl ReadProjections<'_> {
             .query_declared::<ResourceConvoy>(
                 namespace,
                 &StoreQuery {
-                    any_of: vec![
+                    any_of: Some(vec![
                         selected_query,
                         StoreQuery {
                             fields: BTreeMap::from([("status.phase".into(), "Landed".into())]),
-                            any_of: linked,
+                            any_of: (!linked.is_empty()).then_some(linked),
                             ..Default::default()
                         },
-                    ],
+                    ]),
                     include_replicas: true,
                     ..Default::default()
                 },
@@ -1378,30 +1384,32 @@ impl ReadProjections<'_> {
             .query_declared::<flotilla_resources::ChangeRequest>(
                 namespace,
                 &StoreQuery {
-                    any_of: subjects
-                        .iter()
-                        .filter(|row| row.subject.kind == SubjectKind::ChangeRequest)
-                        .map(|row| StoreQuery {
-                            fields: BTreeMap::from([
-                                ("spec.service".into(), row.subject.source.service.clone()),
-                                ("spec.scope".into(), row.subject.source.scope.clone()),
-                                ("spec.number".into(), row.subject.id.clone()),
-                            ]),
-                            ..Default::default()
-                        })
-                        .chain(std::iter::once(StoreQuery::names(
-                            expected_change_request_leaves(&convoy, &selected_checkouts)
-                                .map_err(|error| error.to_string())?
-                                .iter()
-                                .filter_map(|leaf| match &leaf.address {
-                                    flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
-                                        Some(flotilla_resources::change_request_record_name(service, scope, *number))
-                                    }
-                                    _ => None,
-                                }),
-                            true,
-                        )))
-                        .collect(),
+                    any_of: Some(
+                        subjects
+                            .iter()
+                            .filter(|row| row.subject.kind == SubjectKind::ChangeRequest)
+                            .map(|row| StoreQuery {
+                                fields: BTreeMap::from([
+                                    ("spec.service".into(), row.subject.source.service.clone()),
+                                    ("spec.scope".into(), row.subject.source.scope.clone()),
+                                    ("spec.number".into(), row.subject.id.clone()),
+                                ]),
+                                ..Default::default()
+                            })
+                            .chain(std::iter::once(StoreQuery::names(
+                                expected_change_request_leaves(&convoy, &selected_checkouts)
+                                    .map_err(|error| error.to_string())?
+                                    .iter()
+                                    .filter_map(|leaf| match &leaf.address {
+                                        flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
+                                            Some(flotilla_resources::change_request_record_name(service, scope, *number))
+                                        }
+                                        _ => None,
+                                    }),
+                                true,
+                            )))
+                            .collect(),
+                    ),
                     include_replicas: true,
                     ..Default::default()
                 },
@@ -1990,7 +1998,7 @@ fn attention_query(scope: Option<(&str, &BTreeSet<String>)>) -> StoreQuery {
                 },
                 StoreQuery {
                     fields: BTreeMap::from([("spec.originating_work_ref.kind".into(), "Convoy".into())]),
-                    field_values: BTreeMap::from([("spec.originating_work_ref.name".into(), convoys.clone())]),
+                    field_values: BTreeMap::from([("spec.originating_work_ref.name".into(), convoys.clone().into_iter().collect())]),
                     ..Default::default()
                 },
             ]
@@ -2008,7 +2016,7 @@ fn attention_query(scope: Option<(&str, &BTreeSet<String>)>) -> StoreQuery {
             }
         }
     }
-    StoreQuery { any_of: selections, include_replicas: true, ..Default::default() }
+    StoreQuery { any_of: (!selections.is_empty()).then_some(selections), include_replicas: true, ..Default::default() }
 }
 
 /// Gather only the receiver evidence that can affect this convoy. The request
@@ -2029,14 +2037,14 @@ async fn convoy_receiver_evidence(
         .query_declared::<ResourceTerminalSession>(
             namespace,
             &StoreQuery {
-                any_of: vec![
+                any_of: Some(vec![
                     target.clone(),
                     StoreQuery::related(
                         "metadata.annotations.\"flotilla.work/role-address\"",
                         "metadata.annotations.\"flotilla.work/role-address\"",
                         target,
                     ),
-                ],
+                ]),
                 include_replicas: true,
                 ..Default::default()
             },
@@ -2165,14 +2173,22 @@ async fn message_views(
                     )]),
                     ..Default::default()
                 },
-                StoreQuery { field_values: BTreeMap::from([("spec.receiver".into(), aliases.clone())]), ..Default::default() },
+                StoreQuery {
+                    field_values: BTreeMap::from([("spec.receiver".into(), aliases.clone().into_iter().collect())]),
+                    ..Default::default()
+                },
             ]
         })
         .unwrap_or_default();
     let mut records = backend
         .query_declared::<flotilla_resources::Message>(
             namespace,
-            &StoreQuery { message: Some(flotilla_store::MessageQuery::active()), any_of, include_replicas: true, ..Default::default() },
+            &StoreQuery {
+                message: Some(flotilla_store::MessageQuery::active()),
+                any_of: (!any_of.is_empty()).then_some(any_of),
+                include_replicas: true,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|error| error.to_string())?

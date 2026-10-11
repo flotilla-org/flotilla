@@ -1265,6 +1265,8 @@ impl Store for InMemoryBackend {
                 selection.fields.clear();
                 selection.field_values.clear();
                 selection.present.clear();
+                selection.missing_fields.clear();
+                selection.field_matches_query.clear();
                 selection.field_prefixes.clear();
                 selection.label_prefixes.clear();
                 selection.owner = None;

@@ -565,7 +565,7 @@ impl ProjectService<'_> {
             .resource_backend
             .definitions::<Project>(&namespace)
             .list_selected(flotilla_store::StoreQuery {
-                any_of: vec![
+                any_of: Some(vec![
                     flotilla_store::StoreQuery {
                         field_prefixes: BTreeMap::from([("spec.charter".into(), "{".into())]),
                         ..Default::default()
@@ -574,7 +574,7 @@ impl ProjectService<'_> {
                         fields: BTreeMap::from([("spec.repositories.*.charter_store.host".into(), self.repository_index.host.to_string())]),
                         ..Default::default()
                     },
-                ],
+                ]),
                 ..Default::default()
             })
             .await
@@ -1337,7 +1337,7 @@ impl ProjectService<'_> {
         } else {
             repositories
                 .query_declared(&flotilla_store::StoreQuery {
-                    any_of: vec![
+                    any_of: Some(vec![
                         flotilla_store::StoreQuery {
                             fields: BTreeMap::from([("metadata.name".into(), target.into())]),
                             ..Default::default()
@@ -1346,7 +1346,7 @@ impl ProjectService<'_> {
                             fields: BTreeMap::from([("spec.catalog_targets.*".into(), target.into())]),
                             ..Default::default()
                         },
-                    ],
+                    ]),
                     ..Default::default()
                 })
                 .await
@@ -1501,10 +1501,10 @@ impl ProjectService<'_> {
 /// merging authors and tombstones before the request performs in-memory joins.
 fn repository_catalog_query(target: &str) -> flotilla_store::StoreQuery {
     flotilla_store::StoreQuery {
-        any_of: vec![
+        any_of: Some(vec![
             flotilla_store::StoreQuery { fields: BTreeMap::from([("metadata.name".into(), target.into())]), ..Default::default() },
             flotilla_store::StoreQuery { fields: BTreeMap::from([("spec.catalog_targets.*".into(), target.into())]), ..Default::default() },
-        ],
+        ]),
         ..Default::default()
     }
 }

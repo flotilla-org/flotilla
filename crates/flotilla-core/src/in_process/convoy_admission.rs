@@ -941,8 +941,8 @@ impl ConvoyAdmission {
             .await
             .map_err(|error| error.to_string())?;
         let local_checkout_query = StoreQuery {
-            field_values: BTreeMap::from([("spec.repo_ref".into(), repository_names)]),
-            any_of: vec![
+            field_values: BTreeMap::from([("spec.repo_ref".into(), repository_names.into_iter().collect())]),
+            any_of: Some(vec![
                 StoreQuery { fields: BTreeMap::from([("spec.host_ref".into(), local_host.into())]), ..Default::default() },
                 StoreQuery::related_kind(
                     "spec.env_ref",
@@ -950,7 +950,7 @@ impl ConvoyAdmission {
                     "metadata.name",
                     StoreQuery { fields: BTreeMap::from([("spec.host_direct.host_ref".into(), local_host.into())]), ..Default::default() },
                 ),
-            ],
+            ]),
             ..Default::default()
         };
         // The observed partition is an in-memory cache; durable rows override
@@ -965,7 +965,7 @@ impl ConvoyAdmission {
             .query_declared::<ResourceCheckout>(
                 namespace,
                 &StoreQuery {
-                    any_of: vec![
+                    any_of: Some(vec![
                         local_checkout_query,
                         StoreQuery::names(
                             observed
@@ -975,7 +975,7 @@ impl ConvoyAdmission {
                                 .chain(spec.adopted_checkout_refs.values().cloned()),
                             true,
                         ),
-                    ],
+                    ]),
                     include_replicas: true,
                     ..Default::default()
                 },
@@ -1001,17 +1001,22 @@ impl ConvoyAdmission {
                 None => self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?,
             };
             let terminal_query = StoreQuery {
-                any_of: std::iter::once(StoreQuery::related_kind(
-                    "metadata.labels.\"flotilla.work/convoy\"",
-                    "Convoy",
-                    "metadata.name",
-                    convoy_query,
-                ))
-                .chain(visible.iter().map(|project| StoreQuery {
-                    field_prefixes: BTreeMap::from([("metadata.annotations.\"flotilla.work/role-address\"".into(), format!("{project}/"))]),
-                    ..Default::default()
-                }))
-                .collect(),
+                any_of: Some(
+                    std::iter::once(StoreQuery::related_kind(
+                        "metadata.labels.\"flotilla.work/convoy\"",
+                        "Convoy",
+                        "metadata.name",
+                        convoy_query,
+                    ))
+                    .chain(visible.iter().map(|project| StoreQuery {
+                        field_prefixes: BTreeMap::from([(
+                            "metadata.annotations.\"flotilla.work/role-address\"".into(),
+                            format!("{project}/"),
+                        )]),
+                        ..Default::default()
+                    }))
+                    .collect(),
+                ),
                 include_replicas: true,
                 ..Default::default()
             };
@@ -1025,7 +1030,7 @@ impl ConvoyAdmission {
                 .query_declared::<ConvoyEnsure>(
                     namespace,
                     &StoreQuery {
-                        field_values: BTreeMap::from([("spec.project_ref".into(), visible)]),
+                        field_values: BTreeMap::from([("spec.project_ref".into(), visible.into_iter().collect())]),
                         include_replicas: true,
                         ..Default::default()
                     },
@@ -1714,10 +1719,10 @@ impl AdmissionReadContext<'_> {
         let forges = backend
             .definitions::<Forge>(namespace)
             .list_selected(StoreQuery {
-                any_of: vec![
+                any_of: Some(vec![
                     StoreQuery::names(forge_names, true),
                     StoreQuery { field_values: BTreeMap::from([("spec.remote_hosts.*".into(), remote_hosts)]), ..Default::default() },
-                ],
+                ]),
                 include_replicas: true,
                 ..Default::default()
             })
@@ -1771,7 +1776,7 @@ impl AdmissionReadContext<'_> {
             .query_declared::<CredentialSpec>(
                 namespace,
                 &StoreQuery {
-                    any_of: vec![
+                    any_of: Some(vec![
                         StoreQuery::names(credential_names, true),
                         StoreQuery {
                             field_values: BTreeMap::from([(
@@ -1780,7 +1785,7 @@ impl AdmissionReadContext<'_> {
                             )]),
                             ..Default::default()
                         },
-                    ],
+                    ]),
                     include_replicas: true,
                     ..Default::default()
                 },
@@ -1823,7 +1828,7 @@ impl AdmissionReadContext<'_> {
                 .query_declared::<ImageBuild>(
                     namespace,
                     &StoreQuery {
-                        field_values: BTreeMap::from([("spec.layer.name".into(), frozen_layer_names)]),
+                        field_values: BTreeMap::from([("spec.layer.name".into(), frozen_layer_names.into_iter().collect())]),
                         include_replicas: true,
                         ..Default::default()
                     },
@@ -3595,8 +3600,8 @@ fn brief_convoy_query(
     }
     let convoy_scope = if subtree {
         StoreQuery {
-            field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone())]),
-            any_of: vec![
+            field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone().into_iter().collect())]),
+            any_of: Some(vec![
                 StoreQuery { missing_fields: ["status.phase".into()].into(), ..Default::default() },
                 StoreQuery {
                     field_values: BTreeMap::from([(
@@ -3605,7 +3610,7 @@ fn brief_convoy_query(
                     )]),
                     ..Default::default()
                 },
-            ],
+            ]),
             include_replicas: true,
             ..Default::default()
         }
@@ -3613,7 +3618,7 @@ fn brief_convoy_query(
         StoreQuery::names([name.into()], true)
     };
     let convoy_query = StoreQuery {
-        any_of: vec![
+        any_of: Some(vec![
             convoy_scope.clone(),
             StoreQuery {
                 include_replicas: true,
@@ -3622,13 +3627,13 @@ fn brief_convoy_query(
                     "ConvoyEnsure",
                     "status.convoy_ref",
                     StoreQuery {
-                        field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone())]),
+                        field_values: BTreeMap::from([("spec.project_ref".into(), visible.clone().into_iter().collect())]),
                         include_replicas: true,
                         ..Default::default()
                     },
                 )
             },
-        ],
+        ]),
         include_replicas: true,
         ..Default::default()
     };
@@ -3687,11 +3692,17 @@ async fn convoy_admission_inventory(
             .map(|entry| serde_json::to_value(entry.subject).map(|value| value.to_string()).map_err(|error| error.to_string()))
             .collect::<Result<BTreeSet<_>, _>>()?;
         for path in ["spec.subjects.*.subject", "status.subjects.*.subject"] {
-            selections.push(StoreQuery { field_values: BTreeMap::from([(path.into(), subjects.clone())]), ..Default::default() });
+            selections.push(StoreQuery {
+                field_values: BTreeMap::from([(path.into(), subjects.clone().into_iter().collect())]),
+                ..Default::default()
+            });
         }
     }
     backend
-        .query_declared::<ResourceConvoy>(namespace, &StoreQuery { any_of: selections, include_replicas: true, ..Default::default() })
+        .query_declared::<ResourceConvoy>(
+            namespace,
+            &StoreQuery { any_of: (!selections.is_empty()).then_some(selections), include_replicas: true, ..Default::default() },
+        )
         .await
         .map(|listed| listed.items)
         .map_err(|error| error.to_string())
@@ -4336,7 +4347,7 @@ fn credential_grant_query(project: Option<&str>, roles: BTreeSet<String>) -> Sto
     }
     let roles = [
         StoreQuery { missing_fields: ["spec.selector.roles.*".into()].into(), ..Default::default() },
-        StoreQuery { field_values: BTreeMap::from([("spec.selector.roles.*".into(), roles)]), ..Default::default() },
+        StoreQuery { field_values: BTreeMap::from([("spec.selector.roles.*".into(), roles.into_iter().collect())]), ..Default::default() },
     ];
     let mut alternatives = Vec::new();
     for project in projects {
@@ -4349,7 +4360,7 @@ fn credential_grant_query(project: Option<&str>, roles: BTreeSet<String>) -> Sto
     }
     StoreQuery {
         missing_fields: ["spec.selector.host_action".into()].into(),
-        any_of: alternatives,
+        any_of: (!alternatives.is_empty()).then_some(alternatives),
         include_replicas: true,
         ..Default::default()
     }
@@ -4569,7 +4580,7 @@ pub(super) async fn validate_workflow_credentials_with_capabilities_for_admissio
         .query_declared::<CredentialSpec>(
             namespace,
             &StoreQuery {
-                any_of: vec![
+                any_of: Some(vec![
                     StoreQuery::names(workflow.vessels.iter().flat_map(|vessel| vessel.credential_refs.iter().cloned()), true),
                     StoreQuery {
                         field_values: BTreeMap::from([(
@@ -4578,7 +4589,7 @@ pub(super) async fn validate_workflow_credentials_with_capabilities_for_admissio
                         )]),
                         ..Default::default()
                     },
-                ],
+                ]),
                 include_replicas: true,
                 ..Default::default()
             },

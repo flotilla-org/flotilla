@@ -27,7 +27,7 @@ pub struct StoreQuery {
     /// Indexed membership: each field must equal one of its supplied values.
     /// An empty value set selects no rows.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub field_values: BTreeMap<String, BTreeSet<String>>,
+    pub field_values: BTreeMap<String, Vec<String>>,
     /// Literal prefixes of declared string fields (AND across fields).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub field_prefixes: BTreeMap<String, String>,
@@ -179,7 +179,14 @@ impl StoreQuery {
         self.validate_at(kind, 0)
     }
     fn validate_at(&self, kind: ResourceKind, depth: usize) -> Result<(), ResourceError> {
-        if self.all_sources_for_matches && (kind.replication != crate::ReplicationClass::Definitions || self.message.is_some() || self.suppress_self_origin || !self.include_replicas) { return Err(ResourceError::invalid("source hydration requires an unsuppressed definitions query")); }
+        if self.all_sources_for_matches
+            && (kind.replication != crate::ReplicationClass::Definitions
+                || self.message.is_some()
+                || self.suppress_self_origin
+                || !self.include_replicas)
+        {
+            return Err(ResourceError::invalid("source hydration requires an unsuppressed definitions query"));
+        }
         if depth > 8 {
             return Err(ResourceError::invalid("declared query nesting exceeds eight levels"));
         }
@@ -188,7 +195,8 @@ impl StoreQuery {
             .keys()
             .chain(self.field_values.keys())
             .chain(self.field_prefixes.keys())
-            .chain(self.missing_fields.iter()).chain(self.present.iter())
+            .chain(self.missing_fields.iter())
+            .chain(self.present.iter())
             .chain(self.field_matches_query.keys())
         {
             if !kind.queryable_fields.contains(&path.as_str()) {
@@ -206,7 +214,10 @@ impl StoreQuery {
                 || self.message.is_some()
                 || !self.field_prefixes.is_empty()
                 || !self.missing_fields.is_empty()
-                || self.any_of.is_some() || !self.present.is_empty() || !self.label_prefixes.is_empty() || self.all_sources_for_matches
+                || self.any_of.is_some()
+                || !self.present.is_empty()
+                || !self.label_prefixes.is_empty()
+                || self.all_sources_for_matches
                 || self.field_matches_query.iter().any(|(field, selection)| {
                     field != "metadata.name" || selection.field != "metadata.name" || selection.source_kind.is_some()
                 })
@@ -280,7 +291,9 @@ impl QueryIndex {
         {
             for path in kind.queryable_fields {
                 let fields = declared_field_values(value, path);
-                if !fields.is_empty() { keys.push((format!("present:{path}"), String::new())); }
+                if !fields.is_empty() {
+                    keys.push((format!("present:{path}"), String::new()));
+                }
                 if fields.is_empty() {
                     keys.push((format!("missing:{path}"), String::new()));
                 }
@@ -332,10 +345,21 @@ impl QueryIndex {
             });
         }
         for (path, values) in &query.field_values {
-            let names = values.iter().flat_map(|value| self.entries.get(&(format!("field:{path}"),value.clone())).into_iter().flatten().cloned()).collect::<BTreeSet<_>>();
-            result = Some(match result { None => names, Some(found) => found.intersection(&names).cloned().collect() });
+            let names = values
+                .iter()
+                .flat_map(|value| self.entries.get(&(format!("field:{path}"), value.clone())).into_iter().flatten().cloned())
+                .collect::<BTreeSet<_>>();
+            result = Some(match result {
+                None => names,
+                Some(found) => found.intersection(&names).cloned().collect(),
+            });
         }
-        for (field, prefix) in query.field_prefixes.iter().map(|(path,prefix)| (format!("field:{path}"),prefix)).chain(query.label_prefixes.iter().map(|(path,prefix)| (format!("label:{path}"),prefix))) {
+        for (field, prefix) in query
+            .field_prefixes
+            .iter()
+            .map(|(path, prefix)| (format!("field:{path}"), prefix))
+            .chain(query.label_prefixes.iter().map(|(path, prefix)| (format!("label:{path}"), prefix)))
+        {
             let names = self
                 .entries
                 .range((field.clone(), prefix.clone())..)
@@ -531,14 +555,16 @@ pub fn resolve_semijoins<'a>(
         for (field, selection) in &query.field_matches_query {
             let values = store.query_values_raw(selection.kind(kind)?, namespace, &selection.query, &selection.field).await?;
             let values = match resolved.field_values.remove(field) {
-                Some(existing) => existing.intersection(&values).cloned().collect(),
-                None => values,
+                Some(existing) => existing.into_iter().filter(|value| values.contains(value)).collect(),
+                None => values.into_iter().collect(),
             };
             resolved.field_values.insert(field.clone(), values);
         }
         if let Some(alternatives) = &query.any_of {
             let mut items = Vec::new();
-            for alternative in alternatives { items.push(resolve_semijoins(store, kind, namespace, alternative).await?); }
+            for alternative in alternatives {
+                items.push(resolve_semijoins(store, kind, namespace, alternative).await?);
+            }
             resolved.any_of = Some(items);
         }
         Ok(resolved)

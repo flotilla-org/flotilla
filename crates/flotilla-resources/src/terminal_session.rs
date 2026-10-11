@@ -27,7 +27,14 @@ define_resource!(
     replication = ReplicationClass::HomeBoundRuntime,
     queryable = &[
         "metadata.name",
-    const QUERYABLE_FIELDS: &'static [&'static str] = &["status.phase","status.crew.id","status.completion_pending.authority","spec.role","spec.env_ref","spec.source.context.convoy","spec.source.context.vessel_ref","metadata.labels.\"flotilla.work/convoy\""];
+        "status.phase",
+        "status.crew.id",
+        "status.completion_pending.authority",
+        "spec.role",
+        "spec.env_ref",
+        "spec.source.context.convoy",
+        "spec.source.context.vessel_ref",
+        "metadata.labels.\"flotilla.work/convoy\"",
         "metadata.annotations.\"flotilla.work/role-address\""
     ]
 );

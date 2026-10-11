@@ -160,7 +160,11 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     peer.definitions::<Project>("flotilla")
         .create(
             &InputMeta::builder().name("membership".into()).build(),
-            &ProjectSpec::builder().display_name("peer".into()).repositories(vec![member("target")]).build(),
+            &ProjectSpec::builder()
+                .display_name("peer".into())
+                .repositories(vec![member("target")])
+                .charter(flotilla_resources::CharterPointer::Inline { documents: vec![], files: BTreeMap::new() })
+                .build(),
         )
         .await
         .unwrap();
@@ -183,6 +187,20 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     assert_eq!(selected.into_iter().map(|project| project.metadata.name).collect::<Vec<_>>(), expected);
     assert_eq!(observed.read_calls().get("Project"), Some(&1));
     assert_eq!(observed.read_counts().get("Project"), Some(&2), "every sibling of the selected name is hydrated");
+    // Newly added absence selectors still hydrate nonmatching authors before
+    // causal merge, including when the author lives in a durable hybrid store.
+    let selected = backend
+        .definitions::<Project>("flotilla")
+        .query_declared(&StoreQuery {
+            field_values: BTreeMap::from([("metadata.name".into(), vec!["membership".into()])]),
+            missing_fields: ["spec.charter".into()].into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let merged = authority.definitions::<Project>("flotilla").get("membership").await.unwrap();
+    assert!(merged.spec.charter.is_some());
+    assert!(selected.is_empty(), "the merged charter is present: absence selection must retain nonmatching author evidence");
     authority
         .replace_replicas_typed::<Project>(
             &NodeId::new("membership-peer"),
@@ -214,9 +232,12 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
                 .source(TerminalSessionSource::Tool { command: "sh".into() })
                 .cwd("/work".into())
                 .pool("pool".into())
+                .build(),
+        )
+        .await
+        .unwrap();
     // Cross-kind scope discovery uses source indexes and never decodes an
     // unrelated source body. Quoted label keys retain their literal spelling.
-    use flotilla_resources::{TerminalSession, TerminalSessionSource, TerminalSessionSpec};
     authority
         .using::<TerminalSession>("flotilla")
         .create(
@@ -463,7 +484,7 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
         (StoreQuery { missing_fields: ["spec.continuation".into()].into(), ..Default::default() }, vec!["a", "b", "shadow"]),
         (
             StoreQuery {
-                any_of: vec![StoreQuery::names(["a".into()], false), StoreQuery::names(["remote".into()], true)],
+                any_of: Some(vec![StoreQuery::names(["a".into()], false), StoreQuery::names(["remote".into()], true)]),
                 include_replicas: true,
                 ..Default::default()
             },
@@ -508,7 +529,7 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     assert!(backend.query_declared::<Convoy>("flotilla", &nested).await.is_err());
     nested = StoreQuery::default();
     for _ in 0..10 {
-        nested = StoreQuery { any_of: vec![nested], ..Default::default() };
+        nested = StoreQuery { any_of: Some(vec![nested]), ..Default::default() };
     }
     assert!(backend.query_declared::<Convoy>("flotilla", &nested).await.is_err());
     // Equality predicates combine with AND; empty selections return all local rows.

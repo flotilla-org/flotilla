@@ -205,12 +205,16 @@ impl<T: Resource> ViewState<T> {
                 .collect();
             let values = index.values(&source.field, &names);
             let values = match resolved.field_values.remove(field) {
-                Some(existing) => existing.intersection(&values).cloned().collect(),
-                None => values,
+                Some(existing) => existing.into_iter().filter(|value| values.contains(value)).collect(),
+                None => values.into_iter().collect(),
             };
             resolved.field_values.insert(field.clone(), values);
         }
-        resolved.any_of = query.any_of.as_ref().map(|queries| queries.iter().map(|query| self.resolve_query(query)).collect::<Result<_, _>>()).transpose()?;
+        resolved.any_of = query
+            .any_of
+            .as_ref()
+            .map(|queries| queries.iter().map(|query| self.resolve_query(query)).collect::<Result<_, _>>())
+            .transpose()?;
         Ok(resolved)
     }
     fn select(&self, query: &StoreQuery) -> Result<Vec<Arc<ReadResourceObject<T>>>, ResourceError> {

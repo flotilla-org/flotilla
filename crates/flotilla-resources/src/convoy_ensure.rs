@@ -16,7 +16,13 @@ define_resource!(
     ConvoyEnsureStatus,
     ConvoyEnsureStatusPatch,
     replication = ReplicationClass::Definitions,
-    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name","spec.project_ref","spec.role","status.convoy_ref","metadata.annotations.\"flotilla.work/materialized-project\""];
+    queryable = &[
+        "metadata.name",
+        "spec.project_ref",
+        "spec.role",
+        "status.convoy_ref",
+        "metadata.annotations.\"flotilla.work/materialized-project\"",
+    ]
 );
 
 /// Desired state for one standing convoy.
