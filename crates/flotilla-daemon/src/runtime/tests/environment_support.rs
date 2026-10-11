@@ -245,22 +245,22 @@ pub(super) struct TestInteriorEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for TestInteriorEnvironmentProvider {
-    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
-        flotilla_core::providers::environment::EnvironmentKind::Docker
+    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
+        flotilla_environment::environment::EnvironmentKind::Docker
     }
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
-        _opts: &flotilla_core::providers::environment::PrepareOpts,
-    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
-        Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
     async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_core::providers::environment::PreparedEnvironment,
-        _opts: flotilla_core::providers::environment::ProvisionOpts,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
     ) -> Result<EnvironmentHandle, String> {
         self.handle.lock().await.take().ok_or_else(|| "test environment already created".to_string())
     }
@@ -280,22 +280,22 @@ pub(super) struct AdoptionEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for AdoptionEnvironmentProvider {
-    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
-        flotilla_core::providers::environment::EnvironmentKind::Docker
+    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
+        flotilla_environment::environment::EnvironmentKind::Docker
     }
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
-        _opts: &flotilla_core::providers::environment::PrepareOpts,
-    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
-        Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
     async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_core::providers::environment::PreparedEnvironment,
-        _opts: flotilla_core::providers::environment::ProvisionOpts,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
     ) -> Result<EnvironmentHandle, String> {
         Err("not used".to_string())
     }
@@ -321,23 +321,23 @@ pub(super) struct CapturingFailingEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for CapturingFailingEnvironmentProvider {
-    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
-        flotilla_core::providers::environment::EnvironmentKind::Docker
+    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
+        flotilla_environment::environment::EnvironmentKind::Docker
     }
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
-        opts: &flotilla_core::providers::environment::PrepareOpts,
-    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
+        opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
         *self.prepared_auth.lock().await = Some(opts.prepared_auth.clone());
-        Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
     async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_core::providers::environment::PreparedEnvironment,
-        opts: flotilla_core::providers::environment::ProvisionOpts,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        opts: flotilla_environment::environment::ProvisionOpts,
     ) -> Result<EnvironmentHandle, String> {
         *self.create_opts.lock().await = Some(CreateOpts {
             tokens: opts.tokens,
@@ -447,22 +447,22 @@ pub(super) struct ListingEnvironmentProvider {
 
 #[async_trait]
 impl EnvironmentProvider for ListingEnvironmentProvider {
-    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
-        flotilla_core::providers::environment::EnvironmentKind::Docker
+    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
+        flotilla_environment::environment::EnvironmentKind::Docker
     }
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
-        _opts: &flotilla_core::providers::environment::PrepareOpts,
-    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
-        Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
     async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_core::providers::environment::PreparedEnvironment,
-        _opts: flotilla_core::providers::environment::ProvisionOpts,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
     ) -> Result<EnvironmentHandle, String> {
         Err("not used".to_string())
     }
@@ -480,7 +480,7 @@ impl EnvironmentProvider for ListingEnvironmentProvider {
 }
 
 pub(super) fn register_host_adoption(registry: &mut ProviderRegistry) {
-    use flotilla_core::providers::environment::host_direct::HostDirectEnvironmentProvider;
+    use flotilla_environment::environment::host_direct::HostDirectEnvironmentProvider;
     // The injected runner stands in for host subprocesses; adopting and
     // detaching the host itself must never invoke it.
     registry.environment_providers.insert(

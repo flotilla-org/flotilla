@@ -35,7 +35,7 @@ A production module imported from an integration-test directory remains checked;
 `src/tests/` has no blanket exemption. Any parser ERROR node in a tracked Rust
 file fails the scan, including fixture and build files. The pinned parser is
 0.45.3: 0.39.5 misparsed ordinary identifiers named `raw`.
-Only the exact core VCS implementation paths are exempt from production checks.
+Only the `flotilla-vcs` implementation crate are exempt from production checks.
 
 CI's format job installs the pinned parser and runs
 both commands in the existing every-PR Format job. Workflow changes are applied
@@ -46,7 +46,7 @@ by the operator.
 The same scan and test-module traversal also reject:
 
 - literal runtime CLI calls outside `RUNTIME_IMPLEMENTATIONS`' exact files;
-- concrete environment adapter and Buildx identifiers outside core `providers/`
+- concrete environment adapter and Buildx identifiers outside `crates/flotilla-environment/src/`
   and the exact daemon composition root;
 - literal runtime names in environment-provider registry lookups or provider
   implementation/backend preferences.

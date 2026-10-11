@@ -11,6 +11,7 @@ skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests", "flotilla-cloud
 
 [dependencies]
 flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
+flotilla-environment = { path = "../flotilla-environment" }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-vcs = { path = "../flotilla-vcs" }

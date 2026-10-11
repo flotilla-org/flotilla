@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::providers::environment::EnvironmentHandle;
+use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_protocol::{CanonicalHostId, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -71,7 +71,7 @@ pub(super) async fn reconcile_provisioned_environments(state: &Arc<ControllerRun
             environments.push(environment);
         }
     }
-    use flotilla_core::providers::environment::{EnvironmentKind, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
+    use flotilla_environment::environment::{EnvironmentKind, ENVIRONMENT_PROVIDER_INSTANCE_LABEL};
     if environments.is_empty() {
         let mut observed = false;
         for (_, provider) in

@@ -22,8 +22,6 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::model::RepoModel;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::DiscoveryRuntime;
-use flotilla_core::providers::environment::EnvironmentHandle;
-use flotilla_core::providers::environment::ProvisionedEnvironment;
 use flotilla_core::providers::types::ChangeRequest;
 use flotilla_core::providers::types::CloudAgentSession;
 use flotilla_core::providers::types::SessionStatus;
@@ -58,6 +56,8 @@ use flotilla_discovery_testkit::FakeTerminalPool;
 use flotilla_discovery_testkit::FakeVcsFactory;
 use flotilla_discovery_testkit::FakeVcsState;
 use flotilla_discovery_testkit::TestEnvVars;
+use flotilla_environment::environment::EnvironmentHandle;
+use flotilla_environment::environment::ProvisionedEnvironment;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::qualified_path::QualifiedPath;
@@ -566,7 +566,7 @@ impl ProvisionedEnvironment for TestProvisionedEnvironment {
         None
     }
 
-    fn provisioned_mounts(&self) -> Vec<flotilla_core::providers::environment::ProvisionedMount> {
+    fn provisioned_mounts(&self) -> Vec<flotilla_environment::environment::ProvisionedMount> {
         vec![]
     }
 

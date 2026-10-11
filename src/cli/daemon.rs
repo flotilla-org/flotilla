@@ -113,7 +113,7 @@ pub(crate) async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::Vie
     let cli_theme = cli.theme.clone();
     let socket_path = paths.socket_path;
     let require_host_daemon =
-        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
+        host_daemon_socket_required(std::env::var_os(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
 
     // Connect to the daemon concurrently with terminal initialization.
     let daemon_log_path =
@@ -424,7 +424,7 @@ pub(super) async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
         &socket_path,
         &config_dir,
         &state_dir,
-        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
+        host_daemon_socket_required(std::env::var_os(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await
     .map_err(|e| color_eyre::eyre::eyre!(e))?;

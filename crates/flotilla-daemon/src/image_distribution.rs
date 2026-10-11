@@ -284,8 +284,8 @@ fn validate_registry_reference(cache: &ImageCacheBinding, reference: &str) -> Re
 
 #[derive(bon::Builder)]
 pub(crate) struct ProviderImageIo {
-    pub provider: Arc<dyn flotilla_core::providers::environment::EnvironmentProvider>,
-    pub publisher: Option<Arc<dyn flotilla_core::providers::environment::ImageBuilder>>,
+    pub provider: Arc<dyn flotilla_environment::environment::EnvironmentProvider>,
+    pub publisher: Option<Arc<dyn flotilla_environment::environment::ImageBuilder>>,
     pub credentials: Arc<CredentialStore>,
     pub host: String,
 }
@@ -312,7 +312,7 @@ impl ImageDistributionIo for ProviderImageIo {
     }
 }
 impl ProviderImageIo {
-    fn cache(&self) -> Result<&dyn flotilla_core::providers::environment::LocalImageCache, String> {
+    fn cache(&self) -> Result<&dyn flotilla_environment::environment::LocalImageCache, String> {
         self.provider.local_image_cache().ok_or_else(|| "provider has no local image cache".into())
     }
 }

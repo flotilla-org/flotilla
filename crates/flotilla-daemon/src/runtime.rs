@@ -392,7 +392,7 @@ impl DaemonRuntime {
                 ));
                 let distributor = if let Some((_, provider)) = local_registry
                     .environment_providers
-                    .for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker)
+                    .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
                     .filter(|(_, provider)| provider.local_image_cache().is_some())
                 {
                     Some(Arc::new(
@@ -511,7 +511,7 @@ impl StartupRestoration {
         let credential_store = &self.credential_store;
         let options = &self.options;
         if let Some((_, provider)) =
-            local_registry.environment_providers.for_kind(flotilla_core::providers::environment::EnvironmentKind::Docker)
+            local_registry.environment_providers.for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
         {
             let live =
                 phase("list_environments_for_credential_sweep", daemon.resource_backend().using::<Environment>(&options.namespace).list())

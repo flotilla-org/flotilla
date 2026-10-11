@@ -1577,7 +1577,7 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
     .await;
     // Placement freezes the exact runtime instance into the created environment
     // so later provisioning and recovery cannot switch to a different endpoint.
-    let instance_key = flotilla_core::providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+    let instance_key = flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
     let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
     let policy = policies.get("policy-local-image").await.expect("placement policy");
     policies

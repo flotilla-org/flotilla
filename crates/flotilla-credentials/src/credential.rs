@@ -7,11 +7,11 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::providers::environment::{
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_environment::environment::{
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
     PreparedEnvironmentAuth, RegistryAuth,
 };
-use flotilla_discovery_api::EnvironmentBag;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -5624,7 +5624,7 @@ interactions:
     // configuration, and runtime diagnostics cannot expose admitted material.
     #[tokio::test]
     async fn cancelled_host_image_operation_removes_private_config() {
-        use flotilla_core::providers::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider};
+        use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider};
         for pause in [false, true] {
             let runner = Arc::new(RegistryOperationRunner { pause, ..Default::default() });
             let provider = DockerEnvironmentProvider::new(runner.clone());

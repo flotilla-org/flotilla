@@ -12,9 +12,9 @@ use std::{
 use chrono::Utc;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::providers::environment::EnvironmentKind;
 use flotilla_core::providers::registry::ProviderRegistry;
 use flotilla_credentials::CredentialStore;
+use flotilla_environment::environment::EnvironmentKind;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::EnvironmentId;

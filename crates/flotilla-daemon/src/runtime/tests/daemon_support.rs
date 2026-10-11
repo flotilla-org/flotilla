@@ -325,6 +325,7 @@ use flotilla_discovery_testkit::InProcessDiscoveryExt;
 
 // Real built-in detection providers over an injected subprocess stand-in.
 pub(super) fn detection_registry(runner: Arc<dyn CommandRunner>) -> Arc<ProviderRegistry> {
-    use flotilla_core::providers::environment::{command_provider_registry, EnvironmentKind};
+    use flotilla_core::providers::registry::command_provider_registry;
+    use flotilla_environment::environment::EnvironmentKind;
     Arc::new(command_provider_registry(&[EnvironmentKind::Docker, EnvironmentKind::HostDirect], runner))
 }

@@ -253,7 +253,7 @@ async fn fresh_daemon_readopts_running_environment_from_shared_store_and_backing
             environment
                 .metadata
                 .labels
-                .insert(flotilla_core::providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.into());
+                .insert(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL.into(), instance.into());
             api.update(&InputMeta::from(&environment.metadata), &environment.metadata.resource_version, &environment.spec)
                 .await
                 .expect("bind instance");

@@ -15,8 +15,8 @@ use flotilla_core::{
         CrewBriefTemplateResolver,
     },
     in_process::BRIEF_ARTIFACTS_ANNOTATION,
-    providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL,
 };
+use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
     artifact_record_name, canonicalize_repo_url, host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact,

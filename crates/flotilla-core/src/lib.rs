@@ -31,7 +31,6 @@ pub mod event_sink;
 pub mod executor;
 pub(crate) mod fleet;
 pub mod fleet_health;
-pub mod hop_chain;
 pub mod host_identity;
 pub(crate) mod host_registry;
 pub mod host_resolution;

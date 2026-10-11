@@ -2,7 +2,6 @@ use flotilla_protocol::{arg::Arg, HostName};
 use tracing::warn;
 
 use super::{ResolutionContext, ResolvedAction};
-use crate::config::HostsConfig;
 use flotilla_paths::path_context::DaemonHostPath;
 
 /// Resolves a `Hop::RemoteToHost` into SSH-specific actions on the context.
@@ -14,21 +13,22 @@ pub trait RemoteHopResolver: Send + Sync {
 /// SSH-based remote hop resolver. Extracts the SSH wrapping knowledge previously
 /// hardcoded in `wrap_remote_attach_commands()` into the hop chain model.
 pub struct SshRemoteHopResolver {
-    hosts: HostsConfig,
+    hosts: Vec<(HostName, SshConnection)>,
     /// Pre-resolved multiplex control path, if the directory was created successfully.
     multiplex_ctrl_path: Option<DaemonHostPath>,
 }
 
 /// Resolved SSH connection info for a single host.
-struct SshInfo {
-    target: String,
-    multiplex: bool,
+pub struct SshConnection {
+    pub target: String,
+    pub multiplex: bool,
 }
 
 impl SshRemoteHopResolver {
-    /// Create from pre-loaded hosts config and a config base path (for SSH control socket dir).
+    /// Create from resolved connections and a config base path (for SSH control socket dir).
+    /// Connection order determines the first match for duplicate host identities.
     /// The control socket directory is created eagerly here, not during arg building.
-    pub fn new(config_base: DaemonHostPath, hosts: HostsConfig) -> Self {
+    pub fn new(config_base: DaemonHostPath, hosts: Vec<(HostName, SshConnection)>) -> Self {
         let ctrl_dir = config_base.join("ssh");
         let multiplex_ctrl_path = match std::fs::create_dir_all(ctrl_dir.as_path()) {
             Ok(()) => Some(ctrl_dir.join("ctrl-%r@%h-%p")),
@@ -41,24 +41,16 @@ impl SshRemoteHopResolver {
     }
 
     /// Look up SSH connection info for a given HostName.
-    fn ssh_info(&self, host: &HostName) -> Result<SshInfo, String> {
-        let (label, remote) = self
-            .hosts
-            .hosts
+    fn ssh_info(&self, host: &HostName) -> Result<&SshConnection, String> {
+        self.hosts
             .iter()
-            .find(|(_, h)| h.expected_host_name == host.as_str())
-            .ok_or_else(|| format!("unknown remote host: {host}"))?;
-
-        let target = match &remote.user {
-            Some(user) => format!("{user}@{}", remote.hostname),
-            None => remote.hostname.clone(),
-        };
-        let multiplex = self.hosts.resolved_ssh_multiplex(label);
-        Ok(SshInfo { target, multiplex })
+            .find(|(name, _)| name == host)
+            .map(|(_, connection)| connection)
+            .ok_or_else(|| format!("unknown remote host: {host}"))
     }
 
     /// Build the SSH prefix args: `ssh [-t] [-o ControlMaster=auto ...] <target>`
-    fn ssh_prefix_args(&self, info: &SshInfo, allocate_tty: bool) -> Vec<Arg> {
+    fn ssh_prefix_args(&self, info: &SshConnection, allocate_tty: bool) -> Vec<Arg> {
         let mut args = vec![Arg::Literal("ssh".into())];
         if allocate_tty {
             args.push(Arg::Literal("-t".into()));
@@ -91,7 +83,7 @@ impl SshRemoteHopResolver {
     /// user-installed tools such as `flotilla` under `~/.cargo/bin` are found.
     pub fn one_hop_command_args(&self, host: &HostName, command: Vec<Arg>) -> Result<Vec<Arg>, String> {
         let info = self.ssh_info(host)?;
-        let mut ssh_args = self.ssh_prefix_args(&info, true);
+        let mut ssh_args = self.ssh_prefix_args(info, true);
         ssh_args.push(Arg::NestedCommand(vec![
             Arg::Literal("${SHELL:-/bin/sh}".into()),
             Arg::Literal("-l".into()),
@@ -146,7 +138,7 @@ impl RemoteHopResolver for SshRemoteHopResolver {
         ];
 
         // Build: ssh -t [multiplex] target <NestedCommand(login_wrapper)>
-        let mut ssh_args = self.ssh_prefix_args(&info, true);
+        let mut ssh_args = self.ssh_prefix_args(info, true);
         ssh_args.push(Arg::NestedCommand(login_wrapper));
 
         context.actions.push(ResolvedAction::Command(ssh_args));
@@ -164,11 +156,4 @@ impl RemoteHopResolver for NoopRemoteHopResolver {
     fn resolve_wrap(&self, host: &HostName, _context: &mut ResolutionContext) -> Result<(), String> {
         Err(format!("no remote transport available to reach host: {host}"))
     }
-}
-
-/// Create an `SshRemoteHopResolver` by loading hosts config from disk.
-pub fn ssh_resolver_from_config(config_base: &DaemonHostPath) -> Result<SshRemoteHopResolver, String> {
-    let config = crate::config::ConfigStore::with_base(config_base.as_path());
-    let hosts = config.load_hosts()?;
-    Ok(SshRemoteHopResolver::new(config_base.clone(), hosts))
 }

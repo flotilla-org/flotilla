@@ -251,7 +251,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .local_registry
                 .environment_providers
                 .iter()
-                .filter(|(_, provider)| provider.kind() == flotilla_core::providers::environment::EnvironmentKind::Docker)
+                .filter(|(_, provider)| provider.kind() == flotilla_environment::environment::EnvironmentKind::Docker)
                 .collect::<Vec<_>>();
             if providers.is_empty() {
                 return Err("Docker environment provider absent for standing-convoy liveness check".into());
@@ -292,11 +292,11 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             }
         }
         for environment in environments {
-            let instance = environment.metadata.labels.get(flotilla_core::providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL);
+            let instance = environment.metadata.labels.get(flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL);
             let (_, provider) = self
                 .local_registry
                 .environment_providers
-                .select(flotilla_core::providers::environment::EnvironmentKind::Docker, instance.map(String::as_str))
+                .select(flotilla_environment::environment::EnvironmentKind::Docker, instance.map(String::as_str))
                 .ok_or_else(|| {
                     let reason = if instance.is_some() {
                         "instance absent or wrong kind"
@@ -304,7 +304,7 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                         .local_registry
                         .environment_providers
                         .iter()
-                        .any(|(_, provider)| provider.kind() == flotilla_core::providers::environment::EnvironmentKind::Docker)
+                        .any(|(_, provider)| provider.kind() == flotilla_environment::environment::EnvironmentKind::Docker)
                     {
                         "ambiguous instances"
                     } else {

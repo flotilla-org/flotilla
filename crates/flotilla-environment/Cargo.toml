@@ -1,0 +1,49 @@
+# ADR 0060: provider component; no composition-root or store dependencies.
+[package]
+name = "flotilla-environment"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-paths = { path = "../flotilla-paths" }
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+async-trait.workspace = true
+bon.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
+url.workspace = true
+sha2.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flotilla-tls = { path = "../flotilla-tls" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+flotilla-terminal = { path = "../flotilla-terminal" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+hegeltest = "=0.48.1"
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-http = { path = "../flotilla-build-features-http" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

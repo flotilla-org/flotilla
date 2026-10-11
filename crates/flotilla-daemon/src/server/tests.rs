@@ -4966,26 +4966,26 @@ struct GatedStartupEnvironmentProvider {
 }
 
 #[async_trait::async_trait]
-impl flotilla_core::providers::environment::EnvironmentProvider for GatedStartupEnvironmentProvider {
-    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
-        flotilla_core::providers::environment::EnvironmentKind::Docker
+impl flotilla_environment::environment::EnvironmentProvider for GatedStartupEnvironmentProvider {
+    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
+        flotilla_environment::environment::EnvironmentKind::Docker
     }
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
-        _opts: &flotilla_core::providers::environment::PrepareOpts,
-    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
         Err("unused".into())
     }
     async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_core::providers::environment::PreparedEnvironment,
-        _opts: flotilla_core::providers::environment::ProvisionOpts,
-    ) -> Result<flotilla_core::providers::environment::EnvironmentHandle, String> {
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
+    ) -> Result<flotilla_environment::environment::EnvironmentHandle, String> {
         Err("unused".into())
     }
-    async fn list(&self) -> Result<Vec<flotilla_core::providers::environment::EnvironmentHandle>, String> {
+    async fn list(&self) -> Result<Vec<flotilla_environment::environment::EnvironmentHandle>, String> {
         self.entered.notify_one();
         self.release.acquire().await.expect("release reconciliation").forget();
         self.completed.fetch_add(1, Ordering::SeqCst);
@@ -5001,7 +5001,7 @@ struct GatedStartupEnvironmentFactory(Arc<GatedStartupEnvironmentProvider>);
 #[async_trait::async_trait]
 impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
     type Descriptor = flotilla_discovery_api::ProviderDescriptor;
-    type Output = dyn flotilla_core::providers::environment::EnvironmentProvider;
+    type Output = dyn flotilla_environment::environment::EnvironmentProvider;
     fn descriptor(&self) -> Self::Descriptor {
         flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker")
     }

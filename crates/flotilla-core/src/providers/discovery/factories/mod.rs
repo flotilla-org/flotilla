@@ -1,8 +1,7 @@
 use flotilla_ai_utility::factories::claude::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
 use flotilla_cloud_agent::factories::{claude::ClaudeCodingAgentFactory, codex::CodexCodingAgentFactory, cursor::CursorCodingAgentFactory};
-pub mod docker;
+use flotilla_environment::factories::{docker, host_direct};
 pub mod github;
-pub mod host_direct;
 
 use super::FactoryRegistry;
 use flotilla_terminal::factories::{cleat::CleatTerminalPoolFactory, passthrough::PassthroughTerminalPoolFactory};

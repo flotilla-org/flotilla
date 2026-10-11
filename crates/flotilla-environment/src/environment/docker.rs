@@ -12,7 +12,7 @@ use super::{
     runner::DockerEnvironmentRunner, CreateOpts, EnvironmentBacking, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
     EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
-use crate::providers::environment::{PrepareOpts, ProvisionOpts};
+use crate::environment::{PrepareOpts, ProvisionOpts};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 

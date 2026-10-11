@@ -10,8 +10,8 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::environment::docker::DockerEnvironmentProvider;
-use crate::providers::environment::EnvironmentProvider;
+use crate::environment::docker::DockerEnvironmentProvider;
+use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -51,19 +51,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::DockerEnvironmentFactory;
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::test_config::TestConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_discovery_api::UnmetRequirement;
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]
     async fn docker_factory_succeeds_with_binary_in_bag() {
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("docker", "/usr/local/bin/docker"));
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
@@ -73,7 +73,7 @@ mod tests {
     async fn docker_factory_succeeds_via_fallback_run() {
         let bag = EnvironmentBag::new(); // no binary in bag
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         // Runner returns success for `docker --version`
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("docker", &["--version"], Ok("Docker version 24.0.0".into())).build());
         let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
@@ -84,7 +84,7 @@ mod tests {
     async fn docker_factory_fails_without_docker() {
         let bag = EnvironmentBag::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::with_base(dir.path());
         // Runner returns error for `docker --version` — docker not available
         let runner =
             Arc::new(DiscoveryMockRunner::builder().on_run("docker", &["--version"], Err("docker: command not found".into())).build());

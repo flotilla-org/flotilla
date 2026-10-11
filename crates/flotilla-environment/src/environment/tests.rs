@@ -1229,7 +1229,7 @@ async fn destroy_calls_docker_rm() {
 /// pattern works end-to-end with real factory logic.
 #[tokio::test]
 async fn environment_runner_supports_factory_probe() {
-    use crate::config::ConfigStore;
+    use crate::test_config::TestConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
@@ -1244,7 +1244,7 @@ async fn environment_runner_supports_factory_probe() {
     let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"));
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = ConfigStore::with_base(dir.path());
+    let config = TestConfig::with_base(dir.path());
     let repo_root = ExecutionEnvironmentPath::new("/repo");
 
     // The factory checks env.find_binary("cleat") first — it does NOT call runner for binary detection.
@@ -1260,12 +1260,12 @@ async fn environment_runner_supports_factory_probe() {
 
 #[tokio::test]
 async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
-    use crate::config::ConfigStore;
-    use crate::testkits::replay::testing::MockRunner;
+    use crate::test_config::TestConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_replay_testkit::testing::MockRunner;
     use flotilla_terminal::factories::cleat::CleatTerminalPoolFactory;
 
     let inner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("--env-clear --env".into()), Ok("{}".into())]));
@@ -1277,7 +1277,7 @@ async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
         .with(EnvironmentAssertion::env_var("TERM_PROGRAM_VERSION", "1.2.3"))
         .with(EnvironmentAssertion::env_var("COLORTERM", "truecolor"));
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = ConfigStore::with_base(dir.path());
+    let config = TestConfig::with_base(dir.path());
     let repo_root = ExecutionEnvironmentPath::new("/repo");
 
     let pool = CleatTerminalPoolFactory.probe(&bag, &config, &repo_root, env_runner).await.expect("cleat pool in Docker");
@@ -1679,38 +1679,6 @@ async fn list_backings_rejects_incomplete_identity() {
     }
     let provider = DockerEnvironmentProvider::new(Arc::new(RecordingRunner::new_ok("")));
     assert!(provider.list_backings().await.expect("empty listing").is_empty());
-}
-
-// Explicit instance selection never crosses kinds. Generate zero through three
-// same-kind instances, including ambiguity, exact hits and an absent identity.
-#[hegel::test]
-fn provider_selection_is_kind_and_instance_scoped(tc: hegel::TestCase) {
-    use super::{host_direct::HostDirectEnvironmentProvider, EnvironmentKind};
-    use crate::providers::registry::ProviderRegistry;
-    use flotilla_discovery_api::ProviderCategory;
-    use flotilla_discovery_api::ProviderDescriptor;
-    use hegel::generators as gs;
-    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
-    let mut registry = ProviderRegistry::new();
-    let runner = Arc::new(RecordingRunner::new_ok(""));
-    registry.environment_providers.insert(
-        "direct",
-        ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "direct"),
-        Arc::new(HostDirectEnvironmentProvider::new(runner.clone(), Default::default())),
-    );
-    for index in 0..count {
-        let identity = format!("endpoint-{index}");
-        registry.environment_providers.insert(
-            &identity,
-            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, &identity),
-            Arc::new(DockerEnvironmentProvider::new(runner.clone())),
-        );
-    }
-    assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, None).is_some(), count == 1);
-    assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, Some("endpoint-0")).is_some(), count > 0);
-    assert!(registry.environment_providers.select(EnvironmentKind::Docker, Some("direct")).is_none());
-    assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, Some("absent")).is_none());
-    assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, None).is_some());
 }
 
 // Docker provisioning consumes only its own preparation, uses the prepared

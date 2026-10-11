@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
 use super::{EnvironmentHandle, EnvironmentKind, EnvironmentProvider, PreparedEnvironment, ProvisionedEnvironment, ProvisionedMount};
-use crate::providers::environment::{PrepareOpts, ProvisionOpts};
+use crate::environment::{PrepareOpts, ProvisionOpts};
 use flotilla_provider_runtime::CommandRunner;
 
 /// Legacy handles require an image id even for image-free adoption.

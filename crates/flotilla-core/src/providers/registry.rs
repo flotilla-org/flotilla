@@ -1,18 +1,18 @@
 use flotilla_ai_utility::AiUtility;
 use flotilla_cloud_agent::CloudAgentService;
-use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
+use flotilla_environment::environment::{EnvironmentKind, EnvironmentProvider};
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_terminal::TerminalPool;
 use flotilla_vcs::vcs::Vcs;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::providers::environment::EnvironmentKind;
 use crate::{
     agent_adapter::AgentAdapterRegistry,
     providers::{
         change_request::ChangeRequestTracker,
-        environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
     },
 };
@@ -324,5 +324,61 @@ mod tests {
         let mut set = make_set_with_entries(&[("a", "alpha", "a"), ("b", "beta", "b")]);
         set.prefer_by_implementation("z");
         assert_eq!(set.preferred_name(), Some("a"));
+    }
+}
+
+/// Compose detection-only endpoint providers with their canonical instance
+/// descriptors. This is for callers without a discovered provider registry.
+pub fn command_provider_registry(kinds: &[EnvironmentKind], runner: Arc<dyn CommandRunner>) -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    for &kind in kinds {
+        let name = match kind {
+            EnvironmentKind::Docker => "docker",
+            EnvironmentKind::HostDirect => "host-direct",
+        };
+        registry.environment_providers.insert(
+            name,
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, name),
+            flotilla_environment::environment::command_provider(kind, runner.clone()),
+        );
+    }
+    registry
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use std::sync::Arc;
+    // Explicit instance selection never crosses kinds. Generate zero through three
+    // same-kind instances, including ambiguity, exact hits and an absent identity.
+    #[hegel::test]
+    fn provider_selection_is_kind_and_instance_scoped(tc: hegel::TestCase) {
+        use crate::providers::registry::ProviderRegistry;
+        use flotilla_discovery_api::ProviderCategory;
+        use flotilla_discovery_api::ProviderDescriptor;
+        use flotilla_environment::environment::{
+            docker::DockerEnvironmentProvider, host_direct::HostDirectEnvironmentProvider, EnvironmentKind,
+        };
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let mut registry = ProviderRegistry::new();
+        let runner = Arc::new(flotilla_replay_testkit::testing::MockRunner::new(vec![]));
+        registry.environment_providers.insert(
+            "direct",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "direct"),
+            Arc::new(HostDirectEnvironmentProvider::new(runner.clone(), Default::default())),
+        );
+        for index in 0..count {
+            let identity = format!("endpoint-{index}");
+            registry.environment_providers.insert(
+                &identity,
+                ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, &identity),
+                Arc::new(DockerEnvironmentProvider::new(runner.clone())),
+            );
+        }
+        assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, None).is_some(), count == 1);
+        assert_eq!(registry.environment_providers.select(EnvironmentKind::Docker, Some("endpoint-0")).is_some(), count > 0);
+        assert!(registry.environment_providers.select(EnvironmentKind::Docker, Some("direct")).is_none());
+        assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, Some("absent")).is_none());
+        assert!(registry.environment_providers.select(EnvironmentKind::HostDirect, None).is_some());
     }
 }

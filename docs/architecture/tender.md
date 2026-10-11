@@ -201,7 +201,7 @@ Sibling-repository links below assume the portfolio's usual checkout layout.
 | [Peer wire types](../../crates/flotilla-protocol/src/peer.rs) and [manager](../../crates/flotilla-daemon/src/peer/manager.rs) | Routing is mixed with commands, steps, host summaries, and response handling. Audit surviving callers; do not move this whole module into Tender. |
 | [Replicator](../../crates/flotilla-daemon/src/server/replicator.rs) | `SocketPathSource` updates the forwarded path; generation checks protect against stale teardown. Flotilla can consume Tender reachability here, while keeping resource watches, cursors, and replication policy. |
 | [Transport crate](../../crates/flotilla-transport/src/lib.rs) | Provides message and memory modules today. Its name does not establish that it is already the Tender extraction. |
-| [Container hop resolver](../../crates/flotilla-core/src/hop_chain/environment.rs) | Supervises `docker exec` attachment and cleans child processes after disconnect. Publishing a stream can remove this need for some attachment paths; general command execution and provisioning remain outside Tender. |
+| [Container hop resolver](../../crates/flotilla-environment/src/hop_chain/environment.rs) | Supervises `docker exec` attachment and cleans child processes after disconnect. Publishing a stream can remove this need for some attachment paths; general command execution and provisioning remain outside Tender. |
 
 The new work includes generic publication, grants, permitted discovery, endpoint
 identity, local exposures, outward publishers, and configured intermediaries.

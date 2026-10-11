@@ -17,20 +17,20 @@ use crate::providers::discovery::run_host_detectors;
 use crate::providers::discovery::run_provisioned_host_detectors;
 use crate::providers::discovery::DiscoveryRuntime;
 use crate::providers::discovery::FactoryRegistry;
-use crate::providers::environment::contained_daemon_socket_path;
-use crate::providers::environment::CreateOpts;
-use crate::providers::environment::EnvironmentHandle;
-use crate::providers::environment::EnvironmentKind;
-use crate::providers::environment::EnvironmentTool;
-use crate::providers::environment::EnvironmentToolAsset;
-use crate::providers::environment::EnvironmentToolAssetAccess;
-use crate::providers::environment::EnvironmentToolAssetKind;
-use crate::providers::environment::EnvironmentVariableUpdate;
-use crate::providers::environment::PreparedEnvironment;
-use crate::providers::environment::ProvisionedMount;
-use crate::providers::environment::ProvisionedMountMode;
-use crate::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
 use crate::providers::registry::ProviderRegistry;
+use flotilla_environment::environment::contained_daemon_socket_path;
+use flotilla_environment::environment::CreateOpts;
+use flotilla_environment::environment::EnvironmentHandle;
+use flotilla_environment::environment::EnvironmentKind;
+use flotilla_environment::environment::EnvironmentTool;
+use flotilla_environment::environment::EnvironmentToolAsset;
+use flotilla_environment::environment::EnvironmentToolAssetAccess;
+use flotilla_environment::environment::EnvironmentToolAssetKind;
+use flotilla_environment::environment::EnvironmentVariableUpdate;
+use flotilla_environment::environment::PreparedEnvironment;
+use flotilla_environment::environment::ProvisionedMount;
+use flotilla_environment::environment::ProvisionedMountMode;
+use flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
@@ -591,23 +591,23 @@ mod tests {
         },
     };
 
-    use crate::providers::environment::PrepareOpts;
-    use crate::providers::environment::ProvisionOpts;
     use async_trait::async_trait;
+    use flotilla_environment::environment::PrepareOpts;
+    use flotilla_environment::environment::ProvisionOpts;
     use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
     use super::*;
     use crate::providers::discovery::detectors::default_host_detectors;
-    use crate::providers::environment::EnvironmentHandle;
-    use crate::providers::environment::EnvironmentProvider;
-    use crate::providers::environment::ProvisionedEnvironment;
-    use crate::providers::environment::ProvisionedMount;
     use crate::providers::registry::ProviderRegistry;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::ProviderCategory;
     use flotilla_discovery_api::ProviderDescriptor;
+    use flotilla_environment::environment::EnvironmentHandle;
+    use flotilla_environment::environment::EnvironmentProvider;
+    use flotilla_environment::environment::ProvisionedEnvironment;
+    use flotilla_environment::environment::ProvisionedMount;
     use flotilla_provider_runtime::CommandRunner;
 
     struct MockProvisionedEnvironment {

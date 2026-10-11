@@ -1,6 +1,7 @@
 //! Convoy admission state and transaction boundary.
 
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
+use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
@@ -10,7 +11,6 @@ use super::*;
 use crate::{
     agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
     branch_lookup_observer::BranchLookupObserver,
-    providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
-use flotilla_core::providers::environment::EnvironmentProvider;
+use flotilla_environment::environment::EnvironmentProvider;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -299,7 +299,7 @@ mod tests {
         scratch: &Path,
         model_probes: &mut ModelProbeState,
     ) -> Result<FulfilmentFacts, String> {
-        use flotilla_core::providers::environment::{command_provider, EnvironmentKind};
+        use flotilla_environment::environment::{command_provider, EnvironmentKind};
         let kind = match spec.realisation {
             FulfilmentRealisation::HostDirect => EnvironmentKind::HostDirect,
             FulfilmentRealisation::DockerPerVessel { .. } => EnvironmentKind::Docker,

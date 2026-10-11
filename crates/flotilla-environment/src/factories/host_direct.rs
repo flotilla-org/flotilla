@@ -11,8 +11,8 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::environment::host_direct::HostDirectEnvironmentProvider;
-use crate::providers::environment::EnvironmentProvider;
+use crate::environment::host_direct::HostDirectEnvironmentProvider;
+use crate::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 

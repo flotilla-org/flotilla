@@ -1,6 +1,5 @@
 pub mod change_request;
 pub mod discovery;
-pub mod environment;
 pub mod issue_tracker;
 pub mod registry;
 pub mod types;

@@ -10,13 +10,13 @@ use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning};
 use flotilla_core::config::ConfigStore;
 use flotilla_core::providers::discovery::run_provisioned_host_detectors;
-use flotilla_core::providers::environment::CreateOpts;
-use flotilla_core::providers::environment::EnvironmentHandle;
-use flotilla_core::providers::environment::EnvironmentToolAssetKind;
-use flotilla_core::providers::environment::EnvironmentVariableUpdate;
 use flotilla_core::providers::registry::ProviderRegistry;
 use flotilla_credentials::{compose_agent_environment, AgentMaterialRegistry, CredentialStore};
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_environment::environment::CreateOpts;
+use flotilla_environment::environment::EnvironmentHandle;
+use flotilla_environment::environment::EnvironmentToolAssetKind;
+use flotilla_environment::environment::EnvironmentVariableUpdate;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, EnvironmentId};
 use flotilla_provider_runtime::ChannelLabel;
@@ -70,9 +70,9 @@ impl DockerControllerRuntime {
     pub(super) async fn provider_for_environment(
         &self,
         name: &str,
-        kind: flotilla_core::providers::environment::EnvironmentKind,
-    ) -> Result<Arc<dyn flotilla_core::providers::environment::EnvironmentProvider>, String> {
-        use flotilla_core::providers::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+        kind: flotilla_environment::environment::EnvironmentKind,
+    ) -> Result<Arc<dyn flotilla_environment::environment::EnvironmentProvider>, String> {
+        use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
         let environment = match self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(name).await {
             Ok(environment) => Some(environment),
             Err(ResourceError::NotFound { .. }) => None,
@@ -124,7 +124,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         spec: &EnvironmentSpec,
     ) -> Result<flotilla_controllers::reconcilers::environment::EnvironmentProvisioning, String> {
         use flotilla_controllers::reconcilers::environment::EnvironmentProvisioning;
-        use flotilla_core::providers::environment::EnvironmentKind;
+        use flotilla_environment::environment::EnvironmentKind;
         let kind = EnvironmentKind::of(spec)?;
         if kind == EnvironmentKind::Docker {
             return self.provision(name, spec.docker.as_ref().expect("kind checked")).await.map(EnvironmentProvisioning::Docker);
@@ -176,7 +176,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let credential_refs = credential_refs_from_environment(spec)?;
         let credential_scopes = credential_scopes_from_environment(spec)?;
         let credential_permissions = credential_permissions_from_environment(spec)?;
-        let provider = self.provider_for_environment(name, flotilla_core::providers::environment::EnvironmentKind::Docker).await?;
+        let provider = self.provider_for_environment(name, flotilla_environment::environment::EnvironmentKind::Docker).await?;
 
         let env_id = EnvironmentId::new(name.to_string());
         let mut environment_variables = spec
@@ -296,7 +296,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let prepared = match provider
             .prepare(
                 &EnvironmentSpec { host_direct: None, docker: Some(spec.clone()) },
-                &flotilla_core::providers::environment::PrepareOpts { legacy_baseline, prepared_auth: opts.prepared_auth.clone() },
+                &flotilla_environment::environment::PrepareOpts { legacy_baseline, prepared_auth: opts.prepared_auth.clone() },
             )
             .await
         {
@@ -579,7 +579,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             Some(active) => active.handle.destroy().await?,
             None => {
                 let provider =
-                    self.provider_for_environment(environment_ref, flotilla_core::providers::environment::EnvironmentKind::Docker).await?;
+                    self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentKind::Docker).await?;
                 provider.destroy(container_id).await?;
             }
         }
@@ -592,8 +592,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn destroy_unrecorded(&self, environment_ref: &str) -> Result<(), String> {
-        let provider =
-            self.provider_for_environment(environment_ref, flotilla_core::providers::environment::EnvironmentKind::Docker).await?;
+        let provider = self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentKind::Docker).await?;
         // The record may predate status persistence, or the daemon may have
         // restarted after Docker creation. Mutable mount labels are irrelevant.
         for backing in provider.list_backings().await? {
@@ -608,7 +607,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let resource = self.state.daemon.resource_backend().using::<Environment>(&self.state.namespace).get(environment_ref).await;
         match resource {
             Ok(environment) if environment.spec.host_direct.is_some() => {
-                self.provider_for_environment(environment_ref, flotilla_core::providers::environment::EnvironmentKind::HostDirect)
+                self.provider_for_environment(environment_ref, flotilla_environment::environment::EnvironmentKind::HostDirect)
                     .await?
                     .destroy(environment_ref)
                     .await?;
