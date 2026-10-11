@@ -912,7 +912,7 @@ async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, request: 
     dispatch_request_with_state(daemon, &flotilla_core::agents::shared_in_memory_agent_state_store(), id, request).await
 }
 
-async fn dispatch_request_with_state(
+pub(crate) async fn dispatch_request_with_state(
     daemon: &Arc<InProcessDaemon>,
     agent_state_store: &flotilla_core::agents::SharedAgentStateStore,
     id: u64,
@@ -1321,9 +1321,23 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     ]))
                     .build(),
                 &TerminalSessionSpec {
-                    env_ref: "host-direct".into(),
+                    env_ref: "contained-vessel".into(),
                     role: "coder".into(),
-                    source: TerminalSessionSource::Tool { command: harness_name.into() },
+                    source: TerminalSessionSource::Agent {
+                        selector: Selector::for_capability("coding"),
+                        brief: TerminalBrief {
+                            artifact_digest: None,
+                            path: ".flotilla/briefs/coder.md".into(),
+                            content: "fix".into(),
+                            copies: Vec::new(),
+                        },
+                        context: Box::new(TerminalCrewContext {
+                            namespace: "flotilla".into(),
+                            convoy: convoy_name.clone(),
+                            vessel_ref: "work".into(),
+                        }),
+                        message: None,
+                    },
                     cwd: "/repo".into(),
                     env: Default::default(),
                     pool: "cleat".into(),
@@ -1336,18 +1350,56 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             configured_limits: None,
             session_id: name.clone(),
             pid: None,
-            started_at: chrono::Utc::now(),
-            crew: None,
+            started_at: chrono::Utc::now() - chrono::Duration::minutes(20),
+            crew: Some(
+                CrewSessionStatus::builder().id("crew".into()).adapter(harness_name.into()).stance("trusted-implicit".into()).build(),
+            ),
             launch_command: harness_name.into(),
             delivered_message_id: None,
         }
         .apply(&mut status);
         sessions.update_status(&name, &created.metadata.resource_version, &status).await.expect("running status");
         let store = flotilla_core::agents::shared_in_memory_agent_state_store();
+        if harness_name == "codex" {
+            // Upgrade from a pre-fix notification stored under a random candidate.
+            store.lock().expect("agents").upsert(
+                AttachableId::new("pre-fix-candidate"),
+                AgentEntry {
+                    harness: AgentHarness::Codex,
+                    status: AgentStatus::Idle,
+                    model: None,
+                    session_title: None,
+                    session_id: Some("codex-1".into()),
+                    last_event_epoch_secs: 1,
+                },
+            );
+            let response = dispatch_request_with_state(
+                &daemon,
+                &store,
+                8,
+                Request::AgentHook {
+                    event: AgentHookEvent::builder()
+                        .attachable_id(flotilla_core::agents::allocate_attachable_id())
+                        .harness(AgentHarness::Codex)
+                        .event_type(AgentEventType::NoChange)
+                        .session_id("codex-1".into())
+                        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() })
+                        .build(),
+                },
+            )
+            .await;
+            assert!(matches!(ok_response(response, 8), Response::AgentHook));
+            assert!(
+                store.lock().expect("agents").get(&AttachableId::new("pre-fix-candidate")).is_some(),
+                "unknown notifications must not mutate the registry"
+            );
+        }
         let (_, parser) = flotilla_core::agents::parser_for_harness(harness_name).expect("parser");
-        for (event_type, payload, expected) in
-            [(active_event, active_payload, TerminalAttentionState::Working), (idle_event, idle_payload, TerminalAttentionState::Idle)]
-        {
+        for (event_type, payload, expected) in [
+            (active_event, active_payload, TerminalAttentionState::Working),
+            (idle_event, idle_payload, TerminalAttentionState::Idle),
+            (idle_event, idle_payload, TerminalAttentionState::Idle),
+        ] {
             if harness_name == "codex" && expected == TerminalAttentionState::Working {
                 let current = sessions.get(&name).await.expect("terminal for screen observation");
                 let mut status = current.status.expect("running status");
@@ -1368,7 +1420,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     8,
                     Request::AgentHook {
                         event: AgentHookEvent::builder()
-                            .attachable_id(AttachableId::new(name.clone()))
+                            .attachable_id(flotilla_core::agents::allocate_attachable_id())
                             .harness(harness.clone())
                             .event_type(parsed.event_type)
                             .maybe_session_id(parsed.session_id)
@@ -1378,6 +1430,12 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 )
                 .await;
                 assert!(matches!(ok_response(response, 8), Response::AgentHook));
+            }
+            if harness_name == "codex" && expected == TerminalAttentionState::Idle {
+                let agents = store.lock().expect("agents");
+                let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
+                assert_eq!(agents.lookup_by_session_id("codex-1"), Some(&flotilla_core::attachable::codex_hook_id(None, Some(&terminal))));
+                assert_eq!(agents.list_agents().len(), 1, "repeated notify events must not orphan identities");
             }
             let observed = sessions.get(&name).await.expect("observed terminal");
             let attention = observed.status.and_then(|status| status.attention).expect("attention");
@@ -1393,8 +1451,10 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             let obligation = convoy_status.nudge_obligations.first().expect("actor obligation");
             if source == flotilla_resources::TerminalAttentionSource::Hook {
                 assert_eq!(obligation.last_hook_at, Some(attention.as_of));
+                assert!(convoy_status.attention.is_none(), "attributed idle hooks clear the no-hook advisory");
             } else {
                 assert!(obligation.last_hook_at.is_none(), "screen evidence must not masquerade as a hook");
+                assert_eq!(convoy_status.attention.as_ref().map(|a| a.source.as_str()), Some("missing-turn-hook"));
             }
         }
     }

@@ -377,6 +377,37 @@ pub struct TerminalSessionDegradedCondition {
 }
 
 impl TerminalSessionStatus {
+    /// Codex notify supplies only turn-complete (Idle), so every newer
+    /// completion timestamp is evidence even inside the screen debounce window.
+    pub fn should_record_attention(&self, incoming: &TerminalAttention) -> bool {
+        self.attention.as_ref().is_none_or(|previous| {
+            previous.should_replace_with(incoming)
+                || (self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")
+                    && incoming.source == TerminalAttentionSource::Hook
+                    && incoming.state == TerminalAttentionState::Idle
+                    && incoming.as_of > previous.as_of)
+        })
+    }
+
+    /// Temporary terminal-evidence policy until AgentSession owns channel receipts.
+    /// Callers also verify the recorded process and crew generation. Screen Idle
+    /// and other harnesses' Idle events do not prove a submitted Codex turn ended.
+    /// Hook timestamps come from the receiving daemon, not the contained crew.
+    /// Future observations (for example after a clock rollback) remain ineligible
+    /// until the daemon clock catches up, and must still satisfy freshness then.
+    pub fn codex_completed_after(&self, submitted_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        self.phase == TerminalSessionPhase::Running
+            && self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")
+            && self.started_at.is_some_and(|started| submitted_at >= started)
+            && self.attention.as_ref().is_some_and(|attention| {
+                attention.source == TerminalAttentionSource::Hook
+                    && attention.state == TerminalAttentionState::Idle
+                    && attention.as_of > submitted_at
+                    && attention.as_of <= now
+                    && !attention.is_stale_at(now)
+            })
+    }
+
     /// Count the next failed attempt for this message, retaining a saturated
     /// ceiling. A different message starts a fresh delivery budget.
     pub fn next_delivery_failure_count(&self, message_id: &str) -> u32 {
@@ -706,7 +737,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 Self::ObserveAttention { attention: attention.clone() }.apply(status);
             }
             Self::ObserveAttention { attention } => {
-                let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
+                let replace = status.should_record_attention(attention);
                 if replace {
                     status.attention = Some(attention.clone());
                 }
@@ -724,7 +755,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     }
                 }
                 if let Some(attention) = attention {
-                    let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
+                    let replace = status.should_record_attention(attention);
                     if replace {
                         status.attention = Some(attention.clone());
                     }
@@ -816,6 +847,76 @@ mod tests {
         assert!(message.following.is_empty());
         let written = serde_json::to_value(message).expect("serialize current message");
         assert_eq!(written["following"], serde_json::json!([]));
+    }
+
+    // #3028: each Codex completion is new evidence, even inside the five-second
+    // debounce window. Only fresh post-submission hooks on a live Codex crew count.
+    #[hegel::test]
+    fn codex_completion_keeps_each_timestamp_and_respects_acceptance_boundaries(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let start = Utc.with_ymd_and_hms(2026, 10, 11, 12, 0, 0).single().expect("time");
+        let mut at = start;
+        let mut status = TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            started_at: Some(start),
+            crew: Some(CrewSessionStatus::builder().id("crew".into()).adapter("codex".into()).stance("trusted-implicit".into()).build()),
+            ..Default::default()
+        };
+        // Generate repeated completion events 1..4ms apart, interleaved with
+        // duplicate hooks and screen Idle observations through both patch paths.
+        for _ in 0..tc.draw(gs::integers::<usize>().min_value(2).max_value(6)) {
+            let submitted_at = at;
+            at += chrono::Duration::milliseconds(tc.draw(gs::integers::<i64>().min_value(1).max_value(4)));
+            let hook = TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: at };
+            let patch = if tc.draw(gs::booleans()) {
+                TerminalSessionStatusPatch::ObserveAttention { attention: hook.clone() }
+            } else {
+                TerminalSessionStatusPatch::Observe {
+                    attention: Some(hook.clone()),
+                    occupancy: TerminalOccupancy::Vacant,
+                    output_digest: None,
+                    observed_at: at,
+                }
+            };
+            patch.apply(&mut status);
+            patch.apply(&mut status);
+            assert_eq!(status.attention.as_ref(), Some(&hook), "duplicates preserve the latest completion");
+            assert!(status.codex_completed_after(submitted_at, at), "the next completion settles a hold");
+            assert!(!status.codex_completed_after(at, at), "a completion at submission is not following evidence");
+            assert!(
+                !status.codex_completed_after(submitted_at, at - chrono::Duration::milliseconds(1)),
+                "future hooks are not current evidence"
+            );
+            assert!(!status.codex_completed_after(submitted_at, at + TerminalAttention::FRESH_FOR), "expired hooks do not settle holds");
+            TerminalSessionStatusPatch::ObserveAttention {
+                attention: TerminalAttention {
+                    source: TerminalAttentionSource::Screen,
+                    as_of: at + chrono::Duration::milliseconds(1),
+                    ..hook.clone()
+                },
+            }
+            .apply(&mut status);
+            assert_eq!(status.attention.as_ref(), Some(&hook), "idle screen refreshes cannot erase hook evidence");
+            let mut other = status.clone();
+            other.crew.as_mut().expect("crew").adapter = "claude-code".into();
+            assert!(!other.codex_completed_after(submitted_at, at), "Claude Idle keeps its existing acceptance policy");
+            other.crew = None;
+            assert!(!other.codex_completed_after(submitted_at, at), "unmanaged terminals cannot settle a crew hold");
+            let mut stopped = status.clone();
+            stopped.phase = TerminalSessionPhase::Stopped;
+            assert!(!stopped.codex_completed_after(submitted_at, at), "stopped receivers cannot settle holds");
+            let mut restarted = status.clone();
+            restarted.started_at = Some(at);
+            assert!(!restarted.codex_completed_after(submitted_at, at), "a new launch cannot acknowledge old input");
+            for state in [TerminalAttentionState::Working, TerminalAttentionState::NeedsInput, TerminalAttentionState::Unobservable] {
+                let mut other = status.clone();
+                other.attention.as_mut().expect("attention").state = state;
+                assert!(!other.codex_completed_after(submitted_at, at), "only a completion is completion evidence");
+            }
+            let mut screen = status.clone();
+            screen.attention.as_mut().expect("attention").source = TerminalAttentionSource::Screen;
+            assert!(!screen.codex_completed_after(submitted_at, at), "screen Idle is not a completion");
+        }
     }
 
     fn attention(state: TerminalAttentionState, source: TerminalAttentionSource, second: u32) -> TerminalAttention {

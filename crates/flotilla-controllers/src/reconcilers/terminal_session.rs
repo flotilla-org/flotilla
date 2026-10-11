@@ -1019,6 +1019,9 @@ fn held_delivery_consumed(
     held_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> bool {
+    if status.codex_completed_after(held_at, now) {
+        return true;
+    }
     let working = |attention: &TerminalAttention| {
         attention.state == TerminalAttentionState::Working && attention.as_of > held_at && !attention.is_stale_at(now)
     };

@@ -43,12 +43,16 @@ BYOC).
 
 ### Environment Variable Injection
 
-Hooks accept `FLOTILLA_ATTACHABLE_ID` as an optional existing identity; otherwise the
-CLI allocates a UUID and the daemon reuses the persisted session-to-identity mapping.
-The AttachableStore and personal-terminal injection path have been retired.
-
 Managed crew sessions supply `FLOTILLA_NAMESPACE` and `FLOTILLA_TERMINAL_SESSION`
-to identify their TerminalSession. `FLOTILLA_DAEMON_SOCKET` identifies the daemon socket.
+to identify their TerminalSession. Codex hooks derive the temporary attachable ID
+from that namespace-qualified reference. Daemon dispatch applies the same rule to
+older notify clients that send a fresh UUID, replacing a prior native-session
+mapping with the managed identity. This shim remains until AgentSession replaces it.
+
+Unmanaged hooks accept `FLOTILLA_ATTACHABLE_ID` as an optional existing identity;
+otherwise the CLI allocates a candidate UUID and the daemon reuses the persisted
+native-session mapping. The AttachableStore and personal-terminal injection path
+have been retired. `FLOTILLA_DAEMON_SOCKET` identifies the daemon socket.
 
 ### Hook Command and Event Flow
 
@@ -77,8 +81,8 @@ trait HarnessHookParser {
 }
 ```
 
-**Unmanaged terminal handling:** When `FLOTILLA_ATTACHABLE_ID` is absent (agent running in
-a terminal flotilla didn't launch — common when hooks are installed globally):
+**Unmanaged terminal handling:** When neither a managed Codex terminal reference nor
+`FLOTILLA_ATTACHABLE_ID` is present (common when hooks are installed globally):
 1. The CLI allocates a candidate attachable ID.
 2. The daemon stores a `session_id → attachable_id` mapping in AgentStateStore.
 3. For subsequent hooks the daemon reuses the mapped identity for the stdin `session_id`.

@@ -465,8 +465,16 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
-    async fn handle_agent_hook(&self, event: AgentHookEvent) -> Result<(), String> {
+    async fn handle_agent_hook(&self, mut event: AgentHookEvent) -> Result<(), String> {
         use flotilla_protocol::AgentEventType;
+
+        // Older notify clients allocate a candidate UUID on every invocation.
+        // The managed TerminalSession, rather than that candidate or a legacy
+        // native-session index entry, owns Codex hook attribution.
+        let managed_codex = event.harness == flotilla_protocol::AgentHarness::Codex && event.terminal.is_some();
+        if managed_codex {
+            event.attachable_id = flotilla_core::attachable::codex_hook_id(None, event.terminal.as_ref());
+        }
 
         tracing::info!(
             harness = ?event.harness,
@@ -480,7 +488,16 @@ impl<'a> RequestDispatcher<'a> {
             let mut store = self.agent_state_store.lock().map_err(|_| "agent state store lock poisoned".to_string())?;
 
             let attachable_id = if let Some(ref sid) = event.session_id {
-                if let Some(existing) = store.lookup_by_session_id(sid) {
+                if managed_codex {
+                    // Fold a pre-fix unmanaged candidate into the managed shim.
+                    // Unknown notifications are NoChange and must leave the registry intact.
+                    if event.event_type != AgentEventType::NoChange {
+                        if let Some(existing) = store.lookup_by_session_id(sid).cloned().filter(|id| id != &event.attachable_id) {
+                            store.remove(&existing);
+                        }
+                    }
+                    event.attachable_id.clone()
+                } else if let Some(existing) = store.lookup_by_session_id(sid) {
                     existing.clone()
                 } else {
                     event.attachable_id.clone()
@@ -532,11 +549,7 @@ impl<'a> RequestDispatcher<'a> {
             source: flotilla_resources::TerminalAttentionSource::Hook,
         };
         if event.event_type != AgentEventType::ToolActive
-            && session
-                .status
-                .as_ref()
-                .and_then(|status| status.attention.as_ref())
-                .is_some_and(|current| !current.should_replace_with(&attention))
+            && session.status.as_ref().is_some_and(|status| !status.should_record_attention(&attention))
         {
             return Ok(());
         }
