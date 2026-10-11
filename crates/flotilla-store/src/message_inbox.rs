@@ -202,7 +202,92 @@ pub struct MessageReceiverSnapshot {
 }
 
 impl MessageReceiverSnapshot {
+    /// Load exactly the receivers named by a request, reading each holder kind once.
+    pub async fn load_for_addresses(backend: &ResourceBackend, namespace: &str, addresses: &[String]) -> Result<Self, ResourceError> {
+        let mut convoy_names = std::collections::BTreeSet::new();
+        let mut ensure_queries = Vec::new();
+        let mut adopted_queries = Vec::new();
+        for address in addresses {
+            validate_message_address(address)?;
+            let parts: Vec<_> = address.split('/').collect();
+            match parts.as_slice() {
+                [_, convoy, vessel, role] => {
+                    adopted_queries.push(crate::StoreQuery::labels(
+                        &BTreeMap::from([
+                            (CONVOY_LABEL.into(), (*convoy).into()),
+                            (VESSEL_LABEL.into(), (*vessel).into()),
+                            (ROLE_LABEL.into(), (*role).into()),
+                        ]),
+                        false,
+                        true,
+                    ));
+                    convoy_names.insert((*convoy).to_string());
+                }
+                [project, role] => {
+                    ensure_queries.push(crate::StoreQuery {
+                        fields: BTreeMap::from([("spec.project_ref".into(), (*project).into()), ("spec.role".into(), (*role).into())]),
+                        ..Default::default()
+                    });
+                    adopted_queries.push(crate::StoreQuery {
+                        fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/role-address\"".into(), address.clone())]),
+                        ..Default::default()
+                    });
+                }
+                _ => {}
+            }
+        }
+        let ensures = if ensure_queries.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .query_declared::<ConvoyEnsure>(
+                    namespace,
+                    &crate::StoreQuery { any_of: Some(ensure_queries), include_replicas: true, ..Default::default() },
+                )
+                .await?
+                .items
+        };
+        let standing_convoys = ensures
+            .iter()
+            .filter_map(|ensure| ensure.object.status.as_ref()?.convoy_ref.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        convoy_names.extend(standing_convoys.iter().cloned());
+        let convoys = if convoy_names.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .query_declared::<Convoy>(
+                    namespace,
+                    &crate::StoreQuery {
+                        field_values: BTreeMap::from([("metadata.name".into(), convoy_names.iter().cloned().collect())]),
+                        include_replicas: true,
+                        ..Default::default()
+                    },
+                )
+                .await?
+                .items
+        };
+        adopted_queries.extend(
+            standing_convoys
+                .into_iter()
+                .map(|name| crate::StoreQuery { labels: BTreeMap::from([(CONVOY_LABEL.into(), name)]), ..Default::default() }),
+        );
+        let terminals = if adopted_queries.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .query_declared::<TerminalSession>(
+                    namespace,
+                    &crate::StoreQuery { any_of: Some(adopted_queries), include_replicas: true, ..Default::default() },
+                )
+                .await?
+                .items
+        };
+        Self::load_with_ensures(backend, namespace, convoys, terminals, ensures).await
+    }
+
     pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
+        // Batch reconciliation needs every receiver holder in the namespace.
         let convoys = backend.including_replicas::<Convoy>(namespace).list().await?.items;
         let terminals = backend.including_replicas::<TerminalSession>(namespace).list().await?.items;
         Self::load_from_observations(backend, namespace, convoys, terminals).await
@@ -215,11 +300,24 @@ impl MessageReceiverSnapshot {
         convoys: Vec<crate::ReadResourceObject<Convoy>>,
         terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
     ) -> Result<Self, ResourceError> {
+        // A full observation batch resolves every standing-role declaration.
         let ensures = backend.including_replicas::<ConvoyEnsure>(namespace).list().await?.items;
+        Self::load_with_ensures(backend, namespace, convoys, terminals, ensures).await
+    }
+
+    async fn load_with_ensures(
+        backend: &ResourceBackend,
+        namespace: &str,
+        convoys: Vec<crate::ReadResourceObject<Convoy>>,
+        terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
+        ensures: Vec<crate::ReadResourceObject<ConvoyEnsure>>,
+    ) -> Result<Self, ResourceError> {
         let mut projects = BTreeMap::new();
         let mut fleet = None;
         let mut defaults = Vec::new();
         if terminals.iter().any(|holder| holder.object.metadata.annotations.contains_key(ROLE_ADDRESS_ANNOTATION)) {
+            // Adoptable-role validation resolves the complete Project parent hierarchy
+            // and defaults cascade; both sides are read once for this batch.
             projects = backend
                 .definitions::<Project>(namespace)
                 .list()
@@ -371,5 +469,5 @@ pub async fn resolve_message_receiver(
     address: &str,
 ) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
     validate_message_address(address)?;
-    MessageReceiverSnapshot::load(backend, namespace).await?.resolve_validated(address)
+    MessageReceiverSnapshot::load_for_addresses(backend, namespace, &[address.to_string()]).await?.resolve_validated(address)
 }

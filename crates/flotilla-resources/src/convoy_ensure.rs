@@ -15,7 +15,8 @@ define_resource!(
     ConvoyEnsureSpec,
     ConvoyEnsureStatus,
     ConvoyEnsureStatusPatch,
-    replication = ReplicationClass::Definitions
+    replication = ReplicationClass::Definitions,
+    queryable = &["metadata.name", "spec.project_ref", "spec.role"]
 );
 
 /// Desired state for one standing convoy.

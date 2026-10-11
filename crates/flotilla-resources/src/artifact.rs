@@ -16,6 +16,7 @@ impl Resource for Artifact {
     type StatusPatch = ArtifactStatusPatch;
 
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "artifacts", kind: "Artifact" };
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "spec.convoy"];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
 
     fn validate_spec_update(current: &ArtifactSpec, requested: &ArtifactSpec) -> Result<(), ResourceError> {

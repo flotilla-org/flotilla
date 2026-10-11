@@ -92,6 +92,148 @@ async fn seed(backend: &ResourceBackend) {
     backend.replace_replicas_typed::<Convoy>(&NodeId::new("local"), "flotilla", &listed, chrono::Utc::now(), None).await.unwrap();
 }
 async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
+    // Finite sets and alternatives are indexed selections: duplicates never
+    // multiply rows, empty alternatives select nothing, and outer predicates
+    // still intersect the union. The same contract runs over every adapter.
+    for (alternatives, expected) in [(vec![], vec![]), (vec!["a", "a", "b"], vec!["a", "b"])] {
+        let observed = backend.clone().with_read_counts();
+        let query = StoreQuery {
+            any_of: Some(
+                alternatives
+                    .into_iter()
+                    .map(|name| StoreQuery { fields: BTreeMap::from([("metadata.name".into(), name.into())]), ..Default::default() })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let result = observed.query_declared::<Convoy>("flotilla", &query).await.unwrap();
+        assert_eq!(result.items.iter().map(|source| source.object.metadata.name.as_str()).collect::<Vec<_>>(), expected);
+        assert_eq!(observed.read_counts().get("Convoy"), Some(&expected.len()));
+        assert_eq!(observed.read_calls().get("Convoy"), Some(&1));
+    }
+    for (values, expected) in [(vec![], 0), (vec!["a", "a", "missing"], 1), (vec!["a", "b"], 2)] {
+        let query = StoreQuery {
+            field_values: BTreeMap::from([("metadata.name".into(), values.into_iter().map(String::from).collect())]),
+            ..Default::default()
+        };
+        assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), expected);
+    }
+    // Prefixes are literal (not SQL LIKE patterns), combine with labels and
+    // respect namespace isolation and unfiltered local replica shadowing.
+    let query = StoreQuery {
+        label_prefixes: BTreeMap::from([("literal".into(), "a+".into())]),
+        field_prefixes: BTreeMap::from([("metadata.name".into(), "a".into())]),
+        ..Default::default()
+    };
+    assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 1);
+    assert!(backend.query_declared::<Convoy>("other", &query).await.unwrap().items.is_empty());
+    let alternatives = vec![StoreQuery {
+        field_values: BTreeMap::from([("metadata.name".into(), vec!["shadow".into(), "remote".into()])]),
+        ..Default::default()
+    }];
+    for (suppress, expected) in [(true, 2), (false, 3)] {
+        let query =
+            StoreQuery { any_of: Some(alternatives.clone()), include_replicas: true, suppress_self_origin: suppress, ..Default::default() };
+        assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), expected);
+    }
+    // Collection membership selects Project charters before decoding, and
+    // writes remove obsolete membership entries without rewriting stored bodies.
+    use flotilla_resources::{
+        Project, ProjectRepositorySpec, ProjectSpec, RepositoryKey, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    };
+    let projects = authority.using::<Project>("flotilla");
+    let member = |repo: &str| ProjectRepositorySpec::builder().repo(RepositoryKey(repo.into())).build();
+    let spec = ProjectSpec::builder().display_name("project".into()).repositories(vec![member("target"), member("other")]).build();
+    let project = projects.create(&InputMeta::builder().name("membership".into()).build(), &spec).await.unwrap();
+    let query = StoreQuery { fields: BTreeMap::from([("spec.repositories[].repo".into(), "target".into())]), ..Default::default() };
+    assert_eq!(backend.definitions::<Project>("flotilla").query_declared(&query).await.unwrap().len(), 1);
+    let observed = backend.clone().with_read_counts();
+    assert_eq!(observed.query_declared::<Project>("flotilla", &query).await.unwrap().items.len(), 1);
+    assert_eq!(observed.read_counts().get("Project"), Some(&1));
+    let mut next = spec;
+    next.repositories = vec![member("other")];
+    projects.update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &next).await.unwrap();
+    assert!(backend.query_declared::<Project>("flotilla", &query).await.unwrap().items.is_empty());
+    // Hydration includes nonmatching siblings so the selected definition agrees
+    // with ordinary causal merge, including a remote membership replacement.
+    let peer = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("membership-peer"));
+    peer.definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("membership".into()).build(),
+            &ProjectSpec::builder().display_name("peer".into()).repositories(vec![member("target")]).build(),
+        )
+        .await
+        .unwrap();
+    let peer_rows = peer.using::<Project>("flotilla").list().await.unwrap();
+    authority
+        .replace_replicas_typed::<Project>(&NodeId::new("membership-peer"), "flotilla", &peer_rows, chrono::Utc::now(), None)
+        .await
+        .unwrap();
+    let observed = backend.clone().with_read_counts();
+    let selected = observed.definitions::<Project>("flotilla").query_declared(&query).await.unwrap();
+    let expected = authority
+        .definitions::<Project>("flotilla")
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|project| project.spec.repositories.iter().any(|member| member.repo.0 == "target"))
+        .map(|project| project.metadata.name)
+        .collect::<Vec<_>>();
+    assert_eq!(selected.into_iter().map(|project| project.metadata.name).collect::<Vec<_>>(), expected);
+    assert_eq!(observed.read_calls().get("Project"), Some(&1));
+    assert_eq!(observed.read_counts().get("Project"), Some(&2), "every sibling of the selected name is hydrated");
+    authority
+        .replace_replicas_typed::<Project>(
+            &NodeId::new("membership-peer"),
+            "flotilla",
+            &flotilla_resources::ResourceList { items: vec![], resource_version: "0".into(), generation: None },
+            chrono::Utc::now(),
+            None,
+        )
+        .await
+        .unwrap();
+    projects.delete("membership").await.unwrap();
+    assert!(backend
+        .definitions::<Project>("flotilla")
+        .query_declared(&StoreQuery { fields: BTreeMap::from([("spec.repositories[].repo".into(), "other".into())]), ..Default::default() })
+        .await
+        .unwrap()
+        .is_empty());
+    // Quoted components address literal annotation keys, including dots and
+    // slashes. Presence excludes missing/null fields and sees object values.
+    let terminals = authority.using::<TerminalSession>("flotilla");
+    let mut meta = InputMeta::builder().name("claimed".into()).build();
+    meta.annotations.insert(flotilla_resources::ROLE_ADDRESS_ANNOTATION.into(), "flotilla/coder".into());
+    let terminal = terminals
+        .create(
+            &meta,
+            &TerminalSessionSpec::builder()
+                .env_ref("env".into())
+                .role("coder".into())
+                .source(TerminalSessionSource::Tool { command: "sh".into() })
+                .cwd("/work".into())
+                .pool("pool".into())
+                .build(),
+        )
+        .await
+        .unwrap();
+    // Fleet environment aliases use a declared field across every adapter.
+    let environment_query = StoreQuery { fields: BTreeMap::from([("spec.env_ref".into(), "env".into())]), ..Default::default() };
+    assert_eq!(backend.query_declared::<TerminalSession>("flotilla", &environment_query).await.unwrap().items.len(), 1);
+    let query = StoreQuery {
+        fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/role-address\"".into(), "flotilla/coder".into())]),
+        present: vec!["spec.source.context.convoy".into()],
+        ..Default::default()
+    };
+    assert!(backend.query_declared::<TerminalSession>("flotilla", &query).await.unwrap().items.is_empty());
+    let query = StoreQuery { present: vec!["metadata.annotations.\"flotilla.work/role-address\"".into()], ..Default::default() };
+    assert_eq!(backend.query_declared::<TerminalSession>("flotilla", &query).await.unwrap().items.len(), 1);
+    let mut next_meta = InputMeta::from(&terminal.metadata);
+    next_meta.annotations.clear();
+    terminals.update(&next_meta, &terminal.metadata.resource_version, &terminal.spec).await.unwrap();
+    assert!(backend.query_declared::<TerminalSession>("flotilla", &query).await.unwrap().items.is_empty());
+
     // Equality predicates combine with AND; empty selections return all local rows.
     let query = StoreQuery::default();
     assert_eq!(backend.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 3);

@@ -2452,3 +2452,147 @@ async fn missing_condition_receipt_exhausts_bounded_retries_without_input() {
         ControllerRetryDisposition::Terminal { .. }
     ));
 }
+
+// #3042: a receiver batch reads each named holder kind once; adding unrelated
+// convoys, messages, terminals and ensures cannot increase decoding or calls.
+#[tokio::test]
+async fn addressed_receiver_reads_ignore_unrelated_holders() {
+    use flotilla_resources::{
+        Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    };
+    use flotilla_store::{resolve_message_receiver, MessageReceiverSnapshot};
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    use std::collections::BTreeMap;
+    for sqlite in [false, true] {
+        let mut samples = Vec::new();
+        for unrelated in [0, 48] {
+            let backend = if sqlite {
+                ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))
+            } else {
+                ResourceBackend::new(InMemoryBackend::default())
+            }
+            .with_read_counts();
+            for n in 0..=unrelated {
+                let name = if n == 0 { "convoy".into() } else { format!("unrelated-{n}") };
+                backend
+                    .using::<Convoy>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(name.clone()).build(),
+                        &ConvoySpec::builder()
+                            .workflow_ref("workflow".into())
+                            .project_ref("flotilla".into())
+                            .role(if n == 0 { "coder".into() } else { "other".into() })
+                            .build(),
+                    )
+                    .await
+                    .expect("convoy");
+                let terminal = if n == 0 { "terminal".into() } else { format!("terminal-{n}") };
+                backend
+                    .using::<TerminalSession>("flotilla")
+                    .create(
+                        &InputMeta::builder()
+                            .name(terminal)
+                            .labels(BTreeMap::from([
+                                (CONVOY_LABEL.into(), name.clone()),
+                                (ROLE_LABEL.into(), "coder".into()),
+                                (VESSEL_LABEL.into(), "work".into()),
+                            ]))
+                            .build(),
+                        &holder_spec(&name),
+                    )
+                    .await
+                    .expect("holder");
+                let ensure_name = if n == 0 { "ensure".into() } else { format!("ensure-{n}") };
+                let ensures = backend.using::<ConvoyEnsure>("flotilla");
+                ensures
+                    .create(
+                        &InputMeta::builder().name(ensure_name.clone()).build(),
+                        &ConvoyEnsureSpec::builder()
+                            .project_ref("flotilla".into())
+                            .role(if n == 0 { "coder".into() } else { format!("other-{n}") })
+                            .repositories(vec![])
+                            .build(),
+                    )
+                    .await
+                    .expect("ensure");
+                let ensure = ensures.get(&ensure_name).await.expect("local ensure version");
+                ensures
+                    .update_status(
+                        &ensure_name,
+                        &ensure.metadata.resource_version,
+                        &ConvoyEnsureStatus { convoy_ref: Some(name), ..Default::default() },
+                    )
+                    .await
+                    .expect("ensure status");
+                if n > 0 {
+                    backend
+                        .using::<Message>("flotilla")
+                        .create(&InputMeta::builder().name(format!("message-{n}")).build(), &spec(None, MessageExpectation::Reply))
+                        .await
+                        .expect("noise message");
+                }
+            }
+            let before_calls = backend.read_calls();
+            let before_objects = backend.read_counts();
+            let snapshot = MessageReceiverSnapshot::load_for_addresses(
+                &backend,
+                "flotilla",
+                &["flotilla/convoy/work/coder".into(), "flotilla/coder".into()],
+            )
+            .await
+            .expect("targeted snapshot");
+            for address in ["flotilla/convoy/work/coder", "flotilla/coder"] {
+                assert_eq!(snapshot.resolve(address).expect("resolve").expect("holder").object.metadata.name, "terminal");
+            }
+            let calls = backend.read_calls();
+            let objects = backend.read_counts();
+            let delta = |after: &BTreeMap<String, usize>, before: &BTreeMap<String, usize>, kind: &str| {
+                after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default()
+            };
+            let counts = ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"]
+                .map(|kind| (delta(&calls, &before_calls, kind), delta(&objects, &before_objects, kind)));
+            assert_eq!(counts, [(1, 1), (1, 1), (1, 1), (0, 0)]);
+            samples.push(counts);
+            // A four-part address selects its crew, even when the named convoy
+            // contains other sessions. It does not need standing-role holders.
+            backend
+                .using::<TerminalSession>("flotilla")
+                .create(
+                    &InputMeta::builder()
+                        .name("other-crew".into())
+                        .labels(BTreeMap::from([
+                            (CONVOY_LABEL.into(), "convoy".into()),
+                            (ROLE_LABEL.into(), "reviewer".into()),
+                            (VESSEL_LABEL.into(), "work".into()),
+                        ]))
+                        .build(),
+                    &holder_spec("convoy"),
+                )
+                .await
+                .expect("other crew");
+            let before_calls = backend.read_calls();
+            let before_objects = backend.read_counts();
+            assert_eq!(
+                resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder")
+                    .await
+                    .expect("explicit receiver")
+                    .expect("holder")
+                    .object
+                    .metadata
+                    .name,
+                "terminal"
+            );
+            let calls = backend.read_calls();
+            let objects = backend.read_counts();
+            assert_eq!(
+                ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"]
+                    .map(|kind| (delta(&calls, &before_calls, kind), delta(&objects, &before_objects, kind))),
+                [(1, 1), (1, 1), (0, 0), (0, 0)]
+            );
+            let before = backend.read_calls();
+            assert!(resolve_message_receiver(&backend, "flotilla", "principal:operator").await.expect("principal").is_none());
+            assert_eq!(backend.read_calls(), before, "principal addresses never load agent holders");
+        }
+        assert_eq!(samples[0], samples[1]);
+    }
+}

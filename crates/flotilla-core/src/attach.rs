@@ -20,7 +20,7 @@ use flotilla_resources::{
     Environment as ResourceEnvironment, Project, ResourceProvenance, TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL,
     VESSEL_LABEL, VESSEL_REF_LABEL,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, StoreQuery};
 use sha2::{Digest, Sha256};
 
 use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
@@ -78,25 +78,7 @@ impl<'a> AttachResolver<'a> {
         mode: AttachMode,
         project_context: Option<&str>,
     ) -> Result<ResolvedAttach, String> {
-        let mut resolved = self.resolve_attach_with_context(reference, host, transient, mode, project_context).await?;
-        if let Some(binding) = resolved.binding.as_mut() {
-            if let Some(convoy_name) = &binding.convoy {
-                let namespace = self.provisioning_namespace().await;
-                let convoys = self
-                    .resource_backend
-                    .including_replicas::<ResourceConvoy>(&namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                binding.convoy_phase = convoys
-                    .items
-                    .into_iter()
-                    .find(|source| source.object.metadata.name == *convoy_name)
-                    .and_then(|source| source.object.status)
-                    .map(|status| attach_convoy_phase(status.phase));
-            }
-        }
-        Ok(resolved)
+        self.resolve_attach_with_context(reference, host, transient, mode, project_context).await
     }
 
     pub(super) async fn resolve_transient(&self, reference: &str, host: Option<&HostName>) -> Result<ResolvedAttach, String> {
@@ -110,7 +92,7 @@ impl<'a> AttachResolver<'a> {
         if references.is_empty() {
             return Ok(HashSet::new());
         }
-        let index = self.attach_candidate_index().await?;
+        let index = self.attach_candidate_index(references).await?;
         let mut resolved = HashSet::new();
         for reference in references {
             if index.resolve(self, reference, None, false, AttachMode::Default).await.is_ok() {
@@ -121,7 +103,7 @@ impl<'a> AttachResolver<'a> {
     }
 
     pub(super) async fn resolvable_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
-        let index = self.attach_candidate_index().await?;
+        let index = self.attach_candidate_index(&targets.iter().map(|(reference, _)| reference.clone()).collect::<Vec<_>>()).await?;
         let mut resolved = Vec::with_capacity(targets.len());
         for (reference, host) in targets {
             resolved.push(index.resolve(self, reference, Some(host), false, AttachMode::Default).await.is_ok());
@@ -155,11 +137,17 @@ impl<'a> AttachResolver<'a> {
                 ))
             };
         };
-        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let mut matches = projects
-            .into_iter()
-            .filter(|project| project.spec.repositories.iter().any(|repository| repository.repo == repository_key))
-            .collect::<Vec<_>>();
+        let projects = self
+            .resource_backend
+            .definitions::<Project>(&namespace)
+            .query_declared(&StoreQuery {
+                fields: BTreeMap::from([("spec.repositories[].repo".into(), repository_key.to_string())]),
+                include_replicas: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut matches = projects;
         let repository_key = repository_key.to_string();
         let mut declaration_matches = matches
             .iter()
@@ -176,58 +164,40 @@ impl<'a> AttachResolver<'a> {
         Ok(matches.as_slice().first().filter(|_| matches.len() == 1).map(|project| project.metadata.name.clone()))
     }
 
-    async fn resolve_live_convoy_record(&self, reference: &str, project_context: Option<&str>) -> Result<Option<LiveConvoyRecord>, String> {
+    async fn resolve_live_convoy_record(
+        &self,
+        reference: &str,
+        project_context: Option<&str>,
+        observations: &AttachCandidateIndex,
+    ) -> Result<Option<LiveConvoyRecord>, String> {
         let explicit = reference.contains('@');
         let requested = if explicit {
             Some(RoleAddress::from_str(reference)?)
         } else {
             project_context.map(|project| RoleAddress { project: project.to_string(), role: reference.to_string() })
         };
-        let namespace = self.provisioning_namespace().await;
-        let sources =
-            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let has_role = sources.items.iter().any(|source| source.object.spec.role == reference);
+        let sources = &observations.convoys;
+        let has_role = sources.iter().any(|source| source.object.spec.role == reference);
         if !explicit && requested.is_none() && !has_role {
             return Ok(None);
         }
 
         let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
-        let matching_convoy_exists = sources.items.iter().any(|source| {
+        let matching_convoy_exists = sources.iter().any(|source| {
             source.object.spec.role == role
                 && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
         });
-        let durable_sessions = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
-        let observed_sessions = self
-            .observed_resource_backend
-            .clone()
-            .including_replicas::<ResourceTerminalSession>(&namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
+        let durable_sessions = &observations.sessions;
         let mut sessions_by_convoy = HashMap::<String, Vec<_>>::new();
-        for source in durable_sessions.items {
+        for source in durable_sessions {
             if source.object.status.as_ref().and_then(|status| status.session_id.as_ref()).is_some() {
                 if let Some(convoy) = source.object.metadata.labels.get(CONVOY_LABEL).cloned() {
-                    sessions_by_convoy.entry(convoy).or_default().push((source.object, source.provenance));
-                }
-            }
-        }
-        for source in observed_sessions.items {
-            let session = source.object;
-            if session.status.as_ref().and_then(|status| status.session_id.as_ref()).is_some() {
-                if let Some(convoy) = session.metadata.labels.get(CONVOY_LABEL).cloned() {
-                    sessions_by_convoy.entry(convoy).or_default().push((session, source.provenance));
+                    sessions_by_convoy.entry(convoy).or_default().push((&source.object, &source.provenance));
                 }
             }
         }
         let mut candidates = sources
-            .items
-            .into_iter()
+            .iter()
             .filter(|source| {
                 source.object.spec.role == role
                     && sessions_by_convoy.contains_key(&source.object.metadata.name)
@@ -324,7 +294,8 @@ impl<'a> AttachResolver<'a> {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
-        if let Some(record) = self.resolve_live_convoy_record(reference, project_context).await? {
+        let index = self.attach_candidate_index(&[reference.to_string()]).await?;
+        if let Some(record) = self.resolve_live_convoy_record(reference, project_context, &index).await? {
             if let Some(requested) = host {
                 if requested != &record.owner_host {
                     return Err(format!("no attach target matching '{reference}' on host '{requested}'"));
@@ -335,25 +306,29 @@ impl<'a> AttachResolver<'a> {
                 let binding = AttachBinding::builder()
                     .host(record.owner_host)
                     .namespace(self.provisioning_namespace().await)
+                    .maybe_convoy_phase(
+                        index
+                            .convoys
+                            .iter()
+                            .find(|source| source.object.metadata.name == record.record_name)
+                            .and_then(|source| source.object.status.as_ref())
+                            .map(|status| attach_convoy_phase(status.phase)),
+                    )
                     .convoy(record.record_name)
                     .role(record.address.role)
                     .build();
                 return Ok(ResolvedAttach { plan, binding: Some(binding) });
             }
-            let index = self.attach_candidate_index().await?;
             return index.resolve(self, &record.record_name, host, transient, mode).await.map_err(AttachIndexError::into_message);
         }
-        let index = self.attach_candidate_index().await?;
         match index.resolve(self, reference, host, transient, mode).await {
             Err(AttachIndexError::NoMatch(_)) if reference.starts_with("terminal-") => {
                 Err(format!("session {reference} no longer exists on {}", host.unwrap_or(self.host_name)))
             }
             Err(AttachIndexError::NoMatch(error)) => {
-                let namespace = self.provisioning_namespace().await;
-                let convoys =
-                    self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|err| err.to_string())?;
+                let convoys = &index.convoys;
                 let requested_role = reference.contains('@').then(|| RoleAddress::from_str(reference)).transpose()?;
-                if convoys.items.iter().any(|source| {
+                if convoys.iter().any(|source| {
                     source.object.metadata.name == reference
                         || (source.object.spec.role == reference)
                         || requested_role.as_ref().is_some_and(|address| {
@@ -370,36 +345,41 @@ impl<'a> AttachResolver<'a> {
         }
     }
 
-    async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
+    async fn attach_candidate_index(&self, references: &[String]) -> Result<AttachCandidateIndex, String> {
         let namespace = self.provisioning_namespace().await;
-        let convoy_addresses = self
+        let convoy_sources = self
             .resource_backend
-            .including_replicas::<ResourceConvoy>(&namespace)
-            .list()
+            .query_declared::<ResourceConvoy>(&namespace, &convoy_reference_query(references))
             .await
             .map_err(|error| error.to_string())?
-            .items
+            .items;
+        let mut query = session_reference_query(references);
+        if let Some(alternatives) = query.any_of.as_mut() {
+            alternatives.extend(convoy_sources.iter().map(|source| {
+                StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), source.object.metadata.name.clone())]), false, true)
+            }));
+        }
+        let durable_sessions = self
+            .resource_backend
+            .query_declared::<ResourceTerminalSession>(&namespace, &query)
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let observed_sessions = self
+            .observed_resource_backend
+            .query_declared::<ResourceTerminalSession>(&namespace, &query)
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let convoys = convoy_sources.clone();
+        let sessions = durable_sessions.iter().chain(&observed_sessions).cloned().collect();
+        let convoy_addresses = convoy_sources
             .into_iter()
             .map(|source| {
                 let address = convoy_address(&source.object.spec.role, source.object.spec.project_ref.as_deref());
                 ((source.object.metadata.namespace, source.object.metadata.name, replica_origin(&source.provenance).cloned()), address)
             })
             .collect::<HashMap<_, _>>();
-        let durable_sessions = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&namespace)
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
-        let observed_sessions = self
-            .observed_resource_backend
-            .clone()
-            .including_replicas::<ResourceTerminalSession>(&namespace)
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
         let mut sessions_by_name = HashMap::new();
         let mut replicated_sessions = Vec::new();
         for session in durable_sessions {
@@ -506,7 +486,7 @@ impl<'a> AttachResolver<'a> {
             }));
         }
 
-        Ok(AttachCandidateIndex::new(candidates))
+        Ok(AttachCandidateIndex::new(candidates, convoys, sessions))
     }
 
     async fn local_checkout_terminal_plan(&self, checkout: &CheckoutRow, seat: AttachMode) -> Result<ResolvedAttachPlan, String> {
@@ -766,6 +746,69 @@ fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     }
 }
 
+fn convoy_reference_query(references: &[String]) -> StoreQuery {
+    let mut alternatives = Vec::new();
+    for reference in references {
+        let root = reference.split('/').next().unwrap_or(reference);
+        alternatives.push(StoreQuery { field_prefixes: BTreeMap::from([("metadata.name".into(), root.into())]), ..Default::default() });
+        let (role, project) = root.split_once('@').map_or((root, None), |(role, project)| (role, Some(project)));
+        let mut fields = BTreeMap::new();
+        let mut field_prefixes = BTreeMap::new();
+        if project.is_some() {
+            fields.insert("spec.role".into(), role.into());
+        } else {
+            field_prefixes.insert("spec.role".into(), role.into());
+        }
+        if let Some(project) = project {
+            field_prefixes.insert("spec.project_ref".into(), project.into());
+        }
+        alternatives.push(StoreQuery { fields, field_prefixes, ..Default::default() });
+    }
+    StoreQuery { any_of: Some(alternatives), include_replicas: true, ..Default::default() }
+}
+
+fn session_reference_query(references: &[String]) -> StoreQuery {
+    let mut alternatives = Vec::new();
+    for reference in references {
+        alternatives
+            .push(StoreQuery { field_prefixes: BTreeMap::from([("metadata.name".into(), reference.clone())]), ..Default::default() });
+        let parts: Vec<_> = reference.split('/').collect();
+        let root = parts[0];
+        for key in [CONVOY_LABEL, VESSEL_REF_LABEL] {
+            let mut labels = BTreeMap::from([(key.into(), root.into())]);
+            if let Some(role) = parts.get(2) {
+                labels.insert(ROLE_LABEL.into(), (*role).into());
+            }
+            if key == CONVOY_LABEL {
+                if let Some(vessel) = parts.get(1) {
+                    labels.insert(VESSEL_LABEL.into(), (*vessel).into());
+                }
+            } else if let Some(role) = parts.get(1) {
+                labels.insert(ROLE_LABEL.into(), (*role).into());
+            }
+            alternatives.push(StoreQuery { label_prefixes: labels, ..Default::default() });
+        }
+        if !root.contains('@') {
+            // Fleet rows also expose within-convoy crew and environment aliases.
+            // Select these aliases before decoding, just like durable session keys.
+            if parts.len() <= 2 {
+                let mut labels = BTreeMap::from([(VESSEL_LABEL.into(), root.into())]);
+                if let Some(role) = parts.get(1) {
+                    labels.insert(ROLE_LABEL.into(), (*role).into());
+                }
+                alternatives.push(StoreQuery { label_prefixes: labels, ..Default::default() });
+            }
+            if parts.len() == 1 {
+                alternatives.push(StoreQuery { label_prefixes: BTreeMap::from([(ROLE_LABEL.into(), root.into())]), ..Default::default() });
+                for field in ["spec.role", "spec.env_ref"] {
+                    alternatives.push(StoreQuery { field_prefixes: BTreeMap::from([(field.into(), root.into())]), ..Default::default() });
+                }
+            }
+        }
+    }
+    StoreQuery { any_of: Some(alternatives), include_replicas: true, ..Default::default() }
+}
+
 fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>, convoy_address: Option<&str>) -> Vec<String> {
     let mut refs = vec![session_name.to_string()];
 
@@ -959,6 +1002,8 @@ struct AttachCandidate {
 }
 
 struct AttachCandidateIndex {
+    convoys: Vec<flotilla_resources::ReadResourceObject<ResourceConvoy>>,
+    sessions: Vec<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
     candidates: Vec<AttachCandidate>,
     exact: HashMap<String, Vec<usize>>,
 }
@@ -977,14 +1022,18 @@ impl AttachIndexError {
 }
 
 impl AttachCandidateIndex {
-    fn new(candidates: Vec<AttachCandidate>) -> Self {
+    fn new(
+        candidates: Vec<AttachCandidate>,
+        convoys: Vec<flotilla_resources::ReadResourceObject<ResourceConvoy>>,
+        sessions: Vec<flotilla_resources::ReadResourceObject<ResourceTerminalSession>>,
+    ) -> Self {
         let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, candidate) in candidates.iter().enumerate() {
             for reference in &candidate.references {
                 exact.entry(reference.clone()).or_default().push(index);
             }
         }
-        Self { candidates, exact }
+        Self { candidates, exact, convoys, sessions }
     }
 
     async fn resolve(
@@ -1015,7 +1064,28 @@ impl AttachCandidateIndex {
                 Some(host) => Err(AttachIndexError::NoMatch(format!("no attach target matching '{reference}' on host '{host}'"))),
                 None => Err(AttachIndexError::NoMatch(format!("no attach target matching '{reference}'"))),
             },
-            [index] => self.candidates[*index].target.resolve(resolver, reference, transient, seat).await.map_err(AttachIndexError::Other),
+            [index] => {
+                let mut resolved =
+                    self.candidates[*index].target.resolve(resolver, reference, transient, seat).await.map_err(AttachIndexError::Other)?;
+                if let Some(binding) = resolved.binding.as_mut() {
+                    if let Some(name) = binding.convoy.as_ref() {
+                        let observed = self.convoys.iter().find(|source| source.object.metadata.name == *name);
+                        binding.convoy_phase = if let Some(source) = observed {
+                            source.object.status.as_ref().map(|status| attach_convoy_phase(status.phase))
+                        } else {
+                            // A direct TerminalSession name already identifies its parent;
+                            // fetch that exact name rather than scanning Convoys for phase.
+                            let namespace = resolver.provisioning_namespace().await;
+                            match resolver.resource_backend.including_replicas::<ResourceConvoy>(&namespace).get(name).await {
+                                Ok(source) => source.object.status.map(|status| attach_convoy_phase(status.phase)),
+                                Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
+                                Err(error) => return Err(AttachIndexError::Other(error.to_string())),
+                            }
+                        };
+                    }
+                }
+                Ok(resolved)
+            }
             _ => {
                 let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
                 labels.sort();
@@ -1055,6 +1125,7 @@ fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_store_testkit::ReadCountsBackendExt;
     use std::path::PathBuf;
 
     use chrono::Utc;
@@ -1360,6 +1431,101 @@ mod tests {
             .expect("make newer endpoint unreachable");
         let fallback = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("older reachable generation");
         assert_eq!(fallback.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
+    }
+
+    // #3042: role/name/prefix attach resolution shares its per-request join,
+    // and unrelated convoys/messages cannot increase store reads or decoding.
+    #[tokio::test]
+    async fn attach_reads_ignore_unrelated_convoys_and_messages() {
+        for reference in ["coder", "coder@flotilla", "convoy-main", "terminal-main", "terminal-ma"] {
+            let mut samples = Vec::new();
+            for unrelated in [0, 40] {
+                let (daemon, backend, _temp) = attach_fixture().await;
+                create_identity_convoy(&backend, "convoy-main", "coder", Some("flotilla")).await;
+                let convoys = backend.using::<ResourceConvoy>("flotilla");
+                let convoy = convoys.get("convoy-main").await.expect("convoy");
+                convoys
+                    .update_status(
+                        "convoy-main",
+                        &convoy.metadata.resource_version,
+                        &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+                    )
+                    .await
+                    .expect("convoy phase");
+                let host = daemon.local_host_id().expect("host").to_string();
+                backend
+                    .using::<ResourceHost>("flotilla")
+                    .create(
+                        &test_meta(&host),
+                        &HostSpec { display_name: "host".into(), connection: Default::default(), ..Default::default() },
+                    )
+                    .await
+                    .expect("host");
+                let environment = create_test_environment(&daemon, "env-main", &host).await;
+                create_running_session(&daemon, &environment, "terminal-main", "convoy-main", "coder").await;
+                for n in 0..unrelated {
+                    create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
+                    backend
+                        .using::<flotilla_resources::Message>("flotilla")
+                        .create(
+                            &test_meta(&format!("message-{n}")),
+                            &flotilla_resources::MessageSpec::builder()
+                                .sender("other/source".into())
+                                .receiver("other/receiver".into())
+                                .relation(flotilla_resources::MessageRelation::Peer)
+                                .body("other".into())
+                                .build(),
+                        )
+                        .await
+                        .expect("noise message");
+                }
+                // Count this resolver's real store collaborators. Daemon startup,
+                // projection materialization and provider-retirement tasks share
+                // the same data but retain separate, uncounted backend handles.
+                let request_backend = backend.clone().with_read_counts();
+                let mut resolver = daemon.attach_resolver();
+                let request_observations = resolver.observed_resource_backend.clone().with_read_counts();
+                resolver.resource_backend = &request_backend;
+                resolver.observed_resource_backend = &request_observations;
+                // A read through the daemon handle must not leak into the
+                // request observer, even when it reads the same resource kind.
+                backend.using::<ResourceConvoy>("flotilla").get("convoy-main").await.expect("daemon read");
+                assert!(request_backend.read_calls().is_empty());
+                let calls = request_backend.read_calls();
+                let objects = request_backend.read_counts();
+                let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
+                let binding = resolved.binding.expect("binding");
+                assert_eq!(binding.session.as_deref(), Some("terminal-main"));
+                assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
+                let delta = |before: BTreeMap<String, usize>, after: BTreeMap<String, usize>| {
+                    after
+                        .into_iter()
+                        .map(|(kind, count)| {
+                            let count = count - before.get(&kind).copied().unwrap_or_default();
+                            (kind, count)
+                        })
+                        .filter(|(_, count)| *count != 0)
+                        .collect::<BTreeMap<_, _>>()
+                };
+                let reads = delta(calls, request_backend.read_calls());
+                if reference.starts_with("terminal-") {
+                    // Direct session references select no Convoy candidates. One
+                    // exact parent get restores phase without a namespace read.
+                    assert_eq!(reads.get("Convoy"), Some(&2));
+                } else {
+                    assert_eq!(reads.get("Convoy"), Some(&1));
+                }
+                assert_eq!(reads.get("TerminalSession"), Some(&1));
+                let decoded = delta(objects, request_backend.read_counts());
+                assert_eq!(decoded.get("Convoy"), Some(&1));
+                let observed_reads = request_observations.read_calls();
+                let observed_decoded = request_observations.read_counts();
+                assert_eq!(observed_reads.get("TerminalSession"), Some(&1));
+                assert_eq!(observed_decoded.get("TerminalSession"), Some(&0));
+                samples.push((reads, decoded, observed_reads, observed_decoded));
+            }
+            assert_eq!(samples[0], samples[1], "{reference}");
+        }
     }
 
     #[tokio::test]

@@ -29,7 +29,9 @@ use flotilla_resources::{
 };
 #[cfg(test)]
 use flotilla_resources::{CrewMessageDelivery, TerminalCrewMessage};
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, controller::delete_lifecycle_owned_matching, ResourceBackend};
+use flotilla_store::{
+    apply_status_patch as apply_resource_status_patch, controller::delete_lifecycle_owned_matching, ResourceBackend, StoreQuery,
+};
 use tokio::sync::{Mutex, RwLock};
 #[cfg(test)]
 use tracing::debug;
@@ -121,12 +123,21 @@ impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CrewRoutingContext {
     pub command_context: CrewCommandContext,
     pub session_name: Option<String>,
+    caller_session: Option<ResourceObject<ResourceTerminalSession>>,
     pub convoy: String,
 }
+
+// Routing identity excludes the cached observation, which can age independently.
+impl PartialEq for CrewRoutingContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.command_context == other.command_context && self.session_name == other.session_name && self.convoy == other.convoy
+    }
+}
+impl Eq for CrewRoutingContext {}
 
 fn handoff_crew_brief(
     context: &ResolvedCrewContext,
@@ -195,6 +206,61 @@ async fn crew_brief_repo_roots(
         roots.push(PathBuf::from(path));
     }
     roots
+}
+
+// Keep local completion evidence authoritative regardless of query row ordering.
+fn select_crew_artifacts(
+    sources: Vec<flotilla_resources::ReadResourceObject<flotilla_resources::Artifact>>,
+) -> BTreeMap<String, ResourceObject<flotilla_resources::Artifact>> {
+    let mut selected = BTreeMap::new();
+    for source in sources {
+        let name = source.object.metadata.name.clone();
+        if matches!(source.provenance, flotilla_resources::ResourceProvenance::Local) {
+            selected.insert(name, source.object);
+        } else {
+            selected.entry(name).or_insert(source.object);
+        }
+    }
+    selected
+}
+
+fn convoy_names_query(name: Option<&str>, include_replicas: bool) -> StoreQuery {
+    // An empty filter is used only by namespace-wide startup/reconciliation passes.
+    StoreQuery {
+        fields: name.map(|name| BTreeMap::from([("metadata.name".into(), name.into())])).unwrap_or_default(),
+        include_replicas,
+        ..Default::default()
+    }
+}
+
+fn crew_change_request_query(
+    convoy: &ResourceObject<ResourceConvoy>,
+    checkouts: &BTreeMap<String, ResourceObject<ResourceCheckout>>,
+) -> Result<StoreQuery, String> {
+    let mut names = BTreeSet::new();
+    let mut add = |address: LeafAddress| {
+        if let LeafAddress::ChangeRequest { service, scope, number } = address {
+            names.insert(change_request_record_name(&service, &scope, number));
+        }
+    };
+    for leaf in expected_change_request_leaves(convoy, checkouts)? {
+        add(leaf.address);
+    }
+    for subject in flotilla_resources::active_change_request_subjects(convoy)? {
+        add(subject.leaf()?);
+    }
+    if let Some(status) = &convoy.status {
+        for submission in status.promises.values().flat_map(|crew| crew.values()).flatten().flat_map(|promise| &promise.submissions) {
+            if let Ok(address) = submission.subject().parse::<LeafAddress>() {
+                add(address);
+            }
+        }
+    }
+    Ok(StoreQuery {
+        field_values: BTreeMap::from([("metadata.name".into(), names.into_iter().collect())]),
+        include_replicas: true,
+        ..Default::default()
+    })
 }
 
 /// Legacy convoys may have no role; retain their resource identity instead of
@@ -473,10 +539,36 @@ impl CrewService {
         if namespace != provisioning_namespace {
             return Err(format!("crew namespace `{namespace}` is not served by this daemon"));
         }
+        let query = if let Some(crew_id) = &requested.crew_id {
+            StoreQuery {
+                fields: BTreeMap::from([("status.crew.id".into(), crew_id.clone())]),
+                include_replicas: true,
+                ..Default::default()
+            }
+        } else {
+            let vessel =
+                requested.vessel_ref.clone().ok_or("crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role")?;
+            let convoy = requested.convoy.clone().ok_or("crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role")?;
+            let role = requested.role.clone().ok_or("crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role")?;
+            StoreQuery {
+                fields: BTreeMap::from([("spec.role".into(), role)]),
+                any_of: Some(vec![
+                    StoreQuery { labels: BTreeMap::from([(VESSEL_REF_LABEL.into(), vessel.clone())]), ..Default::default() },
+                    StoreQuery {
+                        fields: BTreeMap::from([
+                            ("spec.source.context.vessel_ref".into(), vessel),
+                            ("spec.source.context.convoy".into(), convoy),
+                        ]),
+                        ..Default::default()
+                    },
+                ]),
+                include_replicas: true,
+                ..Default::default()
+            }
+        };
         let session_list = self
             .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&namespace)
-            .list()
+            .query_declared::<ResourceTerminalSession>(&namespace, &query)
             .await
             .map_err(|err| err.to_string())?
             .items
@@ -504,6 +596,7 @@ impl CrewService {
                     vessel_ref: Some(vessel_ref),
                     role: Some(role),
                 },
+                caller_session: Some(session.clone()),
                 session_name: Some(session.metadata.name.clone()),
                 convoy,
             });
@@ -538,6 +631,7 @@ impl CrewService {
                 vessel_ref: Some(vessel_ref),
                 role: Some(role),
             },
+            caller_session: caller.cloned(),
             session_name: caller.map(|session| session.metadata.name.clone()),
             convoy,
         })
@@ -545,23 +639,33 @@ impl CrewService {
 
     async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
         let routing = self.resolve_crew_routing_context(requested).await?;
-        self.resolve_crew_context_from_routing(&routing).await
+        self.resolve_crew_context_from_routing(&routing, false).await
     }
 
-    async fn resolve_crew_context_from_routing(&self, routing: &CrewRoutingContext) -> Result<ResolvedCrewContext, String> {
+    async fn resolve_crew_context_from_routing(
+        &self,
+        routing: &CrewRoutingContext,
+        refresh_caller: bool,
+    ) -> Result<ResolvedCrewContext, String> {
         let namespace = routing.command_context.namespace.as_ref().expect("routing context always has namespace").clone();
         let convoy = routing.command_context.convoy.as_ref().expect("routing context always has convoy").clone();
         let vessel_ref = routing.command_context.vessel_ref.as_ref().expect("routing context always has vessel ref").clone();
         let role = routing.command_context.role.as_ref().expect("routing context always has role").clone();
-        let caller = match routing.session_name.as_ref() {
-            Some(name) => self
-                .resource_backend
-                .including_replicas::<ResourceTerminalSession>(&namespace)
-                .get(name)
-                .await
-                .ok()
-                .map(|source| source.object),
-            None => None,
+        // Promise/completion acquire a message lock after routing. Refresh only
+        // their named caller so status changes during the wait remain visible.
+        let caller = if refresh_caller {
+            match routing.session_name.as_ref() {
+                Some(name) => self
+                    .resource_backend
+                    .including_replicas::<ResourceTerminalSession>(&namespace)
+                    .get(name)
+                    .await
+                    .ok()
+                    .map(|source| source.object),
+                None => None,
+            }
+        } else {
+            routing.caller_session.clone()
         };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
     }
@@ -595,12 +699,19 @@ impl CrewService {
 
     pub(super) async fn pending_crew_completions(&self) -> Result<Vec<(String, CrewCompletionPending, CrewCommandContext)>, String> {
         let namespace = self.provisioning_namespace().await;
-        let sessions =
-            self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let sessions = self
+            .resource_backend
+            .query_declared::<ResourceTerminalSession>(
+                &namespace,
+                &StoreQuery { present: vec!["status.completion_pending.authority".into()], ..Default::default() },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(sessions
             .items
             .into_iter()
             .filter_map(|session| {
+                let session = session.object;
                 let pending = session.status.as_ref()?.completion_pending.clone()?;
                 let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return None };
                 Some((
@@ -752,12 +863,15 @@ impl CrewService {
             .resource_backend
             .clone()
             .using::<ResourceDemand>(&context.namespace)
-            .list()
+            .query_declared(&StoreQuery {
+                fields: BTreeMap::from([("spec.originating_work_ref.name".into(), context.convoy.clone())]),
+                ..Default::default()
+            })
             .await
             .map_err(|err| err.to_string())?
             .items
             .into_iter()
-            .filter_map(|demand| credential_refresh_alert_for_vessel(&demand, &context.convoy, &context.vessel))
+            .filter_map(|demand| credential_refresh_alert_for_vessel(&demand.object, &context.convoy, &context.vessel))
             .collect::<Vec<_>>();
         let crew_work = convoy.status.as_ref().and_then(|status| status.crew_work.get(&context.vessel));
         let loss_reason =
@@ -835,7 +949,7 @@ impl CrewService {
         let name = routing.command_context.convoy.as_deref().expect("resolved convoy");
         let lock = self.convoy_message_lock(namespace, name).await;
         let _guard = lock.lock().await;
-        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|e| e.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
@@ -862,6 +976,7 @@ impl CrewService {
                 }
                 let mut metadata = metadata;
                 if kind == PromiseKind::Pr {
+                    // URL parsing needs every declared forge endpoint; read this catalogue once.
                     let forges = self
                         .resource_backend
                         .definitions::<Forge>(namespace)
@@ -974,10 +1089,10 @@ impl CrewService {
         let routing = self.resolve_crew_routing_context(requested).await?;
         let namespace = routing.command_context.namespace.as_deref().expect("resolved crew routing context has a namespace");
         let convoy_name = routing.command_context.convoy.as_deref().expect("resolved crew routing context has a convoy");
-        self.adopt_legacy_convoy_queues_before_command(namespace).await?;
+        self.adopt_legacy_convoy_queues_before_command(namespace, convoy_name).await?;
         let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
         let _message_guard = message_lock.lock().await;
-        let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let context = self.resolve_crew_context_from_routing(&routing, true).await?;
         let completed_while_crew_active = context.caller_session.as_ref().is_some_and(|session| {
             let Some(status) = session.status.as_ref() else { return false };
             status.phase == ResourceTerminalSessionPhase::Running
@@ -985,6 +1100,7 @@ impl CrewService {
         });
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let mut convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        // URL parsing needs every declared forge endpoint; read this catalogue once.
         let forges = self
             .resource_backend
             .definitions::<Forge>(namespace)
@@ -1043,12 +1159,21 @@ impl CrewService {
             }
         }
         let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
-        let ledger_artifact =
-            match self.resource_backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&ledger_name).await {
-                Ok(record) => Some(record.object),
-                Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            };
+        let artifact_sources = self
+            .resource_backend
+            .query_declared::<flotilla_resources::Artifact>(
+                namespace,
+                &StoreQuery {
+                    fields: BTreeMap::from([("spec.convoy".into(), convoy_name.into())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        let promise_artifacts = select_crew_artifacts(artifact_sources);
+        let ledger_artifact = promise_artifacts.get(&ledger_name);
         let decision_ledger_digest = ledger_artifact.as_ref().map(|artifact| artifact.spec.digest.clone());
         let projected_ledger_ref = ledger_artifact
             .as_ref()
@@ -1084,9 +1209,16 @@ impl CrewService {
         {
             return Ok(flotilla_protocol::CommandValue::Ok);
         }
+        let mut observed_change_requests = None;
         if forced_by.is_none() && !existing_claim_is_admitted {
-            let checkout_sources =
-                self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
+            let checkout_sources = self
+                .resource_backend
+                .query_declared::<ResourceCheckout>(
+                    namespace,
+                    &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
             let requires_change_request = convoy
                 .status
@@ -1134,36 +1266,22 @@ impl CrewService {
             }
             let change_request_sources = self
                 .resource_backend
-                .including_replicas::<ResourceChangeRequest>(namespace)
-                .list()
+                .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &checkouts)?)
                 .await
                 .map_err(|error| error.to_string())?;
-            let mut change_requests = BTreeMap::new();
-            for source in change_request_sources.items {
-                let name = source.object.metadata.name.clone();
-                if !change_requests.contains_key(&name) || matches!(source.provenance, ResourceProvenance::Local) {
-                    change_requests.insert(name, source.object);
-                }
-            }
-            let artifact_sources = self
-                .resource_backend
-                .including_replicas::<flotilla_resources::Artifact>(namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut artifacts = BTreeMap::new();
-            for source in artifact_sources.items {
-                let name = source.object.metadata.name.clone();
-                if !artifacts.contains_key(&name) || matches!(source.provenance, ResourceProvenance::Local) {
-                    artifacts.insert(name, source.object);
-                }
-            }
+            let change_requests =
+                flotilla_resources::select_change_requests(change_request_sources.items.iter().map(|source| &source.object));
+            let change_requests = change_requests
+                .into_values()
+                .map(|record| (change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record))
+                .collect::<BTreeMap<_, _>>();
+            observed_change_requests = Some(change_requests.clone());
             let unmet = evaluate_crew_completion(
                 &convoy,
                 CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
                 &checkouts,
                 &change_requests,
-                &artifacts,
+                &promise_artifacts,
                 self.leaf_subscriptions.change_request_stale_after(),
                 self.clock.now(),
             )?;
@@ -1218,24 +1336,20 @@ impl CrewService {
                 return Err(format!("crew completion expectations unmet: {expectation}"));
             }
         }
-        let promise_sources =
-            self.resource_backend.including_replicas::<ResourceChangeRequest>(namespace).list().await.map_err(|e| e.to_string())?;
-        let promise_change_requests = flotilla_resources::select_change_requests(promise_sources.items.iter().map(|source| &source.object))
-            .into_values()
-            .map(|record| {
-                (flotilla_resources::change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record)
-            })
-            .collect();
-        let promise_artifacts = self
-            .resource_backend
-            .including_replicas::<flotilla_resources::Artifact>(namespace)
-            .list()
-            .await
-            .map_err(|e| e.to_string())?
-            .items
-            .into_iter()
-            .map(|item| (item.object.metadata.name.clone(), item.object))
-            .collect();
+        let promise_change_requests = match observed_change_requests {
+            Some(records) => records,
+            None => {
+                let records = self
+                    .resource_backend
+                    .query_declared::<ResourceChangeRequest>(namespace, &crew_change_request_query(&convoy, &BTreeMap::new())?)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                flotilla_resources::select_change_requests(records.items.iter().map(|source| &source.object))
+                    .into_values()
+                    .map(|record| (change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number), record))
+                    .collect()
+            }
+        };
         loop {
             let next = convoy.status.as_ref().and_then(|status| {
                 flotilla_resources::promises::next_observation(
@@ -1458,8 +1572,12 @@ impl CrewService {
             let sessions = self
                 .resource_backend
                 .clone()
-                .including_replicas::<ResourceTerminalSession>(namespace)
-                .list()
+                .using::<ResourceTerminalSession>(namespace)
+                .query_declared(&StoreQuery {
+                    fields: BTreeMap::from([("status.crew.id".into(), crew_id.into())]),
+                    include_replicas: true,
+                    ..Default::default()
+                })
                 .await
                 .map_err(|error| error.to_string())?;
             let authorized = sessions.items.iter().map(|source| &source.object).any(|session| {
@@ -1500,8 +1618,14 @@ impl CrewService {
             Some(reference.name.clone())
         } else {
             self.resource_backend
-                .including_replicas::<flotilla_resources::Message>(namespace)
-                .list()
+                .using::<flotilla_resources::Message>(namespace)
+                .query_declared(
+                    &StoreQuery {
+                        message: Some(flotilla_store::MessageQuery::Active { receiver: Some(sender.clone()) }),
+                        ..Default::default()
+                    }
+                    .with_replicas(),
+                )
                 .await
                 .map_err(|error| error.to_string())?
                 .items
@@ -1602,8 +1726,14 @@ impl CrewService {
             return Ok(());
         }
 
-        let checkout_sources =
-            self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|err| err.to_string())?;
+        let checkout_sources = self
+            .resource_backend
+            .query_declared::<ResourceCheckout>(
+                namespace,
+                &StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
         let checkout_list = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items).into_values().collect::<Vec<_>>();
         self.verify_convoy_teardown_gate_for_checkouts(&convoy, &checkout_list, false).await
     }
@@ -1620,7 +1750,16 @@ impl CrewService {
             .await
             .map_err(|error| error.to_string())?;
         let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
-        for demand in demands.list().await.map_err(|error| error.to_string())?.items {
+        for source in demands
+            .query_declared(&StoreQuery {
+                fields: BTreeMap::from([("spec.originating_work_ref.name".into(), name.into())]),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+        {
+            let demand = source.object;
             let target = &demand.spec.originating_work_ref;
             if target.api_version == flotilla_resources::api_version(ResourceConvoy::API_PATHS)
                 && target.kind == ResourceConvoy::API_PATHS.kind
@@ -1674,6 +1813,17 @@ impl CrewService {
             ));
         }
 
+        // URL parsing needs every declared forge endpoint; read this catalogue once.
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+
         // A completed convoy can outlive its checkout observation. In
         // particular, checkout cleanup may remove the worktree and a new
         // short-lived record may have no status at all. The merged change
@@ -1681,10 +1831,16 @@ impl CrewService {
         let merged_change_requests = if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
             && checkout_list.iter().any(|checkout| expected.contains(&checkout.metadata.name) && checkout.status.is_none())
         {
+            let names = checkout_list
+                .iter()
+                .filter_map(|checkout| associated_change_request_name_without_checkout_status(convoy, checkout, &forges).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut query = crew_change_request_query(convoy, &BTreeMap::new())?;
+            query.field_values.entry("metadata.name".into()).or_default().extend(names);
+            query.fields.insert("status.state.value".into(), "merged".into());
             let records = self
                 .resource_backend
-                .including_replicas::<ResourceChangeRequest>(namespace)
-                .list()
+                .query_declared::<ResourceChangeRequest>(namespace, &query)
                 .await
                 .map_err(|error| error.to_string())?;
             records
@@ -1698,16 +1854,6 @@ impl CrewService {
         } else {
             BTreeSet::new()
         };
-
-        let forges = self
-            .resource_backend
-            .definitions::<Forge>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|forge| forge.spec)
-            .collect::<Vec<_>>();
 
         let mut refusals = Vec::new();
         for checkout in checkout_list
@@ -2318,7 +2464,7 @@ impl CrewService {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
         }
-        self.adopt_legacy_convoy_queues_before_command(namespace).await?;
+        self.adopt_legacy_convoy_queues_before_command(namespace, name).await?;
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
         self.convoy_resume_with_sender_locked(namespace, name, prompt, requested_vessel, requested_role, attribution).await
@@ -2553,7 +2699,7 @@ impl CrewService {
     }
 
     pub(super) async fn withdraw_pending_brief(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
-        self.adopt_legacy_convoy_queues_before_command(namespace).await?;
+        self.adopt_legacy_convoy_queues_before_command(namespace, name).await?;
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
@@ -2566,8 +2712,13 @@ impl CrewService {
         let prefix = format!("{project}/{name}/");
         let mut messages = self
             .resource_backend
-            .including_replicas::<flotilla_resources::Message>(namespace)
-            .list()
+            .using::<flotilla_resources::Message>(namespace)
+            .query_declared(&StoreQuery {
+                message: Some(flotilla_store::MessageQuery::active()),
+                field_prefixes: BTreeMap::from([("spec.receiver".into(), prefix.clone())]),
+                include_replicas: true,
+                ..Default::default()
+            })
             .await
             .map_err(|error| error.to_string())?
             .items
@@ -2861,8 +3012,12 @@ impl CrewService {
         }
         let records = self
             .resource_backend
-            .including_replicas::<flotilla_resources::Message>(&request.namespace)
-            .list()
+            .using::<flotilla_resources::Message>(&request.namespace)
+            .query_declared(&StoreQuery {
+                message: Some(flotilla_store::MessageQuery::Active { receiver: Some(intent.receiver.clone()) }),
+                include_replicas: true,
+                ..Default::default()
+            })
             .await
             .map_err(|error| error.to_string())?;
         if let Some(existing) = records.items.iter().find(|record| {
@@ -2981,15 +3136,15 @@ impl CrewService {
     // Deliberately rescan through the one-generation window: a replica containing
     // old intent can arrive after a previous successful adoption sweep. A permanent
     // namespace latch would skip that newly arrived work. Remove after #2710's roll.
-    async fn adopt_legacy_convoy_queues_before_command(&self, namespace: &str) -> Result<(), String> {
+    async fn adopt_legacy_convoy_queues_before_command(&self, namespace: &str, name: &str) -> Result<(), String> {
         let convoys =
-            self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?;
+            self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get_all(name).await.map_err(|error| error.to_string())?;
         if convoys.items.iter().any(|source| {
             source.object.status.as_ref().is_some_and(|status| {
                 status.turn_deliveries.values().any(|queue| queue.pending_brief.is_some() || queue.pending_supervisor_turn.is_some())
             })
         }) {
-            self.reconcile_pending_supervisor_turns_once(namespace).await?;
+            self.reconcile_pending_supervisor_turns_selected(namespace, Some(name)).await?;
         }
         Ok(())
     }
@@ -2997,12 +3152,38 @@ impl CrewService {
     // Convoy queues remain decodable and adoptable for #2710's one-generation window.
     // Terminal receipt/launch-witness retirement and the pre-roll guard from #2878
     // remain intact. Remove this convoy-only adoption after the first #2710 roll.
-    async fn adopt_legacy_convoy_queues_once(&self, namespace: &str) -> Result<(), String> {
+    async fn adopt_legacy_convoy_queues_once(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
         // Previous-generation authority queues may arrive before a local
         // TerminalSession payload. Their receiver home adopts the same IDs.
-        for source in
-            self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?.items
-        {
+        let candidates = self
+            .resource_backend
+            .query_declared::<ResourceConvoy>(namespace, &convoy_names_query(name, true))
+            .await
+            .map_err(|error| error.to_string())?
+            .items;
+        // Startup/reconciliation backfill needs all legacy convoy queues when no name is selected.
+        let addresses =
+            candidates
+                .iter()
+                .flat_map(|source| {
+                    source.object.status.iter().flat_map(|status| status.turn_deliveries.values()).flat_map(|delivery| {
+                        let convoy = &source.object;
+                        let project = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
+                        delivery
+                            .pending_supervisor_turn
+                            .as_ref()
+                            .map(|turn| crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role))
+                            .into_iter()
+                            .chain(delivery.pending_brief.as_ref().map(|brief| {
+                                crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role)
+                            }))
+                    })
+                })
+                .collect::<Vec<_>>();
+        let receiver_snapshot = flotilla_store::MessageReceiverSnapshot::load_for_addresses(&self.resource_backend, namespace, &addresses)
+            .await
+            .map_err(|error| error.to_string())?;
+        for source in candidates {
             if matches!(source.provenance, ResourceProvenance::Local) {
                 continue;
             }
@@ -3018,9 +3199,7 @@ impl CrewService {
             turns.sort_by_key(|turn| turn.queued_order);
             for turn in turns {
                 let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &turn.vessel, &turn.role);
-                let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let holder = receiver_snapshot.resolve(&receiver).map_err(|error| error.to_string())?;
                 if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
                     continue;
                 }
@@ -3036,9 +3215,7 @@ impl CrewService {
                 .filter_map(|delivery| delivery.pending_brief.as_ref())
             {
                 let receiver = crate::leaf_engine::crew_role_address(project, &convoy.metadata.name, &brief.vessel, &brief.role);
-                let holder = flotilla_store::resolve_message_receiver(&self.resource_backend, namespace, &receiver)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let holder = receiver_snapshot.resolve(&receiver).map_err(|error| error.to_string())?;
                 if !holder.is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Local)) {
                     continue;
                 }
@@ -3054,7 +3231,9 @@ impl CrewService {
             }
         }
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
-        for candidate in convoys.list().await.map_err(|error| error.to_string())?.items {
+        // A background backfill examines all queues; interactive callers select one convoy.
+        for source in convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items {
+            let candidate = source.object;
             let lock = self.convoy_message_lock(namespace, &candidate.metadata.name).await;
             let _guard = lock.lock().await;
             let convoy = convoys.get(&candidate.metadata.name).await.map_err(|error| error.to_string())?;
@@ -3138,9 +3317,46 @@ impl CrewService {
 
     /// Continue follow-ups only from receiver-owned Message evidence.
     pub(super) async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
-        self.adopt_legacy_convoy_queues_once(namespace).await?;
+        self.reconcile_pending_supervisor_turns_selected(namespace, None).await
+    }
+    async fn reconcile_pending_supervisor_turns_selected(&self, namespace: &str, name: Option<&str>) -> Result<(), String> {
+        self.adopt_legacy_convoy_queues_once(namespace, name).await?;
         let convoys = self.resource_backend.using::<ResourceConvoy>(namespace);
-        for candidate in convoys.list().await.map_err(|error| error.to_string())?.items {
+        let candidates = convoys.query_declared(&convoy_names_query(name, false)).await.map_err(|error| error.to_string())?.items;
+        let mut references = BTreeMap::<String, Vec<String>>::new();
+        for source in &candidates {
+            for reference in source
+                .object
+                .status
+                .iter()
+                .flat_map(|status| status.crew_work.values())
+                .flat_map(|crew| crew.values())
+                .filter_map(|state| state.pending_follow_up.as_ref())
+            {
+                references.entry(reference.namespace.clone()).or_default().push(reference.name.clone());
+            }
+        }
+        let mut messages = BTreeMap::new();
+        for (message_namespace, names) in references {
+            let records = self
+                .resource_backend
+                .query_declared::<flotilla_resources::Message>(
+                    &message_namespace,
+                    &StoreQuery {
+                        field_values: BTreeMap::from([("metadata.name".into(), names)]),
+                        include_replicas: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            for source in records.items {
+                messages.entry((message_namespace.clone(), source.object.metadata.name.clone())).or_insert(source.object);
+            }
+        }
+        // Reconciliation owns every queued continuation; interactive callers select one convoy.
+        for source in candidates {
+            let candidate = source.object;
             let lock = self.convoy_message_lock(namespace, &candidate.metadata.name).await;
             let _guard = lock.lock().await;
             let current = convoys.get(&candidate.metadata.name).await.map_err(|error| error.to_string())?;
@@ -3153,19 +3369,16 @@ impl CrewService {
             for (vessel, crew) in &mut next.crew_work {
                 for (role, state) in crew {
                     let Some(reference) = &state.pending_follow_up else { continue };
-                    let message = match self
-                        .resource_backend
-                        .including_replicas::<flotilla_resources::Message>(&reference.namespace)
-                        .get(&reference.name)
-                        .await
-                    {
-                        Ok(message) => message.object,
-                        Err(ResourceError::NotFound { .. }) => continue,
-                        Err(error) => return Err(error.to_string()),
-                    };
+                    let Some(message) = messages.get(&(reference.namespace.clone(), reference.name.clone())) else { continue };
                     if let Some(status) = &message.status {
                         if status.phase.has_delivery_evidence() {
-                            continuations.push((vessel.clone(), role.clone(), reference.name.clone(), message.spec.body, status.since));
+                            continuations.push((
+                                vessel.clone(),
+                                role.clone(),
+                                reference.name.clone(),
+                                message.spec.body.clone(),
+                                status.since,
+                            ));
                         } else if status.phase.is_terminal() {
                             state.pending_follow_up = None;
                         }
@@ -3416,8 +3629,8 @@ impl CrewService {
                 let expected_checkout = flotilla_resources::expected_checkout_refs(&convoy).map_or(true, |refs| !refs.is_empty());
                 let observed_checkout = self
                     .resource_backend
-                    .including_replicas::<ResourceCheckout>(namespace)
-                    .list()
+                    .using::<ResourceCheckout>(namespace)
+                    .query_declared(&StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), name.into())]), true, true))
                     .await
                     .map_err(|error| error.to_string())?
                     .items

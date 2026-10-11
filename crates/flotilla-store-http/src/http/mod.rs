@@ -162,7 +162,10 @@ impl HttpBackend {
             .send()
             .await
             .map_err(|e| crate::ResourceError::other(format!("declared query: {e}")))?;
-        let list: K8sResourceList<SerializedResource> = Self::decode_response(response, None).await?;
+        let document: serde_json::Value = Self::decode_response(response, None).await?;
+        let local_root = document.pointer("/metadata/localRoot").and_then(serde_json::Value::as_str).map(flotilla_protocol::NodeId::new);
+        let list: K8sResourceList<SerializedResource> =
+            serde_json::from_value(document).map_err(|error| crate::ResourceError::decode(error.to_string()))?;
         let position = crate::ResourcePosition {
             resource_version: list.metadata.resource_version.clone(),
             generation: list.metadata.generation.clone(),
@@ -172,7 +175,7 @@ impl HttpBackend {
         if let Some(observer) = self.read_observer() {
             observer.read(kind.paths.kind, items.len());
         }
-        Ok(crate::QueryResult { items, position })
+        Ok(crate::QueryResult { items, position, local_root })
     }
     pub async fn query_messages(
         &self,

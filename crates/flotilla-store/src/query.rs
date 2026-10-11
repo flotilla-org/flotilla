@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub struct QueryResult {
     pub items: Vec<crate::ReadResourceObject<crate::SerializedResource>>,
     pub position: crate::ResourcePosition,
+    pub local_root: Option<flotilla_protocol::NodeId>,
 }
 impl QueryResult {
     pub fn into_list(self) -> ReadResourceList<crate::SerializedResource> {
@@ -25,6 +26,21 @@ pub struct StoreQuery {
     pub fields: BTreeMap<String, String>,
     #[serde(default)]
     pub owner: Option<OwnerQuery>,
+    /// Alternatives are ORed, then intersected with this query.
+    #[serde(default)]
+    pub any_of: Option<Vec<StoreQuery>>,
+    /// Equality against any member of a finite set; an empty set selects no rows.
+    #[serde(default)]
+    pub field_values: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub present: Vec<String>,
+    #[serde(default)]
+    pub field_prefixes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub label_prefixes: BTreeMap<String, String>,
+    /// Hydrate every origin of names selected by the predicates for causal merge.
+    #[serde(default)]
+    pub all_sources_for_matches: bool,
     #[serde(default)]
     pub message: Option<MessageQuery>,
     #[serde(default)]
@@ -77,6 +93,12 @@ impl Default for StoreQuery {
             labels: BTreeMap::new(),
             fields: BTreeMap::new(),
             owner: None,
+            any_of: None,
+            field_values: BTreeMap::new(),
+            present: Vec::new(),
+            field_prefixes: BTreeMap::new(),
+            label_prefixes: BTreeMap::new(),
+            all_sources_for_matches: false,
             message: None,
             include_replicas: false,
             replicas_only: false,
@@ -89,13 +111,33 @@ fn suppress_default() -> bool {
     true
 }
 impl StoreQuery {
+    pub fn with_replicas(mut self) -> Self {
+        self.include_replicas = true;
+        self
+    }
     pub fn labels(labels: &BTreeMap<String, String>, include_replicas: bool, suppress_self_origin: bool) -> Self {
         Self { labels: labels.clone(), include_replicas, suppress_self_origin, ..Self::default() }
     }
     pub fn validate(&self, kind: ResourceKind) -> Result<(), ResourceError> {
-        for path in self.fields.keys() {
+        if self.all_sources_for_matches
+            && (kind.replication != crate::ReplicationClass::Definitions
+                || self.message.is_some()
+                || self.suppress_self_origin
+                || !self.include_replicas)
+        {
+            return Err(ResourceError::invalid("source hydration requires an unsuppressed definitions query"));
+        }
+        for path in self.fields.keys().chain(self.field_values.keys()).chain(self.present.iter()).chain(self.field_prefixes.keys()) {
             if !kind.queryable_fields.contains(&path.as_str()) {
                 return Err(ResourceError::invalid(format!("undeclared query field {} for {}", path, kind.paths.kind)));
+            }
+        }
+        if let Some(alternatives) = &self.any_of {
+            for alternative in alternatives {
+                alternative.validate(kind)?;
+                if alternative.message.is_some() {
+                    return Err(ResourceError::invalid("message predicate belongs on the outer query"));
+                }
             }
         }
         if self.message.is_some() && kind.paths.kind != "Message" {
@@ -150,7 +192,11 @@ impl QueryIndex {
             crate::declared_resource_kinds().into_iter().find(|kind| Some(kind.paths.kind) == value.get("kind").and_then(Value::as_str))
         {
             for path in kind.queryable_fields {
-                if let Some(value) = value.pointer(&format!("/{}", path.replace('.', "/"))).and_then(Value::as_str) {
+                let values = field_values(value, path);
+                if values.iter().any(|v| !v.is_null()) {
+                    keys.push((format!("present:{path}"), String::new()));
+                }
+                for value in values.into_iter().filter_map(Value::as_str) {
                     keys.push((format!("field:{path}"), value.into()));
                 }
             }
@@ -175,6 +221,7 @@ impl QueryIndex {
     pub fn names(&self, query: &StoreQuery) -> BTreeSet<String> {
         let mut required: Vec<_> = query.labels.iter().map(|(k, v)| (format!("label:{k}"), v.clone())).collect();
         required.extend(query.fields.iter().map(|(k, v)| (format!("field:{k}"), v.clone())));
+        required.extend(query.present.iter().map(|path| (format!("present:{path}"), String::new())));
         if let Some(owner) = &query.owner {
             required.push(("owner".into(), owner.key()));
         }
@@ -186,6 +233,62 @@ impl QueryIndex {
                 Some(found) => found.intersection(names).cloned().collect(),
             });
         }
-        result.unwrap_or_else(|| self.names.clone())
+        let mut result = result.unwrap_or_else(|| self.names.clone());
+        for (path, values) in &query.field_values {
+            let names: BTreeSet<_> = values
+                .iter()
+                .flat_map(|value| self.entries.get(&(format!("field:{path}"), value.clone())).into_iter().flatten().cloned())
+                .collect();
+            result = result.intersection(&names).cloned().collect();
+        }
+        for (key, prefix) in query
+            .field_prefixes
+            .iter()
+            .map(|(path, prefix)| (format!("field:{path}"), prefix))
+            .chain(query.label_prefixes.iter().map(|(label, prefix)| (format!("label:{label}"), prefix)))
+        {
+            let names = self
+                .entries
+                .range((key.clone(), prefix.clone())..)
+                .take_while(|((k, v), _)| k == &key && v.starts_with(prefix))
+                .flat_map(|(_, names)| names.iter().cloned())
+                .collect();
+            result = result.intersection(&names).cloned().collect();
+        }
+        if let Some(alternatives) = &query.any_of {
+            let names: BTreeSet<_> = alternatives.iter().flat_map(|alternative| self.names(alternative)).collect();
+            result = result.intersection(&names).cloned().collect();
+        }
+        result
     }
+}
+
+/// Serialized field paths use JSON-path quoted components for literal map keys.
+fn field_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut value = value;
+    let mut quoted = false;
+    let mut component = String::new();
+    for c in path.chars().chain(std::iter::once('.')) {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                value = value.get(&component)?;
+                component.clear();
+            }
+            _ => component.push(c),
+        }
+    }
+    Some(value)
+}
+
+fn field_values<'a>(value: &'a Value, path: &str) -> Vec<&'a Value> {
+    if let Some((prefix, suffix)) = path.split_once("[].") {
+        return field_value(value, prefix)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| field_value(item, suffix))
+            .collect();
+    }
+    field_value(value, path).into_iter().collect()
 }

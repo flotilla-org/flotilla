@@ -31,7 +31,7 @@ define_resource!(
     ConvoyStatus,
     ConvoyStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
-    queryable = &["metadata.name", "status.phase"]
+    queryable = &["metadata.name", "status.phase", "spec.role", "spec.project_ref"]
 );
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";

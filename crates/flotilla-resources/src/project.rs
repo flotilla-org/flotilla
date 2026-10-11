@@ -20,6 +20,7 @@ impl Resource for Project {
     type Status = ProjectStatus;
     type StatusPatch = ProjectStatusPatch;
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "projects", kind: "Project" };
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "spec.repositories[].repo"];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
     const VALIDATE_NAMESPACE_SPEC: bool = true;
 
