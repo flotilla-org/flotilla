@@ -39,7 +39,7 @@ use flotilla_resources::{
 #[cfg(test)]
 use flotilla_resources::{ReadResourceList, ResourceList, WatchStart};
 use flotilla_store::{
-    recover_indexed_view, recover_local_view, LocalViewSource as AggregatorWatchSource, ViewSource as AggregatorReplicaWatchSource,
+    recover_local_view, recover_view, LocalViewSource as AggregatorWatchSource, ViewSource as AggregatorReplicaWatchSource,
 };
 use flotilla_store::{ReplicaReadResolver, TypedResolver};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
@@ -825,7 +825,7 @@ impl Aggregator {
     async fn recover_replica_watch<T: Resource>(
         resolver: &dyn AggregatorReplicaWatchSource<T>,
     ) -> Result<(Vec<ReadResourceObject<T>>, BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>), ResourceError> {
-        let (listed, watch) = recover_indexed_view(resolver).await?;
+        let (listed, watch) = recover_view(resolver).await?;
         Ok((listed.items, watch))
     }
 

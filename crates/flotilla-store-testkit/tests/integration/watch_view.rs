@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -77,6 +77,40 @@ impl ViewSource<Convoy> for GapSource {
                 .map(move |event| {
                     if gap.swap(false, Ordering::SeqCst) {
                         Err(ResourceError::WatchExpired { requested_version: "injected gap".into(), compacted_through: None })
+                    } else {
+                        event
+                    }
+                })
+                .boxed(),
+        ))
+    }
+}
+
+// Inject failures at the transport boundary while preserving the real backend's
+// snapshot and resumed event stream. Recovery itself also fails transiently.
+struct FaultSource {
+    source: StoreViewSource<Convoy>,
+    fault: Arc<AtomicBool>,
+    failures: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl ViewSource<Convoy> for FaultSource {
+    async fn list_and_watch(
+        &self,
+    ) -> Result<(ReadResourceList<Convoy>, BoxStream<'static, Result<ReadWatchEvent<Convoy>, ResourceError>>), ResourceError> {
+        if self.failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1)).is_ok() {
+            return Err(ResourceError::other("transient relist failure"));
+        }
+        let (listed, events) = self.source.list_and_watch().await?;
+        let fault = self.fault.clone();
+        let failures = self.failures.clone();
+        Ok((
+            listed,
+            events
+                .map(move |event| {
+                    if fault.swap(false, Ordering::SeqCst) {
+                        failures.store(2, Ordering::SeqCst);
+                        Err(ResourceError::other("transient watch failure"))
                     } else {
                         event
                     }
@@ -198,6 +232,27 @@ async fn contract(reader: ResourceBackend, writer: ResourceBackend) {
         tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed()).await.unwrap().unwrap();
     }
     assert!(view.list().await.unwrap().items.is_empty());
+    // A transient watch error and two failing relists must resync, including
+    // the mutation whose event was lost, and continue delivering later events.
+    let fault = Arc::new(AtomicBool::new(false));
+    let recovered = WatchView::from_source(
+        Arc::new(FaultSource {
+            source: StoreViewSource::new(reader.clone(), "flotilla"),
+            fault: fault.clone(),
+            failures: Arc::new(AtomicUsize::new(0)),
+        }),
+        Some(NodeId::new("local-root")),
+    )
+    .await
+    .unwrap();
+    let mut recovered_changes = recovered.subscribe();
+    fault.store(true, Ordering::SeqCst);
+    convoys.create(&convoy_meta("after-error"), &convoy_spec("template")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), recovered_changes.changed()).await.unwrap().unwrap();
+    assert_eq!(recovered.list().await.unwrap().items.len(), 1);
+    convoys.delete("after-error").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), recovered_changes.changed()).await.unwrap().unwrap();
+    assert!(recovered.list().await.unwrap().items.is_empty());
     // Definitions retain causal merge semantics. A view update must agree with
     // the existing resolver, including replica-only fields and deletion state.
     let projects = writer.definitions::<flotilla_resources::Project>("flotilla");
