@@ -12,6 +12,7 @@ use flotilla_resources::{
     ChangeRequest, ChangeRequestLeafSubject, ChangeRequestSpec, ChangeRequestStatus, ConvoyStatus, IssueSourceBindingSpec, LeafSubject,
     Observation, ObservedChangeRequestState, ObservedChecks, Project, ProjectSpec,
 };
+use tokio_util::task::AbortOnDropHandle;
 
 // External forge boundary: the owner sees complete observations; any nonowner
 // read is a failure. Transport, replication, convoys and observers are real.
@@ -162,7 +163,7 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
     let requester_observer = refresher(&requester, forbidden.clone());
     let start_watcher = || {
         let watcher = owner_observer.clone();
-        tokio::spawn(async move { watcher.watch_convoy_demands("flotilla").await })
+        AbortOnDropHandle::new(tokio::spawn(async move { watcher.watch_convoy_demands("flotilla").await }))
     };
     let mut owner_demand_task = (!late_watcher).then(start_watcher);
     tokio::task::yield_now().await;
@@ -265,7 +266,7 @@ async fn remote_change_request_scenario(existing: ExistingRecord, late_watcher: 
         owner_observer.demanded_owned().await.is_ok_and(|subjects| subjects.is_empty())
     })
     .await;
-    owner_demand_task.expect("owner watcher").abort();
+    drop(owner_demand_task.expect("owner watcher"));
     assert_eq!(forbidden.0.load(std::sync::atomic::Ordering::SeqCst), 0, "nonowner never reads the forge");
     drop(mesh);
 }

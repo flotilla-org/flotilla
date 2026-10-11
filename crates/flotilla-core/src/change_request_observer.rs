@@ -1,6 +1,6 @@
 use crate::providers::change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -14,7 +14,7 @@ use flotilla_resources::{
     ResourceProvenance,
 };
 use flotilla_store::{watch_resource_kind_including_replicas, ResourceBackend};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -98,6 +98,7 @@ impl ChangeRequestRefresher {
     /// observer loop and observations reach consumers through store replication.
     pub async fn watch_convoy_demands(&self, namespace: &str) {
         let mut demands = HashMap::new();
+        let mut retry_delay = Duration::from_secs(1);
         loop {
             let mut streams = Vec::new();
             let mut subscription_error = None;
@@ -121,13 +122,27 @@ impl ChangeRequestRefresher {
                 tracing::warn!(%error, "change request convoy demand watch subscription failed");
             } else {
                 let mut events = futures::stream::select_all(streams);
-                loop {
+                'reconcile: loop {
                     if let Err(error) = self.reconcile_convoy_demands(namespace, &mut demands).await {
                         tracing::warn!(%error, "change request convoy demand reconciliation failed");
                         break;
                     }
+                    retry_delay = Duration::from_secs(1);
                     match events.next().await {
-                        Some(Ok(_)) => {}
+                        Some(Ok(_)) => {
+                            // Collapse bursts into one re-list without delaying isolated
+                            // changes. Bound the drain so a busy source cannot starve it.
+                            for _ in 0..64 {
+                                match events.next().now_or_never() {
+                                    Some(Some(Ok(_))) => {}
+                                    Some(Some(Err(error))) => {
+                                        tracing::warn!(%error, "change request convoy demand watch failed; relisting");
+                                        break 'reconcile;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
                         Some(Err(error)) => {
                             tracing::warn!(%error, "change request convoy demand watch failed; relisting");
                             break;
@@ -136,7 +151,8 @@ impl ChangeRequestRefresher {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
         }
     }
 
@@ -169,7 +185,7 @@ impl ChangeRequestRefresher {
             }
         }
         for subject in &wanted {
-            if let std::collections::hash_map::Entry::Vacant(entry) = demands.entry(subject.clone()) {
+            if let Entry::Vacant(entry) = demands.entry(subject.clone()) {
                 let id = uuid::Uuid::new_v4();
                 self.demand(id, subject.clone(), None).await?;
                 entry.insert(id);
@@ -688,6 +704,7 @@ impl ChangeRequestRefresher {
                 }
                 // Declared source ownership is authoritative immediately. The
                 // legacy stale-record election below applies only without it.
+                // Even a fresher foreign claim cannot override the declared owner.
                 let mut spec = current.spec.clone();
                 spec.observing_authority = self.inner.authority.clone();
                 match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
@@ -805,14 +822,15 @@ impl ChangeRequestRefresher {
         subject: &ChangeRequestRef,
         name: &str,
     ) -> Result<flotilla_resources::ResourceObject<ChangeRequest>, String> {
-        let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
-        let authority = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source)
-            .await?
-            .map_or_else(|| self.inner.authority.clone(), |owner| owner.to_string());
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         match records.get(name).await {
             Ok(current) => Ok(current),
             Err(ResourceError::NotFound { .. }) => {
+                let source = IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
+                // Without declared ownership, preserve the legacy local authority election.
+                let authority = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source)
+                    .await?
+                    .map_or_else(|| self.inner.authority.clone(), |owner| owner.to_string());
                 let candidates = self
                     .inner
                     .backend
