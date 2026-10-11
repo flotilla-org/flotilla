@@ -391,6 +391,9 @@ impl TerminalSessionStatus {
     /// Temporary terminal-evidence policy until AgentSession owns channel receipts.
     /// Callers also verify the recorded process and crew generation. Screen Idle
     /// and other harnesses' Idle events do not prove a submitted Codex turn ended.
+    /// Hook timestamps come from the receiving daemon, not the contained crew.
+    /// Future observations (for example after a clock rollback) remain ineligible
+    /// until the daemon clock catches up, and must still satisfy freshness then.
     pub fn codex_completed_after(&self, submitted_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
         self.phase == TerminalSessionPhase::Running
             && self.crew.as_ref().is_some_and(|crew| crew.adapter == "codex")

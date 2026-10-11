@@ -2,6 +2,7 @@
 pub use flotilla_protocol::AttachableId;
 
 /// Resolve the temporary Codex hook identity without introducing AgentSession.
+/// Retire this shim with the legacy terminal/attachable model tracked by #2912.
 pub fn codex_hook_id(explicit: Option<&str>, terminal: Option<&flotilla_protocol::AgentHookTerminalRef>) -> AttachableId {
     if let Some(terminal) = terminal {
         return AttachableId::new(format!("terminal:{}/{}", terminal.namespace, terminal.session_name));

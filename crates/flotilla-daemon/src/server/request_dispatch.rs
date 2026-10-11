@@ -490,6 +490,7 @@ impl<'a> RequestDispatcher<'a> {
             let attachable_id = if let Some(ref sid) = event.session_id {
                 if managed_codex {
                     // Fold a pre-fix unmanaged candidate into the managed shim.
+                    // Unknown notifications are NoChange and must leave the registry intact.
                     if event.event_type != AgentEventType::NoChange {
                         if let Some(existing) = store.lookup_by_session_id(sid).cloned().filter(|id| id != &event.attachable_id) {
                             store.remove(&existing);
