@@ -47,6 +47,8 @@ pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argumen
         .maybe_session_id(parsed.session_id)
         .maybe_model(parsed.model)
         .maybe_cwd(parsed.cwd)
+        .maybe_transcript_path(parsed.transcript_path)
+        .native_codex_hook(parsed.native_codex_hook)
         .maybe_terminal(terminal)
         .build();
 
@@ -68,7 +70,7 @@ pub(crate) async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
         HooksSubCommand::Install { harness, user, project, local, plugin } => {
             if harness == "codex" {
                 if *plugin || *project || *local {
-                    return Err(color_eyre::eyre::eyre!("Codex notify can only be installed in user config"));
+                    return Err(color_eyre::eyre::eyre!("Codex hooks can only be installed in user config"));
                 }
                 let path = codex_config_path();
                 install_codex_hook(&path)?;
@@ -100,7 +102,7 @@ pub(crate) async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
         HooksSubCommand::Uninstall { harness, user, project, local } => {
             if harness == "codex" {
                 if *project || *local {
-                    return Err(color_eyre::eyre::eyre!("Codex notify can only be uninstalled from user config"));
+                    return Err(color_eyre::eyre::eyre!("Codex hooks can only be uninstalled from user config"));
                 }
                 let path = codex_config_path();
                 uninstall_codex_hook(&path)?;
@@ -224,7 +226,12 @@ fn codex_config_path() -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("~")).join(".codex"));
-    home.join("config.toml")
+    let path = home.join("config.toml");
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    }
 }
 
 fn update_codex_hook(path: &std::path::Path, install: bool) -> Result<()> {
@@ -235,26 +242,15 @@ fn update_codex_hook(path: &std::path::Path, install: bool) -> Result<()> {
     };
     let mut doc: toml_edit::DocumentMut =
         content.parse().map_err(|error| color_eyre::eyre::eyre!("failed to parse {}: {error}", path.display()))?;
-    let expected = agents::CODEX_NOTIFY_COMMAND.iter().map(|part| toml_edit::Value::from(*part)).collect::<toml_edit::Array>();
-    let matches_installed =
-        doc.get("notify").and_then(toml_edit::Item::as_value).and_then(toml_edit::Value::as_array).is_some_and(|array| {
-            array.len() == agents::CODEX_NOTIFY_COMMAND.len()
-                && array.iter().zip(agents::CODEX_NOTIFY_COMMAND).all(|(value, expected)| value.as_str() == Some(*expected))
-        });
-    if install {
-        if doc.get("notify").is_some() && !matches_installed {
-            return Err(color_eyre::eyre::eyre!("{} already has a different notify command", path.display()));
-        }
-        doc["notify"] = toml_edit::value(expected);
-    } else if matches_installed {
-        doc.remove("notify");
-    } else {
+    agents::update_codex_hooks(&mut doc, install, path).map_err(|error| color_eyre::eyre::eyre!("{}: {error}", path.display()))?;
+    let updated = doc.to_string();
+    if updated == content {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| color_eyre::eyre::eyre!("failed to create {}: {error}", parent.display()))?;
     }
-    std::fs::write(path, doc.to_string()).map_err(|error| color_eyre::eyre::eyre!("failed to write {}: {error}", path.display()))
+    std::fs::write(path, updated).map_err(|error| color_eyre::eyre::eyre!("failed to write {}: {error}", path.display()))
 }
 
 fn install_codex_hook(path: &std::path::Path) -> Result<()> {
@@ -330,7 +326,7 @@ mod tests {
         install_codex_hook(&path).expect("install hook");
         install_codex_hook(&path).expect("idempotent install");
         let installed = std::fs::read_to_string(&path).expect("read installed config");
-        assert!(installed.contains("notify = [\"flotilla\", \"hook\", \"codex\", \"notify\"]"), "{installed}");
+        assert!(installed.contains("flotilla hook codex stop"), "{installed}");
         assert!(installed.contains("trust_level = \"trusted\""));
         uninstall_codex_hook(&path).expect("uninstall hook");
         let uninstalled = std::fs::read_to_string(&path).expect("read uninstalled config");

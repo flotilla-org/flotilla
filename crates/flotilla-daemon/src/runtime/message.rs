@@ -174,7 +174,8 @@ impl flotilla_store::MessageTransport for TerminalControllerRuntime {
                 return Some("fresh Codex turn completion after submission".into());
             }
             if flotilla_resources::delivery_hold::delivery_acceptance_evidence(
-                status.last_tool_activity_at.is_some_and(|at| at > submission.started_at),
+                status.last_tool_activity_at.is_some_and(|at| at > submission.started_at)
+                    || status.last_hook_working_at.is_some_and(|at| at > submission.started_at),
                 attention.is_some_and(|attention| {
                     attention.state == TerminalAttentionState::Working
                         && attention.as_of > submission.started_at

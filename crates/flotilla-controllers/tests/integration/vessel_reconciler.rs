@@ -3178,6 +3178,8 @@ async fn create_running_terminal(
             name,
             &created.metadata.resource_version,
             &TerminalSessionStatus {
+                codex_native_hooks: false,
+                last_hook_working_at: None,
                 configured_limits: None,
                 turn_delivery_hold: None,
                 last_tool_activity_at: None,

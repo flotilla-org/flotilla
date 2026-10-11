@@ -517,12 +517,23 @@ impl<'a> RequestDispatcher<'a> {
                     harness: event.harness.clone(),
                     status,
                     model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
+                    transcript_path: event
+                        .transcript_path
+                        .clone()
+                        .or_else(|| existing.filter(|e| e.session_id == event.session_id).and_then(|e| e.transcript_path.clone())),
                     session_title: existing.and_then(|e| e.session_title.clone()),
                     session_id: event.session_id.clone(),
                     last_event_epoch_secs: now,
                 };
                 store.upsert(attachable_id, entry);
                 true
+            } else if let Some(existing) = store.get(&attachable_id).cloned() {
+                if let Some(path) = event.transcript_path.clone() {
+                    store.upsert(attachable_id, AgentEntry { transcript_path: Some(path), ..existing });
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -548,7 +559,8 @@ impl<'a> RequestDispatcher<'a> {
             as_of: chrono::Utc::now(),
             source: flotilla_resources::TerminalAttentionSource::Hook,
         };
-        if event.event_type != AgentEventType::ToolActive
+        if !event.native_codex_hook
+            && event.event_type != AgentEventType::ToolActive
             && session.status.as_ref().is_some_and(|status| !status.should_record_attention(&attention))
         {
             return Ok(());
@@ -556,7 +568,12 @@ impl<'a> RequestDispatcher<'a> {
         flotilla_store::apply_status_patch(
             &sessions,
             &terminal.session_name,
-            &if event.event_type == AgentEventType::ToolActive {
+            &if event.harness == flotilla_protocol::AgentHarness::Codex && event.native_codex_hook {
+                flotilla_resources::TerminalSessionStatusPatch::ObserveNativeCodexHook {
+                    attention,
+                    tool_activity: event.event_type == AgentEventType::ToolActive,
+                }
+            } else if event.event_type == AgentEventType::ToolActive {
                 flotilla_resources::TerminalSessionStatusPatch::ObserveToolActivity { attention }
             } else {
                 flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }

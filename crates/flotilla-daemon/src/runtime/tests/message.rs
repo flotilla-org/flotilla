@@ -701,17 +701,25 @@ fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
 // observing a held write, acknowledge later output, and never retype it.
 #[tokio::test(start_paused = true)]
 async fn held_pool_delivery_observes_late_consumption_without_resending() {
-    held_pool_delivery_scenario(false).await;
+    held_pool_delivery_scenario("screen").await;
 }
 
 // #3028: an attributed Codex completion settles both the legacy held input
 // and its durable Message representation without submitting another copy.
 #[tokio::test(start_paused = true)]
 async fn held_pool_delivery_accepts_following_codex_idle_hook() {
-    held_pool_delivery_scenario(true).await;
+    held_pool_delivery_scenario("notify").await;
 }
 
-async fn held_pool_delivery_scenario(codex_hook: bool) {
+// Native top-level activity acknowledges input; subagent completion and Idle
+// without Working leave both held-delivery representations held.
+#[tokio::test(start_paused = true)]
+async fn held_pool_delivery_accepts_native_codex_lifecycle_and_ignores_child_stop() {
+    held_pool_delivery_scenario("native").await;
+    held_pool_delivery_scenario("native-prompt-only").await;
+}
+
+async fn held_pool_delivery_scenario(mode: &str) {
     let temp = TempDir::new().expect("tempdir");
     fs::write(temp.path().join("daemon.toml"), "machine_id = \"held-pool-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(temp.path()));
@@ -832,13 +840,41 @@ async fn held_pool_delivery_scenario(codex_hook: bool) {
     assert_eq!(held.len(), 1);
     assert!(!held[0].status.as_ref().expect("held status").phase.has_delivery_evidence());
     assert!(held[0].status.as_ref().expect("held status").submission.is_some());
-    if codex_hook {
+    if mode != "screen" {
         let store = flotilla_core::agents::shared_in_memory_agent_state_store();
         let (_, parser) = flotilla_core::agents::parser_for_harness("codex").expect("parser");
-        let parsed = parser
-            .parse_event("notify", br#"{"type":"agent-turn-complete","thread-id":"held-thread","cwd":"/workspace"}"#)
-            .expect("notify");
-        for _ in 0..2 {
+        let events = if mode.starts_with("native") {
+            vec![
+                ("session-start", "SessionStart"),
+                ("subagent-stop", "SubagentStop"),
+                ("stop", "Stop"),
+                ("user-prompt-submit", "UserPromptSubmit"),
+                ("pre-tool-use", "PreToolUse"),
+                ("post-tool-use", "PostToolUse"),
+                ("stop", "Stop"),
+            ]
+        } else {
+            vec![("notify", ""), ("notify", "")]
+        };
+        for (event, native) in events {
+            if mode == "native-prompt-only" && matches!(event, "pre-tool-use" | "post-tool-use") {
+                continue;
+            }
+            let payload = if event == "notify" {
+                serde_json::json!({"type":"agent-turn-complete","thread-id":"held-thread","cwd":"/workspace"})
+            } else {
+                let mut payload = serde_json::json!({"session_id":"held-thread","turn_id":"turn-1","cwd":"/workspace",
+                    "hook_event_name":native,"transcript_path":"/workspace/transcript.jsonl","stop_hook_active":false,"last_assistant_message":null});
+                if event == "stop" {
+                    payload["transcript_path"] = serde_json::Value::Null;
+                }
+                if event == "subagent-stop" {
+                    payload["agent_id"] = "child".into();
+                    payload["agent_type"] = "worker".into();
+                }
+                payload
+            };
+            let parsed = parser.parse_event(event, &serde_json::to_vec(&payload).unwrap()).expect("hook");
             tokio::time::advance(Duration::from_millis(1)).await;
             let response = crate::server::dispatch_request_with_state(
                 &runtime.state.daemon,
@@ -850,6 +886,8 @@ async fn held_pool_delivery_scenario(codex_hook: bool) {
                         .harness(flotilla_protocol::AgentHarness::Codex)
                         .event_type(parsed.event_type.clone())
                         .maybe_session_id(parsed.session_id.clone())
+                        .maybe_transcript_path(parsed.transcript_path.clone())
+                        .native_codex_hook(parsed.native_codex_hook)
                         .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: NAMESPACE.into(), session_name: "agent".into() })
                         .build(),
                 },
@@ -857,6 +895,32 @@ async fn held_pool_delivery_scenario(codex_hook: bool) {
             .await;
             let flotilla_protocol::Message::Response { response, .. } = response else { panic!("hook response") };
             assert!(matches!(*response, flotilla_protocol::ResponseResult::Ok { .. }));
+            if mode.starts_with("native") && matches!(event, "session-start" | "subagent-stop" | "stop") {
+                let holder = sessions.get("agent").await.expect("holder");
+                if holder.status.as_ref().unwrap().last_hook_working_at.is_none() {
+                    inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe held");
+                    assert!(
+                        !messages.get("held-turn").await.unwrap().status.unwrap().phase.has_delivery_evidence(),
+                        "{event} must leave input held"
+                    );
+                    let mut legacy = holder.clone();
+                    legacy.spec = spec.clone();
+                    let outcome = reconciler.reconcile(
+                        &legacy,
+                        &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                            attention: None,
+                            occupancy: TerminalOccupancy::Vacant,
+                            output_digest: None,
+                        }),
+                        Utc::now(),
+                    );
+                    let mut status = legacy.status.unwrap();
+                    if let Some(patch) = outcome.patch {
+                        patch.apply(&mut status);
+                    }
+                    assert!(status.degraded.is_some(), "{event} must leave legacy input held");
+                }
+            }
         }
         let receiver = sessions.get("agent").await.expect("attributed receiver");
         // The pre-migration representation retains its queued message spec;
@@ -882,6 +946,9 @@ async fn held_pool_delivery_scenario(codex_hook: bool) {
         assert_eq!(settled.delivered_message_id.as_deref(), Some("held-turn"));
         let agents = store.lock().expect("agents");
         assert_eq!(agents.list_agents().len(), 1);
+        if mode.starts_with("native") {
+            assert_eq!(agents.list_agents()[0].1.transcript_path.as_deref(), Some("/workspace/transcript.jsonl"));
+        }
     } else {
         pool.observations.store(100, Ordering::SeqCst);
         refresh_message_test_attention(&runtime, &backend, "agent").await;
