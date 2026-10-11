@@ -1,5 +1,6 @@
 //! Short-lived, daemon-local observations of proven branch absence.
 
+use flotilla_provider_runtime::ObservationError;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
@@ -7,7 +8,7 @@ use std::{
 
 use tokio::time::{Duration, Instant};
 
-use crate::providers::{change_request::ChangeRequestTracker, forge::observation_error::ObservationError, types::ChangeRequest};
+use crate::providers::{change_request::ChangeRequestTracker, types::ChangeRequest};
 
 const ABSENCE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_ABSENCES: usize = 1024;

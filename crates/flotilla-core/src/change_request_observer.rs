@@ -24,7 +24,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::providers::forge::observation_error::ObservationError;
+use flotilla_provider_runtime::ObservationError;
 
 const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
@@ -237,7 +237,7 @@ impl ChangeRequestRefresher {
         let _guard = lock.lock().await;
         // Ownership and publication use the resource store's string errors, not
         // forge observations. Tag them explicitly as ordinary failures.
-        if !self.owns_record(subject, false, create_missing).await.map_err(ObservationError::Forge)? {
+        if !self.owns_record(subject, false, create_missing).await.map_err(ObservationError::Failed)? {
             return Ok(());
         }
         let status = if create_missing {
@@ -266,7 +266,7 @@ impl ChangeRequestRefresher {
                 return Err(error);
             }
         };
-        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await.map_err(ObservationError::Forge)
+        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await.map_err(ObservationError::Failed)
     }
 
     pub async fn demand(
@@ -615,7 +615,7 @@ impl ChangeRequestRefresher {
                     continue;
                 }
                 Err(error) => {
-                    self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Forge(error));
+                    self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Failed(error));
                     if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.checks_pending).await).await {
                         break;
                     }
@@ -639,7 +639,7 @@ impl ChangeRequestRefresher {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
                     if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true, true).await {
-                        self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Forge(error.clone()));
+                        self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Failed(error.clone()));
                         tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
                     } else {
                         self.inner.observation_errors.lock().await.remove(&subject);
@@ -907,7 +907,7 @@ mod tests {
     use flotilla_store::{ResourceBackend, TypedResolver};
 
     use super::*;
-    use crate::providers::forge::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
+    use flotilla_forge_github::github::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
 
     struct UnavailableSource;
 
@@ -927,14 +927,12 @@ mod tests {
                 self.0.lock().await.clone()
             }
         }
-        let error = ObservationError::RateLimited {
-            budget: "GraphQL".into(),
-            limit: GithubRateLimit {
-                kind: GithubRateLimitKind::Secondary,
-                retry_source: GithubRetrySource::RetryAfter,
-                retry_at: Some("2026-10-03T12:00:00Z".parse().expect("deadline")),
-            },
-        };
+        let error = (GithubRateLimit {
+            kind: GithubRateLimitKind::Secondary,
+            retry_source: GithubRetrySource::RetryAfter,
+            retry_at: Some("2026-10-03T12:00:00Z".parse().expect("deadline")),
+        })
+        .observation_error("GraphQL".into());
         let source = Arc::new(RecoveringSource(Mutex::new(Err(error.clone()))));
         let refresher = ChangeRequestRefresher::new(
             "fleet".into(),
@@ -1794,7 +1792,7 @@ mod tests {
         })
         .await
         .expect("failed observation should become diagnostic evidence");
-        assert_eq!(refresher.observation_error(&subject).await, Some(ObservationError::Forge("unavailable".into())));
+        assert_eq!(refresher.observation_error(&subject).await, Some(ObservationError::Failed("unavailable".into())));
 
         refresher.release(demand).await;
         assert_eq!(refresher.observation_error(&subject).await, None);

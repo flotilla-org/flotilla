@@ -14,10 +14,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::ForgeBudgetRow;
 
-use crate::providers::forge::github::github_rate_limit;
-use crate::providers::forge::github::low_graphql_budget;
-use crate::providers::forge::github::parse_gh_api_response;
-use crate::providers::forge::github::response_header;
+use crate::github::github_rate_limit;
+use crate::github::low_graphql_budget;
+use crate::github::parse_gh_api_response;
+use crate::github::response_header;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandProcess;

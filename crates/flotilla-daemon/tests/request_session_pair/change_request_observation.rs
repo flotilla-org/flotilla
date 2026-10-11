@@ -1,11 +1,9 @@
 use super::*;
 use flotilla_core::{
     change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher},
-    providers::{
-        change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef},
-        forge::observation_error::ObservationError,
-    },
+    providers::change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef},
 };
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     change_request_record_name,
     promises::{self, PromiseKind, PromiseOperation, PromiseSource, PromiseState, Submission},
@@ -38,7 +36,7 @@ struct ForbiddenForge(std::sync::atomic::AtomicUsize);
 impl ChangeRequestObservationSource for ForbiddenForge {
     async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(ObservationError::Forge("nonowner contacted forge".into()))
+        Err(ObservationError::Failed("nonowner contacted forge".into()))
     }
 }
 

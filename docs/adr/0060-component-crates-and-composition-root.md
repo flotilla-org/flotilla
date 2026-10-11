@@ -42,10 +42,10 @@ The owner's direction is to break flotilla into components so it isn't committed
   - Backends: `flotilla-store-sqlite`, `flotilla-store-memory` and `flotilla-store-http`.
   - `flotilla-replication`: store-to-store sync over `dyn Store`. An event-sourced, log-backed backend may later replace or sit beneath it.
 - **Providers:**
-  - `flotilla-provider-runtime`: the runner, the HTTP client and the invocation macros.
+  - `flotilla-provider-runtime`: the runner, the HTTP client, generic invocation macros and the neutral `ObservationError { Failed(String), RateLimited { budget, retry_at, detail } }`. The error exposes a retry deadline and adapter-owned diagnostic text without a forge dependency.
   - `flotilla-discovery-api`: the `Factory` trait, `EnvironmentBag`, `UnmetRequirement`, `ProviderDescriptor` and a narrow config view.
   - **One crate per provider type**, each with a file module per provider: `flotilla-vcs`, `-change-request`, `-issue-tracker`, `-terminal`, `-environment`, `-ai-utility`, `-cloud-agent` and `-agent` (the harness adapters). Each type crate exports its own factories and type-specific detectors. CLI and library implementations are sibling modules, with heavy library dependencies behind per-provider features. Provider traits never mention the runner.
-  - Forge clients `flotilla-forge-github` and `flotilla-forge-forgejo`, shared by the change-request and issue-tracker crates.
+  - Forge clients `flotilla-forge-github` and `flotilla-forge-forgejo`, shared by the change-request and issue-tracker crates. `flotilla-forge-github` owns `GhApi`, the `gh_api_*` macros, polling, observation telemetry, host budget accounting and `GithubRateLimit`; the classifier fills the neutral error detail and preserves existing diagnostic text.
   - `flotilla-discovery`: the generic detectors, plus assembly of the factory list, static for now and open to registration later (for example plugin factories: scripted, wasm, dylib).
 - **Charter:** `flotilla-charter` holds the project's declarations read through a `RevisionedTree` interface: a local directory, git at a ref, or a database later. VCS offers only a generic "read files under a path at a revision" operation. `CharterSnapshot` leaves the `Vcs` trait. Agent guidance (briefs and prose delivery) consumes the charter from the agent and role layer.
 - **Agents:**

@@ -27,6 +27,7 @@ absolute-paths-allowed-crates = [
     "flotilla_build_features",
     "flotilla_client",
     "flotilla_cloud_agent",
+    "flotilla_forge_github",
     "flotilla_commands",
     "flotilla_controllers",
     "flotilla_core",

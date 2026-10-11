@@ -132,7 +132,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
 | `flotilla-terminal` | Terminal pool traits, Cleat and passthrough adapters, factories and shared session scans |
 | `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
-| `flotilla-provider-runtime` | Command and HTTP runners, invocation macros, environment variables, shared scans and bounded host probes |
+| `flotilla-provider-runtime` | Command and HTTP runners, generic invocation macros, neutral observation errors, environment variables, shared scans and bounded host probes |
+| `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry and host budget accounting |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
 | `flotilla-ai-utility` | AI utility trait, Claude API/CLI implementations and factories |
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |

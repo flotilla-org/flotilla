@@ -1,3 +1,4 @@
+use flotilla_provider_runtime::ObservationError;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
@@ -20,7 +21,7 @@ use crate::{
     change_request_observer::ChangeRequestRefresher,
     event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
-    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
+    providers::change_request::observation::ChangeRequestRef,
 };
 use turn_delivery::UnavailableTurnDeliveryActuator;
 use wake::ReconcilerWake;

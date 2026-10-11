@@ -1,4 +1,6 @@
 //! Source-scoped forge ownership and replicated reads (ADR 0057).
+use flotilla_forge_github::github::{classified_rate_error, rate_limit_reset};
+use flotilla_provider_runtime::ObservationError;
 use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration as StdDuration};
 
 use async_trait::async_trait;
@@ -20,10 +22,6 @@ use tokio::sync::Mutex;
 
 use crate::providers::{
     change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest},
-    forge::{
-        github::{classified_rate_error, rate_limit_reset},
-        observation_error::ObservationError,
-    },
     issue_tracker::IssueProvider,
     types::ChangeRequest,
 };

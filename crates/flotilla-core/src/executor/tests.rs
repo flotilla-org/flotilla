@@ -830,7 +830,8 @@ fn link_request_response(body: &str) -> String {
 }
 
 fn install_link_provider(registry: &mut ProviderRegistry, runner: MockRunner) {
-    use crate::providers::{change_request::github::GitHubChangeRequest, forge::github::GhApiClient};
+    use crate::providers::change_request::github::GitHubChangeRequest;
+    use flotilla_forge_github::github::GhApiClient;
     let runner: Arc<dyn CommandRunner> = Arc::new(runner);
     let provider = GitHubChangeRequest::new("github".into(), "owner/repo".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
     registry.change_requests.insert("github", desc("github"), Arc::new(provider));

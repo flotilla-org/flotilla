@@ -131,7 +131,8 @@ pub(super) struct RestAdmissionFixture {
 }
 
 pub(super) async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lookup: RestAdmissionLookup) -> RestAdmissionFixture {
-    use crate::providers::{change_request::github::GitHubChangeRequest, forge::github::GhApiClient};
+    use crate::providers::change_request::github::GitHubChangeRequest;
+    use flotilla_forge_github::github::GhApiClient;
     let config = tempfile::tempdir().expect("tempdir");
     std::fs::write(config.path().join("daemon.toml"), "machine_id = \"rest-admission-test\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());

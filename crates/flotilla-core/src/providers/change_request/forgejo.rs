@@ -10,13 +10,13 @@ use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
 use crate::providers::forge::forgejo::ForgejoClient;
 use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
-use crate::providers::forge::observation_error::ObservationError;
 use crate::providers::types::ChangeRequest;
 use crate::providers::types::ChangeRequestStatus;
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::HttpClient;
+use flotilla_provider_runtime::ObservationError;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,

@@ -1025,10 +1025,7 @@ impl ChangeRequestTracker for FakeChangeRequest {
     async fn get_change_request_for_admission(
         &self,
         id: &str,
-    ) -> Result<
-        flotilla_core::providers::change_request::ChangeRequestAdmission,
-        flotilla_core::providers::forge::observation_error::ObservationError,
-    > {
+    ) -> Result<flotilla_core::providers::change_request::ChangeRequestAdmission, flotilla_provider_runtime::ObservationError> {
         let (id, change_request) = self.get_change_request(id).await?;
         Ok(flotilla_core::providers::change_request::ChangeRequestAdmission {
             id,

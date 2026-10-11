@@ -29,8 +29,8 @@ use crate::in_process::WorkCredentialReconciler;
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::providers::change_request::observation::ChangeRequestObservationSource;
 use crate::providers::change_request::observation::ChangeRequestRef;
-use crate::providers::forge::observation_error::ObservationError;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_provider_runtime::ObservationError;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.
 struct UnusedForge;

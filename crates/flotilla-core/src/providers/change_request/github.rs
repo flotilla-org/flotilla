@@ -1,4 +1,4 @@
-use crate::providers::github_poll::PollCache;
+use flotilla_forge_github::github_poll::PollCache;
 
 use std::{collections::HashMap, path::Path, sync::Arc};
 
@@ -7,18 +7,18 @@ use chrono::Utc;
 
 use crate::providers::change_request::observation::parse_gh_observation_value_with_crew_identity;
 use crate::providers::change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
-use crate::providers::forge::github::clamp_per_page;
-use crate::providers::forge::github::GhApi;
-use crate::providers::forge::observation_error::ObservationError;
-use crate::providers::github_observation::ObservationTelemetry;
-use crate::providers::github_observation::ParsedObservationResponse;
-use crate::providers::github_observation::QueryShape;
 use crate::providers::types::*;
+use flotilla_forge_github::gh_api_get;
+use flotilla_forge_github::github::clamp_per_page;
+use flotilla_forge_github::github::GhApi;
+use flotilla_forge_github::github_observation::ObservationTelemetry;
+use flotilla_forge_github::github_observation::ParsedObservationResponse;
+use flotilla_forge_github::github_observation::QueryShape;
 use flotilla_provider_runtime::gh_api_channel_label;
-use flotilla_provider_runtime::gh_api_get;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ObservationError;
 
 fn execution_root() -> &'static Path {
     Path::new("/")
@@ -245,7 +245,7 @@ impl GitHubChangeRequest {
         call.finish(parsed.as_ref().ok());
         let parsed = parsed?;
         if let Some(limit) = &parsed.limit {
-            return Err(ObservationError::RateLimited { budget: "GraphQL".into(), limit: limit.clone() });
+            return Err((limit.clone()).observation_error("GraphQL".into()));
         }
         Ok(parsed)
     }
@@ -554,11 +554,11 @@ mod tests {
 
     use super::*;
     use crate::providers::change_request::ChangeRequestTracker;
-    use crate::providers::forge::github::GhApiClient;
-    use crate::providers::forge::github::GithubRetrySource;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
+    use flotilla_forge_github::github::GhApiClient;
+    use flotilla_forge_github::github::GithubRetrySource;
     use flotilla_provider_runtime::CommandOutput;
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
@@ -1165,13 +1165,13 @@ mod tests {
     // fabricate a retry deadline. Glue: classifier matrix owns response variants.
     #[tokio::test]
     async fn primary_limit_without_deadline_keeps_classification_without_timed_wait() {
-        use crate::providers::forge::github::GithubRateLimitKind;
+        use flotilla_forge_github::github::{GithubRateLimit, GithubRateLimitKind};
         let runner = Arc::new(MockRunner::new(vec![Ok(
             "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
         )]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("classified limit");
-        assert!(matches!(&error, ObservationError::RateLimited { limit, .. }
+        assert!(matches!(GithubRateLimit::from_observation_error(&error), Some(limit)
             if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == GithubRetrySource::Unavailable));
         assert_eq!(error.retry_at(), None, "no fabricated deadline for a cache, completion or Landing wait");
     }

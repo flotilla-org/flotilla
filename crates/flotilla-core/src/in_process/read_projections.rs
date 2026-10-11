@@ -1,5 +1,6 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
+use flotilla_provider_runtime::ObservationError;
 use flotilla_store::ProjectHierarchyStoreExt;
 
 use crate::providers::change_request::observation;
@@ -60,7 +61,7 @@ use crate::{
         DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
         DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
     },
-    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
+    providers::change_request::observation::ChangeRequestRef,
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
 

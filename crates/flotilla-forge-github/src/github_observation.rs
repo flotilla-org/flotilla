@@ -2,17 +2,17 @@ use std::time::Instant;
 
 use chrono::Utc;
 
-use crate::providers::forge::github::github_rate_limit_from_document;
-use crate::providers::forge::github::parse_gh_api_response;
-use crate::providers::forge::github::response_header;
-use crate::providers::forge::github::GhApiResponse;
-use crate::providers::forge::github::GithubRateLimit;
-use crate::providers::forge::observation_error::ObservationError;
+use crate::github::github_rate_limit_from_document;
+use crate::github::parse_gh_api_response;
+use crate::github::response_header;
+use crate::github::GhApiResponse;
+use crate::github::GithubRateLimit;
 use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::ObservationError;
 
 /// Every observer call derives accounting and decoding from this one JSON parse.
 #[derive(bon::Builder)]
-pub(crate) struct ParsedObservationResponse {
+pub struct ParsedObservationResponse {
     pub response: GhApiResponse,
     pub success: bool,
     pub stderr: String,
@@ -37,8 +37,8 @@ impl ParsedObservationResponse {
             .headers(headers)
             .build()
     }
-    pub(crate) fn low_budget(&self) -> Option<chrono::DateTime<Utc>> {
-        super::forge::github::low_graphql_budget(&self.headers, self.document.as_ref().unwrap_or(&serde_json::Value::Null))
+    pub fn low_budget(&self) -> Option<chrono::DateTime<Utc>> {
+        crate::github::low_graphql_budget(&self.headers, self.document.as_ref().unwrap_or(&serde_json::Value::Null))
     }
     pub fn into_document(self) -> Result<serde_json::Value, ObservationError> {
         self.document.map_err(|error| format!("decode GitHub GraphQL observation: {error}").into())
@@ -46,7 +46,7 @@ impl ParsedObservationResponse {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum QueryShape {
+pub enum QueryShape {
     BoundBatch,
     BoardBatch,
     HistoryComments,
@@ -73,7 +73,7 @@ impl QueryShape {
 /// One repository observation, including all history follow-ups. Logs contain
 /// budget headers and forge errors, never credentials, query text, or PR bodies.
 #[derive(bon::Builder)]
-pub(crate) struct ObservationTelemetry<'a> {
+pub struct ObservationTelemetry<'a> {
     scope: &'a str,
     #[builder(default = "change request")]
     observer: &'static str,
@@ -91,25 +91,19 @@ pub(crate) struct ObservationTelemetry<'a> {
 }
 
 impl<'a> ObservationTelemetry<'a> {
-    pub(crate) fn new(scope: &'a str, subjects: usize) -> Self {
+    pub fn new(scope: &'a str, subjects: usize) -> Self {
         Self::builder().scope(scope).subjects(subjects).build()
     }
 
-    pub(crate) fn board(scope: &'a str, subjects: usize) -> Self {
+    pub fn board(scope: &'a str, subjects: usize) -> Self {
         Self::builder().scope(scope).subjects(subjects).observer("dispatch board").build()
     }
 
-    pub(crate) fn call(&mut self, shape: QueryShape, subjects: usize) -> ObservationCall<'_, 'a> {
+    pub fn call(&mut self, shape: QueryShape, subjects: usize) -> ObservationCall<'_, 'a> {
         ObservationCall { telemetry: self, pending: Some((shape, subjects, Instant::now())) }
     }
 
-    pub(crate) fn record(
-        &mut self,
-        shape: QueryShape,
-        subjects: usize,
-        parsed: Option<&ParsedObservationResponse>,
-        elapsed: std::time::Duration,
-    ) {
+    pub fn record(&mut self, shape: QueryShape, subjects: usize, parsed: Option<&ParsedObservationResponse>, elapsed: std::time::Duration) {
         self.calls += 1;
         self.history_calls += usize::from(shape.is_history());
         let headers = parsed.map(|parsed| parsed.headers.as_str()).unwrap_or_default();
@@ -147,12 +141,12 @@ impl<'a> ObservationTelemetry<'a> {
 }
 
 /// Dropping an in-flight query records unknown cost before its cycle aggregate.
-pub(crate) struct ObservationCall<'call, 'scope> {
+pub struct ObservationCall<'call, 'scope> {
     telemetry: &'call mut ObservationTelemetry<'scope>,
     pending: Option<(QueryShape, usize, Instant)>,
 }
 impl ObservationCall<'_, '_> {
-    pub(crate) fn finish(mut self, parsed: Option<&ParsedObservationResponse>) {
+    pub fn finish(mut self, parsed: Option<&ParsedObservationResponse>) {
         if let Some((shape, subjects, started)) = self.pending.take() {
             self.telemetry.record(shape, subjects, parsed, started.elapsed());
         }

@@ -12,10 +12,10 @@ use serde_json::{json, Value};
 
 use super::{GitHubIssueProvider, BOARD_BATCH_SIZE};
 
-use crate::providers::forge::github::rate_limit_reset;
-use crate::providers::forge::github::GhApiClient;
-use crate::providers::github_poll::BoardState;
 use crate::providers::issue_tracker::IssueProvider;
+use flotilla_forge_github::github::rate_limit_reset;
+use flotilla_forge_github::github::GhApiClient;
+use flotilla_forge_github::github_poll::BoardState;
 use flotilla_protocol::IssueSource;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
@@ -133,8 +133,8 @@ fn provider(forge: Arc<dyn CommandRunner>, directory: &Path) -> GitHubIssueProvi
 async fn board_deadlines_and_restarts_converge_with_bounded_bulk_calls() {
     let forge = Arc::new(BoardForge::new(125));
     let directory = tempfile::tempdir().expect("durable cache");
-    let budgets = crate::forge_budget::ForgeBudgets::default();
-    let metered = Arc::new(crate::forge_budget::BudgetedRunner { inner: forge.clone(), budgets: budgets.clone() });
+    let budgets = flotilla_forge_github::forge_budget::ForgeBudgets::default();
+    let metered = Arc::new(flotilla_forge_github::forge_budget::BudgetedRunner { inner: forge.clone(), budgets: budgets.clone() });
     let mut previous = 0;
     let mut timeouts = 0;
     loop {
@@ -318,8 +318,8 @@ async fn board_incremental_closures_resolve_cached_blockers_and_linked_prs() {
         ("repos/team/repo/pulls/11".into(), unchanged),
     ];
     let runner = Arc::new(ScriptForge { requests: Mutex::new(requests.into()), graphql_calls: AtomicUsize::new(0) });
-    let budgets = crate::forge_budget::ForgeBudgets::default();
-    let metered = Arc::new(crate::forge_budget::BudgetedRunner { inner: runner.clone(), budgets: budgets.clone() });
+    let budgets = flotilla_forge_github::forge_budget::ForgeBudgets::default();
+    let metered = Arc::new(flotilla_forge_github::forge_budget::BudgetedRunner { inner: runner.clone(), budgets: budgets.clone() });
     let directory = tempfile::tempdir().expect("cache");
     let make = || {
         GitHubIssueProvider::new(

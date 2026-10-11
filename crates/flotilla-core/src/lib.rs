@@ -67,8 +67,6 @@ pub use flotilla_protocol::HostName;
 
 pub mod forge_observation;
 
-pub mod forge_budget;
-
 // Unit tests compile this library under cfg(test), which gives its traits a
 // different Rust identity from the normal library used by external testkits.
 // Compile the shared adapters against that identity; integration tests use the

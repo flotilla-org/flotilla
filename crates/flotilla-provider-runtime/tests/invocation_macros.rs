@@ -1,9 +1,8 @@
 use std::path::Path;
 
-use flotilla_provider_runtime::{gh_api_get, gh_api_get_with_headers, http_execute, run, run_output, ChannelLabel, TaskId};
+use flotilla_provider_runtime::{http_execute, run, run_output, ChannelLabel, TaskId};
 
-// In-memory invocation boundary: return the label sent by each macro. The GhApi
-// macros deliberately need no forge trait dependency in the runtime crate.
+// In-memory invocation boundary: return the label sent by each macro.
 struct Invocation;
 
 impl Invocation {
@@ -12,14 +11,6 @@ impl Invocation {
     }
 
     async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, label: &ChannelLabel) -> ChannelLabel {
-        label.clone()
-    }
-
-    async fn get(&self, _endpoint: &str, _cwd: &Path, label: &ChannelLabel) -> ChannelLabel {
-        label.clone()
-    }
-
-    async fn get_with_headers(&self, _endpoint: &str, _cwd: &Path, label: &ChannelLabel) -> ChannelLabel {
         label.clone()
     }
 
@@ -41,12 +32,8 @@ async fn exported_macros_preserve_default_and_explicit_channel_labels() {
     let cwd = Path::new("/");
     assert_eq!(run!(invocation, "tool", &["list"], cwd), ChannelLabel::Command("tool list".into()));
     assert_eq!(run_output!(invocation, "tool", &["list"], cwd), ChannelLabel::Command("tool list".into()));
-    assert_eq!(gh_api_get!(invocation, "repos/o/r", cwd), ChannelLabel::GhApi("repos/o/r".into()));
-    assert_eq!(gh_api_get_with_headers!(invocation, "repos/o/r", cwd), ChannelLabel::GhApi("repos/o/r".into()));
     assert_eq!(http_execute!(invocation, request()), ChannelLabel::Http("example.com".into()));
     assert_eq!(run!(invocation, "tool", &["list"], cwd, TaskId("task")), ChannelLabel::Command("task".into()));
     assert_eq!(run_output!(invocation, "tool", &["list"], cwd, TaskId("task")), ChannelLabel::Command("task".into()));
-    assert_eq!(gh_api_get!(invocation, "repos/o/r", cwd, TaskId("task")), ChannelLabel::GhApi("task".into()));
-    assert_eq!(gh_api_get_with_headers!(invocation, "repos/o/r", cwd, TaskId("task")), ChannelLabel::GhApi("task".into()));
     assert_eq!(http_execute!(invocation, request(), TaskId("task")), ChannelLabel::Http("task".into()));
 }

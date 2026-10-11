@@ -936,7 +936,7 @@ impl GhApi for ClassifiedTestApi {
 fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use flotilla_core::providers::forge::github::GithubRetrySource;
+    use flotilla_forge_github::github::GithubRetrySource;
     // Exhaust error variants, both kinds, every retry source and absent/present
     // deadlines in each case; generate timestamps across zero and modern dates,
     // pagination boundaries and counts across the empty/100-item page boundary.
@@ -944,7 +944,7 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
     let has_next_page = tc.draw(gs::booleans());
     let total_count = tc.draw(gs::integers::<u32>().min_value(0).max_value(101));
     let mut outcomes = vec![
-        Err(ObservationError::Forge("rate limited diagnostics unavailable".into())),
+        Err(ObservationError::Failed("rate limited diagnostics unavailable".into())),
         Ok(GhApiResponse { status: 200, etag: Some("etag".into()), body: "[]".into(), has_next_page, total_count: Some(total_count) }),
     ];
     for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
@@ -955,10 +955,7 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
             GithubRetrySource::SecondaryFallback,
         ] {
             for retry_at in [None, Some(chrono::DateTime::from_timestamp(timestamp, 0).expect("deadline"))] {
-                outcomes.push(Err(ObservationError::RateLimited {
-                    budget: "REST core".into(),
-                    limit: GithubRateLimit { kind, retry_at, retry_source },
-                }));
+                outcomes.push(Err((GithubRateLimit { kind, retry_at, retry_source }).observation_error("REST core".into())));
             }
         }
     }
@@ -1019,8 +1016,8 @@ impl CommandRunner for RestFailureRunner {
 fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
     use hegel::generators as gs;
 
-    use flotilla_core::providers::forge::github::GhApiClient;
-    use flotilla_core::providers::forge::github::GithubRetrySource;
+    use flotilla_forge_github::github::GhApiClient;
+    use flotilla_forge_github::github::GithubRetrySource;
     // Exhaust ordinary 403/404, primary and secondary 403/429, missing reset,
     // and transport failure each run. Generate reset boundaries and retry delay.
     let reset = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
@@ -1098,7 +1095,7 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
                 );
             }
             if status == 403 && remaining == "0" && !deadline {
-                let ObservationError::RateLimited { limit, .. } = &classified else { panic!("primary limit") };
+                let limit = GithubRateLimit::from_observation_error(&classified).expect("primary limit");
                 assert_eq!(limit.retry_at, None);
                 assert_eq!(limit.retry_source, GithubRetrySource::Unavailable);
             }
@@ -1131,7 +1128,7 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
 #[tokio::test]
 async fn classified_issue_budget_recording_has_no_failure_response() {
     use super::testing::MockRunner;
-    use flotilla_core::providers::forge::github::GhApiClient;
+    use flotilla_forge_github::github::GhApiClient;
     let reset = chrono::Utc::now().timestamp() + 3600;
     // Substitute the gh subprocess boundary with one successful low-budget response.
     let runner = Arc::new(MockRunner::new(vec![Ok(format!(

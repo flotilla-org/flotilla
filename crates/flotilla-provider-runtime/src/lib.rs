@@ -2,6 +2,8 @@
 //! This crate owns command/HTTP execution, channel labels and host probes;
 //! provider traits, discovery assembly and resource stores live elsewhere.
 
+pub mod observation_error;
+pub use observation_error::ObservationError;
 mod git_config_guard;
 pub mod probe;
 pub mod scan_cache;
@@ -712,37 +714,7 @@ macro_rules! run_output {
     }};
 }
 
-/// Macro that calls `GhApi::get`, auto-deriving the channel label from the endpoint.
-#[macro_export]
-macro_rules! gh_api_get {
-    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
-        let __endpoint = $endpoint;
-        let __label = $crate::gh_api_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>("GET", __endpoint, &$labeler);
-        $api.get(__endpoint, $repo_root, &__label).await
-    }};
-    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
-        let __endpoint = $endpoint;
-        let __label = $crate::gh_api_channel_label("GET", __endpoint);
-        $api.get(__endpoint, $repo_root, &__label).await
-    }};
-}
-
-/// Macro that calls `GhApi::get_with_headers`, auto-deriving the channel label from the endpoint.
-#[macro_export]
-macro_rules! gh_api_get_with_headers {
-    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
-        let __endpoint = $endpoint;
-        let __label = $crate::gh_api_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>("GET", __endpoint, &$labeler);
-        $api.get_with_headers(__endpoint, $repo_root, &__label).await
-    }};
-    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
-        let __endpoint = $endpoint;
-        let __label = $crate::gh_api_channel_label("GET", __endpoint);
-        $api.get_with_headers(__endpoint, $repo_root, &__label).await
-    }};
-}
-
-/// Macro that calls `HttpClient::execute`, auto-deriving the channel label from the request.
+/// Execute an HTTP request with an automatically derived channel label.
 #[macro_export]
 macro_rules! http_execute {
     ($http:expr, $request:expr, $labeler:expr $(,)?) => {{

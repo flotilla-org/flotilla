@@ -40,14 +40,14 @@ use crate::event_sink::broadcast_test_sink;
 use crate::issue_observer::IssueRefreshCadence;
 use crate::issue_observer::IssueRefresher;
 use crate::providers::change_request::observation::ChangeRequestRef;
-use crate::providers::forge::github::GithubRateLimit;
-use crate::providers::forge::github::GithubRateLimitKind;
-use crate::providers::forge::github::GithubRetrySource;
-use crate::providers::forge::observation_error::ObservationError;
 use crate::testkits::replay::test_runner;
 use crate::testkits::replay::testing::fixture_path;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
+use flotilla_forge_github::github::GithubRateLimit;
+use flotilla_forge_github::github::GithubRateLimitKind;
+use flotilla_forge_github::github::GithubRetrySource;
+use flotilla_provider_runtime::ObservationError;
 
 #[derive(Clone)]
 struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);

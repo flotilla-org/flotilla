@@ -128,7 +128,7 @@ pub trait ChangeRequestTracker: Send + Sync {
 }
 
 pub mod observation;
-use crate::providers::forge::observation_error::ObservationError;
+use flotilla_provider_runtime::ObservationError;
 
 #[cfg(test)]
 mod tests {

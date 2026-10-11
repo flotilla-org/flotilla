@@ -1332,14 +1332,9 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let now = Utc::now();
     let retry_at = now + chrono::Duration::seconds(60);
-    let error = ObservationError::RateLimited {
-        budget: "GraphQL".into(),
-        limit: GithubRateLimit {
-            kind: GithubRateLimitKind::Secondary,
-            retry_source: GithubRetrySource::RetryAfter,
-            retry_at: Some(retry_at),
-        },
-    };
+    let error =
+        (GithubRateLimit { kind: GithubRateLimitKind::Secondary, retry_source: GithubRetrySource::RetryAfter, retry_at: Some(retry_at) })
+            .observation_error("GraphQL".into());
     let refresher = ChangeRequestRefresher::new(
         "fleet".into(),
         backend.clone(),
