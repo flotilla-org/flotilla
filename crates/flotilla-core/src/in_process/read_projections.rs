@@ -40,7 +40,7 @@ use flotilla_resources::{
     TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
     ROLE_LABEL, VESSEL_LABEL,
 };
-use flotilla_store::{EventRecorder, ResourceBackend, StoreQuery};
+use flotilla_store::{EventRecorder, ProjectHierarchyStoreExt, ResourceBackend, StoreQuery};
 use tracing::warn;
 
 use super::{project_ops, resolve_convoy_candidate_indices, ConvoyAddressIdentity};
@@ -1464,7 +1464,7 @@ impl ReadProjections<'_> {
         let mut observation_errors = BTreeMap::new();
         for leaf in expected_change_request_leaves {
             if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
-                let subject = observation::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
+                let subject = ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                 if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
                     observation_errors.insert(subject.record_name(), error.to_string());
                 }
