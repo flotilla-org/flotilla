@@ -282,7 +282,7 @@ pub(crate) mod test_helpers {
 pub use commands::{
     AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget,
     CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyContinuation,
-    ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, CrewSupervisionAction, EvidenceFreshness, ExplainedArtifact,
+    ConvoyDispatchRegard, ConvoyExplanation, ConvoyNaming, ConvoyStartIntent, CrewSupervisionAction, EvidenceFreshness, ExplainedArtifact,
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
     ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition,
     ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, RepoSelector, ResourceCursor, ResourceDigest,

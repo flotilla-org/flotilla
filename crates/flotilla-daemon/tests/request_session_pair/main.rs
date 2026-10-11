@@ -543,7 +543,7 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
     let (node, result) = await_command_finished(&mut events, id).await;
     assert_eq!(node, *home.node_id());
     let started_name = match result {
-        CommandValue::ConvoyStarted { name, attach_plan, binding } => {
+        CommandValue::ConvoyStarted { name, attach_plan, binding, .. } => {
             trace.push(format!("started:attach_plan={}:binding={}", attach_plan.is_some(), binding.is_some()));
             name
         }
@@ -3287,7 +3287,12 @@ async fn convoy_start_routes_to_placement_when_presentation_membership_is_stale(
 
     assert_eq!(
         await_command_result(&mut events, command_id).await,
-        CommandValue::ConvoyStarted { name: "remote-work@flotilla".to_string(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "remote-work@flotilla".to_string(),
+            attach_plan: None,
+            binding: None
+        }
     );
     let origin_convoys = topology
         .leader
@@ -3449,7 +3454,15 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
 
     let result = await_command_result(&mut events, command_id).await;
     if destination_holds_credential && destination_has_capacity {
-        assert_eq!(result, CommandValue::ConvoyStarted { name: "kiwi-to-feta@flotilla".to_string(), attach_plan: None, binding: None });
+        assert_eq!(
+            result,
+            CommandValue::ConvoyStarted {
+                naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+                name: "kiwi-to-feta@flotilla".to_string(),
+                attach_plan: None,
+                binding: None
+            }
+        );
     } else {
         let CommandValue::Error { message } = result else {
             panic!("expected credential refusal: {result:?}");

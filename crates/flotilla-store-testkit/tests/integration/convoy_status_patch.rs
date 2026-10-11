@@ -270,6 +270,7 @@ fn successful_branch_scan_clears_a_stale_lookup_error() {
 #[test]
 fn abandon_convoy_stamps_convoy_and_open_work() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -449,6 +450,7 @@ fn one_shot_work_patches_preserve_existing_terminal_outcomes() {
 #[test]
 fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -528,6 +530,7 @@ fn crew_completion_updates_only_the_calling_agent() {
 #[test]
 fn final_crew_completion_claim_enters_landing_idempotently() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -615,6 +618,7 @@ fn stall_after_completion_preserves_done_and_landing() {
 #[test]
 fn crew_failure_records_terminal_state_and_message() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -668,6 +672,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     let mut coder = crew_work(CrewWorkPhase::Done);
     coder.finished_at = Some(ts(15));
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -735,6 +740,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
     coder.finished_at = Some(ts(15));
     coder.message = Some("ready".to_string());
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -793,6 +799,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
     let mut pending_coder = crew_work(CrewWorkPhase::Pending);
     pending_coder.started_at = None;
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -848,6 +855,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
 #[test]
 fn running_vessel_work_leaves_latent_agents_pending() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -940,6 +948,7 @@ fn bootstrap_sets_snapshot_and_initial_work_map() {
 #[test]
 fn advance_work_to_ready_updates_only_selected_vessels() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -1007,6 +1016,7 @@ fn init_failure_records_that_provisioning_never_started() {
 #[test]
 fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -1087,6 +1097,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         placement: None,
     };
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -1128,6 +1139,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
 #[test]
 fn forced_work_completion_claim_enters_landing() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -1183,6 +1195,7 @@ fn forced_work_completion_claim_enters_landing() {
 #[test]
 fn forced_work_completion_preserves_agent_owned_state() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,
@@ -1242,6 +1255,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
 #[test]
 fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     let mut status = ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,

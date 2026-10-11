@@ -188,6 +188,7 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        naming: None,
         promises: vec![
             serde_json::json!({"id": "second-pr", "vessel": "work", "role": "coder", "state": "open", "submissions": [{"reference": "https://github.com/org/repo/pull/42", "metadata": {"commit": "rejected-head"}, "verdict": {"accepted": false, "why": "closed unmerged"}}]}),
         ],
@@ -287,6 +288,20 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 
     // Every claim renders the active-process marker, including a superseded
     // claim and a claim with a valid ledger artifact.
+    // Glue: explain renders every naming source and the fallback diagnostic.
+    for (naming, expected) in [
+        (flotilla_protocol::ConvoyNaming::Explicit, "Naming: explicit"),
+        (flotilla_protocol::ConvoyNaming::AiUtility { utility: "Claude API".into() }, "Naming: AI utility (Claude API)"),
+        (
+            flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "Claude CLI: OAuth session expired".into() },
+            "Naming: deterministic fallback (Claude CLI: OAuth session expired)",
+        ),
+    ] {
+        let mut named = explanation.clone();
+        named.naming = Some(naming);
+        assert!(format_convoy_explanation_human(&named).contains(expected));
+    }
+    assert!(!format_convoy_explanation_human(&explanation).contains("Naming:"));
     let mut all_active = explanation.clone();
     for ledger in &mut all_active.decision_ledgers {
         ledger.completed_while_crew_active = true;
@@ -341,6 +356,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        naming: None,
         promises: Vec::new(),
         landing_entry: None,
         landing_settlement: None,
