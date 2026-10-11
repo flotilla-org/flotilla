@@ -24,7 +24,6 @@ use crate::providers::terminal::TerminalSession;
 use crate::providers::terminal::TerminalSessionTag;
 use crate::providers::types::*;
 use crate::providers::vcs::write_branch_issue_links;
-use crate::providers::CommandRunner;
 use crate::step::StepAction;
 use crate::step::StepExecutionContext;
 use crate::step::StepOutcome;
@@ -38,6 +37,7 @@ use crate::vcs::EnumeratedCheckout;
 use crate::vcs::Vcs;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)

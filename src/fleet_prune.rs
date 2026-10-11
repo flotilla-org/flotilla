@@ -6,7 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use flotilla_core::providers::{ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 /// Native executable lookup is separate from PID enumeration so tests can
 /// inject process lifetimes without spawning processes or relying on /proc.
@@ -235,7 +236,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_core::providers::CommandOutput;
+    use flotilla_provider_runtime::CommandOutput;
     use tempfile::TempDir;
 
     use super::*;

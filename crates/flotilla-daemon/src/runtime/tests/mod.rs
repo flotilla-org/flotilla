@@ -29,7 +29,6 @@ use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
 use flotilla_core::providers::change_request::ChangeRequestTracker;
-use flotilla_core::providers::discovery::EnvVars;
 use flotilla_core::providers::discovery::ProviderCategory;
 use flotilla_core::providers::discovery::ProviderDescriptor;
 use flotilla_core::providers::environment::CreateOpts;
@@ -49,10 +48,6 @@ use flotilla_core::providers::terminal::TerminalSessionLiveness;
 use flotilla_core::providers::terminal::TerminalSessionTag;
 use flotilla_core::providers::terminal::TerminalSize;
 use flotilla_core::providers::types::ChangeRequest as ProviderChangeRequest;
-use flotilla_core::providers::ChannelLabel;
-use flotilla_core::providers::CommandOutput;
-use flotilla_core::providers::CommandRunner;
-use flotilla_core::providers::ProcessCommandRunner;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_credentials::AgentMaterialRegistry;
 use flotilla_credentials::CredentialRefreshError;
@@ -76,6 +71,11 @@ use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
     NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, TerminalStatus,
 };
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
+use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_replay_testkit::Masks;
 use flotilla_replay_testkit::ReplayHttpClient;
 use flotilla_replay_testkit::Session;

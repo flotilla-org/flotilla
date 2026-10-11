@@ -1062,6 +1062,7 @@ dependencies = [
  "flotilla-manifest",
  "flotilla-paths",
  "flotilla-protocol",
+ "flotilla-provider-runtime",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-test-support",
@@ -1102,6 +1103,7 @@ dependencies = [
  "flotilla-daemon-api",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-tls",
@@ -1409,6 +1411,7 @@ dependencies = [
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
  "flotilla-resources",
  "flotilla-store",
  "flotilla-store-testkit",
@@ -1456,6 +1459,7 @@ dependencies = [
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
@@ -1515,6 +1519,7 @@ dependencies = [
  "flotilla-credentials-testkit",
  "flotilla-discovery-testkit",
  "flotilla-protocol",
+ "flotilla-provider-runtime",
  "flotilla-replay-testkit",
  "flotilla-resources",
  "flotilla-store",
@@ -1579,6 +1584,7 @@ dependencies = [
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
  "flotilla-resources",
@@ -1652,6 +1658,7 @@ dependencies = [
  "flotilla-paths",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
+ "flotilla-provider-runtime",
  "flotilla-resources",
  "tokio",
 ]
@@ -1756,6 +1763,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-provider-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-protocol",
+ "flotilla-tls",
+ "http",
+ "libc",
+ "reqwest 0.13.2",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "flotilla-relay"
 version = "0.1.0"
 dependencies = [
@@ -1805,6 +1837,7 @@ dependencies = [
  "flotilla-build-features-logging",
  "flotilla-core",
  "flotilla-paths",
+ "flotilla-provider-runtime",
  "flotilla-tls",
  "hegeltest",
  "http",

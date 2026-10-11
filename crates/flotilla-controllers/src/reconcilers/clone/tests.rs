@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::providers::ProcessCommandRunner;
+use flotilla_provider_runtime::ProcessCommandRunner;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 

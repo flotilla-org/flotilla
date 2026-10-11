@@ -22,7 +22,10 @@ use std::{
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
-use flotilla_core::providers::{discovery::EnvVars, ChannelLabel, HttpClient, ReqwestHttpClient};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::EnvVars;
+use flotilla_provider_runtime::HttpClient;
+use flotilla_provider_runtime::ReqwestHttpClient;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;

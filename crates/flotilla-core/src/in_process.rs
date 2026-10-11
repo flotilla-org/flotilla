@@ -145,16 +145,12 @@ use crate::providers::discovery::run_host_detectors;
 use crate::providers::discovery::status::provider_names_from_registry;
 use crate::providers::discovery::DiscoveryResult;
 use crate::providers::discovery::DiscoveryRuntime;
-use crate::providers::discovery::EnvVars;
 use crate::providers::environment::EnvironmentHandle;
 use crate::providers::forge::observation_error::ObservationError;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
-use crate::providers::ssh_runner::SshCommandRunner;
 use crate::providers::types::RepoCriteria;
 use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-use crate::providers::ChannelLabel;
-use crate::providers::CommandRunner;
 use crate::regard_lifecycle::RegardLifecycle;
 use crate::regard_lifecycle::SurfaceGestureOutcome;
 use crate::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
@@ -172,6 +168,10 @@ use crate::step::StepOutcome;
 use crate::step::StepResolver;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
+use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 type ObservationScope = (String, String, String);
 const OBSERVATION_CACHE_FALLBACK_DELAY: Duration = Duration::from_secs(9);
@@ -941,7 +941,7 @@ async fn create_adopted_checkout_resource(
     request: AdoptedCheckoutRequest<'_>,
 ) -> Result<(String, String, String), String> {
     let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, repository_url, git_ref, host_ref } = request;
-    let path = crate::probe::canonicalize(checkout_path).await?;
+    let path = flotilla_provider_runtime::probe::canonicalize(checkout_path).await?;
     let path_str = path.to_string_lossy().to_string();
     let checkout_ref = adopted_checkout_name(convoy_name);
     let repository_key = repository_spec.key();
@@ -2557,7 +2557,7 @@ impl InProcessDaemon {
     ) -> Result<RepositoryInspection, String> {
         if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
             if let Ok(spec) = RepositorySpec::remote(repository_url) {
-                let path = crate::probe::canonicalize(path).await?;
+                let path = flotilla_provider_runtime::probe::canonicalize(path).await?;
                 let (spec, replaces_prior_repository) = self.configure_inspected_repository(&path, spec).await?;
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
@@ -4531,8 +4531,8 @@ impl InProcessDaemon {
             Some(repo_root) => {
                 let repo_root_raw = repo_root.into_path_buf();
                 // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
-                let canonical_root = crate::probe::canonicalize(&repo_root_raw).await.unwrap_or(repo_root_raw);
-                let canonical_path = crate::probe::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
+                let canonical_root = flotilla_provider_runtime::probe::canonicalize(&repo_root_raw).await.unwrap_or(repo_root_raw);
+                let canonical_path = flotilla_provider_runtime::probe::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
                 if canonical_root != canonical_path {
                     debug!(
                         worktree = %path.display(),

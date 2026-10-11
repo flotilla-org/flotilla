@@ -5,11 +5,15 @@ use async_trait::async_trait;
 use flotilla_resources::CheckoutBranchProvenance;
 use tracing::info;
 
-use crate::{
-    providers::{types::Checkout, ChannelLabel, CommandRunner},
-    vcs::{existing_checkout_branch_error, CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
-};
+use crate::providers::types::Checkout;
+use crate::vcs::existing_checkout_branch_error;
+use crate::vcs::CheckoutMaterialisation;
+use crate::vcs::EnumeratedCheckout;
+use crate::vcs::GitCliBackend;
+use crate::vcs::VcsBackend;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 /// A `CheckoutManager` for sandbox/container environments that uses
 /// `git clone --reference` from a read-only reference repo (typically
@@ -292,10 +296,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{
-        providers::{vcs::checkout_test_support::git, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner},
-        vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs},
-    };
+    use crate::providers::vcs::checkout_test_support::git;
+    use crate::vcs::FlotillaVcs;
+    use crate::vcs::GitCheckoutStrategy;
+    use crate::vcs::Vcs;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
+    use flotilla_provider_runtime::ProcessCommandRunner;
 
     /// A test runner that records all (cmd, args) calls and returns queued responses.
     struct RecordingRunner {

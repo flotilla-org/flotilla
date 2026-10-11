@@ -13,8 +13,8 @@ use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::discovery::UnmetRequirement;
 use crate::providers::terminal::cleat::CleatTerminalPool;
 use crate::providers::terminal::TerminalPool;
-use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
 
 pub struct CleatTerminalPoolFactory;
 
@@ -60,8 +60,8 @@ mod tests {
     // Cleat owns terminal identity and ambient harness values never transfer.
     #[tokio::test]
     async fn session_factory_uses_declared_host_baseline_and_leaves_vt_identity_to_cleat() {
-        use crate::providers::CommandRunner;
         use crate::testkits::replay::testing::MockRunner;
+        use flotilla_provider_runtime::CommandRunner;
 
         for outer_identity in [None, Some(("screen-256color", "truecolor"))] {
             let mut bag = EnvironmentBag::new()

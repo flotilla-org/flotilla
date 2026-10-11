@@ -14,13 +14,13 @@ memchr = { version = "2" }
 serde = { version = "1", features = ["derive"] }
 serde_core = { version = "1", features = ["alloc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.10", features = ["oid"] }
+sha2 = { workspace = true, features = ["oid"] }
 subtle = { version = "2" }
 zeroize = { version = "1", features = ["derive"] }
 
 # sha2's Apple Silicon cpufeatures path reaches libc without default/std.
 [target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }

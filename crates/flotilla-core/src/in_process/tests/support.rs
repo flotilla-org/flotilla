@@ -32,11 +32,11 @@ use crate::providers::discovery::ProviderCategory;
 use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::discovery::UnmetRequirement;
 use crate::providers::issue_tracker::IssueProvider;
-use crate::providers::ChannelLabel;
-use crate::providers::CommandOutput;
-use crate::providers::CommandRunner;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 pub(super) struct RecordingWorkCredentials {
     pub(super) backend: ResourceBackend,
@@ -269,7 +269,7 @@ impl CommandRunner for BatchedObservationRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<crate::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         if cmd == "gh" && args.first() == Some(&"api") && args.get(1) == Some(&"--include") {
             let endpoint = args.get(2).ok_or("missing REST endpoint")?;
             let number = endpoint.rsplit('/').next().ok_or("missing PR number")?.parse::<u64>().map_err(|e| e.to_string())?;
@@ -297,7 +297,7 @@ impl CommandRunner for BatchedObservationRunner {
             });
         }
         if cmd != "gh" || args.first() != Some(&"api") || args.get(1) != Some(&"graphql") {
-            return self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+            return self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
                 stdout,
                 stderr: String::new(),
                 exit_code: Some(0),
@@ -312,7 +312,7 @@ impl CommandRunner for BatchedObservationRunner {
         // This fake stands in for the GitHub subprocess/network boundary.
         if self.mixed_history_errors.load(std::sync::atomic::Ordering::SeqCst) && query.contains("before:") {
             let limited = query.contains("number:2201)");
-            return Ok(crate::providers::CommandOutput {
+            return Ok(flotilla_provider_runtime::CommandOutput {
                 stdout: if limited {
                     "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nRetry-After: 60\r\n\r\n{\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"secondary rate limit\"}]}".into()
                 } else {
@@ -323,7 +323,7 @@ impl CommandRunner for BatchedObservationRunner {
             });
         }
         if self.rate_limit_all.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(crate::providers::CommandOutput {
+            return Ok(flotilla_provider_runtime::CommandOutput {
                 stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\nRetry-After: 60\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}".into(),
                 stderr: String::new(), exit_code: Some(1),
             });
@@ -332,7 +332,7 @@ impl CommandRunner for BatchedObservationRunner {
             return Err("rate limited diagnostics unavailable: access denied".into());
         }
         if query.contains("name:\"two\"") && self.rate_limit_two.load(std::sync::atomic::Ordering::SeqCst) {
-            return Ok(crate::providers::CommandOutput {
+            return Ok(flotilla_provider_runtime::CommandOutput {
                 stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1893456000\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
                 stderr: "gh: API rate limit exceeded".into(),
                 exit_code: Some(1),
@@ -357,7 +357,7 @@ impl CommandRunner for BatchedObservationRunner {
                 ))
             })
             .collect::<serde_json::Map<_, _>>();
-        Ok(crate::providers::CommandOutput {
+        Ok(flotilla_provider_runtime::CommandOutput {
             stdout: format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": requests}})),
             stderr: String::new(),
             exit_code: Some(0),

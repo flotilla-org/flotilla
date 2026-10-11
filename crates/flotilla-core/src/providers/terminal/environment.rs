@@ -9,11 +9,11 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use async_trait::async_trait;
 
 use super::TerminalEnvVars;
+use crate::discovery_api::EnvironmentBag;
 use crate::discovery_api::HOST_ENVIRONMENT_KEYS;
-use crate::{
-    discovery_api::EnvironmentBag,
-    providers::{ChannelLabel, CommandOutput, CommandRunner},
-};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 const CLEAT_CLIENT_KEYS: &[&str] = &["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON"];
 // Cleat sets these session coordinates itself and refuses them as launch

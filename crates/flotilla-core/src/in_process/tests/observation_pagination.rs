@@ -14,10 +14,10 @@ use crate::discovery_api::EnvironmentBag;
 use crate::in_process::InProcessDaemon;
 use crate::providers::change_request::observation::ChangeRequestObservationSource;
 use crate::providers::change_request::observation::ChangeRequestRef;
-use crate::providers::ChannelLabel;
-use crate::providers::CommandOutput;
-use crate::providers::CommandRunner;
 use crate::testkits::discovery::fake_discovery_with_runner;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Default)]
 struct BusyObservationRunner {
@@ -38,7 +38,7 @@ impl CommandRunner for BusyObservationRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<crate::providers::CommandOutput, String> {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         if cmd == "gh" && args.first() == Some(&"api") && args.get(1) == Some(&"--include") {
             let number =
                 args.get(2).ok_or("REST endpoint")?.rsplit('/').next().ok_or("PR number")?.parse::<u64>().map_err(|e| e.to_string())?;
@@ -52,7 +52,7 @@ impl CommandRunner for BusyObservationRunner {
             });
         }
         if cmd != "gh" || args.first() != Some(&"api") || args.get(1) != Some(&"graphql") {
-            return self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+            return self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
                 stdout,
                 stderr: String::new(),
                 exit_code: Some(0),
@@ -68,7 +68,7 @@ impl CommandRunner for BusyObservationRunner {
                 "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}});
             serde_json::json!({"data": {"repository": {"pr1": busy, "pr2": busy, "pr3": busy}}})
         };
-        Ok(crate::providers::CommandOutput {
+        Ok(flotilla_provider_runtime::CommandOutput {
             stdout: format!("HTTP/2 200 OK\r\n\r\n{document}"),
             stderr: String::new(),
             exit_code: Some(0),

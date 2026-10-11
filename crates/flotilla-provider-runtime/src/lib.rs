@@ -1,0 +1,1000 @@
+//! Provider invocation infrastructure shared by adapters and their test doubles.
+//! This crate owns command/HTTP execution, channel labels and host probes;
+//! provider traits, discovery assembly and resource stores live elsewhere.
+
+mod git_config_guard;
+pub mod probe;
+pub mod scan_cache;
+pub mod ssh_runner;
+
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+
+/// Identifies the logical channel an interaction belongs to.
+/// Within a replay round, interactions on the same channel are FIFO-ordered,
+/// while different channels can be consumed in any order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ChannelLabel {
+    /// Use the default label rather than an explicit one; the interaction is still recorded for replay.
+    Default,
+    Command(String),
+    GhApi(String),
+    Http(String),
+}
+
+impl ChannelLabel {
+    /// Extract host from a URL via simple string parsing.
+    /// "https://api.example.com/v1/foo" → "api.example.com"
+    pub fn http_from_url(url: &str) -> Self {
+        let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url).split(':').next().unwrap_or(url).to_string();
+        ChannelLabel::Http(host)
+    }
+}
+
+/// Request-side data passed to channel labeling strategies.
+pub enum ChannelRequest<'a> {
+    Command { cmd: &'a str, args: &'a [&'a str] },
+    GhApi { method: &'a str, endpoint: &'a str },
+    Http { method: &'a str, url: &'a str },
+}
+
+pub trait ChannelLabeler {
+    fn label_for(&self, request: &ChannelRequest) -> ChannelLabel;
+}
+
+pub struct DefaultLabeler;
+impl ChannelLabeler for DefaultLabeler {
+    fn label_for(&self, request: &ChannelRequest) -> ChannelLabel {
+        match request {
+            ChannelRequest::Command { cmd, args } => match args.first() {
+                Some(sub) if !sub.is_empty() => ChannelLabel::Command(format!("{} {}", cmd, sub)),
+                _ => ChannelLabel::Command(cmd.to_string()),
+            },
+            ChannelRequest::GhApi { endpoint, .. } => ChannelLabel::GhApi(endpoint.to_string()),
+            ChannelRequest::Http { url, .. } => ChannelLabel::http_from_url(url),
+        }
+    }
+}
+
+pub struct TaskId(pub &'static str);
+impl ChannelLabeler for TaskId {
+    fn label_for(&self, request: &ChannelRequest) -> ChannelLabel {
+        match request {
+            ChannelRequest::Command { .. } => ChannelLabel::Command(self.0.into()),
+            ChannelRequest::GhApi { .. } => ChannelLabel::GhApi(self.0.into()),
+            ChannelRequest::Http { .. } => ChannelLabel::Http(self.0.into()),
+        }
+    }
+}
+
+#[doc(hidden)]
+pub const REPLAY_LABELS_ENABLED: bool = true;
+pub(crate) const INSTALL_MANAGED_SCRIPT: &str = include_str!("scripts/install_managed_script.sh");
+pub(crate) const INSTALL_MANAGED_SCRIPT_BOOTSTRAP_NAME: &str = "flotilla-bootstrap-install-managed-script";
+pub const FLOTILLA_HELPER_NAME: &str = "flotilla-helper";
+pub const FLOTILLA_HELPER_SCRIPT: &str = include_str!("scripts/flotilla_helper.sh");
+
+#[inline]
+pub fn default_channel_label() -> ChannelLabel {
+    ChannelLabel::Default
+}
+
+#[inline]
+pub fn command_channel_label(cmd: &str, args: &[&str]) -> ChannelLabel {
+    command_channel_label_with::<REPLAY_LABELS_ENABLED, _>(cmd, args, &DefaultLabeler)
+}
+
+#[inline]
+pub fn command_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(cmd: &str, args: &[&str], labeler: &L) -> ChannelLabel {
+    if ENABLED {
+        let request = ChannelRequest::Command { cmd, args };
+        labeler.label_for(&request)
+    } else {
+        default_channel_label()
+    }
+}
+
+#[inline]
+pub fn gh_api_channel_label(method: &'static str, endpoint: &str) -> ChannelLabel {
+    gh_api_channel_label_with::<REPLAY_LABELS_ENABLED, _>(method, endpoint, &DefaultLabeler)
+}
+
+#[inline]
+pub fn gh_api_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(
+    method: &'static str,
+    endpoint: &str,
+    labeler: &L,
+) -> ChannelLabel {
+    if ENABLED {
+        let request = ChannelRequest::GhApi { method, endpoint };
+        labeler.label_for(&request)
+    } else {
+        default_channel_label()
+    }
+}
+
+#[inline]
+pub fn http_channel_label(method: &str, url: &str) -> ChannelLabel {
+    http_channel_label_with::<REPLAY_LABELS_ENABLED, _>(method, url, &DefaultLabeler)
+}
+
+#[inline]
+pub fn http_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?Sized>(method: &str, url: &str, labeler: &L) -> ChannelLabel {
+    if ENABLED {
+        let request = ChannelRequest::Http { method, url };
+        labeler.label_for(&request)
+    } else {
+        default_channel_label()
+    }
+}
+
+/// Raw output from a command, preserving stdout/stderr regardless of exit status.
+pub struct CommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    /// Numeric exit status, or None when the process terminated without a code.
+    pub exit_code: Option<i32>,
+}
+
+impl CommandOutput {
+    pub fn success(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+}
+
+/// Handle to a supervised long-lived command spawned by a [`CommandRunner`].
+#[async_trait]
+pub trait CommandProcess: Send + Sync {
+    /// Return the exit status when the command has exited, without waiting.
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String>;
+
+    /// Request termination of the command.
+    async fn kill(&mut self) -> Result<(), String>;
+
+    /// Wait for the command to exit.
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, String>;
+}
+
+pub fn helper_exec_script(helper_path: &str, subcommand: &str, args: &[&str]) -> Result<String, String> {
+    let helper_dir = Path::new(helper_path).parent().ok_or_else(|| format!("installed helper path has no parent: {helper_path}"))?;
+    let mut parts = vec![
+        format!("PATH={}:\"$PATH\"", flotilla_protocol::arg::shell_quote(&helper_dir.to_string_lossy())),
+        "exec".to_string(),
+        flotilla_protocol::arg::shell_quote("flotilla-helper"),
+        flotilla_protocol::arg::shell_quote(subcommand),
+    ];
+    parts.extend(args.iter().map(|arg| flotilla_protocol::arg::shell_quote(arg)));
+    Ok(parts.join(" "))
+}
+
+pub fn atomic_write_script(path: &Path, temp_suffix: &str, mode: Option<u32>) -> Result<String, String> {
+    let parent = path.parent().ok_or_else(|| format!("file path has no parent: {}", path.display()))?;
+    let target = path.to_string_lossy();
+    let temporary = format!("{target}.flotilla-tmp-{temp_suffix}");
+    if mode.is_some_and(|mode| mode > 0o777) {
+        return Err("file mode must contain only permission bits".to_string());
+    }
+    let protect = mode.map(|mode| format!("chmod {mode:o} \"$tmp\"; ")).unwrap_or_default();
+    let private_create = if mode.is_some() { "umask 077; " } else { "" };
+    Ok(format!(
+        "set -eu; mkdir -p {}; tmp={}; trap 'rm -f \"$tmp\"' EXIT; {private_create}cat > \"$tmp\"; {protect}mv \"$tmp\" {}; trap - EXIT",
+        flotilla_protocol::arg::shell_quote(&parent.to_string_lossy()),
+        flotilla_protocol::arg::shell_quote(&temporary),
+        flotilla_protocol::arg::shell_quote(&target),
+    ))
+}
+
+/// `shell_flag` follows the runner's shell policy: contained writes avoid
+/// login files, while static SSH hosts retain their configured login path.
+pub async fn install_managed_helper_script(
+    runner: &dyn CommandRunner,
+    command: &str,
+    command_prefix: &[&str],
+    shell_flag: &str,
+    helper_name: &str,
+    helper_content: &str,
+) -> Result<String, String> {
+    let helper_hash = format!("{:x}", Sha256::digest(helper_content.as_bytes()));
+    let mut owned_args: Vec<String> = command_prefix.iter().map(|arg| (*arg).to_string()).collect();
+    owned_args.extend([
+        "sh".to_string(),
+        shell_flag.to_string(),
+        INSTALL_MANAGED_SCRIPT.to_string(),
+        // `sh -c` treats the next argument as `$0`; this is only a diagnostic
+        // placeholder for the one-time bootstrap script text above.
+        INSTALL_MANAGED_SCRIPT_BOOTSTRAP_NAME.to_string(),
+        helper_name.to_string(),
+        helper_hash,
+        helper_content.to_string(),
+    ]);
+    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    let helper_path = runner.run(command, &arg_refs, Path::new("/"), &ChannelLabel::Default).await?;
+    let helper_path = helper_path.trim();
+    if helper_path.is_empty() {
+        return Err(format!("managed helper installer returned empty path for {helper_name}"));
+    }
+    Ok(helper_path.to_string())
+}
+
+/// Trait abstracting command execution so providers can be tested without
+/// spawning real processes.
+#[async_trait]
+pub trait CommandRunner: Send + Sync {
+    /// Run a command and return stdout on success, stderr on failure.
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String>;
+
+    /// Run a command with a deadline. Dropping the command future must stop
+    /// its local child processes; wrappers must forward the deadline to their
+    /// inner runner. Killing an SSH or Docker client cannot guarantee that a
+    /// command on the remote host or inside the container has stopped.
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        tokio::time::timeout(timeout, self.run(cmd, args, cwd, label)).await.map_err(|_| command_timeout_message(cmd, timeout))?
+    }
+
+    /// Run a command and return full output regardless of exit status.
+    /// `Err` only if the process could not be spawned at all.
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
+
+    /// Spawn a supervised command that is expected to outlive this call.
+    ///
+    /// Implementations should ensure dropping the returned handle terminates
+    /// the command so cancellation cannot orphan a child process.
+    async fn spawn_long_lived(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<Box<dyn CommandProcess>, String> {
+        Err("command runner does not support long-lived processes".to_string())
+    }
+
+    /// Run a command with bytes supplied on stdin. The input is deliberately
+    /// separate from argv so sensitive content cannot leak into process lists
+    /// or recorded command transcripts.
+    async fn run_with_input(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+        _input: &[u8],
+    ) -> Result<String, String> {
+        Err("command runner does not support stdin input".to_string())
+    }
+
+    /// Stream a command's binary stdout into a daemon-host file.
+    async fn run_to_file(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _destination: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file reads".to_string())
+    }
+
+    /// Stream a daemon-host file into a command's binary stdin.
+    async fn run_from_file(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _source: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file writes".to_string())
+    }
+
+    /// Copy a file from this runner's environment to the daemon host.
+    async fn read_file_to(&self, _source: &Path, _destination: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file reads".to_string())
+    }
+
+    /// Copy a daemon-host file into this runner's environment.
+    async fn write_file_from(&self, _source: &Path, _destination: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file writes".to_string())
+    }
+
+    /// Check if a command is available by running it.
+    async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
+
+    /// Check whether a path exists in the runner's execution environment.
+    ///
+    /// Unlike checking from the daemon process, this preserves container and
+    /// remote-host path semantics.
+    async fn path_exists(&self, path: &Path) -> Result<bool, String> {
+        let path = path.to_string_lossy();
+        let args = ["-e", &*path];
+        self.run_output("test", &args, Path::new("/"), &command_channel_label("test", &args)).await.map(|output| output.success())
+    }
+
+    /// Choose a Flotilla-owned writable scratch base in this runner's
+    /// filesystem world.
+    ///
+    /// Direct runners use the host's preferred runtime directory when it is
+    /// still usable, then fall back to the daemon-owned state directory.
+    /// Runners that cross into another filesystem namespace must override
+    /// this method and choose a path owned by that environment instead.
+    async fn writable_scratch_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
+        if let Some(preferred) = preferred {
+            let preferred_arg = preferred.to_string_lossy();
+            let output = self
+                .run_output(
+                    "sh",
+                    &["-c", "test -d \"$1\" && test -w \"$1\"", "flotilla-xdg-runtime-dir", &preferred_arg],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await;
+            if output.is_ok_and(|output| output.success()) {
+                return Ok(preferred.join("flotilla"));
+            }
+            tracing::debug!(rejected_path = %preferred.display(), "preferred scratch directory is missing or unwritable; using fallback");
+        }
+        Ok(fallback.to_path_buf())
+    }
+
+    /// Choose a Flotilla-owned writable base for files that must persist for
+    /// the lifetime of this runner's execution environment.
+    ///
+    /// This is deliberately distinct from [`Self::writable_scratch_base`]:
+    /// callers must not attach scratch-probe cleanup to paths returned here.
+    /// The default filesystem policy is shared, while namespace-crossing
+    /// runners may resolve the base in their own environment.
+    async fn writable_config_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
+        self.writable_scratch_base(preferred, fallback).await
+    }
+
+    /// Ensure `path` exists with `content` if absent, returning the resulting
+    /// file contents. Existing files are preserved.
+    async fn ensure_file(&self, _path: &Path, content: &str) -> Result<String, String> {
+        Ok(content.to_owned())
+    }
+
+    /// Atomically replace `path` with `content`. Implementations must transport
+    /// the content outside argv and command transcripts.
+    async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
+        Err("command runner does not support secure file writes".to_string())
+    }
+
+    /// Atomically publish content with its final Unix permissions. The
+    /// temporary file must be private while it is written. Wrappers that may
+    /// deliver credentials must override this method; the default fails closed.
+    /// On Windows, ProcessCommandRunner falls back to an atomic write with
+    /// inherited ACLs and warns that the requested mode is not enforced.
+    async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
+        Err("command runner does not support protected file writes".to_string())
+    }
+}
+
+pub fn command_timeout_message(cmd: &str, timeout: Duration) -> String {
+    format!("{cmd} timed out after {timeout:?}")
+}
+
+pub fn rename_command_timeout(error: String, from: &str, to: &str, timeout: Duration) -> String {
+    if error == command_timeout_message(from, timeout) {
+        command_timeout_message(to, timeout)
+    } else {
+        error
+    }
+}
+
+/// Production implementation that delegates to `tokio::process::Command`.
+pub struct ProcessCommandRunner;
+
+#[cfg(unix)]
+struct ProcessGroupGuard(i32);
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn for_child(child: &tokio::process::Child) -> Result<Self, String> {
+        let pid = child.id().expect("spawned child has pid");
+        let pgid = i32::try_from(pid).map_err(|_| format!("child PID {pid} exceeds pid_t range"))?;
+        Ok(Self(pgid))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        // The child was placed in a new process group at spawn. Never send a
+        // negative PID to a shell utility: killpg targets exactly this group.
+        if self.0 != 0 {
+            unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        }
+    }
+}
+
+impl ProcessCommandRunner {
+    async fn checked_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<tokio::process::Command, String> {
+        crate::git_config_guard::guard_host_git_config_async(cmd, args, cwd).await?;
+        let mut command = tokio::process::Command::new(cmd);
+        command.args(args).current_dir(cwd);
+        #[cfg(unix)]
+        command.process_group(0);
+        Ok(command)
+    }
+
+    async fn command_output(cmd: &str, args: &[&str], cwd: &Path) -> Result<std::process::Output, String> {
+        let child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let mut guard = ProcessGroupGuard::for_child(&child)?;
+        let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            guard.0 = 0;
+        }
+        Ok(output)
+    }
+}
+
+struct TokioCommandProcess {
+    child: tokio::process::Child,
+}
+
+#[async_trait]
+impl CommandProcess for TokioCommandProcess {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        self.child.try_wait().map_err(|error| error.to_string())
+    }
+
+    async fn kill(&mut self) -> Result<(), String> {
+        self.child.kill().await.map_err(|error| error.to_string())
+    }
+
+    async fn wait(&mut self) -> Result<std::process::ExitStatus, String> {
+        self.child.wait().await.map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait]
+impl CommandRunner for ProcessCommandRunner {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        let output = Self::command_output(cmd, args, cwd).await?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+        let output = Self::command_output(cmd, args, cwd).await?;
+        Ok(CommandOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code(),
+        })
+    }
+
+    async fn spawn_long_lived(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<Box<dyn CommandProcess>, String> {
+        let child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok(Box::new(TokioCommandProcess { child }))
+    }
+
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let mut guard = ProcessGroupGuard::for_child(&child)?;
+        let mut stdin = child.stdin.take().expect("piped stdin should be available");
+        let write_input = async move {
+            stdin.write_all(input).await.map_err(|e| e.to_string())?;
+            stdin.shutdown().await.map_err(|e| e.to_string())
+        };
+        let wait_for_output = async move { child.wait_with_output().await.map_err(|e| e.to_string()) };
+        let ((), output) = tokio::try_join!(write_input, wait_for_output)?;
+        #[cfg(unix)]
+        {
+            guard.0 = 0;
+        }
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let mut output = tokio::fs::File::create(destination).await.map_err(|error| error.to_string())?;
+        tokio::io::copy(&mut child.stdout.take().expect("piped stdout"), &mut output).await.map_err(|error| error.to_string())?;
+        let status = child.wait().await.map_err(|error| error.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited with {status}"))
+        }
+    }
+
+    async fn run_from_file(&self, cmd: &str, args: &[&str], cwd: &Path, source: &Path) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let mut input = tokio::fs::File::open(source).await.map_err(|error| error.to_string())?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        tokio::io::copy(&mut input, &mut stdin).await.map_err(|error| error.to_string())?;
+        stdin.shutdown().await.map_err(|error| error.to_string())?;
+        drop(stdin);
+        let status = child.wait().await.map_err(|error| error.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited with {status}"))
+        }
+    }
+
+    async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        tokio::fs::copy(source, destination).await.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let temporary = destination.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::copy(source, &temporary).await.map_err(|error| error.to_string())?;
+        tokio::fs::rename(&temporary, destination).await.map_err(|error| error.to_string())
+    }
+
+    async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+        tokio::time::timeout(crate::probe::PROBE_TIMEOUT, async {
+            let mut child = Self::checked_command(cmd, args, Path::new("/"))
+                .await?
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let mut guard = ProcessGroupGuard::for_child(&child)?;
+            let status = child.wait().await.map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            {
+                guard.0 = 0;
+            }
+            Ok::<_, String>(status.success())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false)
+    }
+
+    async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        match tokio::fs::OpenOptions::new().write(true).create_new(true).open(path).await {
+            Ok(mut file) => {
+                use tokio::io::AsyncWriteExt;
+                file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", path.display()))?;
+                file.flush().await.map_err(|e| format!("flush {}: {e}", path.display()))?;
+                drop(file);
+                Ok(content.to_owned())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                tokio::fs::read_to_string(path).await.map_err(|e| format!("read {}: {e}", path.display()))
+            }
+            Err(err) => Err(format!("open {}: {err}", path.display())),
+        }
+    }
+
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        let temporary = path.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, content).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
+        tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+    }
+
+    #[cfg(unix)]
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if mode > 0o777 {
+            return Err("file mode must contain only permission bits".to_string());
+        }
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(".flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let temporary = PathBuf::from(temporary);
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .await
+                .map_err(|e| format!("open {}: {e}", temporary.display()))?;
+            use tokio::io::AsyncWriteExt;
+            file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
+            file.flush().await.map_err(|e| format!("flush {}: {e}", temporary.display()))?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await
+                .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
+            file.sync_all().await.map_err(|e| format!("sync {}: {e}", temporary.display()))?;
+            drop(file);
+            tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        if mode > 0o777 {
+            return Err("file mode must contain only permission bits".to_string());
+        }
+        // Windows writes inherit directory ACLs; POSIX mode bits cannot enforce
+        // the requested protection. Explicit ACL policy belongs here when
+        // Windows hosts start materializing daemon credentials (#2468).
+        tracing::warn!(mode, path = %path.display(), "writing with inherited ACLs; requested POSIX file permissions are not enforced");
+        self.write_file(path, content).await
+    }
+}
+
+#[macro_export]
+macro_rules! run {
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __label = $crate::command_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>(__cmd, __args, &$labeler);
+        $runner.run(__cmd, __args, $cwd, &__label).await
+    }};
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __label = $crate::command_channel_label(__cmd, __args);
+        $runner.run(__cmd, __args, $cwd, &__label).await
+    }};
+}
+
+#[macro_export]
+macro_rules! run_output {
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr, $labeler:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __label = $crate::command_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>(__cmd, __args, &$labeler);
+        $runner.run_output(__cmd, __args, $cwd, &__label).await
+    }};
+    ($runner:expr, $cmd:expr, $args:expr, $cwd:expr $(,)?) => {{
+        let __args = $args;
+        let __cmd = $cmd;
+        let __label = $crate::command_channel_label(__cmd, __args);
+        $runner.run_output(__cmd, __args, $cwd, &__label).await
+    }};
+}
+
+/// Macro that calls `GhApi::get`, auto-deriving the channel label from the endpoint.
+#[macro_export]
+macro_rules! gh_api_get {
+    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __label = $crate::gh_api_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>("GET", __endpoint, &$labeler);
+        $api.get(__endpoint, $repo_root, &__label).await
+    }};
+    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __label = $crate::gh_api_channel_label("GET", __endpoint);
+        $api.get(__endpoint, $repo_root, &__label).await
+    }};
+}
+
+/// Macro that calls `GhApi::get_with_headers`, auto-deriving the channel label from the endpoint.
+#[macro_export]
+macro_rules! gh_api_get_with_headers {
+    ($api:expr, $endpoint:expr, $repo_root:expr, $labeler:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __label = $crate::gh_api_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>("GET", __endpoint, &$labeler);
+        $api.get_with_headers(__endpoint, $repo_root, &__label).await
+    }};
+    ($api:expr, $endpoint:expr, $repo_root:expr $(,)?) => {{
+        let __endpoint = $endpoint;
+        let __label = $crate::gh_api_channel_label("GET", __endpoint);
+        $api.get_with_headers(__endpoint, $repo_root, &__label).await
+    }};
+}
+
+/// Macro that calls `HttpClient::execute`, auto-deriving the channel label from the request.
+#[macro_export]
+macro_rules! http_execute {
+    ($http:expr, $request:expr, $labeler:expr $(,)?) => {{
+        let __request = $request;
+        let __label = $crate::http_channel_label_with::<{ $crate::REPLAY_LABELS_ENABLED }, _>(
+            __request.method().as_str(),
+            __request.url().as_str(),
+            &$labeler,
+        );
+        $http.execute(__request, &__label).await
+    }};
+    ($http:expr, $request:expr $(,)?) => {{
+        let __request = $request;
+        let __label = $crate::http_channel_label(__request.method().as_str(), __request.url().as_str());
+        $http.execute(__request, &__label).await
+    }};
+}
+
+/// Trait abstracting HTTP request execution so providers can be tested
+/// without making real network calls.
+///
+/// Uses reqwest::Request as input (callers build with the reqwest builder API)
+/// and returns http::Response<bytes::Bytes> (the standard Rust HTTP type that
+/// reqwest is built on, trivially constructable in tests).
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String>;
+
+    /// Stream a response body to a file. Test clients may use the buffered
+    /// `execute` implementation; production overrides this to bound memory.
+    async fn execute_to_file(&self, request: reqwest::Request, label: &ChannelLabel, path: &Path) -> Result<http::StatusCode, String> {
+        let response = self.execute(request, label).await?;
+        let status = response.status();
+        if status.is_success() {
+            tokio::fs::write(path, response.body()).await.map_err(|error| error.to_string())?;
+        }
+        Ok(status)
+    }
+}
+
+/// Production implementation that delegates to `reqwest::Client`.
+pub struct ReqwestHttpClient {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpClient {
+    pub fn new() -> Self {
+        const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let client = flotilla_tls::client_builder().timeout(REQUEST_TIMEOUT).build().expect("build HTTP client");
+        Self { client }
+    }
+}
+
+impl Default for ReqwestHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl HttpClient for ReqwestHttpClient {
+    async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+        let resp = self.client.execute(request).await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.bytes().await.map_err(|e| e.to_string())?;
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in headers.iter() {
+            builder = builder.header(name, value);
+        }
+        builder.body(body).map_err(|e| e.to_string())
+    }
+
+    async fn execute_to_file(&self, request: reqwest::Request, _label: &ChannelLabel, path: &Path) -> Result<http::StatusCode, String> {
+        use tokio::io::AsyncWriteExt;
+        let mut response = self.client.execute(request).await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        if status.is_success() {
+            let mut file = tokio::fs::File::create(path).await.map_err(|error| error.to_string())?;
+            while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+                file.write_all(&chunk).await.map_err(|error| error.to_string())?;
+            }
+            file.flush().await.map_err(|error| error.to_string())?;
+        }
+        Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // HTTP audit (#1512): ReqwestHttpClient is service-neutral transport, including
+    // execute_to_file. Service rules belong to its callers' contract/replay tests;
+    // it has no separate remote service contract or fixture. TLS User-Agent wire
+    // coverage lives in flotilla-resources/src/tls.rs.
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct PanicLabeler;
+
+    impl ChannelLabeler for PanicLabeler {
+        fn label_for(&self, _request: &ChannelRequest) -> ChannelLabel {
+            panic!("labeler should not be called");
+        }
+    }
+
+    #[tokio::test]
+    async fn process_runner_echo() {
+        let runner = ProcessCommandRunner;
+        let result = run!(runner, "echo", &["hello"], &PathBuf::from("/"));
+        assert_eq!(result.unwrap().trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn process_runner_exists_true() {
+        let runner = ProcessCommandRunner;
+        assert!(runner.exists("echo", &["test"]).await);
+    }
+
+    #[tokio::test]
+    async fn process_runner_exists_false() {
+        let runner = ProcessCommandRunner;
+        assert!(!runner.exists("nonexistent-binary-xyz", &[]).await);
+    }
+
+    #[tokio::test]
+    async fn process_runner_transfers_binary_files_without_text_conversion() {
+        let directory = tempfile::tempdir().expect("transfer directory");
+        let source = directory.path().join("source");
+        let copied = directory.path().join("copied");
+        let streamed = directory.path().join("streamed");
+        let returned = directory.path().join("returned");
+        let bytes = [0_u8, 1, 127, 128, 255];
+        tokio::fs::write(&source, bytes).await.expect("source bytes");
+        let runner = ProcessCommandRunner;
+        runner.read_file_to(&source, &copied).await.expect("read host file");
+        runner.write_file_from(&copied, &returned).await.expect("write host file");
+        runner.run_to_file("cat", &[source.to_str().expect("utf8 path")], Path::new("/"), &streamed).await.expect("stream stdout");
+        assert_eq!(tokio::fs::read(&streamed).await.expect("streamed bytes"), bytes);
+        assert_eq!(tokio::fs::read(&returned).await.expect("returned bytes"), bytes);
+        let piped = directory.path().join("piped");
+        runner
+            .run_from_file("sh", &["-c", "cat > \"$1\"", "flotilla-test", piped.to_str().expect("utf8 path")], Path::new("/"), &source)
+            .await
+            .expect("stream stdin");
+        assert_eq!(tokio::fs::read(piped).await.expect("piped bytes"), bytes);
+    }
+
+    #[test]
+    fn command_label_enabled_uses_labeler() {
+        let label = command_channel_label_with::<true, _>("git", &["status"], &TaskId("task"));
+        assert_eq!(label, ChannelLabel::Command("task".to_string()));
+    }
+
+    #[test]
+    fn command_label_disabled_skips_labeler() {
+        let label = command_channel_label_with::<false, _>("git", &["status"], &PanicLabeler);
+        assert_eq!(label, ChannelLabel::Default);
+    }
+
+    #[test]
+    fn gh_api_label_enabled_uses_labeler() {
+        let label = gh_api_channel_label_with::<true, _>("GET", "repos/a/b/issues", &TaskId("gh"));
+        assert_eq!(label, ChannelLabel::GhApi("gh".to_string()));
+    }
+
+    #[test]
+    fn gh_api_label_disabled_skips_labeler() {
+        let label = gh_api_channel_label_with::<false, _>("GET", "repos/a/b/issues", &PanicLabeler);
+        assert_eq!(label, ChannelLabel::Default);
+    }
+
+    #[test]
+    fn http_label_enabled_uses_labeler() {
+        let label = http_channel_label_with::<true, _>("POST", "https://api.example.com/v1", &TaskId("http"));
+        assert_eq!(label, ChannelLabel::Http("http".to_string()));
+    }
+
+    #[test]
+    fn http_label_disabled_skips_labeler() {
+        let label = http_channel_label_with::<false, _>("POST", "https://api.example.com/v1", &PanicLabeler);
+        assert_eq!(label, ChannelLabel::Default);
+    }
+}
+
+pub trait EnvVars: Send + Sync {
+    fn get(&self, key: &str) -> Option<String>;
+
+    fn host_os(&self) -> &str {
+        std::env::consts::OS
+    }
+}
+
+pub struct ProcessEnvVars;
+
+impl EnvVars for ProcessEnvVars {
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use crate::{ChannelLabel, CommandOutput, CommandRunner};
+    use async_trait::async_trait;
+    use std::{
+        path::{Path, PathBuf},
+        time::Duration,
+    };
+    pub type TimeoutCall = (String, Vec<String>, PathBuf, Duration);
+
+    /// Stub that proves decorators use the timeout seam rather than `run`.
+    pub struct TimeoutOnlyRunner {
+        pub calls: std::sync::Mutex<Vec<TimeoutCall>>,
+        result: Result<String, String>,
+    }
+
+    impl TimeoutOnlyRunner {
+        pub fn new(result: Result<String, String>) -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()), result }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for TimeoutOnlyRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            panic!("run called instead of run_with_timeout")
+        }
+
+        async fn run_with_timeout(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            _label: &ChannelLabel,
+            timeout: Duration,
+        ) -> Result<String, String> {
+            self.calls.lock().expect("calls mutex").push((
+                cmd.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd.to_path_buf(),
+                timeout,
+            ));
+            self.result.clone()
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("run_output not expected")
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+}

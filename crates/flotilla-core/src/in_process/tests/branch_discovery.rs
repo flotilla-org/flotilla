@@ -148,7 +148,7 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
     let conflict =
         fixture.daemon.validate_new_checkout_branch(&checkout).await.expect("forge lookup").expect("old merged head must refuse creation");
     assert!(conflict.contains("requested") && conflict.contains("#7"), "{conflict}");
-    let runner = Arc::new(crate::providers::ProcessCommandRunner);
+    let runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
     let vcs = crate::vcs::FlotillaVcs::new(
         ExecutionEnvironmentPath::new(root.path()),
         runner.clone(),

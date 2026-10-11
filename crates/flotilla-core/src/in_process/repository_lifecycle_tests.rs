@@ -225,8 +225,8 @@ impl CommandRunner for ConditionalIssueRunner {
         args: &[&str],
         cwd: &Path,
         label: &ChannelLabel,
-    ) -> Result<crate::providers::CommandOutput, String> {
-        self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+        self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
             stdout,
             stderr: String::new(),
             exit_code: Some(0),

@@ -5,7 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [features]
 # Keep helper features uniform across build/workspace/package commands on stable.
@@ -22,14 +22,14 @@ gethostname = "1.1.0"
 tracing = { workspace = true }
 url = "2"
 percent-encoding = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 serde_yml = "0.0.12"
-sha2 = "0.10"
-tempfile = "3"
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

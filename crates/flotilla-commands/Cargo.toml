@@ -13,7 +13,7 @@ clap = { version = "4", features = ["derive", "string"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = "=0.48.1"
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -1114,11 +1114,11 @@ mod tests {
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_core::providers::discovery::factories::git::GitVcsFactory;
     use flotilla_core::providers::discovery::Factory;
-    use flotilla_core::providers::ProcessCommandRunner;
     use flotilla_discovery_testkit::fake_discovery_with_provider_set;
     use flotilla_discovery_testkit::FakeDiscoveryProviders;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_protocol::{HostName, NodeId};
+    use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_resources::{InputMeta, PlacementPolicy, PlacementPolicySpec, Project, Resolution, WatchStart, WorkflowTemplate};
     use flotilla_store::{patch_resource_annotation, InMemoryBackend, ResourceBackend, MANIFEST_WRITER_SOURCE};
     use futures::StreamExt;

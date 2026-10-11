@@ -5,6 +5,7 @@
 //! producing `EnvironmentAssertion` values collected into an `EnvironmentBag`.
 //! Factories consume the bag to construct typed provider instances.
 
+use flotilla_provider_runtime::{EnvVars, ProcessEnvVars};
 use futures::StreamExt;
 
 use crate::providers::environment::EnvironmentProvider;
@@ -37,25 +38,9 @@ use crate::providers::registry::ProviderRegistry;
 use crate::providers::registry::ProviderSet;
 use crate::providers::scan_cache::SharedTerminalPool;
 use crate::providers::terminal::TerminalPool;
-use crate::providers::CommandRunner;
 use crate::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
-
-pub trait EnvVars: Send + Sync {
-    fn get(&self, key: &str) -> Option<String>;
-
-    fn host_os(&self) -> &str {
-        std::env::consts::OS
-    }
-}
-
-pub struct ProcessEnvVars;
-
-impl EnvVars for ProcessEnvVars {
-    fn get(&self, key: &str) -> Option<String> {
-        std::env::var(key).ok()
-    }
-}
+use flotilla_provider_runtime::CommandRunner;
 
 // ---------------------------------------------------------------------------
 // Unmet requirements and provider descriptor
@@ -465,7 +450,7 @@ impl HostScopedProviderCache {
 impl DiscoveryRuntime {
     pub fn for_process() -> Self {
         Self {
-            runner: Arc::new(crate::providers::ProcessCommandRunner),
+            runner: Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             env: Arc::new(ProcessEnvVars),
             available_space_probe: system_available_space_probe(),
             host_detectors: Arc::new(detectors::default_host_detectors()),
@@ -515,13 +500,13 @@ async fn probe_factory<T: ?Sized + Send + Sync + 'static>(
     runner: Arc<dyn CommandRunner>,
 ) -> Result<Arc<T>, Vec<UnmetRequirement>> {
     config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
-    tokio::time::timeout(crate::probe::PROBE_TIMEOUT, factory.probe(env, config, repo_root, runner))
+    tokio::time::timeout(flotilla_provider_runtime::probe::PROBE_TIMEOUT, factory.probe(env, config, repo_root, runner))
         .await
         .map_err(|_| vec![UnmetRequirement::MissingConfig(format!("{} discovery probe timed out", factory.descriptor().implementation))])?
 }
 
 async fn bounded_detection<T>(future: impl std::future::Future<Output = Vec<T>>) -> Vec<T> {
-    match tokio::time::timeout(crate::probe::PROBE_TIMEOUT, future).await {
+    match tokio::time::timeout(flotilla_provider_runtime::probe::PROBE_TIMEOUT, future).await {
         Ok(assertions) => assertions,
         Err(_) => {
             tracing::warn!("discovery detector timed out; skipping probe");

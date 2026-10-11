@@ -12,9 +12,9 @@ use super::{
     EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind, EnvironmentVariableUpdate,
     ImagePullPolicy, ProvisionedMount, ProvisionedMountMode,
 };
-use crate::providers::ChannelLabel;
-use crate::providers::CommandOutput;
-use crate::providers::CommandRunner;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 // Boundary double: admitted material is lowered to a virtual tool config.
 struct TestRegistryMaterial(PathBuf);

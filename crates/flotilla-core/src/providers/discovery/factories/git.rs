@@ -14,11 +14,11 @@ use crate::providers::discovery::UnmetRequirement;
 use crate::providers::vcs::clone::ReferenceCloneStrategy;
 use crate::providers::vcs::detection::reference_clone_available;
 use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
-use crate::providers::CommandRunner;
 use crate::vcs::FlotillaVcs;
 use crate::vcs::GitCheckoutStrategy;
 use crate::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
 
 pub struct GitVcsFactory;
 

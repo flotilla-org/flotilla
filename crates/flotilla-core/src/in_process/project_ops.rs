@@ -1593,9 +1593,9 @@ mod tests {
     async fn bound_ops_sources_apply_without_checkouts_and_preserve_last_good() {
         use flotilla_resources::{CharterSource, CharterStoreBinding, ManifestRoot};
 
-        use crate::providers::ProcessCommandRunner;
         use crate::repository_inspection::GitRepositoryInspector;
         use crate::testkits::discovery::test_vcs_resolver;
+        use flotilla_provider_runtime::ProcessCommandRunner;
         for local in [false, true] {
             let source_dir = tempfile::tempdir().expect("source");
             let cache = tempfile::tempdir().expect("cache");
@@ -1622,7 +1622,7 @@ mod tests {
                     path: String::new(),
                 }
             };
-            let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
+            let runner: Arc<dyn flotilla_provider_runtime::CommandRunner> = Arc::new(ProcessCommandRunner);
             let inspector = Arc::new(
                 GitRepositoryInspector::new(runner.clone(), test_vcs_resolver(runner), "local-host")
                     .with_charter_cache(cache.path().to_path_buf()),

@@ -5,11 +5,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{
-    config::RemoteHostConfig,
-    providers::{ChannelLabel, CommandOutput, CommandProcess, CommandRunner},
-};
+use flotilla_core::config::RemoteHostConfig;
 use flotilla_protocol::{ConfigLabel, GoodbyeReason, HostName, Message, NodeId, NodeInfo, PeerWireMessage, PROTOCOL_VERSION};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandProcess;
+use flotilla_provider_runtime::CommandRunner;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixStream,
@@ -880,7 +881,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -905,7 +906,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths {
                 state_dir: Path::new("/home/test-local/.local/state/flotilla"),
                 daemon_socket: Path::new("/home/test-local/.config/flotilla/flotilla.sock"),
@@ -952,7 +953,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid transport");
@@ -1096,7 +1097,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         ) {
             Err(e) => assert!(e.contains("path separators"), "unexpected error: {e}"),
@@ -1121,7 +1122,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1226,7 +1227,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1250,7 +1251,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1282,7 +1283,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");
@@ -1346,7 +1347,7 @@ mod tests {
             config,
             None,
             uuid::Uuid::nil(),
-            Arc::new(flotilla_core::providers::ProcessCommandRunner),
+            Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
             SshTransportPaths { state_dir: Path::new("/tmp/flotilla-test"), daemon_socket: Path::new("/tmp/flotilla.sock") },
         )
         .expect("valid host name");

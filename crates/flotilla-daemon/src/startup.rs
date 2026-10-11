@@ -195,7 +195,9 @@ pub(crate) mod test_support {
     };
 
     use async_trait::async_trait;
-    use flotilla_core::providers::{ChannelLabel, CommandOutput, CommandRunner};
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
     use tokio::sync::{Notify, Semaphore};
 
     // Represents the credential consumer's process/HTTP boundary. No actual

@@ -12,13 +12,14 @@ use serde_json::{json, Value};
 
 use super::{GitHubIssueProvider, BOARD_BATCH_SIZE};
 
-use crate::providers::{
-    forge::github::{rate_limit_reset, GhApiClient},
-    github_poll::BoardState,
-    issue_tracker::IssueProvider,
-    ChannelLabel, CommandOutput, CommandRunner,
-};
+use crate::providers::forge::github::rate_limit_reset;
+use crate::providers::forge::github::GhApiClient;
+use crate::providers::github_poll::BoardState;
+use crate::providers::issue_tracker::IssueProvider;
 use flotilla_protocol::IssueSource;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 // Stand-in for the gh/HTTP boundary. Enforce the actual REST routes and
 // bounded GraphQL selection, and return GitHub's connection-shaped responses.

@@ -14,13 +14,15 @@ use flotilla_controllers::reconcilers::{
     vessel::WorktreeMetadataResolver, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneRuntime, ForgeDefaultBranchResolver,
     PreparedCheckout,
 };
-use flotilla_core::{
-    checkout_integration::checkout_path_from_status_and_spec,
-    in_process::{InProcessDaemon, OperatorReconciler},
-    providers::{ChannelLabel, CommandRunner},
-    vcs::{CheckoutMaterialisationError, CheckoutRegistration, WorktreeMetadata},
-};
+use flotilla_core::checkout_integration::checkout_path_from_status_and_spec;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::in_process::OperatorReconciler;
+use flotilla_core::vcs::CheckoutMaterialisationError;
+use flotilla_core::vcs::CheckoutRegistration;
+use flotilla_core::vcs::WorktreeMetadata;
 use flotilla_protocol::RepoSelector;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     ChangeRequest, Checkout, CheckoutIntegrationStatus, CheckoutSpec, Clone, ClonePhase, Convoy, ConvoyTeardownRuntime, Demand, DemandKind,
     DemandSpec, Forge, ForgeIdentity, InputMeta, ManifestRoot, Resource, ResourceError, ResourceObject,

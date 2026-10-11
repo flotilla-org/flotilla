@@ -27,12 +27,12 @@ reqwest = { workspace = true, features = ["json", "query", "stream"] }
 rustls = { workspace = true }
 serde_yml = "0.0.12"
 base64 = "0.22"
-bytes = "1"
+bytes = { workspace = true }
 tracing = "0.1"
-sha2 = "0.10"
+sha2 = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
 tokio-rusqlite = "0.7"
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 object_store = { version = "0.12", features = ["aws"] }
 serde_path_to_error = "0.1.20"
 
@@ -42,7 +42,7 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 hegeltest = "=0.48.1"
 rstest = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [[example]]

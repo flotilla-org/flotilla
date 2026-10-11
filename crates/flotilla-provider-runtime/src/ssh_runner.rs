@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::providers::{
+use crate::{
     atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
     CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
@@ -195,12 +195,12 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
-    use crate::providers::command_timeout_message;
-    use crate::providers::ChannelLabel;
-    use crate::providers::CommandOutput;
-    use crate::providers::CommandRunner;
-    use crate::providers::ProcessCommandRunner;
-    use crate::testkits::replay::testing::TimeoutOnlyRunner;
+    use crate::command_timeout_message;
+    use crate::test_support::TimeoutOnlyRunner;
+    use crate::ChannelLabel;
+    use crate::CommandOutput;
+    use crate::CommandRunner;
+    use crate::ProcessCommandRunner;
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_ssh_client() {

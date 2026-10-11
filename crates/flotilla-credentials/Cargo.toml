@@ -10,6 +10,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provide
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-core = { path = "../flotilla-core" }
@@ -21,13 +22,13 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 base64 = "0.22"
 serde = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 url = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
@@ -40,8 +41,8 @@ flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
-bytes = "1"
-http = "1"
+bytes = { workspace = true }
+http = { workspace = true }
 hegeltest = "=0.48.1"
 
 [lints]

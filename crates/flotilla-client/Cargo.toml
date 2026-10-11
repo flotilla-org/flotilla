@@ -15,13 +15,13 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 bon = { workspace = true }
-libc = "0.2"
-uuid = { version = "1", features = ["v4"] }
+libc = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 flotilla-test-support = { path = "../flotilla-test-support" }
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

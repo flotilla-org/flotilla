@@ -7,13 +7,10 @@
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentAssertion,
-    providers::{
-        discovery::{EnvVars, HostDetector},
-        CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::providers::discovery::HostDetector;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 /// Hardcoded path to the cmux binary inside the macOS app bundle.
 const CMUX_APP_BUNDLE_BIN: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";

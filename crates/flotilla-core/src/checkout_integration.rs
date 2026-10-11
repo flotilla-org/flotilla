@@ -12,10 +12,11 @@ use flotilla_resources::{
     RemoteRefObservation, ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
-use crate::{
-    providers::{ChannelLabel, CommandRunner},
-    vcs::{RepositoryRead, Vcs, VcsCheck},
-};
+use crate::vcs::RepositoryRead;
+use crate::vcs::Vcs;
+use crate::vcs::VcsCheck;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
 pub const LANDING_EVIDENCE_TTL: Duration = Duration::from_secs(30);
@@ -605,8 +606,8 @@ mod tests {
             args: &[&str],
             cwd: &Path,
             label: &ChannelLabel,
-        ) -> Result<crate::providers::CommandOutput, String> {
-            self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_provider_runtime::CommandOutput {
                 stdout,
                 stderr: String::new(),
                 exit_code: Some(0),

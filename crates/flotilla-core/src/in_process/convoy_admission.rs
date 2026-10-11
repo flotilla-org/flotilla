@@ -110,7 +110,10 @@ impl ConvoyAdmission {
     pub(super) async fn free_space_bytes(&self) -> Result<Option<u64>, String> {
         let path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let probe = Arc::clone(&self.discovery.available_space_probe);
-        crate::probe::blocking("available disk space", crate::probe::PROBE_TIMEOUT, move || Ok(probe.measure(&path))).await
+        flotilla_provider_runtime::probe::blocking("available disk space", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+            Ok(probe.measure(&path))
+        })
+        .await
     }
 
     async fn provisioning_namespace(&self) -> String {
@@ -1721,7 +1724,7 @@ impl ConvoyAdmission {
         let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
         let admission_free_space_path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let host_name = self.host_name.to_string();
-        crate::probe::blocking("free-space admission", crate::probe::PROBE_TIMEOUT, move || {
+        flotilla_provider_runtime::probe::blocking("free-space admission", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
             let daemon_config = config.load_daemon_config()?;
             crate::admission::check_free_space_floor(
                 &*available_space_probe,

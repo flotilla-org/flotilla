@@ -6,18 +6,18 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{
-    config::ConfigStore,
-    in_process::InProcessDaemon,
-    providers::{
-        environment::{
-            contained_daemon_socket_path, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
-            EnvironmentVariableUpdate, CONTAINED_DAEMON_REQUIRED_ENV,
-        },
-        ChannelLabel, CommandRunner,
-    },
-};
+use flotilla_core::config::ConfigStore;
+use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::providers::environment::contained_daemon_socket_path;
+use flotilla_core::providers::environment::EnvironmentTool;
+use flotilla_core::providers::environment::EnvironmentToolAsset;
+use flotilla_core::providers::environment::EnvironmentToolAssetAccess;
+use flotilla_core::providers::environment::EnvironmentToolAssetKind;
+use flotilla_core::providers::environment::EnvironmentVariableUpdate;
+use flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV;
 use flotilla_paths::path_context::DaemonHostPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use tokio::sync::OnceCell;
 
 /// A registered provider key. The private representation keeps factory contracts

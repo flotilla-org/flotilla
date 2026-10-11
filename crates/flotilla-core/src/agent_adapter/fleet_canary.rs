@@ -37,7 +37,7 @@ mod tests {
     // seam-selected launch values when explicitly enabled.
     #[test]
     fn canary_is_opt_in_and_preserves_the_selected_environment() {
-        let runner = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let ordinary = AgentAdapterRegistry::discover(&EnvironmentBag::new(), runner.clone());
         assert!(ordinary.get("fleet-canary").is_none());
         let disabled = EnvironmentBag::new().with(EnvironmentAssertion::env_var("FLOTILLA_FLEET_CANARY", "0"));

@@ -6,15 +6,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::{EnvironmentAssertion, EnvironmentBag},
-    providers::{
-        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        environment::{host_direct::HostDirectEnvironmentProvider, EnvironmentProvider},
-        CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::discovery_api::EnvironmentBag;
+use crate::providers::discovery::Factory;
+use crate::providers::discovery::ProviderCategory;
+use crate::providers::discovery::ProviderDescriptor;
+use crate::providers::discovery::UnmetRequirement;
+use crate::providers::environment::host_direct::HostDirectEnvironmentProvider;
+use crate::providers::environment::EnvironmentProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
 
 pub struct HostDirectEnvironmentFactory;
 

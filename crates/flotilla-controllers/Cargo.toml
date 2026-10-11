@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-paths = { path = "../flotilla-paths" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
@@ -19,7 +20,7 @@ tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dirs = "6"
 futures = "0.3"
-sha2 = "0.10"
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
@@ -32,12 +33,12 @@ tokio = { workspace = true, features = ["test-util"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { workspace = true }
 toml = "0.8"
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 flotilla-core = { path = "../flotilla-core" }
 hegeltest = "=0.48.1"
 flotilla-resources = { path = "../flotilla-resources" }
 rstest = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]

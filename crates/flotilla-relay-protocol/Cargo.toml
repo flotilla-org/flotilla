@@ -8,7 +8,7 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = { workspace = true }
 hex = "0.4"
 
 [lints]

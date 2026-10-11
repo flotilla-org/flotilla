@@ -5,7 +5,7 @@ use sysinfo::System;
 
 use crate::convert::inventory_from_bag;
 use crate::environment_manager::EnvironmentManager;
-use crate::providers::discovery::EnvVars;
+use flotilla_provider_runtime::EnvVars;
 
 /// Resident bytes of this daemon process, sampled for the host heartbeat.
 /// Failure is unknown, never zero; refresh only this PID rather than the fleet.
@@ -104,8 +104,8 @@ mod tests {
     use crate::environment_manager::EnvironmentManager;
     use crate::providers::environment::EnvironmentHandle;
     use crate::providers::environment::ProvisionedEnvironment;
-    use crate::providers::CommandRunner;
     use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
+    use flotilla_provider_runtime::CommandRunner;
 
     #[test]
     fn system_info_uses_fixture_host_os() {

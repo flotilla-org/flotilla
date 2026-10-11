@@ -9,11 +9,11 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::{
-    config::BlobStoreConfig,
-    providers::{ChannelLabel, HttpClient, ReqwestHttpClient},
-};
+use flotilla_core::config::BlobStoreConfig;
 use flotilla_protocol::BlobSyncStatus;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::HttpClient;
+use flotilla_provider_runtime::ReqwestHttpClient;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

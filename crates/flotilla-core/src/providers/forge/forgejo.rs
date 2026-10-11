@@ -1,4 +1,5 @@
 //! Shared Forgejo connection and credential values.
+use flotilla_provider_runtime::http_execute;
 use std::path::PathBuf;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -27,7 +28,7 @@ impl ForgejoIssueProviderConfig {
     }
 }
 
-use crate::providers::HttpClient;
+use flotilla_provider_runtime::HttpClient;
 use std::sync::Arc;
 
 pub(crate) struct ForgejoClient {

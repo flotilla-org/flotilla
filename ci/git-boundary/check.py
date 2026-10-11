@@ -44,6 +44,7 @@ def exempt(path, production=False):
         (integration_test_path(path) and not production)
         or Path(path).name == "build.rs"
         or path == "crates/build_identity.rs"
+        or path == "crates/flotilla-provider-runtime/src/git_config_guard.rs"
         or path == VCS + "vcs.rs"
         or path.startswith(VCS + "providers/vcs/")
     )

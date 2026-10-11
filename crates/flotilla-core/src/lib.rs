@@ -45,7 +45,6 @@ pub mod model;
 pub(crate) mod observed_resources;
 pub mod ops_entry;
 pub mod placement_policy;
-pub mod probe;
 pub mod project_declaration;
 mod project_repositories;
 pub mod provider_data;
@@ -81,3 +80,6 @@ pub mod discovery_api;
 pub mod provider_config;
 #[cfg(test)]
 mod testkits;
+
+#[cfg(test)]
+mod probe_tests;

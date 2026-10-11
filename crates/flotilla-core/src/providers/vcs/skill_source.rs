@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use crate::providers::{ChannelLabel, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 pub const STAGE_DIAGNOSTIC_PREFIX: &str = "flotilla-stage-skills: ";
 pub const STAGE_RETRYABLE_PREFIX: &str = "flotilla-stage-skills-retryable:";

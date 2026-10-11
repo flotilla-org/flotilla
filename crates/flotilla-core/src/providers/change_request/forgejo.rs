@@ -8,15 +8,15 @@ use flotilla_resources::{
 
 use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
-use crate::providers::{
-    forge::{
-        forgejo::{ForgejoClient, ForgejoIssueProviderConfig},
-        observation_error::ObservationError,
-    },
-    http_execute, run,
-    types::{ChangeRequest, ChangeRequestStatus},
-    CommandRunner, HttpClient,
-};
+use crate::providers::forge::forgejo::ForgejoClient;
+use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
+use crate::providers::forge::observation_error::ObservationError;
+use crate::providers::types::ChangeRequest;
+use crate::providers::types::ChangeRequestStatus;
+use flotilla_provider_runtime::http_execute;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::HttpClient;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,
@@ -335,11 +335,11 @@ mod tests {
 
     use super::*;
     use crate::providers::forge::forgejo::ForgejoAuth;
-    use crate::providers::ChannelLabel;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::Masks;
+    use flotilla_provider_runtime::ChannelLabel;
 
     // Boundary double: Forgejo HTTP requests, including the body update.
     struct LinkHttp {
@@ -828,7 +828,7 @@ mod tests {
     fn parses_forgejo_states_and_branch() {
         let config = ForgejoIssueProviderConfig::new("https://forgejo.example.test".into(), None, auth());
         let provider = ForgejoChangeRequestProvider::new(
-            Arc::new(crate::providers::ReqwestHttpClient::new()),
+            Arc::new(flotilla_provider_runtime::ReqwestHttpClient::new()),
             Arc::new(MockRunner::new(vec![])),
             config,
             "team/repo".into(),

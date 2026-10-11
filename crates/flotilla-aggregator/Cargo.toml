@@ -10,6 +10,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-tls/aws-lc-provide
 skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/skip-no-sandbox-tests"]
 
 [dependencies]
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
@@ -22,14 +23,14 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = "3"
+tempfile = { workspace = true }
 hegeltest = "=0.48.1"
 
 [lints]

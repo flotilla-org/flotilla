@@ -3,14 +3,15 @@
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_core::{
-    checkout_integration::{
-        checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
-        inspect_convoy_checkout_integration,
-    },
-    providers::{ChannelLabel, CommandRunner},
-    vcs::{self as core_vcs, CheckoutRegistration, Vcs},
-};
+use flotilla_core::checkout_integration::checkout_path_from_status_and_spec;
+use flotilla_core::checkout_integration::convoy_change_request_id_for_checkout;
+use flotilla_core::checkout_integration::inspect_checkout_integration;
+use flotilla_core::checkout_integration::inspect_convoy_checkout_integration;
+use flotilla_core::vcs as core_vcs;
+use flotilla_core::vcs::CheckoutRegistration;
+use flotilla_core::vcs::Vcs;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     canonicalize_repo_url, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Convoy, Environment, ForgeSpec,
     ResourceObject,

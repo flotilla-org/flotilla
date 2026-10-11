@@ -12,8 +12,11 @@ use flotilla_protocol::CheckoutIntent;
 pub use provisioning::{CloneInspection, CloneProvisioner, GitCloneProvisioner};
 use tracing::warn;
 
-use crate::providers::{run, types::*, ChannelLabel, CommandRunner};
+use crate::providers::types::*;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
@@ -148,10 +151,9 @@ pub(crate) mod checkout_test_support {
         sync::Arc,
     };
 
-    use crate::{
-        providers::{ChannelLabel, CommandRunner},
-        vcs::Vcs,
-    };
+    use crate::vcs::Vcs;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandRunner;
 
     /// Run a git command, panicking on failure.
     pub fn git(cwd: &Path, args: &[&str]) {

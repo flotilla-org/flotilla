@@ -7,11 +7,13 @@ use std::{
 use async_trait::async_trait;
 use flotilla_resources::{ForgeSpec, Project, ProjectRepositoryRole, RepositoryKey, RepositorySpec, ResourceObject};
 
-use crate::{
-    ops_entry::OperationalEntryFile,
-    providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandRunner},
-    vcs::{CheckoutVcsResolver, RepositoryRead, Vcs},
-};
+use crate::ops_entry::OperationalEntryFile;
+use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+use crate::vcs::CheckoutVcsResolver;
+use crate::vcs::RepositoryRead;
+use crate::vcs::Vcs;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct LocalCheckoutInspection {
@@ -108,12 +110,13 @@ pub trait RepositoryInspector: Send + Sync {
     async fn operational_entry_files_at(&self, checkout: &Path) -> Result<(String, Vec<OperationalEntryFile>), String> {
         let repository = self.inspect_path(checkout, None).await?;
         let path = repository.checkout.path.clone();
-        let mut files = crate::probe::blocking("operational entries", crate::probe::PROBE_TIMEOUT, move || {
-            let mut files = Vec::new();
-            collect_operational_entry_files(&path, &path, &mut files)?;
-            Ok(files)
-        })
-        .await?;
+        let mut files =
+            flotilla_provider_runtime::probe::blocking("operational entries", flotilla_provider_runtime::probe::PROBE_TIMEOUT, move || {
+                let mut files = Vec::new();
+                collect_operational_entry_files(&path, &path, &mut files)?;
+                Ok(files)
+            })
+            .await?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok((repository.checkout.git_ref, files))
     }
@@ -403,9 +406,9 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        let path = crate::probe::canonicalize(path).await?;
+        let path = flotilla_provider_runtime::probe::canonicalize(path).await?;
         let top_level = PathBuf::from(self.read(&path, RepositoryRead::CheckoutRoot).await?);
-        let top_level = crate::probe::canonicalize(&top_level).await?;
+        let top_level = flotilla_provider_runtime::probe::canonicalize(&top_level).await?;
         let provider = self.provider(&path).await?;
         self.vcs_cache.lock().await.insert(top_level.clone(), provider);
         // `rev-parse HEAD` can fail before the first commit, while the symbolic
@@ -426,7 +429,7 @@ impl RepositoryInspector for GitRepositoryInspector {
             None => {
                 let common_dir = PathBuf::from(self.read(&top_level, RepositoryRead::SharedMetadataDir).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
-                let common_dir = crate::probe::canonicalize(&common_dir).await?;
+                let common_dir = flotilla_provider_runtime::probe::canonicalize(&common_dir).await?;
                 (RepositorySpec::local(&self.host_ref, common_dir.to_string_lossy())?, None)
             }
         };
@@ -557,13 +560,13 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
-    use crate::providers::ChannelLabel;
-    use crate::providers::CommandOutput;
-    use crate::providers::CommandRunner;
     use crate::testkits::discovery::test_vcs_resolver;
     use crate::testkits::discovery::DiscoveryMockRunner;
     use crate::vcs::EnumeratedCheckout;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
 
     // Process boundary: count and reject every Git command except worktree enumeration.
     struct ObservationRunner {

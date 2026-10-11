@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-tls = { path = "../flotilla-tls" }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
@@ -15,8 +16,8 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 toml = "0.8"
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
-http = "1"
-bytes = "1"
+http = { workspace = true }
+bytes = { workspace = true }
 serde_yml = "0.0.12"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -29,8 +30,8 @@ workspace = true
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-paths = { path = "../flotilla-paths" }
 hegeltest = "=0.48.1"
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
+libc = { workspace = true }

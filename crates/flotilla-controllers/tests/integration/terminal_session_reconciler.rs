@@ -2563,8 +2563,8 @@ async fn controller_loop_prunes_acknowledged_message_payloads() {
 struct UnusedCommandRunner;
 
 #[async_trait]
-impl flotilla_core::providers::CommandRunner for UnusedCommandRunner {
-    async fn run(&self, _: &str, _: &[&str], _: &std::path::Path, _: &flotilla_core::providers::ChannelLabel) -> Result<String, String> {
+impl flotilla_provider_runtime::CommandRunner for UnusedCommandRunner {
+    async fn run(&self, _: &str, _: &[&str], _: &std::path::Path, _: &flotilla_provider_runtime::ChannelLabel) -> Result<String, String> {
         panic!("exit classification must not run commands")
     }
     async fn run_output(
@@ -2572,8 +2572,8 @@ impl flotilla_core::providers::CommandRunner for UnusedCommandRunner {
         _: &str,
         _: &[&str],
         _: &std::path::Path,
-        _: &flotilla_core::providers::ChannelLabel,
-    ) -> Result<flotilla_core::providers::CommandOutput, String> {
+        _: &flotilla_provider_runtime::ChannelLabel,
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         panic!("exit classification must not run commands")
     }
     async fn exists(&self, _: &str, _: &[&str]) -> bool {
@@ -2760,9 +2760,9 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
         if self.fail_launch.load(Ordering::SeqCst) {
             return Err("launch failed".into());
         }
-        use flotilla_core::providers::ChannelLabel;
-        use flotilla_core::providers::CommandRunner;
-        use flotilla_core::providers::ProcessCommandRunner;
+        use flotilla_provider_runtime::ChannelLabel;
+        use flotilla_provider_runtime::CommandRunner;
+        use flotilla_provider_runtime::ProcessCommandRunner;
         ProcessCommandRunner
             .run(
                 "sh",
@@ -2793,7 +2793,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
     ) -> Result<Option<i32>, String> {
         use flotilla_core::agent_process::exit_receipt;
         use flotilla_core::agent_process::ExitReceiptObserver;
-        use flotilla_core::providers::ProcessCommandRunner;
+        use flotilla_provider_runtime::ProcessCommandRunner;
         ExitReceiptObserver::default()
             .observe(&spec.env_ref, &ProcessCommandRunner, std::path::Path::new(&spec.cwd).join(exit_receipt(&crew.id)), || async {
                 Ok(Vec::new())
@@ -2805,7 +2805,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
             return Err("cleanup transport unavailable".into());
         }
         flotilla_core::agent_process::remove_exit_receipt(
-            &flotilla_core::providers::ProcessCommandRunner,
+            &flotilla_provider_runtime::ProcessCommandRunner,
             std::path::Path::new(&spec.cwd),
             launch_id,
         )
@@ -2826,9 +2826,9 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
 #[tokio::test]
 async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart() {
     use flotilla_core::agent_process::exit_receipt;
-    use flotilla_core::providers::ChannelLabel;
-    use flotilla_core::providers::CommandRunner;
-    use flotilla_core::providers::ProcessCommandRunner;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandRunner;
+    use flotilla_provider_runtime::ProcessCommandRunner;
     let cwd = tempfile::tempdir().expect("shared checkout");
     for launch in ["old", "other-role"] {
         ProcessCommandRunner

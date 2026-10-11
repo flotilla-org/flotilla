@@ -14,10 +14,14 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::ForgeBudgetRow;
 
-use crate::providers::{
-    forge::github::{github_rate_limit, low_graphql_budget, parse_gh_api_response, response_header},
-    ChannelLabel, CommandOutput, CommandProcess, CommandRunner,
-};
+use crate::providers::forge::github::github_rate_limit;
+use crate::providers::forge::github::low_graphql_budget;
+use crate::providers::forge::github::parse_gh_api_response;
+use crate::providers::forge::github::response_header;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandProcess;
+use flotilla_provider_runtime::CommandRunner;
 
 #[derive(Clone, Default)]
 pub struct ForgeBudgets {
@@ -412,14 +416,8 @@ mod tests {
         fn methods(source: &str) -> std::collections::BTreeSet<&str> {
             source.split("fn ").skip(1).map(|method| method.split('(').next().unwrap().trim()).collect()
         }
-        let providers = include_str!("providers/mod.rs");
-        let runner = providers
-            .split("pub trait CommandRunner: Send + Sync {")
-            .nth(1)
-            .unwrap()
-            .split("pub(crate) fn command_timeout_message")
-            .next()
-            .unwrap();
+        let runtime = include_str!("../../flotilla-provider-runtime/src/lib.rs");
+        let runner = runtime.split("pub trait CommandRunner: Send + Sync {").nth(1).unwrap().split("\n}\n").next().unwrap();
         let budget = include_str!("forge_budget.rs");
         let wrapper = budget.split("impl CommandRunner for BudgetedRunner {").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
         assert_eq!(methods(wrapper), methods(runner), "every CommandRunner method needs explicit forwarding");

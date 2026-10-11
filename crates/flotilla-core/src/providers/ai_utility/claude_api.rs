@@ -5,7 +5,8 @@ use serde::Deserialize;
 use tracing::info;
 
 use super::Model;
-use crate::providers::{http_execute, HttpClient};
+use flotilla_provider_runtime::http_execute;
+use flotilla_provider_runtime::HttpClient;
 
 static REQUEST_FACTORY: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(flotilla_tls::client);
 
@@ -112,7 +113,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::ClaudeApiAiUtility;
-    use crate::providers::{ai_utility::AiUtility, ChannelLabel, HttpClient};
+    use crate::providers::ai_utility::AiUtility;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::HttpClient;
 
     struct HangingHttpClient;
 

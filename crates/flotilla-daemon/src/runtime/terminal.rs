@@ -13,18 +13,19 @@ use flotilla_controllers::reconcilers::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState,
 };
+use flotilla_core::agent_adapter::AgentAdapter;
+use flotilla_core::agent_adapter::AgentLaunchRequest;
+use flotilla_core::agent_adapter::CapabilityTable;
 use flotilla_core::crew_capabilities::SessionCapabilitySource;
-use flotilla_core::{
-    agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
-    providers::{
-        registry::ProviderRegistry,
-        terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
-        CommandRunner,
-    },
-};
+use flotilla_core::providers::registry::ProviderRegistry;
+use flotilla_core::providers::terminal::ScreenActivity;
+use flotilla_core::providers::terminal::TerminalPool;
+use flotilla_core::providers::terminal::TerminalSessionLiveness;
+use flotilla_core::providers::terminal::TerminalSize;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     Checkout, Convoy, Environment, FulfilmentKind, ResourceError, ResourceObject, TerminalAttentionSource, TerminalAttentionState,
     TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,

@@ -15,13 +15,14 @@ use flotilla_core::{
     providers::{
         environment::{command_provider, EnvironmentKind},
         vcs::git_worktree::GitWorktreeStrategy,
-        ProcessCommandRunner,
     },
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
 #[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+#[cfg(unix)]
+use flotilla_provider_runtime::ProcessCommandRunner;
 #[cfg(unix)]
 use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject};
 use flotilla_store::validate_resource_document;
@@ -1160,12 +1161,13 @@ mod tests {
     async fn candidate_reads_ops_entries_from_a_detached_checkout_with_ambiguous_remotes() {
         use std::sync::Arc;
 
-        use flotilla_core::{
-            providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
-            repository_inspection::GitRepositoryInspector,
-            vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
-        };
+        use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use flotilla_core::repository_inspection::GitRepositoryInspector;
+        use flotilla_core::vcs::FixedVcsResolver;
+        use flotilla_core::vcs::FlotillaVcs;
+        use flotilla_core::vcs::GitCheckoutStrategy;
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
+        use flotilla_provider_runtime::ProcessCommandRunner;
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
         let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
         let tmp = tmp_guard.path().to_path_buf();
@@ -1246,12 +1248,13 @@ mod tests {
         flotilla_tls::install_default_provider();
         use std::sync::Arc;
 
-        use flotilla_core::{
-            providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
-            repository_inspection::GitRepositoryInspector,
-            vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
-        };
+        use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
+        use flotilla_core::repository_inspection::GitRepositoryInspector;
+        use flotilla_core::vcs::FixedVcsResolver;
+        use flotilla_core::vcs::FlotillaVcs;
+        use flotilla_core::vcs::GitCheckoutStrategy;
         use flotilla_paths::path_context::ExecutionEnvironmentPath;
+        use flotilla_provider_runtime::ProcessCommandRunner;
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
         let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
         let tmp = tmp_guard.path().to_path_buf();

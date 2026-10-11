@@ -7,11 +7,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{
-    in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
-    providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner},
-};
+use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_resources::{CheckoutBranchProvenance, Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec};
 use flotilla_store::{InMemoryBackend, ResourceBackend, SqliteBackend};
 use tempfile::TempDir;

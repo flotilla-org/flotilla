@@ -22,23 +22,28 @@ use flotilla_protocol::{
 };
 use tokio::sync::Mutex as TokioMutex;
 
+use flotilla_core::discovery_api::EnvironmentBag;
+use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::{
     DiscoveryRuntime, Factory, FactoryRegistry, ProviderCategory, ProviderDescriptor, UnmetRequirement,
 };
-use flotilla_core::{
-    discovery_api::EnvironmentBag,
-    providers::{
-        change_request::ChangeRequestTracker,
-        discovery::EnvVars,
-        issue_tracker::IssueProvider,
-        terminal::{TerminalPool, TerminalSessionLiveness},
-        types::BranchInfo,
-        vcs::{git_worktree::GitWorktreeStrategy, VcsInspection},
-        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
-    },
-    vcs::{CheckoutVcsResolver, EnumeratedCheckout, FlotillaVcs, GitCheckoutStrategy, Vcs},
-};
+use flotilla_core::providers::issue_tracker::IssueProvider;
+use flotilla_core::providers::terminal::TerminalPool;
+use flotilla_core::providers::terminal::TerminalSessionLiveness;
+use flotilla_core::providers::types::BranchInfo;
+use flotilla_core::providers::vcs::git_worktree::GitWorktreeStrategy;
+use flotilla_core::providers::vcs::VcsInspection;
+use flotilla_core::vcs::CheckoutVcsResolver;
+use flotilla_core::vcs::EnumeratedCheckout;
+use flotilla_core::vcs::FlotillaVcs;
+use flotilla_core::vcs::GitCheckoutStrategy;
+use flotilla_core::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
+use flotilla_provider_runtime::ProcessCommandRunner;
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
 
@@ -390,7 +395,7 @@ pub fn fake_discovery_with_runner(
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
 pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_core::providers::discovery::DiscoveryRuntime {
-    minimal_discovery_runtime(std::sync::Arc::new(flotilla_core::providers::ProcessCommandRunner))
+    minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
 }
 
 fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_core::providers::discovery::DiscoveryRuntime {

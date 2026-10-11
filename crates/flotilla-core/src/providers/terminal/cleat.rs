@@ -14,10 +14,10 @@ use super::{
     TerminalSessionTag, TerminalSize,
 };
 use crate::discovery_api::EnvironmentBag;
-use crate::providers::run;
-use crate::providers::ChannelLabel;
-use crate::providers::CommandRunner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
@@ -407,9 +407,9 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use super::*;
-    use crate::providers::CommandRunner;
     use crate::testkits::replay::testing::MockRunner;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_provider_runtime::CommandRunner;
 
     // Existing command-layout tests exercise their operation after the launch
     // capability has been established. environment_tests covers the real probe.

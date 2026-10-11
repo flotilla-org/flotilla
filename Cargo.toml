@@ -18,6 +18,7 @@ members = [
     "crates/flotilla-manifest",
     "crates/flotilla-orchestration-testkit",
     "crates/flotilla-paths",
+    "crates/flotilla-provider-runtime",
     "crates/flotilla-protocol",
     "crates/flotilla-protocol-testkit",
     "crates/flotilla-relay",
@@ -41,6 +42,12 @@ license = "Apache-2.0 OR MIT"
 # When adding dependencies anywhere in the workspace, update the external-crate
 # allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
+sha2 = "0.10"
+http = "1"
+bytes = "1"
+uuid = "1"
+libc = "0.2"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -67,6 +74,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 
 # New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
 [dependencies]
+flotilla-provider-runtime = { path = "crates/flotilla-provider-runtime" }
 flotilla-tls = { path = "crates/flotilla-tls" }
 flotilla-store = { path = "crates/flotilla-store" }
 flotilla-paths = { path = "crates/flotilla-paths" }
@@ -89,8 +97,8 @@ serde = { workspace = true }
 serde_yml = "0.0.12"
 reqwest = { workspace = true, features = ["json"] }
 toml_edit = "0.22"
-libc = "0.2"
-uuid = { version = "1", features = ["v4"] }
+libc = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -103,7 +111,7 @@ async-trait = { workspace = true }
 flotilla-core = { path = "crates/flotilla-core" }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
 hegeltest = "=0.48.1"
-tempfile = "3"
+tempfile = { workspace = true }
 
 [[example]]
 name = "glyph_showcase"

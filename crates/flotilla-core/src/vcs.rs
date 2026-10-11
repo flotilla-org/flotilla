@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
@@ -18,13 +17,15 @@ use flotilla_resources::{canonicalize_repo_url, CheckoutBranchProvenance};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::providers::{
-    command_channel_label,
-    types::Checkout,
-    vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy, CloneProvisioner, GitCloneProvisioner},
-    CommandOutput, CommandRunner,
-};
+use crate::providers::types::Checkout;
+use crate::providers::vcs::clone::ReferenceCloneStrategy;
+use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
+use crate::providers::vcs::CloneProvisioner;
+use crate::providers::vcs::GitCloneProvisioner;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::command_channel_label;
+use flotilla_provider_runtime::CommandOutput;
+use flotilla_provider_runtime::CommandRunner;
 
 fn revision_cache(cache: &Path, repo: &str) -> PathBuf {
     cache.join(format!("{:x}", Sha256::digest(repo.as_bytes())))
@@ -40,341 +41,6 @@ fn object_cache_lock(directory: &Path) -> Arc<tokio::sync::Mutex<()>> {
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     locks.insert(directory.to_path_buf(), Arc::downgrade(&lock));
     lock
-}
-
-/// Check host-owned repository configuration before a local Git process can
-/// interpret it. A contained worktree can write refs in the shared gitdir, so
-/// the host must treat config there as untrusted even with read-only overlays.
-pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
-    if cmd != "git" {
-        return Ok(());
-    }
-    // ProcessCommandRunner launches a host child without replacing its process
-    // environment, so this is the same GIT_DIR that the child Git will see.
-    let (directory, explicit_git_dir) = git_command_location(args, cwd, std::env::var_os("GIT_DIR").map(PathBuf::from));
-    let git_entry = if let Some(path) = explicit_git_dir {
-        if path.is_absolute() {
-            path
-        } else {
-            directory.join(path)
-        }
-    } else if let Some(path) = directory.ancestors().find_map(discovered_git_entry) {
-        path
-    } else {
-        return Ok(());
-    };
-    // Let Git report a missing explicit gitdir. Do not fall back to an ancestor
-    // or turn an absent checkout into a host-config inspection failure.
-    if !git_entry.exists() {
-        return Ok(());
-    }
-    let admin_dir = if git_entry.is_dir() {
-        git_entry
-    } else {
-        let pointer = std::fs::read_to_string(&git_entry).map_err(|error| format!("read {}: {error}", git_entry.display()))?;
-        let target = pointer.trim().strip_prefix("gitdir: ").ok_or_else(|| format!("invalid gitdir pointer at {}", git_entry.display()))?;
-        if Path::new(target).is_absolute() {
-            PathBuf::from(target)
-        } else {
-            git_entry.parent().expect(".git has a parent").join(target)
-        }
-    };
-    let common_dir = match std::fs::read_to_string(admin_dir.join("commondir")) {
-        Ok(relative) => admin_dir.join(relative.trim()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => admin_dir.clone(),
-        Err(error) => return Err(format!("read {}: {error}", admin_dir.join("commondir").display())),
-    };
-    let common_dir =
-        common_dir.canonicalize().map_err(|error| format!("resolve shared Git directory {}: {error}", common_dir.display()))?;
-    for config in [common_dir.join("config"), admin_dir.join("config.worktree")] {
-        if !config.exists() {
-            continue;
-        }
-        let output = Command::new("git")
-            .args(["config", "--no-includes", "--file"])
-            .arg(&config)
-            .args(["--name-only", "--list", "--null"])
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_CONFIG_COUNT")
-            .output()
-            .map_err(|error| format!("inspect {}: {error}", config.display()))?;
-        if !output.status.success() {
-            return Err(format!("cannot inspect Git configuration {}: {}", config.display(), String::from_utf8_lossy(&output.stderr)));
-        }
-        for key in output.stdout.split(|byte| *byte == 0).filter(|key| !key.is_empty()) {
-            let key = String::from_utf8_lossy(key).to_ascii_lowercase();
-            // An explicit absolute default hooks path is harmless; hosts have
-            // used it historically. Relative paths can point into a checkout.
-            if key == "core.hookspath" && default_hooks_path(&config, &common_dir)? {
-                continue;
-            }
-            if !allowed_shared_config_key(&key) {
-                tracing::error!(config = %config.display(), %key, "unsafe shared Git configuration; refusing Git operation");
-                return Err(format!(
-                    "unsafe shared Git configuration {}: {key}; remove this key from the host-owned clone config before retrying",
-                    config.display()
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Git discovery checks each directory level in turn: a `.git` entry first,
-/// then the directory itself as a bare repository, before moving up. A bare
-/// repository nested inside a checkout must resolve to its own config.
-fn discovered_git_entry(directory: &Path) -> Option<PathBuf> {
-    let dot_git = directory.join(".git");
-    if dot_git.exists() {
-        return Some(dot_git);
-    }
-    let bare = ["HEAD", "config", "objects", "refs"].iter().all(|entry| directory.join(entry).exists());
-    bare.then(|| directory.to_path_buf())
-}
-
-fn git_command_location(args: &[&str], cwd: &Path, inherited_git_dir: Option<PathBuf>) -> (PathBuf, Option<PathBuf>) {
-    let mut directory = cwd.to_path_buf();
-    let mut explicit_git_dir = inherited_git_dir;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index] {
-            "-C" if index + 1 < args.len() => {
-                let path = Path::new(args[index + 1]);
-                directory = if path.is_absolute() { path.to_path_buf() } else { directory.join(path) };
-                index += 2;
-            }
-            "--git-dir" if index + 1 < args.len() => {
-                explicit_git_dir = Some(PathBuf::from(args[index + 1]));
-                index += 2;
-            }
-            "-c" | "--config-env" | "--work-tree" | "--namespace" if index + 1 < args.len() => index += 2,
-            option if option.starts_with("-C") && option.len() > 2 => {
-                let path = Path::new(&option[2..]);
-                directory = if path.is_absolute() { path.to_path_buf() } else { directory.join(path) };
-                index += 1;
-            }
-            option if option.starts_with("--git-dir=") => {
-                explicit_git_dir = Some(PathBuf::from(&option[10..]));
-                index += 1;
-            }
-            option if option.starts_with('-') => index += 1,
-            _ => break, // everything after the subcommand belongs to that command
-        }
-    }
-    (directory, explicit_git_dir)
-}
-
-fn default_hooks_path(config: &Path, common_dir: &Path) -> Result<bool, String> {
-    let output = Command::new("git")
-        .args(["config", "--no-includes", "--file"])
-        .arg(config)
-        .args(["--get", "core.hooksPath"])
-        .output()
-        .map_err(|error| format!("inspect hooks path in {}: {error}", config.display()))?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let value = String::from_utf8_lossy(&output.stdout);
-    let path = value.trim();
-    // A symlinked spelling is rejected even if it resolves to the default.
-    Ok(Path::new(path) == common_dir.join("hooks"))
-}
-
-fn allowed_shared_config_key(key: &str) -> bool {
-    matches!(
-        key,
-        "core.bare"
-            | "core.repositoryformatversion"
-            | "core.filemode"
-            | "core.logallrefupdates"
-            | "core.ignorecase"
-            | "core.precomposeunicode"
-            | "core.worktree"
-            | "core.autocrlf"
-            | "core.symlinks"
-            | "core.sparsecheckout"
-            | "core.sparsecheckoutcone"
-            | "core.untrackedcache"
-            | "gc.auto"
-            | "gc.autodetach"
-            | "gc.pruneexpire"
-            | "pull.rebase"
-            | "pull.ff"
-            | "init.defaultbranch"
-            | "extensions.objectformat"
-            | "user.name"
-            | "user.email"
-            | "worktrunk.default-branch"
-            | "worktrunk.history"
-    ) || key.starts_with("worktrunk.hints.")
-        || ["url", "fetch", "pushurl", "push", "mirror", "prune", "tagopt"]
-        .iter()
-        .any(|suffix| key.starts_with("remote.") && key.ends_with(&format!(".{suffix}")))
-        || ["remote", "merge", "rebase", "pushremote", "description"]
-            .iter()
-            .any(|suffix| key.starts_with("branch.") && key.ends_with(&format!(".{suffix}")))
-        // Flotilla's own issue links: `branch.<branch>.flotilla.issues.<provider>`.
-        || key.starts_with("branch.") && key.rsplit_once('.').is_some_and(|(prefix, _provider)| prefix.ends_with(".flotilla.issues"))
-}
-
-pub(crate) async fn guard_host_git_config_async(cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
-    if cmd != "git" {
-        return Ok(());
-    }
-    let cmd = cmd.to_string();
-    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
-    let cwd = cwd.to_path_buf();
-    crate::probe::blocking("shared Git config", crate::probe::PROBE_TIMEOUT, move || {
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        guard_host_git_config(&cmd, &args, &cwd)
-    })
-    .await
-}
-
-#[cfg(test)]
-mod git_config_guard_tests {
-    use super::*;
-
-    fn git(repo: &Path, args: &[&str]) {
-        let output = Command::new("git").args(args).current_dir(repo).output().expect("run Git fixture command");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    #[test]
-    fn clean_repo_and_explicit_default_hooks_path_are_allowed() {
-        let repo = tempfile::tempdir().expect("temporary repository");
-        git(repo.path(), &["init", "-q"]);
-        git(repo.path(), &["config", "remote.origin.url", "https://example.com/repo.git"]);
-        git(repo.path(), &["config", "branch.main.remote", "origin"]);
-        git(repo.path(), &["config", "core.autocrlf", "false"]);
-        guard_host_git_config("git", &["status"], repo.path()).expect("clean repository");
-        // Keys flotilla and worktrunk write into the host clone as ordinary state.
-        git(repo.path(), &["config", "branch.fix/a.b.flotilla.issues.github", "42"]);
-        git(repo.path(), &["config", "worktrunk.history", "fix/a.b"]);
-        git(repo.path(), &["config", "worktrunk.hints.worktree-path", "true"]);
-        guard_host_git_config("git", &["status"], repo.path()).expect("flotilla issue links and worktrunk state");
-        // Canonical spelling: macOS temp dirs sit behind the `/var` symlink, which the guard rejects.
-        let hooks = repo.path().canonicalize().expect("canonical repository path").join(".git/hooks");
-        git(repo.path(), &["config", "core.hooksPath", hooks.to_str().expect("UTF-8 path")]);
-        guard_host_git_config("git", &["status"], repo.path()).expect("host's default hooks path");
-    }
-
-    #[test]
-    fn bare_repository_config_is_checked() {
-        let repo = tempfile::tempdir().expect("temporary bare repository");
-        git(repo.path(), &["init", "--bare", "-q"]);
-        git(repo.path(), &["config", "core.fsmonitor", "true"]);
-        let error = guard_host_git_config("git", &["show-ref"], repo.path()).expect_err("bare config drift");
-        assert!(error.contains("core.fsmonitor"));
-    }
-
-    #[test]
-    fn bare_repository_nested_in_a_checkout_is_inspected_itself() {
-        let outer = tempfile::tempdir().expect("temporary checkout");
-        git(outer.path(), &["init", "-q"]);
-        let bare = outer.path().join("nested.git");
-        git(outer.path(), &["init", "--bare", "-q", bare.to_str().expect("UTF-8 path")]);
-        git(&bare, &["config", "core.fsmonitor", "true"]);
-        let error = guard_host_git_config("git", &["show-ref"], &bare).expect_err("nested bare config drift");
-        assert!(error.contains("core.fsmonitor"), "{error}");
-        assert!(error.contains("nested.git"), "{error}");
-    }
-
-    // A missing explicit gitdir must fail in Git without inspecting or executing
-    // an ancestor's unsafe config. Normal discovery still rejects that config.
-    // This runner-boundary scenario complements the generated root-shape coverage.
-    #[tokio::test]
-    async fn missing_explicit_git_dir_does_not_inspect_ancestor_config() {
-        use crate::providers::{ChannelLabel, ProcessCommandRunner};
-
-        let outer = tempfile::tempdir().expect("temporary checkout");
-        git(outer.path(), &["init", "-q"]);
-        let marker = outer.path().join("fsmonitor-ran");
-        git(outer.path(), &["config", "core.fsmonitor", &format!("touch {}", marker.display())]);
-        let child = outer.path().join("not-a-checkout");
-        std::fs::create_dir(&child).expect("create non-repository child");
-        let child = child.to_str().expect("UTF-8 child path");
-        let error = guard_host_git_config("git", &["-C", child, "status"], Path::new("/"))
-            .expect_err("normal discovery must reject unsafe ancestor config");
-        assert!(error.contains("core.fsmonitor"), "{error}");
-
-        let output = ProcessCommandRunner
-            .run_output("git", &["-C", child, "--git-dir=.git", "status"], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .expect("missing explicit gitdir must be reported by Git, not the config guard");
-        assert!(!output.success());
-        assert!(output.stderr.contains("not a git repository"), "{}", output.stderr);
-        assert!(!marker.exists(), "ancestor fsmonitor must never run");
-    }
-
-    #[test]
-    fn only_leading_global_options_change_git_config_resolution() {
-        let cwd = Path::new("/safe/repo");
-        let (directory, git_dir) = git_command_location(&["diff", "-C", "/untrusted", "--git-dir=/untrusted/.git"], cwd, None);
-        assert_eq!(directory, cwd);
-        assert!(git_dir.is_none());
-        let (directory, git_dir) = git_command_location(&["-C", "/other", "--git-dir=.git", "status"], cwd, None);
-        assert_eq!(directory, Path::new("/other"));
-        assert_eq!(git_dir, Some(PathBuf::from(".git")));
-    }
-
-    #[test]
-    fn reject_other_executable_keys_and_writable_worktree_config_extension() {
-        let repo = tempfile::tempdir().expect("temporary repository");
-        git(repo.path(), &["init", "-q"]);
-        for key in ["alias.exploit", "core.editor", "diff.foo.textconv", "merge.foo.driver", "extensions.worktreeConfig"] {
-            let value = if key == "extensions.worktreeConfig" { "true" } else { "echo unsafe" };
-            git(repo.path(), &["config", key, value]);
-            let error = guard_host_git_config("git", &["status"], repo.path()).expect_err("unexpected key must be rejected");
-            assert!(error.to_ascii_lowercase().contains(&key.to_ascii_lowercase()), "{error}");
-            git(repo.path(), &["config", "--unset", key]);
-        }
-    }
-
-    #[test]
-    fn explicit_git_dir_and_worktree_config_are_inspected() {
-        let repo = tempfile::tempdir().expect("temporary repository");
-        git(repo.path(), &["init", "-q"]);
-        git(repo.path(), &["config", "user.name", "Tester"]);
-        git(repo.path(), &["config", "user.email", "tester@example.com"]);
-        git(repo.path(), &["commit", "--allow-empty", "-qm", "initial"]);
-        let worktree = repo.path().join("work");
-        git(repo.path(), &["worktree", "add", "-qb", "work", worktree.to_str().expect("UTF-8 path")]);
-        let admin = std::fs::read_to_string(worktree.join(".git")).expect("worktree pointer");
-        let admin = PathBuf::from(admin.trim().strip_prefix("gitdir: ").expect("gitdir pointer"));
-        std::fs::write(admin.join("config.worktree"), "[core]\n\tfsmonitor = true\n").expect("inject worktree config");
-        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/work\n").expect("relative worktree pointer");
-        let error = guard_host_git_config("git", &["status"], &worktree).expect_err("worktree config drift");
-        assert!(error.contains("core.fsmonitor"));
-        let git_dir = repo.path().join(".git");
-        git(repo.path(), &["config", "core.fsmonitor", "true"]);
-        let error = guard_host_git_config("git", &["--git-dir", git_dir.to_str().expect("UTF-8 path"), "status"], Path::new("/"))
-            .expect_err("explicit git dir drift");
-        assert!(error.contains("core.fsmonitor"));
-    }
-
-    #[tokio::test]
-    async fn injected_fsmonitor_blocks_host_git_before_it_runs() {
-        let repo = tempfile::tempdir().expect("temporary repository");
-        let marker = repo.path().join("fsmonitor-ran");
-        git(repo.path(), &["init", "-q"]);
-        let config = Command::new("git")
-            .args(["config", "core.fsmonitor", &format!("touch {}", marker.display())])
-            .current_dir(repo.path())
-            .output()
-            .expect("inject config");
-        assert!(config.status.success());
-
-        let runner = crate::providers::ProcessCommandRunner;
-        let error = runner
-            .run("git", &["status"], repo.path(), &crate::providers::ChannelLabel::Default)
-            .await
-            .expect_err("unsafe key must block Git");
-        assert!(error.contains("core.fsmonitor"), "{error}");
-        assert!(!marker.exists());
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,11 +123,11 @@ pub async fn prune_checkout_archives(runner: &dyn CommandRunner, archive_root: &
             "find",
             &[root, "!", "-path", root, "-type", "d", "-prune", "-mmin", &format!("+{minutes}"), "-print0"],
             Path::new("/"),
-            &crate::providers::ChannelLabel::Default,
+            &flotilla_provider_runtime::ChannelLabel::Default,
         )
         .await?;
     for path in expired.split('\0').filter(|path| !path.is_empty()) {
-        runner.run("rm", &["-rf", "--", path], Path::new("/"), &crate::providers::ChannelLabel::Default).await?;
+        runner.run("rm", &["-rf", "--", path], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await?;
     }
     Ok(())
 }
@@ -495,7 +161,7 @@ find "$1" ! -path "$1" -type d -prune -mmin "+$2" -exec rm -rf -- {} +"#;
             "timeout",
             &[&kill_after, &seconds, "sh", "-c", script, "flotilla-archive-sweep", root, &minutes],
             Path::new("/"),
-            &crate::providers::ChannelLabel::Default,
+            &flotilla_provider_runtime::ChannelLabel::Default,
             deadline + REMOTE_ARCHIVE_CLIENT_GRACE,
         )
         .await
@@ -993,7 +659,12 @@ impl Vcs for FlotillaVcs {
         let context = directory.join("context");
         tokio::fs::create_dir_all(&context).await.map_err(|error| error.to_string())?;
         self.runner
-            .run("tar", &["-xf", archive.to_str().ok_or("archive path is not UTF-8")?], &context, &crate::providers::ChannelLabel::Default)
+            .run(
+                "tar",
+                &["-xf", archive.to_str().ok_or("archive path is not UTF-8")?],
+                &context,
+                &flotilla_provider_runtime::ChannelLabel::Default,
+            )
             .await?;
         Ok(())
     }
@@ -1282,7 +953,7 @@ impl Vcs for FlotillaVcs {
         let bundle_path = bundle.to_str().ok_or_else(|| "bundle path is not UTF-8".to_string())?;
         let patch_path = patch.to_str().ok_or_else(|| "patch path is not UTF-8".to_string())?;
         let snapshot_path = snapshot.to_str().ok_or_else(|| "snapshot path is not UTF-8".to_string())?;
-        self.runner.run("mkdir", &["-p", staging_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await?;
+        self.runner.run("mkdir", &["-p", staging_path], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await?;
         let backend = GitCliBackend::checkout_root(path, &*self.runner);
         let archive_result = async {
             backend.bundle_head(bundle_path).await?;
@@ -1313,7 +984,7 @@ impl Vcs for FlotillaVcs {
                             paths.to_str().ok_or_else(|| "path list is not UTF-8".to_string())?,
                         ],
                         Path::new("/"),
-                        &crate::providers::ChannelLabel::Default,
+                        &flotilla_provider_runtime::ChannelLabel::Default,
                     )
                     .await?;
             }
@@ -1330,7 +1001,7 @@ impl Vcs for FlotillaVcs {
                         "rm",
                         &["-f", paths.to_str().ok_or_else(|| "path list is not UTF-8".to_string())?],
                         Path::new("/"),
-                        &crate::providers::ChannelLabel::Default,
+                        &flotilla_provider_runtime::ChannelLabel::Default,
                     )
                     .await?;
             }
@@ -1340,16 +1011,16 @@ impl Vcs for FlotillaVcs {
         if let Err(error) = archive_result {
             // The checkout remains in place, so a failed archive can be retried safely.
             if let Err(cleanup_error) =
-                self.runner.run("rm", &["-rf", staging_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await
+                self.runner.run("rm", &["-rf", staging_path], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await
             {
                 return Err(format!("{error}; failed to remove partial archive at {staging_path}: {cleanup_error}"));
             }
             return Err(error);
         }
         if let Err(error) =
-            self.runner.run("mv", &[staging_path, archive_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await
+            self.runner.run("mv", &[staging_path, archive_path], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await
         {
-            let _ = self.runner.run("rm", &["-rf", staging_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await;
+            let _ = self.runner.run("rm", &["-rf", staging_path], Path::new("/"), &flotilla_provider_runtime::ChannelLabel::Default).await;
             return Err(error);
         }
         if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
@@ -2295,7 +1966,13 @@ mod tests {
         }
         #[async_trait]
         impl CommandRunner for HeldFetch {
-            async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &crate::providers::ChannelLabel) -> Result<String, String> {
+            async fn run(
+                &self,
+                _cmd: &str,
+                args: &[&str],
+                _cwd: &Path,
+                _label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
                 if args.contains(&"fetch") {
                     self.started.notify_one();
                     self.release.notified().await;
@@ -2307,7 +1984,7 @@ mod tests {
                 _cmd: &str,
                 _args: &[&str],
                 _cwd: &Path,
-                _label: &crate::providers::ChannelLabel,
+                _label: &flotilla_provider_runtime::ChannelLabel,
             ) -> Result<CommandOutput, String> {
                 unreachable!("fetch uses run")
             }
@@ -2361,23 +2038,29 @@ mod tests {
         struct RefuseUpstream;
         #[async_trait]
         impl CommandRunner for RefuseUpstream {
-            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
                 if args.contains(&"--set-upstream-to") {
                     return Err("temporary upstream failure".into());
                 }
-                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
             }
             async fn run_output(
                 &self,
                 cmd: &str,
                 args: &[&str],
                 cwd: &Path,
-                label: &crate::providers::ChannelLabel,
+                label: &flotilla_provider_runtime::ChannelLabel,
             ) -> Result<CommandOutput, String> {
-                crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+                flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
             }
             async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
             }
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2397,7 +2080,7 @@ mod tests {
         git(dir.path(), &["clone", "--branch", "continued", remote.to_str().expect("remote"), writer.to_str().expect("writer")]);
         git(&writer, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "new remote tip"]);
         git(&writer, &["push"]);
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(&root, runner.clone(), true);
         for fresh in [false, true] {
             let advertised = GitCliBackend::new(&root, &*runner).remote_heads("origin", "refs/heads/continued").await.expect("tip");
@@ -2492,7 +2175,7 @@ mod tests {
             if occupied {
                 git(root, &["worktree", "add", root.join("old").to_str().expect("old path"), "reused"]);
             }
-            let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+            let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
             let vcs = test_fl(root, runner, true);
             let target = root.join("new");
             let error = vcs
@@ -2512,7 +2195,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         git(dir.path(), &["init", "-b", "main"]);
         git(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
-        let runner = crate::providers::ProcessCommandRunner;
+        let runner = flotilla_provider_runtime::ProcessCommandRunner;
         let backend = GitCliBackend::new(dir.path(), &runner);
         let commit = backend.head_commit_text().await.expect("commit");
         for (index, branch) in ["HEAD", commit.trim()].into_iter().enumerate() {
@@ -2571,7 +2254,7 @@ mod tests {
             );
 
             let checkout = root.join("checkout");
-            let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+            let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
             let vcs = test_fl(&checkout, runner, true);
             assert_eq!(vcs.commits_beyond_base(Some("main")).await.expect("compare against remote main"), ("origin/main".to_string(), 0));
         }
@@ -2589,7 +2272,7 @@ mod tests {
         git(repo, &["commit", "-m", "initial"]);
         git(repo, &["switch", "-c", "untouched"]);
 
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(repo, runner, true);
         assert_eq!(vcs.commits_beyond_base(Some("main")).await.expect("compare local-only base"), ("main".to_string(), 0));
         assert_eq!(
@@ -2610,7 +2293,7 @@ mod tests {
         git(repo, &["commit", "-m", "initial"]);
         git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
 
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(repo, runner, true);
         assert_eq!(
             vcs.commits_beyond_base(Some("origin/main")).await.expect("compare explicit remote base"),
@@ -2634,7 +2317,7 @@ mod tests {
         git(repo, &["commit", "-m", "initial"]);
         git(repo, &["remote", "add", "origin", "https://example.com/repo.git"]);
 
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(repo, runner, true);
         assert!(vcs.commits_beyond_base(Some("main")).await.is_err());
     }
@@ -2848,7 +2531,7 @@ mod tests {
         git(root, &["clone", "--bare", ".", bare.to_str().expect("bare path")]);
         let linked = root.join("linked");
         git(root, &["worktree", "add", "-b", "linked", linked.to_str().expect("linked path")]);
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         for (path, branch, exact) in
             [(root, "main", true), (linked.as_path(), "linked", true), (subdir.as_path(), "main", false), (bare.as_path(), "main", false)]
         {
@@ -2876,7 +2559,7 @@ mod tests {
         git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
         let target = root.join("stale-target");
         std::fs::create_dir(&target).expect("stale target");
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let strategy = GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(
             Arc::clone(&runner),
             ExecutionEnvironmentPath::new(root.join(".git")),
@@ -2908,7 +2591,7 @@ mod tests {
         git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
         git(&source, &["push", "origin", "main"]);
 
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let strategy = GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(
             Arc::clone(&runner),
             ExecutionEnvironmentPath::new(source.join(".git")),
@@ -2951,7 +2634,7 @@ mod tests {
         std::fs::create_dir(&source).expect("source");
         git(&source, &["init", "-b", "main"]);
         git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
-        let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
+        let vcs = test_fl(&source, Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
         let mut admins = Vec::new();
         for index in 0..2 {
             let parent = root.join(format!("vessel-{index}"));
@@ -2987,23 +2670,29 @@ mod tests {
         }
         #[async_trait]
         impl CommandRunner for RefuseRepair {
-            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
                 if args.windows(2).any(|pair| pair == if self.before_lock { ["worktree", "list"] } else { ["worktree", "repair"] }) {
                     return Err("temporary repair failure".into());
                 }
-                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
             }
             async fn run_output(
                 &self,
                 cmd: &str,
                 args: &[&str],
                 cwd: &Path,
-                label: &crate::providers::ChannelLabel,
+                label: &flotilla_provider_runtime::ChannelLabel,
             ) -> Result<CommandOutput, String> {
-                crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+                flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
             }
             async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
             }
         }
         // Inject both before protection can lock and during later repair.
@@ -3042,7 +2731,7 @@ mod tests {
             git(&source, &["worktree", "prune", "--expire", "now"]);
             assert!(admin.exists(), "sibling prune must preserve failed creation");
             std::fs::rename(hidden, &target).expect("restore target");
-            let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
+            let vcs = test_fl(&source, Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
             let recovered = vcs.materialise_checkout("convoy/work", Some("main"), target_str, "managed").await.expect("retry");
             assert_eq!(
                 recovered.provenance,
@@ -3072,7 +2761,7 @@ mod tests {
         std::fs::create_dir(&source).expect("source");
         git(&source, &["init", "-b", "main"]);
         git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
-        let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
+        let vcs = test_fl(&source, Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
         let target_str = target.to_str().expect("target");
         vcs.materialise_checkout("convoy/work", Some("main"), target_str, "flotilla-managed: convoy/work").await.expect("materialise");
         let admin = source.join(".git/worktrees/managed");
@@ -3121,15 +2810,21 @@ mod tests {
         }
         #[async_trait]
         impl CommandRunner for RefuseRemoval {
-            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
-                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
             }
             async fn run_output(
                 &self,
                 cmd: &str,
                 args: &[&str],
                 cwd: &Path,
-                label: &crate::providers::ChannelLabel,
+                label: &flotilla_provider_runtime::ChannelLabel,
             ) -> Result<CommandOutput, String> {
                 if cmd == "git" && args.windows(2).any(|pair| pair == ["worktree", "remove"]) {
                     return if self.transport {
@@ -3138,14 +2833,14 @@ mod tests {
                         Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), exit_code: Some(1) })
                     };
                 }
-                let mut output = crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await?;
+                let mut output = flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await?;
                 if !output.success() && args.windows(2).any(|pair| pair == ["worktree", "lock"] || pair == ["worktree", "unlock"]) {
                     output.stderr = "message Git localisé".into();
                 }
                 Ok(output)
             }
             async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
             }
         }
         for transport in [true, false] {
@@ -3187,7 +2882,7 @@ mod tests {
         git(&source, &["commit", "-m", "initial"]);
         git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
         git(&source, &["push", "origin", "main"]);
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
         vcs.materialise_checkout("convoy/work", Some("main"), target, "flotilla-managed: convoy/work")
@@ -3223,7 +2918,7 @@ mod tests {
         git(&source, &["commit", "-m", "initial"]);
         git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
         git(&source, &["push", "origin", "main"]);
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
         vcs.materialise_checkout("convoy/work", Some("main"), target, "flotilla-managed: convoy/work")
@@ -3292,7 +2987,7 @@ mod tests {
         git(&source, &["commit", "-m", "initial"]);
         git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
         git(&source, &["push", "origin", "main"]);
-        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let runner: Arc<dyn CommandRunner> = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
         vcs.materialise_checkout("convoy/work", Some("main"), target, "flotilla-managed: convoy/work")
@@ -3368,7 +3063,7 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
         let touched = std::process::Command::new("touch").args(["-t", &past]).arg(&old).status().expect("age archive");
         assert!(touched.success());
-        prune_checkout_archives(&crate::providers::ProcessCommandRunner, &archive_root, 14).await.expect("prune archive root");
+        prune_checkout_archives(&flotilla_provider_runtime::ProcessCommandRunner, &archive_root, 14).await.expect("prune archive root");
         assert!(!old.exists());
         assert!(recent.exists());
     }
@@ -3378,7 +3073,9 @@ mod tests {
     async fn remote_archive_deadline_stops_find_and_rm_and_allows_the_next_root() {
         use std::os::unix::fs::PermissionsExt;
 
-        use crate::providers::{ssh_runner::SshCommandRunner, ChannelLabel, ProcessCommandRunner};
+        use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
+        use flotilla_provider_runtime::ChannelLabel;
+        use flotilla_provider_runtime::ProcessCommandRunner;
 
         // Execute the remote shell locally, preserving the real SSH decorator
         // and process runner. No live host or SSH credentials are required.

@@ -2,10 +2,9 @@ use std::path::Path;
 
 use flotilla_protocol::CheckoutStatus;
 
-use crate::{
-    providers::run,
-    vcs::{RepositoryRead, Vcs},
-};
+use crate::vcs::RepositoryRead;
+use crate::vcs::Vcs;
+use flotilla_provider_runtime::run;
 
 pub async fn fetch_checkout_status(
     branch: &str,
@@ -13,7 +12,7 @@ pub async fn fetch_checkout_status(
     change_request_id: Option<&str>,
     repo_root: &Path,
     vcs: &dyn Vcs,
-    runner: &dyn crate::providers::CommandRunner,
+    runner: &dyn flotilla_provider_runtime::CommandRunner,
 ) -> CheckoutStatus {
     let branch_owned = branch.to_string();
     let repo = repo_root.to_path_buf();

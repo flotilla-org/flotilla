@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
-use super::CommandRunner;
+use flotilla_provider_runtime::CommandRunner;
 
 /// Options for creating a new provisioned environment.
 ///
@@ -292,7 +292,13 @@ pub trait EnvironmentProvider: Send + Sync {
     }
     /// Read-only detection before provisioning. Image-backed providers run in
     /// an ephemeral environment without pulling or changing the local cache.
-    async fn detect(&self, _image: Option<&str>, _binary: &str, _args: &[&str], _scratch: &Path) -> Result<super::CommandOutput, String> {
+    async fn detect(
+        &self,
+        _image: Option<&str>,
+        _binary: &str,
+        _args: &[&str],
+        _scratch: &Path,
+    ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
         Err("environment provider does not support detection".into())
     }
     async fn prepare(&self, spec: &flotilla_resources::EnvironmentSpec, _opts: &PrepareOpts) -> Result<PreparedEnvironment, String>;

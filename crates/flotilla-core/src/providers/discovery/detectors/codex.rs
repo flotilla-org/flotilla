@@ -8,13 +8,10 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::{
-    discovery_api::EnvironmentAssertion,
-    providers::{
-        discovery::{EnvVars, HostDetector},
-        CommandRunner,
-    },
-};
+use crate::discovery_api::EnvironmentAssertion;
+use crate::providers::discovery::HostDetector;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::EnvVars;
 
 /// Returns the Codex home directory: `$CODEX_HOME` or `$HOME/.codex`.
 /// Returns `None` when neither env var is available.

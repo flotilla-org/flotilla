@@ -13,9 +13,9 @@ use crate::providers::discovery::Factory;
 use crate::providers::discovery::ProviderCategory;
 use crate::providers::discovery::ProviderDescriptor;
 use crate::providers::discovery::UnmetRequirement;
-use crate::providers::CommandRunner;
-use crate::providers::ReqwestHttpClient;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ReqwestHttpClient;
 
 // ---------------------------------------------------------------------------
 // CodexCodingAgentFactory

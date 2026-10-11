@@ -4949,7 +4949,7 @@ impl flotilla_core::providers::discovery::Factory for GatedStartupEnvironmentFac
         _env: &flotilla_core::discovery_api::EnvironmentBag,
         _config: &dyn provider_config::ProviderConfigView,
         _root: &flotilla_paths::path_context::ExecutionEnvironmentPath,
-        _runner: Arc<dyn flotilla_core::providers::CommandRunner>,
+        _runner: Arc<dyn flotilla_provider_runtime::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<flotilla_core::providers::discovery::UnmetRequirement>> {
         Ok(self.0.clone())
     }

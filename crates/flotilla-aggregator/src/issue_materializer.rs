@@ -960,10 +960,9 @@ mod tests {
     use std::{collections::VecDeque, path::Path, sync::Mutex as StdMutex};
 
     use chrono::{Duration as ChronoDuration, Utc};
-    use flotilla_core::{
-        event_sink::BroadcastEventSink,
-        providers::{forge::github::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner},
-    };
+    use flotilla_core::event_sink::BroadcastEventSink;
+    use flotilla_core::providers::forge::github::GhApiClient;
+    use flotilla_core::providers::issue_tracker::github::GitHubIssueProvider;
     use flotilla_protocol::issue_query::IssueResultPage;
     use flotilla_protocol::issue_query::READY_ISSUE_LABEL;
     use flotilla_protocol::result_set::ConvoyIssueRow;
@@ -974,6 +973,9 @@ mod tests {
     use flotilla_protocol::QueryCursor;
     use flotilla_protocol::ResourceRef;
     use flotilla_protocol_testkit::TestIssue;
+    use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_provider_runtime::CommandOutput;
+    use flotilla_provider_runtime::CommandRunner;
     use tokio::sync::{Mutex, Notify};
     use uuid::Uuid;
 

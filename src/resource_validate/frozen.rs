@@ -6,9 +6,10 @@ use std::{
 };
 
 use color_eyre::{eyre::eyre, Result};
+use flotilla_core::providers::environment::EnvironmentProvider;
 #[cfg(test)]
-use flotilla_core::providers::ChannelLabel;
-use flotilla_core::providers::{environment::EnvironmentProvider, CommandRunner};
+use flotilla_provider_runtime::ChannelLabel;
+use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
     compose_image, pinned_workflow_ref, Convoy, ConvoyPhase, CredentialSpec, CredentialSpecSpec, Environment, FrozenImageLayers,
     ImageBuild, ImageComposition, InputDefinition, K8sResourceObject, Resource, ResourceObject, SkillCatalogEntry, Vessel,
@@ -996,12 +997,12 @@ mod tests {
             args: &[&str],
             cwd: &Path,
             _label: &ChannelLabel,
-        ) -> Result<flotilla_core::providers::CommandOutput, String> {
+        ) -> Result<flotilla_provider_runtime::CommandOutput, String> {
             assert_eq!(command, "docker");
             assert_eq!(args, ["image", "inspect", &self.reference]);
             assert_eq!(cwd, Path::new("/"));
             let local = self.local.expect("exact digest validation must not probe local tags");
-            Ok(flotilla_core::providers::CommandOutput {
+            Ok(flotilla_provider_runtime::CommandOutput {
                 stdout: serde_json::json!([{"Id": format!("sha256:{}", "a".repeat(64))}]).to_string(),
                 stderr: "image absent".into(),
                 exit_code: Some(i32::from(!local)),
