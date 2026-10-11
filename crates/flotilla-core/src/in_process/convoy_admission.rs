@@ -1,7 +1,7 @@
 //! Convoy admission state and transaction boundary.
 
-use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
+use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;

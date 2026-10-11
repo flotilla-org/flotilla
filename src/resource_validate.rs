@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use color_eyre::{eyre::eyre, Result};
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
+#[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
