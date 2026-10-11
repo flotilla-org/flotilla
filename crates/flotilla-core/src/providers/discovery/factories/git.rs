@@ -1,16 +1,15 @@
 //! Checkout-scoped Git provider factory.
 
-use crate::provider_config::ProviderConfigView;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 
-use crate::discovery_api::EnvironmentBag;
-use crate::providers::discovery::Factory;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::discovery::UnmetRequirement;
 use crate::providers::vcs::clone::ReferenceCloneStrategy;
 use crate::providers::vcs::detection::reference_clone_available;
 use crate::providers::vcs::git_worktree::GitWorktreeStrategy;
@@ -66,11 +65,11 @@ mod tests {
 
     use super::GitVcsFactory;
     use crate::config::ConfigStore;
-    use crate::discovery_api::EnvironmentAssertion;
-    use crate::discovery_api::EnvironmentBag;
-    use crate::providers::discovery::Factory;
-    use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
+    use flotilla_discovery_api::UnmetRequirement;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]

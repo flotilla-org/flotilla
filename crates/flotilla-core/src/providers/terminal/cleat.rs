@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint};
 use serde::Deserialize;
 
@@ -13,7 +14,6 @@ use super::{
     environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
     TerminalSessionTag, TerminalSize,
 };
-use crate::discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::ChannelLabel;

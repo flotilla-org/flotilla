@@ -9,6 +9,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceError,
@@ -20,12 +21,7 @@ use tokio::sync::{watch, OnceCell};
 use tracing::warn;
 
 use super::{checkout_path, discover_vcs_for_checkout, InProcessDaemon};
-use crate::{
-    config::ConfigStore,
-    environment_manager::ManagedEnvironmentKind,
-    providers::{discovery::ProviderDescriptor, registry::ProviderRegistry},
-    vcs::Vcs,
-};
+use crate::{config::ConfigStore, environment_manager::ManagedEnvironmentKind, providers::registry::ProviderRegistry, vcs::Vcs};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
 pub(super) struct CheckoutProvider {

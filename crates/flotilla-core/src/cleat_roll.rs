@@ -10,12 +10,12 @@ use std::{
     time::Duration,
 };
 
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{result_set::CleatEndpoint, EnvironmentId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use crate::discovery_api::EnvironmentBag;
 use crate::providers::terminal::environment::ControlledTerminalEnvironment;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;

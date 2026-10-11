@@ -1,3 +1,4 @@
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use async_trait::async_trait;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -9,7 +10,6 @@ use crate::{providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
-        discovery::{ProviderCategory, ProviderDescriptor},
         issue_tracker::IssueProvider,
         types::{
             ChangeRequest, Checkout, CloudAgentSession, Issue,

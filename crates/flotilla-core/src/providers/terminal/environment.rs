@@ -7,10 +7,10 @@
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use flotilla_discovery_api::host_environment_keys;
+use flotilla_discovery_api::EnvironmentBag;
 
 use super::TerminalEnvVars;
-use crate::discovery_api::EnvironmentBag;
-use crate::discovery_api::HOST_ENVIRONMENT_KEYS;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
@@ -47,7 +47,7 @@ impl ControlledTerminalEnvironment {
             let host: TerminalEnvVars = host.into_iter().collect();
             return Self { client: host.clone(), host };
         }
-        for &key in HOST_ENVIRONMENT_KEYS {
+        for &key in host_environment_keys() {
             if let Some(value) = bag.find_env_var(key) {
                 host.insert(key.to_string(), value.to_string());
             }
@@ -139,7 +139,7 @@ mod tests {
     use hegel::generators as gs;
 
     use super::*;
-    use crate::discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentAssertion;
 
     // #2706: host facts enter launches only through the allowlist; explicit
     // declarations override them, including empty and shell-special values.
@@ -147,8 +147,8 @@ mod tests {
     fn only_declared_host_facts_cross_the_environment_seam(tc: hegel::TestCase) {
         // Cover every baseline key, absent/present host values, explicit
         // overrides, duplicate declarations and empty/shell-special values.
-        let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(HOST_ENVIRONMENT_KEYS.len() - 1));
-        let key = HOST_ENVIRONMENT_KEYS[index];
+        let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(host_environment_keys().len() - 1));
+        let key = host_environment_keys()[index];
         let present = tc.draw(gs::booleans());
         let override_host = tc.draw(gs::booleans());
         let values = ["", "host value", "quotes'\" = $() `literal`\nsecond line"];

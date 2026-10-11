@@ -18,6 +18,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
@@ -400,7 +401,6 @@ pub fn command_provider(kind: EnvironmentKind, runner: Arc<dyn CommandRunner>) -
 /// Compose detection-only endpoint providers with their canonical instance
 /// descriptors. This is for callers without a discovered provider registry.
 pub fn command_provider_registry(kinds: &[EnvironmentKind], runner: Arc<dyn CommandRunner>) -> super::registry::ProviderRegistry {
-    use super::discovery::{ProviderCategory, ProviderDescriptor};
     let mut registry = super::registry::ProviderRegistry::new();
     for &kind in kinds {
         let name = match kind {

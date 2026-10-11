@@ -1,4 +1,3 @@
-use flotilla_core::provider_config;
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
@@ -17,6 +16,7 @@ use flotilla_core::agents::AgentEntry;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery_api::provider_config;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::init_git_repo_with_remote;
@@ -4936,22 +4936,19 @@ impl flotilla_core::providers::environment::EnvironmentProvider for GatedStartup
 struct GatedStartupEnvironmentFactory(Arc<GatedStartupEnvironmentProvider>);
 
 #[async_trait::async_trait]
-impl flotilla_core::providers::discovery::Factory for GatedStartupEnvironmentFactory {
-    type Descriptor = flotilla_core::providers::discovery::ProviderDescriptor;
+impl flotilla_discovery_api::Factory for GatedStartupEnvironmentFactory {
+    type Descriptor = flotilla_discovery_api::ProviderDescriptor;
     type Output = dyn flotilla_core::providers::environment::EnvironmentProvider;
     fn descriptor(&self) -> Self::Descriptor {
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        )
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker")
     }
     async fn probe(
         &self,
-        _env: &flotilla_core::discovery_api::EnvironmentBag,
+        _env: &flotilla_discovery_api::EnvironmentBag,
         _config: &dyn provider_config::ProviderConfigView,
         _root: &flotilla_paths::path_context::ExecutionEnvironmentPath,
         _runner: Arc<dyn flotilla_provider_runtime::CommandRunner>,
-    ) -> Result<Arc<Self::Output>, Vec<flotilla_core::providers::discovery::UnmetRequirement>> {
+    ) -> Result<Arc<Self::Output>, Vec<flotilla_discovery_api::UnmetRequirement>> {
         Ok(self.0.clone())
     }
 }

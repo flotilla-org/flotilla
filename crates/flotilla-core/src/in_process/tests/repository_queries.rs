@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy,
@@ -112,11 +113,7 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
 
 #[tokio::test]
 async fn cli_lists_include_active_provider_sessions() {
-    use crate::providers::{
-        coding_agent::CloudAgentService,
-        discovery::{ProviderCategory, ProviderDescriptor},
-        types::RepoCriteria,
-    };
+    use crate::providers::{coding_agent::CloudAgentService, types::RepoCriteria};
 
     struct Sessions;
     struct BrokenSessions;

@@ -591,10 +591,7 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
     let credential_store = Arc::new(CredentialStore::new(
@@ -704,10 +701,7 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
     let env = Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_CODEX_TOKEN", "secret".to_string())]));
@@ -790,10 +784,7 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
     let mut local_registry = ProviderRegistry::new();
     local_registry.environment_providers.insert(
         "docker",
-        flotilla_core::providers::discovery::ProviderDescriptor::named(
-            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
-            "docker",
-        ),
+        flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "docker"),
         Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
     );
     let registry_runner = Arc::new(RejectingRegistryRunner::default());

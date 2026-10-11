@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::HostName;
 use flotilla_resources::{Repository, RepositorySpec};
 use flotilla_store::ResourceBackend;
 
 use super::support::test_meta;
 use crate::config::ConfigStore;
-use crate::discovery_api::EnvironmentAssertion;
-use crate::discovery_api::EnvironmentBag;
 use crate::in_process::InProcessDaemon;
 use crate::providers::change_request::observation::ChangeRequestObservationSource;
 use crate::providers::change_request::observation::ChangeRequestRef;

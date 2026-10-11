@@ -1,22 +1,21 @@
 //! GitHub and Forgejo factories for change request and issue tracker providers.
 
-use crate::provider_config::ProviderConfigView;
-
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
+use flotilla_discovery_api::provider_config::ProviderConfig;
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_resources::ForgeKind;
 
-use crate::discovery_api::EnvironmentBag;
-use crate::provider_config::ForgejoIssueTrackerConfig;
-use crate::provider_config::ProviderConfig;
 use crate::providers::change_request::forgejo::ForgejoChangeRequestProvider;
 use crate::providers::change_request::github::GitHubChangeRequest;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::discovery::Factory;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::discovery::UnmetRequirement;
 use crate::providers::discovery::FORGEJO_AUTH_PROVIDER;
 use crate::providers::forge::forgejo::ForgejoAuth;
 use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
@@ -303,7 +302,7 @@ fn config_path(config_parent: &std::path::Path, path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use crate::provider_config::ProviderConfig;
+    use flotilla_discovery_api::provider_config::ProviderConfig;
     use std::{collections::BTreeSet, sync::Arc};
 
     use flotilla_protocol::{IssueRef, IssueSource};
@@ -314,12 +313,12 @@ mod tests {
         GitHubChangeRequestFactory, GitHubIssueProviderFactory,
     };
     use crate::config::ConfigStore;
-    use crate::discovery_api::EnvironmentAssertion;
-    use crate::discovery_api::EnvironmentBag;
-    use crate::provider_config::ForgejoIssueTrackerConfig;
-    use crate::providers::discovery::Factory;
-    use crate::providers::discovery::UnmetRequirement;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
+    use flotilla_discovery_api::UnmetRequirement;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {

@@ -31,7 +31,7 @@ impl AgentAdapter for FleetCanaryAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentAssertion;
 
     // The probe must be unavailable to ordinary daemons and preserve all
     // seam-selected launch values when explicitly enabled.

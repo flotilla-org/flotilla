@@ -12,14 +12,14 @@
 use std::{path::Path, sync::Arc};
 
 use flotilla_core::config::ConfigStore;
-use flotilla_core::discovery_api::EnvironmentAssertion;
-use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::providers::discovery::detectors::default_host_detectors;
 use flotilla_core::providers::discovery::run_host_detectors;
 use flotilla_core::providers::discovery::FactoryRegistry;
 use flotilla_core::providers::environment::CreateOpts;
 use flotilla_core::providers::environment::EnvironmentKind;
 use flotilla_core::vcs::RepositoryRead;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 use flotilla_provider_runtime::ChannelLabel;

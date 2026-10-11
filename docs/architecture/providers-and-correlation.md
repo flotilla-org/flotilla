@@ -32,7 +32,7 @@ UI.
 
 ## Provider Families
 
-The registry currently supports:
+At the time of this retired pipeline, the registry supported:
 
 - `Vcs`
 - `CheckoutManager`
@@ -40,10 +40,11 @@ The registry currently supports:
 - `IssueTracker`
 - `CloudAgentService`
 - `AiUtility`
-- one selected `WorkspaceManager`
+- one selected `WorkspaceManager` (retired; current discovery uses `TerminalPool`
+  and `EnvironmentProvider` categories instead)
 
-Only some families have multiple implementations today, but the registry shape
-assumes more backends will continue to arrive.
+Only some families had multiple implementations then, but the registry shape
+assumed more backends would continue to arrive.
 
 ## Detection Model
 

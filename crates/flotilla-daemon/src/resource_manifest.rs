@@ -1111,11 +1111,11 @@ mod tests {
 
     use chrono::Utc;
     use flotilla_core::config::ConfigStore;
-    use flotilla_core::discovery_api::EnvironmentAssertion;
-    use flotilla_core::discovery_api::EnvironmentBag;
     use flotilla_core::in_process::InProcessDaemon;
     use flotilla_core::providers::discovery::factories::git::GitVcsFactory;
-    use flotilla_core::providers::discovery::Factory;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
     use flotilla_discovery_testkit::fake_discovery_with_provider_set;
     use flotilla_discovery_testkit::FakeDiscoveryProviders;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;

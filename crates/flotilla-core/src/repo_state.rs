@@ -4,12 +4,10 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::EnvironmentId;
 
-use crate::{
-    model::RepoModel,
-    providers::{discovery::UnmetRequirement, registry::ProviderRegistry},
-};
+use crate::{model::RepoModel, providers::registry::ProviderRegistry};
 
 pub(crate) struct RepoRootState {
     pub(crate) path: PathBuf,

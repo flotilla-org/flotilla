@@ -14,7 +14,6 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::command_target::TargetHost;
 use flotilla_core::config::ConfigStore;
-use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::WorkCredentialReconciler;
 use flotilla_core::providers::environment::ProvisionedEnvironment;
@@ -35,6 +34,7 @@ use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_w
 use flotilla_daemon_testkit::server::spawn_in_memory_request_topology_stateful_with_surface;
 use flotilla_daemon_testkit::server::InMemoryRequestMesh;
 use flotilla_daemon_testkit::server::InMemoryRequestTopology;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::FakeDiscoveryProviders;

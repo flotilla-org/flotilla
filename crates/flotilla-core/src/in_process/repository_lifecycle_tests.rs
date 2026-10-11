@@ -1,6 +1,6 @@
 //! #1770: identity and provider lifetimes follow resources, not presentation roots.
 
-use crate::provider_config;
+use flotilla_discovery_api::provider_config;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hegel::generators as gs;
@@ -9,16 +9,16 @@ use super::*;
 use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
 use crate::providers::discovery::detectors::generic::CommandDetector;
 use crate::providers::discovery::factories::github::GitHubIssueProviderFactory;
-use crate::providers::discovery::Factory;
-use crate::providers::discovery::ProviderCategory;
-use crate::providers::discovery::ProviderDescriptor;
-use crate::providers::discovery::UnmetRequirement;
 use crate::testkits::discovery::fake_discovery;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use crate::testkits::discovery::FakeIssueProvider;
 use crate::testkits::discovery::FakeVcsFactory;
 use crate::testkits::discovery::FakeVcsState;
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_discovery_api::Factory;
+use flotilla_discovery_api::ProviderCategory;
+use flotilla_discovery_api::ProviderDescriptor;
+use flotilla_discovery_api::UnmetRequirement;
 
 struct CountingVcsFactory {
     inner: FakeVcsFactory,

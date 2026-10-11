@@ -130,6 +130,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | Crate | Role |
 |-------|------|
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
+| `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
 | `flotilla-provider-runtime` | Command and HTTP runners, invocation macros, environment variables, shared scans and bounded host probes |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |

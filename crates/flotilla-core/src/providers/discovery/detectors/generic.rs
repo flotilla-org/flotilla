@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::HostDetector;
 use tracing::warn;
 
-use crate::discovery_api::EnvironmentAssertion;
-use crate::providers::discovery::HostDetector;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;

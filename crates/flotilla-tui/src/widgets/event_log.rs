@@ -2,7 +2,7 @@ use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_core::providers::discovery::ProviderCategory;
+use flotilla_discovery_api::ProviderCategory;
 use flotilla_protocol::{
     CredentialAttentionSeverity, FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth,
 };

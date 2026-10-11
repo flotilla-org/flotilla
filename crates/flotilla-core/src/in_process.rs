@@ -3,6 +3,8 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -111,8 +113,6 @@ use crate::checkout_integration::inspect_convoy_checkout_integration;
 use crate::config::ConfigStore;
 use crate::config::StaticEnvironmentConfig;
 pub use crate::convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector};
-use crate::discovery_api::EnvironmentAssertion;
-use crate::discovery_api::EnvironmentBag;
 use crate::environment_manager::EnvironmentManager;
 use crate::environment_manager::ResolvedEnvironment;
 use crate::event_sink::BroadcastEventSink;

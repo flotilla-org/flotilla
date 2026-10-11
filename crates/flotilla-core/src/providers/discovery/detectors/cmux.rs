@@ -6,9 +6,9 @@
 //! the binary on PATH, and finally falls back to the hardcoded app-bundle path.
 
 use async_trait::async_trait;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::HostDetector;
 
-use crate::discovery_api::EnvironmentAssertion;
-use crate::providers::discovery::HostDetector;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 

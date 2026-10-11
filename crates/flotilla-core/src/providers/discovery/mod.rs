@@ -5,6 +5,11 @@
 //! producing `EnvironmentAssertion` values collected into an `EnvironmentBag`.
 //! Factories consume the bag to construct typed provider instances.
 
+use flotilla_discovery_api::provider_config::ProviderConfigView;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
+use flotilla_discovery_api::VcsKind;
+use flotilla_discovery_api::{Factory, HostDetector, ProviderCategory, ProviderDescriptor, RepoDetector, UnmetRequirement};
 use flotilla_provider_runtime::{EnvVars, ProcessEnvVars};
 use futures::StreamExt;
 
@@ -18,7 +23,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use flotilla_protocol::EnvironmentId;
 use futures::stream;
 use tokio::sync::OnceCell as AsyncOnceCell;
@@ -26,10 +30,6 @@ use tokio::sync::OnceCell as AsyncOnceCell;
 use crate::admission::system_available_space_probe;
 use crate::admission::AvailableSpaceProbe;
 use crate::agent_adapter::AgentAdapterRegistry;
-use crate::discovery_api::EnvironmentAssertion;
-use crate::discovery_api::EnvironmentBag;
-use crate::discovery_api::VcsKind;
-use crate::provider_config::ProviderConfigView;
 use crate::providers::ai_utility::AiUtility;
 use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::coding_agent::CloudAgentService;
@@ -41,183 +41,6 @@ use crate::providers::terminal::TerminalPool;
 use crate::vcs::Vcs;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
-
-// ---------------------------------------------------------------------------
-// Unmet requirements and provider descriptor
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum UnmetRequirement {
-    MissingBinary(String),
-    MissingEnvVar(String),
-    MissingAuth(String),
-    MissingConfig(String),
-    MissingRemoteHost(String),
-    NoVcsCheckout,
-    /// Config references a backend or implementation that no factory provides.
-    UnknownProviderPreference {
-        category: ProviderCategory,
-        key: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProviderCategory {
-    Vcs,
-    ChangeRequest,
-    IssueProvider,
-    CloudAgent,
-    AiUtility,
-    WorkspaceManager,
-    TerminalPool,
-    EnvironmentProvider,
-}
-
-impl ProviderCategory {
-    pub const ALL: [Self; 8] = [
-        Self::Vcs,
-        Self::ChangeRequest,
-        Self::IssueProvider,
-        Self::CloudAgent,
-        Self::AiUtility,
-        Self::WorkspaceManager,
-        Self::TerminalPool,
-        Self::EnvironmentProvider,
-    ];
-
-    pub fn slug(&self) -> &'static str {
-        match self {
-            Self::Vcs => "vcs",
-            Self::ChangeRequest => "change_request",
-            Self::IssueProvider => "issue_tracker",
-            Self::CloudAgent => "cloud_agent",
-            Self::AiUtility => "ai_utility",
-            Self::WorkspaceManager => "workspace_manager",
-            Self::TerminalPool => "terminal_pool",
-            Self::EnvironmentProvider => "environment_provider",
-        }
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Vcs => "VCS",
-            Self::ChangeRequest => "Change Requests",
-            Self::IssueProvider => "Issue Provider",
-            Self::CloudAgent => "Cloud Agent",
-            Self::AiUtility => "AI Utility",
-            Self::WorkspaceManager => "Workspace Manager",
-            Self::TerminalPool => "Terminal Pool",
-            Self::EnvironmentProvider => "Environment Provider",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderDescriptor {
-    pub category: ProviderCategory,
-    pub backend: String,
-    pub implementation: String,
-    pub display_name: String,
-    pub abbreviation: String,
-    pub section_label: String,
-    pub item_noun: String,
-}
-
-impl ProviderDescriptor {
-    pub fn named(category: ProviderCategory, name: impl Into<String>) -> Self {
-        let name = name.into();
-        Self {
-            category,
-            backend: name.clone(),
-            implementation: name.clone(),
-            display_name: name,
-            abbreviation: String::new(),
-            section_label: String::new(),
-            item_noun: String::new(),
-        }
-    }
-
-    pub fn labeled(
-        category: ProviderCategory,
-        backend: impl Into<String>,
-        implementation: impl Into<String>,
-        display_name: impl Into<String>,
-        abbreviation: impl Into<String>,
-        section_label: impl Into<String>,
-        item_noun: impl Into<String>,
-    ) -> Self {
-        Self {
-            category,
-            backend: backend.into(),
-            implementation: implementation.into(),
-            display_name: display_name.into(),
-            abbreviation: abbreviation.into(),
-            section_label: section_label.into(),
-            item_noun: item_noun.into(),
-        }
-    }
-
-    /// Shorthand for backends with a single implementation — sets `implementation = backend`.
-    /// Use `labeled()` when a backend has multiple implementations (e.g. claude api vs cli).
-    pub fn labeled_simple(
-        category: ProviderCategory,
-        backend: impl Into<String>,
-        display_name: impl Into<String>,
-        abbreviation: impl Into<String>,
-        section_label: impl Into<String>,
-        item_noun: impl Into<String>,
-    ) -> Self {
-        let backend = backend.into();
-        Self {
-            category,
-            implementation: backend.clone(),
-            backend,
-            display_name: display_name.into(),
-            abbreviation: abbreviation.into(),
-            section_label: section_label.into(),
-            item_noun: item_noun.into(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Detector traits
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-pub trait HostDetector: Send + Sync {
-    async fn detect(&self, runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion>;
-}
-
-#[async_trait]
-pub trait RepoDetector: Send + Sync {
-    async fn detect(
-        &self,
-        repo_root: &ExecutionEnvironmentPath,
-        runner: &dyn CommandRunner,
-        env: &dyn EnvVars,
-    ) -> Vec<EnvironmentAssertion>;
-}
-
-// ---------------------------------------------------------------------------
-// Factory trait and category aliases
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-pub trait Factory: Send + Sync {
-    type Descriptor;
-    type Output: ?Sized + Send + Sync;
-
-    fn descriptor(&self) -> Self::Descriptor;
-
-    async fn probe(
-        &self,
-        env: &EnvironmentBag,
-        config: &dyn ProviderConfigView,
-        repo_root: &ExecutionEnvironmentPath,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>>;
-}
 
 pub type ProviderFactory<T> = dyn Factory<Descriptor = ProviderDescriptor, Output = T>;
 pub type VcsFactory = ProviderFactory<dyn Vcs>;
@@ -524,7 +347,7 @@ mod timeout_tests {
     // The process boundary double simulates a pending privacy prompt. Other
     // detectors must still contribute capabilities after its deadline expires.
     struct PendingDetector;
-    #[async_trait]
+    #[async_trait::async_trait]
     impl HostDetector for PendingDetector {
         async fn detect(&self, _: &dyn CommandRunner, _: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
             std::future::pending().await
@@ -567,10 +390,9 @@ pub async fn run_provisioned_host_detectors(
         }
     }
 
-    let mut bag = env_vars
-        .iter()
-        .fold(EnvironmentBag::new(), |bag, (key, value)| bag.with(EnvironmentAssertion::env_var(key.clone(), value.clone())));
-    bag.provisioned_environment = Some(env_vars.clone());
+    let bag = env_vars.iter().fold(EnvironmentBag::provisioned(env_vars.clone()), |bag, (key, value)| {
+        bag.with(EnvironmentAssertion::env_var(key.clone(), value.clone()))
+    });
     let detected = run_host_detectors(detectors, runner, &ProvisionedEnvVars { values: env_vars }).await;
     bag.extend(detected.assertions().iter().filter(|assertion| !matches!(assertion, EnvironmentAssertion::EnvVarSet { .. })).cloned())
 }

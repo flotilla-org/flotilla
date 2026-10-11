@@ -7,11 +7,11 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::discovery_api::EnvironmentBag;
 use flotilla_core::providers::environment::{
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
     PreparedEnvironmentAuth, RegistryAuth,
 };
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -2413,7 +2413,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_core::discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_protocol::NodeId;
     use flotilla_provider_runtime::CommandOutput;
     use flotilla_provider_runtime::ProcessCommandRunner;

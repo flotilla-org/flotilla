@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_discovery_api::EnvironmentAssertion;
+use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
 use flotilla_resources::{
     change_request_record_name, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Convoy as ResourceConvoy, ConvoyRepositorySpec,
@@ -19,8 +21,6 @@ use flotilla_store::ResourceBackend;
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply, RestAdmissionSelection};
 use super::support::{test_meta, BatchedObservationRunner};
 use crate::config::ConfigStore;
-use crate::discovery_api::EnvironmentAssertion;
-use crate::discovery_api::EnvironmentBag;
 use crate::in_process::forge_service_matches;
 use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;

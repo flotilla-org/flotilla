@@ -5,16 +5,15 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use flotilla_discovery_api::provider_config::{
+    AiUtilityConfig, ChangeRequestConfig, CloudAgentConfig, IssueTrackerConfig, ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig,
+    TerminalPoolConfig,
+};
 use flotilla_protocol::NodeId;
 use flotilla_resources::RepositoryVcsSpec;
 use serde::{Deserialize, Serialize};
 
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
-
-use crate::provider_config::{
-    AiUtilityConfig, ChangeRequestConfig, CloudAgentConfig, IssueTrackerConfig, ProviderConfig, ProviderConfigView, ResolvedCheckoutConfig,
-    TerminalPoolConfig,
-};
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
