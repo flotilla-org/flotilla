@@ -59,6 +59,27 @@ impl<T: Resource> DefinitionResolver<T> {
         Ok(object)
     }
 
+    /// Select indexed candidate names, hydrate their origins in one store read,
+    /// then apply causal merge and revalidate the selection against the merged value.
+    pub async fn query_declared(&self, query: &crate::StoreQuery) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+        ensure_definitions::<T>()?;
+        let hydration =
+            crate::StoreQuery { all_sources_for_matches: true, include_replicas: true, suppress_self_origin: false, ..query.clone() };
+        let result = self.backend.store().query_raw(crate::ResourceKind::of::<T>(), &self.namespace, &hydration).await?;
+        let root = result.local_root.clone().ok_or_else(|| ResourceError::invalid("definition query has no authority root"))?;
+        let items: crate::ReadResourceList<T> = crate::convert_read_list(result.into_list())?;
+        let merged = merge_cached_definitions(items.items, &root)?;
+        let mut index = crate::QueryIndex::default();
+        for object in &merged {
+            index.update(
+                &object.metadata.name,
+                Some(&serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?),
+            );
+        }
+        let selected = index.names(query);
+        Ok(merged.into_iter().filter(|object| selected.contains(&object.metadata.name)).collect())
+    }
+
     pub async fn list(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
         if self.backend.serves_read_views() {

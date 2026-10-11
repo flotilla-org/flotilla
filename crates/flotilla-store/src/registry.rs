@@ -451,6 +451,7 @@ pub async fn query_resource_kind(
     let descriptor = declared_resource_kinds().into_iter().find(|kind| kind.paths.kind == registered.kind).expect("registered descriptor");
     let listed = backend.store().query_raw(descriptor, namespace, query).await?;
     let position = listed.position;
+    let local_root = listed.local_root;
     let items = listed.items;
     let items = items
         .iter()
@@ -463,6 +464,9 @@ pub async fn query_resource_kind(
         .collect::<Result<Vec<_>, ResourceError>>()?;
 
     let mut document = json!({"apiVersion": api_version(descriptor.paths), "kind": format!("{}List", descriptor.paths.kind), "metadata": {"resourceVersion":position.resource_version}, "items":items});
+    if let Some(root) = local_root {
+        document["metadata"]["localRoot"] = json!(root);
+    }
     if let Some(generation) = position.generation {
         document["metadata"]["generation"] = json!(generation);
     }

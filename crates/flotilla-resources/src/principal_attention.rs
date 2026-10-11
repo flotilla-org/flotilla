@@ -5,7 +5,15 @@ use serde::{Deserialize, Serialize};
 use crate::{resource::define_resource, status_patch::StatusPatch, ResourceError, SettlementClaimEvidence};
 
 define_resource!(Regard, "regards", RegardSpec, RegardStatus, RegardStatusPatch);
-define_resource!(Demand, "demands", DemandSpec, DemandStatus, DemandStatusPatch);
+define_resource!(
+    Demand,
+    "demands",
+    DemandSpec,
+    DemandStatus,
+    DemandStatusPatch,
+    replication = crate::ReplicationClass::None,
+    queryable = &["metadata.name", "spec.originating_work_ref.name"]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

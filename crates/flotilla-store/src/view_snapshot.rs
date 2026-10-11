@@ -116,7 +116,11 @@ impl Store for ViewSnapshot {
             observer.read(kind.paths.kind, items.len());
         }
         crate::sort_query_items(&mut items);
-        Ok(crate::QueryResult { items, position: ResourcePosition { resource_version: "0".into(), generation: None } })
+        Ok(crate::QueryResult {
+            local_root: self.root.clone(),
+            items,
+            position: ResourcePosition { resource_version: "0".into(), generation: None },
+        })
     }
     async fn query_messages_raw(
         &self,

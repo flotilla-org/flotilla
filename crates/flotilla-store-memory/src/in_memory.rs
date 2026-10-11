@@ -1247,8 +1247,42 @@ impl Store for InMemoryBackend {
         let key = Self::store_key(kind, namespace);
         let local = stores.get(&key);
         let mut items = Vec::new();
+        let mut hydration_names = local.map(|store| store.queries.names(query)).unwrap_or_default();
+        if query.all_sources_for_matches {
+            if let Some(durable) = &self.durable_replicas {
+                let mut selection = query.clone();
+                selection.replicas_only = true;
+                selection.any_of = Some(vec![
+                    crate::StoreQuery { all_sources_for_matches: false, ..query.clone() },
+                    crate::StoreQuery {
+                        field_values: BTreeMap::from([("metadata.name".into(), hydration_names.iter().cloned().collect())]),
+                        ..Default::default()
+                    },
+                ]);
+                selection.labels.clear();
+                selection.fields.clear();
+                selection.field_values.clear();
+                selection.present.clear();
+                selection.field_prefixes.clear();
+                selection.label_prefixes.clear();
+                selection.owner = None;
+                items = durable.store().query_raw(kind, namespace, &selection).await?.items;
+                hydration_names.extend(items.iter().map(|source| source.object.metadata.name.clone()));
+            } else {
+                let replicas = self.replicas.lock().await;
+                for ((_, partition_key), partition) in &replicas.partitions {
+                    if partition_key == &key {
+                        hydration_names.extend(partition.queries.names(query));
+                    }
+                }
+            }
+        }
         if let Some(store) = local.filter(|_| !query.replicas_only) {
-            let mut names = store.queries.names(query);
+            let mut names = if query.all_sources_for_matches {
+                hydration_names.intersection(&store.objects.keys().cloned().collect()).cloned().collect()
+            } else {
+                store.queries.names(query)
+            };
             if let Some(message) = &query.message {
                 let message_names = store.messages.names(message).into_iter().collect();
                 names = names.intersection(&message_names).cloned().collect();
@@ -1276,14 +1310,20 @@ impl Store for InMemoryBackend {
                     origin_root: self.local_root(),
                     local_names: local.map(|store| store.objects.keys().cloned().collect()).unwrap_or_default(),
                 }));
-                items.extend(durable.store().query_raw(kind, namespace, &replica_query).await?.items);
+                if !query.all_sources_for_matches {
+                    items.extend(durable.store().query_raw(kind, namespace, &replica_query).await?.items);
+                }
             } else {
                 let replicas = self.replicas.lock().await;
                 for ((origin, partition_key), partition) in &replicas.partitions {
                     if partition_key != &key {
                         continue;
                     }
-                    let mut names = partition.queries.names(query);
+                    let mut names = if query.all_sources_for_matches {
+                        hydration_names.intersection(&partition.objects.keys().cloned().collect()).cloned().collect()
+                    } else {
+                        partition.queries.names(query)
+                    };
                     if let Some(message) = &query.message {
                         let message_names = partition.messages.names(message).into_iter().collect();
                         names = names.intersection(&message_names).cloned().collect();
@@ -1320,6 +1360,7 @@ impl Store for InMemoryBackend {
         self.count_read(kind, items.len());
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult {
+            local_root: Some(self.local_root()),
             items,
             position: crate::ResourcePosition {
                 resource_version: local.map(|store| store.current_version()).unwrap_or_default().to_string(),

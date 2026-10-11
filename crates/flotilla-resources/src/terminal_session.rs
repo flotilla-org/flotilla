@@ -25,7 +25,17 @@ define_resource!(
     TerminalSessionStatus,
     TerminalSessionStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
-    queryable = &["metadata.name", "status.phase"]
+    queryable = &[
+        "metadata.name",
+        "status.phase",
+        "status.crew.id",
+        "status.completion_pending.authority",
+        "spec.role",
+        "spec.env_ref",
+        "spec.source.context.convoy",
+        "spec.source.context.vessel_ref",
+        "metadata.annotations.\"flotilla.work/role-address\""
+    ]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
