@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{arg::shell_quote, Leaf, LeafAddress, LeafOperator};
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     actor_obligation, select_convoy_children, Convoy, ConvoyAttention, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal,
     CrewCompletionRefusalCause, LeafMaker, NudgeObligation, ResourceObject, StallEvidenceSource, StallNudge, StallRung, StallSupervisor,
@@ -13,10 +14,7 @@ use flotilla_resources::{
 use super::sources::{change_request_sources, freshest_change_requests};
 use super::wake::ReconcilerWake;
 use super::{CrewTurnIntent, LeafWatcher, UnableEvidenceKey};
-use crate::{
-    in_process::convoy_message_address,
-    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
-};
+use crate::{in_process::convoy_message_address, providers::change_request::observation::ChangeRequestRef};
 
 pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
     format!("{project}/{convoy}/{vessel}/{role}")

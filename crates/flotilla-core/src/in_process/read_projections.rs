@@ -1,8 +1,5 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
-use flotilla_store::ProjectHierarchyStoreExt;
-
-use crate::providers::change_request::observation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
@@ -31,6 +28,7 @@ use flotilla_protocol::{
     HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
     ResourceRef, Subject, SubjectKind, ViewAddress,
 };
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
     expected_checkout_refs, repository_display_labels, ChangeRequestStatus, Checkout as ResourceCheckout, Clock, ConditionValue,
@@ -42,10 +40,12 @@ use flotilla_resources::{
     ROLE_LABEL, VESSEL_LABEL,
 };
 use flotilla_store::resolve_project_issue_sources;
+use flotilla_store::ProjectHierarchyStoreExt;
 use flotilla_store::{EventRecorder, ResourceBackend};
 use tracing::warn;
 
 use super::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+use crate::providers::change_request::observation;
 use crate::{
     checkout_integration::LANDING_EVIDENCE_TTL,
     config::ConfigStore,
@@ -60,7 +60,7 @@ use crate::{
         DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
         DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
     },
-    providers::{change_request::observation::ChangeRequestRef, forge::observation_error::ObservationError},
+    providers::change_request::observation::ChangeRequestRef,
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
 
@@ -1574,7 +1574,9 @@ async fn message_views(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, TimeZone};
+    use flotilla_discovery_api::EnvironmentBag;
     use flotilla_protocol::{qualified_path::HostId, EvidenceFreshness, HostSummary, IssueSource, NodeInfo, Relationship, SystemInfo};
+    use flotilla_provider_runtime::ProcessCommandRunner;
     use flotilla_resources::{
         ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyPhase, ConvoySpec, CrewWorkState, DeclaredSubject,
         DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InputMeta, Observation, ObservedChangeRequestState,
@@ -1591,8 +1593,6 @@ mod tests {
     use crate::event_sink::EventSink;
     use crate::event_sink::RecordingEventSink;
     use crate::providers::change_request::observation::GhChangeRequestObservationSource;
-    use flotilla_discovery_api::EnvironmentBag;
-    use flotilla_provider_runtime::ProcessCommandRunner;
 
     // #2498: every distinct stalled actor is visible across namespaces and replica stores.
     // Generate empty through multi-convoy fleets, duplicate leaves, all rungs, shared and distinct

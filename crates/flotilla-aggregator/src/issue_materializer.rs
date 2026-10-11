@@ -12,14 +12,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_core::{
-    aggregator_projection::AggregatorProjectionState,
-    event_sink::EventSink,
-    in_process::InProcessDaemon,
-    providers::{
-        forge::github::{core_rate_limit_reset, rate_limit_reset},
-        issue_tracker::IssueProvider,
-    },
+    aggregator_projection::AggregatorProjectionState, event_sink::EventSink, in_process::InProcessDaemon,
+    providers::issue_tracker::IssueProvider,
 };
+use flotilla_forge_github::github::{core_rate_limit_reset, rate_limit_reset};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     DaemonEvent, DemandBackedMetadata, IssueChangeset, IssueRef, IssueRow, IssueSource, IssueState, QueryId, QueryScope,
@@ -961,8 +957,8 @@ mod tests {
 
     use chrono::{Duration as ChronoDuration, Utc};
     use flotilla_core::event_sink::BroadcastEventSink;
-    use flotilla_core::providers::forge::github::GhApiClient;
     use flotilla_core::providers::issue_tracker::github::GitHubIssueProvider;
+    use flotilla_forge_github::github::GhApiClient;
     use flotilla_protocol::issue_query::IssueResultPage;
     use flotilla_protocol::issue_query::READY_ISSUE_LABEL;
     use flotilla_protocol::result_set::ConvoyIssueRow;

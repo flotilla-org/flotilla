@@ -145,7 +145,6 @@ use crate::providers::discovery::status::provider_names_from_registry;
 use crate::providers::discovery::DiscoveryResult;
 use crate::providers::discovery::DiscoveryRuntime;
 use crate::providers::environment::EnvironmentHandle;
-use crate::providers::forge::observation_error::ObservationError;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
 use crate::regard_lifecycle::RegardLifecycle;
@@ -172,6 +171,7 @@ use flotilla_provider_runtime::ssh_runner::SshCommandRunner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
+use flotilla_provider_runtime::ObservationError;
 use flotilla_vcs::providers::git_worktree::GitWorktreeStrategy;
 
 type ObservationScope = (String, String, String);
@@ -1398,7 +1398,7 @@ pub struct InProcessDaemon {
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
     issue_query_port: Arc<dyn IssueQueryPort>,
-    forge_budgets: crate::forge_budget::ForgeBudgets,
+    forge_budgets: flotilla_forge_github::forge_budget::ForgeBudgets,
     pub(crate) forge_demand_refresh: Mutex<()>,
     dispatch_board_cache: dispatch_board::DispatchBoardCache,
     /// VCS capabilities are selected once for each checkout in its execution environment.
@@ -1628,8 +1628,9 @@ impl InProcessDaemon {
         use crate::providers::discovery::DiscoveryResult;
 
         let mut discovery = discovery;
-        let forge_budgets = crate::forge_budget::ForgeBudgets::default();
-        discovery.runner = Arc::new(crate::forge_budget::BudgetedRunner { inner: discovery.runner, budgets: forge_budgets.clone() });
+        let forge_budgets = flotilla_forge_github::forge_budget::ForgeBudgets::default();
+        discovery.runner =
+            Arc::new(flotilla_forge_github::forge_budget::BudgetedRunner { inner: discovery.runner, budgets: forge_budgets.clone() });
         let discovery = Arc::new(discovery);
         let (event_tx, _) = broadcast::channel(256);
         let event_source = Arc::new(BroadcastEventSink::new(event_tx));

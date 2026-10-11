@@ -1,5 +1,3 @@
-use crate::providers::github_poll;
-use flotilla_provider_runtime::run_output;
 use std::{
     collections::HashMap,
     path::Path,
@@ -8,10 +6,12 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-
-use crate::providers::forge::observation_error::ObservationError;
+use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ObservationError;
+
+use crate::github_poll;
 
 const MAX_PER_PAGE: usize = 100;
 const MIN_REMAINING_BUDGET: u32 = 100;
@@ -21,7 +21,7 @@ fn is_issue_observation(endpoint: &str) -> bool {
     endpoint.starts_with("repos/") && endpoint.contains("/issues?")
 }
 
-pub(crate) fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+pub fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
     raw.lines().take_while(|line| !line.is_empty()).find_map(|line| {
         let (key, value) = line.split_once(':')?;
         key.eq_ignore_ascii_case(name).then_some(value.trim())
@@ -89,7 +89,7 @@ impl From<ObservationError> for GhApiFailure {
 }
 impl From<String> for GhApiFailure {
     fn from(error: String) -> Self {
-        ObservationError::Forge(error).into()
+        ObservationError::Failed(error).into()
     }
 }
 impl From<&str> for GhApiFailure {
@@ -144,7 +144,7 @@ fn parse_gh_api_response_with_headers(raw: &str) -> (GhApiResponse, HashMap<Stri
     (response, headers)
 }
 
-pub(crate) fn rate_limit_error_for(budget: &str, reset: &str) -> String {
+pub fn rate_limit_error_for(budget: &str, reset: &str) -> String {
     let reset = reset
         .parse::<i64>()
         .ok()
@@ -219,6 +219,35 @@ pub struct GithubRateLimit {
     pub retry_source: GithubRetrySource,
 }
 
+impl GithubRateLimit {
+    /// Keep GitHub diagnostics at the adapter boundary; consumers see a neutral failure.
+    /// The `kind=value,` and `retry_source=value,` fields are also the replay
+    /// provenance contract consumed by `from_observation_error`. Preserve their
+    /// spelling and delimiters; the round-trip and display tests pin this shape.
+    pub fn observation_error(&self, budget: String) -> ObservationError {
+        let detail = format!(
+            "github rate limited (budget={budget}, identity=host gh login, kind={}, retry_source={}, retry_at={})",
+            self.kind.as_str(),
+            self.retry_source,
+            self.retry_at.map(|at| at.to_rfc3339()).unwrap_or_else(|| "unavailable".into())
+        );
+        ObservationError::RateLimited { budget, retry_at: self.retry_at, detail }
+    }
+
+    /// Recover adapter-owned provenance for the existing replay metadata schema.
+    /// Runtime consumers use the neutral retry deadline, never these text fields.
+    pub fn from_observation_error(error: &ObservationError) -> Option<Self> {
+        let ObservationError::RateLimited { retry_at, detail, .. } = error else { return None };
+        let kind = match detail.split_once("kind=")?.1.split(',').next()? {
+            "primary" => GithubRateLimitKind::Primary,
+            "secondary" => GithubRateLimitKind::Secondary,
+            _ => return None,
+        };
+        let retry_source = detail.split_once("retry_source=")?.1.split(',').next()?.parse().ok()?;
+        Some(Self { kind, retry_at: *retry_at, retry_source })
+    }
+}
+
 /// Classify only error fields, never text in a successful response (for example
 /// a PR comment mentioning rate limits). Primary reset headers accompany ordinary
 /// errors too, and must not turn a secondary limit into an hourly suspension.
@@ -228,7 +257,7 @@ pub fn github_rate_limit(raw: &str, received_at: DateTime<Utc>) -> Option<Github
     github_rate_limit_from_document(raw, response.status, &document, received_at)
 }
 
-pub(crate) fn github_rate_limit_from_document(
+pub fn github_rate_limit_from_document(
     raw: &str,
     status: u16,
     document: &serde_json::Value,
@@ -290,7 +319,7 @@ pub(crate) fn github_rate_limit_from_document(
     Some(GithubRateLimit { kind, retry_at: Some(retry_at), retry_source })
 }
 
-pub(crate) fn rate_limit_error_from_response(raw: &str, budget: &str) -> Option<String> {
+pub fn rate_limit_error_from_response(raw: &str, budget: &str) -> Option<String> {
     rate_limit_error_from_response_at(raw, budget, Utc::now())
 }
 
@@ -311,7 +340,7 @@ fn rate_limit_error_from_response_at(raw: &str, budget: &str, received_at: DateT
 
 /// Reserve the last 100 GraphQL points for other users of the host identity.
 /// Use headers when present, with the requested rateLimit fields as fallback.
-pub(crate) fn low_graphql_budget(raw: &str, document: &serde_json::Value) -> Option<DateTime<Utc>> {
+pub fn low_graphql_budget(raw: &str, document: &serde_json::Value) -> Option<DateTime<Utc>> {
     let remaining = response_header(raw, "x-ratelimit-remaining")
         .and_then(|value| value.parse::<u64>().ok())
         .or_else(|| document["data"]["rateLimit"]["remaining"].as_u64())?;
@@ -353,7 +382,7 @@ pub trait GhApi: Send + Sync {
         repo_root: &Path,
         label: &ChannelLabel,
     ) -> Result<GhApiResponse, ObservationError> {
-        self.get_with_headers(endpoint, repo_root, label).await.map_err(ObservationError::Forge)
+        self.get_with_headers(endpoint, repo_root, label).await.map_err(ObservationError::Failed)
     }
     /// Recording seam retaining raw REST failures. Non-REST adapters have no response.
     async fn get_classified_response(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, GhApiFailure> {
@@ -488,11 +517,11 @@ impl GhApiClient {
                         let budget = response_header(&output.stdout, "x-ratelimit-resource")
                             .map(|resource| format!("REST {resource}"))
                             .unwrap_or_else(|| "REST core".into());
-                        ObservationError::RateLimited { budget, limit }
+                        limit.observation_error(budget)
                     })
-                    .unwrap_or_else(|| ObservationError::Forge(output.stderr.clone()))
+                    .unwrap_or_else(|| ObservationError::Failed(output.stderr.clone()))
             } else {
-                ObservationError::Forge(legacy_error.clone())
+                ObservationError::Failed(legacy_error.clone())
             };
             let response = (parsed.status != 0)
                 .then(|| Box::new(GhApiFailureResponse { status: parsed.status, headers, body: parsed.body, legacy_error }));
@@ -522,7 +551,7 @@ impl GhApiClient {
 }
 
 /// Preserve the classified retry contract when crossing replicated read errors.
-pub(crate) fn classified_rate_error(error: String) -> ObservationError {
+pub fn classified_rate_error(error: String) -> ObservationError {
     if let Some(retry_at) = rate_limit_reset(&error) {
         let budget = error
             .strip_prefix(RATE_LIMIT_PREFIX)
@@ -536,15 +565,73 @@ pub(crate) fn classified_rate_error(error: String) -> ObservationError {
             .and_then(|(_, value)| value.split(',').next())
             .and_then(|value| value.parse().ok())
             .unwrap_or(GithubRetrySource::RateLimitReset);
-        return ObservationError::RateLimited { budget, limit: GithubRateLimit { kind, retry_at: Some(retry_at), retry_source } };
+        return GithubRateLimit { kind, retry_at: Some(retry_at), retry_source }.observation_error(budget);
     }
-    ObservationError::Forge(error)
+    ObservationError::Failed(error)
 }
 
 #[cfg(test)]
 mod tests {
+    use flotilla_replay_testkit::testing::MockRunner;
+
     use super::*;
-    use crate::testkits::replay::testing::MockRunner;
+
+    // #3039: GitHub owns diagnostic provenance; every kind/source/deadline combination
+    // must survive conversion through the neutral error, including untimed limits.
+    // Finite generator: exhaust both kinds, all four sources, absent deadlines,
+    // the epoch and a modern deadline. Budget strings include empty and named quotas.
+    #[test]
+    fn rate_limit_provenance_round_trips_through_neutral_error() {
+        for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
+            for retry_source in [
+                GithubRetrySource::RateLimitReset,
+                GithubRetrySource::RetryAfter,
+                GithubRetrySource::SecondaryFallback,
+                GithubRetrySource::Unavailable,
+            ] {
+                for retry_at in [None, DateTime::from_timestamp(0, 0), DateTime::from_timestamp(1893456000, 0)] {
+                    for budget in ["", "GraphQL", "REST core"] {
+                        let limit = GithubRateLimit { kind, retry_at, retry_source };
+                        let error = limit.observation_error(budget.into());
+                        assert_eq!(GithubRateLimit::from_observation_error(&error), Some(limit));
+                        assert_eq!(error.retry_at(), retry_at);
+                        let ObservationError::RateLimited { budget: actual_budget, .. } = error else { panic!("classified limit") };
+                        assert_eq!(actual_budget, budget);
+                    }
+                }
+            }
+        }
+    }
+
+    // #3039: extraction preserves the exact externally visible GitHub diagnostic.
+    // Glue: fixed formatting contract, including the existing untimed-limit spelling.
+    #[test]
+    fn neutral_rate_limit_keeps_existing_display_text() {
+        let limit = GithubRateLimit {
+            kind: GithubRateLimitKind::Secondary,
+            retry_source: GithubRetrySource::RetryAfter,
+            retry_at: DateTime::from_timestamp(1893456000, 0),
+        };
+        assert_eq!(limit.observation_error("GraphQL".into()).to_string(),
+            "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at=2030-01-01T00:00:00+00:00)");
+        let untimed = GithubRateLimit { kind: GithubRateLimitKind::Primary, retry_source: GithubRetrySource::Unavailable, retry_at: None };
+        assert_eq!(
+            untimed.observation_error("REST core".into()).to_string(),
+            "github rate limited (budget=REST core, identity=host gh login, kind=primary, retry_source=unavailable, retry_at=unavailable)"
+        );
+    }
+
+    // Diagnostic conversion must reject unknown provenance rather than invent a primary limit.
+    #[test]
+    fn unknown_or_missing_provenance_is_rejected() {
+        assert_eq!(GithubRateLimit::from_observation_error(&ObservationError::Failed("failure".into())), None);
+        for detail in
+            ["kind=unknown, retry_source=retry-after,", "kind=primary, retry_source=unknown,", "kind=primary,", "retry_source=retry-after,"]
+        {
+            let error = ObservationError::RateLimited { budget: "quota".into(), retry_at: None, detail: detail.into() };
+            assert_eq!(GithubRateLimit::from_observation_error(&error), None);
+        }
+    }
 
     #[test]
     fn parse_200_response_extracts_etag_and_body() {

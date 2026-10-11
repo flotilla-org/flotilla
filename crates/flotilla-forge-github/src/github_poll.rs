@@ -5,15 +5,15 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_provider_runtime::gh_api_channel_label;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use super::forge::github::GhApi;
-use flotilla_provider_runtime::gh_api_channel_label;
+use crate::github::GhApi;
 
-pub(super) fn persist(path: &Path, value: &impl Serialize) -> Result<(), String> {
+pub fn persist(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().ok_or("poll cache has no parent")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     use std::{
@@ -44,7 +44,7 @@ pub(super) fn persist(path: &Path, value: &impl Serialize) -> Result<(), String>
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(super) struct Collection {
+pub struct Collection {
     pub cursor: Option<String>,
     pub revisions: BTreeMap<String, String>,
     pub details: BTreeMap<String, Value>,
@@ -130,7 +130,7 @@ impl Collection {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, bon::Builder)]
-pub(super) struct BoardState {
+pub struct BoardState {
     // Added for #2928. Previous-generation forge-cache records lack these fields.
     // Defaults may be retired one roll after #2928, once caches are rewritten (ADR 0047).
     #[serde(default)]
@@ -146,12 +146,12 @@ pub(super) struct BoardState {
 /// An inventory is durable before detail work begins. Cursors may advance as
 /// batches commit because the remaining revisions are retained here atomically.
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(super) struct PendingBoard {
+pub struct PendingBoard {
     pub issues: Vec<Value>,
     pub pulls: Vec<Value>,
 }
 
-pub(super) struct PollCache {
+pub struct PollCache {
     directory: Option<PathBuf>,
     pub state: Arc<Mutex<BTreeMap<String, BoardState>>>,
 }
@@ -191,13 +191,13 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex as StdMutex};
 
     use async_trait::async_trait;
-
-    use super::*;
-    use crate::providers::forge::github::GhApiClient;
-    use crate::testkits::replay::testing::MockRunner;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandOutput;
     use flotilla_provider_runtime::CommandRunner;
+    use flotilla_replay_testkit::testing::MockRunner;
+
+    use super::*;
+    use crate::github::GhApiClient;
 
     // Stand-in at the gh/HTTP boundary: refuse requests with an incorrect
     // route, ordering, cursor or conditional header instead of accepting any argv.

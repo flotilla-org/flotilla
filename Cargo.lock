@@ -1103,6 +1103,7 @@ dependencies = [
  "flotilla-build-features-types",
  "flotilla-core",
  "flotilla-daemon-api",
+ "flotilla-forge-github",
  "flotilla-protocol",
  "flotilla-protocol-testkit",
  "flotilla-provider-runtime",
@@ -1541,6 +1542,7 @@ dependencies = [
  "flotilla-daemon-api",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",
+ "flotilla-forge-github",
  "flotilla-manifest",
  "flotilla-paths",
  "flotilla-protocol",
@@ -1785,6 +1787,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-forge-github"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "hegeltest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+]
+
+[[package]]
 name = "flotilla-manifest"
 version = "0.1.0"
 dependencies = [
@@ -1891,6 +1922,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1958,7 +1990,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flotilla-build-features-logging",
- "flotilla-core",
+ "flotilla-forge-github",
  "flotilla-paths",
  "flotilla-provider-runtime",
  "flotilla-tls",
@@ -1972,6 +2004,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "url",

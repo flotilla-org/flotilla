@@ -1,10 +1,9 @@
 //! Convoy admission state and transaction boundary.
 
-use flotilla_vcs::providers::detection::remote_assertion;
-
 use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_vcs::providers::detection::remote_assertion;
 
 use super::*;
 use crate::{
@@ -281,7 +280,7 @@ impl ConvoyAdmission {
         let (candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
         let mut failures = setup_failures
             .into_iter()
-            .map(|error| AdmissionLookupFailure { context: None, error: ObservationError::Forge(error) })
+            .map(|error| AdmissionLookupFailure { context: None, error: ObservationError::Failed(error) })
             .collect::<Vec<_>>();
         let consulted = candidates.iter().map(|(_, scope, _)| scope.clone()).collect::<Vec<_>>();
 
@@ -294,7 +293,7 @@ impl ConvoyAdmission {
                         if let Err(error) = require_open_continuation(&admission.change_request.status, &admission.id) {
                             failures.push(AdmissionLookupFailure {
                                 context: Some(format!("repository {scope}")),
-                                error: ObservationError::Forge(error),
+                                error: ObservationError::Failed(error),
                             });
                             continue;
                         }
@@ -302,7 +301,7 @@ impl ConvoyAdmission {
                     let Some(base_ref) = admission.base_ref else {
                         failures.push(AdmissionLookupFailure {
                             context: Some(format!("repository {scope}")),
-                            error: ObservationError::Forge(format!("change request {} did not report a base ref", admission.id)),
+                            error: ObservationError::Failed(format!("change request {} did not report a base ref", admission.id)),
                         });
                         continue;
                     };
@@ -419,7 +418,7 @@ impl ConvoyAdmission {
             let repository = match repositories.get(&repository_key.to_string()).await {
                 Ok(repository) => repository,
                 Err(error) => {
-                    failures.push(ObservationError::Forge(error.to_string()));
+                    failures.push(ObservationError::Failed(error.to_string()));
                     continue;
                 }
             };
@@ -427,7 +426,7 @@ impl ConvoyAdmission {
             let address = match change_request_address(remote, id) {
                 Ok(address) => address,
                 Err(error) => {
-                    failures.push(ObservationError::Forge(error));
+                    failures.push(ObservationError::Failed(error));
                     continue;
                 }
             };
@@ -477,7 +476,7 @@ impl ConvoyAdmission {
             let result = if binding.is_some_and(|binding| binding.repository_ref == *key) {
                 // The admitted ID remains authoritative for this repository;
                 // reuse its lookup for discovery just as for the primary row.
-                bound.as_ref().expect("binding has a lookup").clone().map_err(ObservationError::Forge)
+                bound.as_ref().expect("binding has a lookup").clone().map_err(ObservationError::Failed)
             } else {
                 let (candidates, setup_failures) = self.repository_change_request_candidates(std::slice::from_ref(key)).await;
                 if let Some((repository, _, provider)) = candidates.into_iter().next() {
@@ -487,7 +486,7 @@ impl ConvoyAdmission {
                 } else {
                     // Setup reports repository-read, forge-identity, or provider-discovery
                     // failures. The generic text defends against an empty diagnostic set.
-                    Err(ObservationError::Forge(setup_failures.into_iter().next().unwrap_or_else(|| "no repository provider".into())))
+                    Err(ObservationError::Failed(setup_failures.into_iter().next().unwrap_or_else(|| "no repository provider".into())))
                 }
             };
             match &result {

@@ -1,19 +1,20 @@
 //! Change-request observation interface and GitHub observation decoding.
-use crate::providers::forge::observation_error::ObservationError;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::LeafAddress;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ObservationError;
 use flotilla_relay_protocol::Subject;
 use flotilla_resources::{
     change_request_record_name, ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState,
     ObservedChecks, ObservedMergeability, ObservedReviewDecision,
-};
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
 };
 
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
@@ -84,7 +85,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             &["pr", "view", &number, "--repo", &subject.scope, "--json", "state,headRefOid,statusCheckRollup,reviewDecision,mergeable",],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Forge)
+        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Failed)
     }
 
     async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
@@ -106,7 +107,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             ],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Forge)
+        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Failed)
     }
 }
 

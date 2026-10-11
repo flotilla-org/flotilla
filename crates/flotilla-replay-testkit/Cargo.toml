@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# Replay already uses toml_edit through toml; align its default feature with workspace tests.
+toml_edit = "0.22"
+flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-tls = { path = "../flotilla-tls" }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
@@ -21,7 +24,6 @@ bytes = { workspace = true }
 serde_yml = "0.0.12"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-flotilla-core = { path = "../flotilla-core" }
 
 [lints]
 workspace = true

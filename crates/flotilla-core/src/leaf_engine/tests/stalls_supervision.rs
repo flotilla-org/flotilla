@@ -1,6 +1,7 @@
+use flotilla_store_memory::InMemoryBackend;
+
 use super::*;
 use crate::providers::change_request::observation;
-use flotilla_store_memory::InMemoryBackend;
 
 // #2560: the inactivity bound follows the newest tool/hook evidence, not
 // total turn age or refreshed screen timestamps. Generated ages straddle
@@ -1332,13 +1333,10 @@ async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let now = Utc::now();
     let retry_at = now + chrono::Duration::seconds(60);
-    let error = ObservationError::RateLimited {
-        budget: "GraphQL".into(),
-        limit: GithubRateLimit {
-            kind: GithubRateLimitKind::Secondary,
-            retry_source: GithubRetrySource::RetryAfter,
-            retry_at: Some(retry_at),
-        },
+    let error = {
+        let limit =
+            GithubRateLimit { kind: GithubRateLimitKind::Secondary, retry_source: GithubRetrySource::RetryAfter, retry_at: Some(retry_at) };
+        limit.observation_error("GraphQL".into())
     };
     let refresher = ChangeRequestRefresher::new(
         "fleet".into(),

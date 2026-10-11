@@ -2,6 +2,11 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_provider_runtime::http_execute;
+use flotilla_provider_runtime::run;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::HttpClient;
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedReviewDecision,
 };
@@ -10,13 +15,8 @@ use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
 use crate::providers::forge::forgejo::ForgejoClient;
 use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
-use crate::providers::forge::observation_error::ObservationError;
 use crate::providers::types::ChangeRequest;
 use crate::providers::types::ChangeRequestStatus;
-use flotilla_provider_runtime::http_execute;
-use flotilla_provider_runtime::run;
-use flotilla_provider_runtime::CommandRunner;
-use flotilla_provider_runtime::HttpClient;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,
@@ -333,13 +333,14 @@ mod tests {
         },
     };
 
+    use flotilla_provider_runtime::ChannelLabel;
+
     use super::*;
     use crate::providers::forge::forgejo::ForgejoAuth;
     use crate::testkits::replay;
     use crate::testkits::replay::testing::fixture_path;
     use crate::testkits::replay::testing::MockRunner;
     use crate::testkits::replay::Masks;
-    use flotilla_provider_runtime::ChannelLabel;
 
     // Boundary double: Forgejo HTTP requests, including the body update.
     struct LinkHttp {

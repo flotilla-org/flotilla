@@ -10,22 +10,22 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use flotilla_core::providers::forge::github::github_rate_limit;
-use flotilla_core::providers::forge::github::rate_limit_error;
-use flotilla_core::providers::forge::github::rate_limit_reset;
-use flotilla_core::providers::forge::github::GhApi;
-use flotilla_core::providers::forge::github::GhApiFailure;
-use flotilla_core::providers::forge::github::GhApiFailureResponse;
-use flotilla_core::providers::forge::github::GhApiResponse;
-use flotilla_core::providers::forge::github::GithubRateLimit;
-use flotilla_core::providers::forge::github::GithubRateLimitKind;
-use flotilla_core::providers::forge::observation_error::ObservationError;
+use flotilla_forge_github::github::github_rate_limit;
+use flotilla_forge_github::github::rate_limit_error;
+use flotilla_forge_github::github::rate_limit_reset;
+use flotilla_forge_github::github::GhApi;
+use flotilla_forge_github::github::GhApiFailure;
+use flotilla_forge_github::github::GhApiFailureResponse;
+use flotilla_forge_github::github::GhApiResponse;
+use flotilla_forge_github::github::GithubRateLimit;
+use flotilla_forge_github::github::GithubRateLimitKind;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::ChannelLabeler;
 use flotilla_provider_runtime::ChannelRequest;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::DefaultLabeler;
+use flotilla_provider_runtime::ObservationError;
 
 /// A single recorded interaction with an external system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,7 +584,8 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
     format!("HTTP {status}: {body}")
 }
 
-// Classified recordings store explicit metadata, never classify Display text.
+// Classified recordings retain explicit metadata; GitHub owns the diagnostic
+// provenance conversion at the adapter boundary. Replay never infers deadlines.
 // The observation-* recording schema is reserved and separate from actual REST
 // headers: discard raw headers in this namespace before adding these keys.
 // - observation-error-kind: forge, primary or secondary classification;
@@ -598,20 +599,20 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
 fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> ObservationError {
     if let Some(kind) = headers.get("observation-error-kind") {
         let kind = match kind.as_str() {
-            "forge" => return ObservationError::Forge(headers.get("observation-diagnostic").cloned().unwrap_or_else(|| body.to_string())),
+            "forge" => return ObservationError::Failed(headers.get("observation-diagnostic").cloned().unwrap_or_else(|| body.to_string())),
             "primary" => GithubRateLimitKind::Primary,
             "secondary" => GithubRateLimitKind::Secondary,
             other => panic!("unknown recorded observation error kind: {other}"),
         };
         let retry_source =
             headers.get("observation-retry-source").expect("recorded retry source").parse().expect("known recorded retry source");
-        return ObservationError::RateLimited {
-            budget: headers.get("observation-budget").expect("recorded budget").clone(),
-            limit: GithubRateLimit {
+        return {
+            let limit = GithubRateLimit {
                 kind,
                 retry_source,
                 retry_at: headers.get("observation-retry-at").map(|at| at.parse().expect("recorded retry deadline")),
-            },
+            };
+            limit.observation_error(headers.get("observation-budget").expect("recorded budget").clone())
         };
     }
     let raw =
@@ -621,9 +622,9 @@ fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String,
             .iter()
             .find_map(|(name, value)| name.eq_ignore_ascii_case("x-ratelimit-resource").then(|| format!("REST {value}")))
             .unwrap_or_else(|| "REST core".into());
-        return ObservationError::RateLimited { budget, limit };
+        return limit.observation_error(budget);
     }
-    ObservationError::Forge(replay_gh_error(status, body, headers))
+    ObservationError::Failed(replay_gh_error(status, body, headers))
 }
 
 fn recorded_gh_error(error: &str) -> (u16, HashMap<String, String>) {
@@ -1084,10 +1085,11 @@ impl GhApi for RecordingGhApi {
                 }
                 headers.insert("observation-diagnostic".into(), error.to_string());
                 match error {
-                    ObservationError::Forge(_) => {
+                    ObservationError::Failed(_) => {
                         headers.insert("observation-error-kind".into(), "forge".into());
                     }
-                    ObservationError::RateLimited { budget, limit } => {
+                    ObservationError::RateLimited { budget, .. } => {
+                        let limit = GithubRateLimit::from_observation_error(error).expect("GitHub rate-limit provenance");
                         headers.insert("observation-error-kind".into(), limit.kind.as_str().into());
                         headers.insert("observation-budget".into(), budget.clone());
                         headers.insert("observation-retry-source".into(), limit.retry_source.as_str().into());
@@ -1122,12 +1124,12 @@ pub fn test_gh_api(session: &Session) -> Arc<dyn GhApi> {
             // RecordingRunner.  GhApiClient shells out via its runner, so using a
             // RecordingRunner here would double-record (once as Command, once as GhApi).
             let raw_runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
-            let real_api = Arc::new(flotilla_core::providers::forge::github::GhApiClient::new(raw_runner));
+            let real_api = Arc::new(flotilla_forge_github::github::GhApiClient::new(raw_runner));
             Arc::new(RecordingGhApi::new(session.clone(), real_api))
         }
         Session::Passthrough => {
             let raw_runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
-            Arc::new(flotilla_core::providers::forge::github::GhApiClient::new(raw_runner))
+            Arc::new(flotilla_forge_github::github::GhApiClient::new(raw_runner))
         }
         Session::Replaying(_) => Arc::new(ReplayGhApi::new(session.clone())),
     }

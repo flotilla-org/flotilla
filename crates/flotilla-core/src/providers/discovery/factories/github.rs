@@ -11,6 +11,10 @@ use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
+use flotilla_forge_github::github::GhApiClient;
+use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::CommandRunner;
+use flotilla_provider_runtime::ReqwestHttpClient;
 use flotilla_resources::ForgeKind;
 
 use crate::providers::change_request::forgejo::ForgejoChangeRequestProvider;
@@ -19,13 +23,9 @@ use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::discovery::FORGEJO_AUTH_PROVIDER;
 use crate::providers::forge::forgejo::ForgejoAuth;
 use crate::providers::forge::forgejo::ForgejoIssueProviderConfig;
-use crate::providers::forge::github::GhApiClient;
 use crate::providers::issue_tracker::forgejo::ForgejoIssueProvider;
 use crate::providers::issue_tracker::github::GitHubIssueProvider;
 use crate::providers::issue_tracker::IssueProvider;
-use flotilla_paths::path_context::ExecutionEnvironmentPath;
-use flotilla_provider_runtime::CommandRunner;
-use flotilla_provider_runtime::ReqwestHttpClient;
 
 pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<UnmetRequirement>> {
     let mut unmet = vec![];
@@ -302,9 +302,15 @@ fn config_path(config_parent: &std::path::Path, path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_discovery_api::provider_config::ProviderConfig;
     use std::{collections::BTreeSet, sync::Arc};
 
+    use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
+    use flotilla_discovery_api::provider_config::ProviderConfig;
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_discovery_api::Factory;
+    use flotilla_discovery_api::UnmetRequirement;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_protocol::{IssueRef, IssueSource};
     use flotilla_resources::{ForgeKind, ForgeSpec};
 
@@ -314,12 +320,6 @@ mod tests {
     };
     use crate::config::ConfigStore;
     use crate::testkits::discovery::DiscoveryMockRunner;
-    use flotilla_discovery_api::provider_config::ForgejoIssueTrackerConfig;
-    use flotilla_discovery_api::EnvironmentAssertion;
-    use flotilla_discovery_api::EnvironmentBag;
-    use flotilla_discovery_api::Factory;
-    use flotilla_discovery_api::UnmetRequirement;
-    use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {
         EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")).with(EnvironmentAssertion::remote_host(

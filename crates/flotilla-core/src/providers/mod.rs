@@ -1,8 +1,6 @@
 pub mod change_request;
 pub mod discovery;
 pub mod environment;
-pub(crate) mod github_observation;
-pub(crate) mod github_poll;
 pub mod issue_tracker;
 pub mod registry;
 pub mod types;
@@ -11,9 +9,10 @@ pub mod types;
 pub(crate) mod github_test_support {
     use std::{path::PathBuf, sync::Arc};
 
-    use crate::providers::forge::github::GhApi;
-    use crate::testkits::replay;
+    use flotilla_forge_github::github::GhApi;
     use flotilla_provider_runtime::CommandRunner;
+
+    use crate::testkits::replay;
 
     pub fn repo_root_for_recording() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

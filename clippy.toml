@@ -36,6 +36,7 @@ absolute-paths-allowed-crates = [
     "flotilla_daemon_api",
     "flotilla_daemon_testkit",
     "flotilla_discovery_testkit",
+    "flotilla_forge_github",
     "flotilla_manifest",
     "flotilla_orchestration_testkit",
     "flotilla_paths",
