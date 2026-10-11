@@ -10,8 +10,8 @@ use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
 
-use crate::providers::coding_agent::codex::CodexCodingAgent;
-use crate::providers::coding_agent::CloudAgentService;
+use crate::codex::CodexCodingAgent;
+use crate::CloudAgentService;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ReqwestHttpClient;
@@ -55,8 +55,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::CodexCodingAgentFactory;
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testing::DiscoveryMockRunner;
+    use crate::testing::TestConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
@@ -71,7 +71,7 @@ mod tests {
     async fn codex_factory_succeeds_with_auth() {
         let bag = bag_with_codex_auth();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::new(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = CodexCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
@@ -81,7 +81,7 @@ mod tests {
     async fn codex_factory_fails_without_auth() {
         let bag = EnvironmentBag::new();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
-        let config = ConfigStore::with_base(dir.path());
+        let config = TestConfig::new(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = CodexCodingAgentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without codex auth");

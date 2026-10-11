@@ -26,6 +26,7 @@ sha2 = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-store-memory = { path = "../flotilla-store-memory" }

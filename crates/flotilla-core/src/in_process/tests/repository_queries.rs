@@ -113,7 +113,7 @@ async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
 
 #[tokio::test]
 async fn cli_lists_include_active_provider_sessions() {
-    use crate::providers::{coding_agent::CloudAgentService, types::RepoCriteria};
+    use flotilla_cloud_agent::{CloudAgentService, RepoCriteria};
 
     struct Sessions;
     struct BrokenSessions;

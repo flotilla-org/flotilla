@@ -134,6 +134,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
 | `flotilla-provider-runtime` | Command and HTTP runners, invocation macros, environment variables, shared scans and bounded host probes |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
+| `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
@@ -211,7 +212,7 @@ Provider traits live in their type crates as they are extracted, with remaining 
 - **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
 - **ChangeRequestTracker** (`crates/flotilla-core/src/providers/change_request/github.rs`)
 - **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
-- **CloudAgentService** (`crates/flotilla-core/src/providers/coding_agent/claude.rs`, `crates/flotilla-core/src/providers/coding_agent/codex.rs`, `crates/flotilla-core/src/providers/coding_agent/cursor.rs`)
+- **CloudAgentService** (`crates/flotilla-cloud-agent/src/claude.rs`, `crates/flotilla-cloud-agent/src/codex.rs`, `crates/flotilla-cloud-agent/src/cursor.rs`)
 - **AiUtility** (`crates/flotilla-core/src/providers/ai_utility/claude_api.rs`, `crates/flotilla-core/src/providers/ai_utility/claude_cli.rs`)
 - **TerminalPool** (`crates/flotilla-terminal/src/cleat.rs`, `crates/flotilla-terminal/src/passthrough.rs`)
 

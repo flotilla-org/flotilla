@@ -50,7 +50,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::testkits::discovery::{DiscoveryMockRunner, TestEnvVars};
+    use crate::testing::{DiscoveryMockRunner, TestEnvVars};
 
     #[tokio::test]
     async fn codex_auth_detector_found_via_codex_home() {

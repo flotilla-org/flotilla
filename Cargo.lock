@@ -1377,6 +1377,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-cloud-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-http-server",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-discovery-api",
+ "flotilla-discovery-testkit",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-replay-testkit",
+ "flotilla-tls",
+ "http",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "flotilla-commands"
 version = "0.1.0"
 dependencies = [
@@ -1414,6 +1448,7 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-cloud-agent",
  "flotilla-core",
  "flotilla-daemon-api",
  "flotilla-discovery-api",
@@ -1470,6 +1505,7 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-cloud-agent",
  "flotilla-daemon-api",
  "flotilla-discovery-api",
  "flotilla-discovery-testkit",

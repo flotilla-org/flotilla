@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::HostDetector;
 
-use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
-use crate::providers::discovery::detectors::generic::resolve_binary_path;
+use super::helpers::parse_first_dotted_version;
+use super::helpers::resolve_binary_path;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
@@ -49,8 +49,8 @@ impl HostDetector for ClaudeDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::testkits::discovery::TestEnvVars;
+    use crate::testing::DiscoveryMockRunner;
+    use crate::testing::TestEnvVars;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     #[tokio::test]

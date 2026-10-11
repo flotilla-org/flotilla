@@ -1,6 +1,5 @@
+use flotilla_cloud_agent::factories::{claude::ClaudeCodingAgentFactory, codex::CodexCodingAgentFactory, cursor::CursorCodingAgentFactory};
 pub mod claude;
-pub mod codex;
-pub mod cursor;
 pub mod docker;
 pub mod github;
 pub mod host_direct;
@@ -22,11 +21,7 @@ impl FactoryRegistry {
             vcs: vcs_factories(),
             change_requests: vec![Box::new(github::GitHubChangeRequestFactory), Box::new(github::ForgejoChangeRequestFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
-            cloud_agents: vec![
-                Box::new(claude::ClaudeCodingAgentFactory),
-                Box::new(cursor::CursorCodingAgentFactory),
-                Box::new(codex::CodexCodingAgentFactory),
-            ],
+            cloud_agents: vec![Box::new(ClaudeCodingAgentFactory), Box::new(CursorCodingAgentFactory), Box::new(CodexCodingAgentFactory)],
             ai_utilities: vec![Box::new(claude::ClaudeApiAiUtilityFactory), Box::new(claude::ClaudeCliAiUtilityFactory)],
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory), Box::new(host_direct::HostDirectEnvironmentFactory)],

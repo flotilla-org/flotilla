@@ -1,3 +1,4 @@
+use flotilla_cloud_agent::CloudAgentService;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_terminal::TerminalPool;
 use flotilla_vcs::vcs::Vcs;
@@ -11,7 +12,6 @@ use crate::{
     providers::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
-        coding_agent::CloudAgentService,
         environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
     },

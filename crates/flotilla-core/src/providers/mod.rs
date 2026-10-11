@@ -1,6 +1,5 @@
 pub mod ai_utility;
 pub mod change_request;
-pub mod coding_agent;
 pub mod discovery;
 pub mod environment;
 pub(crate) mod github_observation;

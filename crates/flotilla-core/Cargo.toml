@@ -7,11 +7,12 @@ license.workspace = true
 [features]
 default = []
 aws-lc-provider = ["flotilla-tls/aws-lc-provider"]
-skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests"]
+skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests", "flotilla-cloud-agent/skip-no-sandbox-tests"]
 
 [dependencies]
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
+flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
