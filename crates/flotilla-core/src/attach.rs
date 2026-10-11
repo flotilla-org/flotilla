@@ -1148,7 +1148,7 @@ mod tests {
     async fn attach_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"attach-test\"\n").expect("daemon config");
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_read_counts();
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let daemon = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(temp.path())),
@@ -1479,10 +1479,21 @@ mod tests {
                         .await
                         .expect("noise message");
                 }
-                let calls = backend.read_calls();
-                let objects = backend.read_counts();
-                let resolved =
-                    daemon.attach_resolver().resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
+                // Count this resolver's real store collaborators. Daemon startup,
+                // projection materialization and provider-retirement tasks share
+                // the same data but retain separate, uncounted backend handles.
+                let request_backend = backend.clone().with_read_counts();
+                let mut resolver = daemon.attach_resolver();
+                let request_observations = resolver.observed_resource_backend.clone().with_read_counts();
+                resolver.resource_backend = &request_backend;
+                resolver.observed_resource_backend = &request_observations;
+                // A read through the daemon handle must not leak into the
+                // request observer, even when it reads the same resource kind.
+                backend.using::<ResourceConvoy>("flotilla").get("convoy-main").await.expect("daemon read");
+                assert!(request_backend.read_calls().is_empty());
+                let calls = request_backend.read_calls();
+                let objects = request_backend.read_counts();
+                let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
                 let binding = resolved.binding.expect("binding");
                 assert_eq!(binding.session.as_deref(), Some("terminal-main"));
                 assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
@@ -1496,7 +1507,7 @@ mod tests {
                         .filter(|(_, count)| *count != 0)
                         .collect::<BTreeMap<_, _>>()
                 };
-                let reads = delta(calls, backend.read_calls());
+                let reads = delta(calls, request_backend.read_calls());
                 if reference.starts_with("terminal-") {
                     // Direct session references select no Convoy candidates. One
                     // exact parent get restores phase without a namespace read.
@@ -1505,9 +1516,13 @@ mod tests {
                     assert_eq!(reads.get("Convoy"), Some(&1));
                 }
                 assert_eq!(reads.get("TerminalSession"), Some(&1));
-                let decoded = delta(objects, backend.read_counts());
+                let decoded = delta(objects, request_backend.read_counts());
                 assert_eq!(decoded.get("Convoy"), Some(&1));
-                samples.push((reads, decoded));
+                let observed_reads = request_observations.read_calls();
+                let observed_decoded = request_observations.read_counts();
+                assert_eq!(observed_reads.get("TerminalSession"), Some(&1));
+                assert_eq!(observed_decoded.get("TerminalSession"), Some(&0));
+                samples.push((reads, decoded, observed_reads, observed_decoded));
             }
             assert_eq!(samples[0], samples[1], "{reference}");
         }
