@@ -278,7 +278,19 @@ impl ReconcilerWake {
         .map_err(|error| error.to_string())?;
         let rows = self.subscriptions.rows().await;
         self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
+        let current_versions = available_convoys
+            .items
+            .iter()
+            .filter(|current| current.provenance == flotilla_resources::ResourceProvenance::Local)
+            .map(|current| (&current.object.metadata.name, &current.object.metadata.resource_version))
+            .collect::<HashMap<_, _>>();
         for convoy in convoys.values().map(ConvoyRead::convoy) {
+            // Rows belong to the caller's convoy revision. A judge tick can win
+            // the select before its convoy-watch wake; do not publish a new
+            // episode from that stale revision. The watch will rebuild the rows.
+            if current_versions.get(&convoy.metadata.name).copied() != Some(&convoy.metadata.resource_version) {
+                continue;
+            }
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, sessions);
             self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;

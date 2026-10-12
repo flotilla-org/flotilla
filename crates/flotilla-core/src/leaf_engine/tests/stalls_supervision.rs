@@ -1183,6 +1183,10 @@ async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_
     }
     .apply(&mut status);
     terminal.update_status(&created.metadata.name, &running.metadata.resource_version, &status).await.expect("lost");
+    // The first judgement persisted hook health and obligations. Refresh the
+    // outer convoy snapshot as its watch handler does before judging new evidence.
+    let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("current convoy");
+    let objects = HashMap::from([("delivery".into(), convoy)]);
     wake.judge_stalls("flotilla", &objects).await.expect("judge dead session");
     let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
     let stalled = stalled.expect("dead actor must stall");
@@ -1464,4 +1468,105 @@ async fn leaf_engine_steady_state_lists_no_kind() {
         wake.subscriptions.reconcile_stalls_once("flotilla").await.expect("steady state pass");
     }
     counted.read_snapshot().since(&bootstrap).assert_no_lists("leaf engine reconcile passes");
+}
+
+// #3118: one declared stall episode yields one receiver-homed Message even
+// when the crew repeats its report and the judge restarts between passes.
+async fn stall_message_scenario(repeat_report: bool, restart: bool) {
+    use flotilla_resources::{Message, MessageSpec, StallReason};
+    struct InboxDelivery(flotilla_store::MessageInbox);
+    // Boundary stand-in for turn delivery; persist through the real Message inbox.
+    #[async_trait]
+    impl TurnDeliveryActuator for InboxDelivery {
+        async fn deliver(&self, request: &CrewTurnIntent) -> Result<CrewTurnAdmission, String> {
+            let receiver =
+                request.receiver.clone().unwrap_or_else(|| format!("wheelhouse/{}/{}/{}", request.convoy, request.vessel, request.role,));
+            let name = flotilla_resources::message_record_name(
+                &receiver,
+                &request.sender,
+                &turn_message_producer_key(&request.source, &request.subject_revision),
+            );
+            let spec = MessageSpec::builder()
+                .sender(request.sender.clone())
+                .receiver(receiver)
+                .body(request.brief.clone())
+                .relation(request.relation)
+                .references(request.references.clone())
+                .expectation(request.expectation.clone())
+                .build();
+            let admission =
+                self.0.accept(&InputMeta::builder().name(name).build(), &spec, Utc::now()).await.map_err(|error| error.to_string())?;
+            let object = match admission {
+                flotilla_store::MessageAdmission::Accepted(object) => object,
+                flotilla_store::MessageAdmission::Suppressed { predecessor } => predecessor,
+            };
+            Ok(CrewTurnAdmission {
+                new_turn: true,
+                rung: TurnDeliveryRung::WarmSession,
+                message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", object.metadata.name),
+            })
+        }
+        async fn hold(&self, _: &CrewTurnIntent, _: &HoldAct, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let (backend, _, _) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    let delivery = Arc::new(InboxDelivery(flotilla_store::MessageInbox::new(backend.clone(), "flotilla")));
+    let convoys = backend.using::<Convoy>("flotilla");
+    let now = Utc::now();
+    let stale_objects: HashMap<_, _> =
+        convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+    let mut wake = supervision_wake(&backend);
+    for step in 0..3 {
+        if repeat_report {
+            flotilla_store::apply_status_patch(
+                &convoys,
+                "stalled-work",
+                &flotilla_resources::external_patches::mark_crew_stalled(
+                    "stalled-work".into(),
+                    "work".into(),
+                    "coder".into(),
+                    now + chrono::Duration::seconds(step),
+                    StallReason::Scope,
+                    None,
+                    "needs decision".into(),
+                ),
+            )
+            .await
+            .expect("report stall");
+        }
+        if restart {
+            wake = supervision_wake(&backend);
+        }
+        wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+        let objects = if repeat_report {
+            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect()
+        } else {
+            stale_objects.clone()
+        };
+        wake.sync_rows("flotilla", &objects).await.expect("rows");
+        wake.judge_stalls_at("flotilla", &objects, now + chrono::Duration::seconds(step)).await.expect("judge");
+        let messages = backend.using::<Message>("flotilla").list().await.expect("inbox").items;
+        assert_eq!(messages.len(), 1, "one episode must not create a burst of copies");
+    }
+    // Catching up the outer watch rebuilds rows and continues judging normally.
+    let current = convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+    wake.sync_rows("flotilla", &current).await.expect("current rows");
+    wake.judge_stalls_at("flotilla", &current, now + chrono::Duration::seconds(4)).await.expect("current judge");
+    assert_eq!(backend.using::<Message>("flotilla").list().await.expect("inbox").items.len(), 1);
+}
+
+#[tokio::test]
+async fn repeated_stall_reports_publish_one_supervisor_message() {
+    for restart in [false, true] {
+        stall_message_scenario(true, restart).await;
+    }
+}
+
+// A delayed convoy watch must not recreate an inferred episode at each tick.
+#[tokio::test]
+async fn stale_stall_snapshot_publishes_one_supervisor_message() {
+    for restart in [false, true] {
+        stall_message_scenario(false, restart).await;
+    }
 }

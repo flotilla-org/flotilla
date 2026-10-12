@@ -2427,6 +2427,26 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_stall_for_crew(status, vessel, role);
             }
             Self::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message } => {
+                // Repeating a report is still the same episode, even after its
+                // maker has moved to a supervisor. Keep the delivery identity,
+                // consumed rung, and nudge budget rather than notifying again.
+                if status
+                    .crew_work
+                    .get(vessel)
+                    .and_then(|crew| crew.get(role))
+                    .is_some_and(|state| state.phase == CrewWorkPhase::Stalled && state.message.as_ref() == Some(message))
+                    && status.stalled.as_ref().is_some_and(|stall| {
+                        stall.source == StallEvidenceSource::Crew
+                            && stall.reason == Some(*reason)
+                            && stall.proposed_disposition == *proposed_disposition
+                            && stall.leaves.iter().any(|leaf| {
+                                matches!(&leaf.address, LeafAddress::Work { convoy: source, work } if source == convoy && work == vessel)
+                                    && leaf.field_path == format!(".crew.{role}.phase")
+                            })
+                    })
+                {
+                    return;
+                }
                 clear_nudge_budget(status, vessel, role);
                 // A completion claim is settled work. A late stall cannot turn a
                 // world-owned landing wait back into a crew obligation.
@@ -3449,6 +3469,78 @@ mod subject_tests {
             }
         }
         assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(&decoded).unwrap()).unwrap(), decoded);
+    }
+
+    // #3118: repeating the same report during one stall episode must retain
+    // its identity and consumed rung, so the judge cannot notify again.
+    #[test]
+    fn repeated_stall_report_preserves_episode_and_supervision() {
+        let mut status = ConvoyStatus::default();
+        status
+            .crew_work
+            .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
+        let now = Utc::now();
+        let report = |at| ConvoyStatusPatch::MarkCrewStalled {
+            convoy: "job".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            at,
+            reason: StallReason::Scope,
+            proposed_disposition: None,
+            message: "needs decision".into(),
+        };
+        report(now).apply(&mut status);
+        let stall = status.stalled.as_mut().expect("stall");
+        stall.supervision_index = Some(1);
+        stall.maker = Some(LeafMaker::Supervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
+        stall.evidence.push_str("; supervisor reconnecting");
+        stall.supervision_message = Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "notice"));
+        let expected = stall.clone();
+        report(now + chrono::Duration::seconds(1)).apply(&mut status);
+        assert_eq!(status.stalled.as_ref(), Some(&expected));
+    }
+
+    // Duplicate reports preserve an episode; changed reports and reports after
+    // progress are new episodes. Draw report changes and the role's progress
+    // independently, including the unchanged boundary.
+    #[hegel::test]
+    fn stall_report_episode_boundaries(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let change = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let progressed = tc.draw(gs::booleans());
+        let mut status = ConvoyStatus::default();
+        status
+            .crew_work
+            .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
+        let now = Utc::now();
+        let mut report = ConvoyStatusPatch::MarkCrewStalled {
+            convoy: "job".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            at: now,
+            reason: StallReason::Scope,
+            proposed_disposition: None,
+            message: "needs decision".into(),
+        };
+        report.apply(&mut status);
+        if progressed {
+            status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Working;
+        }
+        let later = now + chrono::Duration::seconds(1);
+        if let ConvoyStatusPatch::MarkCrewStalled { at, reason, proposed_disposition, message, .. } = &mut report {
+            *at = later;
+            match change {
+                1 => *reason = StallReason::Decision,
+                2 => *proposed_disposition = Some(StallProposedDisposition::ReduceScope),
+                3 => *message = "new evidence".into(),
+                _ => {}
+            }
+        }
+        report.apply(&mut status);
+        assert_eq!(status.stalled.as_ref().unwrap().began_at, if progressed || change != 0 { later } else { now });
+        let expected = status.stalled.clone();
+        report.apply(&mut status);
+        assert_eq!(status.stalled, expected, "every repeated report is idempotent");
     }
 
     #[test]
