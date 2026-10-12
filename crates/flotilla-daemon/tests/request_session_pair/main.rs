@@ -2711,10 +2711,11 @@ impl IssueProvider for MockIssueProvider {
 // remote target so delivery cannot accidentally drain or write on another host.
 // Local completion and readable diagnostics must survive unrelated event traffic.
 async fn fleet_post_install_target_scenario(remote: bool, background_events: usize) {
+    const BACKGROUND_COMMAND_ID: u64 = u64::MAX;
+
     let topology =
         spawn_in_memory_request_topology(empty_daemon_named("leader").await, empty_daemon_named("follower").await).await.expect("topology");
     let directory = tempfile::tempdir().expect("diagnostics directory");
-    let mut events = topology.client.subscribe();
     let command = Command::builder()
         .node_id(if remote { topology.follower.node_id().clone() } else { topology.leader.node_id().clone() })
         .action(CommandAction::FleetPostInstall {
@@ -2729,14 +2730,17 @@ async fn fleet_post_install_target_scenario(remote: bool, background_events: usi
         // returns. The observer proves delivery without a sleep or clock budget.
         for _ in 0..background_events {
             topology.leader.send_event(DaemonEvent::CommandStarted {
-                command_id: u64::MAX,
+                command_id: BACKGROUND_COMMAND_ID,
                 node_id: topology.leader.node_id().clone(),
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "test".into(), path: "background".into() },
                 repo: None,
                 description: "unrelated command".into(),
             });
             loop {
-                if matches!(observer.recv().await.expect("background event"), DaemonEvent::CommandStarted { command_id: u64::MAX, .. }) {
+                if matches!(
+                    observer.recv().await.expect("background event"),
+                    DaemonEvent::CommandStarted { command_id: BACKGROUND_COMMAND_ID, .. }
+                ) {
                     break;
                 }
             }
@@ -2744,9 +2748,11 @@ async fn fleet_post_install_target_scenario(remote: bool, background_events: usi
         topology.client.execute(command).await
     };
     if remote {
+        // Refusal arrives in the dispatch response; no completion subscription is needed.
         assert!(matches!(dispatch.await, Err(message) if message.contains("must run on the installing host")));
         assert!(!directory.path().join("diagnostics").exists());
     } else {
+        let mut events = topology.client.subscribe();
         // Execute returns only after diagnostics I/O and command completion.
         // Drain concurrently: waiting for its response first lets unrelated
         // peer events overwrite the bounded subscription under workspace load.
@@ -2757,6 +2763,7 @@ async fn fleet_post_install_target_scenario(remote: bool, background_events: usi
                 }
             }
         };
+        // A rejected dispatch must fail immediately rather than leave completion waiting.
         let (dispatched, (finished_id, node_id, result)) = tokio::try_join!(dispatch, completion).expect("dispatch local post-install");
         assert_eq!(finished_id, dispatched);
         assert_eq!(node_id, *topology.leader.node_id());
