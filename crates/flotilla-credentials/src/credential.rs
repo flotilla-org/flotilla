@@ -309,6 +309,8 @@ pub struct CredentialStore {
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     work_deliveries: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    // Only successful delivery and explicit withdrawal change this observation.
+    delivered_capabilities: Mutex<BTreeMap<(String, String), Option<DeliveredCapability>>>,
     capability_scopes: Mutex<BTreeMap<(String, String), Vec<String>>>,
     capability_endpoints: Mutex<BTreeMap<(String, String), BTreeMap<String, String>>>,
     ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
@@ -319,6 +321,12 @@ pub struct CredentialStore {
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
     cleaned_delivery_environments: Mutex<BTreeMap<String, Arc<OnceCell<()>>>>,
+}
+
+#[derive(Clone)]
+struct DeliveredCapability {
+    capability: flotilla_core::crew_capabilities::CredentialCapability,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -589,6 +597,7 @@ impl CredentialStore {
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             work_deliveries: Mutex::new(BTreeMap::new()),
+            delivered_capabilities: Mutex::new(BTreeMap::new()),
             capability_scopes: Mutex::new(BTreeMap::new()),
             capability_endpoints: Mutex::new(BTreeMap::new()),
             ledger_delivery_environment: Mutex::new(BTreeMap::new()),
@@ -855,13 +864,11 @@ impl CredentialStore {
         let mut git_config_owner = None;
         let mut pending_git_preflights = Vec::new();
         let mut prepared_cache_keys = Vec::new();
+        let mut delivery_guards = Vec::new();
+        let mut pending_github_deliveries = Vec::new();
         for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
-            let _delivery_guard = if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
-                Some(self.github_app_delivery_lock(&cache_key).await.lock_owned().await)
-            } else {
-                None
-            };
+            delivery_guards.push(self.github_app_delivery_lock(&cache_key).await.lock_owned().await);
             if let CredentialConsumer::GithubApp { permissions: declaration, .. } = &spec.consumer {
                 let requested = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
                 if self.github_app_deliveries.lock().await.get(&cache_key).is_some_and(|existing| existing.request.permissions != requested)
@@ -925,7 +932,7 @@ impl CredentialStore {
             env.extend(delivered.env);
             if let Some((request, expires_at, effective_permissions)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
-                self.github_app_deliveries.lock().await.insert(
+                pending_github_deliveries.push((
                     cache_key.clone(),
                     GithubAppDelivery {
                         generation: uuid::Uuid::new_v4(),
@@ -945,7 +952,7 @@ impl CredentialStore {
                         },
                         scope: None,
                     },
-                );
+                ));
             }
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
@@ -1003,8 +1010,37 @@ impl CredentialStore {
             scopes.insert(key.clone(), repositories);
         }
         drop(scopes);
-        self.prepared.lock().await.extend(prepared_cache_keys);
+        // Registration and observation are committed only after shared Git configuration
+        // and adapter preflights succeed. Readers keep the previous delivered snapshot.
+        self.github_app_deliveries.lock().await.extend(pending_github_deliveries);
+        self.prepared.lock().await.extend(prepared_cache_keys.iter().cloned());
+        self.record_delivered_capabilities(&prepared_cache_keys).await;
         Ok(env.into_iter().collect())
+    }
+
+    async fn record_delivered_capabilities(&self, keys: &[(String, String)]) {
+        let scopes = self.capability_scopes.lock().await;
+        let deliveries = self.github_app_deliveries.lock().await;
+        let mut observations = self.delivered_capabilities.lock().await;
+        for key in keys {
+            let delivery = deliveries.get(key);
+            let mut repositories = delivery
+                .map(|delivery| delivery.request.repositories.clone())
+                .unwrap_or_else(|| scopes.get(key).cloned().unwrap_or_default());
+            repositories.sort();
+            repositories.dedup();
+            observations.insert(
+                key.clone(),
+                Some(DeliveredCapability {
+                    capability: flotilla_core::crew_capabilities::CredentialCapability::builder()
+                        .name(key.1.clone())
+                        .repositories(repositories)
+                        .maybe_permissions(delivery.and_then(|delivery| delivery.effective_permissions.clone()))
+                        .build(),
+                    expires_at: delivery.map(|delivery| delivery.expires_at),
+                }),
+            );
+        }
     }
 
     pub fn ledger_delivery_environment<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, Result<BTreeMap<String, String>, String>> {
@@ -1225,6 +1261,7 @@ impl CredentialStore {
 
     pub fn forget_environment<'a>(&'a self, environment_ref: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            self.delivered_capabilities.lock().await.retain(|(environment, _), _| environment != environment_ref);
             self.work_deliveries.lock().await.remove(environment_ref);
             self.ledger_delivery_environment.lock().await.remove(environment_ref);
             self.capability_endpoints.lock().await.retain(|(environment, _), _| environment != environment_ref);
@@ -1341,6 +1378,9 @@ impl CredentialStore {
             }
             let paths = self.delivery_paths(&*runner).await?;
             for name in delivered.difference(running) {
+                let key = (environment_ref.to_string(), name.clone());
+                // Serialize withdrawal with a refresh that already minted a successor.
+                let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
                 let directory = paths.credential_dir(name);
                 runner
                     .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
@@ -1349,7 +1389,7 @@ impl CredentialStore {
                 if let Some(record) = self.ledger_delivery_environment.lock().await.get_mut(environment_ref) {
                     record.remove(name);
                 }
-                let key = (environment_ref.to_string(), name.clone());
+                self.delivered_capabilities.lock().await.insert(key.clone(), None);
                 self.prepared.lock().await.remove(&key);
                 self.materials.lock().await.remove(&key);
                 self.github_app_deliveries.lock().await.remove(&key);
@@ -1496,6 +1536,8 @@ impl CredentialStore {
                     current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
                     current.request = request;
                 }
+                drop(deliveries);
+                self.record_delivered_capabilities(std::slice::from_ref(&key)).await;
             }
             errors
         })
@@ -2647,6 +2689,349 @@ mod tests {
                 .unwrap_or_else(|| Err("no fake token available".to_string()))
                 .map_err(GithubAppMintError::Other)
         }
+    }
+
+    // A temporary preparation-cache gap must not revoke the last delivered capability.
+    #[tokio::test]
+    async fn capability_observation_survives_preparation_gap() {
+        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(
+                &InputMeta::builder().name("github".into()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Gh,
+                    source: CredentialSource::Env { name: "TEST_TOKEN".into() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .expect("declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_TOKEN".into(), "test-token".into())]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/state"),
+        );
+        let key = ("vessel".to_string(), "github".to_string());
+        let refs = BTreeSet::from(["github".to_string()]);
+        store.prepare_scoped("vessel", &refs, &BTreeMap::new(), runner).await.expect("delivery");
+        let delivered = store.credentials("vessel", &refs).await.expect("delivered");
+        assert_eq!(delivered.len(), 1);
+        store.prepared.lock().await.remove(&key);
+        assert_eq!(store.credentials("vessel", &refs).await.expect("refresh gap"), delivered);
+    }
+
+    // Generated operations cover remints, daemon reconstruction gaps, reconciliation, source failures,
+    // expiry, withdrawal, redelivery and card refresh. Every step checks the delivered observation
+    // and published revision through the real CredentialStore and core observer. The minter and
+    // RecordingRunner replace GitHub/subprocess I/O; storage and the clock are real in-memory ports.
+    #[hegel::test]
+    fn generated_capability_interleavings_preserve_revisions(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(18));
+        let operations = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(8))).collect::<Vec<_>>();
+        tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime").block_on(async {
+            use flotilla_core::crew_capabilities::{
+                observe_launch_card, refresh_cards, session_card, CapabilityCardTracker, SessionCapabilitySource,
+            };
+            use flotilla_resources::{
+                Convoy, ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Selector, TerminalBrief, TerminalCrewContext,
+                TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
+            };
+            struct Minter {
+                clock: Arc<VirtualClock>,
+                fail: std::sync::atomic::AtomicBool,
+                pause: std::sync::atomic::AtomicBool,
+                entered: tokio::sync::Notify,
+                release: tokio::sync::Semaphore,
+            }
+            #[async_trait]
+            impl GithubAppTokenMinter for Minter {
+                async fn resolve_installation(&self, _: &GithubAppInstallationRequest) -> Result<u64, String> {
+                    Ok(1)
+                }
+                async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
+                    if self.pause.swap(false, Ordering::SeqCst) {
+                        self.entered.notify_one();
+                        self.release.acquire().await.expect("release mint").forget();
+                    }
+                    if self.fail.load(Ordering::SeqCst) {
+                        return Err(GithubAppMintError::Transient("injected outage".into()));
+                    }
+                    Ok(GithubAppToken {
+                        value: uuid::Uuid::new_v4().to_string(),
+                        expires_at: self.clock.now() + Duration::hours(1),
+                        permissions: request.permissions.clone(),
+                    })
+                }
+            }
+            let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+            backend
+                .definitions::<CredentialSpec>("flotilla")
+                .create(
+                    &InputMeta::builder().name("github".into()).build(),
+                    &CredentialSpecSpec {
+                        consumer: CredentialConsumer::GithubApp {
+                            actor_login: None,
+                            installation_id: Some(1),
+                            installation_repository: None,
+                            permissions: Some(BTreeMap::from([("contents".into(), "write".into()), ("workflows".into(), "write".into())])),
+                        },
+                        source: CredentialSource::GithubApp { app_id_path: "/host/id".into(), private_key_path: "/host/key".into() },
+                        lifecycle: CredentialLifecycle::Refreshable,
+                        placement: Default::default(),
+                    },
+                )
+                .await
+                .expect("declaration");
+            backend
+                .using::<Convoy>("flotilla")
+                .create(
+                    &InputMeta::builder().name("crew".into()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).role("crew".into()).build(),
+                )
+                .await
+                .expect("convoy");
+            backend
+                .using::<Vessel>("flotilla")
+                .create(
+                    &InputMeta::builder().name("vessel".into()).build(),
+                    &VesselSpec {
+                        convoy_ref: "crew".into(),
+                        vessel_name: "work".into(),
+                        placement_policy_ref: "policy".into(),
+                        adopted_checkout_refs: Default::default(),
+                    },
+                )
+                .await
+                .expect("vessel");
+            let sessions = backend.using::<TerminalSession>("flotilla");
+            sessions
+                .create(
+                    &InputMeta::builder()
+                        .name("session".into())
+                        .annotations(BTreeMap::from([(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"github\"]".into())]))
+                        .build(),
+                    &TerminalSessionSpec {
+                        env_ref: "env".into(),
+                        role: "coder".into(),
+                        cwd: "/workspace".into(),
+                        env: Default::default(),
+                        pool: "pool".into(),
+                        source: TerminalSessionSource::Agent {
+                            selector: Selector { capability: "code".into(), adapter: None, model: None },
+                            brief: TerminalBrief { artifact_digest: None, path: "brief".into(), content: String::new(), copies: vec![] },
+                            context: Box::new(TerminalCrewContext {
+                                namespace: "flotilla".into(),
+                                convoy: "crew".into(),
+                                vessel_ref: "vessel".into(),
+                            }),
+                            message: None,
+                        },
+                    },
+                )
+                .await
+                .expect("session");
+            let session = sessions.get("session").await.expect("session");
+            let mut status = session.status.clone().unwrap_or_default();
+            status.phase = flotilla_resources::TerminalSessionPhase::Running;
+            sessions.update_status("session", &session.metadata.resource_version, &status).await.expect("running");
+            backend
+                .using::<Environment>("flotilla")
+                .create(
+                    &InputMeta::builder().name("env".into()).build(),
+                    &EnvironmentSpec {
+                        host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/workspace".into() }),
+                        docker: None,
+                    },
+                )
+                .await
+                .expect("environment");
+            let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("time");
+            let clock = Arc::new(VirtualClock::new(now));
+            let minter = Arc::new(Minter {
+                clock: clock.clone(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+                pause: std::sync::atomic::AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let runner = Arc::new(RecordingRunner::default());
+            let make_store = || {
+                CredentialStore::new_with_github_app_minter(
+                    backend.clone(),
+                    "flotilla",
+                    Arc::new(TestEnv::default()),
+                    EnvironmentBag::new(),
+                    runner.clone(),
+                    GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+                    PathBuf::from("/state"),
+                )
+            };
+            let mut store = make_store();
+            let refs = BTreeSet::from(["github".to_string()]);
+            let repo = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+            backend
+                .using::<Repository>("flotilla")
+                .create(&InputMeta::builder().name(repo.key().to_string()).build(), &repo)
+                .await
+                .expect("repository");
+            let scopes = BTreeMap::from([("github".into(), BTreeSet::from([repo.key()]))]);
+            store.prepare_scoped("env", &refs, &scopes, runner.clone()).await.expect("launch delivery");
+            let mut tracker = CapabilityCardTracker::default();
+            let initial = store.credentials("env", &refs).await.expect("initial observation");
+            let mut expected = initial.clone();
+            let mut expiry = clock.now() + Duration::hours(1);
+            let mut withdrawn = false;
+            let mut observed = session_card(
+                &backend,
+                "flotilla",
+                "crew",
+                &sessions.get("session").await.expect("session").spec,
+                &initial,
+                &BTreeMap::new(),
+            )
+            .await
+            .expect("launch card");
+            assert!(observed.contains("You can push `.github/workflows`"));
+            observe_launch_card(&backend, "flotilla", "session", &observed, &tracker).await.expect("launch observation");
+            let mut revision = 1;
+            let mut unknown = false;
+            // Pinned prefix reproduces the reported gap before generated exploration.
+            for operation in [1, 3, 2, 3, 8, 5, 4, 7, 6, 7].into_iter().chain(operations) {
+                match operation {
+                    0 => {
+                        if !withdrawn && !unknown {
+                            clock.advance(Duration::minutes(31));
+                            minter.fail.store(false, Ordering::SeqCst);
+                            store.refresh_due_github_app_tokens().await;
+                            expiry = clock.now() + Duration::hours(1);
+                            expected = initial.clone();
+                        }
+                    }
+                    1 => {
+                        store = make_store();
+                        tracker = CapabilityCardTracker::default();
+                        unknown = true;
+                    }
+                    2 => {
+                        minter.fail.store(false, Ordering::SeqCst);
+                        let remints = unknown || withdrawn;
+                        store.reconcile_work_delivery("env", &refs, &refs, &scopes, runner.clone()).await.expect("reconcile");
+                        if remints {
+                            expiry = clock.now() + Duration::hours(1);
+                        }
+                        unknown = false;
+                        withdrawn = false;
+                        expected = if clock.now() < expiry { initial.clone() } else { vec![] };
+                    }
+                    3 => {}
+                    4 => {
+                        minter.fail.store(true, Ordering::SeqCst);
+                        store.refresh_due_github_app_tokens().await;
+                        minter.fail.store(false, Ordering::SeqCst);
+                    }
+                    5 => {
+                        clock.advance(Duration::hours(2));
+                        expected.clear();
+                    }
+                    6 => {
+                        store.reconcile_work_delivery("env", &refs, &BTreeSet::new(), &scopes, runner.clone()).await.expect("withdraw");
+                        unknown = false;
+                        withdrawn = true;
+                        expected.clear();
+                    }
+                    7 => {
+                        minter.fail.store(false, Ordering::SeqCst);
+                        store.prepare_scoped("env", &refs, &scopes, runner.clone()).await.expect("redelivery");
+                        unknown = false;
+                        withdrawn = false;
+                        expiry = clock.now() + Duration::hours(1);
+                        expected = initial.clone();
+                    }
+                    8 => {
+                        if !withdrawn && !unknown {
+                            clock.advance(Duration::minutes(31));
+                            if clock.now() >= expiry {
+                                expected.clear();
+                            }
+                            minter.pause.store(true, Ordering::SeqCst);
+                            let refresh = store.refresh_due_github_app_tokens();
+                            tokio::pin!(refresh);
+                            tokio::select! {
+                                _ = minter.entered.notified() => {},
+                                _ = &mut refresh => panic!("refresh must pause at the injected mint boundary"),
+                            }
+                            // Card refresh and reconciliation interleave with an in-flight token mint.
+                            let during = store.credentials("env", &refs).await.expect("in-flight observation");
+                            assert_eq!(during, expected);
+                            let card = session_card(
+                                &backend,
+                                "flotilla",
+                                "crew",
+                                &sessions.get("session").await.expect("session").spec,
+                                &during,
+                                &BTreeMap::new(),
+                            )
+                            .await
+                            .expect("in-flight card");
+                            if card != observed {
+                                revision += 1;
+                                observed = card;
+                            }
+                            refresh_cards(&backend, "flotilla", &store, &tracker).await.expect("in-flight card refresh");
+                            store
+                                .reconcile_work_delivery("env", &refs, &refs, &scopes, runner.clone())
+                                .await
+                                .expect("in-flight reconciliation");
+                            minter.release.add_permits(1);
+                            refresh.await;
+                            expiry = clock.now() + Duration::hours(1);
+                            expected = initial.clone();
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                match store.credentials("env", &refs).await {
+                    Ok(actual) => {
+                        assert!(!unknown);
+                        assert_eq!(actual, expected, "operation {operation}");
+                        let card = session_card(
+                            &backend,
+                            "flotilla",
+                            "crew",
+                            &sessions.get("session").await.expect("session").spec,
+                            &actual,
+                            &BTreeMap::new(),
+                        )
+                        .await
+                        .expect("card");
+                        if card != observed {
+                            revision += 1;
+                            observed = card;
+                        }
+                        refresh_cards(&backend, "flotilla", &store, &tracker).await.expect("card refresh");
+                    }
+                    Err(_) => {
+                        assert!(unknown);
+                        assert!(
+                            refresh_cards(&backend, "flotilla", &store, &tracker).await.is_err(),
+                            "reconstruction must never publish an empty card"
+                        );
+                    }
+                }
+                assert_eq!(
+                    sessions.get("session").await.expect("observation").metadata.annotations["flotilla.work/capabilities-revision"],
+                    revision.to_string()
+                );
+            }
+        });
     }
 
     #[test]
@@ -5742,33 +6127,17 @@ impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialSto
         environment: &str,
         references: &BTreeSet<String>,
     ) -> Result<Vec<flotilla_core::crew_capabilities::CredentialCapability>, String> {
-        let names = self
-            .prepared
-            .lock()
-            .await
-            .iter()
-            .filter(|(env, name)| env == environment && references.contains(name))
-            .map(|(_, name)| name.clone())
-            .collect::<BTreeSet<_>>();
-        let scopes = self.capability_scopes.lock().await.clone();
-        let deliveries = self.github_app_deliveries.lock().await;
+        let observations = self.delivered_capabilities.lock().await;
+        let now = self.clock.now();
         let mut capabilities = Vec::new();
-        for name in names {
-            let delivery = deliveries.get(&(environment.to_string(), name.clone()));
-            if delivery.is_some_and(|delivery| delivery.expires_at <= self.clock.now()) {
-                continue;
+        for name in references {
+            match observations.get(&(environment.to_string(), name.clone())) {
+                Some(Some(delivered)) if delivered.expires_at.is_none_or(|expiry| now < expiry) => {
+                    capabilities.push(delivered.capability.clone());
+                }
+                Some(_) => {} // Explicit withdrawal or expiry without a delivered successor.
+                None => return Err(format!("credential `{name}` delivery observation unavailable for environment `{environment}`")),
             }
-            capabilities.push(
-                flotilla_core::crew_capabilities::CredentialCapability::builder()
-                    .name(name.clone())
-                    .repositories(
-                        delivery
-                            .map(|delivery| delivery.request.repositories.clone())
-                            .unwrap_or_else(|| scopes.get(&(environment.to_string(), name.clone())).cloned().unwrap_or_default()),
-                    )
-                    .maybe_permissions(delivery.and_then(|delivery| delivery.effective_permissions.clone()))
-                    .build(),
-            );
         }
         Ok(capabilities)
     }
