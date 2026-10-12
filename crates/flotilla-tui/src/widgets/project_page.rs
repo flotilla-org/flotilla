@@ -310,7 +310,10 @@ impl ProjectPageWidget {
                 };
                 let style = if focused { style.add_modifier(Modifier::REVERSED) } else { style };
                 let row_style = if focused { style } else { Default::default() };
-                let timestamp = layout.panel.table.meta.as_of.map(|as_of| format!("as of {}", as_of.format("%Y-%m-%d %H:%M")));
+                let mut timestamp = layout.panel.table.meta.as_of.map(|as_of| format!("as of {}", as_of.format("%Y-%m-%d %H:%M")));
+                if let Some(note) = layout.panel.table.meta.older_finished_note() {
+                    timestamp = Some(timestamp.map_or_else(|| note.clone(), |at| format!("{note} · {at}")));
+                }
                 ui_helpers::render_section_header(frame, &label, timestamp.as_deref(), theme, header_area, row_style, style);
             }
             if let Some(columns_area) = self.line_area(layout.columns_line, state) {

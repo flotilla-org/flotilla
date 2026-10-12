@@ -487,13 +487,41 @@ pub struct TableMeta {
     pub has_more: bool,
     pub conditions: Vec<String>,
     pub availability: TableAvailability,
+    /// Convoy-specific default visibility metadata; only the convoy projection
+    /// populates it. Sorted positions let local find reveal rows without a
+    /// general sorting/filtering widget.
+    #[builder(default)]
+    pub older_finished: Vec<(usize, ProjectedRow)>,
+}
+
+impl TableMeta {
+    pub fn older_finished_note(&self) -> Option<String> {
+        let count = self.older_finished.len();
+        (count > 0).then(|| {
+            let noun = if count == 1 { "convoy" } else { "convoys" };
+            format!("{count} older finished {noun} hidden")
+        })
+    }
 }
 
 impl TableView {
+    /// Apply local find once to a fresh projection. Filtering consumes visible
+    /// rows, so changing or clearing find requires projecting again.
     pub fn filtered(mut self, filter: &str) -> Self {
         let filter = filter.trim().to_lowercase();
         if !filter.is_empty() {
-            self.rows.retain(|row| row.cells.iter().any(|cell| fuzzy_matches(&cell.text, &filter)));
+            let matches = |row: &ProjectedRow| row.cells.iter().any(|cell| fuzzy_matches(&cell.text, &filter));
+            let mut skipped = 0;
+            self.meta.older_finished.retain(|(index, row)| {
+                if matches(row) {
+                    self.rows.insert(index - skipped, row.clone());
+                    false
+                } else {
+                    skipped += 1;
+                    true
+                }
+            });
+            self.rows.retain(matches);
         }
         self
     }
@@ -567,6 +595,10 @@ pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<Q
 }
 
 pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
+    project_at(address, data, chrono::Utc::now())
+}
+
+fn project_at(address: &ViewAddress, data: &TableRows<'_>, now: Timestamp) -> Result<TableView, String> {
     match address {
         ViewAddress::Convoys { namespace, scope } => {
             let query = query_for(address, data.source_search).expect("convoys address has a query");
@@ -584,8 +616,9 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                             .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
                     })
                 })
-                .cloned();
-            Ok(convoy_spec().project(format!("Convoys · {namespace}"), rows))
+                .cloned()
+                .collect::<Vec<_>>();
+            Ok(project_convoy_rows(format!("Convoys · {namespace}"), rows, now))
         }
         ViewAddress::Independents { scope } => {
             let query = query_for(address, data.source_search).expect("independents address has a query");
@@ -725,7 +758,7 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     // The enclosing Project page already supplies this scope. The shared
     // convoy projection decorates names for fleet-wide surfaces; omit that
     // suffix here.
-    for row in &mut convoys.rows {
+    for row in convoys.rows.iter_mut().chain(convoys.meta.older_finished.iter_mut().map(|(_, row)| row)) {
         let name = &mut row.cells[0].text;
         for suffix in [format!(" @ {}/{}", scope.namespace, scope.name), format!(" @ {}", scope.name)] {
             if let Some(bare) = name.strip_suffix(&suffix) {
@@ -736,7 +769,7 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     }
     if let Some(scope_column) = convoys.columns.iter().position(|column| column.id == "scope") {
         convoys.columns.remove(scope_column);
-        for row in &mut convoys.rows {
+        for row in convoys.rows.iter_mut().chain(convoys.meta.older_finished.iter_mut().map(|(_, row)| row)) {
             row.cells.remove(scope_column);
         }
     }
@@ -847,6 +880,51 @@ fn stable_topological_vessels(vessels: &[VesselSummary]) -> Vec<&VesselSummary> 
     // Invalid/cyclic snapshots must remain visible and diagnosable.
     ordered.extend(vessels.iter().enumerate().filter(|(index, _)| !emitted.contains(index)).map(|(_, vessel)| vessel));
     ordered
+}
+
+// Lifecycle phase takes precedence over surface state, including stale attention
+// on terminal rows. Missing timestamps stay visible rather than guessing age.
+fn project_convoy_rows(title: String, mut rows: Vec<ConvoySummary>, now: Timestamp) -> TableView {
+    fn rank(row: &ConvoySummary) -> u8 {
+        if row.phase.is_terminal() {
+            return 4;
+        }
+        match row.surface_state {
+            SurfaceState::NeedsYou => 0,
+            SurfaceState::StalledHandled { .. } => 1,
+            SurfaceState::Working => 2,
+            SurfaceState::Available => 3,
+        }
+    }
+    rows.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| convoy_recency(b).cmp(&convoy_recency(a))));
+    let hidden: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (row.phase.is_terminal() && convoy_recency(row).is_some_and(|at| now.signed_duration_since(at) > chrono::Duration::hours(24)))
+                .then_some(index)
+        })
+        .collect();
+    let mut view = convoy_spec().project(title, rows);
+    for index in hidden.into_iter().rev() {
+        let row = view.rows.remove(index);
+        view.meta.older_finished.push((index, row));
+    }
+    view.meta.older_finished.reverse();
+    view
+}
+
+fn convoy_recency(row: &ConvoySummary) -> Option<Timestamp> {
+    let latest = row
+        .started_at
+        .into_iter()
+        .chain(row.vessels.iter().flat_map(|vessel| [vessel.ready_at, vessel.started_at, vessel.finished_at].into_iter().flatten()))
+        .max();
+    if row.phase.is_terminal() {
+        row.finished_at.or(latest)
+    } else {
+        latest.into_iter().chain(row.finished_at).max()
+    }
 }
 
 fn convoy_spec() -> TableSpec<ConvoySummary> {
@@ -1544,6 +1622,107 @@ mod tests {
             .maybe_attach(attach.map(ToString::to_string))
             .phase(SessionPhase::Running)
             .build()
+    }
+
+    // Contract: all surface states precede terminal phases; recency descends
+    // within each group, independent of the source's iteration order.
+    #[test]
+    fn convoy_order_and_recency() {
+        use flotilla_protocol::result_set::HandledRung;
+        let now = Timestamp::UNIX_EPOCH;
+        let states = [
+            SurfaceState::NeedsYou,
+            SurfaceState::StalledHandled { rung: HandledRung::Supervisor },
+            SurfaceState::Working,
+            SurfaceState::Available,
+        ];
+        let mut rows = Vec::new();
+        for (group, state) in states.into_iter().enumerate() {
+            for age in [1, 2] {
+                let mut row = convoy(vec![]);
+                row.id = ConvoyId::new("dev", format!("{group}-{age}"));
+                row.surface_state = state;
+                row.started_at = Some(now - chrono::Duration::hours(age));
+                rows.push(row);
+            }
+        }
+        for (age, phase) in [(1, ConvoyPhase::Landed), (2, ConvoyPhase::Failed), (3, ConvoyPhase::Abandoned)] {
+            let mut row = convoy(vec![]);
+            row.id = ConvoyId::new("dev", format!("terminal-{age}"));
+            row.phase = phase;
+            row.surface_state = SurfaceState::NeedsYou;
+            row.finished_at = Some(now - chrono::Duration::hours(age));
+            rows.push(row);
+        }
+        let expected: Vec<_> = rows.iter().map(convoy_id).collect();
+        for rotation in 0..rows.len() {
+            rows.rotate_left(rotation);
+            let view = project_convoy_rows("Convoys".into(), rows.clone(), now);
+            assert_eq!(view.rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    // Contract: active recency follows the latest lifecycle change; terminal
+    // recency uses finish time, with lifecycle recency only as a fallback.
+    #[test]
+    fn convoy_lifecycle_recency_and_revealed_order() {
+        let now = Timestamp::UNIX_EPOCH;
+        let mut first = convoy(vec![vessel("work", &[], WorkPhase::Running)]);
+        first.id = ConvoyId::new("dev", "first");
+        first.started_at = Some(now - chrono::Duration::days(3));
+        first.vessels[0].ready_at = Some(now - chrono::Duration::hours(1));
+        let mut second = convoy(vec![]);
+        second.id = ConvoyId::new("dev", "second");
+        second.started_at = Some(now - chrono::Duration::days(1));
+        assert_eq!(project_convoy_rows("".into(), vec![second.clone(), first.clone()], now).rows[0].id, convoy_id(&first));
+        first.phase = ConvoyPhase::Landed;
+        first.finished_at = Some(now - chrono::Duration::days(2));
+        second.phase = ConvoyPhase::Failed;
+        second.started_at = None;
+        let view = project_convoy_rows("".into(), vec![second.clone(), first.clone()], now);
+        assert_eq!(view.rows[0].id, convoy_id(&second));
+        let found = view.filtered("tables");
+        assert_eq!(found.rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(), vec![convoy_id(&first), convoy_id(&second)]);
+        assert!(found.meta.older_finished.is_empty());
+        let mut nonmatch = first.clone();
+        nonmatch.id = ConvoyId::new("dev", "elsewhere");
+        nonmatch.name = "elsewhere".into();
+        nonmatch.finished_at = Some(now - chrono::Duration::hours(25));
+        let view = project_convoy_rows("".into(), vec![second.clone(), first.clone(), nonmatch], now);
+        assert_eq!(view.meta.older_finished_note().as_deref(), Some("2 older finished convoys hidden"));
+        let found = view.filtered("tables");
+        assert_eq!(found.rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(), vec![convoy_id(&first), convoy_id(&second)]);
+        assert_eq!(found.meta.older_finished_note().as_deref(), Some("1 older finished convoy hidden"));
+    }
+
+    // Contract: strictly older than 24 hours is hidden for every terminal
+    // phase. Find reveals matching old names; active and unknown-age rows stay.
+    #[test]
+    fn convoy_visibility_and_find() {
+        let now = Timestamp::UNIX_EPOCH;
+        for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Abandoned] {
+            for seconds in [86399, 86400, 86401] {
+                let mut row = convoy(vec![]);
+                row.phase = phase;
+                row.name = "old-needle".into();
+                row.finished_at = Some(now - chrono::Duration::seconds(seconds));
+                let data = TableRows { convoys: vec![&row], ..Default::default() };
+                let view = project_at(&"convoys/dev".parse().unwrap(), &data, now).unwrap();
+                assert_eq!(view.rows.len(), usize::from(seconds <= 86400));
+                assert_eq!(view.meta.older_finished.len(), usize::from(seconds > 86400));
+                assert_eq!(view.clone().filtered("needle").rows.len(), 1);
+                assert!(view.clone().filtered("no match").rows.is_empty());
+                assert_eq!(view.filtered("  ").rows.len(), usize::from(seconds <= 86400));
+                row.phase = ConvoyPhase::Active;
+                assert_eq!(project_convoy_rows("".into(), vec![row.clone()], now).rows.len(), 1);
+                row.phase = phase;
+                row.finished_at = None;
+                assert_eq!(project_convoy_rows("".into(), vec![row.clone()], now).rows.len(), 1);
+                row.started_at = Some(now - chrono::Duration::days(2));
+                assert!(project_convoy_rows("".into(), vec![row], now).rows.is_empty());
+            }
+        }
+        assert!(project_convoy_rows("".into(), vec![], now).rows.is_empty());
     }
 
     // #1961: surfaces preserve Active lifecycle while readiness explains why
