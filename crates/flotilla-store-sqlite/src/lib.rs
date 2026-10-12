@@ -17,17 +17,19 @@ mod overload_contract {
         let blocked = backend.writer_for_test();
         let injection = async move {
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 blocked
                     .call(move |_| {
                         entered_tx.send(()).unwrap();
-                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        let _ = release_rx.blocking_recv();
                         Ok::<_, ResourceError>(())
                     })
                     .await
                     .unwrap();
             });
             entered_rx.await.unwrap();
+            Some(release_tx)
         };
         flotilla_store_testkit::fixtures::contract::assert_replica_burst_recovers_with(
             flotilla_store::ResourceBackend::new(backend),

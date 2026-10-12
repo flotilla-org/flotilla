@@ -180,6 +180,36 @@ impl StoredEventKind {
 }
 
 impl SqliteBackend {
+    fn read_namespace_inventory(connection: &mut RusqliteConnection) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
+        let mut inventory = crate::declared_resource_kinds()
+            .into_iter()
+            .map(|kind| (kind.paths.plural.to_string(), Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        let kinds = crate::declared_resource_kinds();
+        let mut statement = connection
+            .prepare(
+                "SELECT group_name, version, kind, namespace FROM resource_objects
+                 UNION SELECT group_name, version, kind, namespace FROM replica_objects
+                 ORDER BY namespace",
+            )
+            .map_err(|err| Self::map_sqlite(err, "prepare namespace inventory"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            })
+            .map_err(|err| Self::map_sqlite(err, "query namespace inventory"))?;
+        for row in rows {
+            let (group, version, kind, namespace) = row.map_err(|err| Self::map_sqlite(err, "read namespace inventory"))?;
+            if let Some(descriptor) = kinds
+                .iter()
+                .find(|descriptor| descriptor.paths.group == group && descriptor.paths.version == version && descriptor.paths.kind == kind)
+            {
+                inventory.get_mut(descriptor.paths.plural).expect("registered kind").push(namespace);
+            }
+        }
+        Ok(inventory)
+    }
+
     #[cfg(test)]
     pub(crate) fn writer_for_test(&self) -> Connection {
         self.connection.clone()
@@ -1035,6 +1065,8 @@ impl SqliteBackend {
         let depth = DepthClaim::new(self.read_depth.clone());
         let execution_started = Arc::new(Mutex::new(None::<Instant>));
         let worker_execution_started = execution_started.clone();
+        // In-memory SQLite cannot use separate WAL readers: its one private
+        // connection uses the shared lease and the same shedding guard.
         // Reserve the fourth WAL worker for inventory: discovery cannot queue
         // behind either resource reads or the replication writer.
         let (slots, available) = if discovery && !self.read_connections.is_empty() {
@@ -3002,21 +3034,7 @@ impl Store for SqliteBackend {
         SqliteBackend::delete_decode_quarantine_raw(self, resource_kind, namespace, name).await
     }
     async fn namespace_inventory(&self) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
-        self.read_call_with_pool("discovery namespace inventory", |connection| {
-            let mut inventory = crate::declared_resource_kinds().into_iter().map(|kind| (kind.paths.plural.to_string(), Vec::new())).collect::<BTreeMap<_, _>>();
-            let kinds = crate::declared_resource_kinds();
-            let mut statement = connection.prepare("SELECT group_name, version, kind, namespace FROM resource_objects UNION SELECT group_name, version, kind, namespace FROM replica_objects ORDER BY namespace")
-                .map_err(|err| Self::map_sqlite(err, "prepare namespace inventory"))?;
-            let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
-                .map_err(|err| Self::map_sqlite(err, "query namespace inventory"))?;
-            for row in rows {
-                let (group, version, kind, namespace) = row.map_err(|err| Self::map_sqlite(err, "read namespace inventory"))?;
-                if let Some(descriptor) = kinds.iter().find(|descriptor| descriptor.paths.group == group && descriptor.paths.version == version && descriptor.paths.kind == kind) {
-                    inventory.get_mut(descriptor.paths.plural).expect("registered kind").push(namespace);
-                }
-            }
-            Ok(inventory)
-        }, true).await
+        self.read_call_with_pool("discovery namespace inventory", Self::read_namespace_inventory, true).await
     }
     async fn local_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
         SqliteBackend::local_namespaces_raw(self, resource_kind).await
@@ -3072,7 +3090,7 @@ impl Store for SqliteBackend {
         namespace: &str,
         events: &[(WatchEvent<SerializedResource>, DateTime<Utc>)],
     ) -> Result<(), ResourceError> {
-        for batch in events.chunks(64) {
+        for batch in events.chunks(crate::replica::REPLICA_BATCH_SIZE) {
             let mutations = batch
                 .iter()
                 .map(|(event, synced_at)| {
@@ -4165,7 +4183,7 @@ mod queue_contract {
             entered_rx.await.unwrap();
             releases.push(release_tx);
         }
-        let result = tokio::time::timeout(Duration::from_millis(100), backend.namespace_inventory()).await;
+        let result = tokio::time::timeout(READ_DEADLINE, backend.namespace_inventory()).await;
         for release in releases {
             release.send(()).unwrap();
         }
@@ -4239,12 +4257,18 @@ mod queue_contract {
                 })
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(READ_DEADLINE, async {
+            while backend.read_depth.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         abandoned.abort();
         let _ = abandoned.await;
         release_tx.send(()).unwrap();
         blocker.await.unwrap();
-        tokio::time::timeout(Duration::from_millis(250), backend.read_call("recovered read", |_| Ok(()))).await.unwrap().unwrap();
+        tokio::time::timeout(READ_DEADLINE, backend.read_call("recovered read", |_| Ok(()))).await.unwrap().unwrap();
         assert_eq!(executed.load(Ordering::SeqCst), 0);
     }
 }

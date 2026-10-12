@@ -1007,4 +1007,5 @@ grep -Fq '/current/bin/flotilla|' "$prune_log" || fail 'prune did not use active
 
 # The module unit tests cover Darwin copy policy through its public function.
 "$repo_root/scripts/test-fleet-canary.sh"
+"$repo_root/scripts/test-fleet-validation-retry.sh"
 echo 'fleet-install contract passed'

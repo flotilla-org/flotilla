@@ -460,7 +460,7 @@ impl<T: Resource> ReplicaWriter<T> {
 
     pub async fn apply_batch(&self, events: &[crate::WatchEvent<T>], synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
         ensure_replication_enabled::<T>()?;
-        for batch in events.chunks(64) {
+        for batch in events.chunks(crate::replica::REPLICA_BATCH_SIZE) {
             let serialized = crate::transcode::<_, Vec<crate::WatchEvent<crate::SerializedResource>>>(batch)?;
             let stamped = serialized.into_iter().map(|event| (event, synced_at)).collect::<Vec<_>>();
             self.backend.apply_replica_batch_raw(crate::ResourceKind::of::<T>(), &self.origin_root, &self.namespace, &stamped).await?;
@@ -471,7 +471,7 @@ impl<T: Resource> ReplicaWriter<T> {
     /// Relay batches retain each event's originating sync time for conflict resolution.
     pub async fn apply_stamped_batch(&self, events: &[(crate::WatchEvent<T>, DateTime<Utc>)]) -> Result<(), ResourceError> {
         ensure_replication_enabled::<T>()?;
-        for batch in events.chunks(64) {
+        for batch in events.chunks(crate::replica::REPLICA_BATCH_SIZE) {
             let serialized = crate::transcode::<_, Vec<(crate::WatchEvent<crate::SerializedResource>, DateTime<Utc>)>>(batch)?;
             self.backend.apply_replica_batch_raw(crate::ResourceKind::of::<T>(), &self.origin_root, &self.namespace, &serialized).await?;
         }

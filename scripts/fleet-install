@@ -750,6 +750,8 @@ switch_to() {
 
 # Retry transient daemon overload only. Decode and frozen-reference refusals
 # still fail immediately, and no activation happens before validation succeeds.
+# Discovery currently reports only status, so its bounded 500 retry is retained;
+# unrelated 500 diagnostics are not treated as evidence of store overload.
 validate_live_store() {
   local candidate="$1"
   shift
@@ -761,7 +763,7 @@ validate_live_store() {
       return 0
     fi
     cat "$output" >&2
-    if [[ "$attempt" == 4 ]] || ! grep -Eq '500 Internal Server Error|resource store busy|503 Service Unavailable' "$output"; then
+    if [[ "$attempt" == 4 ]] || ! grep -Eq 'daemon kind discovery failed: 500 Internal Server Error|resource store busy|503 Service Unavailable' "$output"; then
       return 1
     fi
     delay=$((1 << (attempt - 1)))

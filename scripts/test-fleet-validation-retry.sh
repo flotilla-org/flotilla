@@ -18,6 +18,7 @@ case "$VALIDATION_TEST_MODE" in
   recover) [[ "$count" -gt 2 ]] && exit 0; echo 'daemon kind discovery failed: 500 Internal Server Error' >&2 ;;
   busy) echo 'resource store busy: read deadline exceeded' >&2 ;;
   invalid) echo 'stored resource decode refused' >&2 ;;
+  fault) echo 'unrelated server failure: 500 Internal Server Error' >&2 ;;
 esac
 exit 1
 CANDIDATE
@@ -35,6 +36,11 @@ if validate_live_store "$root/candidate" >"$root/output" 2>&1; then exit 1; fi
 [[ "$(cat "$root/delays")" == $'1\n2\n4' ]]
 rm "$root/count" "$root/delays"
 export VALIDATION_TEST_MODE=invalid
+if validate_live_store "$root/candidate" >"$root/output" 2>&1; then exit 1; fi
+[[ "$(cat "$root/count")" == 1 ]]
+[[ ! -e "$root/delays" ]]
+rm "$root/count"
+export VALIDATION_TEST_MODE=fault
 if validate_live_store "$root/candidate" >"$root/output" 2>&1; then exit 1; fi
 [[ "$(cat "$root/count")" == 1 ]]
 [[ ! -e "$root/delays" ]]
