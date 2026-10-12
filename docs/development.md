@@ -182,6 +182,16 @@ Use `scripts/prune-target.sh --root /path/to/checkout` to cap another checkout; 
 
 GitHub Actions keeps target caches because compiled dependencies are expensive and reusable across runs with the same lockfile. Compiler incremental state is disabled with `CARGO_INCREMENTAL=0`; every target-caching job removes restored incremental directories before the cache post-action saves a new entry, so incremental generations are neither restored nor re-uploaded.
 
+## CI for stacked pull requests
+
+In a GitHub PR stack, CI's `Stack scope` job limits the expensive jobs (Test, the cleat launch environment contracts, and the Windows and macOS platform jobs) to two layers:
+- the lowest unmerged layer, which merges next;
+- the top layer, which carries the whole changeset.
+
+Middle layers run Format, Clippy and the cheap checks. The skipped required Test check counts as passing. Platform path classification diffs against the stack's base, so the top layer's platform jobs cover the whole stack. PRs outside a stack, pushes to `main` and merge-group runs are unchanged. The `ci:full` label forces the full set on any layer. CI reads the label live, but adding it starts no run: push again or re-run the workflow.
+
+Merge a stack **one layer at a time, or whole**. When a layer merges, the next becomes the lowest unmerged layer and gets the full run before it merges. A partial `gh stack merge` (layers 1–k, below the top) would land layer k without a full Test run.
+
 ## Crew idle supervision
 
 Actor obligations require three minutes of continuously confirmed idle before

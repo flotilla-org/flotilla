@@ -19,6 +19,49 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
+  # In a GitHub PR stack, the expensive jobs run only for the lowest unmerged
+  # layer (the next to merge) and the top layer (the whole changeset). Middle
+  # layers run the cheap checks; each becomes the lowest layer, and gets the
+  # full run, before it merges. Merge a stack one layer at a time or whole:
+  # a partial `gh stack merge` would land a middle layer without a full run.
+  # The ci:full label forces the full run on any layer; it is read live, so
+  # it applies to the next push or a re-run of the workflow.
+  stack-scope:
+    name: Stack scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          STACK: ${{ toJSON(github.event.pull_request.stack) }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          full=true
+          if [ "$EVENT" = pull_request ] && [ "$STACK" != null ]; then
+            position=$(jq -r '.position // empty' <<<"$STACK")
+            size=$(jq -r '.size // empty' <<<"$STACK")
+            stack_base=$(jq -r '.base.ref // empty' <<<"$STACK")
+            # A payload missing any field fails safe by running the full set.
+            if [ -n "$position" ] && [ -n "$size" ] && [ -n "$stack_base" ] \
+              && [ "$position" != "$size" ] && [ "$stack_base" != "$BASE_REF" ]; then
+              full=false
+              # A failed label lookup fails safe by running the full set.
+              if ! labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name') \
+                || printf '%s\n' "$labels" | grep -qx 'ci:full'; then
+                full=true
+              fi
+            fi
+            echo "stack layer $position of $size (base $BASE_REF, stack base $stack_base): full=$full"
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -105,6 +148,9 @@ jobs:
   cleat-environment:
     name: Cleat launch environment contracts
     runs-on: ubuntu-24.04
+    needs: stack-scope
+    # Fail safe: a failed scope job leaves the output empty, which runs the job.
+    if: ${{ !cancelled() && needs.stack-scope.outputs.full != 'false' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -114,7 +160,7 @@ jobs:
         id: filter
         env:
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          BASE: ${{ github.event.pull_request.stack.base.sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           if [ "$EVENT" = push ] || [ -z "$BASE" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -225,7 +271,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: fmt
+    needs: [fmt, stack-scope]
+    if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.stack-scope.outputs.full != 'false' }}
     steps:
       - uses: actions/checkout@v7
       - name: Set up pinned Rust
@@ -259,7 +306,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          # In a PR stack, diff against the stack's base so the top layer's
+          # platform jobs cover the whole changeset.
+          BASE: ${{ github.event.pull_request.stack.base.sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           # Read labels live rather than from the event payload, so re-running
           # the workflow after adding ci:full honours the label. A failed
@@ -286,8 +335,8 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
     runs-on: windows-latest
-    needs: changes
-    if: needs.changes.outputs.windows == 'true'
+    needs: [changes, stack-scope]
+    if: ${{ !cancelled() && needs.changes.outputs.windows == 'true' && needs.stack-scope.outputs.full != 'false' }}
     steps:
       - uses: actions/checkout@v7
       - name: Set up pinned Rust
@@ -320,8 +369,8 @@ jobs:
   macos-peer-identity:
     name: macOS peer identity
     runs-on: macos-latest
-    needs: [fmt, changes]
-    if: needs.changes.outputs.macos == 'true'
+    needs: [fmt, changes, stack-scope]
+    if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.changes.outputs.macos == 'true' && needs.stack-scope.outputs.full != 'false' }}
     steps:
       - uses: actions/checkout@v7
       - name: Set up pinned Rust
