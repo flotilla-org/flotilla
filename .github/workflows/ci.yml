@@ -1,8 +1,8 @@
 name: CI
 
 on:
+  # Every pull request, including layers of a PR stack whose base is another branch.
   pull_request:
-    branches: [main]
   merge_group:
   push:
     branches: [main]
