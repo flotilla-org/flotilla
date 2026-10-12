@@ -146,6 +146,27 @@ spec:
                           format: date-time
                 instruction:
                   type: string
+                promises:
+                  type: array
+                  items:
+                    type: object
+                    required: [label, kind, vessel, role]
+                    properties:
+                      label:
+                        type: string
+                        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+                      kind:
+                        type: string
+                        enum: [pr, decision-ledger]
+                      vessel:
+                        type: string
+                        minLength: 1
+                      role:
+                        type: string
+                        minLength: 1
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "promises are frozen at admission"
             status:
               type: object
               properties:

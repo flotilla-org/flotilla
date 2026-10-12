@@ -1397,6 +1397,7 @@ impl ConvoyAdmission {
             issues: Vec::new(),
             change_request: None,
             instruction: None,
+            promises: Vec::new(),
         };
         let read_snapshot = match self.load_brief_definitions(namespace, &spec, workflow).await {
             Ok(reads) => reads,
@@ -2978,6 +2979,9 @@ impl AdmissionReadContext<'_> {
             .map(|(owner, kind)| Ok(flotilla_resources::TemplatePromise { owner: owner.clone(), kind: kind.parse()? }))
             .collect::<Result<Vec<_>, String>>()?;
         workflow.exclude_template_promises(&exclusions)?;
+        // Dispatchers name owners in the workflow they can read; allocation may
+        // regroup or rename those vessels below.
+        let authored_owners = flotilla_resources::promises::authored_owners(&workflow);
         let mut allocation_roles = expand_allocation_roles(&mut workflow, &project.spec)?;
         self.compose_convoy_needs(namespace, &project.spec, &issues, intent, &mut workflow).await?;
         refresh_allocation_role_crews(&workflow, &mut allocation_roles)?;
@@ -3067,6 +3071,9 @@ impl AdmissionReadContext<'_> {
         flotilla_resources::validate(&workflow).map_err(|errors| {
             format!("allocated workflow invalid: {}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
         })?;
+        // ADR 0061: dispatch promises freeze owners in the final, allocated
+        // workflow, which is the snapshot Bootstrap freezes and seeds from.
+        let promises = flotilla_resources::promises::resolve_dispatch_promises(&workflow, &authored_owners, &intent.promises)?;
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
@@ -3096,6 +3103,7 @@ impl AdmissionReadContext<'_> {
             issues,
             change_request: change_request.map(|change_request| change_request.binding),
             instruction: intent.instruction.clone(),
+            promises,
         };
         Ok(PreparedConvoyAdmission::builder()
             .evidence(self.backend.clone())

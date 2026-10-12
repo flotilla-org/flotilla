@@ -658,6 +658,11 @@ pub struct ConvoyStartIntent {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promise_exclusions: Vec<(String, String)>,
+    /// Dispatch-supplied promises (`--promise kind:label[@vessel/role]`).
+    /// Admission resolves kind and owner against the final workflow.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promises: Vec<DispatchPromiseRequest>,
     #[builder(default)]
     #[serde(default)]
     pub skills: Vec<String>,
@@ -692,6 +697,60 @@ impl std::str::FromStr for AgentOverride {
             return Err(format!("agent override must be [capability=]adapter[:model] using alphanumerics, `.`, `_`, and `-`: {raw}"));
         }
         Ok(Self { capability: capability.to_string(), adapter: adapter.to_string(), model: model.map(str::to_string) })
+    }
+}
+
+/// One dispatch-supplied promise as the operator wrote it. The kind stays raw
+/// so admission reports unknown kinds against the supported set; the owner
+/// defaults to the workflow's deliverer when omitted (ADR 0061).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchPromiseRequest {
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<PromiseOwner>,
+}
+
+/// The crew member owning a promise, addressed by vessel and role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromiseOwner {
+    pub vessel: String,
+    pub role: String,
+}
+
+impl std::str::FromStr for DispatchPromiseRequest {
+    type Err = String;
+
+    /// `kind:label[@vessel/role]`. Only syntax is checked here; kind, owner
+    /// and label rules belong to admission. The owner follows the last `@`,
+    /// so a label containing `@` reaches admission's label-charset refusal.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let syntax = || format!("promise must be kind:label[@vessel/role]: {raw}");
+        let (kind, rest) = raw.split_once(':').filter(|(kind, rest)| !kind.is_empty() && !rest.is_empty()).ok_or_else(syntax)?;
+        let (label, owner) = match rest.rsplit_once('@') {
+            Some((label, owner)) => {
+                let (vessel, role) = owner
+                    .split_once('/')
+                    .filter(|(vessel, role)| !vessel.is_empty() && !role.is_empty())
+                    .ok_or_else(|| format!("{}; the owner after `@` is vessel/role, and labels cannot contain `@`", syntax()))?;
+                (label, Some(PromiseOwner { vessel: vessel.to_string(), role: role.to_string() }))
+            }
+            None => (rest, None),
+        };
+        if label.is_empty() {
+            return Err(syntax());
+        }
+        Ok(Self { kind: kind.to_string(), label: label.to_string(), owner })
+    }
+}
+
+impl std::fmt::Display for DispatchPromiseRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.kind, self.label)?;
+        if let Some(owner) = &self.owner {
+            write!(f, "@{}/{}", owner.vessel, owner.role)?;
+        }
+        Ok(())
     }
 }
 

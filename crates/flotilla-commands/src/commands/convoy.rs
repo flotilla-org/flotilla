@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use flotilla_protocol::{AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
+use flotilla_protocol::{
+    AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, DispatchPromiseRequest, IssueRef, IssueSelector,
+    IssueSource,
+};
 
 use crate::{
     quote::quote_value,
@@ -160,6 +163,10 @@ pub struct ConvoyStartArgs {
     /// Exclude a template promise at admission (repeatable): --exclude-promise role=kind
     #[arg(long = "exclude-promise", value_parser = parse_promise_exclusion)]
     pub promise_exclusions: Vec<(String, String)>,
+    /// Dispatch a promise (repeatable): --promise kind:label[@vessel/role].
+    /// The owner defaults to the workflow's deliverer, e.g. --promise pr:api-split
+    #[arg(long = "promise", value_parser = parse_dispatch_promise)]
+    pub promises: Vec<DispatchPromiseRequest>,
     /// Explicit skill import or -name removal (repeatable)
     #[arg(long = "skill", allow_hyphen_values = true)]
     pub skills: Vec<String>,
@@ -202,6 +209,10 @@ fn parse_promise_exclusion(raw: &str) -> Result<(String, String), String> {
         .filter(|(role, kind)| !role.is_empty() && !kind.is_empty())
         .ok_or_else(|| format!("promise exclusion must be role=kind: {raw}"))?;
     Ok((role.to_string(), kind.to_string()))
+}
+
+fn parse_dispatch_promise(raw: &str) -> Result<DispatchPromiseRequest, String> {
+    raw.parse()
 }
 
 fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
@@ -393,6 +404,7 @@ impl ConvoyNoun {
                     escalation_reason,
                     agent_overrides,
                     promise_exclusions,
+                    promises,
                     skills,
                     no_attach,
                     attach,
@@ -447,6 +459,7 @@ impl ConvoyNoun {
                                 escalation_reason,
                                 agent_overrides,
                                 promise_exclusions,
+                                promises,
                                 skills,
                                 auto_attach: match (attach, no_attach) {
                                     (true, false) => ConvoyAutoAttach::Always,
@@ -495,6 +508,7 @@ impl ConvoyNoun {
                                     escalation_reason: None,
                                     agent_overrides: Vec::new(),
                                     promise_exclusions: Vec::new(),
+                                    promises: Vec::new(),
                                     skills: Vec::new(),
                                     auto_attach: ConvoyAutoAttach::Never,
                                 }),
@@ -605,6 +619,7 @@ impl std::fmt::Display for ConvoyNoun {
                     escalation_reason,
                     agent_overrides,
                     promise_exclusions,
+                    promises,
                     skills,
                     no_attach,
                     attach,
@@ -654,6 +669,9 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 for (role, kind) in promise_exclusions {
                     write!(f, " --exclude-promise {}", quote_value(&format!("{role}={kind}")))?;
+                }
+                for promise in promises {
+                    write!(f, " --promise {}", quote_value(&promise.to_string()))?;
                 }
                 for skill in skills {
                     write!(f, " --skill {}", quote_value(skill))?;
@@ -707,7 +725,8 @@ impl std::fmt::Display for ConvoyNoun {
 mod tests {
     use clap::Parser;
     use flotilla_protocol::{
-        AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource, Relationship,
+        AgentOverride, Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, DispatchPromiseRequest, IssueRef, IssueSelector,
+        IssueSource, PromiseOwner, Relationship,
     };
 
     use super::ConvoyNoun;
@@ -935,6 +954,66 @@ mod tests {
         }
     }
 
+    // Glue: dispatch promises reach admission in order, with and without an
+    // explicit owner, and render back to the same command for other surfaces.
+    // The kind stays raw so admission reports unknown kinds loudly.
+    #[test]
+    fn start_dispatch_promises_reach_admission() {
+        let args = [
+            "convoy",
+            "start",
+            "--project",
+            "flotilla",
+            "--promise",
+            "pr:api-split",
+            "--promise",
+            "decision-ledger:notes@work/reviewer",
+            "--promise",
+            "demo-video:walkthrough",
+            "--promise",
+            "pr:ui_split.v2@coder[linux]/coder",
+        ];
+        assert_round_trip::<ConvoyNoun>(&args);
+        let Resolved::NeedsContext { command, .. } = parse(&args).resolve().expect("resolve promises") else { panic!("command expected") };
+        let CommandAction::ConvoyStart { intent } = command.action else { panic!("start expected") };
+        assert_eq!(
+            intent.promises,
+            vec![
+                DispatchPromiseRequest { kind: "pr".into(), label: "api-split".into(), owner: None },
+                DispatchPromiseRequest {
+                    kind: "decision-ledger".into(),
+                    label: "notes".into(),
+                    owner: Some(PromiseOwner { vessel: "work".into(), role: "reviewer".into() }),
+                },
+                DispatchPromiseRequest { kind: "demo-video".into(), label: "walkthrough".into(), owner: None },
+                DispatchPromiseRequest {
+                    kind: "pr".into(),
+                    label: "ui_split.v2".into(),
+                    owner: Some(PromiseOwner { vessel: "coder[linux]".into(), role: "coder".into() }),
+                },
+            ]
+        );
+    }
+
+    // Glue: malformed dispatch promises explain the required syntax. Kind,
+    // owner and label rules depend on the admitted workflow and are checked there.
+    #[test]
+    fn malformed_dispatch_promises_explain_syntax() {
+        for malformed in ["pr", "pr:", ":label", "pr:@work/coder", "pr:label@", "pr:label@work", "pr:label@/coder", "pr:label@work/"] {
+            let error = ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--promise", malformed])
+                .expect_err("malformed dispatch promise");
+            assert!(error.to_string().contains("kind:label[@vessel/role]"), "{malformed}: {error}");
+        }
+        // The owner follows the last `@`: an `@` in a label either reaches
+        // admission's label refusal intact or is explained here.
+        let error = ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--promise", "pr:team@api"])
+            .expect_err("owner without role");
+        assert!(error.to_string().contains("labels cannot contain `@`"), "{error}");
+        let request: DispatchPromiseRequest = "pr:team@api@work/coder".parse().expect("owner after last @");
+        assert_eq!(request.label, "team@api");
+        assert_eq!(request.owner, Some(PromiseOwner { vessel: "work".into(), role: "coder".into() }));
+    }
+
     #[test]
     fn round_trip_start_with_agent_overrides() {
         assert_round_trip::<ConvoyNoun>(&["convoy", "start", "--project", "flotilla", "--agent", "code=claude-code:sonnet"]);
@@ -1033,6 +1112,7 @@ mod tests {
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
                     promise_exclusions: Vec::new(),
+                    promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
@@ -1068,6 +1148,7 @@ mod tests {
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
                     promise_exclusions: Vec::new(),
+                    promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
@@ -1101,6 +1182,7 @@ mod tests {
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
                     promise_exclusions: Vec::new(),
+                    promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
@@ -1143,6 +1225,7 @@ mod tests {
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
                     promise_exclusions: Vec::new(),
+                    promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
@@ -1262,6 +1345,7 @@ mod tests {
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
                     promise_exclusions: Vec::new(),
+                    promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),

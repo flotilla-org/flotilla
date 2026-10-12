@@ -1023,6 +1023,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await

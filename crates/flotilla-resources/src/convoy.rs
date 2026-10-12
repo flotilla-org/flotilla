@@ -93,6 +93,10 @@ pub struct ConvoySpec {
     /// Change request explicitly bound when the convoy was admitted.
     pub change_request: Option<BoundChangeRequest>,
     pub instruction: Option<String>,
+    /// Dispatch-supplied promises, resolved against the admitted workflow and
+    /// frozen at admission (ADR 0061). Bootstrap seeds them as open promises.
+    #[builder(default)]
+    pub promises: Vec<promises::DispatchPromise>,
 }
 
 impl ConvoySpec {
@@ -258,6 +262,9 @@ struct ConvoySpecRecord {
     change_request: Option<BoundChangeRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instruction: Option<String>,
+    // Additive (ADR 0047): previous-generation specs decode with no dispatch promises.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    promises: Vec<promises::DispatchPromise>,
 }
 
 impl ConvoySpec {
@@ -320,6 +327,7 @@ impl Serialize for ConvoySpec {
             issues: Vec::new(),
             change_request: None,
             instruction: self.instruction.clone(),
+            promises: self.promises.clone(),
         }
         .serialize(serializer)
     }
@@ -344,6 +352,7 @@ impl<'de> Deserialize<'de> for ConvoySpec {
             issues: record.issues,
             change_request: record.change_request,
             instruction: record.instruction,
+            promises: record.promises,
         };
         for issue in spec.subjects.iter().filter_map(|entry| entry.issue.as_ref()) {
             if !spec.issues.iter().any(|existing| existing.reference == issue.reference) {
@@ -1689,6 +1698,9 @@ pub enum ConvoyStatusPatch {
         observed_workflows: BTreeMap<String, String>,
         work: BTreeMap<String, WorkState>,
         crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
+        /// The spec's frozen dispatch promises, carried so Bootstrap seeds them
+        /// in the same patch as the template declarations.
+        dispatch_promises: Vec<promises::DispatchPromise>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     },
@@ -1969,14 +1981,23 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
             }
-            Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at } => {
+            Self::Bootstrap {
+                workflow_snapshot,
+                observed_workflow_ref,
+                observed_workflows,
+                work,
+                crew_work,
+                dispatch_promises,
+                phase,
+                started_at,
+            } => {
                 status.provisioning.get_or_insert(ConvoyProvisioningState::NotStarted);
                 status.workflow_snapshot = Some(workflow_snapshot.clone());
                 status.observed_workflow_ref = Some(observed_workflow_ref.clone());
                 status.observed_workflows = Some(observed_workflows.clone());
                 status.work = work.clone();
                 status.crew_work = crew_work.clone();
-                for (vessel, role, operation) in promises::template_declarations(status) {
+                for (vessel, role, operation) in promises::admitted_declarations(dispatch_promises, status) {
                     promises::apply(status, &vessel, &role, &operation);
                 }
                 status.phase = *phase;
@@ -2612,16 +2633,28 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
 pub mod controller_patches {
     use super::*;
 
+    // Mirrors the Bootstrap patch fields one-for-one.
+    #[allow(clippy::too_many_arguments)]
     pub fn bootstrap(
         workflow_snapshot: WorkflowSnapshot,
         observed_workflow_ref: String,
         observed_workflows: BTreeMap<String, String>,
         work: BTreeMap<String, WorkState>,
         crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
+        dispatch_promises: Vec<promises::DispatchPromise>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at }
+        ConvoyStatusPatch::Bootstrap {
+            workflow_snapshot,
+            observed_workflow_ref,
+            observed_workflows,
+            work,
+            crew_work,
+            dispatch_promises,
+            phase,
+            started_at,
+        }
     }
 
     pub fn fail_init(phase: ConvoyPhase, message: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
@@ -3350,6 +3383,28 @@ mod subject_tests {
         }
         assert_eq!(status.turn_deliveries["z-first"].pending_supervisor_turn.as_ref().expect("first").queued_order, 1);
         assert_eq!(status.turn_deliveries["a-second"].pending_supervisor_turn.as_ref().expect("second").queued_order, 2);
+    }
+
+    // ADR 0047: previous-generation specs carry no dispatch promises and still
+    // decode; empty sets stay unwritten, and frozen promises round-trip.
+    #[test]
+    fn dispatch_promises_are_an_additive_spec_field() {
+        let old = serde_json::json!({"workflow_ref": "implement-review", "role": "api", "instruction": "Split the API"});
+        let spec: ConvoySpec = serde_json::from_value(old.clone()).expect("previous-generation spec decodes");
+        assert!(spec.promises.is_empty());
+        assert_eq!(serde_json::to_value(&spec).expect("write").get("promises"), None);
+        let promised = ConvoySpec {
+            promises: vec![promises::DispatchPromise {
+                label: "api-split".into(),
+                kind: promises::PromiseKind::Pr,
+                vessel: "work".into(),
+                role: "coder".into(),
+            }],
+            ..spec
+        };
+        let written = serde_json::to_value(&promised).expect("write promises");
+        assert_eq!(written["promises"], serde_json::json!([{"label": "api-split", "kind": "pr", "vessel": "work", "role": "coder"}]));
+        assert_eq!(serde_json::from_value::<ConvoySpec>(written).expect("read promises"), promised);
     }
 
     #[test]

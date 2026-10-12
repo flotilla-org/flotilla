@@ -111,6 +111,7 @@ pub async fn create_convoy_with_single_task(
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await

@@ -937,6 +937,7 @@ fn bootstrap_sets_snapshot_and_initial_work_map() {
         [("review-and-fix".to_string(), "42".to_string())].into_iter().collect(),
         work.clone(),
         BTreeMap::new(),
+        Vec::new(),
         ConvoyPhase::Pending,
         None,
     );

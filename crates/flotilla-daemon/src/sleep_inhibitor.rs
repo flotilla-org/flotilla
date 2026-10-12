@@ -650,6 +650,7 @@ mod tests {
             issues: vec![],
             change_request: None,
             instruction: None,
+            promises: Vec::new(),
         }
     }
 

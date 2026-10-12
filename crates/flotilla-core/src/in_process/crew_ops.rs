@@ -1135,7 +1135,7 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         }
         if let Some(status) = &convoy.status {
-            for (vessel, role, operation) in flotilla_resources::promises::template_declarations(status) {
+            for (vessel, role, operation) in flotilla_resources::promises::admitted_declarations(&convoy.spec.promises, status) {
                 convoy = apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::Promise { vessel, role, operation })
                     .await
                     .map_err(|e| e.to_string())?;

@@ -212,6 +212,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await

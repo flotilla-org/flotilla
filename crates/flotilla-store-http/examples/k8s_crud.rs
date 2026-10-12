@@ -64,6 +64,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         issues: Vec::new(),
         change_request: None,
         instruction: None,
+        promises: Vec::new(),
     }
 }
 

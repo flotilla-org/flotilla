@@ -290,7 +290,7 @@ pub fn handoff(status: &mut ConvoyStatus, vessel: &str, sender: &str, target: &s
             let original = promise.id.clone();
             let mut sequence = 1;
             loop {
-                promise.id = format!("handoff/{sender}/{original}/{sequence}");
+                promise.id = handoff_id(sender, &original, sequence);
                 if !target_promises.iter().any(|p| p.id == promise.id) {
                     break;
                 }
@@ -302,6 +302,29 @@ pub fn handoff(status: &mut ConvoyStatus, vessel: &str, sender: &str, target: &s
     }
 }
 
+/// Handoff renames an ID that collides at the target to
+/// `handoff/{sender}/{original}/{sequence}`. [`handoff_origin`] is its inverse;
+/// keep the two together.
+fn handoff_id(sender: &str, original: &str, sequence: u32) -> String {
+    format!("handoff/{sender}/{original}/{sequence}")
+}
+
+/// The ID a handoff rename wrapped, one level deep. Role names contain no `/`,
+/// so the sender is the first segment and the sequence the last.
+fn handoff_origin(id: &str) -> Option<&str> {
+    let (_sender, rest) = id.strip_prefix("handoff/")?.split_once('/')?;
+    rest.rsplit_once('/').map(|(original, _sequence)| original)
+}
+
+/// Seeding never declares obligations for crew whose work is already finished.
+fn seeds_open_promises(status: &ConvoyStatus, vessel: &str, role: &str) -> bool {
+    status
+        .crew_work
+        .get(vessel)
+        .and_then(|roles| roles.get(role))
+        .is_none_or(|work| !matches!(work.phase, super::CrewWorkPhase::Done | super::CrewWorkPhase::HandedBack))
+}
+
 /// Seed the admitted, frozen template declarations. Exclusions remain in the
 /// snapshot for explainability, but never become open promises.
 pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, PromiseOperation)> {
@@ -310,36 +333,214 @@ pub fn template_declarations(status: &ConvoyStatus) -> Vec<(String, String, Prom
         .iter()
         .flat_map(|snapshot| &snapshot.vessels)
         .flat_map(|vessel| {
-            vessel
-                .crew
-                .iter()
-                .filter(|crew| {
-                    status
-                        .crew_work
-                        .get(&vessel.name)
-                        .and_then(|roles| roles.get(&crew.role))
-                        .is_none_or(|work| !matches!(work.phase, super::CrewWorkPhase::Done | super::CrewWorkPhase::HandedBack))
+            vessel.crew.iter().filter(|crew| seeds_open_promises(status, &vessel.name, &crew.role)).flat_map(move |crew| {
+                crew.promises.iter().filter_map(move |promise| {
+                    if crew.promise_exclusions.contains(&promise.kind) {
+                        return None;
+                    }
+                    let kind = promise.kind;
+                    let name = kind.as_str();
+                    let id = format!("template/{name}");
+                    if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
+                        return None;
+                    }
+                    Some((vessel.name.clone(), crew.role.clone(), PromiseOperation::Declare { id, kind, source: PromiseSource::Template }))
                 })
-                .flat_map(move |crew| {
-                    crew.promises.iter().filter_map(move |promise| {
-                        if crew.promise_exclusions.contains(&promise.kind) {
-                            return None;
-                        }
-                        let kind = promise.kind;
-                        let name = kind.as_str();
-                        let id = format!("template/{name}");
-                        if owned(status, &vessel.name, &crew.role).iter().any(|p| p.id == id) {
-                            return None;
-                        }
-                        Some((
-                            vessel.name.clone(),
-                            crew.role.clone(),
-                            PromiseOperation::Declare { id, kind, source: PromiseSource::Template },
-                        ))
-                    })
-                })
+            })
         })
         .collect()
+}
+
+/// A dispatch-supplied promise, resolved against the admitted workflow and
+/// frozen into the Convoy spec (ADR 0061). The label is the promise ID the
+/// owner submits against, so it is unique within the convoy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchPromise {
+    pub label: String,
+    pub kind: PromiseKind,
+    pub vessel: String,
+    pub role: String,
+}
+
+/// Labels become promise IDs and CLI arguments. The charset excludes `/`, so
+/// they never collide with `template/...`, handoff or discovered-subject IDs.
+/// A leading letter or digit keeps `crew submit --promise <label>` from
+/// reading the label as a flag, and rules out `.` and `..`.
+pub fn validate_dispatch_label(label: &str) -> Result<(), String> {
+    let mut chars = label.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(format!(
+            "promise label `{label}` must start with an ASCII letter or digit and use only ASCII letters, digits, `-`, `_` and `.`"
+        ));
+    }
+    Ok(())
+}
+
+/// Where the authored workflow places each crew role, before allocation
+/// regroups, renames or matrix-expands vessels: `(authored vessel, role)`.
+/// A role-list workflow places a role in the vessel hint that names it, or in
+/// a vessel named after the role, as allocation expansion does.
+pub fn authored_owners(workflow: &crate::WorkflowTemplateSpec) -> Vec<(String, String)> {
+    if workflow.roles.is_empty() {
+        return workflow
+            .vessels
+            .iter()
+            .flat_map(|vessel| vessel.crew.iter().map(move |crew| (vessel.name.clone(), crew.role.clone())))
+            .collect();
+    }
+    workflow
+        .roles
+        .iter()
+        .map(|crew| {
+            let vessel = workflow.vessels.iter().find(|hint| hint.crew.iter().any(|member| member.role == crew.role));
+            (vessel.map_or_else(|| crew.role.clone(), |hint| hint.name.clone()), crew.role.clone())
+        })
+        .collect()
+}
+
+/// Resolve dispatch requests against the final admitted workflow. Unknown
+/// kinds, owners and labels are refused instead of silently dropping work.
+/// An omitted owner defaults to the single crew member marked `deliverer`.
+/// An explicit owner may name the final vessel, or the vessel the dispatcher
+/// saw in the authored workflow (`authored`, from [`authored_owners`]) when
+/// allocation placed that role in exactly one final vessel.
+pub fn resolve_dispatch_promises(
+    workflow: &crate::WorkflowTemplateSpec,
+    authored: &[(String, String)],
+    requests: &[flotilla_protocol::DispatchPromiseRequest],
+) -> Result<Vec<DispatchPromise>, String> {
+    let mut resolved: Vec<DispatchPromise> = Vec::with_capacity(requests.len());
+    for request in requests {
+        let refuse = |reason: String| format!("--promise {request}: {reason}");
+        let kind = request.kind.parse::<PromiseKind>().map_err(refuse)?;
+        validate_dispatch_label(&request.label).map_err(refuse)?;
+        let (vessel, crew) = match &request.owner {
+            Some(owner) => resolve_explicit_owner(workflow, authored, owner).map_err(refuse)?,
+            None => {
+                let deliverers = workflow
+                    .vessels
+                    .iter()
+                    .flat_map(|vessel| vessel.crew.iter().filter(|crew| crew.deliverer).map(move |crew| (vessel, crew)))
+                    .collect::<Vec<_>>();
+                match deliverers.as_slice() {
+                    [owner] => *owner,
+                    [] => {
+                        return Err(refuse(format!(
+                            "the workflow marks no crew member as deliverer; name the owner with --promise {}:{}@<vessel>/<role>",
+                            request.kind, request.label
+                        )))
+                    }
+                    several => {
+                        let names =
+                            several.iter().map(|(vessel, crew)| format!("{}/{}", vessel.name, crew.role)).collect::<Vec<_>>().join(", ");
+                        return Err(refuse(format!(
+                            "the workflow marks several deliverers ({names}); name the owner with --promise {}:{}@<vessel>/<role>",
+                            request.kind, request.label
+                        )));
+                    }
+                }
+            }
+        };
+        if !matches!(crew.source, crate::CrewSource::Agent { .. }) {
+            return Err(refuse(format!("`{}/{}` is a tool crew member and cannot keep promises", vessel.name, crew.role)));
+        }
+        if let Some(existing) = resolved.iter().find(|existing| existing.label == request.label) {
+            return Err(refuse(format!(
+                "duplicate promise label `{}` (already promised by {}/{}); labels are promise IDs and must be unique",
+                request.label, existing.vessel, existing.role
+            )));
+        }
+        resolved.push(DispatchPromise { label: request.label.clone(), kind, vessel: vessel.name.clone(), role: crew.role.clone() });
+    }
+    Ok(resolved)
+}
+
+fn resolve_explicit_owner<'w>(
+    workflow: &'w crate::WorkflowTemplateSpec,
+    authored: &[(String, String)],
+    owner: &flotilla_protocol::PromiseOwner,
+) -> Result<(&'w crate::VesselRequirement, &'w crate::CrewSpec), String> {
+    let holding = |vessel: &'w crate::VesselRequirement| vessel.crew.iter().find(|crew| crew.role == owner.role).map(|crew| (vessel, crew));
+    if let Some(found) = workflow.vessels.iter().find(|vessel| vessel.name == owner.vessel).and_then(holding) {
+        return Ok(found);
+    }
+    let authored_vessel = authored.iter().any(|(vessel, _)| *vessel == owner.vessel);
+    if authored.iter().any(|(vessel, role)| *vessel == owner.vessel && *role == owner.role) {
+        let placed = workflow.vessels.iter().filter_map(holding).collect::<Vec<_>>();
+        return match placed.as_slice() {
+            [found] => Ok(*found),
+            several => {
+                let names = several.iter().map(|(vessel, _)| format!("{}/{}", vessel.name, owner.role)).collect::<Vec<_>>().join(", ");
+                Err(format!("role `{}/{}` was allocated to several vessels ({names}); name one of them", owner.vessel, owner.role))
+            }
+        };
+    }
+    match workflow.vessels.iter().find(|vessel| vessel.name == owner.vessel) {
+        Some(vessel) => {
+            let roles = vessel.crew.iter().map(|crew| crew.role.as_str()).collect::<Vec<_>>().join(", ");
+            Err(format!("unknown role `{}/{}`; crew of `{}`: {roles}", owner.vessel, owner.role, owner.vessel))
+        }
+        None if authored_vessel => {
+            let roles = authored.iter().filter(|(vessel, _)| *vessel == owner.vessel).map(|(_, role)| role.as_str()).collect::<Vec<_>>();
+            Err(format!("unknown role `{}/{}`; crew of `{}`: {}", owner.vessel, owner.role, owner.vessel, roles.join(", ")))
+        }
+        None => {
+            let mut vessels = authored.iter().map(|(vessel, _)| vessel.as_str()).collect::<Vec<_>>();
+            vessels.extend(workflow.vessels.iter().map(|vessel| vessel.name.as_str()));
+            vessels.sort_unstable();
+            vessels.dedup();
+            Err(format!("unknown vessel `{}`; workflow vessels: {}", owner.vessel, vessels.join(", ")))
+        }
+    }
+}
+
+/// The dispatched label behind any number of handoff renames.
+fn dispatch_origin(mut id: &str) -> &str {
+    while let Some(original) = handoff_origin(id) {
+        id = original;
+    }
+    id
+}
+
+/// Every admitted declaration the status still lacks: the frozen template
+/// declarations plus the spec's dispatch promises, all opening as `open`.
+/// Idempotent: a dispatch promise already present anywhere in its vessel,
+/// including after a handoff moved it to another role, is never re-declared,
+/// nor is an ID its owner already holds from another source.
+pub fn admitted_declarations(dispatch: &[DispatchPromise], status: &ConvoyStatus) -> Vec<(String, String, PromiseOperation)> {
+    let mut declarations = template_declarations(status);
+    declarations.extend(
+        dispatch
+            .iter()
+            .filter(|promise| {
+                status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .vessels
+                        .iter()
+                        .any(|vessel| vessel.name == promise.vessel && vessel.crew.iter().any(|crew| crew.role == promise.role))
+                })
+            })
+            .filter(|promise| seeds_open_promises(status, &promise.vessel, &promise.role))
+            // Bootstrap seeds dispatch promises before any crew runs, so an
+            // owner already holding this ID holds this dispatch promise: a
+            // later same-ID `crew promise` is a no-op against it.
+            .filter(|promise| {
+                !owned(status, &promise.vessel, &promise.role).iter().any(|p| p.id == promise.label)
+                    && !status.promises.get(&promise.vessel).is_some_and(|crew| {
+                        crew.values().flatten().any(|p| p.source == PromiseSource::Dispatch && dispatch_origin(&p.id) == promise.label)
+                    })
+            })
+            .map(|promise| {
+                (
+                    promise.vessel.clone(),
+                    promise.role.clone(),
+                    PromiseOperation::Declare { id: promise.label.clone(), kind: promise.kind, source: PromiseSource::Dispatch },
+                )
+            }),
+    );
+    declarations
 }
 
 /// Discovery and explicit claim attribution share the same submission transition.
@@ -847,6 +1048,237 @@ mod tests {
         )
         .is_some());
     }
+
+    fn request(raw: &str) -> flotilla_protocol::DispatchPromiseRequest {
+        raw.parse().expect("promise syntax")
+    }
+    fn dispatched(label: &str, kind: PromiseKind, role: &str) -> DispatchPromise {
+        DispatchPromise { label: label.into(), kind, vessel: "work".into(), role: role.into() }
+    }
+
+    // ADR 0061 (#2987): resolution against the stock implement-review workflow.
+    // The owner defaults to the deliverer (coder); every unresolvable request
+    // is refused with the reason and the offending argument.
+    #[test]
+    fn dispatch_promises_resolve_against_the_admitted_workflow() {
+        let workflow = crate::implement_review_workflow_spec();
+        let authored = authored_owners(&workflow);
+        let resolve =
+            |raw: &[&str]| resolve_dispatch_promises(&workflow, &authored, &raw.iter().map(|raw| request(raw)).collect::<Vec<_>>());
+        assert_eq!(
+            resolve(&["pr:api-split", "pr:ui_split.v2", "decision-ledger:notes@work/reviewer"]),
+            Ok(vec![
+                dispatched("api-split", PromiseKind::Pr, "coder"),
+                dispatched("ui_split.v2", PromiseKind::Pr, "coder"),
+                dispatched("notes", PromiseKind::DecisionLedger, "reviewer"),
+            ])
+        );
+        for (raw, refusal) in [
+            (vec!["demo-video:walkthrough"], "--promise demo-video:walkthrough: unknown promise kind `demo-video`"),
+            (vec!["pr:x@work/designer"], "unknown role `work/designer`; crew of `work`: coder, reviewer"),
+            (vec!["pr:x@review/coder"], "unknown vessel `review`; workflow vessels: work"),
+            (vec!["pr:a/b"], "promise label `a/b` must start with an ASCII letter or digit"),
+            (vec!["pr:x:y"], "promise label `x:y` must start with an ASCII letter or digit"),
+            (vec!["pr:-x"], "promise label `-x` must start with an ASCII letter or digit"),
+            (vec!["pr:--force"], "promise label `--force` must start with an ASCII letter or digit"),
+            (vec!["pr:.."], "promise label `..` must start with an ASCII letter or digit"),
+            (vec!["pr:team@api@work/coder"], "promise label `team@api` must start with an ASCII letter or digit"),
+            (vec!["pr:x", "decision-ledger:x@work/reviewer"], "duplicate promise label `x` (already promised by work/coder)"),
+        ] {
+            let error = resolve(&raw).expect_err("refused");
+            assert!(error.contains(refusal), "{raw:?}: {error}");
+        }
+    }
+
+    // ADR 0061: an omitted owner needs exactly one deliverer; an explicit owner
+    // never depends on the marker. Labels admit only the documented charset.
+    // Every deliverer marking and owner form is enumerated for a generated
+    // label of mixed valid and invalid characters and for a known-valid label.
+    #[hegel::test]
+    fn dispatch_owner_and_label_rules(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        const ALPHABET: &[char] = &['a', 'Z', '0', '-', '_', '.', ' ', '/', '@', ':', 'é'];
+        let length = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+        let generated: String = (0..length).map(|_| ALPHABET[tc.draw(gs::integers::<usize>().max_value(ALPHABET.len() - 1))]).collect();
+        for label in [generated, "api-split".to_string()] {
+            let valid_label = label.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+                && label.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+            for (coder, reviewer, explicit) in [false, true]
+                .into_iter()
+                .flat_map(|c| [false, true].into_iter().flat_map(move |r| [None, Some("reviewer")].map(|e| (c, r, e))))
+            {
+                let mut workflow = crate::implement_review_workflow_spec();
+                workflow.vessels[0].crew[0].deliverer = coder;
+                workflow.vessels[0].crew[1].deliverer = reviewer;
+                let request = flotilla_protocol::DispatchPromiseRequest {
+                    kind: "pr".into(),
+                    label: label.clone(),
+                    owner: explicit.map(|role| flotilla_protocol::PromiseOwner { vessel: "work".into(), role: role.into() }),
+                };
+                let owner = match (explicit, coder, reviewer) {
+                    (Some(role), _, _) => Some(role),
+                    (None, true, false) => Some("coder"),
+                    (None, false, true) => Some("reviewer"),
+                    (None, _, _) => None,
+                };
+                let case = format!("label={label:?} coder={coder} reviewer={reviewer} explicit={explicit:?}");
+                let resolved = resolve_dispatch_promises(&workflow, &authored_owners(&workflow), std::slice::from_ref(&request));
+                match (valid_label, owner) {
+                    (true, Some(role)) => assert_eq!(resolved, Ok(vec![dispatched(&label, PromiseKind::Pr, role)]), "{case}"),
+                    (false, _) => assert!(resolved.expect_err(&case).contains("must start with an ASCII letter or digit"), "{case}"),
+                    (true, None) => {
+                        let error = resolved.expect_err(&case);
+                        assert!(error.contains(&format!("name the owner with --promise pr:{label}@<vessel>/<role>")), "{case}: {error}");
+                        let reason = if coder { "several deliverers (work/coder, work/reviewer)" } else { "no crew member as deliverer" };
+                        assert!(error.contains(reason), "{case}: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ADR 0061: dispatchers name owners in the authored workflow, but
+    // allocation may regroup, rename or matrix-expand vessels. An authored
+    // owner resolves to the one final vessel holding that role, a final name
+    // resolves directly, and a role placed in several vessels is refused.
+    #[test]
+    fn explicit_owners_follow_allocation_renames() {
+        let authored_workflow = crate::implement_review_workflow_spec();
+        let authored = authored_owners(&authored_workflow);
+        assert_eq!(authored, vec![("work".to_string(), "coder".to_string()), ("work".to_string(), "reviewer".to_string())]);
+        let split = |names: &[(&str, usize)]| {
+            let mut workflow = authored_workflow.clone();
+            workflow.vessels = names
+                .iter()
+                .map(|(name, member)| crate::VesselRequirement {
+                    name: (*name).into(),
+                    crew: vec![authored_workflow.vessels[0].crew[*member].clone()],
+                    ..authored_workflow.vessels[0].clone()
+                })
+                .collect();
+            workflow
+        };
+        let owned_by = |label: &str, vessel: &str, role: &str| DispatchPromise {
+            label: label.into(),
+            kind: PromiseKind::Pr,
+            vessel: vessel.into(),
+            role: role.into(),
+        };
+        let renamed = split(&[("work", 0), ("reviewer", 1)]);
+        assert_eq!(
+            resolve_dispatch_promises(&renamed, &authored, &[request("pr:a@work/reviewer"), request("pr:b@reviewer/reviewer")]),
+            Ok(vec![owned_by("a", "reviewer", "reviewer"), owned_by("b", "reviewer", "reviewer")])
+        );
+        let expanded = split(&[("coder[linux]", 0), ("coder[macos]", 0), ("reviewer", 1)]);
+        let error = resolve_dispatch_promises(&expanded, &authored, &[request("pr:a@work/coder")]).expect_err("ambiguous");
+        assert!(error.contains("role `work/coder` was allocated to several vessels (coder[linux]/coder, coder[macos]/coder)"), "{error}");
+        assert_eq!(
+            resolve_dispatch_promises(&expanded, &authored, &[request("pr:a@coder[linux]/coder")]),
+            Ok(vec![owned_by("a", "coder[linux]", "coder")])
+        );
+        let error = resolve_dispatch_promises(&renamed, &authored, &[request("pr:a@work/designer")]).expect_err("unknown role");
+        assert!(error.contains("unknown role `work/designer`; crew of `work`: coder"), "{error}");
+        let error = resolve_dispatch_promises(&renamed, &authored, &[request("pr:a@ops/coder")]).expect_err("unknown vessel");
+        assert!(error.contains("unknown vessel `ops`; workflow vessels: reviewer, work"), "{error}");
+    }
+
+    // ADR 0061: role-list workflows place unhinted roles in vessels named
+    // after the role, as allocation expansion does.
+    #[test]
+    fn authored_owners_follow_role_list_hints() {
+        let mut workflow = crate::implement_review_workflow_spec();
+        workflow.roles = workflow.vessels[0].crew.clone();
+        workflow.vessels[0].crew.truncate(1);
+        assert_eq!(
+            authored_owners(&workflow),
+            vec![("work".to_string(), "coder".to_string()), ("reviewer".to_string(), "reviewer".to_string())]
+        );
+    }
+
+    // ADR 0061: tool crew members cannot submit, so they cannot own promises.
+    #[test]
+    fn tool_crew_cannot_own_dispatch_promises() {
+        let mut workflow = crate::implement_review_workflow_spec();
+        workflow.vessels[0].crew[1].source = crate::CrewSource::Tool { command: "make lint".into() };
+        let error =
+            resolve_dispatch_promises(&workflow, &authored_owners(&workflow), &[request("pr:x@work/reviewer")]).expect_err("tool owner");
+        assert!(error.contains("`work/reviewer` is a tool crew member"), "{error}");
+    }
+
+    // ADR 0061: Bootstrap seeds frozen dispatch promises beside template ones,
+    // open and dispatch-sourced, under the label the crew submits against.
+    // Re-seeding is idempotent, including after handoff moves (and renames)
+    // the promise, and finished crew never receive new obligations.
+    #[test]
+    fn bootstrap_seeds_dispatch_promises_idempotently() {
+        let workflow = crate::implement_review_workflow_spec();
+        let dispatch =
+            vec![dispatched("api-split", PromiseKind::Pr, "coder"), dispatched("notes", PromiseKind::DecisionLedger, "reviewer")];
+        let pending = || crate::CrewWorkState::builder().phase(super::super::CrewWorkPhase::Pending).build();
+        let mut status = ConvoyStatus::default();
+        super::super::controller_patches::bootstrap(
+            crate::WorkflowSnapshot {
+                cascade: None,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+                vessels: workflow.vessels,
+            },
+            "implement-review".into(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), pending()), ("reviewer".into(), pending())]))]),
+            dispatch.clone(),
+            super::super::ConvoyPhase::Pending,
+            None,
+        )
+        .apply(&mut status);
+        let summary = |status: &ConvoyStatus, role: &str| {
+            owned(status, "work", role).iter().map(|p| (p.id.clone(), p.source, p.kind, p.state)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summary(&status, "coder"),
+            vec![
+                ("template/decision-ledger".into(), PromiseSource::Template, PromiseKind::DecisionLedger, PromiseState::Open),
+                ("api-split".into(), PromiseSource::Dispatch, PromiseKind::Pr, PromiseState::Open),
+            ]
+        );
+        assert_eq!(
+            summary(&status, "reviewer"),
+            vec![
+                ("template/decision-ledger".into(), PromiseSource::Template, PromiseKind::DecisionLedger, PromiseState::Open),
+                ("notes".into(), PromiseSource::Dispatch, PromiseKind::DecisionLedger, PromiseState::Open),
+            ]
+        );
+        assert!(admitted_declarations(&dispatch, &status).is_empty());
+        // A colliding handoff renames the moved promise; it is still seeded.
+        let mut collided = status.clone();
+        apply(
+            &mut collided,
+            "work",
+            "reviewer",
+            &PromiseOperation::Declare { id: "api-split".into(), kind: PromiseKind::Pr, source: PromiseSource::Crew },
+        );
+        handoff(&mut collided, "work", "coder", "reviewer");
+        assert!(owned(&collided, "work", "reviewer")
+            .iter()
+            .any(|p| p.id == "handoff/coder/api-split/1" && p.source == PromiseSource::Dispatch));
+        assert!(admitted_declarations(&dispatch, &collided)
+            .iter()
+            .all(|(_, _, operation)| !matches!(operation, PromiseOperation::Declare { source: PromiseSource::Dispatch, .. })));
+        // Finished crew are skipped; promises outside the snapshot are ignored.
+        let mut fresh = status.clone();
+        fresh.promises.clear();
+        fresh.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = super::super::CrewWorkPhase::Done;
+        let stray = DispatchPromise { label: "stray".into(), kind: PromiseKind::Pr, vessel: "work".into(), role: "designer".into() };
+        let seeded = admitted_declarations(&[dispatch.clone(), vec![stray]].concat(), &fresh);
+        assert_eq!(
+            seeded.iter().map(|(vessel, role, _)| format!("{vessel}/{role}")).collect::<Vec<_>>(),
+            vec!["work/reviewer", "work/reviewer"]
+        );
+    }
+
     // ADR 0061: unknown retractions/verdicts and stale replay are true no-ops,
     // preserving status equality for optimistic write suppression.
     #[hegel::test]

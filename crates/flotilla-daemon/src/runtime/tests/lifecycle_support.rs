@@ -167,6 +167,7 @@ pub(super) async fn run_stage4a_flow_reaches_running_and_completes_convoy(
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await

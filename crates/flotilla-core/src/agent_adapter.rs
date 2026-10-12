@@ -1819,6 +1819,7 @@ mod tests {
                     title: "Existing pull request".to_string(),
                 }),
                 instruction: None,
+                promises: Vec::new(),
             },
             status: None,
         };

@@ -64,6 +64,7 @@ fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
         issues: Vec::new(),
         change_request: None,
         instruction: None,
+        promises: Vec::new(),
     }
 }
 
@@ -224,6 +225,7 @@ async fn generated_table_action_completes_work() {
             BTreeMap::new(),
             work,
             BTreeMap::new(),
+            Vec::new(),
             ConvoyPhase::Active,
             None,
         ),
