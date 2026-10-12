@@ -109,10 +109,12 @@ fn placement_baseline_provenance_round_trips_and_never_infers_literal_tags(tc: h
 #[hegel::test]
 fn cutover_composition_resolution_preserves_frozen_images(tc: hegel::TestCase) {
     use flotilla_resources::{ImageComposition, ImageLayerSelection, PlacedImageIdentity};
-    // Cross empty/boundary/ordinary literal values and all three stored shapes.
+    // Cross empty/boundary/ordinary literals, all stored shapes and identities,
+    // and invalid literal-plus-layer input that must not become another source.
     let size = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(70));
     let shape = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
     let bound = tc.draw(hegel::generators::booleans());
+    let mixed_literal = tc.draw(hegel::generators::booleans());
     let literal = if size == 0 { String::new() } else { format!("crew:{}", "a".repeat(size)) };
     let mut composition = ImageComposition::builder()
         .selection(ImageLayerSelection::builder().base("base".into()).build())
@@ -124,10 +126,23 @@ fn cutover_composition_resolution_preserves_frozen_images(tc: hegel::TestCase) {
         1 => composition.literal_base = Some(literal.clone()),
         _ => {}
     }
+    if shape == 1 && mixed_literal {
+        use flotilla_resources::{FrozenImageLayer, ImageLayerParent, ImageLayerSpec, ImageLayerStage};
+        composition.layers.push(FrozenImageLayer {
+            name: "base".into(),
+            spec: ImageLayerSpec::builder()
+                .stage(ImageLayerStage::Base)
+                .parent(ImageLayerParent::Image(format!("sha256:{}", "a".repeat(64))))
+                .repository("https://example.test/images".into())
+                .revision("1".repeat(40))
+                .fragment("Dockerfile".into())
+                .build(),
+        });
+    }
     if bound {
         composition.bind(PlacedImageIdentity { local_image_id: "sha256:built".into(), registry_digest: None }).expect("bind");
     }
-    if shape == 1 {
+    if shape == 1 && !mixed_literal {
         let mut frozen = flotilla_resources::FrozenImageLayers::default();
         frozen.include(&composition).expect("no-layer literal");
         assert_eq!(frozen, flotilla_resources::FrozenImageLayers::default(), "literal sources do not claim frozen layer revisions");
@@ -140,7 +155,9 @@ fn cutover_composition_resolution_preserves_frozen_images(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
         let resolved = decoded.resolve(&backend.definitions("flotilla")).await;
-        if bound {
+        if shape == 1 && (mixed_literal || size == 0) {
+            assert!(resolved.expect_err("invalid literal source must refuse even when bound").contains("nonempty base and no layers"));
+        } else if bound {
             assert_eq!(resolved.expect("built identity"), "sha256:built");
         } else if shape < 2 && size > 0 {
             assert_eq!(resolved.expect("frozen literal"), literal);

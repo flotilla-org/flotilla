@@ -4828,7 +4828,10 @@ async fn freeze_admission_image(
             };
             (selection, FrozenImageLayers::default())
         }
-        DockerImageSource::Composition { composition } if composition.literal_base.is_some() && composition.layers.is_empty() => {
+        DockerImageSource::Composition { composition } if composition.literal_base.is_some() => {
+            // Operator manifests can mix a literal base and layers. The common
+            // resolver refuses that invalid shape instead of silently dropping
+            // the literal base and admitting a different image source.
             image.resolve(&backend.definitions(namespace)).await?;
             return Ok(image.clone());
         }

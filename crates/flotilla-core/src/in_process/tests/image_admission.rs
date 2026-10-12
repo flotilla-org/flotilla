@@ -139,7 +139,9 @@ async fn image_layer_admission_freezes_inputs_without_baseline_fallback() {
         .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
         .await
         .expect("admission");
-    let image = admitted.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
+    let admitted_docker = admitted.selected.expect("selected").spec.docker_per_vessel.expect("docker");
+    assert!(admitted_docker.legacy_image_baseline_ref.is_none(), "layered output must lose the legacy tag exception");
+    let image = admitted_docker.image;
     let DockerImageSource::Composition { composition } = &image else { panic!("admission must store composition") };
     assert_eq!(composition.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(), ["base", "display"]);
     assert_eq!(composition.layers[0].spec, base);
@@ -168,6 +170,22 @@ async fn image_layer_admission_freezes_inputs_without_baseline_fallback() {
     };
     assert_eq!(repeated.identity, bound.identity);
     assert_eq!(repeated.layers, bound.layers);
+    // Authored mixed sources are reachable and invalid, even with a bound ID;
+    // admission must not silently drop literal_base and choose a layered image.
+    let mut mixed_policy = live.spec.clone();
+    let mut mixed = bound.clone();
+    mixed.literal_base = Some("crew:ambiguous".into());
+    mixed_policy.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Composition { composition: mixed };
+    let mixed_policy = policies
+        .update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &mixed_policy)
+        .await
+        .expect("mixed authored policy");
+    let error = daemon
+        .convoy_admission
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
+        .await
+        .expect_err("ambiguous source must refuse");
+    assert!(error.contains("nonempty base and no layers"), "{error}");
     let mut restored = live.spec;
     // The authored generation-2 shape may contain only a selection. Previous
     // shadow metadata still decodes, but must not survive a new admission.
@@ -183,7 +201,7 @@ async fn image_layer_admission_freezes_inputs_without_baseline_fallback() {
     };
     assert_eq!(restored.docker_per_vessel.as_ref().expect("docker").image.resolve(&baselines).await.expect("old snapshot"), "crew:v1");
     policies
-        .update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &restored)
+        .update(&InputMeta::from(&mixed_policy.metadata), &mixed_policy.metadata.resource_version, &restored)
         .await
         .expect("author composition selection");
     let next = daemon

@@ -9,14 +9,16 @@ impl DockerImageSourceStoreExt for DockerImageSource {
     async fn resolve(&self, baselines: &DefinitionResolver<CrewImageBaseline>) -> Result<String, String> {
         match self {
             Self::Composition { composition } => {
+                // A literal base is a no-layer source, including when bound.
+                // Reject ambiguous authored shapes before choosing any identity.
+                if composition.literal_base.as_ref().is_some_and(|image| image.trim().is_empty() || !composition.layers.is_empty()) {
+                    return Err("literal image composition must have a nonempty base and no layers".into());
+                }
                 if let Some(identity) = &composition.identity {
                     identity.validate()?;
                     return Ok(identity.registry_digest.as_ref().unwrap_or(&identity.local_image_id).clone());
                 }
                 if let Some(image) = &composition.literal_base {
-                    if !composition.layers.is_empty() || image.trim().is_empty() {
-                        return Err("literal image composition must have a nonempty base and no layers".into());
-                    }
                     return Ok(image.clone());
                 }
                 composition

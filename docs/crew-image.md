@@ -187,7 +187,12 @@ run.
    the golden corpus only through the normal post-roll capture process.
 
 Out-of-repo sources: **fleet-ops placement manifests** and **project-map**
-operational entries author placement/fulfilment images. No companion schema
+operational entries may author both `CrewImageBaseline` Definitions and
+placement/fulfilment images. The roll-time companions remove baseline
+Definition authoring, commit reviewed ImageLayer Definitions and replace the
+old selections with the supplied per-host policies. Retained readers keep
+those existing documents decodable until the companions are deployed.
+No companion schema
 change is needed: `literal_base` is an optional field written by admission, and
 old authored forms still decode. Operational selection changes use the exact
 per-host policies supplied here; apply those replacements wherever fleet-ops
