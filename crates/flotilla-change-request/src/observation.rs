@@ -33,12 +33,12 @@ impl ChangeRequestRef {
         Some(Self { namespace: namespace.to_string(), service: service.clone(), scope: scope.clone(), number: *number })
     }
 
-    pub(crate) fn record_name(&self) -> String {
+    pub fn record_name(&self) -> String {
         let (service, scope) = Subject::normalize_scope(&self.service, &self.scope);
         change_request_record_name(&service, &scope, self.number)
     }
 
-    pub(crate) fn normalized(mut self) -> Self {
+    pub fn normalized(mut self) -> Self {
         (self.service, self.scope) = Subject::normalize_scope(&self.service, &self.scope);
         self
     }
@@ -111,7 +111,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
     }
 }
 
-pub(crate) fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
+pub fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
     parse_gh_observation_with_review_bot(json, observed_at, DEFAULT_REVIEW_BOT_LOGIN)
 }
 
@@ -323,4 +323,241 @@ fn check_pending(check: &serde_json::Value) -> bool {
     check.get("conclusion").is_some_and(serde_json::Value::is_null)
         || matches!(check["status"].as_str(), Some("QUEUED" | "IN_PROGRESS" | "WAITING" | "PENDING"))
         || matches!(check["state"].as_str(), Some("PENDING" | "EXPECTED"))
+}
+
+#[cfg(test)]
+mod tests {
+    use flotilla_resources::{ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision};
+
+    use super::{
+        parse_gh_observation, parse_gh_observation_with_crew_identity, parse_gh_observation_with_identity,
+        parse_gh_observation_with_review_bot, DEFAULT_REVIEW_BOT_LOGIN,
+    };
+
+    fn review_actionable(request: serde_json::Value) -> bool {
+        parse_gh_observation(&request.to_string(), "2026-09-30T12:00:00Z".parse().expect("time"))
+            .expect("parse review")
+            .review
+            .actionable_at_head
+            .value
+            .expect("review observation")
+    }
+
+    #[test]
+    fn approval_supersedes_requested_changes_even_when_old_review_has_feedback() {
+        let request = serde_json::json!({
+            "reviewDecision": "APPROVED", "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviews": {"nodes": [
+                {"fullDatabaseId": "1", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"},
+                 "state": "CHANGES_REQUESTED", "body": "Please fix this"},
+                {"fullDatabaseId": "2", "submittedAt": "2026-09-30T11:30:00Z", "author": {"login": "reviewer"},
+                 "state": "APPROVED", "body": ""}
+            ]}
+        });
+        assert!(!review_actionable(request));
+    }
+
+    #[test]
+    fn commented_feedback_after_approval_is_actionable() {
+        let mut request = serde_json::json!({
+            "reviewDecision": "APPROVED", "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviews": {"nodes": [
+                {"fullDatabaseId": "1", "submittedAt": "2026-09-30T09:00:00Z", "author": {"login": "reviewer"},
+                 "state": "CHANGES_REQUESTED", "body": "Please fix this"},
+                {"fullDatabaseId": "2", "submittedAt": "2026-09-30T10:30:00Z", "author": {"login": "reviewer"},
+                 "state": "APPROVED", "body": ""},
+                {"fullDatabaseId": "3", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"},
+                 "state": "COMMENTED", "body": "One more concern"}
+            ]}
+        });
+        assert!(review_actionable(request.clone()));
+        request["reviews"]["nodes"][2]["body"] = "LGTM.".into();
+        assert!(!review_actionable(request));
+    }
+
+    #[test]
+    fn resolved_review_thread_does_not_wake_crew() {
+        let mut request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviewThreads": {"nodes": [{"isResolved": true, "comments": {"nodes": [{
+                "fullDatabaseId": "42", "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "body": "Please fix"
+            }]}}]}
+        });
+        assert!(!review_actionable(request.clone()));
+        request["reviewThreads"]["nodes"][0]["isResolved"] = false.into();
+        assert!(review_actionable(request));
+    }
+
+    #[test]
+    fn only_configured_bot_identity_is_actionable() {
+        let request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "comments": {"nodes": [{"databaseId": 42, "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "review-helper", "__typename": "Bot"}, "body": "Please fix"}]}
+        });
+        let observed_at = "2026-09-30T12:00:00Z".parse().expect("time");
+        assert!(!review_actionable(request.clone()));
+        assert_eq!(
+            parse_gh_observation_with_review_bot(&request.to_string(), observed_at, "review-helper")
+                .expect("parse")
+                .review
+                .actionable_at_head
+                .value,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn crew_markers_are_accepted_only_from_configured_credential_actor() {
+        let mut request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviews": {"nodes": [{"fullDatabaseId": "77", "submittedAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "state": "COMMENTED", "body": "Please fix"}]},
+            "comments": {"nodes": [{"databaseId": 88, "createdAt": "2026-09-30T12:00:00Z",
+                "author": {"login": "other-app"}, "body": "<!-- pr-shepherd-addresses:77 -->"}]}
+        });
+        let observed_at = "2026-09-30T13:00:00Z".parse().expect("time");
+        let observe = |request: &serde_json::Value, crew_logins: &[String]| {
+            parse_gh_observation_with_crew_identity(&request.to_string(), observed_at, DEFAULT_REVIEW_BOT_LOGIN, None, crew_logins)
+                .expect("parse")
+                .review
+                .actionable_at_head
+                .value
+        };
+        let configured = ["crew-app".to_string()];
+        assert_eq!(observe(&request, &configured), Some(true));
+        assert_eq!(observe(&request, &[]), Some(true));
+        assert_eq!(observe(&request, &["crew-app".to_string(), "other-app".to_string()]), Some(false));
+        request["comments"]["nodes"][0]["author"]["login"] = "crew-app".into();
+        assert_eq!(observe(&request, &configured), Some(false));
+    }
+
+    #[test]
+    fn bot_chatter_empty_reviews_and_author_acknowledgments_do_not_wake_crew() {
+        let mut request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "comments": {"nodes": [
+                {"databaseId": 1, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "codecov", "__typename": "Bot"}, "body": "Coverage dropped"},
+                {"databaseId": 2, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "author", "__typename": "User"}, "body": "Thanks"},
+                {"databaseId": 6, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer", "__typename": "User"}, "body": "Thanks!"}
+            ]},
+            "reviews": {"nodes": [
+                {"fullDatabaseId": "3", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "state": "APPROVED", "body": ""},
+                {"fullDatabaseId": "4", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "other"}, "state": "COMMENTED", "body": ""}
+            ]}
+        });
+        assert!(!review_actionable(request.clone()));
+        request["comments"]["nodes"].as_array_mut().expect("comments").push(serde_json::json!({
+            "databaseId": 5, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "claude", "__typename": "Bot"},
+            "body": "Please fix the race"
+        }));
+        assert!(review_actionable(request));
+    }
+
+    #[test]
+    fn marker_in_non_crew_comment_cannot_suppress_feedback() {
+        let request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "comments": {"nodes": [
+                {"databaseId": 42, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "body": "Please fix"},
+                {"databaseId": 43, "createdAt": "2026-09-30T11:30:00Z", "author": {"login": "other"},
+                 "body": "<!-- pr-shepherd-addresses:42 -->"}
+            ]}
+        });
+        assert!(review_actionable(request));
+    }
+
+    #[test]
+    fn parses_gh_observation_vocabulary() {
+        let status = parse_gh_observation(
+            r#"{"state":"MERGED","headRefOid":"abc","statusCheckRollup":[{"conclusion":"SUCCESS","status":"COMPLETED"}],"reviewDecision":"CHANGES_REQUESTED","mergeable":"CONFLICTING"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse");
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Merged));
+        assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
+        assert_eq!(status.review.actionable_at_head.value, Some(true));
+        assert_eq!(status.mergeable.value, Some(ObservedMergeability::Conflicting));
+    }
+
+    #[test]
+    fn observes_presentation_fields_and_configured_operator_request() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let status = parse_gh_observation_with_identity(
+            r#"{"title":"Keep metadata current","state":"OPEN","isDraft":true,"author":{"login":"contributor"},"reviewDecision":"APPROVED","reviewRequests":{"nodes":[{"requestedReviewer":{"login":"owner"}}]}}"#,
+            observed_at,
+            DEFAULT_REVIEW_BOT_LOGIN,
+            Some("OWNER"),
+        )
+        .expect("parse");
+        assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
+        assert_eq!(status.author.value.as_deref(), Some("contributor"));
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Draft));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::Approved));
+        assert_eq!(status.review_requested_from_owner.value, Some(true));
+        assert_eq!(status.title.observed_at, observed_at);
+    }
+
+    #[test]
+    fn operator_request_is_unknown_without_identity_or_with_team_request() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let request = r#"{"state":"OPEN","reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"Team"}}]}}"#;
+        let unset = parse_gh_observation_with_identity(request, observed_at, DEFAULT_REVIEW_BOT_LOGIN, None).expect("parse");
+        assert_eq!(unset.review_requested_from_owner.value, None);
+        let team = parse_gh_observation_with_identity(request, observed_at, DEFAULT_REVIEW_BOT_LOGIN, Some("owner")).expect("parse");
+        assert_eq!(team.review_requested_from_owner.value, None);
+    }
+
+    #[test]
+    fn review_decision_distinguishes_changes_requested_from_review_required() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        for (decision, expected) in
+            [("CHANGES_REQUESTED", ObservedReviewDecision::ChangesRequested), ("REVIEW_REQUIRED", ObservedReviewDecision::Required)]
+        {
+            let request = serde_json::json!({"state": "OPEN", "reviewDecision": decision});
+            let status = parse_gh_observation(&request.to_string(), observed_at).expect("parse");
+            assert_eq!(status.review_decision.value, Some(expected));
+        }
+    }
+
+    #[test]
+    fn draft_pr_is_not_ready_for_a_crew_claim() {
+        let status = parse_gh_observation(
+            r#"{"state":"OPEN","isDraft":true,"headRefOid":"abc","statusCheckRollup":[],"reviewDecision":null,"mergeable":"MERGEABLE"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse draft");
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Draft));
+    }
+
+    #[test]
+    fn classic_success_status_without_check_run_fields_passes() {
+        let status = parse_gh_observation(
+            r#"{"state":"OPEN","headRefOid":"abc","statusCheckRollup":[{"state":"SUCCESS"}],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse");
+        assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
+    }
+
+    #[test]
+    fn explicit_null_review_decision_is_not_actionable() {
+        let status = parse_gh_observation(
+            r#"{"state":"OPEN","headRefOid":"abc","statusCheckRollup":[],"reviewDecision":null,"mergeable":"MERGEABLE"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse");
+        assert_eq!(status.review.actionable_at_head.value, Some(false));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::None));
+        let absent = parse_gh_observation(r#"{"state":"OPEN"}"#, "2026-08-03T20:00:00Z".parse().expect("time")).expect("parse");
+        assert_eq!(absent.review_decision.value, None);
+    }
 }

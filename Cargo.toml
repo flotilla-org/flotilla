@@ -5,6 +5,7 @@ debug = "line-tables-only"
 members = [
     "crates/flotilla-aggregator",
     "crates/flotilla-build-features",
+    "crates/flotilla-change-request",
     "crates/flotilla-client",
     "crates/flotilla-ai-utility",
     "crates/flotilla-cloud-agent",

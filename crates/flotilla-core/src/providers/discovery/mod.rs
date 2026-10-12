@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_protocol::EnvironmentId;
 use futures::stream;
 use tokio::sync::OnceCell as AsyncOnceCell;
@@ -30,7 +31,6 @@ use tokio::sync::OnceCell as AsyncOnceCell;
 use crate::admission::system_available_space_probe;
 use crate::admission::AvailableSpaceProbe;
 use crate::agent_adapter::AgentAdapterRegistry;
-use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::registry::ProviderSet;

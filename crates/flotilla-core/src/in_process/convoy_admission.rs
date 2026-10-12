@@ -1,5 +1,6 @@
 //! Convoy admission state and transaction boundary.
 
+use flotilla_change_request::branch_lookup_observer::BranchLookupObserver;
 use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
@@ -12,7 +13,6 @@ use flotilla_vcs::providers::detection::remote_assertion;
 use super::*;
 use crate::{
     agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
-    branch_lookup_observer::BranchLookupObserver,
     providers::discovery::AiUtilityFactory,
 };
 

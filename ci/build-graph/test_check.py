@@ -193,6 +193,24 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
         )), [])
 
+    def test_change_request_is_native_and_independent(self):
+        # Issue #2749 / ADR 0060: change-request is native and cannot reach composition or storage.
+        self.assertEqual(layer("flotilla-change-request"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-change-request", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-change-request: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-change-request", normal=("flotilla-forge-github", "flotilla-forge-forgejo")),
+            package("flotilla-core", normal=("flotilla-change-request",)),
+            package("flotilla-forge-github"), package("flotilla-forge-forgejo"),
+        )), [])
+
     def test_replication_is_native_and_independent(self):
         # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
         self.assertEqual(layer("flotilla-replication"), "native")

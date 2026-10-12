@@ -5,13 +5,19 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+flotilla-discovery-api = { path = "../flotilla-discovery-api" }
+flotilla-paths = { path = "../flotilla-paths" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-resources = { path = "../flotilla-resources" }
 flotilla-tls = { path = "../flotilla-tls" }
 reqwest = { workspace = true, features = ["json"] }
 serde_json.workspace = true
 urlencoding = "2"
+tracing.workspace = true
+dirs = "6"
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

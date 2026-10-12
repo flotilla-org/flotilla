@@ -13,7 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::providers::change_request::ChangeRequestTracker;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
 use flotilla_core::providers::issue_tracker::IssueProvider;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
@@ -1024,13 +1024,9 @@ impl ChangeRequestTracker for FakeChangeRequest {
     async fn get_change_request_for_admission(
         &self,
         id: &str,
-    ) -> Result<flotilla_core::providers::change_request::ChangeRequestAdmission, flotilla_provider_runtime::ObservationError> {
+    ) -> Result<flotilla_change_request::ChangeRequestAdmission, flotilla_provider_runtime::ObservationError> {
         let (id, change_request) = self.get_change_request(id).await?;
-        Ok(flotilla_core::providers::change_request::ChangeRequestAdmission {
-            id,
-            change_request,
-            base_ref: Some(self.admission_base_ref.clone()),
-        })
+        Ok(flotilla_change_request::ChangeRequestAdmission { id, change_request, base_ref: Some(self.admission_base_ref.clone()) })
     }
 
     async fn open_in_browser(&self, _id: &str) -> Result<(), String> {

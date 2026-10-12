@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_change_request::observation::ChangeRequestObservationSource;
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::{EnvironmentId, HostName};
 use flotilla_provider_runtime::ObservationError;
@@ -28,8 +30,6 @@ use crate::in_process::ConvoyPhase;
 use crate::in_process::CrewMessageSender;
 use crate::in_process::WorkCredentialReconciler;
 use crate::leaf_engine::LeafSubscriptionTable;
-use crate::providers::change_request::observation::ChangeRequestObservationSource;
-use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::discovery::fake_discovery;
 
 // Stand-in for forge I/O; these crew scenarios never request forge observations.

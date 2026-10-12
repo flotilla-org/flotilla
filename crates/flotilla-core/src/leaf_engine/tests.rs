@@ -7,6 +7,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_change_request::observation;
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_forge_github::github::GithubRateLimit;
 use flotilla_forge_github::github::GithubRateLimitKind;
 use flotilla_forge_github::github::GithubRetrySource;
@@ -42,10 +44,7 @@ use crate::change_request_observer::ChangeRequestRefresher;
 use crate::event_sink::broadcast_test_sink;
 use crate::issue_observer::IssueRefreshCadence;
 use crate::issue_observer::IssueRefresher;
-use crate::providers::change_request::observation;
-use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::replay::test_runner;
-use crate::testkits::replay::testing::fixture_path;
 use crate::testkits::replay::Masks;
 use crate::testkits::replay::Session;
 

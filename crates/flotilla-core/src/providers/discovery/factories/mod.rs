@@ -1,4 +1,5 @@
 use flotilla_ai_utility::factories::claude::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
+use flotilla_change_request::factories::{forgejo::ForgejoChangeRequestFactory, github::GitHubChangeRequestFactory};
 use flotilla_cloud_agent::factories::{claude::ClaudeCodingAgentFactory, codex::CodexCodingAgentFactory, cursor::CursorCodingAgentFactory};
 use flotilla_environment::factories::{docker, host_direct};
 pub mod github;
@@ -18,7 +19,7 @@ impl FactoryRegistry {
     pub fn default_all() -> Self {
         Self {
             vcs: vcs_factories(),
-            change_requests: vec![Box::new(github::GitHubChangeRequestFactory), Box::new(github::ForgejoChangeRequestFactory)],
+            change_requests: vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
             cloud_agents: vec![Box::new(ClaudeCodingAgentFactory), Box::new(CursorCodingAgentFactory), Box::new(CodexCodingAgentFactory)],
             ai_utilities: vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)],

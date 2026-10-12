@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, InputMeta,
@@ -10,7 +11,6 @@ use flotilla_resources::{
 
 use super::observation_support::{rest_admission_fixture, RestAdmissionLookup, RestAdmissionReply};
 use super::support::test_meta;
-use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::types::ChangeRequest;
 use crate::testkits::discovery::FakeChangeRequest;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;

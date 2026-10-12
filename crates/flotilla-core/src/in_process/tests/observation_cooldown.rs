@@ -5,6 +5,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use flotilla_change_request::observation::ChangeRequestObservationSource;
+use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::BoundObservations;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext};
 use flotilla_provider_runtime::ObservationError;
@@ -25,10 +29,6 @@ use crate::in_process::CachedObservation;
 use crate::in_process::ChangeRequestQueryPort;
 use crate::in_process::ProviderChangeRequestObservationSource;
 use crate::in_process::OBSERVATION_CACHE_FALLBACK_DELAY;
-use crate::providers::change_request::observation::ChangeRequestObservationSource;
-use crate::providers::change_request::observation::ChangeRequestRef;
-use crate::providers::change_request::BoundObservations;
-use crate::providers::change_request::ChangeRequestTracker;
 
 // #2543: scope waits use the latest deadline independently of batch ordering;
 // hard errors and untimed limits remain substantive refusals for their subjects.

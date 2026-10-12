@@ -13,6 +13,7 @@ skip-no-sandbox-tests = ["flotilla-store/skip-no-sandbox-tests", "flotilla-cloud
 flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
+flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }

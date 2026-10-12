@@ -1,3 +1,4 @@
+pub mod discovery;
 pub mod forge_budget;
 pub mod github;
 pub mod github_observation;

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use chrono::{DateTime, Utc};
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::{arg::shell_quote, Leaf, LeafAddress, LeafOperator};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
@@ -14,7 +15,7 @@ use flotilla_resources::{
 use super::sources::freshest_change_request_refs;
 use super::wake::{ConvoyRead, ReconcilerWake};
 use super::{CrewTurnIntent, LeafWatcher, UnableEvidenceKey};
-use crate::{in_process::convoy_message_address, providers::change_request::observation::ChangeRequestRef};
+use crate::in_process::convoy_message_address;
 
 pub(crate) fn crew_role_address(project: &str, convoy: &str, vessel: &str, role: &str) -> String {
     format!("{project}/{convoy}/{vessel}/{role}")

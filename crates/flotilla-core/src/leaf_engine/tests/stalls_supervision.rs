@@ -1,7 +1,7 @@
+use flotilla_change_request::observation;
 use flotilla_store_memory::InMemoryBackend;
 
 use super::*;
-use crate::providers::change_request::observation;
 
 // #2560: the inactivity bound follows the newest tool/hook evidence, not
 // total turn age or refreshed screen timestamps. Generated ages straddle

@@ -133,12 +133,13 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-terminal` | Terminal pool traits, Cleat and passthrough adapters, factories and shared session scans |
 | `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
 | `flotilla-provider-runtime` | Command and HTTP runners, generic invocation macros, neutral observation errors, environment variables, shared scans and bounded host probes |
-| `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry and host budget accounting |
+| `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry, host budget accounting and discovery-time repository resolution |
 | `flotilla-environment` | Environment and image capability traits, Docker and host-direct adapters, factories and transport hop resolution |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
 | `flotilla-ai-utility` | AI utility trait, Claude API/CLI implementations and factories |
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |
-| `flotilla-forge-forgejo` | Shared Forgejo HTTP client and authentication values |
+| `flotilla-forge-forgejo` | Shared Forgejo HTTP client, authentication values and discovery-time credential resolution |
+| `flotilla-change-request` | Change-request tracker and observation-source traits, GitHub/Forgejo implementations, branch-absence observer and factories |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
@@ -217,7 +218,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 Provider traits live in their type crates as they are extracted, with remaining traits under `crates/flotilla-core/src/providers/`:
 
 - **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
-- **ChangeRequestTracker** (`crates/flotilla-core/src/providers/change_request/github.rs`)
+- **ChangeRequestTracker** (`crates/flotilla-change-request/src/lib.rs`, `crates/flotilla-change-request/src/github.rs`, `crates/flotilla-change-request/src/forgejo.rs`)
 - **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
 - **CloudAgentService** (`crates/flotilla-cloud-agent/src/claude.rs`, `crates/flotilla-cloud-agent/src/codex.rs`, `crates/flotilla-cloud-agent/src/cursor.rs`)
 - **AiUtility** (`crates/flotilla-ai-utility/src/claude_api.rs`, `crates/flotilla-ai-utility/src/claude_cli.rs`)

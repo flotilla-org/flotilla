@@ -9,7 +9,6 @@ pub mod agents;
 pub mod aggregator_projection;
 pub mod attachable;
 pub mod awareness_projection;
-mod branch_lookup_observer;
 pub mod change_request_observer;
 mod charter_notifications;
 pub mod charter_store;

@@ -8,7 +8,9 @@ use std::{
 use flotilla_provider_runtime::ObservationError;
 use tokio::time::{Duration, Instant};
 
-use crate::providers::{change_request::ChangeRequestTracker, types::ChangeRequest};
+use flotilla_protocol::ChangeRequest;
+
+use crate::ChangeRequestTracker;
 
 const ABSENCE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_ABSENCES: usize = 1024;
@@ -22,12 +24,12 @@ struct Absence {
 /// Replacing or retiring a provider invalidates its observations. Positive
 /// results and errors are always read fresh; only a complete scan proves absence.
 #[derive(Default)]
-pub(crate) struct BranchLookupObserver {
+pub struct BranchLookupObserver {
     absences: Mutex<HashMap<(String, String), Absence>>,
 }
 
 impl BranchLookupObserver {
-    pub(crate) async fn find(
+    pub async fn find(
         &self,
         repository: &str,
         provider: &Arc<dyn ChangeRequestTracker>,

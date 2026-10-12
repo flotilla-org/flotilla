@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     ConvoyRepositorySpec, Host as ResourceHost, HostSpec, HostStatus, InputMeta, Project, ProjectSpec, Repository, RepositorySpec,
@@ -15,8 +17,6 @@ use super::support::{test_meta, SuspendedBoardProvider};
 use crate::config::ConfigStore;
 use crate::forge_observation::OWNER_LOCAL_INCREMENTAL_READ_ERROR;
 use crate::in_process::InProcessDaemon;
-use crate::providers::change_request::observation::ChangeRequestRef;
-use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::types::ChangeRequest;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
 
