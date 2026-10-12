@@ -180,7 +180,8 @@ that do not start with an ASCII letter or digit, use characters other than
 ASCII letters, digits, `-`, `_` and `.`, or repeat another dispatch promise's
 label in the convoy. Bootstrap opens
 each one as a dispatch-sourced promise whose identifier is the label, so its
-owner submits with `flotilla crew submit --promise api-split`. Crews cannot
+owner submits with `flotilla crew submit --promise api-split`. Labels are
+case-sensitive, like every promise identifier: `API` and `api` are distinct. Crews cannot
 retract dispatch-sourced promises.
 
 Previous-generation `completion_conditions` and `completion_expectations` decode
