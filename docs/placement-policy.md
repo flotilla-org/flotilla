@@ -27,7 +27,10 @@ commits and detached worktree HEADs. Ignored build/cache outputs and generated
 already published commit is not preserved as a separate name; tags pointing to
 unpublished commits prevent reclamation. Remote refs are cached publication
 facts; stale refs can conservatively refuse removal. Nested paths are normalized
-through the owning runner before membership and cleanliness checks.
+through the owning runner before membership and cleanliness checks. This requires
+`pwd -P` on that runner. A native Windows host without a compatible `pwd` binary
+reports Unknown cleanliness and preserves the clone; volume comparison support
+alone does not provide portable worktree teardown.
 
 `worktree_on_host_and_mount: { mount_path: /workspace }` retains the previous
 shared-clone worktree strategy. `fresh_clone_in_container: { clone_path:
