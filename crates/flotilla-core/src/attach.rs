@@ -1511,7 +1511,8 @@ mod tests {
             assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
             assert_eq!(reads.calls_by_kind().get("TerminalSession"), Some(&1));
             // Host placement lookups list the Host catalog per hop: flat in
-            // unrelated convoys and messages, but a candidate for a view.
+            // unrelated convoys and messages, but not the target. Tighten this
+            // bound when #3078 reads the catalog once per request.
             reads.assert_within(
                 &ReadBudget::new()
                     .objects("Convoy", ReadOperation::Query, 1, 1)
