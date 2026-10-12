@@ -2709,11 +2709,13 @@ impl IssueProvider for MockIssueProvider {
 
 // Post-install contains paths from the installing host. Pin router refusal of a
 // remote target so delivery cannot accidentally drain or write on another host.
-async fn fleet_post_install_target_scenario(remote: bool) {
+// Local completion and readable diagnostics must survive unrelated event traffic.
+async fn fleet_post_install_target_scenario(remote: bool, background_events: usize) {
+    const BACKGROUND_COMMAND_ID: u64 = u64::MAX;
+
     let topology =
         spawn_in_memory_request_topology(empty_daemon_named("leader").await, empty_daemon_named("follower").await).await.expect("topology");
     let directory = tempfile::tempdir().expect("diagnostics directory");
-    let mut events = topology.client.subscribe();
     let command = Command::builder()
         .node_id(if remote { topology.follower.node_id().clone() } else { topology.leader.node_id().clone() })
         .action(CommandAction::FleetPostInstall {
@@ -2722,12 +2724,51 @@ async fn fleet_post_install_target_scenario(remote: bool) {
             diagnostics_dir: directory.path().join("diagnostics"),
         })
         .build();
-    let dispatched = topology.client.execute(command).await;
+    let mut observer = topology.client.subscribe();
+    let dispatch = async {
+        // Deliver unrelated traffic through the real session before dispatch
+        // returns. The observer proves delivery without a sleep or clock budget.
+        for _ in 0..background_events {
+            topology.leader.send_event(DaemonEvent::CommandStarted {
+                command_id: BACKGROUND_COMMAND_ID,
+                node_id: topology.leader.node_id().clone(),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "test".into(), path: "background".into() },
+                repo: None,
+                description: "unrelated command".into(),
+            });
+            loop {
+                if matches!(
+                    observer.recv().await.expect("background event"),
+                    DaemonEvent::CommandStarted { command_id: BACKGROUND_COMMAND_ID, .. }
+                ) {
+                    break;
+                }
+            }
+        }
+        topology.client.execute(command).await
+    };
     if remote {
-        assert!(matches!(dispatched, Err(message) if message.contains("must run on the installing host")));
+        // Refusal arrives in the dispatch response; no completion subscription is needed.
+        // The observer drains each injected event before the next is sent.
+        assert!(matches!(dispatch.await, Err(message) if message.contains("must run on the installing host")));
         assert!(!directory.path().join("diagnostics").exists());
     } else {
-        let result = await_command_result(&mut events, dispatched.expect("dispatch local post-install")).await;
+        let mut events = topology.client.subscribe();
+        // Execute returns only after diagnostics I/O and command completion.
+        // Drain concurrently: waiting for its response first lets unrelated
+        // peer events overwrite the bounded subscription under workspace load.
+        let completion = async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id, node_id, result, .. } = events.recv().await.expect("daemon event") {
+                    // Match dispatch's error type so try_join can cancel this waiter on rejection.
+                    return Ok::<_, String>((command_id, node_id, result));
+                }
+            }
+        };
+        // A rejected dispatch must fail immediately rather than leave completion waiting.
+        let (dispatched, (finished_id, node_id, result)) = tokio::try_join!(dispatch, completion).expect("dispatch local post-install");
+        assert_eq!(finished_id, dispatched);
+        assert_eq!(node_id, *topology.leader.node_id());
         let CommandValue::FleetPostInstall { report, .. } = result else { panic!("expected post-install report: {result:?}") };
         assert_eq!(report["generation"], "new-gen");
         let saved = std::fs::read_to_string(report["diagnostics_path"].as_str().expect("diagnostics path")).expect("retained report");
@@ -2738,19 +2779,22 @@ async fn fleet_post_install_target_scenario(remote: bool) {
 #[tokio::test]
 async fn fleet_post_install_target_pinned_rows() {
     for remote in [false, true] {
-        fleet_post_install_target_scenario(remote).await;
+        for background_events in [0, 256, 257, 512] {
+            fleet_post_install_target_scenario(remote, background_events).await;
+        }
     }
 }
 
 #[hegel::test]
 fn generated_fleet_post_install_target(tc: hegel::TestCase) {
-    // Enumerate both router targets: local execution/retention and remote refusal.
+    // Both targets and traffic counts spanning the client buffer boundary.
     let remote = tc.draw(hegel::generators::booleans());
+    let background_events = tc.draw(gs::integers::<usize>().min_value(0).max_value(512));
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime")
-        .block_on(fleet_post_install_target_scenario(remote));
+        .block_on(fleet_post_install_target_scenario(remote, background_events));
 }
 
 #[tokio::test]
