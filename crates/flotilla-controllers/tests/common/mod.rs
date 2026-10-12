@@ -379,6 +379,7 @@ pub async fn create_ready_checkout(
             &fixture.name,
             &created.metadata.resource_version,
             &CheckoutStatus {
+                degraded: None,
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(fixture.path.clone()),

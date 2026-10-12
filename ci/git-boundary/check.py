@@ -232,7 +232,7 @@ def test_modules(source, path, production=False):
     return result
 
 
-def violations(source, path, production=False):
+def violations(source, path, production=False, check_node=None):
     fixture = integration_test_path(path) and not production
     if fixture:
         return []
@@ -240,7 +240,10 @@ def violations(source, path, production=False):
     found = []
 
     def visit(node):
-        if (not exempt(path, production) and raw_command(node, {"git"}, RUN_METHODS)) or runtime_violation(node, path):
+        violation = check_node(node) if check_node else (
+            (not exempt(path, production) and raw_command(node, {"git"}, RUN_METHODS)) or runtime_violation(node, path)
+        )
+        if violation:
             found.append(node.range().start.line + 1)
         skip = False
         for child in node.children():
@@ -258,6 +261,31 @@ def violations(source, path, production=False):
 
     visit(root)
     return sorted(set(found))
+
+
+def runner_wrapper_violations(source, path, production=False):
+    """A runner must explicitly compare, forward, or refuse in its own namespace."""
+    def missing_comparison(node):
+        if node.kind() != "impl_item":
+            return False
+        trait = node.field("trait")
+        if trait is None or trait.text().rsplit("::", 1)[-1] != "CommandRunner":
+            return False
+        body = node.field("body")
+        if body is None:
+            return True
+        skip = False
+        for member in body.children():
+            if member.kind() in {"attribute_item", "inner_attribute_item"}:
+                skip = skip or test_attribute(member)
+                continue
+            if not member.is_named() or member.kind() in {"line_comment", "block_comment"}:
+                continue
+            if not skip and member.kind() == "function_item" and member.field("name").text() == "same_filesystem":
+                return False
+            skip = False
+        return True
+    return violations(source, path, production, check_node=missing_comparison)
 
 
 def module_descendant(file, modules):
@@ -317,6 +345,10 @@ def main():
     for file, lines in results.items():
         for line in lines:
             print(f"{file}:{line}: operation boundary violation: use Vcs or environment capability traits; keep runtime commands and concrete adapters in their implementations")
+            failed = True
+    for file, lines in scan_sources(sources, runner_wrapper_violations).items():
+        for line in lines:
+            print(f"{file}:{line}: CommandRunner must explicitly implement same_filesystem: compare locally, forward transparently, or refuse a different namespace")
             failed = True
     # Imported here: store_reads builds on this module's traversal helpers.
     import store_reads

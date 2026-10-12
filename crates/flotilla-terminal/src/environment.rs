@@ -109,6 +109,10 @@ impl ControlledCommandRunner {
 
 #[async_trait]
 impl CommandRunner for ControlledCommandRunner {
+    async fn same_filesystem(&self, source: &Path, destination: &Path) -> Result<bool, String> {
+        self.inner.same_filesystem(source, destination).await
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let args = self.arguments(cmd, args);
         self.inner.run("/usr/bin/env", &args.iter().map(String::as_str).collect::<Vec<_>>(), cwd, label).await

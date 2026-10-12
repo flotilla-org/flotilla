@@ -136,6 +136,7 @@ pub enum DockerImagePullPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum DockerCheckoutStrategy {
     WorktreeOnHostAndMount { mount_path: String },
+    LocalCloneOnHostAndMount { mount_path: String },
     FreshCloneInContainer { clone_path: String },
 }
 

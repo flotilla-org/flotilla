@@ -66,6 +66,8 @@ const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
 #[derive(Default)]
 struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
+    local_clone_calls: Mutex<Vec<(String, String, String, String)>>,
+    local_clone_intents: Mutex<Vec<flotilla_vcs::vcs::LocalCloneIntent>>,
     removal_attempts: Mutex<Option<watch::Sender<usize>>>,
     inspections: Mutex<usize>,
     protections: Mutex<Vec<(String, String, String, String)>>,
@@ -154,6 +156,19 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         Ok(PreparedCheckout { commit: Some("base-commit".into()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy })
     }
 
+    // VCS process boundary fake: record host routing and the explicit copy fallback.
+    async fn create_local_clone_in(
+        &self,
+        env_ref: &str,
+        request: flotilla_vcs::vcs::LocalCloneRequest<'_>,
+    ) -> Result<(PreparedCheckout, Option<String>), String> {
+        self.local_clone_intents.lock().expect("intents").push(request.intent);
+        self.local_clone_calls.lock().unwrap().push((env_ref.into(), request.source.into(), request.branch.into(), request.target.into()));
+        Ok((
+            PreparedCheckout { commit: Some("base-tip".into()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy },
+            Some("objects copied across filesystems".into()),
+        ))
+    }
     async fn create_fresh_clone(
         &self,
         _repo_url: &str,
@@ -190,6 +205,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
             | CheckoutRemoval::ForcedWorktree { target_path, .. }
             | CheckoutRemoval::LandedWorktree { target_path, .. }
             | CheckoutRemoval::OrphanedWorktree { target_path }
+            | CheckoutRemoval::LocalClone { target_path }
             | CheckoutRemoval::FreshClone { target_path } => target_path,
         };
         if self.blocked_removal_target.as_deref() == Some(target_path) {
@@ -249,6 +265,7 @@ async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
             .expect("continuing convoy");
         metadata.labels.insert(CONVOY_LABEL.into(), "continuing-owner".into());
         CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+            source_clone_ref: None,
             repo_ref: repo,
             env_ref: "host-direct-a".into(),
             url: REPO_URL.into(),
@@ -467,6 +484,7 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
             .git_ref("feature/cleanup".to_string())
             .path("/checkouts/convoy-a/repo.feature-cleanup".to_string())
             .fresh_clone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-a".to_string(),
                 r#ref: "feature/cleanup".to_string(),
@@ -612,6 +630,7 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
         .create(
             &meta,
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-a".to_string(),
                 r#ref: format!("feature/{name}"),
@@ -627,6 +646,7 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
             name,
             &created.metadata.resource_version,
             &CheckoutStatus {
+                degraded: None,
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(target_path.to_string()),
@@ -707,6 +727,7 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
             "checkout-a",
             &created.metadata.resource_version,
             &CheckoutStatus {
+                degraded: None,
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
@@ -919,6 +940,7 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
             "checkout-a",
             &created.metadata.resource_version,
             &CheckoutStatus {
+                degraded: None,
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
@@ -972,6 +994,7 @@ async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fre
             "checkout-a",
             &created.metadata.resource_version,
             &CheckoutStatus {
+                degraded: None,
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
@@ -1065,6 +1088,7 @@ async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() 
                     .build()
                     .with_lifecycle_authority(LifecycleAuthority::Adopted),
                 &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                    source_clone_ref: None,
                     repo_ref: RepositoryKey(repo_key(REPO_URL)),
                     env_ref: "host-direct-checkout-authority".to_string(),
                     r#ref: "feature/cross-host".to_string(),
@@ -1153,6 +1177,7 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Managed),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-checkout-authority".to_string(),
                 r#ref: "feature/cross-host".to_string(),
@@ -1201,6 +1226,7 @@ async fn annotated_checkout_finds_its_local_deleting_convoy() {
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Managed),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-local".to_string(),
                 r#ref: "feature/local".to_string(),
@@ -1248,6 +1274,7 @@ async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_referen
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Managed),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-checkout-authority".to_string(),
                 r#ref: "feature/old-convoy".to_string(),
@@ -1341,6 +1368,7 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
                 ]))
                 .build(),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-a".to_string(),
                 r#ref: "feature/a".to_string(),
@@ -1542,4 +1570,116 @@ fn continued_checkout_reservation_follows_owner_lifecycle(tc: hegel::TestCase) {
         convoys.delete("old-owner").await.expect("delete owner");
         assert!(matches!(reconciler.prepare(&new).await.expect("deleted binding"), CheckoutPrepared::Ready { .. }));
     });
+}
+
+// #3090: a local clone waits for its managed Clone, materialises on the host,
+// preserves provenance and copy degradation, then uses clone removal at teardown.
+#[tokio::test]
+async fn local_clone_waits_for_source_and_records_host_materialisation_and_teardown() {
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let clones = backend.clone().using::<Clone>(NAMESPACE);
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let key = RepositoryKey(repo_key(REPO_URL));
+    let source = clones
+        .create(
+            &meta("source"),
+            &CloneSpec { repo_ref: key.clone(), url: REPO_URL.into(), env_ref: "host".into(), path: "/host/repos/source".into() },
+        )
+        .await
+        .unwrap();
+    let checkout = checkouts
+        .create(
+            &meta("local"),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: Some("source".into()),
+                repo_ref: key,
+                env_ref: "host".into(),
+                r#ref: "crew".into(),
+                base_ref: Some("main".into()),
+                target_path: "/host/repos/convoy/work".into(),
+                url: REPO_URL.into(),
+            }),
+        )
+        .await
+        .unwrap();
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    assert!(matches!(reconciler.prepare(&checkout).await.unwrap(), CheckoutPrepared::Waiting));
+    assert!(runtime.local_clone_calls.lock().unwrap().is_empty());
+    clones
+        .update_status("source", &source.metadata.resource_version, &CloneStatus { phase: ClonePhase::Ready, ..Default::default() })
+        .await
+        .unwrap();
+    let prepared = reconciler.prepare(&checkout).await.unwrap();
+    assert!(
+        matches!(prepared, CheckoutPrepared::Ready { ref prepared } if prepared.branch_provenance == CheckoutBranchProvenance::CreatedForConvoy)
+    );
+    assert_eq!(
+        *runtime.local_clone_calls.lock().unwrap(),
+        vec![("host".into(), "/host/repos/source".into(), "crew".into(), "/host/repos/convoy/work".into())]
+    );
+    let outcome = reconciler.reconcile(&checkout, &prepared, chrono::Utc::now());
+    apply_status_patch(&checkouts, "local", outcome.patch.as_ref().unwrap()).await.unwrap();
+    let ready = checkouts.get("local").await.unwrap();
+    assert_eq!(ready.status.as_ref().unwrap().degraded.as_deref(), Some("objects copied across filesystems"));
+    assert_eq!(ready.status.as_ref().unwrap().branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
+    reconciler.run_finalizer(&ready).await.unwrap();
+    assert_eq!(*runtime.removals.lock().unwrap(), vec![CheckoutRemoval::LocalClone { target_path: "/host/repos/convoy/work".into() }]);
+}
+
+// A Ready sibling authorises only its own convoy's branch. Late vessels inherit
+// that remote tip without being rejected as a new forge head; other convoys refuse.
+#[tokio::test]
+async fn ready_local_sibling_authorises_shared_branch_only_within_its_convoy() {
+    use flotilla_vcs::vcs::LocalCloneIntent;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    common::create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "work", REPO_URL, "crew").await;
+    common::create_convoy_with_single_task(&backend, NAMESPACE, "convoy-foreign", "work", REPO_URL, "crew").await;
+    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "host", "/host/repos/source").await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let make_spec = |path: &str| {
+        CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+            source_clone_ref: Some("source".into()),
+            repo_ref: RepositoryKey(repo_key(REPO_URL)),
+            env_ref: "host".into(),
+            r#ref: "crew".into(),
+            base_ref: Some("main".into()),
+            target_path: path.into(),
+            url: REPO_URL.into(),
+        })
+    };
+    let mut first_meta = meta("first");
+    first_meta.labels.insert(CONVOY_LABEL.into(), "convoy-shared".into());
+    let first = checkouts.create(&first_meta, &make_spec("/host/repos/convoy-shared/first")).await.expect("first");
+    checkouts
+        .update_status(
+            "first",
+            &first.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ready sibling");
+    let mut late_meta = meta("late");
+    late_meta.labels.insert(CONVOY_LABEL.into(), "convoy-shared".into());
+    let late = checkouts.create(&late_meta, &make_spec("/host/repos/convoy-shared/late")).await.expect("late");
+    let runtime = Arc::new(RecordingCheckoutRuntime { validation_failures: Mutex::new(1), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    assert!(matches!(reconciler.prepare(&late).await.expect("late prepare"), CheckoutPrepared::Ready { .. }));
+    assert_eq!(*runtime.local_clone_intents.lock().expect("intents"), vec![LocalCloneIntent::ShareConvoyBranch]);
+    assert_eq!(
+        *runtime.validation_failures.lock().expect("validation counter"),
+        1,
+        "the established branch is not treated as a new forge head"
+    );
+    let mut foreign_meta = meta("foreign");
+    foreign_meta.labels.insert(CONVOY_LABEL.into(), "convoy-foreign".into());
+    let foreign = checkouts.create(&foreign_meta, &make_spec("/host/repos/convoy-foreign/work")).await.expect("foreign");
+    assert!(
+        matches!(reconciler.prepare(&foreign).await.expect("foreign prepare"), CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout"))
+    );
+    assert_eq!(runtime.local_clone_intents.lock().expect("intents").len(), 1);
 }

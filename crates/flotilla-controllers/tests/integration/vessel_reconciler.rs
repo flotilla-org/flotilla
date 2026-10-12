@@ -425,6 +425,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
             &checkout_meta.name,
             &checkout.metadata.resource_version,
             &CheckoutStatus {
+                degraded: Default::default(),
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: checkout_spec.target_path().map(str::to_string),
@@ -740,6 +741,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 &meta.name,
                 &created.metadata.resource_version,
                 &CheckoutStatus {
+                    degraded: Default::default(),
                     clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: spec.target_path().map(str::to_string),
@@ -932,6 +934,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                 &name,
                 &created.metadata.resource_version,
                 &CheckoutStatus {
+                    degraded: Default::default(),
                     clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some(path),
@@ -1412,6 +1415,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             "adopted-cleat-scoped",
             &adopted.metadata.resource_version,
             &CheckoutStatus {
+                degraded: Default::default(),
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(adopted_path.to_string()),
@@ -3037,6 +3041,7 @@ fn worktree_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, clone
 
 fn fresh_clone_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, url: &str) -> flotilla_resources::FreshCloneCheckoutSpec {
     flotilla_resources::FreshCloneCheckoutSpec {
+        source_clone_ref: None,
         repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key(
             &canonicalize_repo_url(REPO_URL).expect("repo canonicalization"),
         )),
@@ -3290,6 +3295,7 @@ async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &st
             name,
             &created.metadata.resource_version,
             &CheckoutStatus {
+                degraded: Default::default(),
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(path.to_string()),
@@ -3323,6 +3329,7 @@ async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBa
             name,
             &checkout.metadata.resource_version,
             &CheckoutStatus {
+                degraded: Default::default(),
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: None,
@@ -3532,4 +3539,99 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
     let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
     assert!(outcome.actuations.is_empty());
     assert!(matches!(outcome.patch, Some(VesselStatusPatch::MarkProvisioning { .. })));
+}
+
+// #3090: host clone and checkout must precede container provisioning. The vessel
+// owns a self-contained checkout and grants only a single writable workspace bind.
+#[tokio::test]
+async fn local_clone_provisioning_orders_host_checkout_before_container_and_surfaces_copy() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-local", "implement", REPO_URL, GIT_REF).await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/host/repos").await;
+    create_policy(
+        &backend,
+        NAMESPACE,
+        "policy-local",
+        PlacementPolicySpec::builder()
+            .pool("cleat".into())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: HOST_REF.into(),
+                image: "ghcr.io/flotilla/dev:latest".into(),
+                pull_policy: Default::default(),
+                agent_adapters: BTreeSet::from(["codex".into()]),
+                default_cwd: None,
+                env: Default::default(),
+                checkout: DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path: "/workspace".into() },
+                legacy_image_baseline_ref: None,
+                memory_policy: Default::default(),
+            })
+            .build(),
+    )
+    .await;
+    let vessel = create_workspace(&backend, NAMESPACE, "convoy-local-work", "convoy-local", "implement", "policy-local", REPO_URL).await;
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
+    let prepared = reconciler.prepare(&vessel).await.expect("plan host checkout");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    assert!(!outcome.actuations.iter().any(|action| matches!(action, Actuation::CreateEnvironment { .. })));
+    let clone = outcome
+        .actuations
+        .iter()
+        .find_map(|action| match action {
+            Actuation::CreateClone { meta, spec } => Some((meta, spec)),
+            _ => None,
+        })
+        .expect("managed clone demand");
+    let checkout = outcome
+        .actuations
+        .iter()
+        .find_map(|action| match action {
+            Actuation::CreateCheckout { meta, spec } => Some((meta, spec)),
+            _ => None,
+        })
+        .expect("checkout demand");
+    let CheckoutSpec::FreshClone(spec) = checkout.1 else { panic!("self-contained clone required") };
+    assert_eq!(spec.source_clone_ref.as_deref(), Some(clone.0.name.as_str()));
+    assert_eq!(spec.env_ref, host_direct_env_name());
+    assert!(spec.target_path.starts_with("/host/repos/convoy-local-work/"));
+    assert!(clone.1.path.starts_with("/host/repos/"));
+    assert_ne!(spec.target_path, clone.1.path);
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let object = checkouts.create(checkout.0, checkout.1).await.expect("checkout resource");
+    checkouts
+        .update_status(
+            &object.metadata.name,
+            &object.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                path: Some(spec.target_path.clone()),
+                degraded: Some("objects copied across filesystems".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ready local clone");
+    let prepared = reconciler.prepare(&vessel).await.expect("plan container");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    let docker = outcome
+        .actuations
+        .iter()
+        .find_map(|action| match action {
+            Actuation::CreateEnvironment { spec, .. } => spec.docker.as_ref(),
+            _ => None,
+        })
+        .expect("container after checkout");
+    assert_eq!(
+        docker.mounts,
+        vec![flotilla_resources::EnvironmentMount {
+            source_path: spec.target_path.clone(),
+            target_path: "/workspace".into(),
+            mode: flotilla_resources::EnvironmentMountMode::Rw,
+        }]
+    );
+    assert!(!docker.env.contains_key("GIT_CONFIG_COUNT"), "tracking lives in the owned repository config");
+    let persisted = backend.using::<Vessel>(NAMESPACE).get(&vessel.metadata.name).await.expect("vessel");
+    assert_eq!(
+        persisted.status.unwrap().degraded.get(&object.metadata.name).map(String::as_str),
+        Some("objects copied across filesystems")
+    );
 }

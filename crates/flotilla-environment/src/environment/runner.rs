@@ -77,6 +77,10 @@ impl DockerEnvironmentRunner {
 
 #[async_trait]
 impl CommandRunner for DockerEnvironmentRunner {
+    async fn same_filesystem(&self, _source: &Path, _destination: &Path) -> Result<bool, String> {
+        Err("host clone filesystem comparison must run before container provisioning".into())
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let docker_args = self.docker_exec_args(cmd, args, cwd, false);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();

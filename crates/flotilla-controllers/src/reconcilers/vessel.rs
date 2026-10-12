@@ -274,7 +274,8 @@ enum PlacementStrategy {
         host_ref: String,
         pool: String,
     },
-    DockerWorktreeOnHostAndMount {
+    DockerHostCheckoutAndMount {
+        local_clone: bool,
         host_ref: String,
         pool: String,
         image: DockerImageSource,
@@ -298,7 +299,7 @@ impl PlacementStrategy {
     fn canonicalize_host_ref(&mut self, host_ref: &str) {
         match self {
             Self::HostDirect { host_ref: strategy_host_ref, .. }
-            | Self::DockerWorktreeOnHostAndMount { host_ref: strategy_host_ref, .. }
+            | Self::DockerHostCheckoutAndMount { host_ref: strategy_host_ref, .. }
             | Self::DockerFreshCloneInContainer { host_ref: strategy_host_ref, .. } => host_ref.clone_into(strategy_host_ref),
         }
     }
@@ -687,13 +688,18 @@ impl Reconciler for VesselReconciler {
             _ => None,
         };
 
+        let workspace_convoy_slug = if matches!(strategy, PlacementStrategy::DockerHostCheckoutAndMount { local_clone: true, .. }) {
+            obj.metadata.name.as_str()
+        } else {
+            convoy_checkout_slug.as_str()
+        };
         let workspace_root = if multi_repository {
             match &strategy {
-                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
                     format!(
                         "{}/{}/{}",
                         shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
-                        convoy_checkout_slug,
+                        workspace_convoy_slug,
                         checkout_slug.as_deref().expect("repository workspace requires a branch")
                     )
                 }
@@ -703,6 +709,7 @@ impl Reconciler for VesselReconciler {
             String::new()
         };
         let mut checkout_refs = BTreeMap::new();
+        let mut degraded = BTreeMap::new();
         let mut checkout_paths = BTreeMap::new();
         let mut contained_worktree_checkouts = Vec::new();
         // The vessel shares one environment; Git ignores tracking entries for branches absent from a checkout.
@@ -795,7 +802,13 @@ impl Reconciler for VesselReconciler {
                 None
             };
             let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| match &strategy {
-                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => checkout_name(
+                PlacementStrategy::DockerHostCheckoutAndMount { local_clone: true, .. } => checkout_name(
+                    &obj.metadata.name,
+                    &convoy_repository.workspace_slug,
+                    multi_repository,
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
+                ),
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => checkout_name(
                     &convoy.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
@@ -809,13 +822,13 @@ impl Reconciler for VesselReconciler {
                 ),
             });
             let checkout_target_path = match &strategy {
-                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
                     if multi_repository {
                         format!("{workspace_root}/{}", convoy_repository.workspace_slug)
                     } else {
                         checkout_target_path(
                             shared_clone_root.as_deref().expect("shared-clone placement has a root"),
-                            &convoy_checkout_slug,
+                            workspace_convoy_slug,
                             &convoy_repository.workspace_slug,
                             checkout_slug.as_deref().expect("repository checkout requires a branch"),
                         )
@@ -856,6 +869,9 @@ impl Reconciler for VesselReconciler {
                         return Ok(VesselPrepared::failed(message));
                     }
                     if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
+                        if let Some(message) = existing.status.as_ref().and_then(|status| status.degraded.clone()) {
+                            degraded.insert(checkout_name.clone(), message);
+                        }
                         let Some(path) = existing
                             .status
                             .as_ref()
@@ -864,7 +880,7 @@ impl Reconciler for VesselReconciler {
                         else {
                             return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is ready but has no target path")));
                         };
-                        if matches!(&strategy, PlacementStrategy::DockerWorktreeOnHostAndMount { .. }) {
+                        if matches!(&strategy, PlacementStrategy::DockerHostCheckoutAndMount { local_clone: false, .. }) {
                             if let CheckoutSpec::Worktree(spec) = &existing.spec {
                                 contained_branches.insert(spec.r#ref.strip_prefix("refs/heads/").unwrap_or(&spec.r#ref).to_string());
                             }
@@ -901,7 +917,18 @@ impl Reconciler for VesselReconciler {
                     recent.insert(checkout_name.clone(), now);
                     drop(recent);
                     let spec = match &strategy {
-                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                        PlacementStrategy::DockerHostCheckoutAndMount { local_clone: true, .. } => {
+                            CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                                source_clone_ref: clone_name.clone(),
+                                repo_ref: repository_key.clone(),
+                                env_ref: clone_env_ref.clone(),
+                                r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
+                                base_ref: Some(convoy_repository.source_ref.clone()),
+                                target_path: checkout_target_path,
+                                url: convoy_repository.url.clone(),
+                            })
+                        }
+                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerHostCheckoutAndMount { .. } => {
                             CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                                 repo_ref: repository_key.clone(),
                                 env_ref: clone_env_ref.clone(),
@@ -912,6 +939,7 @@ impl Reconciler for VesselReconciler {
                             })
                         }
                         PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                            source_clone_ref: None,
                             repo_ref: repository_key.clone(),
                             env_ref: precreated_environment
                                 .as_ref()
@@ -946,6 +974,14 @@ impl Reconciler for VesselReconciler {
                 actuations,
             ));
         }
+        if obj.status.as_ref().map_or(!degraded.is_empty(), |status| status.degraded != degraded) {
+            flotilla_store::apply_status_patch(
+                &self.backend.using::<Vessel>(&self.namespace),
+                &obj.metadata.name,
+                &VesselStatusPatch::ObserveDegradation { conditions: degraded },
+            )
+            .await?;
+        }
         let has_repositories = !repository_refs.is_empty();
         let workspace_root = if multi_repository {
             workspace_root
@@ -977,12 +1013,13 @@ impl Reconciler for VesselReconciler {
                 }
                 (env_name, None)
             }
-            PlacementStrategy::DockerWorktreeOnHostAndMount { host_ref, image, pull_policy, env, mount_path, .. } => {
-                let git_mounts = match self.contained_git_mounts(&contained_worktree_checkouts).await {
-                    Ok(mounts) => mounts,
-                    Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
-                    Err(error) => return Err(error),
-                };
+            PlacementStrategy::DockerHostCheckoutAndMount { local_clone, host_ref, image, pull_policy, env, mount_path, .. } => {
+                let git_mounts =
+                    match if *local_clone { Ok(Vec::new()) } else { self.contained_git_mounts(&contained_worktree_checkouts).await } {
+                        Ok(mounts) => mounts,
+                        Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
+                        Err(error) => return Err(error),
+                    };
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
@@ -996,7 +1033,19 @@ impl Reconciler for VesselReconciler {
                                 docker.mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if !git_mounts_match(&existing_git_mounts, &git_mounts) {
+                        let local_workspace_mount_matches = !*local_clone || {
+                            let actual = existing
+                                .spec
+                                .docker
+                                .as_ref()
+                                .and_then(|docker| docker.mounts.iter().find(|mount| mount.target_path == *mount_path));
+                            match (has_repositories, actual) {
+                                (true, Some(mount)) => mount.source_path == workspace_root && mount.mode == EnvironmentMountMode::Rw,
+                                (false, None) => true,
+                                _ => false,
+                            }
+                        };
+                        if !local_workspace_mount_matches || !git_mounts_match(&existing_git_mounts, &git_mounts) {
                             return Ok(VesselPrepared {
                                 patch: PlannedPatch::EnvironmentRecreation {
                                     observed_policy_ref: placement_policy.metadata.name.clone(),
@@ -1136,7 +1185,7 @@ impl Reconciler for VesselReconciler {
                     || issue_repository_refs.iter().flatten().any(|relevant| *relevant == *repo_ref)
             })
             .map(|(repo_ref, path)| match &strategy {
-                PlacementStrategy::DockerWorktreeOnHostAndMount { mount_path, .. } => {
+                PlacementStrategy::DockerHostCheckoutAndMount { mount_path, .. } => {
                     if multi_repository {
                         format!("{}/{}", mount_path.trim_end_matches('/'), workspace_slugs[repo_ref])
                     } else {
@@ -1557,7 +1606,9 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
 
     if let Some(docker) = &spec.docker_per_vessel {
         return match &docker.checkout {
-            DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path } => Ok(PlacementStrategy::DockerWorktreeOnHostAndMount {
+            DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path }
+            | DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path } => Ok(PlacementStrategy::DockerHostCheckoutAndMount {
+                local_clone: matches!(docker.checkout, DockerCheckoutStrategy::LocalCloneOnHostAndMount { .. }),
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
                 image: docker.image.clone(),
@@ -1715,14 +1766,14 @@ impl PlacementStrategy {
     fn effective_stance(&self) -> Stance {
         match self {
             Self::HostDirect { .. } => Stance::Trusted,
-            Self::DockerWorktreeOnHostAndMount { .. } | Self::DockerFreshCloneInContainer { .. } => Stance::Contained,
+            Self::DockerHostCheckoutAndMount { .. } | Self::DockerFreshCloneInContainer { .. } => Stance::Contained,
         }
     }
 
     fn host_ref(&self) -> &str {
         match self {
             Self::HostDirect { host_ref, .. }
-            | Self::DockerWorktreeOnHostAndMount { host_ref, .. }
+            | Self::DockerHostCheckoutAndMount { host_ref, .. }
             | Self::DockerFreshCloneInContainer { host_ref, .. } => host_ref,
         }
     }
@@ -1730,7 +1781,7 @@ impl PlacementStrategy {
     fn pool(&self) -> &str {
         match self {
             Self::HostDirect { pool, .. }
-            | Self::DockerWorktreeOnHostAndMount { pool, .. }
+            | Self::DockerHostCheckoutAndMount { pool, .. }
             | Self::DockerFreshCloneInContainer { pool, .. } => pool,
         }
     }
@@ -1742,7 +1793,7 @@ impl PlacementStrategy {
     fn terminal_cwd(&self, workspace_root: &str, multi_repository: bool, has_repositories: bool) -> String {
         match self {
             Self::HostDirect { .. } => workspace_root.to_string(),
-            Self::DockerWorktreeOnHostAndMount { mount_path, default_cwd, .. } => {
+            Self::DockerHostCheckoutAndMount { mount_path, default_cwd, .. } => {
                 if !has_repositories {
                     default_cwd.clone().unwrap_or_else(|| "/".to_string())
                 } else if multi_repository {

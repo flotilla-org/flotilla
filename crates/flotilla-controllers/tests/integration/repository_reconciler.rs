@@ -69,6 +69,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .create(
             &meta("transient-clone"),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: repository_key.clone(),
                 env_ref: "env-host-a".to_string(),
                 r#ref: "main".to_string(),

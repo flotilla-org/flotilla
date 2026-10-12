@@ -148,6 +148,7 @@ async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Managed),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
                 env_ref: "host-direct-checkout-home".into(),
                 r#ref: "feature/old-child".into(),
@@ -1037,6 +1038,7 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Managed),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 r#ref: "test/cross-home".to_string(),
                 target_path: "/tmp/cross-home".to_string(),
                 repo_ref: RepositoryKey("test-repo".to_string()),

@@ -166,6 +166,10 @@ pub struct BudgetedRunner {
 }
 #[async_trait]
 impl CommandRunner for BudgetedRunner {
+    async fn same_filesystem(&self, source: &Path, destination: &Path) -> Result<bool, String> {
+        self.inner.same_filesystem(source, destination).await
+    }
+
     async fn writable_scratch_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
         self.inner.writable_scratch_base(preferred, fallback).await
     }

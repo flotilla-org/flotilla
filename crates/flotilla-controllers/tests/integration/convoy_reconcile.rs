@@ -671,6 +671,7 @@ async fn reconcile_with_observed_change_request(
                 &checkout.metadata.name,
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
+                    degraded: None,
                     clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/tmp/checkout-a".to_string()),
@@ -970,6 +971,7 @@ fn vessel_object_with_local_image_id(
             adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
+            degraded: Default::default(),
             configured_limits: None,
             runtime_observation: None,
             placement_decision: None,
@@ -1895,6 +1897,7 @@ async fn reconcile_terminal_bound_change_request(
                 &checkout.metadata.name,
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
+                    degraded: None,
                     clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/tmp/checkout-a".to_string()),
@@ -1936,6 +1939,7 @@ async fn reconcile_terminal_bound_change_request(
                 &checkout.metadata.name,
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
+                    degraded: None,
                     clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/tmp/checkout-context".to_string()),
@@ -2123,6 +2127,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
             &checkout.metadata.name,
             &checkout.metadata.resource_version,
             &CheckoutStatus {
+                degraded: None,
                 clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/remote/worktree".to_string()),

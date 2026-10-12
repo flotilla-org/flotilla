@@ -164,6 +164,12 @@ fn allowed_shared_config_key(key: &str) -> bool {
             | "gc.auto"
             | "gc.autodetach"
             | "gc.pruneexpire"
+            // Non-executable local-clone tracking and portable worktree metadata (#3090).
+            | "push.default"
+            | "worktree.userelativepaths"
+            | "extensions.relativeworktrees"
+            | "flotilla.createdforconvoy"
+            | "flotilla.localcloneobjects"
             | "pull.rebase"
             | "pull.ff"
             | "init.defaultbranch"
@@ -204,6 +210,24 @@ mod git_config_guard_tests {
     fn git(repo: &Path, args: &[&str]) {
         let output = Command::new("git").args(args).current_dir(repo).output().expect("run Git fixture command");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Finite config contract: portable worktree/provenance settings remain
+    // non-executable while executable includes/helpers keep their refusal.
+    #[test]
+    fn local_clone_metadata_keys_are_allowed_without_executable_configuration() {
+        for key in [
+            "extensions.relativeworktrees",
+            "worktree.userelativepaths",
+            "flotilla.createdforconvoy",
+            "flotilla.localcloneobjects",
+            "push.default",
+        ] {
+            assert!(allowed_shared_config_key(key), "{key}");
+        }
+        for key in ["include.path", "core.fsmonitor", "credential.helper", "extensions.worktreeconfig"] {
+            assert!(!allowed_shared_config_key(key), "{key}");
+        }
     }
 
     #[test]

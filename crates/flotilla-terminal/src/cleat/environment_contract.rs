@@ -374,6 +374,10 @@ struct RealProcessRunner;
 #[cfg(feature = "cleat-environment-contract")]
 #[async_trait]
 impl CommandRunner for RealProcessRunner {
+    async fn same_filesystem(&self, source: &Path, destination: &Path) -> Result<bool, String> {
+        flotilla_provider_runtime::ProcessCommandRunner.same_filesystem(source, destination).await
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let output = self.run_output(cmd, args, cwd, label).await?;
         if output.success() {

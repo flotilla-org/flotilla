@@ -39,7 +39,9 @@ pub fn removal_source_path(removal: &CheckoutRemoval) -> &str {
         CheckoutRemoval::Worktree { clone_path, .. }
         | CheckoutRemoval::ForcedWorktree { clone_path, .. }
         | CheckoutRemoval::LandedWorktree { clone_path, .. } => clone_path,
-        CheckoutRemoval::FreshClone { target_path } | CheckoutRemoval::OrphanedWorktree { target_path } => target_path,
+        CheckoutRemoval::LocalClone { target_path }
+        | CheckoutRemoval::FreshClone { target_path }
+        | CheckoutRemoval::OrphanedWorktree { target_path } => target_path,
     }
 }
 
@@ -114,6 +116,16 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
+    async fn create_local_clone_in(
+        &self,
+        _env_ref: &str,
+        request: core_vcs::LocalCloneRequest<'_>,
+    ) -> Result<(PreparedCheckout, Option<String>), String> {
+        let vcs = controller_vcs(&self.vcs, &self.runner, request.source)?;
+        let (result, message) = vcs.materialise_local_clone(request).await?;
+        Ok((PreparedCheckout { commit: result.commit, branch_provenance: result.provenance }, message))
+    }
+
     async fn inspect_integration(
         &self,
         checkout: &ResourceObject<Checkout>,
@@ -163,6 +175,13 @@ impl CheckoutControllerRuntime {
     async fn remove_checkout_impl(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         let runner = self.local_runner()?;
         let outcome = match removal {
+            CheckoutRemoval::LocalClone { target_path } => {
+                let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
+                vcs.verify_local_clone_reclaimable(target_path).await?;
+                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
+                remove_checkout_path(&*runner, &clone_staging_path(utf8_path(target_path)?)).await?;
+                Ok(CheckoutRemovalOutcome::Removed)
+            }
             CheckoutRemoval::FreshClone { target_path } => {
                 let target_path = utf8_path(target_path)?;
                 remove_checkout_path(&*runner, target_path).await?;
@@ -237,7 +256,8 @@ impl CheckoutControllerRuntime {
             }
         }?;
         let target_path = match removal {
-            CheckoutRemoval::FreshClone { target_path }
+            CheckoutRemoval::LocalClone { target_path }
+            | CheckoutRemoval::FreshClone { target_path }
             | CheckoutRemoval::OrphanedWorktree { target_path }
             | CheckoutRemoval::Worktree { target_path, .. }
             | CheckoutRemoval::ForcedWorktree { target_path, .. }

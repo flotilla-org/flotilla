@@ -47,6 +47,9 @@ pub enum VesselPhase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselStatus {
+    /// ADR 0047: previous-generation vessels have no degraded checkout conditions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub degraded: BTreeMap<String, String>,
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_limits: Option<ConfiguredResourceLimits>,
@@ -98,6 +101,9 @@ pub struct VesselStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VesselStatusPatch {
+    ObserveDegradation {
+        conditions: BTreeMap<String, String>,
+    },
     ObserveRuntime {
         observation: flotilla_protocol::EnvironmentRuntimeObservation,
     },
@@ -149,6 +155,7 @@ pub enum VesselStatusPatch {
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
+            Self::ObserveDegradation { conditions } => status.degraded = conditions.clone(),
             Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),

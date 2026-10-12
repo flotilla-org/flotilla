@@ -249,5 +249,26 @@ class RuntimeBoundaryTests(unittest.TestCase):
             self.assertEqual(check.scan_sources(sources)['src/fixture.rs'], [1])
 
 
+class RunnerFilesystemBoundaryTests(unittest.TestCase):
+    # Every production runner must handle filesystem identity explicitly; the
+    # same AST traversal exempts test doubles and includes production source reuse.
+    def test_runner_must_compare_forward_or_refuse(self):
+        for trait in ["CommandRunner", "flotilla_provider_runtime::CommandRunner"]:
+            absent = f"impl {trait} for Wrapper {{ async fn run(&self) {{}} }}"
+            self.assertEqual(check.runner_wrapper_violations(absent, "src/wrapper.rs"), [1])
+            for body in ["self.inner.same_filesystem(source, destination).await", 'Err("namespace unsupported".into())', "Ok(true)"]:
+                explicit = f"impl {trait} for Wrapper {{ async fn same_filesystem(&self) {{ {body} }} }}"
+                self.assertEqual(check.runner_wrapper_violations(explicit, "src/wrapper.rs"), [])
+            self.assertEqual(check.runner_wrapper_violations("#[cfg(test)] mod tests { " + absent + " }", "src/wrapper.rs"), [])
+            self.assertEqual(check.runner_wrapper_violations(absent, "crates/example-testkit/src/lib.rs"), [])
+            test_only_method = f"impl {trait} for Wrapper {{ #[cfg(test)] async fn same_filesystem(&self) {{}} }}"
+            self.assertEqual(check.runner_wrapper_violations(test_only_method, "src/wrapper.rs"), [1])
+
+    def test_production_inclusions_cannot_hide_missing_forwarding(self):
+        sources = {"src/lib.rs": '#[path="../crates/example/tests/wrapper.rs"] mod wrapper;',
+                   "crates/example/tests/wrapper.rs": 'impl CommandRunner for Wrapper {}'}
+        self.assertEqual(check.scan_sources(sources, check.runner_wrapper_violations)["crates/example/tests/wrapper.rs"], [1])
+
+
 if __name__ == '__main__':
     unittest.main()

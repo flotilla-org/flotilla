@@ -195,7 +195,15 @@ async fn inspect_checkout_integration_with_association(
     observe_remote_ref: bool,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
-    let clean = inspect_clean(providers.vcs, &observed_at).await;
+    let clean = if matches!(spec, CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some()) {
+        let check = match checkout_path.to_str() {
+            Some(path) => providers.vcs.local_clone_is_clean(path).await,
+            None => VcsCheck::Unknown(vec![format!("local clone path {} is not UTF-8", checkout_path.display())]),
+        };
+        clean_condition(check, &observed_at)
+    } else {
+        inspect_clean(providers.vcs, &observed_at).await
+    };
     let pushed = inspect_pushed(providers.vcs, observed_change_request, &observed_at).await;
     let (landed, landed_evidence, change_request) = inspect_landed(
         providers,
@@ -232,7 +240,11 @@ async fn inspect_remote_ref(vcs: &dyn Vcs, branch: &str, observed_at: &str) -> B
 }
 
 async fn inspect_clean(vcs: &dyn Vcs, observed_at: &str) -> IntegrationCondition {
-    let (value, details) = match vcs.is_clean().await {
+    clean_condition(vcs.is_clean().await, observed_at)
+}
+
+fn clean_condition(check: VcsCheck, observed_at: &str) -> IntegrationCondition {
+    let (value, details) = match check {
         VcsCheck::True(details) => (ConditionValue::True, details),
         VcsCheck::False(details) => (ConditionValue::False, details),
         VcsCheck::Unknown(details) => (ConditionValue::Unknown, details),
@@ -615,6 +627,34 @@ mod tests {
                 exit_code: Some(0),
             })
         }
+    }
+
+    // Non-UTF-8 native paths must report their unsupported encoding explicitly,
+    // rather than changing the target to an empty string and querying Git there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_clone_non_utf8_path_reports_encoding_as_unknown() {
+        use std::os::unix::ffi::OsStringExt;
+        let runner = Arc::new(HeadOnlyRunner);
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new("/checkout"),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner.clone()))),
+        );
+        let spec = CheckoutSpec::FreshClone(
+            flotilla_resources::FreshCloneCheckoutSpec::builder()
+                .source_clone_ref("source".into())
+                .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                .env_ref("host".into())
+                .r#ref("crew".into())
+                .target_path("/checkout".into())
+                .url("https://example.invalid/repo".into())
+                .build(),
+        );
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/checkout/invalid-\xff".to_vec()));
+        let observed = inspect_checkout_integration(runner.as_ref(), &vcs, &path, &spec, None).await;
+        assert_eq!(observed.clean.value, ConditionValue::Unknown);
+        assert!(observed.clean.details.iter().any(|detail| detail.contains("is not UTF-8")));
     }
 
     #[tokio::test]

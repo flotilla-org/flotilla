@@ -1228,3 +1228,56 @@ async fn fresh_clone_checkout_refuses_an_existing_convoy_branch() {
 fn empty_meta(name: &str) -> flotilla_resources::InputMeta {
     flotilla_resources::InputMeta::builder().name(name.to_string()).build()
 }
+
+// #3090: teardown preserves dirty local clones, including nested subagent work,
+// and removes the entire clean vessel clone through the runtime/VCS seam.
+#[tokio::test]
+async fn local_clone_teardown_preserves_dirty_work_and_removes_clean_clone() {
+    let temp = TempDir::new().expect("directory");
+    let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+    let remote = temp.path().join("remote.git");
+    assert!(ProcessCommand::new("git").args(["clone", "--bare"]).arg(source.path()).arg(&remote).status().unwrap().success());
+    assert!(ProcessCommand::new("git")
+        .current_dir(source.path())
+        .args(["remote", "add", "origin"])
+        .arg(&remote)
+        .status()
+        .unwrap()
+        .success());
+    let target = temp.path().join("convoy-local/work");
+    let runtime =
+        CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+    runtime
+        .create_local_clone_in(
+            "host",
+            core_vcs::LocalCloneRequest {
+                source: source.path().to_str().unwrap(),
+                url: remote.to_str().unwrap(),
+                branch: "crew",
+                base_ref: Some("main"),
+                target: target.to_str().unwrap(),
+                intent: core_vcs::LocalCloneIntent::NewBranch,
+            },
+        )
+        .await
+        .expect("local clone");
+    let agent = target.join("agents/one");
+    assert!(ProcessCommand::new("git")
+        .current_dir(&target)
+        .args(["worktree", "add", "-b", "agent"])
+        .arg(&agent)
+        .arg("HEAD")
+        .status()
+        .unwrap()
+        .success());
+    fs::write(agent.join("dirty"), "subagent work").unwrap();
+    let removal = CheckoutRemoval::LocalClone { target_path: target.to_str().unwrap().into() };
+    assert!(runtime.remove_checkout(&removal).await.unwrap_err().contains("dirty"));
+    assert!(target.join(".git").is_dir());
+    assert!(agent.join("dirty").exists());
+    fs::remove_file(agent.join("dirty")).unwrap();
+    assert_eq!(runtime.remove_checkout(&removal).await.expect("clean teardown"), CheckoutRemovalOutcome::Removed);
+    assert!(!target.exists());
+    assert!(source.path().join(".git").is_dir(), "managed clone remains");
+    assert_eq!(runtime.remove_checkout(&removal).await.expect("idempotent teardown"), CheckoutRemovalOutcome::Removed);
+}

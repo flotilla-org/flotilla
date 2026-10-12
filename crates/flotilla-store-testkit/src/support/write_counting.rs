@@ -116,6 +116,7 @@ mod tests {
             .create(
                 &InputMeta { name: "checkout-a".to_string(), ..Default::default() },
                 &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                    source_clone_ref: None,
                     repo_ref: RepositoryKey("repo-a".to_string()),
                     env_ref: "env-a".to_string(),
                     r#ref: "main".to_string(),
