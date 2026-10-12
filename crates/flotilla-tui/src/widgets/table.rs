@@ -255,11 +255,8 @@ impl TableWidget {
             title.push_str(&format!(" · ⚠ {}", view.meta.conditions.join("; ")));
         }
         let mut title = Line::from(format!(" {title} "));
-        if !view.meta.older_finished.is_empty() {
-            title.spans.push(Span::styled(
-                format!("· {} older finished convoys hidden ", view.meta.older_finished.len()),
-                Style::default().fg(theme.muted),
-            ));
+        if let Some(note) = view.meta.older_finished_note() {
+            title.spans.push(Span::styled(format!("· {note} "), Style::default().fg(theme.muted)));
         }
         let mut block = Block::bordered().style(theme.block_style()).title(title);
         if let Some(as_of) = view.meta.as_of {

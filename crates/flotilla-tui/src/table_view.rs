@@ -487,20 +487,41 @@ pub struct TableMeta {
     pub has_more: bool,
     pub conditions: Vec<String>,
     pub availability: TableAvailability,
-    /// Old terminal rows retained so local find can reveal them.
+    /// Convoy-specific default visibility metadata; only the convoy projection
+    /// populates it. Sorted positions let local find reveal rows without a
+    /// general sorting/filtering widget.
     #[builder(default)]
     pub older_finished: Vec<(usize, ProjectedRow)>,
 }
 
+impl TableMeta {
+    pub fn older_finished_note(&self) -> Option<String> {
+        let count = self.older_finished.len();
+        (count > 0).then(|| {
+            let noun = if count == 1 { "convoy" } else { "convoys" };
+            format!("{count} older finished {noun} hidden")
+        })
+    }
+}
+
 impl TableView {
+    /// Apply local find once to a fresh projection. Filtering consumes visible
+    /// rows, so changing or clearing find requires projecting again.
     pub fn filtered(mut self, filter: &str) -> Self {
         let filter = filter.trim().to_lowercase();
         if !filter.is_empty() {
-            for (index, row) in &self.meta.older_finished {
-                self.rows.insert((*index).min(self.rows.len()), row.clone());
-            }
-            self.rows.retain(|row| row.cells.iter().any(|cell| fuzzy_matches(&cell.text, &filter)));
-            self.meta.older_finished.retain(|(_, row)| !self.rows.iter().any(|visible| visible.id == row.id));
+            let matches = |row: &ProjectedRow| row.cells.iter().any(|cell| fuzzy_matches(&cell.text, &filter));
+            let mut skipped = 0;
+            self.meta.older_finished.retain(|(index, row)| {
+                if matches(row) {
+                    self.rows.insert(index - skipped, row.clone());
+                    false
+                } else {
+                    skipped += 1;
+                    true
+                }
+            });
+            self.rows.retain(matches);
         }
         self
     }
@@ -1603,8 +1624,6 @@ mod tests {
             .build()
     }
 
-    // #1961: surfaces preserve Active lifecycle while readiness explains why
-    // attachment is unavailable; a fresh projection clears recovered blockers.
     // Contract: all surface states precede terminal phases; recency descends
     // within each group, independent of the source's iteration order.
     #[test]
@@ -1665,6 +1684,15 @@ mod tests {
         let found = view.filtered("tables");
         assert_eq!(found.rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(), vec![convoy_id(&first), convoy_id(&second)]);
         assert!(found.meta.older_finished.is_empty());
+        let mut nonmatch = first.clone();
+        nonmatch.id = ConvoyId::new("dev", "elsewhere");
+        nonmatch.name = "elsewhere".into();
+        nonmatch.finished_at = Some(now - chrono::Duration::hours(25));
+        let view = project_convoy_rows("".into(), vec![second.clone(), first.clone(), nonmatch], now);
+        assert_eq!(view.meta.older_finished_note().as_deref(), Some("2 older finished convoys hidden"));
+        let found = view.filtered("tables");
+        assert_eq!(found.rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(), vec![convoy_id(&first), convoy_id(&second)]);
+        assert_eq!(found.meta.older_finished_note().as_deref(), Some("1 older finished convoy hidden"));
     }
 
     // Contract: strictly older than 24 hours is hidden for every terminal
@@ -1697,6 +1725,8 @@ mod tests {
         assert!(project_convoy_rows("".into(), vec![], now).rows.is_empty());
     }
 
+    // #1961: surfaces preserve Active lifecycle while readiness explains why
+    // attachment is unavailable; a fresh projection clears recovered blockers.
     #[test]
     fn active_convoy_readiness_is_shared_with_vessel_details() {
         use flotilla_protocol::result_set::{Readiness, ReadinessBlocker, ReadinessState};
