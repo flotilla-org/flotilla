@@ -8,13 +8,17 @@ The goal: a crew can act on many repositories with different permissions per rep
 
 ## Recommendation
 
+> **Revised after the second pass. See "Revised recommendation (layered)" at the end.**
+> In short: per-repository token choice in the existing wrapper and helper now, for #3119. Then a small, flotilla-owned Rust proxy built on **hudsucker** as the general route to "no tokens in vessels" that covers native CLIs. It would run as a per-vessel sidecar and be fed by the existing delivery contract.
+> The first-pass text below still stands as the case for layer 1.
+
 **Don't build a forge proxy for #3119. Mint a second, issue-only installation token, and have the `gh` wrapper and Git helper that flotilla already writes choose a token by target repository.**
 
 - The only hard constraint is that one installation token has one permission set. A proxy does not remove it: the proxy would still mint one token per scope and choose between them.
 - The difficult part of choosing is the same in both designs: which repository is this request for? Inside the proxy the answer is unknown for GraphQL, because mutations carry only an opaque node ID. Before `gh` runs, the answer is known from `-R`, `GH_REPO`, a `gh api repos/OWNER/REPO/...` path, or the checkout's remote. For Git, `credential.useHttpPath` passes it to the helper.
 - The token-choosing seam already exists. `flotilla-credentials` writes a `gh` wrapper and a `git-credential-github-app` helper into every crew's credential directory (`crates/flotilla-credentials/src/credential.rs`, GitHub App consumer, around lines 1884-1940).
 
-Keep the proxy as the direction for **removing material from vessels entirely**, a separate goal with its own ticket. If it is pursued, use an **explicit gateway** (gh `api_host`, Git `insteadOf`, Forgejo base URL) rather than TLS interception, and settle GraphQL attribution first. Anthropic's production GitHub proxy settles it by refusing GraphQL, which breaks `gh issue create`.
+Keep the proxy as the direction for **removing material from vessels entirely**, a separate goal with its own ticket. If it is pursued, settle GraphQL attribution first. *(First pass preferred an explicit gateway over TLS interception. The second pass revises this to a per-vessel interception sidecar, which needs no response rewriting and covers native CLIs. The gateway remains a fallback.)* Anthropic's production GitHub proxy settles it by refusing GraphQL, which breaks `gh issue create`.
 
 ## The constraint, verified
 
@@ -179,3 +183,132 @@ Option A's own risks are small:
    - `gh api -X PUT repos/flotilla-org/flotilla/contents/x` (expect B, 403).
 
 If all four behave as expected, #3119 proceeds with option A. To falsify the proxy direction separately, for the later "no material in vessels" ticket: run Envoy with a fixed github.com certificate and an ext_authz stub that injects one token, then `gh issue create` plus a 500 MB `git push`. GraphQL attribution, not Envoy plumbing, is the question that decides the proxy direction.
+
+---
+
+# Second pass: prior art and the revised recommendation
+
+The owner's follow-up: a flotilla verb or MCP tool may exist, but it cannot be the only route, because native CLIs and other programs have their own integrations. This pass therefore surveys proxies that already broker credentials for agents, CI and sandboxes, favouring small, self-contained Rust.
+
+**Method:**
+- `gh api` for licence, push date and releases.
+- Shallow clones under the job's `tmp/research-proxy/`, measured with `tokei` excluding tests.
+- Spot checks of the claims below against source.
+- Cut-off: 2026-10-12. LOC are approximate. "MITM/mint" means TLS interception and on-the-fly leaf certificates.
+
+## Prior art
+
+### Agent egress and credential-injection proxies
+
+| Project | Lang | Licence | Latest activity | LOC | MITM/mint | Policy model | Credential injection | Git smart-HTTP / streaming | GraphQL |
+|---|---|---|---|---|---|---|---|---|---|
+| [openai/codex `network-proxy`](https://github.com/openai/codex/tree/main/codex-rs/network-proxy) | Rust (rama `=0.3.0-alpha.4`) | Apache-2.0 | rust-v0.162.1, 2026-10-09 | ~30k | Y/Y | host allow/deny; MITM hooks on host, method and `path_prefixes` | **Has a GitHub credential broker**: sandbox gets dummy `GH_TOKEN`/`GITHUB_TOKEN`, real value bound to `api.github.com`, `github.com`, `uploads.github.com`, `*.ghe.com` (`src/credential_broker/providers/github.rs:14-42`); `inject_request_headers` (`src/mitm.rs:504`) | unknown | no |
+| [nolabs-ai/nono `nono-proxy`](https://github.com/nolabs-ai/nono) | Rust (hyper, tokio-rustls, rcgen 0.14) | Apache-2.0 | v0.79.0, 2026-09-30 | ~33k (crate) | Y per route/Y | host allowlist; `endpoint_rules` on method and path | "phantom" token checked, then real header from the keyring | route tests for `/org/repo.git/info/refs` and `git-upload-pack` (`src/route.rs`); h2 | no |
+| [onecli/onecli](https://github.com/onecli/onecli) gateway | Rust gateway, TS app | Apache-2.0, plus `ee/`, **CLA** | v2.12.0, 2026-10-09 | ~42k (gateway) | Y/Y | host and path patterns; policy engine | header or query from a secret store (1Password, Bitwarden) | injects on `/*/*/git-upload-pack` | **yes**: fail-closed query-vs-mutation classifier (`apps/gateway/crates/policy-engine/src/graphql.rs`), kept byte-for-byte equal to a TS twin through a shared corpus |
+| [coder/httpjail](https://github.com/coder/httpjail) | Rust (hyper, tokio-rustls, rcgen) | CC0-1.0 | v0.6.2, 2026-09-24 | ~7.4k (proxy core ~2.9k) | Y/Y | JS/V8 rules over method, host, URL and byte limits | **no** (allow/deny only) | bodies stream through a byte-limit wrapper; intercepted connections are HTTP/1 only | no |
+| [anthropics/sandbox-runtime](https://github.com/anthropics/sandbox-runtime) | TS | Apache-2.0 | v0.0.79, 2026-10-07 | ~17k | experimental `tlsTerminate`/Y | domain allow/deny; `filterRequest` hook | **placeholder** substitution in headers and a *streaming* body scan that holds back bytes across chunk boundaries and fails safe (`src/sandbox/body-substitution.ts`); SigV4 re-signing | sets `GIT_SSL_CAINFO` | no |
+| [paradigmxyz/iron-proxy](https://github.com/paradigmxyz/iron-proxy) | Go | Apache-2.0 | v0.53.0, 2026-10-06 | ~13k | Y/Y (your CA) | domain and CIDR; host, method and path rules; built-in DNS; IMDS and SSRF deny list | placeholder in headers, optionally query, path or body; audit trace | SSE and WebSocket aware | no |
+| [superfly/tokenizer](https://github.com/superfly/tokenizer) | Go | Apache-2.0 | 2026-09-15 | ~2.8k | **no** (plain HTTP over a VPN) | host allowlist sealed inside the secret | sealed secret, then header, HMAC, SigV4, JWT, or a **GitHub App mint** that re-seals the result | unknown | no |
+| [denoland/clawpatrol](https://github.com/denoland/clawpatrol) | Go | MIT | v0.5.14, 2026-10-03 | ~179k | Y/Y | HCL plus CEL over method, path, headers and body | per-endpoint `credential` blocks | `info/refs` fixture | no |
+| [luckyPipewrench/pipelock](https://github.com/luckyPipewrench/pipelock) | Go | Apache-2.0 core, **ELv2** enterprise | v3.6.0, 2026-10-03 | ~346k | Y/Y | DLP, request policy, git push allowlist | none found | guards receive-pack | **yes**: resolves root fields through aliases and fragments (`reqpolicy/graphql.go`) |
+| [Infisical/agent-vault](https://github.com/Infisical/agent-vault) | Go | MIT core, plus `ee/` | v0.40.0, 2026-10-01 | ~29k | Y/Y | per-host rules | placeholder, or header replacement | unknown | no |
+| [jingkaihe/matchlock](https://github.com/jingkaihe/matchlock), [getveil/veil](https://github.com/getveil/veil), [GreyhavenHQ/greyproxy](https://github.com/GreyhavenHQ/greyproxy), [hoophq/cloak](https://github.com/hoophq/cloak), [reoring/botbox](https://github.com/reoring/botbox) (Rust, ~2.7k) | Go / Rust | MIT or Apache | 2026 | 3k-40k | mostly Y/Y (cloak: per-upstream listener) | host | placeholder or header | unknown | no (veil scans GraphQL bodies) |
+| [strongdm/leash](https://github.com/strongdm/leash) | Go | Apache-2.0 | v1.1.7, 2026-03 | ~25k | Y (MCP observation) | Cedar | **not yet** (`docs/todo/SECRETS-INJECTION.md`) | unknown | no |
+
+Not open source, or not egress injection:
+- Docker Sandboxes ship binaries only.
+- Tailscale Aperture has no public source.
+- Boundary is BUSL, archived, and injects only into SSH and RDP.
+- kgateway and Pomerium are ingress proxies.
+- LiteLLM and the Envoy AI gateway handle model APIs only.
+- 1Password `op inject`, Doppler and Vault Agent write env vars or files, not traffic.
+- No copyleft licence turned up. Open-core splits do: pipelock (ELv2), onecli (`ee/` plus a CLA), agent-vault (`ee/`).
+
+### GitHub-specific brokers
+
+| Project | Lang / licence | Kind | Policy | GraphQL |
+|---|---|---|---|---|
+| [octo-sts/app](https://github.com/octo-sts/app) | Go, Apache-2.0 (active, 2026-10-09) | security token service: exchanges an OIDC token for a scoped installation token, no proxy | a trust-policy file in each repository (`.github/chainguard/*.sts.yaml`): issuer, subject, claims, `permissions`; org policies list repositories | n/a; scope comes from the minted token |
+| superfly/tokenizer (above) | Go, Apache-2.0 | proxy with GitHub App minting | host-level | no |
+| [finos/git-proxy](https://github.com/finos/git-proxy) | TS, Apache-2.0 | push gateway (smart-HTTP and SSH) | push checks: secrets, authors, approval | no; no API coverage |
+| [actions/create-github-app-token](https://github.com/actions/create-github-app-token) | JS, MIT | mints in Actions | `repositories` and `permission-*` inputs | n/a |
+| Teleport GitHub integration | Go, **AGPL-3.0** | Git-over-SSH with certificates from an org SSH CA | `git_server` resources; requires GitHub Enterprise Cloud | no API |
+| [IniZio/nexus `graphql_policy.go`](https://github.com/IniZio/nexus/blob/main/internal/core/perimeter/mitm/graphql_policy.go) | Go, **no licence**, 1 star | MITM GraphQL allowlist for a sandbox | root-field allowlist; `repository(owner,name)` must name an allowed repository; **a per-sandbox FIFO cache maps `R_kgDO…` node IDs to `owner/name`; unknown IDs are denied** | **yes**, but use the design only; there is no licence to embed |
+
+**Codespaces does have per-repository permissions**, which no API token offers. `customizations.codespaces.repositories` in `devcontainer.json` maps `org/repo` to its own permissions. The repositories must share one owner, and the user approves interactively. ([docs](https://docs.github.com/en/codespaces/managing-your-codespaces/managing-repository-access-for-your-codespaces))
+- This is a Codespaces-only grant flow, so it doesn't help vessels. It does show that GitHub models the "different permissions per repository" shape we want, but only behind its own UI.
+
+### Rust libraries for building one
+
+| Library | Licence | Activity | Size | MITM + cert minting | Streaming | Hook | TLS stack | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| [hudsucker](https://github.com/omjadas/hudsucker) | MIT OR Apache-2.0 | v0.25.0, 2026-07-15 | ~2.6k | CONNECT interception; `RcgenAuthority` mints a leaf per host with a moka cache and ALPN `h2`/`http/1.1` (`src/certificate_authority/rcgen_authority.rs`) | `Body` wraps hyper `Incoming` frame by frame; nothing forces buffering (`src/body.rs`) | `HttpHandler::handle_request`/`handle_response`; `should_intercept_tls(ClientHello)` lets uninteresting hosts pass through (`src/lib.rs:111-167`) | rustls (openssl optional) | **best fit** |
+| [rama](https://github.com/plabayo/rama) | MIT OR Apache-2.0 | v0.4.0, 2026-08 (main 0.5) | very large | rustls MITM example is "not the recommended architecture"; per-SNI minting is BoringSSL-only | streaming layers | rich: ICAP, SOCKS5 | BoringSSL for per-SNI minting | powerful but heavy and unstable; codex pins `0.3.0-alpha.4` |
+| [Pingora](https://github.com/cloudflare/pingora) | Apache-2.0 | v0.9.0, 2026-09 | large | **no MITM**; CONNECT only tunnels, behind a flag (`pingora-proxy/src/lib.rs:383-403`) | per-chunk filters | reverse-proxy filters | per-handshake cert callback needs openssl or boring | explicit-gateway mode only |
+| [http-mitm-proxy](https://github.com/hatoo/http-mitm-proxy) | MIT | v0.18.0, 2026-01 | ~0.9k | Y (rcgen) | raw hyper service | bring your own | default upstream client is native-tls | thinner than hudsucker |
+| [g3proxy](https://github.com/bytedance/g3) | Apache-2.0 | v1.12.4, 2026-07 | ~200k | real TLS MITM; certificates from a separate `g3fcgen` service | Y | **no in-process hook**; requests are modified through an ICAP REQMOD server | OpenSSL family | too heavy for one rule |
+| proxelar/proxyapi | MIT | active | ~27k | Y | **buffers bodies** | Lua | — | no (packfiles) |
+| third-wheel | MIT | dead (2021) | — | — | — | — | — | no |
+| agentgateway | Apache-2.0 | v1.6.0, 2026-10-02 | ~170-275k | egress mode with a `dynamicCa` listener; tests inject a token into a CONNECT tunnel | Y | CEL and YAML transformations | rustls | adoptable, but large, with its own policy model |
+
+## Does anything already scope GraphQL by repository?
+
+- **No maintained, licensed project does.**
+  - pipelock and onecli classify operations (query vs mutation, root fields), but neither maps a mutation to a repository.
+  - The only node-ID-to-repository resolver found is IniZio/nexus. It has no licence and one star, but its design is the right one: deny batched requests and duplicate keys, allowlist root fields, and cache node IDs per sandbox, learned from responses.
+- **gh guarantees a lookup before every write:** `IssueRepoInfo` / `GitHubRepo` sends `repository(owner,name){ id }` before `createIssue` / `createPullRequest` (cli/cli `pkg/cmd/issue/create/create.go:290,482`; `pkg/cmd/pr/create/create.go:798`). A proxy that reads small `/graphql` responses can learn `R_… → owner/repo` in the same command, before the mutation arrives.
+- **Unknown IDs can fall back safely.** If the proxy cannot attribute a mutation, it sends it with the **default (vessel code-scope) token**. GitHub then refuses foreign repositories with "Resource not accessible by integration" (reported by users, e.g. [cli/cli#7134](https://github.com/cli/cli/discussions/7134); the documentation does not state it). A misattribution therefore narrows access and never widens it. The proxy does not need to be a security parser; GitHub's token-scope enforcement does the enforcing.
+- **gh has no REST-only mode.** `issue create` and `pr create` always use GraphQL, so refusing GraphQL, as Anthropic's proxy does, is not an option for us.
+
+## Revised recommendation (layered)
+
+**Layer 1, now (#3119): per-scope tokens with a repo-aware `gh` wrapper and Git helper.** Unchanged from the first pass.
+- It ships the contract, adds nothing to the data path, and keeps tokens in the vessel, as today.
+
+**Layer 2, the general route to "no tokens in vessels": a small, flotilla-owned Rust proxy on hudsucker, run as a per-vessel sidecar.**
+
+- **Why build on hudsucker rather than adopt a product:**
+  - The closest adoptable products are each large and bring their own policy model and secret store: onecli (open core with a CLA), nono-proxy (embedded in a 179k-LOC sandbox), codex `network-proxy` (coupled to codex, pinned to rama alpha), agentgateway (~200k LOC, CEL).
+  - None of them chooses between tokens per repository, and none attributes GraphQL to a repository.
+  - The part that is ours, which token for which repository from the admission snapshot, is small. httpjail's core shows a hyper/rustls/rcgen MITM lands at about 2-3k LOC.
+  - hudsucker supplies the MITM, certificate minting and streaming bodies as an MIT/Apache library of about 2.6k LOC.
+- **Designs to borrow, with credit:**
+  - sandbox-runtime, codex and nono: the placeholder convention. The vessel sees `GH_TOKEN=<placeholder>`, so gh's auth gate passes.
+  - nono: routing by path.
+  - onecli: a fail-closed GraphQL envelope check.
+  - nexus: the node-ID cache, as design only.
+  - iron-proxy: IMDS and SSRF deny lists.
+  - tokenizer and octo-sts: confirmation that **minting stays outside the proxy**. The daemon keeps minting (ADR 0044 §5) and stages token files for the proxy.
+- **Why a per-vessel sidecar:** it removes the vessel-identity problem (spiral risk 3), because each vessel has its own proxy and no xDS or mTLS is needed. The admission snapshot reaches it through the **existing delivery contract**: the credential directory is staged to the sidecar container instead of the crew container. That is ADR 0022's "endpoint plus proxy-held auth" slotting into the same delivery interface.
+  - The crew container gets `HTTPS_PROXY`, the sidecar CA in `SSL_CERT_FILE`/`GIT_SSL_CAINFO`/`NODE_EXTRA_CA_CERTS`, and placeholders.
+  - Egress is restricted so the crew can reach forge hosts only through the sidecar.
+- **Policy:**
+  - Git smart-HTTP: path `/<owner>/<repo>.git/...`.
+  - REST: `/repos/<owner>/<repo>/...`.
+  - GraphQL: `R_… → repo` learned from small responses; anything unattributed gets the default token.
+  - Each request selects a token, with an optional per-scope method allowlist.
+  - Any host outside the table passes through untouched (`should_intercept_tls`).
+- **What layer 2 does not change:**
+  - Minting and refresh stay in `flotilla-credentials`.
+  - Grant and snapshot shapes stay as layer 1 defines them.
+  - Model-API and OAuth logins stay out of scope. A later route could add `api.anthropic.com` / `api.openai.com` header injection, but subscription OAuth refresh remains harness-internal.
+- **Remaining spiral risks for layer 2:**
+  - CA coverage: tools bundling webpki roots ignore `SSL_CERT_FILE`.
+  - Hosts we haven't routed yet: codeload, uploads, LFS, release storage.
+  - The GraphQL cache missing exotic flows. That fails narrow, but crews see 403s.
+  - One more container per vessel.
+  - Pressure to grow into a generic egress firewall. Keep the boundary at credential injection for forge hosts; adopt iron-proxy-style egress control separately if it is ever wanted.
+
+### Cheapest spike for layer 2 (about half a day)
+
+1. Start from `hudsucker/examples/log.rs`. Load a local CA with `Issuer::from_ca_cert_pem` into `RcgenAuthority`, and enable the `http2` feature.
+2. In `handle_request`, use a two-row token table: code repository goes to token A; everything else on `github.com` and `api.github.com` goes to tracker token B. Use Basic `x-access-token:` auth for Git and Bearer auth for the API, and strip the client's placeholder `Authorization`.
+3. For `POST api.github.com/graphql`, buffer requests up to 64 KiB. In `handle_response`, read `data.repository.id` from small responses into a map. Choose the token by looking up `variables.input.repositoryId`.
+4. In a crew-image container with `HTTPS_PROXY` set, the CA trusted and `GH_TOKEN=placeholder`, run:
+   - `gh issue create -R flotilla-org/flotilla` (expect B);
+   - `gh pr create` (expect A);
+   - a `git push` larger than 500 MB (watch the proxy's RSS stay flat, which proves streaming);
+   - a foreign contents write (expect 403).
+5. Pass if all four behave and RSS is bounded. If hudsucker's upstream client gets in the way (HTTP/2 upstream, pooling), the fallback is a do-it-yourself build modelled on httpjail's `proxy_tls.rs`.
+
+The layer 1 spike (two hand-minted tokens plus a 30-line wrapper) still comes first. Layer 2 replaces the delivery path, not the scope model, so both layers share the same scope map and nothing is thrown away.
