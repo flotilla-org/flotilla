@@ -4,16 +4,9 @@ This check uses ast-grep's Rust parser to enforce both the VCS and environment
 runtime boundaries. The `ci/git-boundary` path is retained so existing CI and
 local commands keep working. It runs without compiling Rust.
 
-Use `uv` on desks, in crew vessels, and in CI to run the check and its tests
-from the repository root; `uv` caches the pinned package:
-
-```bash
-uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py
-uv run --with-requirements ci/git-boundary/requirements.txt python -m unittest discover -s ci/git-boundary -p test_check.py
-```
-
-See [the development guide](../../docs/development.md#git-boundary-check) for
-prerequisites. Python's `venv`/`ensurepip` packages are not required.
+Use the [development guide's Git boundary check recipe](../../docs/development.md#git-boundary-check)
+for prerequisites and the check/test commands. It uses `uv` without requiring
+Python's `venv`/`ensurepip` packages.
 
 The checker scans tracked Rust sources, not diffs. It matches associated
 `new("git")` calls (including constructor aliases), the `run`, `run_output`, and

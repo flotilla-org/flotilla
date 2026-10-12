@@ -42,14 +42,7 @@ scripts/prune-target.sh                        # apply the per-checkout target s
 scripts/install-cargo-sweep-schedule.sh        # install/verify the daily per-host mtime sweep
 ```
 
-Use `uv` for the Git boundary check on desks, in crew vessels, and in CI; it installs the pinned dependency from `ci/git-boundary/requirements.txt` in a managed environment without requiring Python's `venv`/`ensurepip` packages. Run the check and its tests from the repository root:
-
-```bash
-uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py
-uv run --with-requirements ci/git-boundary/requirements.txt python -m unittest discover -s ci/git-boundary -p test_check.py
-```
-
-See [docs/development.md](docs/development.md#git-boundary-check) for prerequisites.
+Use the [Git boundary check recipe](docs/development.md#git-boundary-check) for the check and its tests. It uses `uv` without requiring Python's `venv`/`ensurepip` packages.
 
 Platform test coverage belongs in `ci/platform-tests/selectors.txt`, executed by `ci/platform-tests/run.sh`. Add a CI job only for a new runner type or OS, or for deliberate isolation; otherwise use an existing job on the same runner.
 
