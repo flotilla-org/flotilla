@@ -138,7 +138,11 @@ impl VesselReconciler {
         self
     }
 
-    async fn contained_git_mounts(&self, checkouts: &[(String, Option<String>)]) -> Result<Vec<EnvironmentMount>, ResourceError> {
+    async fn contained_git_mounts(
+        &self,
+        checkouts: &[(String, Option<String>)],
+        mount_path: &str,
+    ) -> Result<Vec<EnvironmentMount>, ResourceError> {
         let mut directories = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
         let mut backlinks = BTreeMap::<PathBuf, PathBuf>::new();
         for (checkout_name, clone_ref) in checkouts {
@@ -171,6 +175,13 @@ impl VesselReconciler {
                 || metadata.admin_dir.parent() != Some(metadata.common_dir.join("worktrees").as_path())
             {
                 return Err(ResourceError::invalid(format!("checkout {checkout_name} has an invalid Git administration directory")));
+            }
+            let workspace = std::path::Path::new(mount_path);
+            if metadata.registered_checkout_dir.starts_with(workspace) || workspace.starts_with(&metadata.registered_checkout_dir) {
+                return Err(ResourceError::invalid(format!(
+                    "checkout {checkout_name} Git backlink {} overlaps vessel workspace {mount_path}",
+                    metadata.registered_checkout_dir.display()
+                )));
             }
             let source = PathBuf::from(&spec.target_path);
             if let Some(previous) = backlinks.insert(metadata.registered_checkout_dir, source.clone()) {
@@ -995,7 +1006,7 @@ impl Reconciler for VesselReconciler {
                 (env_name, None)
             }
             PlacementStrategy::DockerWorktreeOnHostAndMount { host_ref, image, pull_policy, env, mount_path, .. } => {
-                let git_mounts = match self.contained_git_mounts(&contained_worktree_checkouts).await {
+                let git_mounts = match self.contained_git_mounts(&contained_worktree_checkouts, mount_path).await {
                     Ok(mounts) => mounts,
                     Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
                     Err(error) => return Err(error),
@@ -1005,6 +1016,9 @@ impl Reconciler for VesselReconciler {
                     Ok(existing) => {
                         // Docker bind mounts cannot change in place. Refuse a stale
                         // grant set until the environment is explicitly recreated.
+                        // The workspace bind is planned separately from Git grants.
+                        // Backlink planning rejects overlap with that bind, so only
+                        // the existing workspace mount is excluded from this check.
                         let existing_git_mounts = existing
                             .spec
                             .docker
@@ -1013,10 +1027,7 @@ impl Reconciler for VesselReconciler {
                                 docker.mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if !git_mounts_match(
-                            &existing_git_mounts,
-                            &git_mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>(),
-                        ) {
+                        if !git_mounts_match(&existing_git_mounts, &git_mounts) {
                             return Ok(VesselPrepared {
                                 patch: PlannedPatch::EnvironmentRecreation {
                                     observed_policy_ref: placement_policy.metadata.name.clone(),
@@ -1857,10 +1868,10 @@ mod tests {
             registered_checkout_dir: "/recorded/own".into(),
         };
         let reconciler = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
-        assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
+        assert!(reconciler.contained_git_mounts(&[], "/workspace").await.expect("empty").is_empty());
         let own = ("own".into(), Some("clone".into()));
-        let one = reconciler.contained_git_mounts(std::slice::from_ref(&own)).await.expect("own mounts");
-        let repeated = reconciler.contained_git_mounts(&[own.clone(), own.clone()]).await.expect("duplicate");
+        let one = reconciler.contained_git_mounts(std::slice::from_ref(&own), "/workspace").await.expect("own mounts");
+        let repeated = reconciler.contained_git_mounts(&[own.clone(), own.clone()], "/workspace").await.expect("duplicate");
         assert_eq!(one, repeated, "duplicate checkout membership must not duplicate grants");
         assert_eq!(one.len(), 6);
         assert!(
@@ -1884,11 +1895,30 @@ mod tests {
             Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
         ] {
             let refusing = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(metadata)));
-            assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
+            assert!(
+                refusing.contained_git_mounts(std::slice::from_ref(&own), "/workspace").await.is_err(),
+                "invalid metadata must fail closed"
+            );
         }
+        // Backlinks at or below the workspace bind must refuse before Docker
+        // receives a duplicate target or an overlay of another repository.
+        for (registered_checkout_dir, workspace) in [
+            ("/workspace", "/workspace"),
+            ("/workspace/other-repository", "/workspace"),
+            ("/recorded/own", "/recorded/own/nested-workspace"),
+            ("/custom-workspace/repository", "/custom-workspace"),
+        ] {
+            let metadata = WorktreeMetadata { registered_checkout_dir: registered_checkout_dir.into(), ..valid.clone() };
+            let refusing = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(Ok(metadata))));
+            let error =
+                refusing.contained_git_mounts(std::slice::from_ref(&own), workspace).await.expect_err("workspace overlap must refuse");
+            assert!(error.to_string().contains("overlaps vessel workspace"));
+        }
+        // A shared string prefix is not a path-component overlap.
+        assert!(reconciler.contained_git_mounts(std::slice::from_ref(&own), "/recorded/ownership").await.is_ok());
         let unavailable = VesselReconciler::new(backend, namespace);
         assert!(
-            matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
+            matches!(unavailable.contained_git_mounts(&[own], "/workspace").await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"
         );
     }

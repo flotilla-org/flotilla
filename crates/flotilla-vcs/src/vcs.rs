@@ -787,8 +787,11 @@ impl Vcs for FlotillaVcs {
         }
         let backlink = self.runner.read_file(&admin_dir.join("gitdir")).await?;
         let backlink = PathBuf::from(backlink.trim());
-        if !backlink.is_absolute() || backlink.file_name() != Some(std::ffi::OsStr::new(".git")) {
-            return Err("Git worktree backlink must name an absolute .git file".into());
+        if backlink.file_name() != Some(std::ffi::OsStr::new(".git")) {
+            return Err("Git worktree backlink must name a .git file".into());
+        }
+        if !backlink.is_absolute() {
+            return Err("relative Git worktree backlinks (worktree.useRelativePaths) are unsupported for contained placement; use absolute host worktree paths".into());
         }
         let registered_checkout_dir = backlink.parent().ok_or("Git worktree backlink has no checkout parent")?.to_path_buf();
         let registered_admin = GitCliBackend::checkout_root(&registered_checkout_dir, &*self.runner)
@@ -2698,6 +2701,10 @@ mod tests {
         std::fs::write(&backlink, &recorded).expect("aliased backlink");
         assert_eq!(vcs.worktree_metadata(&target).await.expect("aliased metadata").registered_checkout_dir, registered);
         assert_eq!(std::fs::read_to_string(&backlink).unwrap(), recorded, "inspection must not repair host paths");
+        // A relative backlink gets an operator-facing configuration diagnosis.
+        std::fs::write(&backlink, "relative/.git\n").expect("relative backlink");
+        let error = vcs.worktree_metadata(&target).await.expect_err("relative backlink refused");
+        assert!(error.contains("worktree.useRelativePaths"), "relative backlink diagnosis: {error}");
         for invalid in ["relative/.git\n".to_string(), format!("{}\n", source.join(".git").display()), format!("{}\n", target.display())] {
             std::fs::write(&backlink, invalid).expect("invalid backlink");
             assert!(vcs.worktree_metadata(&target).await.is_err(), "invalid backlink must refuse a grant");

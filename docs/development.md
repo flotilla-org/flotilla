@@ -364,6 +364,10 @@ metadata at host paths leaves that backlink unresolved: tools that enumerate
 worktrees then try to open an absent host checkout. The VCS boundary reads and
 validates the actual backlink, so symlinked host roots need no path guessing or
 in-container `git worktree repair` (which would corrupt the host backlink).
+Relative registrations (`worktree.useRelativePaths`) refuse with a specific
+diagnosis; use absolute host worktree paths for contained placement. Backlink
+mounts that overlap the vessel workspace mount also refuse before Docker runs,
+preventing duplicate targets and overlays of another repository's workspace.
 
 Crews can create additional worktrees in an independent local clone. Its writable
 administration directory, config, hooks and registrations belong to that crew;
