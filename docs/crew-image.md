@@ -454,3 +454,29 @@ ci/crew-image/accept-stable-fmt.sh flotilla-crew:stable-fmt
 
 The local composition suite injects the Docker process boundary; it does not
 claim a live image build. Run the commands above before publishing the image.
+
+## Formal modelling capability
+
+`capability-formal-modelling` supplies Temurin JDK 21.0.12.1+1, Quint 0.33.0,
+TLC (`tla2tools.jar` 1.7.4), Apalache 0.62.1 and Quint's Rust evaluator 0.7.0
+on amd64 and arm64. Its `toolchain:jdk@…`, `tool:quint@…`, `tool:tlc@…`,
+`tool:apalache@…` and `tool:quint-evaluator@…` capabilities use the existing
+brief/workflow needs → composition path; it requires spine-base's
+`toolchain:node@24.18.0`. Pins and upstream sources live in
+`.flotilla/image-layers/inputs.json`. No placement or baseline change is needed.
+
+The documented [`QUINT_HOME` configuration](https://github.com/quint-co/quint/blob/v0.33.0/quint/src/config.ts) points at read-only `/opt/quint`,
+with both versioned backend distributions baked in. A sourced startup prelude
+restores `JAVA_HOME`, `QUINT_HOME` and PATH after managed launch environment
+clearing; crews do not download backends into `~/.quint`. `apalache-mc` and `tlc` are on PATH, and the standalone
+TLC JAR is `/opt/quint/tla2tools.jar`. Quint's `verify --backend tlc` uses the
+TLC classes bundled in the pinned Apalache JAR, as required by Quint's upstream
+implementation; the standalone JAR is for direct `tlc` invocations.
+
+Always pass `--max-samples` to `quint run`: the default single sample can
+falsely report success. Admission probes simulate the bundled two-state spec
+with `--backend rust --max-samples 100`, then check its invariant through
+`quint verify --backend tlc`. Local acceptance on an image-build host is
+`ci/crew-image/accept-formal-modelling.sh`; it uses the existing composition
+harness and repeats all probes without networking, as an arbitrary non-root
+UID with an unwritable home. Java 21 is required by the pinned Apalache release.

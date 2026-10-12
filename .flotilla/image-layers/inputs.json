@@ -90,6 +90,89 @@
       }
     },
     {
+      "name": "capability-formal-modelling",
+      "stage": "capability",
+      "fragment": ".flotilla/image-layers/formal-modelling.Dockerfile",
+      "pins": {
+        "JDK_VERSION": {
+          "value": "21.0.12.1+1",
+          "source": "https://github.com/adoptium/temurin21-binaries/releases"
+        },
+        "QUINT_VERSION": {
+          "value": "0.33.0",
+          "source": "https://registry.npmjs.org/@informalsystems/quint"
+        },
+        "TLC_VERSION": {
+          "value": "1.7.4",
+          "source": "https://github.com/tlaplus/tlaplus/releases"
+        },
+        "APALACHE_VERSION": {
+          "value": "0.62.1",
+          "source": "https://github.com/apalache-mc/apalache/releases"
+        },
+        "QUINT_EVALUATOR_VERSION": {
+          "value": "0.7.0",
+          "source": "https://github.com/quint-co/quint/releases"
+        },
+        "JDK_AMD64_SHA256": {
+          "value": "ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94",
+          "source": "https://github.com/adoptium/temurin21-binaries/releases/tag/jdk-21.0.12.1%2B1"
+        },
+        "JDK_ARM64_SHA256": {
+          "value": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223",
+          "source": "https://github.com/adoptium/temurin21-binaries/releases/tag/jdk-21.0.12.1%2B1"
+        },
+        "EVALUATOR_AMD64_SHA256": {
+          "value": "869adb8762a518483eb39f67fde622253a58527494e15afe77d610a0b6dab7d2",
+          "source": "https://github.com/quint-co/quint/releases/tag/evaluator/v0.7.0"
+        },
+        "EVALUATOR_ARM64_SHA256": {
+          "value": "26c052831243cdba9cd81f8da0c1df053f3c92cfd3fd8f050c87c45642414f93",
+          "source": "https://github.com/quint-co/quint/releases/tag/evaluator/v0.7.0"
+        },
+        "APALACHE_SHA256": {
+          "value": "38202a8c4ebeb3ab73e0fe5a7e4bb948442d46ad5de8a7fb45c9e5cac2beb2a6",
+          "source": "https://github.com/apalache-mc/apalache/releases/download/v0.62.1/sha256sum.txt"
+        },
+        "TLC_SHA256": {
+          "value": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88",
+          "source": "https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4"
+        }
+      },
+      "requires": [
+        "toolchain:node@24.18.0"
+      ],
+      "provides": [
+        "toolchain:jdk@21.0.12.1+1",
+        "tool:quint@0.33.0",
+        "tool:tlc@1.7.4",
+        "tool:apalache@0.62.1",
+        "tool:quint-evaluator@0.7.0"
+      ],
+      "probes": {
+        "toolchain:jdk@21.0.12.1+1": [
+          "/opt/flotilla/formal-modelling/probe.sh",
+          "jdk"
+        ],
+        "tool:quint@0.33.0": [
+          "/opt/flotilla/formal-modelling/probe.sh",
+          "quint"
+        ],
+        "tool:tlc@1.7.4": [
+          "/opt/flotilla/formal-modelling/probe.sh",
+          "tlc"
+        ],
+        "tool:apalache@0.62.1": [
+          "/opt/flotilla/formal-modelling/probe.sh",
+          "apalache"
+        ],
+        "tool:quint-evaluator@0.7.0": [
+          "/opt/flotilla/formal-modelling/probe.sh",
+          "evaluator"
+        ]
+      }
+    },
+    {
       "name": "spine-harness",
       "stage": "harness",
       "fragment": ".flotilla/image-layers/harness.Dockerfile",
