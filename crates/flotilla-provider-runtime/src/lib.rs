@@ -310,6 +310,12 @@ pub trait CommandRunner: Send + Sync {
         self.run_output("test", &args, Path::new("/"), &command_channel_label("test", &args)).await.map(|output| output.success())
     }
 
+    /// Compare the source filesystem with an existing destination directory.
+    /// Namespace-crossing runners must implement this in their own environment.
+    async fn same_filesystem(&self, _source: &Path, _destination: &Path) -> Result<bool, String> {
+        Err("filesystem comparison is unavailable".into())
+    }
+
     /// Choose a Flotilla-owned writable scratch base in this runner's
     /// filesystem world.
     ///
@@ -458,6 +464,48 @@ impl CommandProcess for TokioCommandProcess {
 
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
+    async fn same_filesystem(&self, source: &Path, destination: &Path) -> Result<bool, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let source = tokio::fs::metadata(source).await.map_err(|error| error.to_string())?;
+            let destination = tokio::fs::metadata(destination).await.map_err(|error| error.to_string())?;
+            Ok(source.dev() == destination.dev())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetVolumePathNameW(path: *const u16, volume_path: *mut u16, length: u32) -> i32;
+                fn GetVolumeNameForVolumeMountPointW(volume_path: *const u16, volume_name: *mut u16, length: u32) -> i32;
+            }
+            fn volume(path: &Path) -> Result<Vec<u16>, String> {
+                let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+                let path = path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+                let mut mount = vec![0u16; 32768];
+                let mut name = vec![0u16; 32768];
+                // Both APIs write at most the supplied buffer length and consume
+                // NUL-terminated UTF-16 paths; volume GUIDs handle mount aliases.
+                unsafe {
+                    if GetVolumePathNameW(path.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) == 0
+                        || GetVolumeNameForVolumeMountPointW(mount.as_ptr(), name.as_mut_ptr(), name.len() as u32) == 0
+                    {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                }
+                name.truncate(name.iter().position(|character| *character == 0).unwrap_or(name.len()));
+                Ok(name)
+            }
+            Ok(volume(source)? == volume(destination)?)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (source, destination);
+            Err("filesystem device comparison is unavailable on this platform".into())
+        }
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         let output = Self::command_output(cmd, args, cwd).await?;
         if output.status.success() {

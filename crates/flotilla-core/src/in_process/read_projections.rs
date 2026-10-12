@@ -1663,6 +1663,11 @@ impl ReadProjections<'_> {
 
         let messages = message_views(self.backend, namespace, &receivers, Some(&convoy), &receiver_aliases).await?;
         Ok(ConvoyExplanation {
+            degraded_checkouts: selected_vessels
+                .values()
+                .filter_map(|vessel| vessel.status.as_ref())
+                .flat_map(|status| status.degraded.clone())
+                .collect(),
             naming: convoy.status.as_ref().and_then(|status| status.naming.clone()),
             landing_entry: convoy
                 .status

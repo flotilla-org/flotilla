@@ -79,6 +79,9 @@ pub struct CheckoutWorktreeSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct FreshCloneCheckoutSpec {
+    /// ADR 0047: absent in the previous generation. Local clones use the host environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_clone_ref: Option<String>,
     pub repo_ref: RepositoryKey,
     pub env_ref: String,
     #[serde(rename = "ref")]
@@ -128,6 +131,9 @@ impl CheckoutBranchProvenance {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CheckoutStatus {
+    /// ADR 0047: absent in the previous generation; retain the default for one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
     pub phase: CheckoutPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -246,6 +252,7 @@ pub enum ChangeRequestMergeability {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutStatusPatch {
+    ObserveDegradation { message: Option<String> },
     ObserveCloneRetry { retry: Option<crate::ControllerRetry> },
     ObserveValidation { message: Option<String> },
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
@@ -273,6 +280,7 @@ pub fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, o
 impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
     fn apply(&self, status: &mut CheckoutStatus) {
         match self {
+            Self::ObserveDegradation { message } => status.degraded = message.clone(),
             Self::ObserveCloneRetry { retry } => status.clone_retry = retry.clone(),
             Self::ObserveValidation { message } => status.message = message.clone(),
             Self::MarkReady { path, commit, branch_provenance } => {

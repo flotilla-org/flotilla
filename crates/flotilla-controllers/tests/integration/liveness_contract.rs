@@ -143,6 +143,7 @@ impl WorldBuilder for CheckoutWorldBuilder {
             .create(
                 &InputMeta { name: "checkout-a".to_string(), ..Default::default() },
                 &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                    source_clone_ref: None,
                     repo_ref: RepositoryKey("repo-a".to_string()),
                     env_ref: "env-a".to_string(),
                     r#ref: "feature/liveness".to_string(),
@@ -160,6 +161,7 @@ impl WorldBuilder for CheckoutWorldBuilder {
                     "checkout-a",
                     &created.metadata.resource_version,
                     &CheckoutStatus {
+                        degraded: None,
                         clone_retry: None,
                         phase: CheckoutPhase::Ready,
                         path: None,
@@ -364,6 +366,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
                     ..Default::default()
                 },
                 &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                    source_clone_ref: None,
                     repo_ref: current.spec.repositories[0].repo_ref.clone(),
                     env_ref: "env-a".to_string(),
                     r#ref: "feature/liveness".to_string(),
@@ -380,6 +383,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
                 "checkout-a",
                 &checkout.metadata.resource_version,
                 &CheckoutStatus {
+                    degraded: None,
                     clone_retry: None,
                     phase: CheckoutPhase::Ready,
                     path: Some("/work/checkout-a".to_string()),

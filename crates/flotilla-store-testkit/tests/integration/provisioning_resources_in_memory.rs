@@ -76,6 +76,7 @@ async fn vessel_metadata_and_status_roundtrip() {
             "convoy-fix-bug-123-implement",
             &created.metadata.resource_version,
             &VesselStatus {
+                degraded: Default::default(),
                 configured_limits: None,
                 runtime_observation: None,
                 placement_decision: None,
@@ -134,6 +135,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
         }),
     };
     let checkout_spec = CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+        source_clone_ref: None,
         repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
         env_ref: "env-a".to_string(),
         r#ref: "feat/convoy-resource".to_string(),

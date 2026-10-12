@@ -36,6 +36,7 @@ pub enum CheckoutRemoval {
     LandedWorktree { clone_path: String, branch: String, target_path: String },
     OrphanedWorktree { target_path: String },
     FreshClone { target_path: String },
+    LocalClone { target_path: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,13 @@ pub trait CheckoutRuntime: Send + Sync {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String>;
+    async fn create_local_clone_in(
+        &self,
+        _env_ref: &str,
+        _request: flotilla_vcs::vcs::LocalCloneRequest<'_>,
+    ) -> Result<(PreparedCheckout, Option<String>), String> {
+        Err("local clone materialisation is unavailable".into())
+    }
     async fn inspect_integration(
         &self,
         checkout: &ResourceObject<Checkout>,
@@ -328,9 +336,14 @@ where
 
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
             if obj.status.as_ref().is_some_and(|status| matches!(status.phase, CheckoutPhase::Ready | CheckoutPhase::Gone)) {
-                if let CheckoutSpec::Worktree(worktree) = &obj.spec {
-                    let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).unwrap_or(&worktree.target_path);
-                    match self.runtime.checkout_path_exists_in(&worktree.env_ref, path).await {
+                let host_checkout = match &obj.spec {
+                    CheckoutSpec::Worktree(spec) => Some((&spec.env_ref, &spec.target_path)),
+                    CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => Some((&spec.env_ref, &spec.target_path)),
+                    _ => None,
+                };
+                if let Some((env_ref, target_path)) = host_checkout {
+                    let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).unwrap_or(target_path);
+                    match self.runtime.checkout_path_exists_in(env_ref, path).await {
                         Ok(Some(false)) if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) => {
                             return Ok(CheckoutPrepared::Gone)
                         }
@@ -410,6 +423,9 @@ where
                         }
                         CheckoutPhase::Failed | CheckoutPhase::Gone => false,
                     }
+                    // Independent local clones of one convoy can use its shared branch name.
+                    && !(matches!((&obj.spec, &other.spec), (CheckoutSpec::FreshClone(left), CheckoutSpec::FreshClone(right)) if left.source_clone_ref.is_some() && right.source_clone_ref.is_some())
+                        && obj.metadata.labels.get(CONVOY_LABEL) == other.metadata.labels.get(CONVOY_LABEL))
                     && other.spec.repo_ref() == obj.spec.repo_ref()
                     // Recovery can move environments; a live owner still reserves the same repository branch.
                     && (continuing || other.spec.env_ref() == obj.spec.env_ref())
@@ -496,6 +512,56 @@ where
                         Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
                     },
                 )
+            }
+            CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => {
+                let clone_name = spec.source_clone_ref.as_ref().expect("local clone source");
+                let clone = match self.clones.get(clone_name).await {
+                    Ok(clone) => clone,
+                    Err(ResourceError::NotFound { .. }) => return Ok(CheckoutPrepared::Waiting),
+                    Err(error) => return Err(error),
+                };
+                self.observe_clone_retry(obj, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
+                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
+                    if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
+                        return Ok(CheckoutPrepared::Failed(
+                            clone
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.clone())
+                                .unwrap_or_else(|| format!("clone {clone_name} failed validation")),
+                        ));
+                    }
+                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
+                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
+                }
+                if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
+                    return Ok(CheckoutPrepared::Waiting);
+                }
+                if clone.spec.env_ref != spec.env_ref || clone.spec.repo_ref != spec.repo_ref {
+                    return Ok(CheckoutPrepared::Failed("local clone source repo/env mismatch".into()));
+                }
+                match self
+                    .runtime
+                    .create_local_clone_in(
+                        &spec.env_ref,
+                        flotilla_vcs::vcs::LocalCloneRequest {
+                            source: &clone.spec.path,
+                            url: &spec.url,
+                            branch: &spec.r#ref,
+                            base_ref: spec.base_ref.as_deref(),
+                            target: &spec.target_path,
+                            continue_branch: continuing,
+                        },
+                    )
+                    .await
+                {
+                    Ok((prepared, message)) => {
+                        apply_status_patch(&self.checkouts, &obj.metadata.name, &CheckoutStatusPatch::ObserveDegradation { message })
+                            .await?;
+                        Ok(CheckoutPrepared::Ready { prepared })
+                    }
+                    Err(error) => Ok(CheckoutPrepared::Failed(error)),
+                }
             }
             CheckoutSpec::FreshClone(_) if continuing => {
                 Ok(match self.runtime.continue_checkout_in(obj, None, &checkout_registration_reason(obj, convoy.as_ref())).await {
@@ -652,6 +718,9 @@ where
                 Err(ResourceError::NotFound { .. }) => CheckoutRemoval::OrphanedWorktree { target_path: spec.target_path.clone() },
                 Err(err) => return Err(err),
             },
+            CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some() => {
+                CheckoutRemoval::LocalClone { target_path: spec.target_path.clone() }
+            }
             CheckoutSpec::FreshClone(spec) => CheckoutRemoval::FreshClone { target_path: spec.target_path.clone() },
             CheckoutSpec::Observed(_) => return Ok(()),
         };

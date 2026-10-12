@@ -195,7 +195,11 @@ async fn inspect_checkout_integration_with_association(
     observe_remote_ref: bool,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
-    let clean = inspect_clean(providers.vcs, &observed_at).await;
+    let clean = if matches!(spec, CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_some()) {
+        clean_condition(providers.vcs.local_clone_is_clean(checkout_path.to_str().unwrap_or_default()).await, &observed_at)
+    } else {
+        inspect_clean(providers.vcs, &observed_at).await
+    };
     let pushed = inspect_pushed(providers.vcs, observed_change_request, &observed_at).await;
     let (landed, landed_evidence, change_request) = inspect_landed(
         providers,
@@ -232,7 +236,11 @@ async fn inspect_remote_ref(vcs: &dyn Vcs, branch: &str, observed_at: &str) -> B
 }
 
 async fn inspect_clean(vcs: &dyn Vcs, observed_at: &str) -> IntegrationCondition {
-    let (value, details) = match vcs.is_clean().await {
+    clean_condition(vcs.is_clean().await, observed_at)
+}
+
+fn clean_condition(check: VcsCheck, observed_at: &str) -> IntegrationCondition {
+    let (value, details) = match check {
         VcsCheck::True(details) => (ConditionValue::True, details),
         VcsCheck::False(details) => (ConditionValue::False, details),
         VcsCheck::Unknown(details) => (ConditionValue::Unknown, details),

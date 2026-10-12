@@ -275,6 +275,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             "convoy-stage4a-implement",
             &workspace.metadata.resource_version,
             &VesselStatus {
+                degraded: Default::default(),
                 configured_limits: None,
                 runtime_observation: None,
                 placement_decision: None,
@@ -385,6 +386,7 @@ async fn controller_loop_finalizer_deletes_vessels_and_checkouts() {
                 .labels([(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect())
                 .build(),
             &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                source_clone_ref: None,
                 repo_ref: RepositoryKey("repo-a".to_string()),
                 env_ref: "env-convoy-delete".to_string(),
                 r#ref: "feature/delete".to_string(),

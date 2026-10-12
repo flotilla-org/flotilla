@@ -164,6 +164,11 @@ fn allowed_shared_config_key(key: &str) -> bool {
             | "gc.auto"
             | "gc.autodetach"
             | "gc.pruneexpire"
+            // Non-executable local-clone tracking and portable worktree metadata (#3090).
+            | "push.default"
+            | "worktree.userelativepaths"
+            | "extensions.relativeworktrees"
+            | "flotilla.createdforconvoy"
             | "pull.rebase"
             | "pull.ff"
             | "init.defaultbranch"

@@ -437,6 +437,14 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
+    async fn create_local_clone_in(
+        &self,
+        env_ref: &str,
+        request: flotilla_vcs::vcs::LocalCloneRequest<'_>,
+    ) -> Result<(PreparedCheckout, Option<String>), String> {
+        self.runtime_for(env_ref, request.source).await?.create_local_clone_in(env_ref, request).await
+    }
+
     async fn create_fresh_clone_in(
         &self,
         env_ref: &str,

@@ -1114,6 +1114,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    for (checkout, message) in &explanation.degraded_checkouts {
+        output.push_str(&format!("\nDegraded checkout {checkout}: {message}\n"));
+    }
     output.push_str("\nExpected checkouts:\n");
     if explanation.checkouts.is_empty() {
         output.push_str("  (none; artifact-less claim exit)\n");

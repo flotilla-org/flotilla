@@ -89,6 +89,15 @@ pub struct WorktreeMetadata {
     pub admin_dir: PathBuf,
 }
 
+pub struct LocalCloneRequest<'a> {
+    pub source: &'a str,
+    pub url: &'a str,
+    pub branch: &'a str,
+    pub base_ref: Option<&'a str>,
+    pub target: &'a str,
+    pub continue_branch: bool,
+}
+
 pub struct CheckoutMaterialisation {
     pub commit: Option<String>,
     pub provenance: CheckoutBranchProvenance,
@@ -509,6 +518,21 @@ pub trait Vcs: Send + Sync {
 
     async fn clone_origin(&self, _target: &Path) -> Result<String, String> {
         Err("clone origin inspection is unavailable".into())
+    }
+
+    /// Own a writable host clone, hardlinking objects only on the same filesystem.
+    /// The optional message reports the full-copy degraded condition.
+    async fn local_clone_is_clean(&self, _target: &str) -> VcsCheck {
+        VcsCheck::Unknown(vec!["local clone cleanliness inspection is unavailable".into()])
+    }
+
+    /// Refuse reclamation if any owned worktree is dirty or any local branch is unpublished.
+    async fn verify_local_clone_reclaimable(&self, _target: &str) -> Result<(), String> {
+        Err("local clone reclamation inspection is unavailable".into())
+    }
+
+    async fn materialise_local_clone(&self, _request: LocalCloneRequest<'_>) -> Result<(CheckoutMaterialisation, Option<String>), String> {
+        Err("local clone materialisation is unavailable".into())
     }
 
     async fn materialise_fresh_clone(
@@ -1107,6 +1131,191 @@ impl Vcs for FlotillaVcs {
 
     async fn clone_origin(&self, target: &Path) -> Result<String, String> {
         GitCliBackend::checkout_root(target, &*self.runner).remote_url("origin").await
+    }
+
+    async fn local_clone_is_clean(&self, target: &str) -> VcsCheck {
+        let inspect = async {
+            let local = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
+            let root = local.run(&["rev-parse", "--show-toplevel"]).await?;
+            let root = Path::new(root.trim());
+            let listing = local.run(&["worktree", "list", "--porcelain", "-z"]).await?;
+            let paths = listing.split('\0').filter_map(|field| field.strip_prefix("worktree ")).collect::<Vec<_>>();
+            let mut changes = Vec::new();
+            for path in &paths {
+                if !Path::new(path).starts_with(root) {
+                    return Err(format!("preserving local clone {target}: worktree {path} is outside the vessel directory"));
+                }
+                let mut args = vec![
+                    "status".to_string(),
+                    "--porcelain".into(),
+                    "-z".into(),
+                    "--untracked-files=all".into(),
+                    "--".into(),
+                    ".".into(),
+                    ":(exclude).flotilla/briefs".into(),
+                ];
+                for child in &paths {
+                    if path != child {
+                        if let Ok(relative) = Path::new(child).strip_prefix(path) {
+                            // Registered nested worktrees are inspected separately; unrelated
+                            // untracked files beside them remain visible in the parent status.
+                            let relative = relative
+                                .components()
+                                .map(|component| component.as_os_str().to_string_lossy())
+                                .collect::<Vec<_>>()
+                                .join("/");
+                            args.push(format!(":(exclude,literal){relative}"));
+                        }
+                    }
+                }
+                let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+                let status = GitCliBackend::checkout_root(Path::new(path), &*self.runner).run(&refs).await?;
+                if !status.is_empty() {
+                    changes.push(format!("dirty local clone worktree {path}"));
+                }
+            }
+            Ok::<_, String>(changes)
+        }
+        .await;
+        match inspect {
+            Ok(changes) if changes.is_empty() => VcsCheck::True(Vec::new()),
+            Ok(changes) => VcsCheck::False(changes),
+            Err(error) => VcsCheck::Unknown(vec![error]),
+        }
+    }
+
+    async fn verify_local_clone_reclaimable(&self, target: &str) -> Result<(), String> {
+        if !self.runner.path_exists(Path::new(target)).await? {
+            return Ok(());
+        }
+        match self.local_clone_is_clean(target).await {
+            VcsCheck::True(_) => {}
+            VcsCheck::False(details) | VcsCheck::Unknown(details) => {
+                return Err(format!("preserving local clone {target}: {}", details.join("; ")))
+            }
+        }
+        let local = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
+        let listing = local.run(&["worktree", "list", "--porcelain", "-z"]).await?;
+        let mut revisions = vec!["rev-list", "--count", "--branches"];
+        revisions.extend(listing.split('\0').filter_map(|field| field.strip_prefix("HEAD ")));
+        revisions.extend(["--not", "--remotes"]);
+        let unpublished = local.run(&revisions).await?;
+        if unpublished.trim() != "0" {
+            return Err(format!("preserving local clone {target}: unpublished branch commits"));
+        }
+        Ok(())
+    }
+
+    async fn materialise_local_clone(&self, request: LocalCloneRequest<'_>) -> Result<(CheckoutMaterialisation, Option<String>), String> {
+        let LocalCloneRequest { source, url, branch, base_ref, target, continue_branch } = request;
+        if Path::new(source) == Path::new(target) {
+            return Err("local clone source and target must differ".into());
+        }
+        let target_lock = object_cache_lock(Path::new(target));
+        let _target_guard = target_lock.lock().await;
+        let parent = Path::new(target).parent().ok_or("local clone target has no parent")?;
+        let parent_text = parent.to_str().ok_or("local clone parent is not UTF-8")?;
+        self.runner.run("mkdir", &["-p", parent_text], Path::new("/"), &command_channel_label("mkdir", &["-p", parent_text])).await?;
+        let hardlinks = self.runner.same_filesystem(Path::new(source), parent).await?;
+        let degraded =
+            (!hardlinks).then(|| "local clone objects copied: managed Clone and vessel workspace are on different filesystems".to_string());
+        if self.runner.path_exists(Path::new(target)).await? {
+            let mut result = self.materialise_fresh_clone(url, branch, base_ref, target).await?;
+            let marker = GitCliBackend::checkout_root(Path::new(target), &*self.runner)
+                .run(&["config", "--get", "flotilla.createdForConvoy"])
+                .await
+                .ok();
+            if marker.as_deref().map(str::trim) == Some(branch) {
+                result.provenance = CheckoutBranchProvenance::CreatedForConvoy;
+            }
+            return Ok((result, degraded));
+        }
+        let source_lock = object_cache_lock(Path::new(source));
+        let _source_guard = source_lock.lock().await;
+        let source_backend = GitCliBackend::checkout_root(Path::new(source), &*self.runner);
+        source_backend.run(&["fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*"]).await?;
+        let remote_branch_exists = branch != "HEAD" && source_backend.ref_exists(&format!("refs/remotes/origin/{branch}")).await;
+        if continue_branch && !remote_branch_exists {
+            return Err(format!("continuation branch {branch} does not exist on origin"));
+        }
+        if !continue_branch && remote_branch_exists {
+            return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
+        }
+        let staging = format!("{target}.flotilla-clone-partial");
+        remove_worktree_path(&*self.runner, &staging).await?;
+        let prepare = async {
+            let mut args = vec!["clone", "--local", "--no-checkout"];
+            if !hardlinks {
+                args.push("--no-hardlinks");
+            }
+            args.extend(["--", source, &staging]);
+            source_backend.run(&args).await?;
+            let local = GitCliBackend::checkout_root(Path::new(&staging), &*self.runner);
+            local.run(&["remote", "set-url", "origin", url]).await?;
+            // clone --local advertises source local heads as origin refs. They
+            // are not publication evidence on the repository's real origin.
+            let copied_refs = local.run(&["for-each-ref", "--format=%(refname)", "refs/remotes/origin"]).await?;
+            for reference in copied_refs.lines() {
+                local.run(&["update-ref", "--no-deref", "-d", reference]).await?;
+            }
+            // Import only freshly fetched origin refs, without a second network fetch.
+            local.run(&["fetch", "--no-tags", "--", source, "+refs/remotes/origin/*:refs/remotes/origin/*"]).await?;
+            let continuation_base = format!("origin/{branch}");
+            let base = if continue_branch { continuation_base.as_str() } else { base_ref.unwrap_or("origin/HEAD") };
+            let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+            let remote_base = format!("refs/remotes/origin/{base}");
+            let base = if local.ref_exists(&remote_base).await { remote_base.as_str() } else { base };
+            local.run(&["checkout", "--detach", base]).await?;
+            // The source's checked-out local branch may contain unpublished desk
+            // work. It remains in the managed Clone; it is not vessel-owned work.
+            let copied_heads = local.run(&["for-each-ref", "--format=%(refname)", "refs/heads"]).await?;
+            for reference in copied_heads.lines() {
+                local.run(&["update-ref", "-d", reference]).await?;
+            }
+            if branch != "HEAD" {
+                local.run(&["checkout", "--no-track", "-B", branch, base]).await?;
+                local.run(&["config", &format!("branch.{branch}.remote"), "origin"]).await?;
+                local.run(&["config", &format!("branch.{branch}.merge"), &format!("refs/heads/{branch}")]).await?;
+            }
+            local.run(&["config", "push.default", "current"]).await?;
+            if !continue_branch && branch != "HEAD" {
+                local.run(&["config", "flotilla.createdForConvoy", branch]).await?;
+            }
+            let version = local.run(&["version"]).await?;
+            let supports_relative = version
+                .split_whitespace()
+                .nth(2)
+                .and_then(|version| {
+                    let mut parts = version.split('.');
+                    Some((parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?))
+                })
+                .is_some_and(|version| version >= (2, 48));
+            if supports_relative {
+                local.run(&["config", "worktree.useRelativePaths", "true"]).await?;
+            }
+            local.head_commit_text().await
+        }
+        .await;
+        let commit = match prepare {
+            Ok(commit) => commit.trim().to_string(),
+            Err(error) => return Err(cleanup_clone_path(&*self.runner, &staging, error).await),
+        };
+        if let Err(error) =
+            self.runner.run("mv", &[&staging, target], Path::new("/"), &command_channel_label("mv", &[&staging, target])).await
+        {
+            return Err(cleanup_clone_path(&*self.runner, &staging, error).await);
+        }
+        Ok((
+            CheckoutMaterialisation {
+                commit: Some(commit),
+                provenance: if continue_branch || branch == "HEAD" {
+                    CheckoutBranchProvenance::PreExisting
+                } else {
+                    CheckoutBranchProvenance::CreatedForConvoy
+                },
+            },
+            degraded,
+        ))
     }
 
     async fn materialise_fresh_clone(
@@ -2020,6 +2229,163 @@ mod tests {
     fn git(cwd: &Path, args: &[&str]) {
         let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");
         assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // Git subprocess boundary: real Git verifies hardlinks, tracking, retries and nested worktrees.
+    // Filesystem seam cases cover the two placement outcomes without a second mount or Docker.
+    #[tokio::test]
+    async fn hardlinked_local_clone_owns_git_and_preserves_subagent_work() {
+        local_clone_owns_git_and_preserves_subagent_work(true).await;
+    }
+    #[tokio::test]
+    async fn copied_local_clone_owns_git_and_preserves_subagent_work() {
+        local_clone_owns_git_and_preserves_subagent_work(false).await;
+    }
+    async fn local_clone_owns_git_and_preserves_subagent_work(same_filesystem: bool) {
+        struct FilesystemCase(bool);
+        #[async_trait]
+        impl CommandRunner for FilesystemCase {
+            async fn same_filesystem(&self, _source: &Path, _destination: &Path) -> Result<bool, String> {
+                Ok(self.0)
+            }
+            async fn run(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<String, String> {
+                flotilla_provider_runtime::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &flotilla_provider_runtime::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                flotilla_provider_runtime::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                flotilla_provider_runtime::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+        fn read_git(cwd: &Path, args: &[&str]) -> String {
+            let result = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("git");
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            String::from_utf8(result.stdout).expect("text").trim().to_string()
+        }
+        let dir = tempfile::tempdir().expect("directory");
+        let remote = dir.path().join("remote");
+        std::fs::create_dir(&remote).expect("remote directory");
+        git(&remote, &["init", "--bare", "-b", "main"]);
+        let writer = dir.path().join("writer");
+        git(dir.path(), &["clone", remote.to_str().unwrap(), writer.to_str().unwrap()]);
+        git(&writer, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        git(&writer, &["push", "origin", "main"]);
+        let source = dir.path().join("managed");
+        git(dir.path(), &["clone", remote.to_str().unwrap(), source.to_str().unwrap()]);
+        let old_commit = read_git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["switch", "-c", "source-only"]);
+        git(
+            &source,
+            &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unpublished source work"],
+        );
+
+        git(&writer, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "new base"]);
+        git(&writer, &["push", "origin", "main"]);
+        let current_base = read_git(&writer, &["rev-parse", "HEAD"]);
+        let target = dir.path().join("convoy-test/vessel");
+        let vcs = test_fl(&source, Arc::new(FilesystemCase(same_filesystem)), true);
+        let (result, degraded) = vcs
+            .materialise_local_clone(LocalCloneRequest {
+                source: source.to_str().unwrap(),
+                url: remote.to_str().unwrap(),
+                branch: "crew",
+                base_ref: Some("main"),
+                target: target.to_str().unwrap(),
+                continue_branch: false,
+            })
+            .await
+            .expect("local clone");
+        assert_eq!(result.commit.as_deref(), Some(current_base.as_str()), "fetched origin wins over stale local main");
+        assert_eq!(result.provenance, CheckoutBranchProvenance::CreatedForConvoy);
+        assert_eq!(degraded.is_some(), !same_filesystem);
+        assert!(target.join(".git").is_dir());
+        assert!(!target.join(".git/objects/info/alternates").exists());
+        assert_eq!(read_git(&target, &["for-each-ref", "--format=%(refname)", "refs/heads"]), "refs/heads/crew");
+        assert!(
+            read_git(&target, &["for-each-ref", "--format=%(refname)", "refs/remotes/origin/source-only"]).is_empty(),
+            "source local heads must not masquerade as published branches"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let object = format!(".git/objects/{}/{}", &old_commit[..2], &old_commit[2..]);
+            let original = std::fs::metadata(source.join(&object)).expect("source object");
+            let cloned = std::fs::metadata(target.join(&object)).expect("cloned object");
+            assert_eq!(original.ino() == cloned.ino(), same_filesystem);
+        }
+        let (retry, retry_degraded) = vcs
+            .materialise_local_clone(LocalCloneRequest {
+                source: source.to_str().unwrap(),
+                url: remote.to_str().unwrap(),
+                branch: "crew",
+                base_ref: Some("main"),
+                target: target.to_str().unwrap(),
+                continue_branch: false,
+            })
+            .await
+            .expect("retry preserves provenance");
+        assert_eq!(retry.provenance, CheckoutBranchProvenance::CreatedForConvoy);
+        assert_eq!(retry.commit, result.commit);
+        assert_eq!(retry_degraded, degraded);
+        assert_eq!(read_git(&target, &["config", "branch.crew.remote"]), "origin");
+        assert_eq!(read_git(&target, &["config", "branch.crew.merge"]), "refs/heads/crew");
+        assert_eq!(read_git(&target, &["remote", "get-url", "origin"]), remote.to_str().unwrap());
+        let agent = target.join("agents/one");
+        git(&target, &["worktree", "add", "-b", "agent", agent.to_str().unwrap(), "HEAD"]);
+        vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.expect("clean clone");
+        std::fs::write(agent.join("dirty"), "work").expect("subagent work");
+        assert!(vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.unwrap_err().contains("dirty"));
+        std::fs::remove_file(agent.join("dirty")).expect("remove dirty file");
+        std::fs::write(target.join("dirty"), "main work").expect("main work");
+        assert!(vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.unwrap_err().contains("dirty"));
+        std::fs::remove_file(target.join("dirty")).expect("remove dirty file");
+        vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.expect("clean again");
+        git(&target, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unpublished"]);
+        assert!(vcs.verify_local_clone_reclaimable(target.to_str().unwrap()).await.unwrap_err().contains("unpublished"));
+        git(&target, &["push"]);
+        let continued = dir.path().join("convoy-test/continued");
+        let (continuation, _) = vcs
+            .materialise_local_clone(LocalCloneRequest {
+                source: source.to_str().unwrap(),
+                url: remote.to_str().unwrap(),
+                branch: "crew",
+                base_ref: Some("main"),
+                target: continued.to_str().unwrap(),
+                continue_branch: true,
+            })
+            .await
+            .expect("continue remote branch in an owned local clone");
+        assert_eq!(continuation.provenance, CheckoutBranchProvenance::PreExisting);
+        assert_eq!(continuation.commit.as_deref(), Some(read_git(&target, &["rev-parse", "HEAD"]).as_str()));
+        let refused = dir.path().join("convoy-test/refused");
+        let conflict = vcs
+            .materialise_local_clone(LocalCloneRequest {
+                source: source.to_str().unwrap(),
+                url: remote.to_str().unwrap(),
+                branch: "crew",
+                base_ref: Some("main"),
+                target: refused.to_str().unwrap(),
+                continue_branch: false,
+            })
+            .await
+            .err()
+            .expect("remote branch conflict");
+        assert!(conflict.contains("already exists on remote"));
+        assert!(!refused.exists());
     }
 
     fn test_fl(cwd: &Path, runner: Arc<dyn CommandRunner>, explicit: bool) -> FlotillaVcs {

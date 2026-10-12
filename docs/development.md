@@ -353,6 +353,32 @@ before the roll. Live acceptance requires an operator on a fleet host.
 
 ## Git in contained host worktrees
 
+`local_clone_on_host_and_mount` gives each Docker vessel a self-contained host
+clone with its own writable `.git`, bound read-write at the policy's `mount_path`.
+Provisioning fetches the managed Clone from origin before `git clone --local`;
+objects are hardlinked without alternates or Git-metadata mounts. The host's
+managed clones and vessel directories share its host-direct environment's
+`repo_default_dir`. If their filesystems differ, provisioning explicitly copies
+objects and records a degraded checkout condition in Vessel status and
+`flotilla convoy explain`.
+
+Tracking is written to the vessel clone's own config, so `git push`, `git pull`,
+`git push -u`, and tools such as `gh stack` can manage the repository normally.
+The strategy does not install `gh-stack`. Put subagent worktrees beneath the
+vessel directory, for example `git worktree add -b agent-one agents/one HEAD`.
+On [Git 2.48 or newer](https://git-scm.com/docs/git-worktree/2.48.0) provisioning sets `worktree.useRelativePaths=true`, allowing
+nested registrations to resolve at both host and container paths. On older Git,
+worktrees work inside the container but their absolute registrations cannot be
+used from the host after moving between path domains. Worktrees and the clone
+survive environment recreation and are removed together on clean teardown.
+Dirty main or subagent worktrees and unpublished branches preserve the clone;
+worktrees outside the vessel directory refuse reclamation.
+
+See the [placement-policy reference](placement-policy.md) for the stored strategy
+shape and the deliberate per-host switch after a fleet roll. Existing
+`worktree_on_host_and_mount` policies remain readable and keep the behavior below
+until the host operator switches them; host-direct placements do not change.
+
 Contained host-worktree vessels receive process-scoped tracking settings for their
 provisioned branches: `branch.<branch>.remote=origin`,
 `branch.<branch>.merge=refs/heads/<branch>`, and `push.default=current`.
