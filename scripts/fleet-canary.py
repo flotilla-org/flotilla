@@ -7,6 +7,7 @@ contract tests. No test-only success path exists in the production gate.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -19,6 +20,14 @@ import time
 
 class CanaryFailure(RuntimeError):
     pass
+
+
+def canary_image(image):
+    """Probe an explicitly selected built image; never a retired tag fallback."""
+    if not isinstance(image, str) or not re.fullmatch(r'(?:[^\s@]+@)?sha256:[0-9a-f]{64}', image):
+        raise CanaryFailure('FLEET_CANARY_IMAGE must name a built local image ID or registry reference pinned by digest')
+    return {'composition': {'selection': {'base': image, 'utilities': None, 'harness': None, 'project': None},
+                            'literal_base': image, 'needs': [], 'layers': []}}
 
 
 class Commands:
@@ -165,13 +174,36 @@ def live_registry_spec(log):
     return None
 
 
+def live_canary_image(log):
+    """Reuse the newest ready local environment's concrete image, without tags."""
+    override = os.environ.get('FLEET_CANARY_IMAGE')
+    if override is not None:
+        canary_image(override)
+        return override
+    commands = Commands({**os.environ, 'FLOTILLA_CONTAINED_HOST_DAEMON': '1'}, log)
+    try:
+        records = objects(json.loads(commands.run([
+            'flotilla', '--json', 'resource', 'list', 'environments', '--local-only'])))
+        ready = [item for item in records if (item.get('spec') or {}).get('docker')
+                 and (item.get('status') or {}).get('phase') == 'Ready']
+        if not ready:
+            raise CanaryFailure('canary image: no ready local Docker environment; set FLEET_CANARY_IMAGE to a built digest')
+        selected = max(ready, key=lambda item: (item['metadata'].get('creation_timestamp', ''), item['metadata']['name']))
+        image = selected['status'].get('local_image_id')
+        canary_image(image)
+        return image
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise CanaryFailure(f'canary image: invalid host environment declarations: {error}') from error
+
+
 class Canary:
-    def __init__(self, release, root, commands, timeout=180, *, host_home=None, live_spec=None):
+    def __init__(self, release, root, commands, timeout=180, *, host_home=None, live_spec=None, image=None):
         self.release = Path(release)
         self.root = Path(root)
         self.commands = commands
         self.host_home = Path.home() if host_home is None else Path(host_home)
         self.live_spec = live_spec
+        self.image = image
         self.timeout = timeout
         self.socket = self.root / 'config/run/flotilla.sock'
         self.containers = set()
@@ -226,6 +258,7 @@ class Canary:
         if len(hosts) != 1:
             raise CanaryFailure('canary must have exactly one unfederated host')
         host = hosts[0]['metadata']['name']
+        image = canary_image(self.image if self.image is not None else os.environ.get('FLEET_CANARY_IMAGE'))
         repo = self.root / 'repository'
         repo.mkdir()
         (repo / '.flotilla').mkdir()
@@ -247,18 +280,17 @@ class Canary:
         self.apply('CredentialSpec', REGISTRY_CREDENTIAL, self.registry_spec)
         self.apply('CredentialGrant', 'fleet-canary-registry', {
             'selector': {'projects': ['fleet-canary']}, 'credentials': [REGISTRY_CREDENTIAL]})
-        self.cli('resource', 'apply', '--file', str(self.release / 'crew-image-baseline.yaml'))
         self.apply('PlacementPolicy', 'fleet-canary', {
             'pool': 'cleat', 'docker_per_vessel': {
-                'host_ref': host, 'image': {'image_baseline_ref': 'fleet-crew'},
-                'pull_policy': 'always',
+                'host_ref': host, 'image': image,
+                'pull_policy': 'if_not_present',
                 'agent_adapters': ['fleet-canary'], 'default_cwd': '/workspace',
                 'env': {'FLOTILLA_FLEET_CANARY': '1', 'CLAUDE_CONFIG_DIR': '/tmp/flotilla-config/canary'},
                 'checkout': {'worktree_on_host_and_mount': {'mount_path': '/workspace'}}}})
         # --fulfilment pins a kind; a PlacementPolicy alone is not its definition.
         self.apply('FulfilmentKind', 'fleet-canary', {
             'host_ref': host, 'pool': 'cleat', 'realisation': 'docker_per_vessel',
-            'image': {'image_baseline_ref': 'fleet-crew'}})
+            'image': image})
         self.wait('host observes registry credential', lambda: any(
             REGISTRY_CREDENTIAL in item.get('status', {}).get('capabilities', {}).get('held_credentials', [])
             for item in self.list('hosts')))
@@ -336,6 +368,7 @@ def main(argv=None):
         canary = Canary(args.release, root, commands, args.timeout)
         try:
             canary.live_spec = live_registry_spec(log)
+            canary.image = live_canary_image(log)
             canary.exercise()
             success = True
         except (CanaryFailure, OSError, ValueError, subprocess.SubprocessError) as error:

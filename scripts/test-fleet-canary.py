@@ -111,9 +111,10 @@ class Processes:
             return json.dumps({'records': [{'object': item} for item in resources[kind]]})
         if command[:2] == ['resource', 'apply']:
             path = Path(command[3])
-            if path.suffix == '.json':
-                doc = json.loads(path.read_text())
-                self.manifests[doc['kind']] = doc
+            # The CLI process boundary must consume the actual manifest bytes;
+            # a missing retired payload cannot be accepted by the stand-in.
+            doc = json.loads(path.read_text())
+            self.manifests[doc['kind']] = doc
             return ''
         if command[:2] == ['project', 'add']:
             repo = Path(command[2])
@@ -148,7 +149,7 @@ class Contract(unittest.TestCase):
             token.parent.mkdir(parents=True)
             token.write_text('test-registry-token\n')
             processes = Processes(root / 'probe', failure)
-            gate = canary.Canary(release, root / 'probe', processes, timeout=0.02, host_home=root)
+            gate = canary.Canary(release, root / 'probe', processes, timeout=0.02, host_home=root, image="sha256:" + "a" * 64)
             if failure:
                 with self.assertRaises(canary.CanaryFailure) as error:
                     gate.exercise()
@@ -158,6 +159,41 @@ class Contract(unittest.TestCase):
 
     # The host CLI is a process-boundary fake: live declarations win and only
     # a successful response without the named credential permits defaults.
+    def test_canary_image_requires_explicit_built_identity(self):
+        # Cover local/registry identities, absent/empty/mutable inputs, malformed
+        # digests and whitespace; no previous baseline can be selected implicitly.
+        for image in ['sha256:' + 'a' * 64, 'registry.example/crew@sha256:' + 'b' * 64]:
+            composition = canary.canary_image(image)['composition']
+            self.assertEqual(composition['literal_base'], image)
+            self.assertEqual(composition['layers'], [])
+            self.assertNotIn('baseline_image', composition)
+        for image in [None, '', 'crew:latest', 'sha256:' + 'a' * 63, 'sha256:' + 'g' * 64,
+                      'registry.example/crew@sha256:' + 'a' * 65, ' sha256:' + 'a' * 64]:
+            with self.subTest(image=image), self.assertRaisesRegex(canary.CanaryFailure, 'FLEET_CANARY_IMAGE'):
+                canary.canary_image(image)
+
+    def test_live_canary_image_uses_newest_ready_identity_without_fallback(self):
+        # A concrete placed image is independent of the candidate's retired
+        # baseline payload. Malformed newest evidence must not pick an older tag.
+        old = {'metadata': {'name': 'old', 'creation_timestamp': '2026-01-01'},
+               'spec': {'docker': {'image': 'old:tag'}}, 'status': {'phase': 'Ready', 'local_image_id': 'sha256:' + 'a' * 64}}
+        newest = copy.deepcopy(old)
+        newest['metadata'] = {'name': 'new', 'creation_timestamp': '2026-02-01'}
+        newest['status']['local_image_id'] = 'sha256:' + 'b' * 64
+        with patch.dict(os.environ, {}, clear=True):
+            for records in [[old, newest], [newest, old]]:
+                with patch.object(canary.Commands, 'run', return_value=json.dumps({'records': [{'object': r} for r in records]})):
+                    self.assertEqual(canary.live_canary_image(io.StringIO()), 'sha256:' + 'b' * 64)
+            newest['status']['local_image_id'] = 'mutable:tag'
+            for records in [[], [old, newest], [{'spec': {'docker': {}}, 'status': None}],
+                            [{'spec': True}], [{'spec': {'docker': True}, 'status': {'phase': 'Ready'}, 'metadata': None}]]:
+                with patch.object(canary.Commands, 'run', return_value=json.dumps({'records': [{'object': r} for r in records]})):
+                    with self.assertRaises(canary.CanaryFailure):
+                        canary.live_canary_image(io.StringIO())
+        with patch.dict(os.environ, {'FLEET_CANARY_IMAGE': 'sha256:' + 'c' * 64}), patch.object(canary.Commands, 'run') as run:
+            self.assertEqual(canary.live_canary_image(io.StringIO()), 'sha256:' + 'c' * 64)
+            run.assert_not_called()
+
     def test_live_registry_lookup(self):
         live = {'consumer': {'adapter': 'docker-registry', 'registry': 'live.example', 'username': 'live-user'},
                 'source': {'kind': 'file', 'path': '/host/token'}, 'lifecycle': 'static'}
@@ -310,7 +346,8 @@ class Contract(unittest.TestCase):
         _, processes = self.exercise()
         self.assertTrue(processes.completed)
         placement = processes.manifests['PlacementPolicy']['spec']['docker_per_vessel']
-        self.assertEqual(placement['image'], {'image_baseline_ref': 'fleet-crew'})
+        self.assertEqual(placement['image'], canary.canary_image('sha256:' + 'a' * 64))
+        self.assertNotIn('CrewImageBaseline', processes.manifests)
         self.assertNotIn('memory_policy', placement, 'use the shared deserialization default')
         self.assertEqual(placement['host_ref'], 'canary-host')
         self.assertEqual(placement['env']['FLOTILLA_FLEET_CANARY'], '1')
@@ -360,6 +397,7 @@ class Contract(unittest.TestCase):
 
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with patch.object(canary, 'Commands', factory), patch.object(canary, 'live_registry_spec', return_value=None), \
+                        patch.object(canary, 'live_canary_image', return_value='sha256:' + 'a' * 64), \
                         patch.object(Path, 'home', return_value=release), \
                         contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     result = canary.main([str(release)])

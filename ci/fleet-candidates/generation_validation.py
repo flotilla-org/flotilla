@@ -51,7 +51,10 @@ REQUIRED_PAYLOAD = {
 }
 # Produced together by build-candidate.sh, optional when decoding a previous
 # generation so health rollback remains valid (ADR 0047).
-CANARY_PAYLOAD = {"fleet-canary.py", "fleet-canary-agent.sh", "crew-image-baseline.yaml"}
+CANARY_PAYLOAD = {"fleet-canary.py", "fleet-canary-agent.sh"}
+# ADR 0047: accept the retired image payload for rollback through the cut-over
+# compatibility roll; new candidates do not package it. Remove in generation 3.
+CANARY_PAYLOAD.add("crew-image-baseline.yaml")
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12}))$")

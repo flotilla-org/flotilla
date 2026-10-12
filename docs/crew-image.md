@@ -163,12 +163,16 @@ run.
    There is no central arm64 image build or cross-architecture builder.
 5. Verify a new admission builds/binds the selected composition, then retire
    the `fleet-crew` baseline Definition. Keep running convoys' images available.
-6. In fleet-ops/lab operations remove the `crew-image-builder` runner and its
+6. Fleet candidate bundles no longer carry the baseline YAML. The isolated
+   binary canary freezes the newest Ready local Docker Environment's concrete
+   image ID (or an explicit `FLEET_CANARY_IMAGE` digest), so the canary must have
+   a ready image available before the roll. No mutable-tag fallback is allowed.
+7. In fleet-ops/lab operations remove the `crew-image-builder` runner and its
    multi-node arm64 buildx worker, delete the `IMAGE_BUILDER_TOKEN` Actions
    secret, revoke the CI `image-builder` PAT, and remove its persisted Docker
    login. Preserve unrelated pull identities and registry credentials granted
    to daemon host actions. These external changes are part of the same roll.
-7. After that roll and pre-roll validation of the next cohort, remove the
+8. After that roll and pre-roll validation of the next cohort, remove the
    compatibility baseline decoder/registry entry in generation 3. Regenerate
    the golden corpus only through the normal post-roll capture process.
 
