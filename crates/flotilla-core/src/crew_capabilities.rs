@@ -6,6 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_agent::adapter::CAPABILITIES_HEADING;
 use flotilla_resources::{
     message_record_name, vessel_placement_pin, Convoy, Environment, EnvironmentMount, EnvironmentMountMode, FulfilmentKind, ImageBuild,
     InputMeta, Message, MessageReference, MessageRelation, MessageSpec, ResourceError, ResourceObject, ResourceRef, TerminalSession,
@@ -15,9 +16,6 @@ use flotilla_store::{MessageInbox, ResourceBackend};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::warn;
-
-/// Shared delimiter for the appended card and oversized-brief fallback.
-pub const CAPABILITIES_HEADING: &str = "\n\n## Your capabilities";
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct CredentialCapability {

@@ -306,7 +306,7 @@ async fn repo_model_new_initializes_state_and_uses_registry_data() {
         Some("owner/repo".to_string()),
         None,
         None,
-        crate::agents::shared_in_memory_agent_state_store(),
+        flotilla_agent::shared_in_memory_agent_state_store(),
     );
 
     assert_eq!(model.labels.checkouts.section, "Checkouts");
@@ -332,7 +332,7 @@ async fn repo_model_new_with_empty_registry_uses_default_labels() {
         None,
         None,
         None,
-        crate::agents::shared_in_memory_agent_state_store(),
+        flotilla_agent::shared_in_memory_agent_state_store(),
     );
     assert_eq!(model.labels.checkouts.section, "\u{2014}");
     assert_eq!(model.labels.change_requests.section, "\u{2014}");

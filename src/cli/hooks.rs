@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use color_eyre::Result;
-use flotilla_core::agents;
+use flotilla_agent as agents;
 use flotilla_protocol::{AgentHookEvent, AttachableId};
 
 use flotilla_tui::cli::args::{Cli, CompletionShell, HooksSubCommand};
@@ -31,7 +31,7 @@ pub(crate) async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argumen
         .map(|(namespace, session_name)| flotilla_protocol::AgentHookTerminalRef { namespace, session_name });
     let explicit_id = std::env::var("FLOTILLA_ATTACHABLE_ID").ok();
     let attachable_id = if harness_enum == flotilla_protocol::AgentHarness::Codex {
-        flotilla_core::attachable::codex_hook_id(explicit_id.as_deref(), terminal.as_ref())
+        flotilla_agent::attachable::codex_hook_id(explicit_id.as_deref(), terminal.as_ref())
     } else {
         match explicit_id {
             Some(id) if !id.is_empty() => AttachableId::new(id),

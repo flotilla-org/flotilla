@@ -2602,7 +2602,7 @@ impl TerminalRuntime for ExitedAgentRuntime {
         Ok(Some(self.0))
     }
     async fn agent_exit_failure(&self, _: &str, _: &TerminalSessionSpec, code: i32) -> Result<Option<String>, String> {
-        use flotilla_core::agent_adapter::AgentAdapterRegistry;
+        use flotilla_agent::adapter::AgentAdapterRegistry;
         use flotilla_discovery_api::EnvironmentAssertion;
         use flotilla_discovery_api::EnvironmentBag;
         let registry = AgentAdapterRegistry::discover(
@@ -2766,7 +2766,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
         ProcessCommandRunner
             .run(
                 "sh",
-                &["-c", &flotilla_core::agent_process::monitored_command("exit 0", "replacement")],
+                &["-c", &flotilla_agent::process::monitored_command("exit 0", "replacement")],
                 std::path::Path::new(&spec.cwd),
                 &ChannelLabel::Default,
             )
@@ -2791,8 +2791,8 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
         spec: &TerminalSessionSpec,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
-        use flotilla_core::agent_process::exit_receipt;
-        use flotilla_core::agent_process::ExitReceiptObserver;
+        use flotilla_agent::process::exit_receipt;
+        use flotilla_agent::process::ExitReceiptObserver;
         use flotilla_provider_runtime::ProcessCommandRunner;
         ExitReceiptObserver::default()
             .observe(&spec.env_ref, &ProcessCommandRunner, std::path::Path::new(&spec.cwd).join(exit_receipt(&crew.id)), || async {
@@ -2804,7 +2804,7 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
         if self.fail_cleanup.swap(false, Ordering::SeqCst) {
             return Err("cleanup transport unavailable".into());
         }
-        flotilla_core::agent_process::remove_exit_receipt(
+        flotilla_agent::process::remove_exit_receipt(
             &flotilla_provider_runtime::ProcessCommandRunner,
             std::path::Path::new(&spec.cwd),
             launch_id,
@@ -2825,14 +2825,14 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
 // teardown removes its final receipt without touching another role's launch.
 #[tokio::test]
 async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart() {
-    use flotilla_core::agent_process::exit_receipt;
+    use flotilla_agent::process::exit_receipt;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandRunner;
     use flotilla_provider_runtime::ProcessCommandRunner;
     let cwd = tempfile::tempdir().expect("shared checkout");
     for launch in ["old", "other-role"] {
         ProcessCommandRunner
-            .run("sh", &["-c", &flotilla_core::agent_process::monitored_command("exit 42", launch)], cwd.path(), &ChannelLabel::Default)
+            .run("sh", &["-c", &flotilla_agent::process::monitored_command("exit 42", launch)], cwd.path(), &ChannelLabel::Default)
             .await
             .expect("exit receipt");
     }

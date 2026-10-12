@@ -141,7 +141,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-forge-forgejo` | Shared Forgejo HTTP client, authentication values and discovery-time credential resolution |
 | `flotilla-change-request` | Change-request tracker and observation-source traits, GitHub/Forgejo implementations, branch-absence observer and factories |
 | `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
-| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
+| `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
+| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-daemon-api` | `DaemonHandle` interface, query subscription token, build identity and lifecycle lock file |
@@ -182,8 +183,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-core/src/data.rs` | Checkout status inspection |
 | `crates/flotilla-core/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
 | `crates/flotilla-core/src/step.rs` | Step planning and execution system |
-| `crates/flotilla-core/src/agents/` | Agent hook handling and state management |
-| `crates/flotilla-core/src/attachable/` | Agent-hook identity shim pending AgentSession |
+| `crates/flotilla-agent/src/adapter.rs` | Agent harness adapters, `AgentAdapterRegistry`, capability table and crew brief rendering |
+| `crates/flotilla-agent/src/hooks.rs`, `crates/flotilla-agent/src/store.rs` | Agent hook handling and state management |
+| `crates/flotilla-agent/src/process.rs` | Process-exit receipts and image preludes for agents in persistent terminal shells |
+| `crates/flotilla-agent/src/attachable.rs` | Agent-hook identity shim pending AgentSession |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
 | `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry and discovery |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |

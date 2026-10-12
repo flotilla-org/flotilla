@@ -11,9 +11,9 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_agent::process::ExitReceiptObserver;
 use flotilla_controllers::reconcilers::clone::runtime::CloneFlights;
 use flotilla_controllers::reconcilers::CheckoutRemoval;
-use flotilla_core::agent_process::ExitReceiptObserver;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY;
 use flotilla_core::in_process::InProcessDaemon;

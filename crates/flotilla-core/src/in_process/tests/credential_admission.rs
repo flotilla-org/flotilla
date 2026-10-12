@@ -13,13 +13,13 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{create_docker_placement, create_host_direct_placement, set_host_credential_expiry, test_meta};
-use crate::agent_adapter::CapabilityTable;
 use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{
     resolve_workflow_credentials, validate_workflow_credentials, validate_workflow_credentials_with_capabilities,
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
+use flotilla_agent::adapter::{AgentRequirement, CapabilityTable};
 
 #[tokio::test]
 async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {
@@ -584,7 +584,10 @@ async fn ambient_only_adapter_is_refused_when_the_host_login_expired() {
         BTreeMap::from([(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), expired)]),
     )
     .await;
-    let capabilities = CapabilityTable::seeded().with_ambient_only_test_requirement("ambient-only");
+    let capabilities = CapabilityTable::seeded().with_requirement(
+        "ambient-only",
+        AgentRequirement::ambient_only("ambient-only-test", None, flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE),
+    );
 
     let error = validate_workflow_credentials_with_capabilities(&backend, "flotilla", &workflow, Some(&placement), &capabilities)
         .await

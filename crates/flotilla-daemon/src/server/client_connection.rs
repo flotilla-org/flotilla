@@ -6,7 +6,8 @@ use std::{
     },
 };
 
-use flotilla_core::{agents::SharedAgentStateStore, in_process::InProcessDaemon};
+use flotilla_agent::SharedAgentStateStore;
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{CommandCaller, DaemonEvent, Message, QueryId, SurfaceDeclaration};
 use flotilla_transport::message::MessageSession;

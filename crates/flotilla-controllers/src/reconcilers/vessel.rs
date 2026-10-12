@@ -9,13 +9,11 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_core::{
-    agent_adapter::{
-        append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
-        CrewBriefTemplateResolver,
-    },
-    in_process::BRIEF_ARTIFACTS_ANNOTATION,
+use flotilla_agent::adapter::{
+    append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
+    CrewBriefTemplateResolver,
 };
+use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
@@ -1328,7 +1326,7 @@ impl Reconciler for VesselReconciler {
                                     Err(error) => return Err(error),
                                 };
                                 flotilla_resources::TerminalBrief {
-                                    path: flotilla_core::agent_adapter::crew_brief_path(&process.role),
+                                    path: flotilla_agent::adapter::crew_brief_path(&process.role),
                                     content: String::new(),
                                     artifact_digest: Some(artifact.spec.digest),
                                     copies: Vec::new(),

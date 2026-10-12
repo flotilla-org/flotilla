@@ -170,7 +170,7 @@ working directory and launches with `claude --settings .flotilla/claude-settings
 layers the hooks on for that invocation only. User settings are never modified, and the
 overlay is removed with the brief at teardown.
 
-The subscription table in `flotilla-core/src/agents/hooks.rs` is the single producer for both
+The subscription table in `flotilla-agent/src/hooks.rs` is the single producer for both
 the installer and the adapter, so a hook Flotilla subscribes to cannot drift from the parser
 arm that handles it.
 

@@ -63,7 +63,7 @@ pub(super) fn missing_turn_hook(
     }
     let status = session.status.as_ref()?;
     let crew = status.crew.as_ref()?;
-    if status.phase != TerminalSessionPhase::Running || crate::agents::parser_for_harness(&crew.adapter).is_err() {
+    if status.phase != TerminalSessionPhase::Running || flotilla_agent::parser_for_harness(&crew.adapter).is_err() {
         return None;
     }
     let started = status.started_at?;

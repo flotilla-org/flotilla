@@ -7,7 +7,7 @@ pub fn codex_hook_id(explicit: Option<&str>, terminal: Option<&flotilla_protocol
     if let Some(terminal) = terminal {
         return AttachableId::new(format!("terminal:{}/{}", terminal.namespace, terminal.session_name));
     }
-    explicit.filter(|id| !id.is_empty()).map(AttachableId::new).unwrap_or_else(crate::agents::allocate_attachable_id)
+    explicit.filter(|id| !id.is_empty()).map(AttachableId::new).unwrap_or_else(crate::allocate_attachable_id)
 }
 
 #[cfg(test)]

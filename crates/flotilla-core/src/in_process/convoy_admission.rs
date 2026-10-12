@@ -11,10 +11,9 @@ use flotilla_store_memory::InMemoryBackend;
 use flotilla_vcs::providers::detection::remote_assertion;
 
 use super::*;
-use crate::{
-    agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
-    providers::discovery::AiUtilityFactory,
-};
+use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
+
+use crate::providers::discovery::AiUtilityFactory;
 
 /// Routing uses replicated observations as hints; only admission may refuse on
 /// destination-owned facts, credentials, or the installed skill catalog.
@@ -1072,7 +1071,7 @@ impl ConvoyAdmission {
                 .crew
                 .iter()
                 .enumerate()
-                .map(|(index, member)| crate::agent_adapter::CrewBriefMember {
+                .map(|(index, member)| flotilla_agent::adapter::CrewBriefMember {
                     role: member.role.clone(),
                     state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.to_string(),
                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
@@ -1099,7 +1098,7 @@ impl ConvoyAdmission {
                     convoy: name.to_string(),
                     vessel_ref: format!("{name}-{}", requirement.name),
                 };
-                let mut brief = crate::agent_adapter::build_convoy_crew_brief_with_options(
+                let mut brief = flotilla_agent::adapter::build_convoy_crew_brief_with_options(
                     &convoy,
                     &context,
                     &requirement.name,
@@ -1108,7 +1107,7 @@ impl ConvoyAdmission {
                     &members,
                     &options,
                 )?;
-                crate::agent_adapter::append_convoy_work_context(
+                flotilla_agent::adapter::append_convoy_work_context(
                     &mut brief.content,
                     &convoy,
                     &repository_refs,

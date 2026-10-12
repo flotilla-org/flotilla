@@ -244,7 +244,7 @@ async fn spawn_request_mesh(
                 client_count,
                 client_notify,
                 peer_connected_tx,
-                flotilla_core::agents::shared_in_memory_agent_state_store(),
+                flotilla_agent::shared_in_memory_agent_state_store(),
                 None,
                 None,
             )
@@ -406,7 +406,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
             client_count_for_task,
             client_notify_for_task,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
             caller,
         )

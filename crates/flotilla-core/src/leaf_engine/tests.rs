@@ -412,8 +412,8 @@ async fn observe_actor_source(
 }
 
 async fn observe_claude_hook(backend: &ResourceBackend, wake: &ReconcilerWake, event: &str, now: DateTime<Utc>) {
-    use crate::agents::hooks::ClaudeCodeParser;
-    use crate::agents::hooks::HarnessHookParser;
+    use flotilla_agent::hooks::ClaudeCodeParser;
+    use flotilla_agent::hooks::HarnessHookParser;
     let parsed = ClaudeCodeParser.parse_event(event, br#"{"session_id":"claude-scenario"}"#).expect("Claude hook");
     let state = match parsed.event_type {
         flotilla_protocol::AgentEventType::Active | flotilla_protocol::AgentEventType::ToolActive => TerminalAttentionState::Working,
