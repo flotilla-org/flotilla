@@ -55,7 +55,7 @@ selector behavior; this scenario adds allocation/lifetime evidence.
 The leaf engine's formerly owned local-convoy map now holds indices into one
 shared typed generation. Charter reconciliation reuses the same convoy/session/
 ensure evidence instead of loading and decoding another inventory from its Store
-adapter. Empty queued-turn evidence no longer clones each convoy status.
+adapter. Empty queued-turn evidence skips status cloning when no queued-turn attention needs repair. Stale queued-turn attention is still cleared across every convoy phase.
 
 Direct probes of an additional independent convoy WatchView identify its owners:
 
@@ -110,13 +110,16 @@ production health diagnostics so remaining fleet retention can be measured.
   self-origin shadowing, selectors, and recovery after lost watch events.
 - Existing counted-definition property verifies unrelated definitions are not
   serialized when the maintained snapshot receives a change.
+- Empty queued batches clear stale queued-turn attention, preserve unrelated attention, and avoid no-op writes across every convoy phase.
 - Borrowed freshest-observation selection is differential against the existing
   owned selection, including exact replica ties and local precedence.
 
 Targeted mutants remove typed-generation invalidation and skip serialized-object
 updates. Each fails the generated snapshot scenario and is reverted. A third
 mutant changes the replica tie comparison from `>=` to `>` and fails
-the differential freshness property; it is reverted.
+the differential freshness property; it is reverted. An unconditional empty-batch
+shortcut also fails the attention-cleanup regression; the final guard preserves
+stale queued-turn attention repair.
 
 Stored shapes and wire shapes are unchanged. No outside resource authors or
 manifests need updates. The supplied issue snapshot is the only out-of-repository

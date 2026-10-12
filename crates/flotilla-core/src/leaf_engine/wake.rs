@@ -209,7 +209,14 @@ impl ReconcilerWake {
                 });
             }
         }
-        if observations.is_empty() {
+        // Empty evidence is a no-op unless the patch must clear stale
+        // queued-turn attention. Preserve that repair across every phase.
+        if observations.is_empty()
+            && !status
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.source == flotilla_resources::ConvoyAttention::QUEUED_TURN_SOURCE)
+        {
             return Ok(());
         }
         let patch = flotilla_resources::ConvoyStatusPatch::ObserveQueuedTurnDeliveries { observations, observed_at: now };

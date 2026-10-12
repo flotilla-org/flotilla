@@ -796,3 +796,40 @@ fn rejected_promise_arms_owner_turn(tc: hegel::TestCase) {
         assert!(deliveries[0].brief.contains("closed without merging"));
     });
 }
+
+// Empty queued evidence may still repair stale queued-turn attention. Across
+// every convoy phase, preserve unrelated attention and avoid no-op status writes.
+#[hegel::test]
+fn empty_queued_batches_preserve_attention_cleanup(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let phases = [
+        ConvoyPhase::Pending,
+        ConvoyPhase::Active,
+        ConvoyPhase::Interrupted,
+        ConvoyPhase::Landing,
+        ConvoyPhase::Landed,
+        ConvoyPhase::Failed,
+        ConvoyPhase::Abandoned,
+    ];
+    let phase = phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
+    let attention_kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let wake = supervision_wake(&backend);
+        let now = Utc::now();
+        let attention = (attention_kind != 0).then(|| flotilla_resources::ConvoyAttention {
+            source: if attention_kind == 1 { flotilla_resources::ConvoyAttention::QUEUED_TURN_SOURCE.into() } else { "operator".into() },
+            reason: "attention must be reconciled without queued episodes".into(),
+            raised_at: now,
+        });
+        create_convoy(&backend, "attention", ConvoyStatus { phase, attention: attention.clone(), ..Default::default() }).await;
+        let resolver = backend.using::<Convoy>("flotilla");
+        let before = resolver.get("attention").await.unwrap();
+        wake.observe_queued_turns("flotilla", &before, &BTreeMap::new(), now).await.unwrap();
+        let after = resolver.get("attention").await.unwrap();
+        let expected = if attention_kind == 1 { None } else { attention };
+        assert_eq!(after.status.as_ref().unwrap().attention, expected);
+        assert_eq!(after.metadata.resource_version == before.metadata.resource_version, attention_kind != 1);
+    });
+}
