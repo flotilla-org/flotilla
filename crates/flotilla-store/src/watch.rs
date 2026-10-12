@@ -55,6 +55,7 @@ impl<T> Drop for WatchTask<T> {
 /// The inline poll preserves the caller's panic/unwind behavior. Once a lookup
 /// is pending and task-owned, its panic or cancellation becomes a watch error;
 /// the JoinError text distinguishes those causes.
+/// Pending lookups require an ambient Tokio runtime to drive their owned task.
 pub(crate) async fn complete_watch_lookup<T: Send + 'static>(
     lookup: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<T, ResourceError> {
