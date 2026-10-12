@@ -1875,6 +1875,7 @@ impl InProcessDaemon {
         let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
+                .with_clock(Arc::clone(&clock))
                 .with_message_inboxes(Arc::clone(&message_inboxes))
                 .with_charter_brief_renderer(Arc::new(crate::charter_notifications::LiveCharterBriefRenderer::new(
                     resource_backend.clone(),

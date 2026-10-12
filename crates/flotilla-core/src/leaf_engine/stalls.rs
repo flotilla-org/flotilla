@@ -216,7 +216,7 @@ pub(super) fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> 
 
 impl ReconcilerWake {
     pub(super) async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
-        self.judge_stalls_at(namespace, convoys, Utc::now()).await
+        self.judge_stalls_at(namespace, convoys, self.subscriptions.inner.clock.now()).await
     }
 
     pub(super) async fn judge_stalls_at(

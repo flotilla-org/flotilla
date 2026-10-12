@@ -111,7 +111,10 @@ async fn merged_unclaimed_crew_delivers_once() {
 
 // Repeated observations and subscription reconstruction must retain exactly
 // one terminal delivery, whether the PR head is known or unknown.
-#[hegel::test]
+// Each case drives real in-memory stores, informers and turn delivery. Hegel
+// charges that whole scenario to generation time; CPU scheduling is not a
+// generation-cost oracle. Keep the bounded generators and other health checks.
+#[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn generated_merged_unclaimed_delivery_is_idempotent(tc: hegel::TestCase) {
     let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
     let unknown_head = tc.draw(hegel::generators::booleans());
@@ -131,7 +134,9 @@ async fn active_produced_pr_checks_settle_to_pass_or_fail_once_per_head() {
     }
 }
 
-#[hegel::test]
+// As above, Hegel charges this bounded store scenario's execution to its
+// generation budget; retain coverage and the other health checks.
+#[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
     // Generate pass/fail sequences across the delivery ceiling (3), including
     // coder/reviewer roles, new heads, unknown and pending observations, and duplicate settlement.

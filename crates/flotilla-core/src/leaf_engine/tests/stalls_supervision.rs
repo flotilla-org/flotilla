@@ -843,7 +843,9 @@ fn unavailable_governor_warns_with_routing_fields() {
 
 // Draw failure modes and sequences of reconciles/restarts. Check fallback after
 // every step and require one-pass recovery and exactly one delivery after healing.
-#[hegel::test]
+// Hegel charges this bounded informer scenario's execution to generation time;
+// scheduler delay must not change the verdict. Keep all coverage and other checks.
+#[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn generated_unavailable_governor_recovers(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let unavailable = GovernorUnavailable::ALL[tc.draw(gs::integers::<usize>().min_value(0).max_value(GovernorUnavailable::ALL.len() - 1))];

@@ -719,14 +719,14 @@ pub(super) async fn forward_with_keepalive_for_test(
 ) -> ForwardResult {
     let mut ping_interval = tokio::time::interval_at(tokio::time::Instant::now() + ping_interval_duration, ping_interval_duration);
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_message_at = Instant::now();
+    let mut last_message_at = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             msg = inbound_rx.recv() => {
                 match msg {
                     Some(peer_msg) => {
-                        last_message_at = Instant::now();
+                        last_message_at = tokio::time::Instant::now();
                         if matches!(&peer_msg, PeerWireMessage::Pong { .. }) {
                             continue;
                         }
