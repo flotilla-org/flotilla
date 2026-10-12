@@ -12,7 +12,6 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
 
-use crate::crew_capabilities::CAPABILITIES_HEADING;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -20,13 +19,15 @@ use flotilla_terminal::TerminalEnvVars;
 
 mod fleet_canary;
 
+/// Shared delimiter for the appended card and oversized-brief fallback.
+pub const CAPABILITIES_HEADING: &str = "\n\n## Your capabilities";
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
 pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
-const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/crew.md");
-const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/interactive-session.md");
-const BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/diff-review.md");
-const BUILTIN_SHEPHERD_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/shepherd.md");
-const BUILTIN_FORK_STANCE_BRIEF_LAYER: &str = include_str!("agent_adapter/templates/fork-stance.md");
+const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("adapter/templates/crew.md");
+const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE: &str = include_str!("adapter/templates/interactive-session.md");
+const BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE: &str = include_str!("adapter/templates/diff-review.md");
+const BUILTIN_SHEPHERD_BRIEF_TEMPLATE: &str = include_str!("adapter/templates/shepherd.md");
+const BUILTIN_FORK_STANCE_BRIEF_LAYER: &str = include_str!("adapter/templates/fork-stance.md");
 const BRIEF_TEMPLATE_DIR: &str = "brief-templates";
 
 pub fn crew_brief_path(role: &str) -> String {
@@ -450,7 +451,8 @@ enum AgentCredentialPolicy {
         slot: &'static str,
         scope: &'static str,
     },
-    #[cfg(test)]
+    /// Authenticates only through an ambient host login. No seeded adapter
+    /// uses this yet; admission is forward-provisioned for one.
     AmbientOnly {
         scope: &'static str,
     },
@@ -479,16 +481,9 @@ impl CapabilityTable {
         self.requirements.get(capability).ok_or_else(|| format!("unknown agent capability `{capability}`"))
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_ambient_only_test_requirement(mut self, capability: &str) -> Self {
-        self.requirements.insert(
-            capability.to_string(),
-            AgentRequirement {
-                adapter: "ambient-only-test".to_string(),
-                model: None,
-                credential_policy: AgentCredentialPolicy::AmbientOnly { scope: flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE },
-            },
-        );
+    /// Add or replace the requirement a capability resolves to.
+    pub fn with_requirement(mut self, capability: &str, requirement: AgentRequirement) -> Self {
+        self.requirements.insert(capability.to_string(), requirement);
         self
     }
 
@@ -542,6 +537,12 @@ impl AgentRequirement {
         Self { adapter, model, credential_policy }
     }
 
+    /// A requirement for an adapter that has no deliverable credential form and
+    /// authenticates only through the named ambient host login scope.
+    pub fn ambient_only(adapter: impl Into<String>, model: Option<String>, scope: &'static str) -> Self {
+        Self { adapter: adapter.into(), model, credential_policy: AgentCredentialPolicy::AmbientOnly { scope } }
+    }
+
     /// Credential delivery slot supported by this adapter. A session must
     /// never fall through to ambient or interactive login when its adapter has
     /// a deliverable material form.
@@ -549,7 +550,6 @@ impl AgentRequirement {
         match self.credential_policy {
             AgentCredentialPolicy::DeliveredWithAmbientFallback { slot, .. } => Some(slot),
             AgentCredentialPolicy::None => None,
-            #[cfg(test)]
             AgentCredentialPolicy::AmbientOnly { .. } => None,
         }
     }
@@ -561,7 +561,6 @@ impl AgentRequirement {
         match self.credential_policy {
             AgentCredentialPolicy::DeliveredWithAmbientFallback { scope, .. } => Some(scope),
             AgentCredentialPolicy::None => None,
-            #[cfg(test)]
             AgentCredentialPolicy::AmbientOnly { scope } => Some(scope),
         }
     }
@@ -728,7 +727,7 @@ impl CliAgentAdapter {
         }
         if matches!(&self.flavor, AdapterFlavor::Codex { .. }) {
             args.push(Arg::Literal("--no-daemon".into()));
-            for override_value in crate::agents::codex_hook_overrides() {
+            for override_value in crate::codex_hook_overrides() {
                 args.extend([Arg::Literal("-c".into()), Arg::Quoted(override_value)]);
             }
         }
@@ -886,7 +885,7 @@ impl CliAgentAdapter {
                 if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
                     seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
                 }
-                let mut settings = crate::agents::claude_code_hook_settings();
+                let mut settings = crate::claude_code_hook_settings();
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
                 if *contained {
                     settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
@@ -1018,7 +1017,7 @@ async fn seed_codex_workspace_trust(
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
     if contained {
-        crate::agents::update_codex_hooks(&mut document, true, &config.path)?;
+        crate::update_codex_hooks(&mut document, true, &config.path)?;
     }
     let projects = document
         .as_table_mut()
@@ -1213,26 +1212,27 @@ mod tests {
     };
     use toml_edit::DocumentMut;
 
-    use crate::agent_adapter::append_convoy_work_context;
-    use crate::agent_adapter::build_convoy_crew_brief_with_options;
-    use crate::agent_adapter::build_crew_brief;
-    use crate::agent_adapter::build_crew_brief_with_options;
-    use crate::agent_adapter::AgentAdapterRegistry;
-    use crate::agent_adapter::AgentLaunchRequest;
-    use crate::agent_adapter::CapabilityTable;
-    use crate::agent_adapter::CrewAssignment;
-    use crate::agent_adapter::CrewBriefMember;
-    use crate::agent_adapter::CrewBriefRenderOptions;
-    use crate::agent_adapter::CrewBriefTemplateOverride;
-    use crate::agent_adapter::CrewBriefTemplateResolver;
-    use crate::agent_adapter::CLAUDE_MANAGED_SETTINGS_PATH;
-    use crate::crew_capabilities::CAPABILITIES_HEADING;
-    use crate::testkits::replay::testing::MockRunner;
+    use crate::adapter::append_convoy_work_context;
+    use crate::adapter::build_convoy_crew_brief_with_options;
+    use crate::adapter::build_crew_brief;
+    use crate::adapter::build_crew_brief_with_options;
+    use crate::adapter::AgentAdapterRegistry;
+    use crate::adapter::AgentLaunchRequest;
+    use crate::adapter::CapabilityTable;
+    use crate::adapter::CrewAssignment;
+    use crate::adapter::CrewBriefMember;
+    use crate::adapter::CrewBriefRenderOptions;
+    use crate::adapter::CrewBriefTemplateOverride;
+    use crate::adapter::CrewBriefTemplateResolver;
+    use crate::adapter::CAPABILITIES_HEADING;
+    use crate::adapter::CLAUDE_MANAGED_SETTINGS_PATH;
+    use crate::testing::TestConfig;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
     use flotilla_discovery_api::Factory;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ProcessCommandRunner;
+    use flotilla_replay_testkit::testing::MockRunner;
     use flotilla_vcs::factory::GitVcsFactory;
 
     const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";
@@ -2012,7 +2012,7 @@ mod tests {
             })
             .expect("codex launch plan");
         assert!(plan.command.starts_with("/tools/codex --dangerously-bypass-approvals-and-sandbox --no-daemon"));
-        for override_value in crate::agents::codex_hook_overrides() {
+        for override_value in crate::codex_hook_overrides() {
             assert!(plan.command.contains(&format!("-c '{override_value}'")));
         }
         assert!(plan.command.contains("Implement the issue"));
@@ -2733,7 +2733,7 @@ gpt-6.1-sol · /workspace"
             result.expect("install effective exclusion");
             concurrent.expect("concurrent role installs effective exclusion");
             std::fs::create_dir_all(repo.path().join(".flotilla/agent-exits")).expect("receipt directory");
-            std::fs::write(repo.path().join(crate::agent_process::exit_receipt("crew")), "0\n").expect("receipt");
+            std::fs::write(repo.path().join(crate::process::exit_receipt("crew")), "0\n").expect("receipt");
             std::fs::create_dir_all(repo.path().join(".flotilla/briefs")).expect("brief directory");
             std::fs::write(repo.path().join(".flotilla/briefs/coder.md"), "brief").expect("runtime brief");
             assert!(ProcessCommand::new("git").args(["add", "-A"]).current_dir(repo.path()).status().expect("add all").success());
@@ -2880,12 +2880,7 @@ gpt-6.1-sol · /workspace"
             .with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let vcs = GitVcsFactory
-            .probe(
-                &env,
-                &crate::config::ConfigStore::with_base(temp.path()),
-                &ExecutionEnvironmentPath::new(&repo),
-                Arc::new(ProcessCommandRunner),
-            )
+            .probe(&env, &TestConfig::new(temp.path()), &ExecutionEnvironmentPath::new(&repo), Arc::new(ProcessCommandRunner))
             .await
             .expect("discovered VCS");
         let brief = flotilla_resources::TerminalBrief {
@@ -2911,7 +2906,7 @@ gpt-6.1-sol · /workspace"
             .success());
         let adopted_path = ExecutionEnvironmentPath::new(&adopted);
         let adopted_vcs = GitVcsFactory
-            .probe(&env, &crate::config::ConfigStore::with_base(temp.path()), &adopted_path, Arc::new(ProcessCommandRunner))
+            .probe(&env, &TestConfig::new(temp.path()), &adopted_path, Arc::new(ProcessCommandRunner))
             .await
             .expect("adopted vcs");
         for role in ["coder", "reviewer"] {
@@ -2922,7 +2917,7 @@ gpt-6.1-sol · /workspace"
                 .prepare_with_vcs(&adopted_path, &role_brief, &Vec::new(), adopted_vcs.as_ref())
                 .await
                 .expect("adopted crew preparation");
-            let receipt = crate::agent_process::exit_receipt(role);
+            let receipt = crate::process::exit_receipt(role);
             std::fs::create_dir_all(adopted.join(".flotilla/agent-exits")).expect("receipt dir");
             std::fs::write(adopted.join(receipt), "0\n").expect("receipt");
         }

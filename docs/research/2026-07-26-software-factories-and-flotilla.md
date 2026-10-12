@@ -210,11 +210,11 @@ made the operating layer overridable and workflow-specific. The built-in Brief
 is a short skeleton with blocks for crew, operating instructions, delivery, and
 assignment; repository, project, and installation overrides can replace those
 blocks. [The built-in template is the current
-evidence.](../../../crates/flotilla-core/src/agent_adapter/templates/crew.md)
+evidence.](../../crates/flotilla-agent/src/adapter/templates/crew.md)
 [The resolver orders installation, project, and repository
-overrides](../../../crates/flotilla-core/src/agent_adapter.rs#L77-L104), and
+overrides](../../crates/flotilla-agent/src/adapter.rs#L86-L114), and
 [the renderer layers them with
-Minijinja](../../../crates/flotilla-core/src/agent_adapter.rs#L186-L247).
+Minijinja](../../crates/flotilla-agent/src/adapter.rs#L277-L329).
 
 ### Product and architecture alignment
 

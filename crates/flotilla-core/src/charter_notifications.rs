@@ -4,15 +4,13 @@ use flotilla_store_memory::InMemoryBackend;
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use flotilla_agent::adapter::{
+    append_convoy_work_context, build_convoy_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
+};
 use flotilla_resources::{CrewSource, ResourceError, TerminalSessionSource, VESSEL_LABEL};
 use flotilla_store::{CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, ResourceBackend};
 
-use crate::{
-    agent_adapter::{
-        append_convoy_work_context, build_convoy_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
-    },
-    config::ConfigStore,
-};
+use crate::config::ConfigStore;
 
 pub(crate) struct LiveCharterBriefRenderer {
     backend: ResourceBackend,

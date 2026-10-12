@@ -347,7 +347,7 @@ mod tests {
             .expect("probe");
         let need = flotilla_resources::CapabilityNeed::Harness {
             adapter: "codex".into(),
-            minimum_version: flotilla_core::agent_adapter::minimum_harness_version("codex").expect("floor").into(),
+            minimum_version: flotilla_agent::adapter::minimum_harness_version("codex").expect("floor").into(),
         };
         assert_eq!(need.covered_by(&kind.grants, Some(&facts)), valid && minor >= 160);
     }

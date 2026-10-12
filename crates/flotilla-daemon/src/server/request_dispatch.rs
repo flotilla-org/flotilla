@@ -1,9 +1,7 @@
 use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
-use flotilla_core::{
-    agents::{AgentEntry, SharedAgentStateStore},
-    in_process::InProcessDaemon,
-};
+use flotilla_agent::{AgentEntry, SharedAgentStateStore};
+use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::{
     AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, Message, RepoSelector, Request, Response,
@@ -473,7 +471,7 @@ impl<'a> RequestDispatcher<'a> {
         // native-session index entry, owns Codex hook attribution.
         let managed_codex = event.harness == flotilla_protocol::AgentHarness::Codex && event.terminal.is_some();
         if managed_codex {
-            event.attachable_id = flotilla_core::attachable::codex_hook_id(None, event.terminal.as_ref());
+            event.attachable_id = flotilla_agent::attachable::codex_hook_id(None, event.terminal.as_ref());
         }
 
         tracing::info!(

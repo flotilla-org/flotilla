@@ -19,6 +19,7 @@ flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
+flotilla-agent = { path = "../flotilla-agent" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
@@ -39,7 +40,6 @@ bon = { workspace = true }
 tracing = { workspace = true }
 indexmap = { workspace = true }
 toml = "0.8"
-toml_edit = "0.22"
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
 http = { workspace = true }
 bytes = { workspace = true }

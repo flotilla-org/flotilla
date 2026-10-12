@@ -229,6 +229,25 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-forge-github"), package("flotilla-forge-forgejo"),
         )), [])
 
+    def test_agent_is_native_and_independent(self):
+        # Issue #2749 / ADR 0060: agent harness adapters build on vcs and terminal, never composition or storage.
+        self.assertEqual(layer("flotilla-agent"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-agent", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-agent: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-agent", normal=("flotilla-vcs", "flotilla-terminal", "flotilla-protocol")),
+            package("flotilla-vcs", normal=("flotilla-protocol",)), package("flotilla-terminal", normal=("flotilla-protocol",)),
+            package("flotilla-core", normal=("flotilla-agent", "flotilla-vcs", "flotilla-terminal")),
+            package("flotilla-protocol"),
+        )), [])
+
     def test_replication_is_native_and_independent(self):
         # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
         self.assertEqual(layer("flotilla-replication"), "native")

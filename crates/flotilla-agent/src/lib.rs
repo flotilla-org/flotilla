@@ -1,4 +1,8 @@
+//! Agent harness adapters, hook handling, agent state and process-exit receipts.
+pub mod adapter;
+pub mod attachable;
 pub mod hooks;
+pub mod process;
 pub mod store;
 
 pub use hooks::{
@@ -21,3 +25,6 @@ pub use store::{
     shared_agent_state_store, shared_file_backed_agent_state_store, shared_in_memory_agent_state_store, AgentEntry, AgentRegistry,
     AgentStateStore, AgentStateStoreApi, InMemoryAgentStateStore, SharedAgentStateStore,
 };
+
+#[cfg(test)]
+mod testing;

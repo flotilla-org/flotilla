@@ -5,6 +5,7 @@
 //! producing `EnvironmentAssertion` values collected into an `EnvironmentBag`.
 //! Factories consume the bag to construct typed provider instances.
 
+use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -30,7 +31,6 @@ use tokio::sync::OnceCell as AsyncOnceCell;
 
 use crate::admission::system_available_space_probe;
 use crate::admission::AvailableSpaceProbe;
-use crate::agent_adapter::AgentAdapterRegistry;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::registry::ProviderSet;
 use flotilla_ai_utility::AiUtility;

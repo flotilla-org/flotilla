@@ -18,6 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_controllers::reconcilers::clone::runtime::{CloneControllerRuntime, CloneFlights};
 use flotilla_controllers::reconcilers::{
@@ -25,7 +26,6 @@ use flotilla_controllers::reconcilers::{
     CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome,
     TerminalDeliveryReadiness, TerminalLiveness, TerminalRuntime, TerminalSessionReconciler, VesselReconciler,
 };
-use flotilla_core::agent_adapter::AgentAdapterRegistry;
 use flotilla_core::aggregator_projection::AggregatorProjectionState;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;

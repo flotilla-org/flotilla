@@ -26,6 +26,7 @@ flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 bon = { workspace = true }
 flotilla-aggregator = { path = "../flotilla-aggregator" }
 flotilla-controllers = { path = "../flotilla-controllers" }
+flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-credentials = { path = "../flotilla-credentials" }
 flotilla-protocol = { path = "../flotilla-protocol" }

@@ -126,7 +126,7 @@ mod tests {
 
         assert!(bag.find_binary("codex").is_some(), "codex binary must be detected for its agent adapter to register");
         assert_eq!(bag.find_env_var("HOME"), Some("/mock/home"), "Codex config discovery needs the detected home directory");
-        let adapters = crate::agent_adapter::AgentAdapterRegistry::discover(&bag, Arc::new(runner));
+        let adapters = flotilla_agent::adapter::AgentAdapterRegistry::discover(&bag, Arc::new(runner));
         let codex = adapters.get("codex").expect("codex agent adapter should register when the binary is present");
         codex
             .prepare(

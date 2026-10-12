@@ -1,3 +1,4 @@
+use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_ai_utility::AiUtility;
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_cloud_agent::CloudAgentService;
@@ -12,7 +13,6 @@ use indexmap::IndexMap;
 
 use flotilla_issue_tracker::{provider_for_source, IssueProvider};
 
-use crate::agent_adapter::AgentAdapterRegistry;
 use flotilla_vcs::providers::CloneProvisioner;
 
 /// Common accessors shared by all descriptor types.

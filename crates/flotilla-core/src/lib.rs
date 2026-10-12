@@ -3,11 +3,7 @@
 #![allow(clippy::double_must_use)]
 
 pub mod admission;
-pub mod agent_adapter;
-pub mod agent_process;
-pub mod agents;
 pub mod aggregator_projection;
-pub mod attachable;
 pub mod awareness_projection;
 pub mod change_request_observer;
 mod charter_notifications;

@@ -88,7 +88,7 @@ fn hash_layer_inputs_blocking(context: &Path, layer: &FrozenImageLayer) -> Resul
         &layer.spec.provides,
         &layer.spec.requires,
         &layer.spec.probes,
-        flotilla_core::agent_process::with_preludes("exec \"$@\""),
+        flotilla_agent::process::with_preludes("exec \"$@\""),
     ))
     .map_err(|error| error.to_string())?;
     hashes.push(format!("sha256:{:x}", Sha256::digest(verification)));
@@ -151,7 +151,7 @@ impl LocalImageBuildRunner {
             return Err(deterministic("image context differs from frozen input hashes".into()));
         }
         let cache_name = self.cache_name.as_deref().ok_or_else(|| transient("image builder has no named cache".into()))?;
-        let probe_script = flotilla_core::agent_process::with_preludes("exec \"$@\"");
+        let probe_script = flotilla_agent::process::with_preludes("exec \"$@\"");
         let request = flotilla_environment::environment::image::ImageLayerBuild::builder()
             .name(name)
             .spec(spec)
@@ -439,7 +439,7 @@ mod runner_contract {
                 "run" => {
                     assert!(args.windows(2).any(|window| window == ["--entrypoint", "sh"]));
                     let shell = args.iter().position(|arg| *arg == "-c").expect("probe shell");
-                    assert_eq!(args[shell + 1], flotilla_core::agent_process::with_preludes("exec \"$@\""));
+                    assert_eq!(args[shell + 1], flotilla_agent::process::with_preludes("exec \"$@\""));
                     assert_eq!(args[shell + 2], "flotilla-provide-probe");
                     assert!(args.contains(&"--pull=never"));
                     assert!(args.contains(&"--network=none"));

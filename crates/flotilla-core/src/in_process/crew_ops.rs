@@ -44,8 +44,9 @@ use super::{
     read_projections::{credential_refresh_alert_for_vessel, LeafSubscriptionRead},
     BriefArtifactWriter, WorkCredentialReconciler,
 };
+use flotilla_agent::adapter::{CrewAssignment, CrewBriefTemplateResolver};
+
 use crate::{
-    agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
     checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
     config::ConfigStore,
     fleet::crew_attention,
@@ -154,7 +155,7 @@ fn handoff_crew_brief(
     prompt: Option<&str>,
     members: &[CrewListMember],
     requirement: &flotilla_resources::VesselRequirement,
-    render_options: &crate::agent_adapter::CrewBriefRenderOptions,
+    render_options: &flotilla_agent::adapter::CrewBriefRenderOptions,
 ) -> Result<TerminalBrief, String> {
     let repository_refs = requirement
         .repository_refs
@@ -166,7 +167,7 @@ fn handoff_crew_brief(
         None if convoy.spec.change_request.is_some() => CrewAssignment::CarriedChangeRequest,
         None => CrewAssignment::Unassigned,
     };
-    let brief = crate::agent_adapter::build_convoy_crew_brief_with_options(
+    let brief = flotilla_agent::adapter::build_convoy_crew_brief_with_options(
         convoy,
         &TerminalCrewContext {
             namespace: context.namespace.clone(),
@@ -178,7 +179,7 @@ fn handoff_crew_brief(
         assignment,
         &members
             .iter()
-            .map(|member| crate::agent_adapter::CrewBriefMember {
+            .map(|member| flotilla_agent::adapter::CrewBriefMember {
                 role: member.role.clone(),
                 state: if member.role == target { "active".to_string() } else { member.state.clone() },
                 is_agent: member.kind == "agent",
@@ -187,7 +188,7 @@ fn handoff_crew_brief(
         render_options,
     );
     let mut brief = brief?;
-    crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, &repository_refs, &requirement.credential_scopes);
+    flotilla_agent::adapter::append_convoy_work_context(&mut brief.content, convoy, &repository_refs, &requirement.credential_scopes);
     Ok(brief)
 }
 

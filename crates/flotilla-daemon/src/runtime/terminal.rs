@@ -9,13 +9,13 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_agent::adapter::AgentAdapter;
+use flotilla_agent::adapter::AgentLaunchRequest;
+use flotilla_agent::adapter::CapabilityTable;
 use flotilla_controllers::reconcilers::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState,
 };
-use flotilla_core::agent_adapter::AgentAdapter;
-use flotilla_core::agent_adapter::AgentLaunchRequest;
-use flotilla_core::agent_adapter::CapabilityTable;
 use flotilla_core::crew_capabilities::SessionCapabilitySource;
 use flotilla_core::providers::registry::ProviderRegistry;
 use flotilla_credentials::crew_git_identity_environment;
@@ -433,7 +433,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         Ok(card) => card,
                         Err(error) => {
                             warn!(session = %name, %error, "failed to construct advisory launch capability card");
-                            format!("{}\n\nCapabilities are currently unavailable. Run `flotilla crew capabilities` when unsure or after the service recovers.\n", flotilla_core::crew_capabilities::CAPABILITIES_HEADING.trim_start())
+                            format!("{}\n\nCapabilities are currently unavailable. Run `flotilla crew capabilities` when unsure or after the service recovers.\n", flotilla_agent::adapter::CAPABILITIES_HEADING.trim_start())
                         }
                     };
                     if let Err(error) = self.state.daemon.observe_launch_capability_card(&context.namespace, name, &card).await {
@@ -482,7 +482,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
                     ("FLOTILLA_TERMINAL_SESSION".to_string(), name.to_string()),
                 ]);
-                (flotilla_core::agent_process::monitored_command(&plan.command, &crew.id), env, Some(crew))
+                (flotilla_agent::process::monitored_command(&plan.command, &crew.id), env, Some(crew))
             }
         };
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
@@ -553,7 +553,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let runner = self.runner_for_env(&spec.env_ref)?;
         self.state
             .exit_receipts
-            .observe(&spec.env_ref, &*runner, Path::new(&spec.cwd).join(flotilla_core::agent_process::exit_receipt(&crew.id)), || async {
+            .observe(&spec.env_ref, &*runner, Path::new(&spec.cwd).join(flotilla_agent::process::exit_receipt(&crew.id)), || async {
                 let sessions = self
                     .state
                     .daemon
@@ -573,7 +573,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         if status.phase != TerminalSessionPhase::Running {
                             return None;
                         }
-                        status.crew.map(|crew| Path::new(&session.spec.cwd).join(flotilla_core::agent_process::exit_receipt(&crew.id)))
+                        status.crew.map(|crew| Path::new(&session.spec.cwd).join(flotilla_agent::process::exit_receipt(&crew.id)))
                     })
                     .collect())
             })
@@ -582,7 +582,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
         let runner = self.runner_for_env(&spec.env_ref)?;
-        flotilla_core::agent_process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
+        flotilla_agent::process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
     }
 
     async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {

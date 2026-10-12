@@ -107,8 +107,6 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::agent_adapter::required_agent_adapters;
-use crate::agent_adapter::CapabilityTable;
 use crate::aggregator_projection::AggregatorProjectionState;
 use crate::checkout_integration::checkout_path_from_status_and_spec;
 use crate::checkout_integration::convoy_change_request_id_for_checkout;
@@ -160,6 +158,8 @@ use crate::step::RemoteStepExecutor;
 use crate::step::RemoteStepProgressSink;
 use crate::step::StepOutcome;
 use crate::step::StepResolver;
+use flotilla_agent::adapter::required_agent_adapters;
+use flotilla_agent::adapter::CapabilityTable;
 use flotilla_ai_utility::AiUtility;
 use flotilla_ai_utility::ConvoyNames;
 use flotilla_cloud_agent::RepoCriteria;
@@ -1414,7 +1414,7 @@ pub struct InProcessDaemon {
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
-    agent_state_store: crate::agents::SharedAgentStateStore,
+    agent_state_store: flotilla_agent::SharedAgentStateStore,
     /// Socket path for the daemon server — set by the daemon after startup.
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
@@ -1681,7 +1681,7 @@ impl InProcessDaemon {
                 local_runner,
             )
             .await;
-        let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
+        let agent_state_store = flotilla_agent::shared_file_backed_agent_state_store(config.base_path());
         for path in repo_paths {
             let path = canonical_or_original(&path);
             if repos.values().any(|state| state.contains_path(&path)) {
@@ -2718,7 +2718,7 @@ impl InProcessDaemon {
         self.environment_manager.host_id_for_environment(env_id)
     }
 
-    pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
+    pub fn agent_state_store(&self) -> &flotilla_agent::SharedAgentStateStore {
         &self.agent_state_store
     }
 

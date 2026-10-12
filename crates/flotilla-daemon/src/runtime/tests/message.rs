@@ -173,7 +173,7 @@ async fn captured_scrollback_delivery_and_bounded_hold() {
     for idle in [true, false] {
         let pool = Arc::new(HooklessComposerPool {
             inner: FakeTerminalPool::new(),
-            submitted_screen: include_str!("../../../../flotilla-core/src/fixtures/codex-2927/working-after-release.txt"),
+            submitted_screen: include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/working-after-release.txt"),
         });
         pool.inner
             .add_sessions(vec![ProviderTerminalSession::builder()
@@ -186,7 +186,7 @@ async fn captured_scrollback_delivery_and_bounded_hold() {
             .set_captured_screen(
                 "agent",
                 if idle {
-                    include_str!("../../../../flotilla-core/src/fixtures/codex-2927/scrolled-back.txt")
+                    include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/scrolled-back.txt")
                 } else {
                     "unobservable screen"
                 },
@@ -233,7 +233,7 @@ async fn captured_scrollback_delivery_and_bounded_hold() {
                 TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
             }
         );
-        pool.inner.set_captured_screen("agent", include_str!("../../../../flotilla-core/src/fixtures/codex-2927/scrolled-back.txt")).await;
+        pool.inner.set_captured_screen("agent", include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/scrolled-back.txt")).await;
         tokio::time::advance(Duration::from_secs(3600)).await;
         assert_eq!(pool.inner.delivered.lock().await.len(), usize::from(idle));
     }
@@ -290,7 +290,7 @@ async fn held_turn_is_revalidated_at_actual_input_boundary() {
         .update_status("subject", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() })
         .await
         .unwrap();
-    pool.inner.set_captured_screen("agent", include_str!("../../../../flotilla-core/src/fixtures/codex-2927/scrolled-back.txt")).await;
+    pool.inner.set_captured_screen("agent", include_str!("../../../../flotilla-agent/src/fixtures/codex-2927/scrolled-back.txt")).await;
     assert_eq!(task.await.unwrap().unwrap(), TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
     assert!(pool.inner.delivered.lock().await.is_empty());
     assert_eq!(
@@ -841,8 +841,8 @@ async fn held_pool_delivery_scenario(mode: &str) {
     assert!(!held[0].status.as_ref().expect("held status").phase.has_delivery_evidence());
     assert!(held[0].status.as_ref().expect("held status").submission.is_some());
     if mode != "screen" {
-        let store = flotilla_core::agents::shared_in_memory_agent_state_store();
-        let (_, parser) = flotilla_core::agents::parser_for_harness("codex").expect("parser");
+        let store = flotilla_agent::shared_in_memory_agent_state_store();
+        let (_, parser) = flotilla_agent::parser_for_harness("codex").expect("parser");
         let events = if mode.starts_with("native") {
             vec![
                 ("session-start", "SessionStart"),
@@ -882,7 +882,7 @@ async fn held_pool_delivery_scenario(mode: &str) {
                 3028,
                 flotilla_protocol::Request::AgentHook {
                     event: flotilla_protocol::AgentHookEvent::builder()
-                        .attachable_id(flotilla_core::agents::allocate_attachable_id())
+                        .attachable_id(flotilla_agent::allocate_attachable_id())
                         .harness(flotilla_protocol::AgentHarness::Codex)
                         .event_type(parsed.event_type.clone())
                         .maybe_session_id(parsed.session_id.clone())

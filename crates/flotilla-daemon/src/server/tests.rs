@@ -12,7 +12,7 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use flotilla_core::agents::AgentEntry;
+use flotilla_agent::AgentEntry;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_daemon_api::daemon::DaemonHandle;
@@ -780,7 +780,7 @@ async fn spawn_test_client_handler(
             count_ref,
             client_notify,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -927,12 +927,12 @@ fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc
 }
 
 async fn dispatch_request_test(daemon: &Arc<InProcessDaemon>, id: u64, request: Request) -> Message {
-    dispatch_request_with_state(daemon, &flotilla_core::agents::shared_in_memory_agent_state_store(), id, request).await
+    dispatch_request_with_state(daemon, &flotilla_agent::shared_in_memory_agent_state_store(), id, request).await
 }
 
 pub(crate) async fn dispatch_request_with_state(
     daemon: &Arc<InProcessDaemon>,
-    agent_state_store: &flotilla_core::agents::SharedAgentStateStore,
+    agent_state_store: &flotilla_agent::SharedAgentStateStore,
     id: u64,
     request: Request,
 ) -> Message {
@@ -1159,7 +1159,7 @@ async fn dispatch_host_query_methods_round_trip() {
 #[tokio::test]
 async fn dispatch_agent_hook_started_updates_existing_session_entry() {
     let (_tmp, daemon) = empty_daemon().await;
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
     let existing_id = AttachableId::new("att-existing");
     let incoming_id = AttachableId::new("att-new");
     let session_id = "sess-123".to_string();
@@ -1235,7 +1235,7 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
     }
     .apply(&mut status);
     sessions.update_status("terminal-demo-coder", &created.metadata.resource_version, &status).await.expect("running status");
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
 
     let response = dispatch_request_with_state(
         &daemon,
@@ -1379,7 +1379,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
         }
         .apply(&mut status);
         sessions.update_status(&name, &created.metadata.resource_version, &status).await.expect("running status");
-        let store = flotilla_core::agents::shared_in_memory_agent_state_store();
+        let store = flotilla_agent::shared_in_memory_agent_state_store();
         if harness_name == "codex" {
             // Upgrade from a pre-fix notification stored under a random candidate.
             store.lock().expect("agents").upsert(
@@ -1400,7 +1400,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 8,
                 Request::AgentHook {
                     event: AgentHookEvent::builder()
-                        .attachable_id(flotilla_core::agents::allocate_attachable_id())
+                        .attachable_id(flotilla_agent::allocate_attachable_id())
                         .harness(AgentHarness::Codex)
                         .event_type(AgentEventType::NoChange)
                         .session_id("codex-1".into())
@@ -1415,7 +1415,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 "unknown notifications must not mutate the registry"
             );
         }
-        let (_, parser) = flotilla_core::agents::parser_for_harness(harness_name).expect("parser");
+        let (_, parser) = flotilla_agent::parser_for_harness(harness_name).expect("parser");
         for (event_type, payload, expected) in [
             (active_event, active_payload, TerminalAttentionState::Working),
             (idle_event, idle_payload, TerminalAttentionState::Idle),
@@ -1441,7 +1441,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     8,
                     Request::AgentHook {
                         event: AgentHookEvent::builder()
-                            .attachable_id(flotilla_core::agents::allocate_attachable_id())
+                            .attachable_id(flotilla_agent::allocate_attachable_id())
                             .harness(harness.clone())
                             .event_type(parsed.event_type)
                             .maybe_session_id(parsed.session_id)
@@ -1455,7 +1455,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             if harness_name == "codex" && expected == TerminalAttentionState::Idle {
                 let agents = store.lock().expect("agents");
                 let terminal = flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() };
-                assert_eq!(agents.lookup_by_session_id("codex-1"), Some(&flotilla_core::attachable::codex_hook_id(None, Some(&terminal))));
+                assert_eq!(agents.lookup_by_session_id("codex-1"), Some(&flotilla_agent::attachable::codex_hook_id(None, Some(&terminal))));
                 assert_eq!(agents.list_agents().len(), 1, "repeated notify events must not orphan identities");
             }
             let observed = sessions.get(&name).await.expect("observed terminal");
@@ -1484,7 +1484,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
 #[tokio::test]
 async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
     let (_tmp, daemon) = empty_daemon().await;
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
     let existing_id = AttachableId::new("att-existing");
     let session_id = "sess-456".to_string();
 
@@ -1528,7 +1528,7 @@ async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
 #[tokio::test]
 async fn dispatch_agent_hook_no_change_event_is_ok_without_creating_entry() {
     let (_tmp, daemon) = empty_daemon().await;
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
     let attachable_id = AttachableId::new("att-no-change");
 
     let response = dispatch_request_with_state(
@@ -2646,7 +2646,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -2686,7 +2686,7 @@ async fn request_dispatcher_forwards_daemon_log_query_through_peer_manager() {
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -3069,7 +3069,7 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
     let forwarded_commands_for_task = Arc::clone(&forwarded_commands);
     let pending_remote_cancels_for_task = Arc::clone(&pending_remote_cancels);
     let next_remote_command_id_for_task = Arc::clone(&next_remote_command_id);
-    let agent_state_store_for_task = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store_for_task = flotilla_agent::shared_in_memory_agent_state_store();
     let response = tokio::spawn(async move {
         let remote_command_router = make_remote_command_router(
             &daemon_for_task,
@@ -3193,7 +3193,7 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
     let forwarded_commands_for_task = Arc::clone(&forwarded_commands);
     let pending_remote_cancels_for_task = Arc::clone(&pending_remote_cancels);
     let next_remote_command_id_for_task = Arc::clone(&next_remote_command_id);
-    let agent_state_store_for_task = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store_for_task = flotilla_agent::shared_in_memory_agent_state_store();
     let cancel_response = tokio::spawn(async move {
         let remote_command_router = make_remote_command_router(
             &daemon_for_task,
@@ -3728,7 +3728,7 @@ async fn handle_client_forwards_peer_link_state_and_registers_peer() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -3908,7 +3908,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -3999,7 +3999,7 @@ async fn handle_client_session_dispatches_request_messages() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4046,7 +4046,7 @@ async fn hello_and_shutdown_remain_responsive_under_scoped_convoy_load() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4166,7 +4166,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4237,7 +4237,7 @@ async fn assert_client_hello_rejected(protocol_version: u32, display_name: Strin
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4494,7 +4494,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4758,7 +4758,7 @@ async fn handle_client_relays_outbound_peer_messages() {
             count_ref,
             notify_ref,
             peer_connected_tx,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4855,7 +4855,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             count_a,
             notify_a,
             peer_connected_tx_a,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -4873,7 +4873,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             count_b,
             notify_b,
             peer_connected_tx_b,
-            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            flotilla_agent::shared_in_memory_agent_state_store(),
             None,
         )
         .await;
@@ -5282,7 +5282,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
-    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    let agent_state_store = flotilla_agent::shared_in_memory_agent_state_store();
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,

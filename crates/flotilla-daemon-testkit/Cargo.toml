@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-client = { path = "../flotilla-client" }
+flotilla-agent = { path = "../flotilla-agent" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-replication = { path = "../flotilla-replication" }

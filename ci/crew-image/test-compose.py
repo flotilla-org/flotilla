@@ -91,7 +91,7 @@ class Composition(unittest.TestCase):
         harness = next(layer for layer in catalogue['layers'] if layer['stage'] == 'harness')
         version = harness['pins']['CODEX_VERSION']['value']
         fixture = 'codex-hooks-list-' + version + '.json'
-        agents = ROOT / 'crates/flotilla-core/src/agents'
+        agents = ROOT / 'crates/flotilla-agent/src'
         self.assertTrue((agents / 'fixtures' / fixture).is_file())
         self.assertIn('include_str!("fixtures/' + fixture + '")', (agents / 'hooks.rs').read_text())
 
