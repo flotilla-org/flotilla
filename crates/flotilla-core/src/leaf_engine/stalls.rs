@@ -164,7 +164,9 @@ pub(super) fn is_merged_settlement_probe(leaf: &Leaf) -> bool {
 }
 
 /// Workflow-declared checks, review and merged settlement rules run during active crew work too,
-/// including custom rules; conflict probes retain their active delivery behavior.
+/// including custom rules. Merged settlement also resumes stalled crews so they
+/// can resolve remaining promises and claim completion; conflict probes retain
+/// their active delivery behavior.
 pub(super) fn is_active_change_request_probe(status: &ConvoyStatus, rule: &TurnDeliveryRule, leaf: &Leaf) -> bool {
     // Promise rejection rows are armed for their owner while work remains active.
     let promise_rejection = leaf.field_path == ".state"
@@ -186,7 +188,8 @@ pub(super) fn is_active_change_request_probe(status: &ConvoyStatus, rule: &TurnD
         && status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role)).is_some_and(|work| {
             work.finished_at.is_none()
                 && (is_conflict_probe(leaf)
-                    || (promise_rejection && work.phase == flotilla_resources::CrewWorkPhase::Stalled)
+                    || ((promise_rejection || is_merged_settlement_probe(leaf))
+                        && work.phase == flotilla_resources::CrewWorkPhase::Stalled)
                     || matches!(work.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Interrupted))
         })
 }

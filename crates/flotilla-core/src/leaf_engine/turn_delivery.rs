@@ -170,7 +170,7 @@ impl LeafSubscriptionTable {
                         )))
                     }
                 };
-                let brief = if active_conflict {
+                let mut brief = if active_conflict {
                     format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.", rule.brief.trim())
                 } else if active_probe {
                     let checks = match cr.checks.value {
@@ -203,6 +203,18 @@ impl LeafSubscriptionTable {
                         })
                         .unwrap_or_default()
                 };
+                if merged_settlement {
+                    let pending: Vec<_> = flotilla_resources::promises::owned(status, &rule.to.vessel, &rule.to.role)
+                        .iter()
+                        .filter(|promise| !promise.state.terminal())
+                        .collect();
+                    if !pending.is_empty() {
+                        brief.push_str("\nResolve these non-terminal promises before `flotilla crew complete`:\n\n");
+                        for promise in pending {
+                            brief.push_str(&format!("- `{}` ({})\n", promise.id, promise.kind.as_str()));
+                        }
+                    }
+                }
                 // Merge is one terminal episode for the subject, independent of
                 // later head observations (including a previously unknown head).
                 let revision = if merged_settlement { format!("{}@merged", leaf.address) } else { head_sha };

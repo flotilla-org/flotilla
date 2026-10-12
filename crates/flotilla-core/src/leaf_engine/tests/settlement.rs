@@ -105,12 +105,13 @@ async fn reconciler_wake_rederives_at_boot_and_lands_without_resync() {
 #[tokio::test]
 async fn merged_unclaimed_crew_delivers_once() {
     for unknown_head in [false, true] {
-        merged_unclaimed_scenario(2, unknown_head).await;
+        merged_unclaimed_scenario(2, unknown_head, false, false).await;
     }
 }
 
 // Repeated observations and subscription reconstruction must retain exactly
-// one terminal delivery, whether the PR head is known or unknown.
+// one terminal delivery across known/unknown heads, interrupted/stalled crews,
+// and open/terminal ledgers.
 // Each case drives real in-memory stores, informers and turn delivery. Hegel
 // charges that whole scenario to generation time; CPU scheduling is not a
 // generation-cost oracle. Keep the bounded generators and other health checks.
@@ -118,11 +119,14 @@ async fn merged_unclaimed_crew_delivers_once() {
 fn generated_merged_unclaimed_delivery_is_idempotent(tc: hegel::TestCase) {
     let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
     let unknown_head = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-        .block_on(merged_unclaimed_scenario(repeats, unknown_head));
+    let stalled = tc.draw(hegel::generators::booleans());
+    let open_ledger = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(merged_unclaimed_scenario(
+        repeats,
+        unknown_head,
+        stalled,
+        open_ledger,
+    ));
 }
 
 #[tokio::test]
@@ -307,4 +311,15 @@ async fn change_request_bound_after_claims_instantiates_and_settles() {
     .expect("late-bound CR should settle");
     assert_eq!(status.disposition.as_deref(), Some("merged"));
     controller.abort();
+}
+
+// #3140: a stalled crew must resume once per merged PR even with another
+// promise open; the brief identifies the remaining ledger by its promise ID.
+#[tokio::test]
+async fn stalled_merged_unclaimed_crew_resumes_with_open_promises() {
+    for open_ledger in [false, true] {
+        for unknown_head in [false, true] {
+            merged_unclaimed_scenario(2, unknown_head, true, open_ledger).await;
+        }
+    }
 }
