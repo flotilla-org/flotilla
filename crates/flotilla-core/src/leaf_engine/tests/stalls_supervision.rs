@@ -843,7 +843,10 @@ fn unavailable_governor_warns_with_routing_fields() {
 
 // Draw failure modes and sequences of reconciles/restarts. Check fallback after
 // every step and require one-pass recovery and exactly one delivery after healing.
-#[hegel::test]
+// Each case drives real in-memory stores, informers and turn delivery. Hegel
+// charges that whole scenario to generation time; CPU scheduling is not a
+// generation-cost oracle. Keep the bounded generators and other health checks.
+#[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn generated_unavailable_governor_recovers(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let unavailable = GovernorUnavailable::ALL[tc.draw(gs::integers::<usize>().min_value(0).max_value(GovernorUnavailable::ALL.len() - 1))];

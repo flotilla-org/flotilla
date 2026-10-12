@@ -276,12 +276,18 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
     }
 }
 
+// Idle episodes stage credentials before delivery, stop at the declared nudge
+// ceiling (including zero), and clear their stall when the convoy lands.
 #[tokio::test]
 async fn idle_crew_nudges_are_bounded_and_credential_staged() {
-    use flotilla_resources::StallRung;
+    use super::support::resume_staging_fixture_with_clock;
+    use flotilla_resources::{Clock, StallRung};
+    use flotilla_store_testkit::VirtualClock;
 
     for limit in [0, 2] {
-        let (daemon, backend, probe) = resume_staging_fixture().await;
+        let clock = Arc::new(VirtualClock::new(Utc::now() + chrono::Duration::hours(1)));
+        let (daemon, backend, probe) =
+            resume_staging_fixture_with_clock(ResourceBackend::new(InMemoryBackend::default()), clock.clone()).await;
         probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
         let convoy = convoys.get("resume-staging").await.expect("convoy");
@@ -297,27 +303,13 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("resume-staging-session").await.expect("session");
         let mut session_status = ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
-        session_status.attention = Some(TerminalAttention {
-            state: TerminalAttentionState::Idle,
-            as_of: chrono::Utc::now(),
-            source: TerminalAttentionSource::Hook,
-        });
+        session_status.attention =
+            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: clock.now(), source: TerminalAttentionSource::Hook });
         sessions.update_status("resume-staging-session", &session.metadata.resource_version, &session_status).await.expect("idle session");
-        let (tx, _rx) = flotilla_store::controller::WorkQueueSender::channel();
-        let watcher = daemon.reconciler_wake_watch();
-        let task = tokio::spawn(watcher.spawn(backend.clone(), "flotilla".to_string(), tx));
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled;
-                if stalled.as_ref().is_some_and(|stall| stall.rung == expected_rung && stall.nudge_history.len() == limit.min(1) as usize) {
-                    break stalled.expect("stalled");
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first stall judgement");
+        daemon.reconcile_crew_stalls_once("flotilla").await.expect("first stall judgement");
+        let first = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+        assert_eq!(first.rung, expected_rung);
         assert_eq!(first.nudge_history.len(), limit.min(1) as usize);
         let session = sessions.get("resume-staging-session").await.expect("session");
         let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent") };
@@ -331,7 +323,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             assert!(nudge.spec.body.contains("You owe a settlement claim for work/coder"));
             assert!(matches!(nudge.spec.expectation, flotilla_resources::MessageExpectation::Outcome { .. }));
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
-            for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
+            for (cooldown_seconds, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
                 for nudge in messages.list().await.expect("nudges").items {
                     if nudge.status.as_ref().is_some_and(|status| status.phase.is_waiting()) {
                         flotilla_store::apply_status_patch(
@@ -341,34 +333,29 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
                                 receiver: flotilla_resources::ResolvedMessageReceiver::builder()
                                     .crew_id("crew".into())
                                     .session("resume-staging-session".into())
-                                    .delivered_at(Utc::now())
+                                    .delivered_at(clock.now())
                                     .evidence("agent accepted nudge".into())
                                     .build(),
-                                at: Utc::now(),
+                                at: clock.now(),
                             },
                         )
                         .await
                         .expect("consume nudge");
                     }
                 }
+                // First observe delivery; only a later idle observation is a reply
+                // to that turn. Coalescing both writes would erase that ordering.
+                daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe delivered nudge");
                 let session = sessions.get("resume-staging-session").await.expect("session");
-                session_status.attention.as_mut().expect("attention").as_of = chrono::Utc::now() + chrono::Duration::seconds(offset);
+                session_status.attention.as_mut().expect("attention").as_of = clock.advance(chrono::Duration::seconds(cooldown_seconds));
                 sessions
                     .update_status("resume-staging-session", &session.metadata.resource_version, &session_status)
                     .await
                     .expect("idle again");
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        let stalled =
-                            convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
-                        if stalled.nudge_history.len() == 2 && stalled.rung == desired_rung {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("next idle episode judgement");
+                daemon.reconcile_crew_stalls_once("flotilla").await.expect("next idle episode judgement");
+                let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+                assert_eq!(stalled.nudge_history.len(), 2);
+                assert_eq!(stalled.rung, desired_rung);
             }
             let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
             assert_eq!(stalled.nudge_history.len(), 2);
@@ -378,16 +365,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         status.phase = flotilla_resources::ConvoyPhase::Landed;
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Done;
         convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("complete");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.is_none() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("stall cleared");
-        task.abort();
+        daemon.reconcile_crew_stalls_once("flotilla").await.expect("clear stall");
+        assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.is_none());
     }
 }

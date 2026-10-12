@@ -131,6 +131,7 @@ pub struct LeafSubscriptionTable {
 }
 
 struct LeafSubscriptionTableInner {
+    clock: Arc<dyn flotilla_resources::Clock>,
     backend: ResourceBackend,
     watch_views: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<wake::LeafViews>>>>,
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
@@ -164,6 +165,12 @@ enum UnableEvidenceKey {
 }
 
 impl LeafSubscriptionTable {
+    /// Use the daemon clock for stall freshness, idle grace and nudge backoff.
+    pub fn with_clock(mut self, clock: Arc<dyn flotilla_resources::Clock>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure clock before sharing subscriptions").clock = clock;
+        self
+    }
+
     pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_store::CharterBriefRenderer>) -> Self {
         Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
         self
@@ -208,6 +215,7 @@ impl LeafSubscriptionTable {
         let (reconciler_tx, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
+                clock: Arc::new(flotilla_resources::SystemClock),
                 backend,
                 watch_views: Default::default(),
                 message_inboxes: Default::default(),

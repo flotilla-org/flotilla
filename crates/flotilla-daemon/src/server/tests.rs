@@ -4573,15 +4573,18 @@ async fn send_link_state_sends_host_summary_and_route_advertisement() {
     assert!(matches!(&sent[1], PeerWireMessage::RouteAdvertisement { origin_node_id, .. } if origin_node_id == &host_name));
 }
 
-#[tokio::test]
+// A silent peer receives pings before its keepalive deadline expires.
+#[tokio::test(start_paused = true)]
 async fn forward_with_keepalive_times_out_after_silence() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(4);
     let (_inbound_tx, mut inbound_rx) = mpsc::channel(4);
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
+    let task = tokio::spawn(async move {
+        // Keep the inbound channel open: silence, rather than disconnection,
+        // must end the forwarding loop.
+        let _inbound_tx = _inbound_tx;
         forward_with_keepalive_for_test(
             &peer_data_tx,
             &mut inbound_rx,
@@ -4590,13 +4593,22 @@ async fn forward_with_keepalive_times_out_after_silence() {
             sender,
             Duration::from_millis(10),
             Duration::from_millis(30),
-        ),
-    )
-    .await
-    .expect("keepalive task should finish before the outer timeout");
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    for expected_pings in 1..=3 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "silence at or before the deadline must not disconnect");
+        assert_eq!(sent.lock().expect("lock").iter().filter(|msg| matches!(msg, PeerWireMessage::Ping { .. })).count(), expected_pings);
+    }
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("keepalive task should finish before the outer timeout")
+        .expect("forward task");
     assert!(matches!(result, ForwardResult::KeepaliveTimeout));
-    let sent = sent.lock().expect("lock");
-    assert!(sent.iter().any(|msg| matches!(msg, PeerWireMessage::Ping { .. })), "keepalive loop should send ping messages");
 }
 
 #[tokio::test(start_paused = true)]
