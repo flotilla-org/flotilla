@@ -32,6 +32,38 @@ pub(super) struct ReconcilerWake {
     _marker: PhantomData<Convoy>,
 }
 
+// Both existing owned test inventories and shared watched inventories cross
+// the judgement seam as references to convoy bodies.
+pub(super) trait ConvoyRead: Send + Sync {
+    fn convoy(&self) -> &ResourceObject<Convoy>;
+}
+impl ConvoyRead for ResourceObject<Convoy> {
+    fn convoy(&self) -> &ResourceObject<Convoy> {
+        self
+    }
+}
+pub(super) struct SharedConvoy {
+    inventory: Arc<flotilla_resources::ReadResourceList<Convoy>>,
+    index: usize,
+}
+impl std::ops::Deref for SharedConvoy {
+    type Target = ResourceObject<Convoy>;
+    fn deref(&self) -> &Self::Target {
+        &self.inventory.items[self.index].object
+    }
+}
+impl ConvoyRead for SharedConvoy {
+    fn convoy(&self) -> &ResourceObject<Convoy> {
+        self
+    }
+}
+
+type SharedConvoyInventory = HashMap<String, SharedConvoy>;
+struct CachedLocalConvoys {
+    generation: Arc<flotilla_resources::ReadResourceList<Convoy>>,
+    objects: Arc<SharedConvoyInventory>,
+}
+
 pub(super) struct LeafViews {
     pub(super) defaults: WatchView<flotilla_resources::CrewDefaults>,
     pub(super) fleet: WatchView<flotilla_resources::FleetDesignation>,
@@ -44,6 +76,7 @@ pub(super) struct LeafViews {
     pub(super) vessels: WatchView<Vessel>,
     pub(super) messages: WatchView<flotilla_resources::Message>,
     pub(super) forges: WatchView<Forge>,
+    local_convoys: tokio::sync::Mutex<Option<CachedLocalConvoys>>,
 }
 impl LeafViews {
     async fn start(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
@@ -59,14 +92,28 @@ impl LeafViews {
             vessels: WatchView::start(backend.clone(), namespace).await?,
             messages: WatchView::start(backend.clone(), namespace).await?,
             forges: WatchView::start(backend.clone(), namespace).await?,
+            local_convoys: Default::default(),
         })
     }
-    async fn local_convoys(&self) -> Result<HashMap<String, ResourceObject<Convoy>>, String> {
-        self.convoys
-            .query(&flotilla_store::StoreQuery::default())
-            .await
-            .map_err(|error| error.to_string())
-            .map(|listed| listed.items.into_iter().map(|item| (item.object.metadata.name.clone(), item.object)).collect())
+    async fn local_convoys(&self) -> Result<Arc<HashMap<String, SharedConvoy>>, String> {
+        let listed = self.convoys.shared_list().await.map_err(|error| error.to_string())?;
+        let mut cached = self.local_convoys.lock().await;
+        if let Some(previous) = cached.as_ref() {
+            if Arc::ptr_eq(&previous.generation, &listed) {
+                return Ok(previous.objects.clone());
+            }
+        }
+        let objects: Arc<HashMap<String, SharedConvoy>> = Arc::new(
+            listed
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches!(item.provenance, flotilla_resources::ResourceProvenance::Local))
+                .map(|(index, item)| (item.object.metadata.name.clone(), SharedConvoy { inventory: listed.clone(), index }))
+                .collect(),
+        );
+        *cached = Some(CachedLocalConvoys { generation: listed, objects: objects.clone() });
+        Ok(objects)
     }
 }
 
@@ -98,7 +145,7 @@ impl ReconcilerWake {
         Ok(cell)
     }
 
-    pub(super) async fn local_convoys(&self, namespace: &str) -> Result<HashMap<String, ResourceObject<Convoy>>, String> {
+    pub(super) async fn local_convoys(&self, namespace: &str) -> Result<Arc<HashMap<String, SharedConvoy>>, String> {
         self.views(namespace).await?.get().expect("initialized views").local_convoys().await
     }
 
@@ -161,6 +208,16 @@ impl ReconcilerWake {
                     blocking_reason,
                 });
             }
+        }
+        // Empty evidence is a no-op unless the patch must clear stale
+        // queued-turn attention. Preserve that repair across every phase.
+        if observations.is_empty()
+            && !status
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.source == flotilla_resources::ConvoyAttention::QUEUED_TURN_SOURCE)
+        {
+            return Ok(());
         }
         let patch = flotilla_resources::ConvoyStatusPatch::ObserveQueuedTurnDeliveries { observations, observed_at: now };
         let mut next = status.clone();
@@ -231,7 +288,7 @@ impl ReconcilerWake {
         }
     }
 
-    pub(super) async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
+    pub(super) async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, impl ConvoyRead>) -> Result<(), String> {
         let cell = self.views(namespace).await?;
         let views = cell.get().expect("initialized views");
         let forges =
@@ -242,7 +299,7 @@ impl ReconcilerWake {
             freshest_change_requests(&change_request_sources(change_request_list)).into_iter().collect::<BTreeMap<_, _>>();
         let vessel_sources = views.vessels.list().await.map_err(|error| error.to_string())?.items;
         let mut desired = Vec::<LeafSubscriptionRow>::new();
-        for convoy in convoys.values().filter(|convoy| {
+        for convoy in convoys.values().map(ConvoyRead::convoy).filter(|convoy| {
             convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing))
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");

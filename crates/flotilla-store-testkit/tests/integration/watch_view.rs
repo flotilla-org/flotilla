@@ -195,12 +195,7 @@ async fn contract(reader: ResourceBackend, writer: ResourceBackend) {
     // The immutable Store adapter exposes the same declared indexed selectors
     // and refuses writes/missing kinds instead of falling back to live reads.
     let mut snapshot = flotilla_store::ViewSnapshot::new(Some(NodeId::new("local-root")));
-    snapshot
-        .insert(
-            "flotilla",
-            view.query(&StoreQuery { include_replicas: true, suppress_self_origin: false, ..StoreQuery::default() }).await.unwrap(),
-        )
-        .unwrap();
+    view.insert_snapshot("flotilla", &mut snapshot).await.unwrap();
     let cached = ResourceBackend::from_arc(Arc::new(snapshot));
     assert_eq!(cached.query_declared::<Convoy>("flotilla", &query).await.unwrap().items.len(), 1);
     assert!(cached.using::<Convoy>("flotilla").delete("alpha").await.is_err());
@@ -310,4 +305,69 @@ async fn http_watch_view_contract() {
     let reader = ResourceBackend::new(HttpBackend::new(flotilla_tls::client(), url));
     contract(reader, writer).await;
     server.abort();
+}
+
+// Across empty inventories, duplicate names, label changes and deletes, shared
+// generations must agree with the maintained view's queries. Saved snapshots
+// remain unchanged when later watch events arrive, including their indexes.
+#[hegel::test]
+fn shared_snapshot_generations_track_mutations(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    fn evidence(list: &ReadResourceList<Convoy>) -> Vec<(serde_json::Value, String)> {
+        list.items
+            .iter()
+            .map(|item| (serde_json::to_value(item.object.to_k8s_object()).unwrap(), format!("{:?}", item.provenance)))
+            .collect()
+    }
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+    let operations: Vec<_> = (0..steps)
+        .map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(3)), tc.draw(gs::booleans()), tc.draw(gs::booleans())))
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("local"));
+        let resolver = backend.using::<Convoy>("flotilla");
+        let view = WatchView::<Convoy>::start(backend, "flotilla").await.unwrap();
+        let all = StoreQuery { include_replicas: true, ..StoreQuery::default() };
+        let team = StoreQuery { labels: BTreeMap::from([("team".into(), "selected".into())]), ..all.clone() };
+        let mut saved = Vec::new();
+        for (name, delete, selected) in operations {
+            let before = view.shared_list().await.unwrap();
+            assert!(Arc::ptr_eq(&before, &view.shared_list().await.unwrap()), "unchanged generation is shared");
+            let name = format!("convoy-{name}");
+            let current = resolver.get(&name).await.ok();
+            if delete {
+                if current.is_some() {
+                    resolver.delete(&name).await.unwrap();
+                }
+            } else {
+                let mut meta = current.as_ref().map(|object| InputMeta::from(&object.metadata)).unwrap_or_else(|| convoy_meta(&name));
+                meta.labels.insert("team".into(), if selected { "selected" } else { "other" }.into());
+                if let Some(object) = current {
+                    resolver.update(&meta, &object.metadata.resource_version, &object.spec).await.unwrap();
+                } else {
+                    resolver.create(&meta, &convoy_spec("template")).await.unwrap();
+                }
+            }
+            let listed = view.shared_list().await.unwrap();
+            assert_eq!(evidence(&listed), evidence(&view.list().await.unwrap()));
+            let mut snapshot = flotilla_store::ViewSnapshot::new(Some(NodeId::new("local")));
+            view.insert_snapshot("flotilla", &mut snapshot).await.unwrap();
+            let snapshot = ResourceBackend::new(snapshot);
+            for query in [&all, &team] {
+                assert_eq!(
+                    evidence(&snapshot.query_declared::<Convoy>("flotilla", query).await.unwrap()),
+                    evidence(&view.query(query).await.unwrap())
+                );
+            }
+            for (old, want_all, want_team) in &saved {
+                let old: &ResourceBackend = old;
+                assert_eq!(&evidence(&old.query_declared::<Convoy>("flotilla", &all).await.unwrap()), want_all);
+                assert_eq!(&evidence(&old.query_declared::<Convoy>("flotilla", &team).await.unwrap()), want_team);
+            }
+            let want_all = evidence(&snapshot.query_declared::<Convoy>("flotilla", &all).await.unwrap());
+            let want_team = evidence(&snapshot.query_declared::<Convoy>("flotilla", &team).await.unwrap());
+            saved.push((snapshot, want_all, want_team));
+        }
+    });
 }

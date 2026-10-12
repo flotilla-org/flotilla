@@ -188,14 +188,15 @@ impl MessageInbox {
     }
 }
 
-/// Receiver evidence frozen for one batch, never cached between passes.
+/// Receiver evidence frozen for one batch. Shared view generations avoid
+/// retaining a fresh inventory copy for each batch.
 /// Resolution after loading is pure, including adopted-role validation.
 #[derive(Debug)]
 pub struct MessageReceiverSnapshot {
     namespace: String,
-    convoys: Vec<crate::ReadResourceObject<Convoy>>,
-    terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
-    ensures: Vec<crate::ReadResourceObject<ConvoyEnsure>>,
+    convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
+    terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
+    ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
     projects: BTreeMap<String, ProjectSpec>,
     hierarchy: ProjectHierarchy,
     defaults: Vec<(String, CrewDefaultsSpec)>,
@@ -312,10 +313,28 @@ impl MessageReceiverSnapshot {
         terminals: Vec<crate::ReadResourceObject<TerminalSession>>,
         ensures: Vec<crate::ReadResourceObject<ConvoyEnsure>>,
     ) -> Result<Self, ResourceError> {
+        Self::load_from_shared_observations(
+            backend,
+            namespace,
+            std::sync::Arc::new(crate::ReadResourceList { items: convoys }),
+            std::sync::Arc::new(crate::ReadResourceList { items: terminals }),
+            std::sync::Arc::new(crate::ReadResourceList { items: ensures }),
+        )
+        .await
+    }
+
+    /// Freeze a receiver batch using the caller's immutable watch generations.
+    pub async fn load_from_shared_observations(
+        backend: &ResourceBackend,
+        namespace: &str,
+        convoys: std::sync::Arc<crate::ReadResourceList<Convoy>>,
+        terminals: std::sync::Arc<crate::ReadResourceList<TerminalSession>>,
+        ensures: std::sync::Arc<crate::ReadResourceList<ConvoyEnsure>>,
+    ) -> Result<Self, ResourceError> {
         let mut projects = BTreeMap::new();
         let mut fleet = None;
         let mut defaults = Vec::new();
-        if terminals.iter().any(|holder| holder.object.metadata.annotations.contains_key(ROLE_ADDRESS_ANNOTATION)) {
+        if terminals.items.iter().any(|holder| holder.object.metadata.annotations.contains_key(ROLE_ADDRESS_ANNOTATION)) {
             // Adoptable-role validation resolves the complete Project parent hierarchy
             // and defaults cascade; both sides are read once for this batch.
             projects = backend
@@ -350,12 +369,12 @@ impl MessageReceiverSnapshot {
         match parts.as_slice() {
             [p, c, _, _] => *p == project && *c == convoy,
             [p, role] if *p == project => {
-                self.ensures.iter().any(|source| {
+                self.ensures.items.iter().any(|source| {
                     let declaration = &source.object;
                     declaration.spec.project_ref == project
                         && declaration.spec.role == *role
                         && declaration.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) == Some(convoy)
-                }) || self.terminals.iter().any(|holder| {
+                }) || self.terminals.items.iter().any(|holder| {
                     holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claim| claim == address)
                         && holder.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|name| name == convoy)
                 })
@@ -365,11 +384,11 @@ impl MessageReceiverSnapshot {
     }
 
     pub(crate) fn convoys(&self) -> &[crate::ReadResourceObject<Convoy>] {
-        &self.convoys
+        &self.convoys.items
     }
     /// Terminal evidence from this batch, including replicas and local precedence.
     pub fn terminals(&self) -> &[crate::ReadResourceObject<TerminalSession>] {
-        &self.terminals
+        &self.terminals.items
     }
 
     pub fn resolve(&self, address: &str) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
@@ -380,7 +399,7 @@ impl MessageReceiverSnapshot {
     fn resolve_validated(&self, address: &str) -> Result<Option<crate::ReadResourceObject<TerminalSession>>, ResourceError> {
         use crate::{TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
         let parts: Vec<_> = address.split('/').collect();
-        let convoys = &self.convoys;
+        let convoys = &self.convoys.items;
         let (project, convoy, vessel, role) = match parts.as_slice() {
             [project, convoy, vessel, role] => (*project, Some(*convoy), Some(*vessel), *role),
             [project, role] => (*project, None, None, *role),
@@ -390,6 +409,7 @@ impl MessageReceiverSnapshot {
         if convoy.is_none() {
             let adopted = self
                 .terminals
+                .items
                 .iter()
                 .filter(|holder| {
                     holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claimed| claimed == address)
@@ -410,7 +430,7 @@ impl MessageReceiverSnapshot {
             }
         }
         let declared_convoy = if convoy.is_none() {
-            let declarations = &self.ensures;
+            let declarations = &self.ensures.items;
             let mut holders = declarations
                 .iter()
                 .filter(|declaration| declaration.object.spec.project_ref == project && declaration.object.spec.role == role);
@@ -439,7 +459,7 @@ impl MessageReceiverSnapshot {
         if candidates.get(1).is_some_and(|other| other.object.spec.generation == convoy.object.spec.generation) {
             return Err(ResourceError::invalid("role address has multiple current convoy holders"));
         }
-        let terminals = &self.terminals;
+        let terminals = &self.terminals.items;
         let mut holders = terminals
             .iter()
             .filter(|source| {

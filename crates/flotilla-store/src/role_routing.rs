@@ -326,13 +326,44 @@ pub async fn reconcile_charter_notifications_with_view(
     now: chrono::DateTime<chrono::Utc>,
     backend: &ResourceBackend,
 ) -> Result<(), ResourceError> {
+    let _charter_pass = inbox.charter_notifications.lock().await;
+    let receivers = MessageReceiverSnapshot::load(backend, &inbox.namespace).await?;
+    let projects = backend.definitions::<Project>(&inbox.namespace).list().await?;
+    reconcile_charter_notifications_from_receivers(inbox, renderer, now, backend, &receivers, projects.iter().collect()).await
+}
+
+/// Reuse shared receiver evidence already frozen by the leaf engine.
+pub async fn reconcile_charter_notifications_with_receivers(
+    inbox: &crate::MessageInbox,
+    renderer: &dyn CharterBriefRenderer,
+    now: chrono::DateTime<chrono::Utc>,
+    backend: &ResourceBackend,
+    receivers: &MessageReceiverSnapshot,
+    projects: &crate::ReadResourceList<Project>,
+) -> Result<(), ResourceError> {
+    let _charter_pass = inbox.charter_notifications.lock().await;
+    reconcile_charter_notifications_from_receivers(
+        inbox,
+        renderer,
+        now,
+        backend,
+        receivers,
+        projects.items.iter().map(|item| &item.object).collect(),
+    )
+    .await
+}
+
+async fn reconcile_charter_notifications_from_receivers(
+    inbox: &crate::MessageInbox,
+    renderer: &dyn CharterBriefRenderer,
+    now: chrono::DateTime<chrono::Utc>,
+    backend: &ResourceBackend,
+    receivers: &MessageReceiverSnapshot,
+    projects: Vec<&ResourceObject<Project>>,
+) -> Result<(), ResourceError> {
     use crate::{InputMeta, MessageExpectation, MessageReference, MessageRelation, MessageSpec, ResourceProvenance, TerminalSessionSource};
     use sha2::{Digest, Sha256};
-    // Keep charter passes ordered without blocking unrelated Message producers.
-    let _charter_pass = inbox.charter_notifications.lock().await;
     let namespace = inbox.namespace.as_str();
-    let receivers = MessageReceiverSnapshot::load(backend, namespace).await?;
-    let projects = backend.definitions::<Project>(namespace).list().await?;
     let convoys = receivers.convoys();
     let mut cascades = BTreeMap::new();
     for holder in receivers.terminals() {
