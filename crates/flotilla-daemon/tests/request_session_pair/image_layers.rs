@@ -171,66 +171,64 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         serde_json::from_str(convoys[0].metadata.annotations.get(IMAGE_LAYERS_ANNOTATION).expect("frozen layer record"))
             .expect("decode layers");
     assert_eq!(frozen.layers.keys().map(String::as_str).collect::<Vec<_>>(), ["base", "display", "harness"]);
-    {
-        assert_eq!(frozen.baseline_image, None);
-        let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("joined builds").items;
-        assert_eq!(builds.len(), 1, "admission joins the first stage before accepting the convoy");
-        assert_eq!(builds[0].spec.host_ref, host_id);
-        let second = CommandAction::ConvoyStart {
-            intent: Box::new(
-                ConvoyStartIntent::builder()
-                    .project_ref("flotilla".into())
-                    .name("layered-work-second".into())
-                    .branch("test/layered-work-second".into())
-                    .needs(vec![need.into()])
-                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                    .build(),
-            ),
-        };
-        let command_id = mesh.clients[issuer].execute(Command::builder().action(second).build()).await.expect("second admission");
-        assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted { .. }));
-        assert_eq!(backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items.len(), 2);
-        assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared execution").items.len(), 1);
+    assert_eq!(frozen.baseline_image, None);
+    let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("joined builds").items;
+    assert_eq!(builds.len(), 1, "admission joins the first stage before accepting the convoy");
+    assert_eq!(builds[0].spec.host_ref, host_id);
+    let second = CommandAction::ConvoyStart {
+        intent: Box::new(
+            ConvoyStartIntent::builder()
+                .project_ref("flotilla".into())
+                .name("layered-work-second".into())
+                .branch("test/layered-work-second".into())
+                .needs(vec![need.into()])
+                .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                .build(),
+        ),
+    };
+    let command_id = mesh.clients[issuer].execute(Command::builder().action(second).build()).await.expect("second admission");
+    assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted { .. }));
+    assert_eq!(backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items.len(), 2);
+    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared execution").items.len(), 1);
 
-        // ConvoyCreate uses the same demand join as ConvoyStart, including when
-        // a matching first-stage execution already exists.
-        let mut create_events = mesh.hosts[0].subscribe();
-        let create = CommandAction::ConvoyCreate {
-            name: "created-layered-work".into(),
-            workflow_ref: "remote-workflow".into(),
-            inputs: Vec::new(),
-            repository_url: None,
-            r#ref: Some("test/created-layered-work".into()),
-            project_ref: Some("flotilla".into()),
-            placement_policy: Some("layered-docker".into()),
-            adopted_checkout: None,
-        };
-        let command_id = mesh.clients[0].execute(Command::builder().action(create).build()).await.expect("create admission");
-        let result = await_command_result(&mut create_events, command_id).await;
-        assert!(matches!(result, CommandValue::ConvoyCreated { .. }), "{result:?}");
-        let created = backend
-            .using::<Convoy>("flotilla")
-            .list()
-            .await
-            .expect("created convoy")
-            .items
-            .into_iter()
-            .find(|convoy| convoy.spec.role == "created-layered-work")
-            .expect("created role");
-        let policy = backend
-            .using::<PlacementPolicy>("flotilla")
-            .get(&created.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION])
-            .await
-            .expect("create snapshot");
-        let DockerImageSource::Composition { composition } = policy.spec.docker_per_vessel.expect("docker").image else {
-            panic!("create must freeze composition");
-        };
-        assert!(!composition.build_refs.is_empty(), "create must join a build before storing the snapshot");
-        assert!(composition.baseline_image.is_none());
-        assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create execution").items.len(), 1);
+    // ConvoyCreate uses the same demand join as ConvoyStart, including when
+    // a matching first-stage execution already exists.
+    let mut create_events = mesh.hosts[0].subscribe();
+    let create = CommandAction::ConvoyCreate {
+        name: "created-layered-work".into(),
+        workflow_ref: "remote-workflow".into(),
+        inputs: Vec::new(),
+        repository_url: None,
+        r#ref: Some("test/created-layered-work".into()),
+        project_ref: Some("flotilla".into()),
+        placement_policy: Some("layered-docker".into()),
+        adopted_checkout: None,
+    };
+    let command_id = mesh.clients[0].execute(Command::builder().action(create).build()).await.expect("create admission");
+    let result = await_command_result(&mut create_events, command_id).await;
+    assert!(matches!(result, CommandValue::ConvoyCreated { .. }), "{result:?}");
+    let created = backend
+        .using::<Convoy>("flotilla")
+        .list()
+        .await
+        .expect("created convoy")
+        .items
+        .into_iter()
+        .find(|convoy| convoy.spec.role == "created-layered-work")
+        .expect("created role");
+    let policy = backend
+        .using::<PlacementPolicy>("flotilla")
+        .get(&created.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION])
+        .await
+        .expect("create snapshot");
+    let DockerImageSource::Composition { composition } = policy.spec.docker_per_vessel.expect("docker").image else {
+        panic!("create must freeze composition");
+    };
+    assert!(!composition.build_refs.is_empty(), "create must join a build before storing the snapshot");
+    assert!(composition.baseline_image.is_none());
+    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create execution").items.len(), 1);
 
-        assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
-    }
+    assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
     assert!(mesh.hosts[1].resource_backend().using::<Convoy>("flotilla").list().await.expect("issuer authored convoys").items.is_empty());
 }
 

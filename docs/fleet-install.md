@@ -279,3 +279,14 @@ The new field-value tables and lookup indexes are additive named migrations.
 Superseded built-in indexes may be retired after the rollback retention window;
 that housekeeping is separate from rollback itself. Native open also removes
 function-dependent objects from pre-release #3057 schemas automatically.
+
+### Crew-image cut-over rollback boundary
+
+The candidate validator accepts the retired `crew-image-baseline.yaml` payload
+through the compatibility roll so previous generation **bundles** remain valid.
+This does not guarantee that the previous binary can decode resources written
+by the candidate. Its `ImageComposition` decoder denies unknown fields and
+rejects new `literal_base` snapshots. ADR 0047 guarantees N→N+1 decoding only.
+After new stored writes, rollback needs a decoder-compatible build or explicit
+stored-data recovery. The pre-activation canary uses a private temporary store
+and does not cross that boundary in the live fleet store.

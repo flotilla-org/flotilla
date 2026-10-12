@@ -14,6 +14,12 @@ from compose import ROOT, dockerfile, manifests
 
 
 class Composition(unittest.TestCase):
+    def test_retired_image_publication_inputs_are_absent(self):
+        # #2731: composition admission replaces the curated baseline and CI
+        # publisher. Check retirement when this suite is invoked directly too.
+        self.assertFalse((ROOT / '.forgejo/workflows/crew-image.yml').exists())
+        self.assertFalse((ROOT / '.flotilla/crew-image-baseline.yaml').exists())
+
     def test_compatibility_file_is_generated_from_spine(self):
         # The compatibility build and independent fleet stages use one source.
         self.assertEqual((ROOT / '.flotilla/Dockerfile.crew').read_text(), dockerfile())

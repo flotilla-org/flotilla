@@ -2890,6 +2890,9 @@ impl AdmissionReadContext<'_> {
                     docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
                 }
                 docker.image = freeze_admission_image(&self.backend, namespace, &docker.image, &needs).await?;
+                // Layered admissions now require built identity, so they must
+                // not retain the legacy tag exception. Only no-layer literals
+                // keep that provenance for the compatibility generation.
                 if matches!(&docker.image, flotilla_resources::DockerImageSource::Composition { composition } if composition.literal_base.is_none())
                 {
                     docker.legacy_image_baseline_ref = None;

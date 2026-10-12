@@ -148,6 +148,13 @@ run.
 
 1. Validate the candidate against every host store and registered operational
    entry under ADR 0047. Preserve frozen convoy snapshots and old images.
+   The previous `ImageComposition` decoder uses `deny_unknown_fields`: after
+   this generation writes `literal_base`, direct rollback to that binary cannot
+   decode those new snapshots. ADR 0047 guarantees forward decoding only.
+   A rollback after new writes needs a decoder-compatible rollback build or
+   explicit stored-data recovery; do not simply switch back to the old binary.
+   Candidate payload compatibility is separate from stored-resource decoding;
+   the pre-activation canary writes only to its private temporary store.
 2. In fleet-ops, generate and commit `ImageLayer` Definitions using the full
    input revision and resolved base digest (command below). Configure same-arch
    builders and optional host-action registry grants. No CI PAT is needed.
@@ -170,8 +177,11 @@ run.
 7. In fleet-ops/lab operations remove the `crew-image-builder` runner and its
    multi-node arm64 buildx worker, delete the `IMAGE_BUILDER_TOKEN` Actions
    secret, revoke the CI `image-builder` PAT, and remove its persisted Docker
-   login. Preserve unrelated pull identities and registry credentials granted
-   to daemon host actions. These external changes are part of the same roll.
+   login, after the daemon roll and new-admission verification. Preserve pull
+   identities and host-action registry grants that can read running convoys'
+   frozen images. Revoking the CI writer must not delete old tags or images;
+   retain them through convoy completion/relaunch. These external changes are
+   part of the same roll.
 8. After that roll and pre-roll validation of the next cohort, remove the
    compatibility baseline decoder/registry entry in generation 3. Regenerate
    the golden corpus only through the normal post-roll capture process.
