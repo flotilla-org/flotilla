@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_manifest::{
     keys::{
         KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
@@ -58,7 +59,6 @@ use crate::{
         DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
         DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
     },
-    providers::change_request::observation::ChangeRequestRef,
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
 
@@ -2218,7 +2218,7 @@ mod tests {
     use crate::change_request_observer::ChangeRequestRefresher;
     use crate::event_sink::EventSink;
     use crate::event_sink::RecordingEventSink;
-    use crate::providers::change_request::observation::GhChangeRequestObservationSource;
+    use flotilla_change_request::observation::GhChangeRequestObservationSource;
 
     // #2498: every distinct stalled actor is visible across namespaces and replica stores.
     // Generate empty through multi-convoy fleets, duplicate leaves, all rungs, shared and distinct

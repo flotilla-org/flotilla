@@ -1,6 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_ai_utility::AiUtility;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_cloud_agent::CloudAgentService;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_discovery_api::EnvironmentBag;
@@ -22,7 +23,6 @@ use super::{
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
-use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::*;
@@ -833,7 +833,7 @@ fn link_request_response(body: &str) -> String {
 fn install_link_provider(registry: &mut ProviderRegistry, runner: MockRunner) {
     use flotilla_forge_github::github::GhApiClient;
 
-    use crate::providers::change_request::github::GitHubChangeRequest;
+    use flotilla_change_request::github::GitHubChangeRequest;
     let runner: Arc<dyn CommandRunner> = Arc::new(runner);
     let provider = GitHubChangeRequest::new("github".into(), "owner/repo".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
     registry.change_requests.insert("github", desc("github"), Arc::new(provider));

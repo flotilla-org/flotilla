@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use flotilla_change_request::observation::ChangeRequestObservationSource;
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::HostName;
@@ -13,8 +15,6 @@ use flotilla_store::ResourceBackend;
 use super::support::test_meta;
 use crate::config::ConfigStore;
 use crate::in_process::InProcessDaemon;
-use crate::providers::change_request::observation::ChangeRequestObservationSource;
-use crate::providers::change_request::observation::ChangeRequestRef;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;

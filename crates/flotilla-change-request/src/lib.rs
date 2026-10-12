@@ -1,13 +1,17 @@
+//! Change-request trackers, forge observation sources and their discovery factories.
+pub mod branch_lookup_observer;
+pub mod factories;
 pub mod forgejo;
 pub mod github;
+pub mod observation;
 
 use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_protocol::ChangeRequest;
+use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState};
-
-use crate::providers::types::ChangeRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRequestAdmission {
@@ -127,30 +131,27 @@ pub trait ChangeRequestTracker: Send + Sync {
     async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String>;
 }
 
-pub mod observation;
-use flotilla_provider_runtime::ObservationError;
+#[cfg(test)]
+mod testing;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkits::discovery::FakeChangeRequest;
+    use crate::testing::ListedChangeRequests;
 
     #[tokio::test]
     async fn default_bound_observation_preserves_healthy_requests_after_a_missing_one() {
-        let provider = FakeChangeRequest::new();
-        provider
-            .add_change_requests(vec![(
-                "2".to_string(),
-                ChangeRequest {
-                    title: "Healthy PR".to_string(),
-                    branch: "healthy".to_string(),
-                    status: flotilla_protocol::ChangeRequestStatus::Open,
-                    body: None,
-                    provider_name: "fake".to_string(),
-                    provider_display_name: "Fake".to_string(),
-                },
-            )])
-            .await;
+        let provider = ListedChangeRequests(vec![(
+            "2".to_string(),
+            ChangeRequest {
+                title: "Healthy PR".to_string(),
+                branch: "healthy".to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "fake".to_string(),
+                provider_display_name: "Fake".to_string(),
+            },
+        )]);
         let observed = provider.observe_bound(&[1, 2], &Default::default()).await.expect("independent reads");
         assert!(observed.get(&1).expect("missing PR result").as_ref().is_err());
         assert_eq!(

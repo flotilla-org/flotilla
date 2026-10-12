@@ -1,6 +1,7 @@
-use super::*;
-use crate::providers::change_request::observation;
+use flotilla_change_request::observation;
 use flotilla_store_memory::InMemoryBackend;
+
+use super::*;
 
 #[tokio::test]
 async fn usage_leaf_fires_from_the_named_window_in_the_replicated_resource_path() {
@@ -233,7 +234,8 @@ async fn authority_reconciler_wakes_from_replicated_checkout_and_change_request(
 async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let (event_tx, _) = broadcast::channel(16);
-    let fixture = fixture_path("change_request", "cr_observation_merge.yaml");
+    // The recording drives the extracted GitHub observation source through the leaf engine.
+    let fixture = format!("{}/src/leaf_engine/fixtures/cr_observation_merge.yaml", env!("CARGO_MANIFEST_DIR"));
     let session = Session::replaying(fixture, Masks::new());
     let source = Arc::new(observation::GhChangeRequestObservationSource::new(test_runner(&session)));
     let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {

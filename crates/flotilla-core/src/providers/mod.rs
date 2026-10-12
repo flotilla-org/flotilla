@@ -1,4 +1,3 @@
-pub mod change_request;
 pub mod discovery;
 pub mod issue_tracker;
 pub mod registry;

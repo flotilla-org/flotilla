@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration as St
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use flotilla_change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest};
 use flotilla_forge_github::github::{classified_rate_error, rate_limit_reset};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -20,11 +21,7 @@ use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
-use crate::providers::{
-    change_request::{BoundObservations, ChangeRequestAdmission, ChangeRequestTracker, CrewGithubLoginsByRequest},
-    issue_tracker::IssueProvider,
-    types::ChangeRequest,
-};
+use crate::providers::{issue_tracker::IssueProvider, types::ChangeRequest};
 
 pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 

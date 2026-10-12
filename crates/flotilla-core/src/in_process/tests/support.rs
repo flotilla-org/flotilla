@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_discovery_api::provider_config;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::Factory;
@@ -31,7 +32,6 @@ use crate::in_process::dispatch_board::tests::board;
 use crate::in_process::input_meta_from_resource;
 use crate::in_process::InProcessDaemon;
 use crate::in_process::WorkCredentialReconciler;
-use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::issue_tracker::IssueProvider;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;

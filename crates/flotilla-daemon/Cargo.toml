@@ -60,6 +60,7 @@ http = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+flotilla-change-request = { path = "../flotilla-change-request" }
 flotilla-build-features-http-server = { path = "../flotilla-build-features-http-server" }
 flotilla-daemon-testkit = { path = "../flotilla-daemon-testkit" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }

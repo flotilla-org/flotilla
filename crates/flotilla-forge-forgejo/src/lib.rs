@@ -1,4 +1,6 @@
 //! Shared Forgejo connection and credential values.
+pub mod discovery;
+
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_provider_runtime::{http_execute, HttpClient};

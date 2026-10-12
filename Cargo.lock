@@ -1383,6 +1383,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-change-request"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bon",
+ "bytes",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-http",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-discovery-api",
+ "flotilla-forge-forgejo",
+ "flotilla-forge-github",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-relay-protocol",
+ "flotilla-replay-testkit",
+ "flotilla-resources",
+ "hegeltest",
+ "http",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "flotilla-client"
 version = "0.1.0"
 dependencies = [
@@ -1482,6 +1517,7 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-change-request",
  "flotilla-cloud-agent",
  "flotilla-core",
  "flotilla-daemon-api",
@@ -1541,6 +1577,7 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-change-request",
  "flotilla-cloud-agent",
  "flotilla-daemon-api",
  "flotilla-discovery-api",
@@ -1675,6 +1712,7 @@ dependencies = [
  "flotilla-build-features-time",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-change-request",
  "flotilla-client",
  "flotilla-controllers",
  "flotilla-core",
@@ -1783,6 +1821,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "flotilla-change-request",
  "flotilla-core",
  "flotilla-discovery-api",
  "flotilla-environment",
@@ -1837,6 +1876,7 @@ dependencies = [
 name = "flotilla-forge-forgejo"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "flotilla-build-features",
  "flotilla-build-features-async",
  "flotilla-build-features-base",
@@ -1844,11 +1884,16 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-discovery-api",
+ "flotilla-paths",
  "flotilla-provider-runtime",
+ "flotilla-resources",
  "flotilla-tls",
  "reqwest 0.13.2",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tracing",
  "urlencoding",
 ]
 
@@ -1867,9 +1912,11 @@ dependencies = [
  "flotilla-build-features-os",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-discovery-api",
  "flotilla-protocol",
  "flotilla-provider-runtime",
  "flotilla-replay-testkit",
+ "flotilla-resources",
  "hegeltest",
  "serde",
  "serde_json",

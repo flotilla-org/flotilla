@@ -1,6 +1,5 @@
 //! Crew outcomes, lifecycle teardown, and serialized crew message delivery.
 
-use crate::providers::change_request::observation;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
@@ -11,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_change_request::observation::{self, ChangeRequestRef};
 use flotilla_protocol::{
     CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
@@ -50,7 +50,6 @@ use crate::{
     config::ConfigStore,
     fleet::crew_attention,
     leaf_engine::{EscalationAdmission, LeafSubscriptionTable, TurnDeliveryActuator},
-    providers::change_request::observation::ChangeRequestRef,
     resource_explain::explain_unmet_expectation,
 };
 

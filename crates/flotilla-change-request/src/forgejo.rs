@@ -3,6 +3,8 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_forge_forgejo::{ForgejoClient, ForgejoIssueProviderConfig};
+use flotilla_protocol::ChangeRequest;
+use flotilla_protocol::ChangeRequestStatus;
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
@@ -14,8 +16,6 @@ use flotilla_resources::{
 
 use super::ChangeRequestAdmission;
 use super::ChangeRequestTracker;
-use crate::providers::types::ChangeRequest;
-use crate::providers::types::ChangeRequestStatus;
 
 pub struct ForgejoChangeRequestProvider {
     runner: Arc<dyn CommandRunner>,
@@ -335,11 +335,13 @@ mod tests {
     use flotilla_provider_runtime::ChannelLabel;
 
     use super::*;
-    use crate::testkits::replay;
-    use crate::testkits::replay::testing::fixture_path;
-    use crate::testkits::replay::testing::MockRunner;
-    use crate::testkits::replay::Masks;
     use flotilla_forge_forgejo::ForgejoAuth;
+    use flotilla_replay_testkit as replay;
+    use flotilla_replay_testkit::testing::MockRunner;
+    use flotilla_replay_testkit::Masks;
+
+    use crate::branch_lookup_observer::BranchLookupObserver;
+    use crate::testing::fixture_path;
 
     // Boundary double: Forgejo HTTP requests, including the body update.
     struct LinkHttp {
@@ -630,7 +632,7 @@ mod tests {
         let auth = auth();
         let mut masks = Masks::new();
         masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = fixture_path("change_request", "forgejo_pulls.yaml");
+        let fixture = fixture_path("forgejo_pulls.yaml");
         let session = replay::test_session(&fixture, masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),
@@ -648,7 +650,7 @@ mod tests {
         let auth = auth();
         let mut masks = Masks::new();
         masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = fixture_path("change_request", "forgejo_ghostty_governor.yaml");
+        let fixture = fixture_path("forgejo_ghostty_governor.yaml");
         let session = replay::test_session(&fixture, masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),
@@ -677,7 +679,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        let observer = BranchLookupObserver::default();
         for _ in 0..4 {
             assert!(observer.find("team/repo", &provider, "feature/wanted").await.expect("proven absence").is_none());
             assert_eq!(http.urls.lock().expect("urls").len(), 3, "repeat scans reuse the complete scan");
@@ -713,7 +715,7 @@ mod tests {
                 urls: Mutex::new(Vec::new()),
             });
             let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-            let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+            let observer = BranchLookupObserver::default();
             let mut seen = std::collections::HashSet::new();
             for (repository, branch) in keys {
                 let repo = ["team/repo", "team/other"][repository];
@@ -734,7 +736,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        let observer = BranchLookupObserver::default();
         for index in 0..1024 {
             assert!(observer.find("team/repo", &provider, &format!("branch-{index}")).await.expect("absence").is_none());
             tokio::time::advance(tokio::time::Duration::from_millis(1)).await;
@@ -763,7 +765,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let first: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
-        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        let observer = BranchLookupObserver::default();
         assert!(observer
             .find("team/repo", &first, "wanted")
             .await
@@ -789,7 +791,7 @@ mod tests {
         let auth = auth();
         let mut masks = Masks::new();
         masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = fixture_path("change_request", "forgejo_head_filter_capability.yaml");
+        let fixture = fixture_path("forgejo_head_filter_capability.yaml");
         let session = replay::test_session(&fixture, masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),
@@ -817,7 +819,7 @@ mod tests {
             provider.find_change_request_by_branch("refs/pull/1/head").await.expect("unfiltered lookup").expect("deleted head PR");
         assert_eq!(request.branch, "refs/pull/1/head");
         let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider);
-        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        let observer = BranchLookupObserver::default();
         for _ in 0..3 {
             assert!(observer.find("robert/ghostty-ops", &provider, "flotilla-2585-definitely-absent").await.expect("absence").is_none());
         }

@@ -1,7 +1,5 @@
-use flotilla_core::{
-    change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher},
-    providers::change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef},
-};
+use flotilla_change_request::observation::{ChangeRequestObservationSource, ChangeRequestRef};
+use flotilla_core::change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher};
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{
     change_request_record_name,

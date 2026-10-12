@@ -5,6 +5,7 @@ use std::{
     sync::Weak,
 };
 
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::LeafAddress;
 use flotilla_resources::{Artifact, ChangeRequest, Convoy, Issue, ReadWatchEvent, Resource, ResourceError, Usage, Vessel};
 use flotilla_store::ResourceBackend;
@@ -16,7 +17,7 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::subscriptions::LeafWatchRecovery;
 use super::{LeafSubscriptionRow, LeafSubscriptionTable, LeafSubscriptionTableInner, LeafWatcher};
-use crate::{issue_observer::IssueRef, providers::change_request::observation::ChangeRequestRef};
+use crate::issue_observer::IssueRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ObjectKind {

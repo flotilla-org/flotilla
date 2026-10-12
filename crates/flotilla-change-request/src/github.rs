@@ -9,15 +9,15 @@ use flotilla_forge_github::github_observation::ObservationTelemetry;
 use flotilla_forge_github::github_observation::ParsedObservationResponse;
 use flotilla_forge_github::github_observation::QueryShape;
 use flotilla_forge_github::github_poll::PollCache;
+use flotilla_protocol::{ChangeRequest, ChangeRequestStatus};
 use flotilla_provider_runtime::gh_api_channel_label;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::ObservationError;
 
-use crate::providers::change_request::observation::parse_gh_observation_value_with_crew_identity;
-use crate::providers::change_request::observation::DEFAULT_REVIEW_BOT_LOGIN;
-use crate::providers::types::*;
+use crate::observation::parse_gh_observation_value_with_crew_identity;
+use crate::observation::DEFAULT_REVIEW_BOT_LOGIN;
 
 fn execution_root() -> &'static Path {
     Path::new("/")
@@ -556,10 +556,11 @@ mod tests {
     use flotilla_provider_runtime::CommandOutput;
 
     use super::*;
-    use crate::providers::change_request::ChangeRequestTracker;
-    use crate::testkits::replay;
-    use crate::testkits::replay::testing::fixture_path;
-    use crate::testkits::replay::testing::MockRunner;
+    use flotilla_replay_testkit as replay;
+    use flotilla_replay_testkit::testing::MockRunner;
+
+    use crate::testing::fixture_path;
+    use crate::ChangeRequestTracker;
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };
@@ -625,7 +626,7 @@ mod tests {
     // the exact filtered endpoint exercised in production.
     #[tokio::test]
     async fn replayed_real_github_head_lookup_found_and_absent() {
-        let fixture = fixture_path("change_request", "github_head_lookup.yaml");
+        let fixture = fixture_path("github_head_lookup.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let runner = replay::test_runner(&session);
         let api = replay::test_gh_api(&session);
@@ -1100,7 +1101,7 @@ mod tests {
 
     #[tokio::test]
     async fn replayed_real_batched_github_observation() {
-        let fixture = fixture_path("change_request", "github_observer_busy.yaml");
+        let fixture = fixture_path("github_observer_busy.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let runner = replay::test_runner(&session);
         let provider =

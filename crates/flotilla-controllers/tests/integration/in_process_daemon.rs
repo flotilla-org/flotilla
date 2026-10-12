@@ -14,13 +14,13 @@ use std::{
 use async_trait::async_trait;
 use flotilla_ai_utility::AiUtility;
 use flotilla_ai_utility::ConvoyNames;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_cloud_agent::CloudAgentService;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::model::RepoModel;
-use flotilla_core::providers::change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::DiscoveryRuntime;
 use flotilla_core::providers::types::ChangeRequest;
 use flotilla_core::providers::types::CloudAgentSession;

@@ -54,6 +54,10 @@ use convoy_admission::{
     ConvoyAddressIdentity, ConvoyAdmission, ConvoyStartTask, StaticFulfilmentDecider,
 };
 pub use convoy_admission::{PreparedConvoyAdmission, RoleAddress};
+use flotilla_change_request::observation::ChangeRequestObservationSource;
+use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_change_request::BoundObservations;
+use flotilla_change_request::ChangeRequestTracker;
 #[cfg(test)]
 use flotilla_protocol::CheckoutArchiveStatus;
 use flotilla_protocol::{
@@ -135,10 +139,6 @@ use crate::model::RepoModel;
 use crate::ops_entry::ENSURED_FROM_ANNOTATION;
 use crate::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
 use crate::ops_entry::SOURCE_COMMIT_ANNOTATION;
-use crate::providers::change_request::observation::ChangeRequestObservationSource;
-use crate::providers::change_request::observation::ChangeRequestRef;
-use crate::providers::change_request::BoundObservations;
-use crate::providers::change_request::ChangeRequestTracker;
 use crate::providers::discovery::discover_checkout_with_host_scoped;
 use crate::providers::discovery::run_host_detectors;
 use crate::providers::discovery::status::provider_names_from_registry;

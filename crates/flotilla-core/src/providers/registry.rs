@@ -1,4 +1,5 @@
 use flotilla_ai_utility::AiUtility;
+use flotilla_change_request::ChangeRequestTracker;
 use flotilla_cloud_agent::CloudAgentService;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_environment::environment::{EnvironmentKind, EnvironmentProvider};
@@ -11,10 +12,7 @@ use indexmap::IndexMap;
 
 use crate::{
     agent_adapter::AgentAdapterRegistry,
-    providers::{
-        change_request::ChangeRequestTracker,
-        issue_tracker::{provider_for_source, IssueProvider},
-    },
+    providers::issue_tracker::{provider_for_source, IssueProvider},
 };
 use flotilla_vcs::providers::CloneProvisioner;
 

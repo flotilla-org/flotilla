@@ -8,6 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_change_request::observation::ChangeRequestRef;
 use flotilla_protocol::Leaf;
 use flotilla_provider_runtime::ObservationError;
 use flotilla_resources::{Convoy, HoldAct, LeafMaker, TerminalAttentionSource, TerminalAttentionState, TurnDeliveryRule, TurnDeliveryRung};
@@ -21,7 +22,6 @@ use crate::{
     change_request_observer::ChangeRequestRefresher,
     event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
-    providers::change_request::observation::ChangeRequestRef,
 };
 use turn_delivery::UnavailableTurnDeliveryActuator;
 use wake::ReconcilerWake;
