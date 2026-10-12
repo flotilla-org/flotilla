@@ -208,6 +208,20 @@ impl super::LeafSubscriptionTable {
                     crew_role_address(target_project, &target_convoy, &vessel, &role)
                 }
             };
+            // A declared crew state is not a receiver binding. Turn admission
+            // can queue an unbound role, so check the binding before calling it.
+            if !receiver.starts_with("principal:") {
+                match flotilla_store::resolve_message_receiver(backend, namespace, &receiver).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Ok((
+                            CommandValue::CrewEscalationRefused { rung, reason: format!("receiver `{receiver}` is not bound") },
+                            None,
+                        ))
+                    }
+                    Err(reason) => return Ok((CommandValue::CrewEscalationRefused { rung, reason: reason.to_string() }, None)),
+                }
+            }
             let intent = super::CrewTurnIntent::builder()
                 .receiver(receiver.clone())
                 .namespace(namespace.to_string())

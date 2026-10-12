@@ -759,6 +759,7 @@ fn escalation_admission_and_ownership(tc: hegel::TestCase) {
     let operator = tc.draw(gs::booleans());
     let conflict = tc.draw(gs::booleans());
     let collocated = tc.draw(gs::booleans());
+    let missing_terminal = tc.draw(gs::booleans());
     let repeats = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     // Boundary fake: receiver-home publication may be unreachable. Successful
     // admissions go through the real durable inbox, not an accepting mock.
@@ -828,12 +829,13 @@ fn escalation_admission_and_ownership(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         // Pin every admission outcome, in addition to generated legacy cursors
         // and repeat counts, so the small development profile cannot miss one.
-        for (bound, reachable, cursor, operator, conflict, collocated) in [
-            (false, true, false, false, false, false), (true, false, true, false, false, false), (true, true, false, false, false, false),
-            (true, true, true, true, false, false), (false, true, true, true, false, false), (true, false, false, true, false, false),
-            (true, true, true, false, true, false),
-            (true, true, true, false, false, true),
-            (bound, reachable, cursor, operator, conflict, collocated && !operator && !conflict),
+        for (bound, reachable, cursor, operator, conflict, collocated, missing_terminal) in [
+            (false, true, false, false, false, false, false), (true, false, true, false, false, false, false), (true, true, false, false, false, false, false),
+            (true, true, true, true, false, false, false), (false, true, true, true, false, false, false), (true, false, false, true, false, false, false),
+            (true, true, true, false, true, false, false),
+            (true, true, true, false, false, true, false),
+            (true, true, true, false, false, true, true),
+            (bound, reachable, cursor, operator, conflict, collocated && !operator && !conflict, missing_terminal),
         ] {
         let receiver = if operator { "principal:operator" } else if collocated { "flotilla/crew/work/deputy" } else { "flotilla/next/watch/governor" };
         let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
@@ -887,6 +889,17 @@ fn escalation_admission_and_ownership(tc: hegel::TestCase) {
                 ..Default::default()
             }).await.expect("receiver working");
         }
+        if collocated && bound && !missing_terminal {
+            let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+            let mut spec = sessions.get("session").await.expect("source session").spec;
+            spec.role = "deputy".into();
+            let terminal = sessions.create(&InputMeta::builder().name("deputy-session".into()).labels(BTreeMap::from([
+                (CONVOY_LABEL.into(), "crew".into()), (VESSEL_LABEL.into(), "work".into()), (ROLE_LABEL.into(), "deputy".into()),
+            ])).build(), &spec).await.expect("local receiver binding");
+            sessions.update_status("deputy-session", &terminal.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running, ..Default::default()
+            }).await.expect("local receiver");
+        }
         let sessions = backend.using::<ResourceTerminalSession>("flotilla");
         let mut spec = sessions.get("session").await.expect("source session").spec;
         spec.role = "bosun".into();
@@ -913,7 +926,7 @@ fn escalation_admission_and_ownership(tc: hegel::TestCase) {
             continue;
         }
         let result = result.expect("typed outcome");
-        if bound && reachable {
+        if bound && reachable && (!collocated || !missing_terminal) {
             assert!(matches!(result, flotilla_protocol::CommandValue::CrewEscalated { receiver: ref actual } if actual == receiver));
             let stall = after.as_ref().expect("stall");
             if operator {
