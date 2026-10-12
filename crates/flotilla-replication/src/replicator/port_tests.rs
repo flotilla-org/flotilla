@@ -236,3 +236,28 @@ async fn routed_watch_lag_is_a_sequence_gap() {
         .expect_err("lag cannot continue the log");
     assert!(error.contains("sequence gap"), "{error}");
 }
+
+// The direct watch's speculative version must never survive an apply error.
+// Keep its source open so swallowing that error would stall instead of return.
+#[tokio::test(start_paused = true)]
+async fn direct_watch_terminates_on_apply_error() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    let object = author(&backend, "first").await;
+    let peer = NodeId::new("peer");
+    let writer = backend.replica_writer::<Convoy>(peer.clone(), REPLICATION_NAMESPACE);
+    writer
+        .replace(&flotilla_resources::ResourceList { items: vec![], resource_version: "0".into(), generation: None }, Utc::now())
+        .await
+        .unwrap();
+    // The event is contiguous with the watch's cut, but the durable prefix has
+    // been invalidated. Sequence validation succeeds and application refuses.
+    writer.invalidate_cursor().await.unwrap();
+    let events = futures::stream::iter([Ok(WatchEvent::Added(object))]).chain(futures::stream::pending()).boxed();
+    let watch = flotilla_resources::WatchStream::new(None, events);
+    let remote = backend.using::<Convoy>(REPLICATION_NAMESPACE);
+    let result = tokio::time::timeout(Duration::from_secs(2), apply_direct_watch(watch, &writer, "0".into(), &remote, &peer))
+        .await
+        .expect("apply error must terminate the open watch");
+    assert!(matches!(result, Err(OriginWatchFailure::SnapshotRequired(message)) if message.contains("replica prefix missing")));
+    assert!(writer.cursor().await.unwrap().is_none());
+}
