@@ -271,6 +271,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Normal runs take about 10 minutes. A hung test (#3097) otherwise holds a
+    # runner for GitHub's six-hour default.
+    timeout-minutes: 40
     needs: [fmt, stack-scope]
     if: ${{ !cancelled() && needs.fmt.result == 'success' && needs.stack-scope.outputs.full != 'false' }}
     steps:
