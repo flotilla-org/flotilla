@@ -40,6 +40,34 @@ pub fn decode_watch_tombstone(value: &Value) -> Result<ResourceTombstone, Resour
 
 pub const WATCH_RING_CAPACITY: usize = 256;
 
+struct WatchTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for WatchTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Complete ready lookups inline, preserving informer flush semantics. If a
+/// lookup waits, drive it independently: an unpolled watch must not retain a
+/// mutex reservation needed by its select! handler. Each adapter has at most
+/// one pending lookup; dropping it cancels the task and releases its resources.
+/// The inline poll preserves the caller's panic/unwind behavior. Once a lookup
+/// is pending and task-owned, its panic or cancellation becomes a watch error;
+/// the JoinError text distinguishes those causes.
+/// Pending lookups require an ambient Tokio runtime to drive their owned task.
+pub(crate) async fn complete_watch_lookup<T: Send + 'static>(
+    lookup: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, ResourceError> {
+    use futures::FutureExt;
+    let mut lookup = Box::pin(lookup);
+    if let Some(result) = lookup.as_mut().now_or_never() {
+        return Ok(result);
+    }
+    let mut task = WatchTask(tokio::spawn(lookup));
+    (&mut task.0).await.map_err(|error| ResourceError::other(format!("watch lookup task failed: {error}")))
+}
+
 // One bounded ring per resource stream, shared by all subscribers. A slow
 // subscriber cannot retain a private, ever-growing queue of full objects.
 #[derive(Debug)]
@@ -91,6 +119,96 @@ mod tests {
     use std::sync::Arc;
 
     use super::WatchStart;
+
+    // Ready lookups must complete in their caller's poll, so an informer flush
+    // can drain already available events before acknowledging a coherent read.
+    #[tokio::test]
+    async fn ready_watch_lookup_completes_inline() {
+        use futures::FutureExt;
+        let result = super::complete_watch_lookup(std::future::ready(7)).now_or_never();
+        assert_eq!(result.expect("ready lookup completes inline").expect("lookup"), 7);
+    }
+
+    // Ready and pending lookups preserve event/error order and EOF without
+    // prefetching. Generate empty through repeated events and both lookup paths.
+    #[hegel::test]
+    fn watch_lookups_preserve_events_without_prefetch(tc: hegel::TestCase) {
+        use futures::{stream, StreamExt};
+        use hegel::generators as gs;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let errors: Vec<_> = (0..count).map(|_| tc.draw(gs::booleans())).collect();
+        let pending: Vec<_> = (0..count).map(|_| tc.draw(gs::booleans())).collect();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let polled = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&polled);
+            let expected: Vec<_> = errors
+                .iter()
+                .enumerate()
+                .map(|(index, error)| if *error { Err(crate::ResourceError::other(format!("event {index}"))) } else { Ok(index) })
+                .collect();
+            let mut watch = stream::iter(expected.clone().into_iter().zip(pending))
+                .inspect(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+                .then(|(event, pending)| async move {
+                    super::complete_watch_lookup(async move {
+                        if pending {
+                            tokio::task::yield_now().await;
+                        }
+                        event
+                    })
+                    .await?
+                })
+                .boxed();
+            tokio::task::yield_now().await;
+            assert_eq!(polled.load(Ordering::SeqCst), 0, "no lookup before consumption");
+            for (index, expected) in expected.into_iter().enumerate() {
+                let actual = watch.next().await.expect("event");
+                assert_eq!(actual.map_err(|error| error.to_string()), expected.map_err(|error| error.to_string()));
+                tokio::task::yield_now().await;
+                assert_eq!(polled.load(Ordering::SeqCst), index + 1, "only the current lookup may run");
+            }
+            assert!(watch.next().await.is_none());
+        });
+    }
+
+    // Dropping a watch cancels an indefinitely pending production lookup and
+    // releases its source; no abandoned task or mutex reservation may survive.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_watch_cancels_pending_lookup() {
+        use futures::{stream, FutureExt, StreamExt};
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                let _ = self.0.take().expect("signal").send(());
+            }
+        }
+        let (sender, dropped) = tokio::sync::oneshot::channel();
+        let signal = DropSignal(Some(sender));
+        let mut watch = stream::once(super::complete_watch_lookup(async move {
+            let _signal = signal;
+            futures::future::pending::<()>().await
+        }))
+        .boxed();
+        assert!(watch.next().now_or_never().is_none());
+        tokio::task::yield_now().await;
+        drop(watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped).await.expect("lookup cancelled").expect("source dropped");
+    }
+
+    // A failed pending lookup task must surface an error to the watch consumer.
+    #[tokio::test]
+    async fn watch_lookup_reports_task_panic() {
+        let error = super::complete_watch_lookup(async {
+            tokio::task::yield_now().await;
+            panic!("lookup failed");
+        })
+        .await
+        .expect_err("lookup panicked");
+        assert!(error.to_string().contains("watch lookup task failed"));
+    }
 
     #[test]
     fn watch_start_roundtrips_through_serde() {

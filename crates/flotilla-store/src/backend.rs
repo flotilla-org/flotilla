@@ -310,30 +310,34 @@ impl<T: Resource> ReplicaReadResolver<T> {
                     let namespace = namespace.clone();
                     let local_root = local_root.clone();
                     async move {
-                        let event = match event {
-                            Ok(event) => event,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        let self_origin_name = match &event {
-                            ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => matches!(
-                                &item.provenance,
-                                ResourceProvenance::Replica { origin_root, .. } if origin_root == &local_root
-                            )
-                            .then_some(item.object.metadata.name.as_str()),
-                            ReadWatchEvent::DeletedByName { tombstone, provenance } => matches!(
-                                provenance,
-                                ResourceProvenance::Replica { origin_root, .. } if origin_root == &local_root
-                            )
-                            .then_some(tombstone.name.as_str()),
-                        };
-                        let Some(name) = self_origin_name else {
-                            return Some(Ok(event));
-                        };
-                        match backend.using::<T>(&namespace).get(name).await {
-                            Ok(_) => None,
-                            Err(ResourceError::NotFound { .. }) => Some(Ok(event)),
-                            Err(error) => Some(Err(error)),
-                        }
+                        crate::watch::complete_watch_lookup(async move {
+                            let event = match event {
+                                Ok(event) => event,
+                                Err(error) => return Some(Err(error)),
+                            };
+                            let self_origin_name = match &event {
+                                ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => matches!(
+                                    &item.provenance,
+                                    ResourceProvenance::Replica { origin_root, .. } if origin_root == &local_root
+                                )
+                                .then_some(item.object.metadata.name.as_str()),
+                                ReadWatchEvent::DeletedByName { tombstone, provenance } => matches!(
+                                    provenance,
+                                    ResourceProvenance::Replica { origin_root, .. } if origin_root == &local_root
+                                )
+                                .then_some(tombstone.name.as_str()),
+                            };
+                            let Some(name) = self_origin_name else {
+                                return Some(Ok(event));
+                            };
+                            match backend.using::<T>(&namespace).get(name).await {
+                                Ok(_) => None,
+                                Err(ResourceError::NotFound { .. }) => Some(Ok(event)),
+                                Err(error) => Some(Err(error)),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|error| Some(Err(error)))
                     }
                 })
                 .boxed());
@@ -345,32 +349,37 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 let backend = backend.clone();
                 let namespace = namespace.clone();
                 async move {
-                    let event = event?;
-                    if let ReadWatchEvent::DeletedByName { tombstone, .. } = event {
-                        return match backend.definitions::<T>(&namespace).get(&tombstone.name).await {
+                    crate::watch::complete_watch_lookup(async move {
+                        let event = event?;
+                        if let ReadWatchEvent::DeletedByName { tombstone, .. } = event {
+                            return match backend.definitions::<T>(&namespace).get(&tombstone.name).await {
+                                Ok(object) => {
+                                    Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local }))
+                                }
+                                Err(ResourceError::NotFound { .. }) => {
+                                    Ok(ReadWatchEvent::DeletedByName { tombstone, provenance: ResourceProvenance::Local })
+                                }
+                                Err(error) => Err(error),
+                            };
+                        }
+                        let fallback = match event {
+                            ReadWatchEvent::Added(object) | ReadWatchEvent::Modified(object) | ReadWatchEvent::Deleted(object) => object,
+                            ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
+                        };
+                        match backend.definitions::<T>(&namespace).get(&fallback.object.metadata.name).await {
                             Ok(object) => {
                                 Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local }))
                             }
-                            Err(ResourceError::NotFound { .. }) => {
-                                Ok(ReadWatchEvent::DeletedByName { tombstone, provenance: ResourceProvenance::Local })
-                            }
+                            // Definitions are one merged logical member, whose initial
+                            // list uses Local provenance even when entirely replicated.
+                            Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::Deleted(ReadResourceObject {
+                                object: fallback.object,
+                                provenance: ResourceProvenance::Local,
+                            })),
                             Err(error) => Err(error),
-                        };
-                    }
-                    let fallback = match event {
-                        ReadWatchEvent::Added(object) | ReadWatchEvent::Modified(object) | ReadWatchEvent::Deleted(object) => object,
-                        ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
-                    };
-                    match backend.definitions::<T>(&namespace).get(&fallback.object.metadata.name).await {
-                        Ok(object) => Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local })),
-                        // Definitions are one merged logical member, whose initial
-                        // list uses Local provenance even when entirely replicated.
-                        Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::Deleted(ReadResourceObject {
-                            object: fallback.object,
-                            provenance: ResourceProvenance::Local,
-                        })),
-                        Err(error) => Err(error),
-                    }
+                        }
+                    })
+                    .await?
                 }
             })
             .boxed())
