@@ -42,7 +42,14 @@ scripts/prune-target.sh                        # apply the per-checkout target s
 scripts/install-cargo-sweep-schedule.sh        # install/verify the daily per-host mtime sweep
 ```
 
-Install the Git check dependency in a virtual environment with `python3 -m venv /tmp/flotilla-git-check` and `/tmp/flotilla-git-check/bin/pip install -r ci/git-boundary/requirements.txt`. Run `/tmp/flotilla-git-check/bin/python ci/git-boundary/check.py` and `/tmp/flotilla-git-check/bin/python -m unittest discover -s ci/git-boundary -p test_check.py`.
+Use `uv` for the Git boundary check on desks, in crew vessels, and in CI; it installs the pinned dependency from `ci/git-boundary/requirements.txt` in a managed environment without requiring Python's `venv`/`ensurepip` packages. Run the check and its tests from the repository root:
+
+```bash
+uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py
+uv run --with-requirements ci/git-boundary/requirements.txt python -m unittest discover -s ci/git-boundary -p test_check.py
+```
+
+See [docs/development.md](docs/development.md#git-boundary-check) for prerequisites.
 
 Platform test coverage belongs in `ci/platform-tests/selectors.txt`, executed by `ci/platform-tests/run.sh`. Add a CI job only for a new runner type or OS, or for deliberate isolation; otherwise use an existing job on the same runner.
 

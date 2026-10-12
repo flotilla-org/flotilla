@@ -3,6 +3,20 @@
 For the post-r591 provider and label cleanup, see the
 [compatibility retirement acceptance checks](compatibility-retirement-acceptance.md).
 
+## Git boundary check
+
+Install `uv` and Python 3.9+ on your desk or CI runner; the crew image already
+provides both. From the repository root, use the same commands in every environment:
+
+```bash
+uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py
+uv run --with-requirements ci/git-boundary/requirements.txt python -m unittest discover -s ci/git-boundary -p test_check.py
+```
+
+`uv` installs the pinned ast-grep dependency in its managed environment, so these
+commands do not need system pip or Python's `venv`/`ensurepip` packages. The first
+run needs access to the Python package index; later runs can reuse uv's cache.
+
 ## Daemon logs
 
 The daemon's canonical structured log is
