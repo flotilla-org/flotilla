@@ -970,6 +970,8 @@ mod tests {
             "decision-ledger:notes@work/reviewer",
             "--promise",
             "demo-video:walkthrough",
+            "--promise",
+            "pr:ui_split.v2@coder[linux]/coder",
         ];
         assert_round_trip::<ConvoyNoun>(&args);
         let Resolved::NeedsContext { command, .. } = parse(&args).resolve().expect("resolve promises") else { panic!("command expected") };
@@ -984,6 +986,11 @@ mod tests {
                     owner: Some(PromiseOwner { vessel: "work".into(), role: "reviewer".into() }),
                 },
                 DispatchPromiseRequest { kind: "demo-video".into(), label: "walkthrough".into(), owner: None },
+                DispatchPromiseRequest {
+                    kind: "pr".into(),
+                    label: "ui_split.v2".into(),
+                    owner: Some(PromiseOwner { vessel: "coder[linux]".into(), role: "coder".into() }),
+                },
             ]
         );
     }

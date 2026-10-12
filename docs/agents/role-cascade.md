@@ -169,12 +169,16 @@ Dispatchers add obligations with repeatable `--promise kind:label[@vessel/role]`
 options to `convoy start`, for example `--promise pr:api-split --promise
 pr:ui-split --promise decision-ledger:rollout@work/reviewer`. Admission resolves
 each against the final allocated workflow and freezes the result in the Convoy
-spec's `promises` field. An omitted owner is the crew member marked
+spec's `promises` field. An explicit owner names the vessel as the workflow
+declares it, or as allocation finally names it. When allocation places the
+role in several vessels, as a platform matrix does, admission refuses and asks
+for the final vessel name. An omitted owner is the crew member marked
 `deliverer: true`; when no crew member, or more than one, is the deliverer,
 admission refuses and asks for an explicit `@vessel/role`. Admission also
 refuses unknown kinds, unknown vessels or roles, tool crew owners, and labels
-that are empty, use characters other than ASCII letters, digits, `-`, `_` and
-`.`, or repeat another dispatch promise's label in the convoy. Bootstrap opens
+that do not start with an ASCII letter or digit, use characters other than
+ASCII letters, digits, `-`, `_` and `.`, or repeat another dispatch promise's
+label in the convoy. Bootstrap opens
 each one as a dispatch-sourced promise whose identifier is the label, so its
 owner submits with `flotilla crew submit --promise api-split`. Crews cannot
 retract dispatch-sourced promises.
