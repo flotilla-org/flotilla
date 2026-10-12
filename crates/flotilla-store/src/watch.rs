@@ -52,6 +52,9 @@ impl<T> Drop for WatchTask<T> {
 /// lookup waits, drive it independently: an unpolled watch must not retain a
 /// mutex reservation needed by its select! handler. Each adapter has at most
 /// one pending lookup; dropping it cancels the task and releases its resources.
+/// The inline poll preserves the caller's panic/unwind behavior. Once a lookup
+/// is pending and task-owned, its panic or cancellation becomes a watch error;
+/// the JoinError text distinguishes those causes.
 pub(crate) async fn complete_watch_lookup<T: Send + 'static>(
     lookup: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<T, ResourceError> {

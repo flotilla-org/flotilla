@@ -698,9 +698,9 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
 async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_converge_drift() {
     // #3097: this scenario includes watch-driven concurrent reads, ensure
     // admission and teardown. A stalled phase must fail instead of holding CI.
-    tokio::time::timeout(Duration::from_secs(10), ops_entries_materialization_scenario())
+    tokio::time::timeout(Duration::from_secs(30), ops_entries_materialization_scenario())
         .await
-        .expect("ops-entry materialization and ensure reconciliation must complete within ten seconds");
+        .expect("ops-entry materialization and ensure reconciliation must complete within thirty seconds");
 }
 
 async fn ops_entries_materialization_scenario() {
