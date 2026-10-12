@@ -436,14 +436,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                             format!("{}\n\nCapabilities are currently unavailable. Run `flotilla crew capabilities` when unsure or after the service recovers.\n", flotilla_core::crew_capabilities::CAPABILITIES_HEADING.trim_start())
                         }
                     };
-                    if let Err(error) = flotilla_core::crew_capabilities::observe_launch_card(
-                        &self.state.daemon.resource_backend(),
-                        &context.namespace,
-                        name,
-                        &card,
-                    )
-                    .await
-                    {
+                    if let Err(error) = self.state.daemon.observe_launch_capability_card(&context.namespace, name, &card).await {
                         warn!(session = %name, %error, "failed to persist launch capability observation");
                     }
                     materialized_brief.content.push_str("\n\n");

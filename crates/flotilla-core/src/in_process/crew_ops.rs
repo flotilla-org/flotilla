@@ -64,6 +64,8 @@ pub(super) struct CrewService {
     #[builder(default)]
     pub(super) capability_source: RwLock<Option<Arc<dyn crate::crew_capabilities::SessionCapabilitySource>>>,
     #[builder(default)]
+    pub(super) capability_cards: crate::crew_capabilities::CapabilityCardTracker,
+    #[builder(default)]
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_store::MessageInbox>>>,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::ResourceIntentPublisher>>>,

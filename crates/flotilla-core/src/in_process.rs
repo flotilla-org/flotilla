@@ -5243,9 +5243,13 @@ impl InProcessDaemon {
         *self.crew_ops.capability_source.write().await = Some(source);
     }
 
+    pub async fn observe_launch_capability_card(&self, namespace: &str, name: &str, card: &str) -> Result<(), String> {
+        crate::crew_capabilities::observe_launch_card(&self.resource_backend, namespace, name, card, &self.crew_ops.capability_cards).await
+    }
+
     pub async fn refresh_capability_cards(&self, namespace: &str) -> Result<(), String> {
         let source = self.crew_ops.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
-        crate::crew_capabilities::refresh_cards(&self.resource_backend, namespace, &*source).await
+        crate::crew_capabilities::refresh_cards(&self.resource_backend, namespace, &*source, &self.crew_ops.capability_cards).await
     }
 
     pub async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {

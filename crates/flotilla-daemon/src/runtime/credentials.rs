@@ -72,7 +72,8 @@ impl SessionCapabilitySource for RuntimeSessionCapabilities {
         let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
         match &state.credential_store {
             Some(store) => store.credentials(environment, references).await,
-            None => Ok(Vec::new()),
+            None if references.is_empty() => Ok(Vec::new()),
+            None => Err("credential delivery observations unavailable".into()),
         }
     }
 
@@ -518,6 +519,8 @@ pub(super) fn spawn_credential_refresh_task(
         let store = Arc::clone(&store);
         async move {
             let errors = store.refresh_due_github_app_tokens().await;
+            // Cards read committed delivery observations, never the preparation index.
+            // A mint outage keeps the previous observation until actual token expiry.
             if let Err(error) = daemon.refresh_capability_cards(&namespace).await {
                 warn!(%error, "failed to refresh session capability cards");
             }
