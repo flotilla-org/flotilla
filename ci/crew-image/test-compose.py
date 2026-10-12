@@ -45,7 +45,7 @@ class Composition(unittest.TestCase):
             base = 'ubuntu@sha256:' + 'b' * 64
             records = [json.loads(doc) for doc in manifests(revision, base).split('\n---\n')]
             self.assertEqual([r['spec']['stage'] for r in records],
-                             ['base', 'utilities', 'capability', 'harness'])
+                             ['base', 'utilities', 'capability', 'capability', 'harness'])
             for record in records:
                 self.assertEqual(record['spec']['revision'], revision)
                 self.assertTrue((ROOT / record['spec']['fragment']).is_file())
@@ -54,6 +54,23 @@ class Composition(unittest.TestCase):
             self.assertEqual(records[1]['spec']['parent'], {'kind': 'layer', 'value': 'spine-base'})
             self.assertEqual(records[2]['spec']['provides'], ['display:headless-x11'])
             self.assertEqual(records[2]['spec']['probes'], {'display:headless-x11': ['xdpyinfo']})
+
+    def test_formal_modelling_is_optional_and_declares_node_dependency(self):
+        # Issue #3113: needs select the capability with its existing Node
+        # prerequisite. Exercise absent, either, and both optional layers.
+        for display in [False, True]:
+            for formal in [False, True]:
+                text = dockerfile(display=display, formal_modelling=formal)
+                self.assertEqual(' AS capability-formal-modelling' in text, formal)
+                self.assertEqual(' AS capability-display-x11' in text, display)
+                if formal:
+                    self.assertIn('ENV QUINT_HOME=/opt/quint', text)
+                    self.assertIn('RUN /opt/flotilla/formal-modelling/probe.sh all', text)
+        records = [json.loads(doc) for doc in manifests('a' * 40, 'sha256:' + 'b' * 64).split('\n---\n')]
+        spec = next(r['spec'] for r in records if r['metadata']['name'] == 'capability-formal-modelling')
+        self.assertEqual(spec['requires'], ['toolchain:node@24.18.0'])
+        self.assertEqual(set(spec['probes']), set(spec['provides']))
+        self.assertEqual(len(spec['provides']), 5)
 
     def test_pin_metadata_matches_fragment_defaults(self):
         # Sources/pins remain beside their inputs; drifting either side is a
@@ -94,7 +111,7 @@ class Composition(unittest.TestCase):
 
     def test_fragment_edits_change_composed_output(self):
         # Metamorphic relation: changes in any selected fragment propagate.
-        original = dockerfile(display=True)
+        original = dockerfile(display=True, formal_modelling=True)
         source = Path.read_text
         catalogue = json.loads((ROOT / '.flotilla/image-layers/inputs.json').read_text())
         for layer in catalogue['layers']:
@@ -102,7 +119,7 @@ class Composition(unittest.TestCase):
             def edited(path, *args, **kwargs):
                 return source(path, *args, **kwargs) + ('\nRUN echo changed\n' if path == selected else '')
             with patch.object(Path, 'read_text', edited):
-                self.assertNotEqual(dockerfile(display=True), original)
+                self.assertNotEqual(dockerfile(display=True, formal_modelling=True), original)
 
 
 class AcceptanceCommand(unittest.TestCase):
@@ -168,6 +185,108 @@ with open(os.environ['DOCKER_CALLS'], 'a') as log:
             self.assertEqual(len(argv), 2)
             self.assertIn('test:display', argv[0])
             self.assertIn('test:display', argv[1])
+
+
+class FormalModelling(unittest.TestCase):
+    def test_standalone_tlc_checks_spec_and_propagates_failure(self):
+        # Fake only the TLC/Quint processes: checking the standalone model
+        # must succeed before the Quint backend can validate the capability.
+        for fails in [False, True]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'tlc').write_text("""#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+assert args[-1] == '/opt/flotilla/formal-modelling/smoke.tla'
+assert args[args.index('-config') + 1] == '/opt/flotilla/formal-modelling/smoke.cfg'
+assert '-help' not in args
+print('TLC2 Version 2.19')
+sys.exit(int(os.environ['TLC_FAILS']))
+""")
+                (root / 'quint').write_text('#!/bin/sh\ntouch "$QUINT_CALLED"\n')
+                for binary in ['tlc', 'quint']:
+                    (root / binary).chmod(0o755)
+                marker = root / 'verified'
+                result = subprocess.run(
+                    [str(ROOT / '.flotilla/image-layers/formal-modelling/probe.sh'), 'tlc'],
+                    env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                             TLC_FAILS=str(int(fails)), QUINT_CALLED=str(marker)),
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, int(fails), result.stderr)
+                self.assertEqual(marker.exists(), not fails)
+
+    def test_probe_uses_baked_rust_and_multiple_samples_then_tlc(self):
+        # Fake only the Quint process. The real probe must use multiple samples,
+        # check the same invariant with TLC, and clean its writable working dir.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            quint = root / 'quint'
+            quint.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+assert os.environ['QUINT_HOME'] == '/opt/quint'
+assert os.environ['JAVA_HOME'] == '/opt/java'
+if args == ['--version']:
+    print('0.33.0')
+else:
+    assert args[1] == '/opt/flotilla/formal-modelling/smoke.qnt'
+    assert args[args.index('--invariant') + 1] == 'bounded'
+    assert pathlib.Path.cwd() != pathlib.Path(os.environ['CALLER_DIR'])
+    if args[0] == 'run':
+        assert args[args.index('--backend') + 1] == 'rust'
+        assert int(args[args.index('--max-samples') + 1]) > 1
+    elif args[0] == 'verify':
+        assert args[args.index('--backend') + 1] == 'tlc'
+    else:
+        raise AssertionError(args)
+    with open(os.environ['PROBE_CALLS'], 'a') as log:
+        log.write(json.dumps([args[0], str(pathlib.Path.cwd())]) + '\\n')
+""")
+            quint.chmod(0o755)
+            calls = root / 'calls'
+            prelude = ROOT / '.flotilla/image-layers/60-formal-modelling.sh'
+            probe = ROOT / '.flotilla/image-layers/formal-modelling/probe.sh'
+            result = subprocess.run(
+                ['sh', '-c', '. "$1"; exec "$2" quint', 'sh', str(prelude), str(probe)],
+                cwd=root, env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                                   QUINT_HOME='/nonexistent', JAVA_HOME='/nonexistent',
+                                   CALLER_DIR=str(root), PROBE_CALLS=str(calls)),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual([r[0] for r in recorded], ['run', 'verify'])
+            self.assertTrue(all(not Path(r[1]).exists() for r in recorded))
+
+    def test_acceptance_builds_selected_layer_and_runs_offline_nonroot(self):
+        # Fake only the container-runtime process, running the actual harness.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docker = root / 'docker'
+            docker.write_text("""#!/usr/bin/env python3
+import pathlib, sys
+args = sys.argv[1:]
+if args[:2] == ['buildx', 'build']:
+    text = pathlib.Path(args[args.index('--file') + 1]).read_text()
+    assert 'FROM spine-utilities AS capability-formal-modelling' in text
+    assert 'FROM capability-formal-modelling AS spine-harness' in text
+    assert 'capability-display-x11' not in text
+    assert '--load' in args and '--push' not in args
+elif args[0] == 'run':
+    assert '--network=none' in args and '--pull=never' in args
+    assert args[args.index('--user') + 1] == '12345:12345'
+    assert args[args.index('--env') + 1] == 'HOME=/nonexistent'
+    assert 'QUINT_HOME=/nonexistent' in args and 'JAVA_HOME=/nonexistent' in args
+    assert 'PATH=/usr/local/bin:/usr/bin:/bin' in args
+    assert '. "$flotilla_prelude_file"' in args[-1]
+    assert 'flotilla_run_with_preludes /opt/flotilla/formal-modelling/probe.sh all' in args[-1]
+else:
+    raise AssertionError(args)
+""")
+            docker.chmod(0o755)
+            result = subprocess.run([str(ROOT / 'ci/crew-image/accept-formal-modelling.sh')],
+                                    env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH']),
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class CallerCleanup(unittest.TestCase):
