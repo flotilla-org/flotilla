@@ -480,3 +480,6 @@ with `--backend rust --max-samples 100`, then check its invariant through
 `ci/crew-image/accept-formal-modelling.sh`; it uses the existing composition
 harness and repeats all probes without networking, as an arbitrary non-root
 UID with an unwritable home. Java 21 is required by the pinned Apalache release.
+The standalone `tlc` probe also checks a bundled TLA+ spec directly. Builds
+require BuildKit for `TARGETARCH`; the acceptance command uses Buildx. Run
+image-build acceptance before publishing this layer.

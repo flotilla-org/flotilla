@@ -163,6 +163,33 @@ with open(os.environ['DOCKER_CALLS'], 'a') as log:
 
 
 class FormalModelling(unittest.TestCase):
+    def test_standalone_tlc_checks_spec_and_propagates_failure(self):
+        # Fake only the TLC/Quint processes: checking the standalone model
+        # must succeed before the Quint backend can validate the capability.
+        for fails in [False, True]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'tlc').write_text("""#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+assert args[-1] == '/opt/flotilla/formal-modelling/smoke.tla'
+assert args[args.index('-config') + 1] == '/opt/flotilla/formal-modelling/smoke.cfg'
+assert '-help' not in args
+print('TLC2 Version 2.19')
+sys.exit(int(os.environ['TLC_FAILS']))
+""")
+                (root / 'quint').write_text('#!/bin/sh\ntouch "$QUINT_CALLED"\n')
+                for binary in ['tlc', 'quint']:
+                    (root / binary).chmod(0o755)
+                marker = root / 'verified'
+                result = subprocess.run(
+                    [str(ROOT / '.flotilla/image-layers/formal-modelling/probe.sh'), 'tlc'],
+                    env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                             TLC_FAILS=str(int(fails)), QUINT_CALLED=str(marker)),
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, int(fails), result.stderr)
+                self.assertEqual(marker.exists(), not fails)
+
     def test_probe_uses_baked_rust_and_multiple_samples_then_tlc(self):
         # Fake only the Quint process. The real probe must use multiple samples,
         # check the same invariant with TLC, and clean its writable working dir.

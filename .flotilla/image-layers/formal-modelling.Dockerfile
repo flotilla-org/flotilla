@@ -45,8 +45,12 @@ RUN case "${TARGETARCH}" in \
     && chmod -R a+rX,a-w "${JAVA_HOME}" "${QUINT_HOME}"
 COPY .flotilla/image-layers/60-formal-modelling.sh /etc/flotilla/prelude.d/60-formal-modelling.sh
 COPY .flotilla/image-layers/formal-modelling/smoke.qnt /opt/flotilla/formal-modelling/smoke.qnt
+COPY .flotilla/image-layers/formal-modelling/smoke.tla /opt/flotilla/formal-modelling/smoke.tla
+COPY .flotilla/image-layers/formal-modelling/smoke.cfg /opt/flotilla/formal-modelling/smoke.cfg
 COPY .flotilla/image-layers/formal-modelling/probe.sh /opt/flotilla/formal-modelling/probe.sh
 COPY .flotilla/image-layers/formal-modelling/tlc /usr/local/bin/tlc
+RUN chmod -R a+rX,a-w /opt/flotilla/formal-modelling \
+    && chmod a-w /usr/local/bin/tlc /etc/flotilla/prelude.d/60-formal-modelling.sh
 # Exercise the same baked paths as admission; runtime acceptance also runs offline
 # as an arbitrary non-root user, so an accidental auto-download cannot pass.
 RUN /opt/flotilla/formal-modelling/probe.sh all
