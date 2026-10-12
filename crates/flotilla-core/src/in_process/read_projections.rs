@@ -976,31 +976,18 @@ impl ReadProjections<'_> {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = flotilla_store::ViewSnapshot::new(Some(reads.local_root().map_err(|error| error.to_string())?));
-        macro_rules! copy_inventory {
-            ($kind:ty) => {
-                snapshot
-                    .insert::<$kind>(
-                        namespace,
-                        reads
-                            .query_declared::<$kind>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-                            .await
-                            .map_err(|error| error.to_string())?,
-                    )
-                    .map_err(|error| error.to_string())?;
-            };
-        }
-        copy_inventory!(ResourceTerminalSession);
-        copy_inventory!(ResourceConvoy);
-        copy_inventory!(flotilla_resources::Environment);
-        copy_inventory!(ResourceHost);
-        copy_inventory!(ResourceCheckout);
-        copy_inventory!(ResourceDemand);
-        copy_inventory!(Project);
-        copy_inventory!(flotilla_resources::FleetDesignation);
-        snapshot.insert::<ManifestRoot>(namespace, roots).map_err(|error| error.to_string())?;
-        snapshot.insert::<FulfilmentKind>(namespace, kinds).map_err(|error| error.to_string())?;
-        let reads = ResourceBackend::new(snapshot);
+        let mut snapshot = project_ops::RequestSnapshot::new(&reads, namespace)?;
+        snapshot.copy::<ResourceTerminalSession>(&reads).await?;
+        snapshot.copy::<ResourceConvoy>(&reads).await?;
+        snapshot.copy::<flotilla_resources::Environment>(&reads).await?;
+        snapshot.copy::<ResourceHost>(&reads).await?;
+        snapshot.copy::<ResourceCheckout>(&reads).await?;
+        snapshot.copy::<ResourceDemand>(&reads).await?;
+        snapshot.copy::<Project>(&reads).await?;
+        snapshot.copy::<flotilla_resources::FleetDesignation>(&reads).await?;
+        snapshot.insert::<ManifestRoot>(roots)?;
+        snapshot.insert::<FulfilmentKind>(kinds)?;
+        let reads = snapshot.finish();
         let rows = self.fleet.rows_with_backend(&reads, namespace, self.host_registry).await?;
         let mut response = self.with_backend(&reads).fleet_health(namespace, host_list, rows, local_host_id, now).await?;
         for host in hosts.items {
@@ -1020,8 +1007,7 @@ impl ReadProjections<'_> {
         crew_id: Option<&str>,
         convoy: Option<&str>,
     ) -> Result<(ResourceBackend, Option<String>, BTreeSet<String>), String> {
-        use flotilla_resources::{Environment, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
-        use flotilla_store::ViewSnapshot;
+        use flotilla_resources::{Environment, FleetDesignation, FLEET_DESIGNATION_NAME};
         let scoped = project.is_some() || crew_id.is_some() || convoy.is_some();
         let (scope, context) = if !scoped {
             // Every convoy participates in the full fleet address catalog.
@@ -1206,31 +1192,16 @@ impl ReadProjections<'_> {
             .list_names([FLEET_DESIGNATION_NAME.into()])
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = ViewSnapshot::new(Some(self.backend.local_root().map_err(|error| error.to_string())?));
-        macro_rules! insert {
-            ($kind:ty, $inventory:expr) => {
-                snapshot.insert::<$kind>(namespace, $inventory).map_err(|error| error.to_string())?;
-            };
-        }
-        insert!(ResourceTerminalSession, sessions);
-        insert!(ResourceConvoy, convoys);
-        insert!(Environment, environments);
-        insert!(ResourceHost, hosts);
-        insert!(ResourceCheckout, checkouts);
-        insert!(ResourceDemand, demands);
-        insert!(
-            Project,
-            ReadResourceList {
-                items: projects.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect()
-            }
-        );
-        insert!(
-            FleetDesignation,
-            ReadResourceList {
-                items: fleet.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect()
-            }
-        );
-        Ok((ResourceBackend::new(snapshot), selected_project, matching))
+        let mut snapshot = project_ops::RequestSnapshot::new(self.backend, namespace)?;
+        snapshot.insert::<ResourceTerminalSession>(sessions)?;
+        snapshot.insert::<ResourceConvoy>(convoys)?;
+        snapshot.insert::<Environment>(environments)?;
+        snapshot.insert::<ResourceHost>(hosts)?;
+        snapshot.insert::<ResourceCheckout>(checkouts)?;
+        snapshot.insert::<ResourceDemand>(demands)?;
+        snapshot.insert_definitions::<Project>(projects)?;
+        snapshot.insert_definitions::<FleetDesignation>(fleet)?;
+        Ok((snapshot.finish(), selected_project, matching))
     }
 
     pub(super) async fn explain_convoy(&self, namespace: &str, name: &str) -> Result<ConvoyExplanation, String> {
@@ -2028,9 +1999,7 @@ async fn convoy_receiver_evidence(
     convoys: &[ReadResourceObject<ResourceConvoy>],
     convoy: &ResourceObject<ResourceConvoy>,
 ) -> Result<(flotilla_store::MessageReceiverSnapshot, Option<ResourceObject<Project>>, BTreeSet<String>), String> {
-    use flotilla_resources::ReadResourceList;
     use flotilla_resources::{ConvoyEnsure, CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME, ROLE_ADDRESS_ANNOTATION};
-    use flotilla_store::ViewSnapshot;
     let project_name = convoy.spec.project_ref.as_deref().unwrap_or(namespace);
     let target = StoreQuery::labels(&BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone())]), true, true);
     let terminals = backend
@@ -2098,48 +2067,24 @@ async fn convoy_receiver_evidence(
         }
     };
     let project = projects.iter().find(|project| project.metadata.name == project_name).cloned();
-    let mut snapshot = ViewSnapshot::new(Some(backend.store().local_root().map_err(|error| error.to_string())?));
-    snapshot.insert(namespace, ensures).map_err(|error| error.to_string())?;
-    snapshot
-        .insert(
-            namespace,
-            ReadResourceList {
-                items: projects.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
+    let mut snapshot = project_ops::RequestSnapshot::new(backend, namespace)?;
+    snapshot.insert(ensures)?;
+    snapshot.insert_definitions(projects)?;
     if adopted {
         let fleet = backend
             .definitions::<FleetDesignation>(namespace)
             .list_names([FLEET_DESIGNATION_NAME.into()])
             .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-            .collect();
-        snapshot.insert(namespace, ReadResourceList { items: fleet }).map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())?;
+        snapshot.insert_definitions(fleet)?;
         // All defaults are cascade layers; their order and refusals participate.
         let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
-        snapshot
-            .insert(
-                namespace,
-                ReadResourceList {
-                    items: defaults
-                        .into_iter()
-                        .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-                        .collect(),
-                },
-            )
-            .map_err(|error| error.to_string())?;
+        snapshot.insert_definitions(defaults)?;
     }
-    let receivers = flotilla_store::MessageReceiverSnapshot::load_from_observations(
-        &ResourceBackend::new(snapshot),
-        namespace,
-        convoys.to_vec(),
-        terminals.items,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
+    let receivers =
+        flotilla_store::MessageReceiverSnapshot::load_from_observations(&snapshot.finish(), namespace, convoys.to_vec(), terminals.items)
+            .await
+            .map_err(|error| error.to_string())?;
     Ok((receivers, project, aliases))
 }
 

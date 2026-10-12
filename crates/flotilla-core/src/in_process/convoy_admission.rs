@@ -24,7 +24,7 @@ pub(super) enum PlacementPurpose {
     Admission,
 }
 
-#[derive(Clone, Copy, bon::Builder)]
+#[derive(Clone, Copy)]
 struct PlacementContext<'a> {
     namespace: &'a str,
     project_ref: &'a str,
@@ -33,7 +33,7 @@ struct PlacementContext<'a> {
     purpose: PlacementPurpose,
 }
 
-#[derive(Clone, Copy, bon::Builder)]
+#[derive(Clone, Copy)]
 struct PolicyPlacementContext<'a> {
     namespace: &'a str,
     project_ref: Option<&'a str>,
@@ -92,17 +92,35 @@ pub(super) struct ConvoyAdmission {
     pending_starts: Mutex<HashSet<ConvoyStartKey>>,
 }
 
-/// Read-only decision phase: one explicit inventory per participating kind.
-/// The original owner retains the mutation backend, guards and runtime ports.
+/// Decisions use one explicit inventory per participating kind. Runtime
+/// observations and selected build joins are separate, explicit dependencies.
 struct AdmissionReadContext<'a> {
-    owner: &'a ConvoyAdmission,
+    runtime: AdmissionRuntime<'a>,
     backend: ResourceBackend,
 }
-impl std::ops::Deref for AdmissionReadContext<'_> {
-    type Target = ConvoyAdmission;
-    fn deref(&self) -> &Self::Target {
-        self.owner
-    }
+
+/// External observations and actions available during planning. No admission
+/// owner, mutation store, identity guard or pending-start registry is exposed.
+struct AdmissionRuntime<'a> {
+    config: &'a ConfigStore,
+    discovery: &'a DiscoveryRuntime,
+    environment_manager: &'a EnvironmentManager,
+    local_environment_id: &'a EnvironmentId,
+    local_host: Option<CanonicalHostId>,
+    namespace: String,
+    repository_change_requests: &'a RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>,
+    change_request_port: &'a dyn ChangeRequestQueryPort,
+    issue_port: &'a dyn IssueQueryPort,
+    clock: &'a dyn Clock,
+    fulfilment_decider: &'a dyn FulfilmentDecider,
+    image_build_inputs: &'a RwLock<Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>>,
+    builds: PlacementBuildJoiner<'a>,
+}
+
+/// The only store-writing action allowed during planning: joining selected builds.
+struct PlacementBuildJoiner<'a> {
+    backend: &'a ResourceBackend,
+    inputs: &'a RwLock<Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>>,
 }
 
 struct AdmissionLookupFailure {
@@ -120,6 +138,27 @@ impl AdmissionLookupFailure {
 }
 
 impl ConvoyAdmission {
+    fn reads(&self, backend: ResourceBackend) -> AdmissionReadContext<'_> {
+        AdmissionReadContext {
+            backend,
+            runtime: AdmissionRuntime {
+                config: &self.config,
+                discovery: &self.discovery,
+                environment_manager: &self.environment_manager,
+                local_environment_id: &self.local_environment_id,
+                local_host: self.canonical_local_host_id(),
+                namespace: self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone(),
+                repository_change_requests: &self.repository_change_requests,
+                change_request_port: self.change_request_port.as_ref(),
+                issue_port: self.issue_port.as_ref(),
+                clock: self.clock.as_ref(),
+                fulfilment_decider: self.fulfilment_decider.as_ref(),
+                image_build_inputs: &self.image_build_inputs,
+                builds: PlacementBuildJoiner { backend: &self.backend, inputs: &self.image_build_inputs },
+            },
+        }
+    }
+
     pub(super) fn set_free_space_path(&self, path: PathBuf) {
         *self.admission_free_space_path.write().expect("admission free-space path lock poisoned") = path;
     }
@@ -143,10 +182,6 @@ impl ConvoyAdmission {
             .map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
     }
 
-    async fn fetch_issue_by_ref(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
-        self.issue_port.fetch_issue_by_ref(reference).await
-    }
-
     pub(super) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.guard.lock().await
     }
@@ -161,42 +196,6 @@ impl ConvoyAdmission {
 }
 
 impl ConvoyAdmission {
-    async fn resolve_convoy_skills(
-        &self,
-        cascade: &flotilla_resources::ResolvedCascade,
-        intent: &flotilla_protocol::ConvoyStartIntent,
-        workflow: &mut WorkflowTemplateSpec,
-    ) -> Result<(), String> {
-        use flotilla_resources::{resolve_skills, SkillCatalogEntry};
-        let required = cascade.skill_layers.iter().any(|(_, refs)| !refs.is_empty()) || !intent.skills.is_empty();
-        let catalog: Vec<SkillCatalogEntry> = if required {
-            let bundle =
-                self.discovery.env.get("FLOTILLA_SKILLS_DIR").ok_or_else(|| "skill admission requires FLOTILLA_SKILLS_DIR".to_string())?;
-            let path = PathBuf::from(bundle).join(".flotilla-skill-catalog.json");
-            let contents =
-                tokio::fs::read_to_string(&path).await.map_err(|error| format!("read pinned skill catalog {}: {error}", path.display()))?;
-            let catalog: Vec<SkillCatalogEntry> =
-                serde_json::from_str(&contents).map_err(|error| format!("decode pinned skill catalog: {error}"))?;
-            let manifest = tokio::fs::read_to_string(path.with_file_name(".flotilla-sources.json"))
-                .await
-                .map_err(|error| format!("read pinned skill sources: {error}"))?;
-            flotilla_resources::crew_defaults::validate_catalog(
-                &catalog,
-                &serde_json::from_str(&manifest).map_err(|error| format!("decode pinned skill sources: {error}"))?,
-            )?;
-            catalog
-        } else {
-            Vec::new()
-        };
-        for crew in workflow.roles.iter_mut().chain(workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
-            if matches!(crew.source, CrewSource::Agent { .. }) {
-                crew.skills =
-                    resolve_skills(&catalog, &cascade.skills_for(&crew.role, &intent.skills)).map_err(|error| error.to_string())?;
-            }
-        }
-        Ok(())
-    }
-
     /// Resolve explicit continuation with fresh forge facts. Absence is allowed
     /// for branch-only work; terminal requests are never silently adopted.
     #[cfg(test)]
@@ -205,7 +204,7 @@ impl ConvoyAdmission {
         repositories: &[ConvoyRepositorySpec],
         continuation: &flotilla_protocol::ConvoyContinuation,
     ) -> Result<(RepositoryKey, String, Option<ResolvedConvoyChangeRequestAdmission>), String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }.resolve_continuation(repositories, continuation).await
+        self.reads(self.backend.clone()).resolve_continuation(repositories, continuation).await
     }
 
     fn refuse_live_continuation_holder(spec: &ConvoySpec, inventory: &[ReadResourceObject<ResourceConvoy>]) -> Result<(), String> {
@@ -237,9 +236,7 @@ impl ConvoyAdmission {
         repository_keys: &[RepositoryKey],
         requested_id: &str,
     ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }
-            .resolve_convoy_change_request_admission(repository_keys, requested_id)
-            .await
+        self.reads(self.backend.clone()).resolve_convoy_change_request_admission(repository_keys, requested_id).await
     }
 
     pub(super) async fn repository_change_request_candidates(
@@ -259,17 +256,7 @@ impl ConvoyAdmission {
         if let Err(error) = snapshot.insert::<Repository>(&namespace, repositories) {
             return (Vec::new(), vec![error.to_string()]);
         }
-        AdmissionReadContext { owner: self, backend: ResourceBackend::new(snapshot) }
-            .repository_change_request_candidates(repository_keys)
-            .await
-    }
-
-    async fn discover_repository_change_request(
-        &self,
-        namespace: &str,
-        repository: &RepositorySpec,
-    ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
-        self.change_request_port.discover_repository_change_request(namespace, repository).await
+        self.reads(ResourceBackend::new(snapshot)).repository_change_request_candidates(repository_keys).await
     }
 
     pub(super) async fn resolve_convoy_change_request(
@@ -367,7 +354,7 @@ impl ConvoyAdmission {
                 }
             }
         };
-        let context = AdmissionReadContext { owner: self, backend: reads.clone() };
+        let context = self.reads(reads.clone());
         let bound = match binding {
             Some(binding) => Some(
                 self.resolve_bound_convoy_change_request_from_inventory(
@@ -465,10 +452,10 @@ impl ConvoyAdmission {
             .query_declared::<ResourceChangeRequest>(namespace, &StoreQuery::names(names, true))
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = flotilla_store::ViewSnapshot::new(Some(self.backend.local_root().map_err(|error| error.to_string())?));
-        snapshot.insert::<Repository>(namespace, repositories).map_err(|error| error.to_string())?;
-        snapshot.insert::<ResourceChangeRequest>(namespace, observations).map_err(|error| error.to_string())?;
-        Ok(ResourceBackend::new(snapshot))
+        let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, namespace)?;
+        snapshot.insert::<Repository>(repositories)?;
+        snapshot.insert::<ResourceChangeRequest>(observations)?;
+        Ok(snapshot.finish())
     }
 
     async fn resolve_observed_convoy_change_request_from_inventory(
@@ -514,18 +501,6 @@ impl ConvoyAdmission {
 }
 
 impl ConvoyAdmission {
-    pub(super) async fn resolve_convoy_issue_snapshot(
-        &self,
-        reference: &flotilla_protocol::IssueRef,
-    ) -> Result<flotilla_protocol::Issue, String> {
-        let issue = self.fetch_issue_by_ref(reference).await?;
-        if issue_snapshot_is_fresh(&issue) {
-            Ok(issue)
-        } else {
-            Err(format!("issue {} snapshot is too stale to admit", reference.id))
-        }
-    }
-
     async fn record_admission_naming(&self, namespace: &str, name: &str, naming: Option<ConvoyNaming>) {
         if let Some(naming) = naming {
             finish_naming_write(namespace, name, async {
@@ -541,13 +516,6 @@ impl ConvoyAdmission {
         }
     }
 
-    async fn admission_ai_utility(&self) -> Result<ProbedNamingUtility, String> {
-        let environment = self.environment_manager.environment_bag(&self.local_environment_id);
-        let runner = self.environment_manager.environment_runner(&self.local_environment_id);
-        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
-        probe_admission_ai_utility(&self.discovery.factories.ai_utilities, environment.as_ref(), &self.config, &probe_root, runner).await
-    }
-
     pub(super) async fn start_placement_host(
         &self,
         namespace: &str,
@@ -555,25 +523,12 @@ impl ConvoyAdmission {
     ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
         let (namespace, intent) = normalize_convoy_start_intent(namespace, intent)?;
         let reads = if intent.placement_policy.is_some() {
-            let mut snapshot = flotilla_store::ViewSnapshot::new(Some(self.backend.local_root().map_err(|error| error.to_string())?));
+            let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, &namespace)?;
             // Every candidate participates in routing, including pin refusals.
-            macro_rules! candidates {
-                ($kind:ty) => {
-                    snapshot
-                        .insert::<$kind>(
-                            &namespace,
-                            self.backend
-                                .query_declared::<$kind>(&namespace, &StoreQuery { include_replicas: true, ..Default::default() })
-                                .await
-                                .map_err(|error| error.to_string())?,
-                        )
-                        .map_err(|error| error.to_string())?;
-                };
-            }
-            candidates!(FulfilmentKind);
-            candidates!(PlacementPolicy);
-            candidates!(ResourceHost);
-            AdmissionReadContext { owner: self, backend: ResourceBackend::new(snapshot) }
+            snapshot.copy::<FulfilmentKind>(&self.backend).await?;
+            snapshot.copy::<PlacementPolicy>(&self.backend).await?;
+            snapshot.copy::<ResourceHost>(&self.backend).await?;
+            self.reads(snapshot.finish())
         } else {
             AdmissionReadContext::load(self, &namespace, &intent).await?
         };
@@ -598,9 +553,7 @@ impl ConvoyAdmission {
         repositories: &[ConvoyRepositorySpec],
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(String, WorkflowTemplateSpec), String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }
-            .resolve_convoy_admission_workflow(namespace, project_ref, project, repositories, intent)
-            .await
+        self.reads(self.backend.clone()).resolve_convoy_admission_workflow(namespace, project_ref, project, repositories, intent).await
     }
 
     #[cfg(test)]
@@ -612,9 +565,7 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
         workflow: &mut WorkflowTemplateSpec,
     ) -> Result<BTreeSet<CapabilityNeed>, String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }
-            .compose_convoy_needs(namespace, project, issues, intent, workflow)
-            .await
+        self.reads(self.backend.clone()).compose_convoy_needs(namespace, project, issues, intent, workflow).await
     }
 
     #[cfg(test)]
@@ -628,13 +579,7 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
         self.decide_capability_placement(
-            &PlacementContext::builder()
-                .namespace(namespace)
-                .project_ref(project_ref)
-                .repositories(repositories)
-                .intent(intent)
-                .purpose(PlacementPurpose::Admission)
-                .build(),
+            &PlacementContext { namespace, project_ref, repositories, intent, purpose: PlacementPurpose::Admission },
             workflow,
             needs,
         )
@@ -648,21 +593,7 @@ impl ConvoyAdmission {
         workflow: &WorkflowTemplateSpec,
         needs: &BTreeSet<CapabilityNeed>,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }.decide_capability_placement(context, workflow, needs).await
-    }
-
-    async fn join_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
-        if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-            if let flotilla_resources::DockerImageSource::Composition { composition } = &mut docker.image {
-                if composition.baseline_image.is_none() && composition.identity.is_none() {
-                    let inputs = self.image_build_inputs.read().await.clone().ok_or("image build input resolver is unavailable")?;
-                    composition.build_refs = crate::image_build::ImageBuildAdmission::new(self.backend.clone(), namespace, inputs)
-                        .join(&docker.host_ref, composition)
-                        .await?;
-                }
-            }
-        }
-        Ok(())
+        self.reads(self.backend.clone()).decide_capability_placement(context, workflow, needs).await
     }
 
     pub(super) async fn prepare_convoy_admission_with_preferences(
@@ -701,15 +632,14 @@ impl ConvoyAdmission {
         self.create_convoy_with_workflow_snapshot(
             namespace,
             &admission.name,
-            ConvoySnapshotBundle::builder()
-                .maybe_read_snapshot(admission.read_snapshot.as_ref())
-                .convoy_inventory(inventory.as_slice())
-                .spec(&admission.spec)
-                .workflow(&admission.workflow)
-                .maybe_placement(admission.placement_policy.as_ref())
-                .maybe_placement_decision(admission.placement_decision)
-                .vessel_placements(&admission.vessel_placements)
-                .build(),
+            ConvoySnapshotBundle {
+                evidence: BriefEvidence { definitions: &admission.evidence, convoys: &inventory },
+                spec: &admission.spec,
+                workflow: &admission.workflow,
+                placement: admission.placement_policy.as_ref(),
+                placement_decision: admission.placement_decision,
+                vessel_placements: Some(&admission.vessel_placements),
+            },
             intent.auto_attach.into(),
         )
         .await?;
@@ -746,13 +676,11 @@ impl ConvoyAdmission {
         namespace: &str,
         placement: Option<&PlacementDecision>,
     ) -> Result<(), String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }
-            .check_remote_placement_free_space_floor(namespace, placement)
-            .await
+        self.reads(self.backend.clone()).check_remote_placement_free_space_floor(namespace, placement).await
     }
 
     pub(super) async fn check_prepared_placement_floors(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<(), String> {
-        let reads = AdmissionReadContext { owner: self, backend: admission.read_snapshot.clone().unwrap_or_else(|| self.backend.clone()) };
+        let reads = self.reads(admission.evidence.clone());
         if admission.vessel_placements.is_empty() {
             reads.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
         }
@@ -770,20 +698,19 @@ impl ConvoyAdmission {
         prepared_snapshot_name("placement", &serde_json::json!({ "origin": root, "spec": spec }))
     }
 
-    pub(super) async fn create_convoy_with_workflow_snapshot(
+    async fn create_convoy_with_workflow_snapshot(
         &self,
         namespace: &str,
         name: &str,
         bundle: ConvoySnapshotBundle<'_>,
         dispatch_regard: ConvoyDispatchRegard,
     ) -> Result<(), String> {
-        let ConvoySnapshotBundle { spec, workflow, placement, placement_decision, vessel_placements, read_snapshot, convoy_inventory } =
-            bundle;
+        let ConvoySnapshotBundle { spec, workflow, placement, placement_decision, vessel_placements, evidence } = bundle;
         let workflow_value = serde_json::to_value(workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.backend, namespace, &workflow_name, workflow).await?;
         let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name)]);
-        if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, read_snapshot, convoy_inventory).await? {
+        if self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, evidence).await? {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
         if let Some(placement) = placement {
@@ -809,14 +736,7 @@ impl ConvoyAdmission {
     }
 
     async fn prepared_brief_query(&self, namespace: &str, admission: &PreparedConvoyAdmission) -> Result<Option<StoreQuery>, String> {
-        self.brief_query(
-            namespace,
-            &admission.name,
-            &admission.spec,
-            &admission.workflow,
-            admission.read_snapshot.as_ref().unwrap_or(&self.backend),
-        )
-        .await
+        self.brief_query(namespace, &admission.name, &admission.spec, &admission.workflow, &admission.evidence).await
     }
 
     async fn brief_query(
@@ -849,57 +769,40 @@ impl ConvoyAdmission {
         namespace: &str,
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
-    ) -> Result<Option<ResourceBackend>, String> {
-        use flotilla_resources::{CrewDefaults, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
+    ) -> Result<ResourceBackend, String> {
+        use flotilla_resources::{CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME};
         if self.brief_artifact_writer.read().await.is_none()
             || !workflow.vessels.iter().flat_map(|vessel| &vessel.crew).any(|crew| matches!(crew.source, CrewSource::Agent { .. }))
         {
-            return Ok(None);
+            return Ok(ResourceBackend::new(flotilla_store::ViewSnapshot::default()));
         }
-        let mut snapshot = flotilla_store::ViewSnapshot::new(Some(self.backend.local_root().map_err(|error| error.to_string())?));
+        let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, namespace)?;
         let names = spec
             .repositories
             .iter()
             .map(|repository| repository.repo_ref.to_string())
             .chain(workflow.vessels.iter().flat_map(|vessel| vessel.repository_refs.iter().flatten().map(ToString::to_string)));
-        snapshot
-            .insert::<Repository>(
-                namespace,
-                self.backend
-                    .query_declared::<Repository>(namespace, &StoreQuery::names(names, false))
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
+        snapshot.insert::<Repository>(
+            self.backend
+                .query_declared::<Repository>(namespace, &StoreQuery::names(names, false))
+                .await
+                .map_err(|error| error.to_string())?,
+        )?;
         if spec.project_ref.is_some() {
-            macro_rules! definitions {
-                ($kind:ty, $objects:expr) => {
-                    snapshot
-                        .insert::<$kind>(
-                            namespace,
-                            ReadResourceList {
-                                items: $objects
-                                    .into_iter()
-                                    .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-                                    .collect(),
-                            },
-                        )
-                        .map_err(|error| error.to_string())?;
-                };
-            }
             // Every graph/default layer participates in cascade/topic refusal.
-            definitions!(Project, project_ops::read_definition_catalog::<Project>(&self.backend, namespace).await?);
-            definitions!(CrewDefaults, project_ops::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?);
-            definitions!(
-                FleetDesignation,
+            snapshot.insert_definitions::<Project>(project_ops::read_definition_catalog::<Project>(&self.backend, namespace).await?)?;
+            snapshot.insert_definitions::<CrewDefaults>(
+                project_ops::read_definition_catalog::<CrewDefaults>(&self.backend, namespace).await?,
+            )?;
+            snapshot.insert_definitions::<FleetDesignation>(
                 self.backend
                     .definitions::<FleetDesignation>(namespace)
                     .list_names([FLEET_DESIGNATION_NAME.into()])
                     .await
-                    .map_err(|error| error.to_string())?
-            );
+                    .map_err(|error| error.to_string())?,
+            )?;
         }
-        Ok(Some(ResourceBackend::new(snapshot)))
+        Ok(snapshot.finish())
     }
 
     async fn brief_read_inventory(
@@ -908,15 +811,11 @@ impl ConvoyAdmission {
         name: &str,
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
-        read_snapshot: Option<&ResourceBackend>,
-        convoy_inventory: Option<&[ReadResourceObject<ResourceConvoy>]>,
+        evidence: BriefEvidence<'_>,
     ) -> Result<(ResourceBackend, ResourceBackend), String> {
         use flotilla_resources::TerminalSession as ResourceTerminalSession;
-        use flotilla_resources::{
-            CrewDefaults, Environment, FleetDesignation, ReadResourceList, ReadResourceObject, ResourceProvenance, FLEET_DESIGNATION_NAME,
-        };
-        use flotilla_store::ViewSnapshot;
-        let read_source = read_snapshot.unwrap_or(&self.backend);
+        use flotilla_resources::{CrewDefaults, Environment, FleetDesignation, ReadResourceList, FLEET_DESIGNATION_NAME};
+        let read_source = evidence.definitions;
         let repository_names = spec
             .repositories
             .iter()
@@ -982,10 +881,10 @@ impl ConvoyAdmission {
             )
             .await
             .map_err(|error| error.to_string())?;
-        let mut snapshot = ViewSnapshot::new(Some(self.backend.local_root().map_err(|error| error.to_string())?));
-        snapshot.insert::<Repository>(namespace, repositories).map_err(|error| error.to_string())?;
-        snapshot.insert::<Environment>(namespace, environments).map_err(|error| error.to_string())?;
-        snapshot.insert::<ResourceCheckout>(namespace, checkouts).map_err(|error| error.to_string())?;
+        let mut snapshot = project_ops::RequestSnapshot::new(&self.backend, namespace)?;
+        snapshot.insert::<Repository>(repositories)?;
+        snapshot.insert::<Environment>(environments)?;
+        snapshot.insert::<ResourceCheckout>(checkouts)?;
         if let Some(project) = spec.project_ref.as_deref() {
             // Every graph/default layer participates in topic and cascade refusals.
             let projects = project_ops::read_definition_catalog::<Project>(read_source, namespace).await?;
@@ -996,10 +895,7 @@ impl ConvoyAdmission {
                 .await
                 .map_err(|error| error.to_string())?;
             let (convoy_query, visible) = brief_convoy_query(project, name, workflow, &projects, &defaults, &fleet)?;
-            let convoys = match convoy_inventory {
-                Some(items) => ReadResourceList { items: items.to_vec() },
-                None => self.backend.query_declared::<ResourceConvoy>(namespace, &convoy_query).await.map_err(|error| error.to_string())?,
-            };
+            let convoys = ReadResourceList { items: evidence.convoys.to_vec() };
             let terminal_query = StoreQuery {
                 any_of: Some(
                     std::iter::once(StoreQuery::related_kind(
@@ -1037,31 +933,16 @@ impl ConvoyAdmission {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            macro_rules! definitions {
-                ($kind:ty, $objects:expr) => {
-                    snapshot
-                        .insert::<$kind>(
-                            namespace,
-                            ReadResourceList {
-                                items: $objects
-                                    .into_iter()
-                                    .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-                                    .collect(),
-                            },
-                        )
-                        .map_err(|error| error.to_string())?;
-                };
-            }
-            definitions!(Project, projects);
-            definitions!(CrewDefaults, defaults);
-            definitions!(FleetDesignation, fleet);
-            snapshot.insert::<ResourceConvoy>(namespace, convoys).map_err(|error| error.to_string())?;
-            snapshot.insert::<ResourceTerminalSession>(namespace, terminals).map_err(|error| error.to_string())?;
-            snapshot.insert::<ConvoyEnsure>(namespace, ensures).map_err(|error| error.to_string())?;
+            snapshot.insert_definitions::<Project>(projects)?;
+            snapshot.insert_definitions::<CrewDefaults>(defaults)?;
+            snapshot.insert_definitions::<FleetDesignation>(fleet)?;
+            snapshot.insert::<ResourceConvoy>(convoys)?;
+            snapshot.insert::<ResourceTerminalSession>(terminals)?;
+            snapshot.insert::<ConvoyEnsure>(ensures)?;
         }
-        let mut observed_snapshot = ViewSnapshot::new(Some(self.observed_backend.local_root().map_err(|error| error.to_string())?));
-        observed_snapshot.insert::<ResourceCheckout>(namespace, observed).map_err(|error| error.to_string())?;
-        Ok((ResourceBackend::new(snapshot), ResourceBackend::new(observed_snapshot)))
+        let mut observed_snapshot = project_ops::RequestSnapshot::new(&self.observed_backend, namespace)?;
+        observed_snapshot.insert::<ResourceCheckout>(observed)?;
+        Ok((snapshot.finish(), observed_snapshot.finish()))
     }
 
     pub(super) async fn write_admission_briefs(
@@ -1071,17 +952,27 @@ impl ConvoyAdmission {
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
     ) -> Result<bool, String> {
-        self.write_admission_briefs_from_inventory(namespace, name, spec, workflow, None, None).await
+        self.write_briefs(namespace, name, spec, workflow, BriefReadSource::Load).await
     }
 
-    pub(super) async fn write_admission_briefs_from_inventory(
+    async fn write_admission_briefs_from_inventory(
         &self,
         namespace: &str,
         name: &str,
         spec: &ConvoySpec,
         workflow: &WorkflowTemplateSpec,
-        read_snapshot: Option<&ResourceBackend>,
-        convoy_inventory: Option<&[ReadResourceObject<ResourceConvoy>]>,
+        evidence: BriefEvidence<'_>,
+    ) -> Result<bool, String> {
+        self.write_briefs(namespace, name, spec, workflow, BriefReadSource::Prepared(evidence)).await
+    }
+
+    async fn write_briefs(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        workflow: &WorkflowTemplateSpec,
+        source: BriefReadSource<'_>,
     ) -> Result<bool, String> {
         let Some(writer) = self.brief_artifact_writer.read().await.clone() else { return Ok(false) };
         // Admission brief addresses use (convoy, role, "brief", convoy). Role
@@ -1102,7 +993,22 @@ impl ConvoyAdmission {
         if agent_roles.is_empty() {
             return Ok(true);
         }
-        let (reads, observed) = self.brief_read_inventory(namespace, name, spec, workflow, read_snapshot, convoy_inventory).await?;
+        let definitions;
+        let convoys;
+        let evidence = match source {
+            BriefReadSource::Prepared(evidence) => evidence,
+            BriefReadSource::Load => {
+                definitions = self.load_brief_definitions(namespace, spec, workflow).await?;
+                convoys = match self.brief_query(namespace, name, spec, workflow, &definitions).await? {
+                    Some(query) => {
+                        self.backend.query_declared::<ResourceConvoy>(namespace, &query).await.map_err(|error| error.to_string())?.items
+                    }
+                    None => Vec::new(),
+                };
+                BriefEvidence { definitions: &definitions, convoys: &convoys }
+            }
+        };
+        let (reads, observed) = self.brief_read_inventory(namespace, name, spec, workflow, evidence).await?;
         let mut annotations = BTreeMap::new();
         if workflow.exit.is_none() {
             annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());
@@ -1332,14 +1238,14 @@ impl ConvoyAdmission {
         allow_unready: bool,
     ) -> Result<PlacementResolution, String> {
         self.decide_placement(
-            PolicyPlacementContext::builder()
-                .namespace(namespace)
-                .maybe_project_ref(project_ref)
-                .repositories(repositories)
-                .maybe_placement_policy(placement_policy)
-                .allow_unready(allow_unready)
-                .purpose(PlacementPurpose::Admission)
-                .build(),
+            PolicyPlacementContext {
+                namespace,
+                project_ref,
+                repositories,
+                placement_policy,
+                allow_unready,
+                purpose: PlacementPurpose::Admission,
+            },
             workflow,
         )
         .await
@@ -1350,7 +1256,7 @@ impl ConvoyAdmission {
         context: PolicyPlacementContext<'_>,
         workflow: &WorkflowTemplateSpec,
     ) -> Result<PlacementResolution, String> {
-        AdmissionReadContext { owner: self, backend: self.backend.clone() }.decide_placement(context, workflow).await
+        self.reads(self.backend.clone()).decide_placement(context, workflow).await
     }
 }
 
@@ -1406,8 +1312,7 @@ impl ConvoyAdmission {
                 &admission.name,
                 &admission.spec,
                 &admission.workflow,
-                admission.read_snapshot.as_ref(),
-                Some(&inventory),
+                BriefEvidence { definitions: &admission.evidence, convoys: &inventory },
             )
             .await?
         {
@@ -1497,7 +1402,7 @@ impl ConvoyAdmission {
             Ok(reads) => reads,
             Err(message) => return CommandValue::Error { message },
         };
-        let extra = match self.brief_query(namespace, name, &spec, workflow, read_snapshot.as_ref().unwrap_or(&self.backend)).await {
+        let extra = match self.brief_query(namespace, name, &spec, workflow, &read_snapshot).await {
             Ok(query) => query,
             Err(message) => return CommandValue::Error { message },
         };
@@ -1526,14 +1431,14 @@ impl ConvoyAdmission {
             .create_convoy_with_workflow_snapshot(
                 namespace,
                 name,
-                ConvoySnapshotBundle::builder()
-                    .maybe_read_snapshot(read_snapshot.as_ref())
-                    .convoy_inventory(inventory.as_slice())
-                    .spec(&spec)
-                    .workflow(workflow)
-                    .maybe_placement(placement.selected.as_ref().map(|placement| &placement.spec))
-                    .maybe_placement_decision(placement_decision)
-                    .build(),
+                ConvoySnapshotBundle {
+                    evidence: BriefEvidence { definitions: &read_snapshot, convoys: &inventory },
+                    spec: &spec,
+                    workflow,
+                    placement: placement.selected.as_ref().map(|placement| &placement.spec),
+                    placement_decision,
+                    vessel_placements: None,
+                },
                 ConvoyDispatchRegard::Emit,
             )
             .await
@@ -1544,12 +1449,78 @@ impl ConvoyAdmission {
     }
 }
 
-impl AdmissionReadContext<'_> {
-    pub(super) async fn check_remote_placement_free_space_floor(
+impl PlacementBuildJoiner<'_> {
+    async fn join_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
+        if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
+            if let flotilla_resources::DockerImageSource::Composition { composition } = &mut docker.image {
+                if composition.baseline_image.is_none() && composition.identity.is_none() {
+                    let inputs = self.inputs.read().await.clone().ok_or("image build input resolver is unavailable")?;
+                    composition.build_refs = crate::image_build::ImageBuildAdmission::new(self.backend.clone(), namespace, inputs)
+                        .join(&docker.host_ref, composition)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AdmissionRuntime<'_> {
+    async fn resolve_convoy_skills(
         &self,
-        namespace: &str,
-        placement: Option<&PlacementDecision>,
+        cascade: &flotilla_resources::ResolvedCascade,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        workflow: &mut WorkflowTemplateSpec,
     ) -> Result<(), String> {
+        use flotilla_resources::{resolve_skills, SkillCatalogEntry};
+        let required = cascade.skill_layers.iter().any(|(_, refs)| !refs.is_empty()) || !intent.skills.is_empty();
+        let catalog: Vec<SkillCatalogEntry> = if required {
+            let bundle =
+                self.discovery.env.get("FLOTILLA_SKILLS_DIR").ok_or_else(|| "skill admission requires FLOTILLA_SKILLS_DIR".to_string())?;
+            let path = PathBuf::from(bundle).join(".flotilla-skill-catalog.json");
+            let contents =
+                tokio::fs::read_to_string(&path).await.map_err(|error| format!("read pinned skill catalog {}: {error}", path.display()))?;
+            let catalog: Vec<SkillCatalogEntry> =
+                serde_json::from_str(&contents).map_err(|error| format!("decode pinned skill catalog: {error}"))?;
+            let manifest = tokio::fs::read_to_string(path.with_file_name(".flotilla-sources.json"))
+                .await
+                .map_err(|error| format!("read pinned skill sources: {error}"))?;
+            flotilla_resources::crew_defaults::validate_catalog(
+                &catalog,
+                &serde_json::from_str(&manifest).map_err(|error| format!("decode pinned skill sources: {error}"))?,
+            )?;
+            catalog
+        } else {
+            Vec::new()
+        };
+        for crew in workflow.roles.iter_mut().chain(workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
+            if matches!(crew.source, CrewSource::Agent { .. }) {
+                crew.skills =
+                    resolve_skills(&catalog, &cascade.skills_for(&crew.role, &intent.skills)).map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_convoy_issue_snapshot(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
+        let issue = self.issue_port.fetch_issue_by_ref(reference).await?;
+        if issue_snapshot_is_fresh(&issue) {
+            Ok(issue)
+        } else {
+            Err(format!("issue {} snapshot is too stale to admit", reference.id))
+        }
+    }
+
+    async fn admission_ai_utility(&self) -> Result<ProbedNamingUtility, String> {
+        let environment = self.environment_manager.environment_bag(self.local_environment_id);
+        let runner = self.environment_manager.environment_runner(self.local_environment_id);
+        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
+        probe_admission_ai_utility(&self.discovery.factories.ai_utilities, environment.as_ref(), self.config, &probe_root, runner).await
+    }
+}
+
+impl AdmissionReadContext<'_> {
+    async fn check_remote_placement_free_space_floor(&self, namespace: &str, placement: Option<&PlacementDecision>) -> Result<(), String> {
         let Some(placement) = placement else {
             return Ok(());
         };
@@ -1574,7 +1545,7 @@ impl AdmissionReadContext<'_> {
             return Ok(());
         }
 
-        let owns_target_identity = self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference);
+        let owns_target_identity = self.runtime.local_host.as_ref().is_some_and(|host_id| host_id == &target_host.reference);
         let capacity = if owns_target_identity {
             matching_sources
                 .iter()
@@ -1590,7 +1561,7 @@ impl AdmissionReadContext<'_> {
         check_placement_capacity(target_host, capacity)
     }
 
-    pub(super) async fn start_placement_host(
+    async fn start_placement_host(
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -1599,13 +1570,13 @@ impl AdmissionReadContext<'_> {
         let project_ref = &intent.project_ref;
         let placement = if intent.placement_policy.is_some() {
             self.decide_capability_placement(
-                &PlacementContext::builder()
-                    .namespace(&namespace)
-                    .project_ref(project_ref)
-                    .repositories(&[])
-                    .intent(&intent)
-                    .purpose(PlacementPurpose::Routing)
-                    .build(),
+                &PlacementContext {
+                    namespace: &namespace,
+                    project_ref,
+                    repositories: &[],
+                    intent: &intent,
+                    purpose: PlacementPurpose::Routing,
+                },
                 &WorkflowTemplateSpec::builder().build(),
                 &BTreeSet::new(),
             )
@@ -1633,13 +1604,13 @@ impl AdmissionReadContext<'_> {
             refresh_allocation_role_crews(&workflow, &mut roles)?;
             allocate_roles(&mut workflow, &roles)?;
             self.decide_vessel_placements(
-                &PlacementContext::builder()
-                    .namespace(&namespace)
-                    .project_ref(project_ref)
-                    .repositories(&repositories)
-                    .intent(&intent)
-                    .purpose(PlacementPurpose::Routing)
-                    .build(),
+                &PlacementContext {
+                    namespace: &namespace,
+                    project_ref,
+                    repositories: &repositories,
+                    intent: &intent,
+                    purpose: PlacementPurpose::Routing,
+                },
                 &mut workflow,
             )
             .await?
@@ -1650,8 +1621,7 @@ impl AdmissionReadContext<'_> {
         };
         let target = placement_target_host(&self.backend, &namespace, &policy).await?;
         let actuator = placement_actuator_host_ref(&self.backend, &namespace, &target).await?;
-        Ok((self.canonical_local_host_id().as_ref() != Some(&actuator))
-            .then(|| flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
+        Ok((self.runtime.local_host.as_ref() != Some(&actuator)).then(|| flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
     }
 
     async fn load<'a>(
@@ -1663,7 +1633,7 @@ impl AdmissionReadContext<'_> {
             CrewDefaults, CrewImageBaseline, DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageBuild, ImageLayer,
             ReadResourceList, FLEET_DESIGNATION_NAME,
         };
-        use flotilla_store::{StoreQuery, ViewSnapshot};
+        use flotilla_store::StoreQuery;
         let backend = &owner.backend;
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
         // All graph declarations participate in ancestor/cycle validation. Load
@@ -1838,43 +1808,25 @@ impl AdmissionReadContext<'_> {
         } else {
             ReadResourceList { items: Vec::new() }
         };
-        let mut snapshot = ViewSnapshot::new(Some(backend.local_root().map_err(|error| error.to_string())?));
-        macro_rules! insert {
-            ($kind:ty, $inventory:expr) => {
-                snapshot.insert::<$kind>(namespace, $inventory).map_err(|error| error.to_string())?;
-            };
-        }
-        macro_rules! definitions {
-            ($kind:ty, $inventory:expr) => {
-                insert!(
-                    $kind,
-                    ReadResourceList {
-                        items: $inventory
-                            .into_iter()
-                            .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
-                            .collect()
-                    }
-                );
-            };
-        }
-        definitions!(Project, projects);
-        definitions!(FleetDesignation, fleet);
-        definitions!(CrewDefaults, defaults);
-        definitions!(Forge, forges);
-        definitions!(WorkflowTemplate, workflows);
-        definitions!(CrewImageBaseline, baselines);
-        definitions!(ImageLayer, image_layers);
-        insert!(Repository, repository_sources);
-        insert!(FulfilmentKind, kinds);
-        insert!(PlacementPolicy, policies);
-        insert!(ResourceHost, hosts);
-        insert!(CredentialGrant, grants);
-        insert!(CredentialSpec, credentials);
-        insert!(ImageBuild, builds);
-        Ok(AdmissionReadContext { owner, backend: ResourceBackend::new(snapshot) })
+        let mut snapshot = project_ops::RequestSnapshot::new(backend, namespace)?;
+        snapshot.insert_definitions::<Project>(projects)?;
+        snapshot.insert_definitions::<FleetDesignation>(fleet)?;
+        snapshot.insert_definitions::<CrewDefaults>(defaults)?;
+        snapshot.insert_definitions::<Forge>(forges)?;
+        snapshot.insert_definitions::<WorkflowTemplate>(workflows)?;
+        snapshot.insert_definitions::<CrewImageBaseline>(baselines)?;
+        snapshot.insert_definitions::<ImageLayer>(image_layers)?;
+        snapshot.insert::<Repository>(repository_sources)?;
+        snapshot.insert::<FulfilmentKind>(kinds)?;
+        snapshot.insert::<PlacementPolicy>(policies)?;
+        snapshot.insert::<ResourceHost>(hosts)?;
+        snapshot.insert::<CredentialGrant>(grants)?;
+        snapshot.insert::<CredentialSpec>(credentials)?;
+        snapshot.insert::<ImageBuild>(builds)?;
+        Ok(owner.reads(snapshot.finish()))
     }
 
-    pub(super) async fn resolve_continuation(
+    async fn resolve_continuation(
         &self,
         repositories: &[ConvoyRepositorySpec],
         continuation: &flotilla_protocol::ConvoyContinuation,
@@ -1923,7 +1875,7 @@ impl AdmissionReadContext<'_> {
         Ok((key, branch, resolved))
     }
 
-    pub(super) async fn resolve_convoy_change_request_admission(
+    async fn resolve_convoy_change_request_admission(
         &self,
         repository_keys: &[RepositoryKey],
         requested_id: &str,
@@ -1997,11 +1949,11 @@ impl AdmissionReadContext<'_> {
         }
     }
 
-    pub(super) async fn repository_change_request_candidates(
+    async fn repository_change_request_candidates(
         &self,
         repository_keys: &[RepositoryKey],
     ) -> (Vec<(RepositoryKey, String, Arc<dyn ChangeRequestTracker>)>, Vec<String>) {
-        let namespace = self.provisioning_namespace().await;
+        let namespace = self.runtime.namespace.clone();
         let repositories = self.backend.including_replicas::<Repository>(&namespace);
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
@@ -2017,20 +1969,20 @@ impl AdmissionReadContext<'_> {
                 failures.push(format!("repository {repository_key}: no forge identity"));
                 continue;
             };
-            if let Some(cached) = self.repository_change_requests.read().await.get(repository_key) {
+            if let Some(cached) = self.runtime.repository_change_requests.read().await.get(repository_key) {
                 if cached.service_url == identity.service_url && cached.repository == identity.repository {
                     candidates.push((repository_key.clone(), identity.repository.clone(), Arc::clone(&cached.provider)));
                     continue;
                 }
             }
-            let provider = match self.discover_repository_change_request(&namespace, &repository.spec).await {
+            let provider = match self.runtime.change_request_port.discover_repository_change_request(&namespace, &repository.spec).await {
                 Ok(provider) => provider,
                 Err(error) => {
                     failures.push(format!("repository {}: {error}", identity.repository));
                     continue;
                 }
             };
-            self.repository_change_requests.write().await.insert(
+            self.runtime.repository_change_requests.write().await.insert(
                 repository_key.clone(),
                 RepositoryChangeRequestProvider {
                     service_url: identity.service_url.clone(),
@@ -2043,7 +1995,7 @@ impl AdmissionReadContext<'_> {
         (candidates, failures)
     }
 
-    pub(super) async fn resolve_convoy_issue(
+    async fn resolve_convoy_issue(
         &self,
         namespace: &str,
         project: &ResourceObject<Project>,
@@ -2080,18 +2032,21 @@ impl AdmissionReadContext<'_> {
                         reference.source.service, reference.source.scope, project.metadata.name
                     ));
                 };
-                self.resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef {
-                    source: binding.source.clone(),
-                    id: reference.id.clone(),
-                })
-                .await?
+                self.runtime
+                    .resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef {
+                        source: binding.source.clone(),
+                        id: reference.id.clone(),
+                    })
+                    .await?
             }
             flotilla_protocol::IssueSelector::Alias { alias, id } => {
                 let binding = sources
                     .iter()
                     .find(|binding| binding.alias == *alias)
                     .ok_or_else(|| format!("project {} has no issue source alias `{alias}`", project.metadata.name))?;
-                self.resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef { source: binding.source.clone(), id: id.clone() }).await?
+                self.runtime
+                    .resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef { source: binding.source.clone(), id: id.clone() })
+                    .await?
             }
             flotilla_protocol::IssueSelector::Id(id) => {
                 if sources.len() != 1 {
@@ -2101,7 +2056,8 @@ impl AdmissionReadContext<'_> {
                         sources.len()
                     ));
                 }
-                self.resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef { source: sources[0].source.clone(), id: id.clone() })
+                self.runtime
+                    .resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef { source: sources[0].source.clone(), id: id.clone() })
                     .await?
             }
         };
@@ -2138,7 +2094,7 @@ impl AdmissionReadContext<'_> {
         })
     }
 
-    pub(super) async fn resolve_convoy_admission_workflow(
+    async fn resolve_convoy_admission_workflow(
         &self,
         namespace: &str,
         project_ref: &str,
@@ -2243,14 +2199,14 @@ impl AdmissionReadContext<'_> {
             }
         }
         if purpose == PlacementPurpose::Admission {
-            self.resolve_convoy_skills(&cascade, intent, &mut workflow.spec).await?;
+            self.runtime.resolve_convoy_skills(&cascade, intent, &mut workflow.spec).await?;
             validate_fork_workflow_admission(&self.backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
         }
         workflow.spec.cascade = Some(Box::new(cascade));
         Ok((workflow_ref, workflow.spec))
     }
 
-    pub(super) async fn compose_convoy_needs(
+    async fn compose_convoy_needs(
         &self,
         namespace: &str,
         project: &ProjectSpec,
@@ -2372,14 +2328,14 @@ impl AdmissionReadContext<'_> {
         if purpose == PlacementPurpose::Routing && intent.placement_policy.is_some() {
             return self
                 .decide_placement(
-                    PolicyPlacementContext::builder()
-                        .namespace(namespace)
-                        .maybe_project_ref(Some(project_ref))
-                        .repositories(repositories)
-                        .maybe_placement_policy(intent.placement_policy.as_deref())
-                        .allow_unready(true)
-                        .purpose(purpose)
-                        .build(),
+                    PolicyPlacementContext {
+                        namespace,
+                        project_ref: Some(project_ref),
+                        repositories,
+                        placement_policy: intent.placement_policy.as_deref(),
+                        allow_unready: true,
+                        purpose,
+                    },
                     workflow,
                 )
                 .await
@@ -2402,14 +2358,14 @@ impl AdmissionReadContext<'_> {
             }
             return self
                 .decide_placement(
-                    PolicyPlacementContext::builder()
-                        .namespace(namespace)
-                        .maybe_project_ref(Some(project_ref))
-                        .repositories(repositories)
-                        .maybe_placement_policy(pin)
-                        .allow_unready(false)
-                        .purpose(purpose)
-                        .build(),
+                    PolicyPlacementContext {
+                        namespace,
+                        project_ref: Some(project_ref),
+                        repositories,
+                        placement_policy: pin,
+                        allow_unready: false,
+                        purpose,
+                    },
                     workflow,
                 )
                 .await
@@ -2534,14 +2490,14 @@ impl AdmissionReadContext<'_> {
             }
             match self
                 .decide_placement(
-                    PolicyPlacementContext::builder()
-                        .namespace(namespace)
-                        .maybe_project_ref(Some(project_ref))
-                        .repositories(repositories)
-                        .maybe_placement_policy(Some(&kind.metadata.name))
-                        .allow_unready(true)
-                        .purpose(purpose)
-                        .build(),
+                    PolicyPlacementContext {
+                        namespace,
+                        project_ref: Some(project_ref),
+                        repositories,
+                        placement_policy: Some(&kind.metadata.name),
+                        allow_unready: true,
+                        purpose,
+                    },
                     workflow,
                 )
                 .await
@@ -2580,7 +2536,7 @@ impl AdmissionReadContext<'_> {
                     let free_slots = facts.and_then(|facts| facts.free_vessel_slots);
                     let host_ready = host.and_then(|host| host.status.as_ref()).is_some_and(|status| {
                         let mut status = status.clone();
-                        status.apply_heartbeat_readiness(self.clock.now());
+                        status.apply_heartbeat_readiness(self.runtime.clock.now());
                         status.ready
                     });
                     let sleeping_until = host.and_then(|host| host.status.as_ref()).and_then(|status| status.sleeping_until);
@@ -2592,7 +2548,7 @@ impl AdmissionReadContext<'_> {
                             &policy.metadata.name,
                             &kind.spec.host_ref,
                             host.and_then(|host| host.status.as_ref()),
-                            self.clock.now(),
+                            self.runtime.clock.now(),
                         ) {
                             rejected.push(refusal(reason));
                             continue;
@@ -2605,7 +2561,7 @@ impl AdmissionReadContext<'_> {
                         policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                         &kind.spec.realisation,
                         composed.as_deref(),
-                        self.image_build_inputs.read().await.clone(),
+                        self.runtime.image_build_inputs.read().await.clone(),
                     )
                     .await?;
                     candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until, image_cost });
@@ -2626,7 +2582,7 @@ impl AdmissionReadContext<'_> {
                 rejected.iter().map(|refusal| format!("{}: {}", refusal.policy_name, refusal.reason)).collect::<Vec<_>>().join("; ")
             ));
         }
-        let placement_tiebreak = self.fulfilment_decider.for_admission(needs, self.clock.now());
+        let placement_tiebreak = self.runtime.fulfilment_decider.for_admission(needs, self.runtime.clock.now());
         // Hold scarce platform capacity only when unreserved capacity also covers the needs.
         let has_unreserved = candidates.iter().any(|candidate| !placement_tiebreak.reserved(candidate));
         let mut reserved = Vec::new();
@@ -2807,7 +2763,7 @@ impl AdmissionReadContext<'_> {
                     .await?;
                 }
                 if purpose == PlacementPurpose::Admission {
-                    self.join_placement_builds(namespace, &mut resolution).await?;
+                    self.runtime.builds.join_placement_builds(namespace, &mut resolution).await?;
                 }
                 workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
@@ -2855,7 +2811,7 @@ impl AdmissionReadContext<'_> {
                 }
             }
             if purpose == PlacementPurpose::Admission {
-                self.join_placement_builds(namespace, &mut result.0).await?;
+                self.runtime.builds.join_placement_builds(namespace, &mut result.0).await?;
             }
             result
         };
@@ -2890,7 +2846,7 @@ impl AdmissionReadContext<'_> {
                 }
             }
             None => {
-                let local_host_id = self.canonical_local_host_id();
+                let local_host_id = self.runtime.local_host.clone();
                 let placement = decide_default_placement(
                     &self.backend,
                     namespace,
@@ -2935,7 +2891,7 @@ impl AdmissionReadContext<'_> {
         Ok(placement)
     }
 
-    pub(super) async fn prepare_convoy_admission_with_preferences(
+    async fn prepare_convoy_admission_with_preferences(
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
@@ -3053,7 +3009,7 @@ impl AdmissionReadContext<'_> {
             .flatten()
             .collect::<Vec<_>>()
             .join("\n");
-            Some(match self.admission_ai_utility().await {
+            Some(match self.runtime.admission_ai_utility().await {
                 Ok(ProbedNamingUtility { name, utility }) => utility
                     .generate_convoy_names(&context)
                     .await
@@ -3091,13 +3047,13 @@ impl AdmissionReadContext<'_> {
         validate_convoy_branch(&branch)?;
         let (placement, minimal_alternatives, vessel_placements) = self
             .decide_vessel_placements(
-                &PlacementContext::builder()
-                    .namespace(namespace)
-                    .project_ref(project_ref)
-                    .repositories(&repositories_snapshot)
-                    .intent(intent)
-                    .purpose(PlacementPurpose::Admission)
-                    .build(),
+                &PlacementContext {
+                    namespace,
+                    project_ref,
+                    repositories: &repositories_snapshot,
+                    intent,
+                    purpose: PlacementPurpose::Admission,
+                },
                 &mut workflow,
             )
             .await?;
@@ -3136,7 +3092,7 @@ impl AdmissionReadContext<'_> {
             instruction: intent.instruction.clone(),
         };
         Ok(PreparedConvoyAdmission::builder()
-            .read_snapshot(self.backend.clone())
+            .evidence(self.backend.clone())
             .name(String::new())
             .maybe_naming(naming)
             .spec(spec)
@@ -3161,7 +3117,7 @@ pub struct PreparedConvoyAdmission {
     pub(super) naming: Option<ConvoyNaming>,
     // Reuse the exact host/policy evidence of this request through final capacity
     // validation; it is neither stored nor reused by another request.
-    read_snapshot: Option<ResourceBackend>,
+    evidence: ResourceBackend,
 
     pub(super) name: String,
     pub(super) spec: ConvoySpec,
@@ -3815,15 +3771,24 @@ pub(super) fn resolve_convoy_candidate_indices(identities: &[ConvoyAddressIdenti
     ))
 }
 
-#[derive(bon::Builder)]
-pub(super) struct ConvoySnapshotBundle<'a> {
+#[derive(Clone, Copy)]
+struct BriefEvidence<'a> {
+    definitions: &'a ResourceBackend,
+    convoys: &'a [ReadResourceObject<ResourceConvoy>],
+}
+
+enum BriefReadSource<'a> {
+    Load,
+    Prepared(BriefEvidence<'a>),
+}
+
+struct ConvoySnapshotBundle<'a> {
     pub(super) spec: &'a ConvoySpec,
     pub(super) workflow: &'a WorkflowTemplateSpec,
     pub(super) placement: Option<&'a PlacementPolicySpec>,
     pub(super) placement_decision: Option<PlacementDecision>,
     pub(super) vessel_placements: Option<&'a BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>>,
-    pub(super) read_snapshot: Option<&'a ResourceBackend>,
-    pub(super) convoy_inventory: Option<&'a [ReadResourceObject<ResourceConvoy>]>,
+    evidence: BriefEvidence<'a>,
 }
 
 /// An issue body is the crew's contract, so admission may only reuse a
@@ -5422,12 +5387,32 @@ mod tests {
             let before = observed.read_calls();
             let decoded_before = observed.read_counts();
             if reuse {
-                let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap().unwrap();
+                let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();
                 let query = fixture.owner.brief_query("flotilla", "target", &spec, &workflow, &snapshot).await.unwrap().unwrap();
                 let inventory = observed.query_declared::<ResourceConvoy>("flotilla", &query).await.unwrap().items;
+                // Incomplete prepared evidence must refuse, never fall back to native reads.
+                let missing = ResourceBackend::new(flotilla_store::ViewSnapshot::default());
+                let error = fixture
+                    .owner
+                    .write_admission_briefs_from_inventory(
+                        "flotilla",
+                        "target",
+                        &spec,
+                        &workflow,
+                        BriefEvidence { definitions: &missing, convoys: &inventory },
+                    )
+                    .await
+                    .expect_err("missing prepared evidence");
+                assert!(error.contains("kind Repository missing from view snapshot"), "{error}");
                 assert!(fixture
                     .owner
-                    .write_admission_briefs_from_inventory("flotilla", "target", &spec, &workflow, Some(&snapshot), Some(&inventory))
+                    .write_admission_briefs_from_inventory(
+                        "flotilla",
+                        "target",
+                        &spec,
+                        &workflow,
+                        BriefEvidence { definitions: &snapshot, convoys: &inventory }
+                    )
                     .await
                     .expect("render reused briefs"));
             } else {
@@ -5453,6 +5438,62 @@ mod tests {
         }
         assert_eq!(outcomes[0], outcomes[1]);
         assert_eq!(outcomes[2], outcomes[3]);
+    }
+
+    // Preparation captures capacity evidence; later native writes cannot silently
+    // replace that evidence or add reads during the per-vessel capacity check.
+    #[tokio::test]
+    async fn prepared_capacity_uses_captured_evidence() {
+        use flotilla_resources::{HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus};
+        use flotilla_store_testkit::ReadCountsBackendExt;
+        for (captured, current) in [(100, 0), (0, 100)] {
+            let mut fixture = handler_contract_fixture().await;
+            let counted = fixture.backend.clone().with_read_counts();
+            fixture.owner.backend = counted.clone();
+            let hosts = fixture.backend.using::<ResourceHost>("flotilla");
+            let host = hosts.create(&InputMeta::builder().name("remote".into()).build(), &HostSpec::default()).await.unwrap();
+            let capacity =
+                |bytes| HostStatus { disk_free_bytes: Some(bytes), admission_free_space_floor_bytes: Some(20), ..Default::default() };
+            let host = hosts.update_status("remote", &host.metadata.resource_version, &capacity(captured)).await.unwrap();
+            fixture
+                .backend
+                .using::<PlacementPolicy>("flotilla")
+                .create(
+                    &InputMeta::builder().name("remote-policy".into()).build(),
+                    &PlacementPolicySpec::builder()
+                        .pool("passthrough".into())
+                        .host_direct(HostDirectPlacementPolicySpec {
+                            host_ref: "remote".into(),
+                            checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                        })
+                        .build(),
+                )
+                .await
+                .unwrap();
+            let mut evidence = project_ops::RequestSnapshot::new(&counted, "flotilla").unwrap();
+            evidence.copy::<ResourceHost>(&counted).await.unwrap();
+            evidence.copy::<PlacementPolicy>(&counted).await.unwrap();
+            let admission = PreparedConvoyAdmission::builder()
+                .evidence(evidence.finish())
+                .name("prepared".into())
+                .spec(ConvoySpec::builder().workflow_ref("scratch".into()).build())
+                .workflow(WorkflowTemplateSpec::builder().build())
+                .placement_decision(PlacementDecision {
+                    policy_name: "remote-policy".into(),
+                    target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("remote"), display_name: "remote".into() },
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
+                    refused_candidates: Vec::new(),
+                    viable_not_selected: Vec::new(),
+                    allocation: None,
+                })
+                .build();
+            hosts.update_status("remote", &host.metadata.resource_version, &capacity(current)).await.unwrap();
+            let before = counted.read_calls();
+            let result = fixture.owner.check_prepared_placement_floors("flotilla", &admission).await;
+            assert_eq!(result.is_ok(), captured >= 20, "captured={captured}, current={current}: {result:?}");
+            assert_eq!(counted.read_calls(), before, "capacity validation must not reread the native store");
+        }
     }
 
     // Admission prepares multiple vessels from one selected inventory per kind;

@@ -1238,6 +1238,7 @@ mod tests {
             Ok((
                 ensure.clone(),
                 PreparedConvoyAdmission::builder()
+                    .evidence(self.backend.clone())
                     .name("unused".into())
                     .spec(ConvoySpec::builder().workflow_ref("standing".into()).build())
                     .workflow(WorkflowTemplateSpec::builder().build())
