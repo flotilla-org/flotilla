@@ -20,6 +20,7 @@ flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
 flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
 flotilla-agent = { path = "../flotilla-agent" }
+flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }

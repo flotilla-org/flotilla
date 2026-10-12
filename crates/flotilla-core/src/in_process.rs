@@ -137,12 +137,6 @@ use crate::model::RepoModel;
 use crate::ops_entry::ENSURED_FROM_ANNOTATION;
 use crate::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
 use crate::ops_entry::SOURCE_COMMIT_ANNOTATION;
-use crate::providers::discovery::discover_checkout_with_host_scoped;
-use crate::providers::discovery::run_host_detectors;
-use crate::providers::discovery::status::provider_names_from_registry;
-use crate::providers::discovery::DiscoveryResult;
-use crate::providers::discovery::DiscoveryRuntime;
-use crate::providers::registry::ProviderRegistry;
 use crate::regard_lifecycle::RegardLifecycle;
 use crate::regard_lifecycle::SurfaceGestureOutcome;
 use crate::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
@@ -164,6 +158,12 @@ use flotilla_ai_utility::AiUtility;
 use flotilla_ai_utility::ConvoyNames;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_daemon_api::daemon::{DaemonHandle, QuerySubscription};
+use flotilla_discovery::discover_checkout_with_host_scoped;
+use flotilla_discovery::registry::ProviderRegistry;
+use flotilla_discovery::run_host_detectors;
+use flotilla_discovery::status::provider_names_from_registry;
+use flotilla_discovery::DiscoveryResult;
+use flotilla_discovery::DiscoveryRuntime;
 use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_paths::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
@@ -1252,10 +1252,7 @@ pub async fn discover_repo_for_environment(
     let remote_env = StaticEnvVars::from_bag(&host_bag);
     let env: &dyn EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
 
-    let host_scoped = discovery
-        .host_scoped_providers
-        .discover_for_environment(environment_id, &host_bag, &discovery.factories, config, &ee_path, Arc::clone(&runner))
-        .await;
+    let host_scoped = discovery.discover_host_scoped(environment_id, &host_bag, config, &ee_path, Arc::clone(&runner)).await;
     Ok(discover_checkout_with_host_scoped(
         &host_bag,
         &ee_path,
@@ -1625,7 +1622,7 @@ impl InProcessDaemon {
         resource_backend: ResourceBackend,
         clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
-        use crate::providers::discovery::DiscoveryResult;
+        use flotilla_discovery::DiscoveryResult;
 
         let mut discovery = discovery;
         let forge_budgets = flotilla_forge_github::forge_budget::ForgeBudgets::default();
@@ -1671,11 +1668,9 @@ impl InProcessDaemon {
             .environment_runner(&local_environment_id)
             .expect("local direct environment runner should always be available");
         let local_host_discovery = discovery
-            .host_scoped_providers
-            .discover_for_environment(
+            .discover_host_scoped(
                 &local_environment_id,
                 &local_host_bag,
-                &discovery.factories,
                 &config,
                 &ExecutionEnvironmentPath::new(config.base_path().as_ref()),
                 local_runner,

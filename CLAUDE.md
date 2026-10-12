@@ -131,8 +131,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 |-------|------|
 | `flotilla-build-features` | No runtime interface; shared native dependency features and host proc-macro features for stable build/test reuse |
 | `flotilla-terminal` | Terminal pool traits, Cleat and passthrough adapters, factories and shared session scans |
-| `flotilla-discovery-api` | Environment facts, narrow provider config view, detectors and generic factory contracts |
-| `flotilla-provider-runtime` | Command and HTTP runners, generic invocation macros, neutral observation errors, environment variables, shared scans and bounded host probes |
+| `flotilla-discovery-api` | Environment facts, narrow provider config view, detector traits, shared generic probe detectors (environment variable, command version, binary path resolution, version parsing) and generic factory contracts |
+| `flotilla-provider-runtime` | Command and HTTP runners, generic invocation macros, neutral observation errors, environment variables, shared scans, bounded host probes and the injected free-space probe |
 | `flotilla-forge-github` | GitHub client, invocation macros, rate-limit classification, polling, telemetry, host budget accounting and discovery-time repository resolution |
 | `flotilla-environment` | Environment and image capability traits, Docker and host-direct adapters, factories and transport hop resolution |
 | `flotilla-vcs` | Checkout-scoped VCS traits, Git strategies, factory and Git discovery probes |
@@ -142,7 +142,8 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-change-request` | Change-request tracker and observation-source traits, GitHub/Forgejo implementations, branch-absence observer and factories |
 | `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
 | `flotilla-agent` | Agent harness adapters and registry, crew brief rendering, hook parsing and installation, agent state store, process-exit receipts |
-| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, step plans, `InProcessDaemon` composition root |
+| `flotilla-discovery` | Static factory-list assembly, default detector lists, detector runs, provider discovery, host-scoped provider cache, `ProviderRegistry` and provider status |
+| `flotilla-core` | Refresh, observed-resource projection, convoy admission and controller ports, executor, config, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
 | `flotilla-daemon-api` | `DaemonHandle` interface, query subscription token, build identity and lifecycle lock file |
@@ -188,7 +189,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-agent/src/process.rs` | Process-exit receipts and image preludes for agents in persistent terminal shells |
 | `crates/flotilla-agent/src/attachable.rs` | Agent-hook identity shim pending AgentSession |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
-| `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry and discovery |
+| `crates/flotilla-discovery/src/lib.rs` | `DiscoveryRuntime`, detector runs, checkout and host-scoped provider discovery |
+| `crates/flotilla-discovery/src/registry.rs` | `ProviderRegistry`, typed provider sets and `command_provider_registry` |
+| `crates/flotilla-discovery/src/factories.rs`, `crates/flotilla-discovery/src/detectors/` | Default factory and detector lists |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |
 | `crates/flotilla-core/src/template.rs` | `.flotilla/workspace.yaml` pane templates |
 | `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |
@@ -219,7 +222,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 
 ### Provider Traits
 
-Provider traits live in their type crates as they are extracted, with remaining traits under `crates/flotilla-core/src/providers/`:
+Provider traits live in their type crates:
 
 - **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
 - **ChangeRequestTracker** (`crates/flotilla-change-request/src/lib.rs`, `crates/flotilla-change-request/src/github.rs`, `crates/flotilla-change-request/src/forgejo.rs`)
@@ -232,12 +235,12 @@ Provider labels and implementation names live in the `ProviderDescriptor` regist
 
 ### Discovery and Provider Construction
 
-Providers are constructed via **factories** (`discovery/factories/`) that receive an `EnvironmentBag` — a typed collection of `EnvironmentAssertion` values populated by **detectors** (`discovery/detectors/`).
+Providers are constructed via **factories** (each type crate's `factories` module, assembled by `FactoryRegistry::default_all()` in `crates/flotilla-discovery/src/factories.rs`) that receive an `EnvironmentBag` — a typed collection of `EnvironmentAssertion` values populated by **detectors** (type-specific detectors in their type crates, shared generic probes in `crates/flotilla-discovery-api/src/detectors.rs`, and the default lists in `crates/flotilla-discovery/src/detectors/`).
 
 - **Host detectors** (`HostDetector`) probe the daemon's environment: available binaries, env vars, sockets. They receive an injected `CommandRunner` and `EnvVars` trait — **never use `std::env` directly** in providers or factories.
 - **Repo detectors** (`RepoDetector`) probe checkout facts (VCS roots). Forge assertions come from `RepositorySpec::forge()`, not checkout remotes.
 - The `EnvironmentBag` provides typed queries: `find_binary()`, `find_env_var()`, `find_socket()`, `find_vcs_checkout()`, `find_remote_host()`.
-- Factories call `env.find_binary("tool")` to check availability, `env.find_env_var("KEY")` for env values, and receive a `ConfigStore` for user preferences.
+- Factories call `env.find_binary("tool")` to check availability, `env.find_env_var("KEY")` for env values, and receive a `ProviderConfigView` for user preferences.
 
 **Why injected collaborators?** The daemon may run discovery for remote hosts or container environments where the host process's own env vars and binaries are wrong. The `EnvVars` trait and `CommandRunner` trait abstract this so tests can inject values and environments can provide their own. Never use `std::env` or `std::process::Command` directly in providers — always go through the injected `EnvVars` and `CommandRunner`.
 
@@ -260,7 +263,7 @@ The ast-grep operation boundary check in the existing format job rejects literal
 - `crates/flotilla-environment/src/environment/runner.rs`
 - `crates/flotilla-environment/src/factories/docker.rs` (discovery version probe)
 
-Local daemon probing uses the discovered provider instance. Callers without a discovery registry may compose a known command endpoint with `flotilla_environment::environment::command_provider` or core's `providers::registry::command_provider_registry`: candidate validation deliberately reads the operator host through `ProcessCommandRunner`, and agentless SSH detection uses its remote runner. These helpers do not select a configured cache instance; callers with a registry must use that existing instance. Missing or ambiguous providers publish fresh unknown fulfilment facts, clearing stale affirmative evidence. Malformed successful image inspections are also unknown, rather than reporting an image present without an identity.
+Local daemon probing uses the discovered provider instance. Callers without a discovery registry may compose a known command endpoint with `flotilla_environment::environment::command_provider` or `flotilla_discovery::registry::command_provider_registry`: candidate validation deliberately reads the operator host through `ProcessCommandRunner`, and agentless SSH detection uses its remote runner. These helpers do not select a configured cache instance; callers with a registry must use that existing instance. Missing or ambiguous providers publish fresh unknown fulfilment facts, clearing stale affirmative evidence. Malformed successful image inspections are also unknown, rather than reporting an image present without an identity.
 
 Concrete environment adapters and Buildx types belong under `crates/flotilla-environment/src/`; only `crates/flotilla-daemon/src/runtime.rs`, the composition root, may name them elsewhere. This allowance does not permit raw runtime commands or literal provider selection in the composition root. New runtime adapters require an explicit file-level allowlist change. Genuine test fixtures are exempt; production inclusions of fixture files remain checked. Build tooling has no runtime exemption.
 

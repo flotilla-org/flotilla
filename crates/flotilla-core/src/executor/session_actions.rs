@@ -3,10 +3,9 @@ use std::collections::HashMap;
 use flotilla_protocol::{provider_data::Issue, CommandValue, IssueSource};
 use tracing::{info, warn};
 
-use crate::{
-    provider_data::ProviderData,
-    providers::{registry::ProviderRegistry, types::CloudAgentSession},
-};
+use crate::provider_data::ProviderData;
+use flotilla_discovery::registry::ProviderRegistry;
+use flotilla_protocol::CloudAgentSession;
 
 pub(super) struct ReadOnlySessionActionService<'a> {
     issue_source: IssueSource,

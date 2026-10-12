@@ -1,6 +1,7 @@
 //! Repository capabilities are independent of observation roots and working copies.
 use super::*;
-use crate::{in_process::convoy_admission::repository_provider_bag, providers::registry::ProviderSet};
+use crate::in_process::convoy_admission::repository_provider_bag;
+use flotilla_discovery::registry::ProviderSet;
 use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
 
 /// Forge identity or Repository key identifies a row independently of any
@@ -147,18 +148,8 @@ impl InProcessDaemon {
             }
         }
         let host_bag = self.environment_manager.local_environment_bag();
-        let host = self
-            .discovery
-            .host_scoped_providers
-            .discover_for_environment(
-                &self.local_environment_id,
-                &host_bag,
-                &self.discovery.factories,
-                &self.config,
-                &probe_root,
-                runner.clone(),
-            )
-            .await;
+        let host =
+            self.discovery.discover_host_scoped(&self.local_environment_id, &host_bag, &self.config, &probe_root, runner.clone()).await;
         host.install(&mut registry, &mut unmet);
         let lease = Arc::new(
             RepositoryProviderLease::builder()

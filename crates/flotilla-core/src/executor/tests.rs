@@ -23,8 +23,6 @@ use super::{
 use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
-use crate::providers::registry::ProviderRegistry;
-use crate::providers::types::*;
 use crate::step::StepAction;
 use crate::step::StepExecutionContext;
 use crate::step::StepOutcome;
@@ -34,9 +32,11 @@ use crate::testkits::discovery::test_vcs_resolver;
 use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use flotilla_issue_tracker::IssueProvider;
+use flotilla_protocol::{ChangeRequest, Checkout, CloudAgentSession, Issue};
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)

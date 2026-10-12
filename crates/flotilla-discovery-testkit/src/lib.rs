@@ -14,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::ChangeRequestTracker;
-use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
+use flotilla_discovery::{DiscoveryRuntime, FactoryRegistry};
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
@@ -364,13 +364,13 @@ impl CommandRunner for DiscoveryMockRunner {
 }
 /// Build a `DiscoveryRuntime` that uses no-op env and a minimal fake runner
 /// (only responds to `git --version`). Avoids probing ambient host tools.
-pub fn fake_discovery(_legacy_mode: bool) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+pub fn fake_discovery(_legacy_mode: bool) -> flotilla_discovery::DiscoveryRuntime {
     minimal_discovery_runtime(std::sync::Arc::new(
         DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build(),
     ))
 }
 
-pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> flotilla_discovery::DiscoveryRuntime {
     let mut discovery = fake_discovery(legacy_mode);
     discovery.env = std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]).with_host_os(host_os));
     discovery
@@ -378,31 +378,28 @@ pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> flotilla_c
 
 /// Build a `DiscoveryRuntime` whose local environment runs entirely through
 /// the given (typically mock) command runner.
-pub fn fake_discovery_with_runner(
-    _legacy_mode: bool,
-    runner: std::sync::Arc<dyn CommandRunner>,
-) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+pub fn fake_discovery_with_runner(_legacy_mode: bool, runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_discovery::DiscoveryRuntime {
     minimal_discovery_runtime(runner)
 }
 
 /// Build a `DiscoveryRuntime` that allows real git commands while still
 /// avoiding ambient host-tool probes like gh, Codex, Claude, or cmux.
-pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+pub fn git_process_discovery(_legacy_mode: bool) -> flotilla_discovery::DiscoveryRuntime {
     minimal_discovery_runtime(std::sync::Arc::new(flotilla_provider_runtime::ProcessCommandRunner))
 }
 
-fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_core::providers::discovery::DiscoveryRuntime {
+fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> flotilla_discovery::DiscoveryRuntime {
     DiscoveryRuntime::builder()
         .runner(runner)
         .env(std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])))
         .available_space_probe(fixed_available_space_probe())
-        .host_detectors(std::sync::Arc::new(vec![Box::new(flotilla_core::providers::discovery::detectors::generic::CommandDetector::new(
+        .host_detectors(std::sync::Arc::new(vec![Box::new(flotilla_discovery_api::detectors::CommandDetector::new(
             "git",
             &["--version"],
-            flotilla_core::providers::discovery::detectors::generic::parse_first_dotted_version,
+            flotilla_discovery_api::detectors::parse_first_dotted_version,
         ))]))
-        .repo_detectors(flotilla_core::providers::discovery::detectors::default_repo_detectors())
-        .factories(flotilla_core::providers::discovery::FactoryRegistry::default_all())
+        .repo_detectors(flotilla_discovery::detectors::default_repo_detectors())
+        .factories(flotilla_discovery::FactoryRegistry::default_all())
         .build()
 }
 // ---------------------------------------------------------------------------
@@ -1256,22 +1253,22 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
     let runner: Arc<dyn CommandRunner> =
         Arc::new(DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build());
 
-    let mut vcs: Vec<Box<flotilla_core::providers::discovery::VcsFactory>> = Vec::new();
+    let mut vcs: Vec<Box<flotilla_discovery::VcsFactory>> = Vec::new();
     if let Some(cm) = providers.checkout_manager {
         vcs.push(Box::new(ArcVcsFactory(cm)));
     }
 
-    let mut change_request_factories: Vec<Box<flotilla_core::providers::discovery::ChangeRequestFactory>> = Vec::new();
+    let mut change_request_factories: Vec<Box<flotilla_discovery::ChangeRequestFactory>> = Vec::new();
     if let Some(cr) = providers.change_request {
         change_request_factories.push(Box::new(FakeChangeRequestFactory(cr)));
     }
 
-    let mut issue_tracker_factories: Vec<Box<flotilla_core::providers::discovery::IssueProviderFactory>> = Vec::new();
+    let mut issue_tracker_factories: Vec<Box<flotilla_discovery::IssueProviderFactory>> = Vec::new();
     if let Some(it) = providers.issue_tracker {
         issue_tracker_factories.push(Box::new(FakeIssueProviderFactory(it)));
     }
 
-    let mut terminal_pool_factories: Vec<Box<flotilla_core::providers::discovery::TerminalPoolFactory>> = Vec::new();
+    let mut terminal_pool_factories: Vec<Box<flotilla_discovery::TerminalPoolFactory>> = Vec::new();
     if let Some(pool) = providers.terminal_pool {
         terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
     }
@@ -1294,10 +1291,10 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         .build()
 }
 
-fn fixed_available_space_probe() -> Arc<dyn flotilla_core::admission::AvailableSpaceProbe> {
+fn fixed_available_space_probe() -> Arc<dyn flotilla_provider_runtime::available_space::AvailableSpaceProbe> {
     struct FixedAvailableSpaceProbe;
 
-    impl flotilla_core::admission::AvailableSpaceProbe for FixedAvailableSpaceProbe {
+    impl flotilla_provider_runtime::available_space::AvailableSpaceProbe for FixedAvailableSpaceProbe {
         fn measure(&self, _path: &Path) -> Option<u64> {
             Some(100 * 1024 * 1024 * 1024)
         }
@@ -1323,13 +1320,10 @@ pub fn fake_vcs_discovery(state: Arc<RwLock<FakeVcsState>>) -> DiscoveryRuntime 
 mod provider_contract;
 pub use provider_contract::assert_provider_contract;
 
-mod in_process;
-pub use in_process::InProcessDiscoveryExt;
-
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-    use flotilla_core::providers::discovery::run_host_detectors;
+    use flotilla_discovery::run_host_detectors;
     use flotilla_discovery_api::EnvironmentAssertion;
 
     use super::*;

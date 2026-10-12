@@ -13,6 +13,7 @@ skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
+flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-review-bundle-object-store = { path = "../flotilla-review-bundle-object-store" }
@@ -69,6 +70,7 @@ flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 flotilla-credentials-testkit = { path = "../flotilla-credentials-testkit" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-orchestration-testkit = { path = "../flotilla-orchestration-testkit" }
 flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }

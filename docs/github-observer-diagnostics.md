@@ -2,7 +2,7 @@
 
 Each production observer GraphQL request emits an INFO event named
 `GitHub change request observation call` beneath
-`flotilla_core::providers::github_observation`. It includes:
+`flotilla_forge_github::github_observation`. It includes:
 
 - Observer (`change request` or `dispatch board`), repository scope, query shape,
   subject count, HTTP status, and elapsed time.

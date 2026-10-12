@@ -17,10 +17,10 @@ use super::support::test_meta;
 use crate::config::ConfigStore;
 use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
 use crate::model::RepoModel;
-use crate::providers::registry::ProviderRegistry;
 use crate::repo_state::{RepoRootState, RepoState};
 use crate::testkits::discovery::fake_discovery;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery::registry::ProviderRegistry;
 
 #[tokio::test]
 async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {

@@ -153,7 +153,7 @@ impl InProcessDaemon {
 
 #[cfg(test)]
 mod tests {
-    use crate::testkits::discovery::InProcessDiscoveryExt;
+    use crate::testkits::in_process_ext::InProcessDiscoveryExt;
     use std::{collections::HashMap, sync::Arc};
 
     use async_trait::async_trait;

@@ -4,6 +4,7 @@
 //! only on base types and provider-runtime; never on core, provider components,
 //! discovery assembly, storage or composition roots. The build-graph gate
 //! enforces the same upward-dependency prohibition as provider-runtime.
+pub mod detectors;
 pub mod environment;
 pub mod provider_config;
 

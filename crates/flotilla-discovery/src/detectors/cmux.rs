@@ -47,8 +47,8 @@ impl HostDetector for CmuxDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::testkits::discovery::TestEnvVars;
+    use crate::testing::DiscoveryMockRunner;
+    use crate::testing::TestEnvVars;
     use flotilla_paths::path_context::DaemonHostPath;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 

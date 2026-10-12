@@ -13,14 +13,18 @@ flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-resources = { path = "../flotilla-resources" }
 async-trait.workspace = true
 serde.workspace = true
+tracing.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 flotilla-build-features = { path = "../flotilla-build-features" }
 flotilla-build-features-async = { path = "../flotilla-build-features-async" }
 flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
 flotilla-build-features-types = { path = "../flotilla-build-features-types" }
 
 [dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-replay-testkit = { path = "../flotilla-replay-testkit" }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

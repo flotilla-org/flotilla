@@ -35,8 +35,8 @@ use crate::{
     config::ConfigStore,
     environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
-    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
 };
+use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_terminal::TerminalSessionLiveness;
 

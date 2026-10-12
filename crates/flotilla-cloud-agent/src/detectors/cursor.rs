@@ -1,4 +1,4 @@
-use super::helpers::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
+use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 use flotilla_discovery_api::HostDetector;
 
 /// Detect the Cursor agent CLI.

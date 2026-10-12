@@ -13,7 +13,7 @@ use flotilla_vcs::providers::detection::remote_assertion;
 use super::*;
 use flotilla_agent::adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver};
 
-use crate::providers::discovery::AiUtilityFactory;
+use flotilla_discovery::AiUtilityFactory;
 
 /// Routing uses replicated observations as hints; only admission may refuse on
 /// destination-owned facts, credentials, or the installed skill catalog.
@@ -5252,9 +5252,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::types::ChangeRequest;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::FakeChangeRequest;
+    use flotilla_protocol::ChangeRequest;
 
     // Artifact storage is the process boundary; read inventories and rendering
     // use real collaborators. Multiple vessels must not reread a kind.

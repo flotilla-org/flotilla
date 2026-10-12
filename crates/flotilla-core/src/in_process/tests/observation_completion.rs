@@ -745,4 +745,4 @@ fn observation_service_matching_preserves_http_and_authority_port() {
     assert!(!forge_service_matches("http://forgejo.local:3000", "forgejo.local:3001"));
 }
 
-use crate::testkits::discovery::InProcessDiscoveryExt;
+use crate::testkits::in_process_ext::InProcessDiscoveryExt;

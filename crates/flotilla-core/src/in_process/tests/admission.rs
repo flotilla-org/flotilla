@@ -20,18 +20,18 @@ use flotilla_resources::{
 use flotilla_store::ResourceBackend;
 
 use super::support::{test_meta, ForgeAwareTestChangeRequestFactory};
-use crate::admission::AvailableSpaceProbe;
 use crate::config::ConfigStore;
 use crate::in_process::convoy_admission::{KindCandidate, PlacementResolution, PlacementTieBreak};
 use crate::in_process::{
     ensure_prepared_placement_snapshot, ensure_prepared_workflow_snapshot, issue_source_for_subject, prepared_snapshot_name,
     CheckoutArchiveStatus, CheckoutIntegrationStatus, InProcessDaemon, IntegrationCondition,
 };
-use crate::providers::types::ChangeRequest;
 use crate::repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_protocol::ChangeRequest;
+use flotilla_provider_runtime::available_space::AvailableSpaceProbe;
 
 #[tokio::test]
 async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credential() {

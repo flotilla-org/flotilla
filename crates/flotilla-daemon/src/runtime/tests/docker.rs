@@ -551,7 +551,7 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
     fs::write(config_base.join("daemon.toml"), "machine_id = \"interior-discovery-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    discovery.host_detectors = Arc::new(flotilla_core::providers::discovery::detectors::default_host_detectors());
+    discovery.host_detectors = Arc::new(flotilla_discovery::detectors::default_host_detectors());
     let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
     let state = ControllerRuntimeState::new(
         Arc::clone(&daemon),
@@ -971,7 +971,7 @@ async fn provisioned_environment_is_destroyed_when_declared_adapter_is_missing()
     fs::write(config_base.join("daemon.toml"), "machine_id = \"interior-rejection-test\"\n").expect("daemon config");
     let config = Arc::new(ConfigStore::with_base(config_base));
     let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
-    discovery.host_detectors = Arc::new(flotilla_core::providers::discovery::detectors::default_host_detectors());
+    discovery.host_detectors = Arc::new(flotilla_discovery::detectors::default_host_detectors());
     let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
     let destroyed = Arc::new(AtomicBool::new(false));
     let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {

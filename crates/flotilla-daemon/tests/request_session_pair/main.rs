@@ -4809,4 +4809,4 @@ fn generated_capabilities_queries_use_session_home(tc: hegel::TestCase) {
         .block_on(capabilities_routing_scenario(remote, workflows));
 }
 
-use flotilla_discovery_testkit::InProcessDiscoveryExt;
+use flotilla_orchestration_testkit::InProcessDiscoveryExt;

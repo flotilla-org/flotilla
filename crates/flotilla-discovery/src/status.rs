@@ -1,4 +1,4 @@
-use crate::providers::registry::{ProviderRegistry, ProviderSet};
+use crate::registry::{ProviderRegistry, ProviderSet};
 use flotilla_protocol::HostProviderStatus;
 use std::collections::{BTreeSet, HashMap};
 

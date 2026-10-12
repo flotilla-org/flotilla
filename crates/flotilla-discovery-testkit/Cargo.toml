@@ -11,6 +11,7 @@ flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
+flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-paths = { path = "../flotilla-paths" }
@@ -19,7 +20,6 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-flotilla-core = { path = "../flotilla-core" }
 
 [lints]
 workspace = true

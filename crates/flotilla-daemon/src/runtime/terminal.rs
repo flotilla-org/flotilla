@@ -17,8 +17,8 @@ use flotilla_controllers::reconcilers::{
     TerminalRuntimeState,
 };
 use flotilla_core::crew_capabilities::SessionCapabilitySource;
-use flotilla_core::providers::registry::ProviderRegistry;
 use flotilla_credentials::crew_git_identity_environment;
+use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfiguredResourceLimits, EnvironmentId, TerminalStatus};
 use flotilla_provider_runtime::CommandRunner;

@@ -1,9 +1,15 @@
-//! Modular provider discovery system.
+//! Provider discovery: detector runs, static factory-list assembly and the
+//! typed provider registry.
 //!
-//! This module defines the core types for environment detection and provider
-//! factory registration. Detectors probe the host and repo for available tools,
-//! producing `EnvironmentAssertion` values collected into an `EnvironmentBag`.
-//! Factories consume the bag to construct typed provider instances.
+//! Detectors probe the host and repo for available tools, producing
+//! `EnvironmentAssertion` values collected into an `EnvironmentBag`. Factories
+//! from each provider type crate consume the bag to construct typed provider
+//! instances, assembled here into a [`registry::ProviderRegistry`].
+//!
+//! ADR 0060 (`docs/adr/0060-component-crates-and-composition-root.md`): this
+//! component depends only on the discovery API, provider runtime and provider
+//! type crates; never on core, storage or composition roots. The build-graph
+//! gate enforces the upward-dependency prohibition.
 
 use flotilla_agent::adapter::AgentAdapterRegistry;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
@@ -17,6 +23,7 @@ use futures::StreamExt;
 use flotilla_environment::environment::EnvironmentProvider;
 pub mod detectors;
 pub mod factories;
+pub mod registry;
 
 use std::{
     collections::HashMap,
@@ -29,14 +36,13 @@ use flotilla_protocol::EnvironmentId;
 use futures::stream;
 use tokio::sync::OnceCell as AsyncOnceCell;
 
-use crate::admission::system_available_space_probe;
-use crate::admission::AvailableSpaceProbe;
-use crate::providers::registry::ProviderRegistry;
-use crate::providers::registry::ProviderSet;
+use crate::registry::ProviderRegistry;
+use crate::registry::ProviderSet;
 use flotilla_ai_utility::AiUtility;
 use flotilla_cloud_agent::CloudAgentService;
 use flotilla_issue_tracker::IssueProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_provider_runtime::available_space::{system_available_space_probe, AvailableSpaceProbe};
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_terminal::{scan_cache::SharedTerminalPool, TerminalPool};
 use flotilla_vcs::vcs::Vcs;
@@ -121,11 +127,15 @@ impl FactoryRegistry {
     }
 }
 
+/// Host collaborators and discovery configuration supplied by the composition
+/// root: the command runner, environment variables and free-space probe that
+/// stand in for direct OS access, plus the detector and factory lists.
 #[derive(bon::Builder)]
 pub struct DiscoveryRuntime {
     pub runner: Arc<dyn CommandRunner>,
     pub env: Arc<dyn EnvVars>,
-    pub(crate) available_space_probe: Arc<dyn AvailableSpaceProbe>,
+    /// Host free-space measurement for admission; injected like the runner.
+    pub available_space_probe: Arc<dyn AvailableSpaceProbe>,
     /// Configure before discovery; managers retain this shared detector set.
     /// Append with `Arc::get_mut` only while uniquely owned. Once shared, replace
     /// the collection to configure a new runtime; existing managers keep their set.
@@ -133,29 +143,32 @@ pub struct DiscoveryRuntime {
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
     #[builder(skip)]
-    pub(crate) host_scoped_providers: HostScopedProviderCache,
+    host_scoped_providers: HostScopedProviderCache,
 }
 
 const HOST_SCAN_CACHE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
-pub(crate) struct HostScopedProviderCache {
+struct HostScopedProviderCache {
     environments: Mutex<HashMap<EnvironmentId, Arc<AsyncOnceCell<HostScopedDiscovery>>>>,
 }
 
 /// Provider capabilities constructed from host detector assertions and shared
 /// by every repository in that environment.
 #[derive(Clone, Default, bon::Builder)]
-pub(crate) struct HostRegistry {
-    pub(crate) agent_adapters: AgentAdapterRegistry,
-    pub(crate) cloud_agents: Vec<(ProviderDescriptor, Arc<dyn CloudAgentService>)>,
-    pub(crate) ai_utilities: Vec<(ProviderDescriptor, Arc<dyn AiUtility>)>,
-    pub(crate) terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
-    pub(crate) environment_providers: Vec<(ProviderDescriptor, Arc<dyn EnvironmentProvider>)>,
+struct HostRegistry {
+    agent_adapters: AgentAdapterRegistry,
+    cloud_agents: Vec<(ProviderDescriptor, Arc<dyn CloudAgentService>)>,
+    ai_utilities: Vec<(ProviderDescriptor, Arc<dyn AiUtility>)>,
+    terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
+    environment_providers: Vec<(ProviderDescriptor, Arc<dyn EnvironmentProvider>)>,
 }
 
+/// Host-scoped providers (agent adapters, cloud agents, AI utilities, terminal
+/// pools and environment providers) discovered once per environment and
+/// shared by every repository discovered there.
 #[derive(Clone, Default)]
-pub(crate) struct HostScopedDiscovery {
+pub struct HostScopedDiscovery {
     registry: HostRegistry,
     unmet: Vec<(String, UnmetRequirement)>,
 }
@@ -163,13 +176,14 @@ pub(crate) struct HostScopedDiscovery {
 impl HostScopedDiscovery {
     /// Host observations come from the environment's retained discovery, never
     /// from which repositories happen to install these shared providers.
-    pub(crate) fn provider_statuses(&self) -> Vec<flotilla_protocol::HostProviderStatus> {
+    pub fn provider_statuses(&self) -> Vec<flotilla_protocol::HostProviderStatus> {
         let mut registry = ProviderRegistry::new();
         self.install(&mut registry, &mut Vec::new());
         status::provider_statuses_from_registries([&registry])
     }
 
-    pub(crate) fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
+    /// Add the retained host-scoped providers and their unmet requirements.
+    pub fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
         registry.agent_adapters = self.registry.agent_adapters.clone();
         for (descriptor, provider) in &self.registry.cloud_agents {
             registry.cloud_agents.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
@@ -218,7 +232,7 @@ impl HostScopedProviderCache {
     /// instances for every repository discovered there. All factories in these
     /// categories are audited to depend only on the host bag, process config,
     /// and environment runner; none consumes repository detector state or root.
-    pub(crate) async fn discover_for_environment(
+    async fn discover_for_environment(
         &self,
         environment_id: &EnvironmentId,
         host_bag: &EnvironmentBag,
@@ -270,6 +284,19 @@ impl HostScopedProviderCache {
 }
 
 impl DiscoveryRuntime {
+    /// Probe host-scoped provider categories once per environment with this
+    /// runtime's factories; later calls for the environment reuse the result.
+    pub async fn discover_host_scoped(
+        &self,
+        environment_id: &EnvironmentId,
+        host_bag: &EnvironmentBag,
+        config: &dyn ProviderConfigView,
+        probe_root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> HostScopedDiscovery {
+        self.host_scoped_providers.discover_for_environment(environment_id, host_bag, &self.factories, config, probe_root, runner).await
+    }
+
     pub fn for_process() -> Self {
         Self {
             runner: Arc::new(flotilla_provider_runtime::ProcessCommandRunner),
@@ -298,7 +325,7 @@ pub struct DiscoveryResult {
 impl DiscoveryResult {
     /// Report failed repository discovery while retaining independently safe
     /// capabilities supplied by the caller, such as the checkout's VCS.
-    pub(crate) fn degraded(registry: ProviderRegistry, repo_slug: Option<String>, error: String) -> Self {
+    pub fn degraded(registry: ProviderRegistry, repo_slug: Option<String>, error: String) -> Self {
         Self {
             registry,
             host_repo_bag: EnvironmentBag::new(),
@@ -337,6 +364,9 @@ async fn bounded_detection<T>(future: impl std::future::Future<Output = Vec<T>>)
 pub mod status;
 
 #[cfg(test)]
+mod testing;
+
+#[cfg(test)]
 mod timeout_tests {
     use super::*;
 
@@ -353,9 +383,9 @@ mod timeout_tests {
     #[tokio::test(start_paused = true)]
     async fn detector_timeout_preserves_other_capabilities() {
         let detectors: Vec<Box<dyn HostDetector>> =
-            vec![Box::new(PendingDetector), Box::new(detectors::generic::EnvVarDetector::new("HOME"))];
-        use crate::testkits::discovery::DiscoveryMockRunner;
-        use crate::testkits::discovery::TestEnvVars;
+            vec![Box::new(PendingDetector), Box::new(flotilla_discovery_api::detectors::EnvVarDetector::new("HOME"))];
+        use crate::testing::DiscoveryMockRunner;
+        use crate::testing::TestEnvVars;
         let runner = DiscoveryMockRunner::builder().build();
         let env = TestEnvVars::new([("HOME", "/safe/home")]);
         let bag = run_host_detectors(&detectors, &runner, &env).await;
@@ -405,8 +435,10 @@ pub async fn discover_providers(
     discover_providers_inner(host_bag, repo_root, repo_detectors, factories, config, runner, env, None).await
 }
 
+/// Discover checkout-scoped providers, installing host-scoped providers from
+/// the environment's retained discovery instead of probing them again.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn discover_checkout_with_host_scoped(
+pub async fn discover_checkout_with_host_scoped(
     host_bag: &EnvironmentBag,
     repo_root: &ExecutionEnvironmentPath,
     repo_detectors: &[Box<dyn RepoDetector>],
@@ -598,10 +630,10 @@ mod orchestrator_tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::config::ConfigStore;
-    use crate::providers::discovery::detectors;
-    use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::testkits::discovery::TestEnvVars;
+    use crate::detectors;
+    use crate::testing::DiscoveryMockRunner;
+    use crate::testing::TestConfig;
+    use crate::testing::TestEnvVars;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
     /// Build a DiscoveryMockRunner with git binary available plus
@@ -630,7 +662,7 @@ mod orchestrator_tests {
         std::fs::create_dir_all(repo_root.join(".git")).expect("create .git");
 
         let runner = runner_with_git_repo(repo_root);
-        let config = ConfigStore::with_base(dir.path().join("config"));
+        let config = TestConfig::new(&dir.path().join("config"));
         let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Build host bag with git binary assertion
@@ -657,7 +689,7 @@ mod orchestrator_tests {
         std::fs::create_dir_all(repo_root.join(".git")).expect("create .git");
 
         let runner = runner_with_git_repo(repo_root);
-        let config = ConfigStore::with_base(dir.path().join("config"));
+        let config = TestConfig::new(&dir.path().join("config"));
         let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Host bag with both git and wt binaries
@@ -681,7 +713,7 @@ mod orchestrator_tests {
 
         // Runner with NO tool_exists — everything will fail
         let runner: Arc<DiscoveryMockRunner> = Arc::new(DiscoveryMockRunner::builder().build());
-        let config = ConfigStore::with_base(dir.path().join("config"));
+        let config = TestConfig::new(&dir.path().join("config"));
         let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Empty host bag — no binaries detected
@@ -702,7 +734,7 @@ mod orchestrator_tests {
         std::fs::create_dir_all(repo_root.join(".git")).expect("create .git");
 
         let runner = runner_with_git_repo(repo_root);
-        let config = ConfigStore::with_base(dir.path().join("config"));
+        let config = TestConfig::new(&dir.path().join("config"));
         let repo_root = ExecutionEnvironmentPath::new(repo_root);
 
         // Host bag with git binary
@@ -733,7 +765,7 @@ mod orchestrator_tests {
         let repo_root = ExecutionEnvironmentPath::new(dir.path());
 
         let runner: Arc<DiscoveryMockRunner> = Arc::new(DiscoveryMockRunner::builder().build());
-        let config = ConfigStore::with_base(dir.path().join("config"));
+        let config = TestConfig::new(&dir.path().join("config"));
 
         let host_bag = EnvironmentBag::new();
         let repo_dets: Vec<Box<dyn RepoDetector>> = vec![];

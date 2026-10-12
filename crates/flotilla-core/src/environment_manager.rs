@@ -13,11 +13,11 @@ use flotilla_protocol::{
 use flotilla_resources::host_direct_environment_name;
 
 use crate::config::ConfigStore;
-use crate::providers::discovery::run_host_detectors;
-use crate::providers::discovery::run_provisioned_host_detectors;
-use crate::providers::discovery::DiscoveryRuntime;
-use crate::providers::discovery::FactoryRegistry;
-use crate::providers::registry::ProviderRegistry;
+use flotilla_discovery::registry::ProviderRegistry;
+use flotilla_discovery::run_host_detectors;
+use flotilla_discovery::run_provisioned_host_detectors;
+use flotilla_discovery::DiscoveryRuntime;
+use flotilla_discovery::FactoryRegistry;
 use flotilla_environment::environment::contained_daemon_socket_path;
 use flotilla_environment::environment::CreateOpts;
 use flotilla_environment::environment::EnvironmentHandle;
@@ -597,10 +597,10 @@ mod tests {
     use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
 
     use super::*;
-    use crate::providers::discovery::detectors::default_host_detectors;
-    use crate::providers::registry::ProviderRegistry;
     use crate::testkits::discovery::fake_discovery;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_discovery::detectors::default_host_detectors;
+    use flotilla_discovery::registry::ProviderRegistry;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::ProviderCategory;
     use flotilla_discovery_api::ProviderDescriptor;
@@ -1100,8 +1100,8 @@ mod tests {
     // Glue: the same custom command detector exercises both probe callers.
     #[tokio::test]
     async fn provisioned_discovery_retains_configured_detectors() {
-        use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
-        use crate::providers::discovery::detectors::generic::CommandDetector;
+        use flotilla_discovery_api::detectors::parse_first_dotted_version;
+        use flotilla_discovery_api::detectors::CommandDetector;
 
         let mut discovery = fake_discovery(false);
         discovery.host_detectors =

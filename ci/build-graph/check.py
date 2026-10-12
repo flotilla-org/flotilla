@@ -73,7 +73,7 @@ def violations(metadata):
     errors = []
     if "flotilla-client" in packages and "flotilla-core" in packages and reaches("flotilla-client", "flotilla-core"):
         errors.append("flotilla-client: must not depend on flotilla-core, directly or transitively")
-    for component in ("flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent"):
+    for component in ("flotilla-provider-runtime", "flotilla-discovery-api", "flotilla-vcs", "flotilla-environment", "flotilla-terminal", "flotilla-cloud-agent", "flotilla-ai-utility", "flotilla-forge-github", "flotilla-forge-forgejo", "flotilla-change-request", "flotilla-issue-tracker", "flotilla-agent", "flotilla-discovery"):
         for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             if component in packages and target in packages and reaches(component, target):

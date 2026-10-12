@@ -463,4 +463,4 @@ pub(super) async fn daemon_with_transient_terminal_pool(
     daemon
 }
 
-use flotilla_discovery_testkit::InProcessDiscoveryExt;
+use flotilla_orchestration_testkit::InProcessDiscoveryExt;
