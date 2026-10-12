@@ -1200,6 +1200,9 @@ impl ReconcilerWake {
                                     condition.maker =
                                         Some(LeafMaker::Supervisor { convoy: target_convoy, vessel: target_vessel, role: target_role });
                                 } else {
+                                    // A named operator is the final receiver: its durable
+                                    // obligation consumes the ladder, so subsequent judgments
+                                    // must neither redeliver nor fall back to an unnamed rung.
                                     condition.supervision_exhausted = true;
                                     operator_delivered = true;
                                 }
