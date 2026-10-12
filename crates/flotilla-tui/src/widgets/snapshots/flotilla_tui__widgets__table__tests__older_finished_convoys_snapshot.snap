@@ -1,0 +1,12 @@
+---
+source: crates/flotilla-tui/src/widgets/table.rs
+assertion_line: 755
+expression: terminal.backend()
+---
+"┌ Convoys · dev · 1 older finished convoys hidden ───────────────────────────────────────┐"
+"│CONVOY                                                                                  │"
+"│tables                                                                                  │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"└────────────────────────────────────────────────────────────────────────────────────────┘"

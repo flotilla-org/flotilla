@@ -9,7 +9,7 @@ use flotilla_protocol::ViewAddress;
 use ratatui::{
     layout::{Alignment as RatatuiAlignment, Constraint, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Cell, Row, Table},
     Frame,
 };
@@ -254,7 +254,14 @@ impl TableWidget {
         if !view.meta.conditions.is_empty() {
             title.push_str(&format!(" · ⚠ {}", view.meta.conditions.join("; ")));
         }
-        let mut block = Block::bordered().style(theme.block_style()).title(format!(" {title} "));
+        let mut title = Line::from(format!(" {title} "));
+        if !view.meta.older_finished.is_empty() {
+            title.spans.push(Span::styled(
+                format!("· {} older finished convoys hidden ", view.meta.older_finished.len()),
+                Style::default().fg(theme.muted),
+            ));
+        }
+        let mut block = Block::bordered().style(theme.block_style()).title(title);
         if let Some(as_of) = view.meta.as_of {
             block = block.title_top(Line::from(format!(" as of {} ", as_of.format("%Y-%m-%d %H:%M"))).right_aligned());
         }
@@ -727,6 +734,22 @@ mod tests {
         terminal
             .draw(|frame| {
                 widget.render_table(frame, frame.area(), &Theme::classic(), &snapshot_view(), &mut state, &[address]);
+            })
+            .expect("draw");
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    // Contract: the default table announces old finished rows in muted text.
+    #[test]
+    fn older_finished_convoys_snapshot() {
+        let mut terminal = Terminal::new(TestBackend::new(90, 7)).expect("terminal");
+        let mut widget = TableWidget::default();
+        let mut state = TableState::default();
+        let mut table = view();
+        table.meta.older_finished = vec![(1, table.rows[0].clone())];
+        terminal
+            .draw(|frame| {
+                widget.render_table(frame, frame.area(), &Theme::classic(), &table, &mut state, &[]);
             })
             .expect("draw");
         insta::assert_snapshot!(terminal.backend());
