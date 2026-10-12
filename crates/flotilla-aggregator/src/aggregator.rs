@@ -2254,9 +2254,25 @@ impl Aggregator {
             .min_by_key(|demand| {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
             });
-        let holds = status.map(|status| status.turn_delivery_holds()).unwrap_or_default();
-        let convoy_attention = status.and_then(|status| status.attention.as_ref()).or_else(|| holds.first());
+        // Terminal records retain delivery history for explain, but delivery can no
+        // longer require a turn. Filter at projection so old stored holds need no repair.
+        let holds = status.filter(|_| !phase.is_terminal()).map(|status| status.turn_delivery_holds()).unwrap_or_default();
+        let convoy_attention = status
+            .and_then(|status| {
+                status.attention.as_ref().filter(|attention| {
+                    !phase.is_terminal()
+                        || !(status.turn_deliveries.contains_key(&attention.source)
+                            || matches!(
+                                attention.source.as_str(),
+                                flotilla_resources::ConvoyAttention::QUEUED_TURN_SOURCE
+                                    | flotilla_resources::ConvoyAttention::MISSING_TURN_HOOK_SOURCE
+                                    | "supervisor-turn-delivery"
+                            ))
+                })
+            })
+            .or_else(|| holds.first());
         let pending_supervisor_turn_count = status
+            .filter(|_| !phase.is_terminal())
             .map_or(0, |status| status.turn_deliveries.values().filter(|delivery| delivery.pending_supervisor_turn.is_some()).count());
         let surface_state = if !subject_conflicts.is_empty()
             || attention_demand.is_some()
@@ -6513,6 +6529,83 @@ mod hold_attention_tests {
     use chrono::Utc;
 
     use super::*;
+    // #3079: terminal rows ignore delivery attention while preserving unrelated
+    // attention and durable refusal history. Exhaust all terminal phases plus Active,
+    // explicit/legacy holds, and shared delivery/unrelated/empty attention slots.
+    #[tokio::test]
+    async fn terminal_delivery_attention_projection() {
+        use flotilla_resources::{ConvoyAttention, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryStatus};
+        for phase in [ResourceConvoyPhase::Landed, ResourceConvoyPhase::Failed, ResourceConvoyPhase::Abandoned, ResourceConvoyPhase::Active]
+        {
+            for explicit_hold in [false, true] {
+                for source in [
+                    None,
+                    Some("actionable-review"),
+                    Some(ConvoyAttention::QUEUED_TURN_SOURCE),
+                    Some("supervisor-turn-delivery"),
+                    Some("settlement"),
+                ] {
+                    let state = AggregatorProjectionState::new();
+                    let (event_tx, _) = broadcast::channel(8);
+                    let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+                    let mut convoy = super::tests::convoy_with_vessel("held").await;
+                    let status = convoy.status.as_mut().expect("status");
+                    status.phase = phase;
+                    let now = Utc::now();
+                    let attention =
+                        ConvoyAttention { source: "actionable-review".into(), reason: "three consecutive refusals".into(), raised_at: now };
+                    status.attention = source.map(|source| ConvoyAttention { source: source.into(), ..attention.clone() });
+                    let delivery = TurnDeliveryStatus {
+                        hold: explicit_hold.then_some(attention),
+                        episodes: (0..3)
+                            .map(|revision| {
+                                TurnDeliveryEpisode::builder()
+                                    .subject_revision(revision.to_string())
+                                    .evidence_at(now)
+                                    .judged_claim_at(now)
+                                    .outcome(TurnDeliveryOutcome::Refused {
+                                        reason: "three consecutive refusals".into(),
+                                        refused_at: now,
+                                        hold_executed: true,
+                                    })
+                                    .build()
+                            })
+                            .collect(),
+                        pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
+                            queued_order: 0,
+                            vessel: "work".into(),
+                            role: "governor".into(),
+                            message: flotilla_resources::TerminalCrewMessage {
+                                id: "supervise".into(),
+                                text: "Supervise".into(),
+                                sender: Default::default(),
+                                delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                                acknowledged: Default::default(),
+                                following: Vec::new(),
+                            },
+                        }),
+                        ..Default::default()
+                    };
+                    status.turn_deliveries.insert("actionable-review".into(), delivery.clone());
+                    aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+                    let result = state.result_set().await;
+                    let row = &result.rows.as_convoys().expect("convoys")[0];
+                    assert_eq!(
+                        row.surface_state == SurfaceState::NeedsYou,
+                        !phase.is_terminal() || source == Some("settlement"),
+                        "{phase:?}, explicit={explicit_hold}, source={source:?}"
+                    );
+                    assert_eq!(row.phase, convoy_phase(phase));
+                    if phase.is_terminal() && source != Some("settlement") {
+                        assert!(row.message.is_none(), "stale delivery reason must not label the terminal row");
+                    }
+                    let stored = aggregator.convoys_by_source[&LocalSource::Durable].values().next().expect("convoy");
+                    assert_eq!(stored.object.status.as_ref().unwrap().turn_deliveries["actionable-review"], delivery);
+                }
+            }
+        }
+    }
+
     // #2758: persistent holds remain in attention views even if an unrelated
     // reconciler clears the shared attention slot; the reason survives too.
     #[tokio::test]
