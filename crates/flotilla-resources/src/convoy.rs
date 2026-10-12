@@ -1375,13 +1375,15 @@ fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
 
 fn is_same_crew_stall(
     status: &ConvoyStatus,
+    convoy: &str,
     vessel: &str,
     role: &str,
-    leaf: &Leaf,
     reason: StallReason,
     proposed_disposition: Option<StallProposedDisposition>,
     message: &str,
 ) -> bool {
+    // The crew's report is stable; stall.evidence may include delivery diagnostics
+    // appended by the judge, so comparing evidence would restart the episode.
     status
         .crew_work
         .get(vessel)
@@ -1391,7 +1393,10 @@ fn is_same_crew_stall(
             stall.source == StallEvidenceSource::Crew
                 && stall.reason == Some(reason)
                 && stall.proposed_disposition == proposed_disposition
-                && stall.leaves.iter().any(|prior| prior.address == leaf.address && prior.field_path == leaf.field_path)
+                && stall.leaves.iter().any(|leaf| {
+                    matches!(&leaf.address, LeafAddress::Work { convoy: source, work } if source == convoy && work == vessel)
+                        && leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) == Some(role)
+                })
         })
 }
 
@@ -2452,13 +2457,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 // Repeating a report is still the same episode, even after its
                 // maker has moved to a supervisor. Keep the delivery identity,
                 // consumed rung, and nudge budget rather than notifying again.
-                let leaf = Leaf {
-                    address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
-                    field_path: format!(".crew.{role}.phase"),
-                    operator: LeafOperator::Equal,
-                    literal: "Done".into(),
-                };
-                if is_same_crew_stall(status, vessel, role, &leaf, *reason, *proposed_disposition, message) {
+                if is_same_crew_stall(status, convoy, vessel, role, *reason, *proposed_disposition, message) {
                     return;
                 }
                 clear_nudge_budget(status, vessel, role);
@@ -2473,7 +2472,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(message.clone());
                 }
                 status.stalled = Some(StalledCondition {
-                    leaves: vec![leaf],
+                    leaves: vec![Leaf {
+                        address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
+                        field_path: format!(".crew.{role}.phase"),
+                        operator: LeafOperator::Equal,
+                        literal: "Done".into(),
+                    }],
                     maker: Some(LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() }),
                     evidence: message.clone(),
                     source: StallEvidenceSource::Crew,
@@ -3515,17 +3519,19 @@ mod subject_tests {
     #[hegel::test]
     fn stall_report_episode_boundaries(tc: hegel::TestCase) {
         use hegel::generators as gs;
+        // Role names overlap the field-path suffix, pinning exact extraction.
+        let role = ["coder", "coder.phase", ".phase", "phase.phase"][tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
         let change = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
         let progressed = tc.draw(gs::booleans());
         let mut status = ConvoyStatus::default();
         status
             .crew_work
-            .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
+            .insert("work".into(), BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
         let now = Utc::now();
         let mut report = ConvoyStatusPatch::MarkCrewStalled {
             convoy: "job".into(),
             vessel: "work".into(),
-            role: "coder".into(),
+            role: role.into(),
             at: now,
             reason: StallReason::Scope,
             proposed_disposition: None,
@@ -3533,7 +3539,7 @@ mod subject_tests {
         };
         report.apply(&mut status);
         if progressed {
-            status.crew_work.get_mut("work").unwrap().get_mut("coder").unwrap().phase = CrewWorkPhase::Working;
+            status.crew_work.get_mut("work").unwrap().get_mut(role).unwrap().phase = CrewWorkPhase::Working;
         }
         let later = now + chrono::Duration::seconds(1);
         if let ConvoyStatusPatch::MarkCrewStalled { at, reason, proposed_disposition, message, .. } = &mut report {

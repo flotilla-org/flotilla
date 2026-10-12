@@ -295,7 +295,7 @@ impl ReconcilerWake {
             // replica-only copy must not be actuated from an old caller map.
             let current_version = current_versions.get(&convoy.metadata.name).copied();
             if current_version != Some(&convoy.metadata.resource_version) {
-                tracing::trace!(
+                tracing::debug!(
                     namespace,
                     convoy = %convoy.metadata.name,
                     snapshot_version = %convoy.metadata.resource_version,
