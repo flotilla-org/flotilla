@@ -134,9 +134,8 @@ async fn active_produced_pr_checks_settle_to_pass_or_fail_once_per_head() {
     }
 }
 
-// Each case drives real in-memory stores, informers and turn delivery. Hegel
-// charges that whole scenario to generation time; CPU scheduling is not a
-// generation-cost oracle. Keep the bounded generators and other health checks.
+// As above, Hegel charges this bounded store scenario's execution to its
+// generation budget; retain coverage and the other health checks.
 #[hegel::test(suppress_health_check = [hegel::HealthCheck::TooSlow])]
 fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
     // Generate pass/fail sequences across the delivery ceiling (3), including

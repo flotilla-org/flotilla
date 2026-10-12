@@ -4577,14 +4577,14 @@ async fn send_link_state_sends_host_summary_and_route_advertisement() {
 #[tokio::test(start_paused = true)]
 async fn forward_with_keepalive_times_out_after_silence() {
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(4);
-    let (_inbound_tx, mut inbound_rx) = mpsc::channel(4);
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
 
     let task = tokio::spawn(async move {
         // Keep the inbound channel open: silence, rather than disconnection,
         // must end the forwarding loop.
-        let _inbound_tx = _inbound_tx;
+        let _keep_open = inbound_tx;
         forward_with_keepalive_for_test(
             &peer_data_tx,
             &mut inbound_rx,
