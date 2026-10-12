@@ -1215,6 +1215,7 @@ impl ReadProjections<'_> {
 
         let messages = message_views(self.backend, namespace, &receivers, Some(&convoy)).await?;
         Ok(ConvoyExplanation {
+            naming: convoy.status.as_ref().and_then(|status| status.naming.clone()),
             landing_entry: convoy
                 .status
                 .as_ref()

@@ -1,7 +1,9 @@
 //! Convoy admission state and transaction boundary.
 
+use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag};
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
+use flotilla_protocol::ConvoyNaming;
 use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
@@ -11,6 +13,7 @@ use super::*;
 use crate::{
     agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
     branch_lookup_observer::BranchLookupObserver,
+    providers::discovery::AiUtilityFactory,
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -565,16 +568,26 @@ impl ConvoyAdmission {
         }
     }
 
-    pub(super) async fn admission_ai_utility(&self) -> Option<Arc<dyn AiUtility>> {
-        let environment = self.environment_manager.environment_bag(&self.local_environment_id)?;
-        let runner = self.environment_manager.environment_runner(&self.local_environment_id)?;
-        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
-        for factory in &self.discovery.factories.ai_utilities {
-            if let Ok(utility) = factory.probe(&environment, &self.config, &probe_root, Arc::clone(&runner)).await {
-                return Some(utility);
-            }
+    async fn record_admission_naming(&self, namespace: &str, name: &str, naming: Option<ConvoyNaming>) {
+        if let Some(naming) = naming {
+            finish_naming_write(namespace, name, async {
+                apply_resource_status_patch(
+                    &self.backend.using::<ResourceConvoy>(namespace),
+                    name,
+                    &ConvoyStatusPatch::RecordNaming { naming },
+                )
+                .await
+                .map(|_| ())
+            })
+            .await;
         }
-        None
+    }
+
+    async fn admission_ai_utility(&self) -> Result<ProbedNamingUtility, String> {
+        let environment = self.environment_manager.environment_bag(&self.local_environment_id);
+        let runner = self.environment_manager.environment_runner(&self.local_environment_id);
+        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
+        probe_admission_ai_utility(&self.discovery.factories.ai_utilities, environment.as_ref(), &self.config, &probe_root, runner).await
     }
 
     pub(super) async fn resolve_convoy_issue(
@@ -1606,14 +1619,28 @@ impl ConvoyAdmission {
             .flatten()
             .collect::<Vec<_>>()
             .join("\n");
-            match self.admission_ai_utility().await {
-                Some(utility) => utility.generate_convoy_names(&context).await.ok(),
-                None => None,
-            }
+            Some(match self.admission_ai_utility().await {
+                Ok(ProbedNamingUtility { name, utility }) => utility
+                    .generate_convoy_names(&context)
+                    .await
+                    .map(|names| (name.clone(), names))
+                    .map_err(|error| naming_failure_summary(&name, &error)),
+                Err(reason) => Err(reason),
+            })
         } else {
             None
         };
-        let generated = generated.unwrap_or_else(|| ConvoyNames { name: fallback_slug.clone(), branch: fallback_slug.clone() });
+        let (generated, naming) = resolve_admission_names(
+            generated,
+            &fallback_slug,
+            intent.name.is_some(),
+            if change_request.is_some() {
+                "change-request admission uses deterministic naming"
+            } else {
+                "explicit name and branch supplied"
+            },
+        );
+
         let role = intent
             .name
             .as_deref()
@@ -1676,6 +1703,7 @@ impl ConvoyAdmission {
         };
         Ok(PreparedConvoyAdmission::builder()
             .name(String::new())
+            .maybe_naming(naming)
             .spec(spec)
             .workflow(workflow)
             .maybe_placement_policy(placement.selected.map(|placement| placement.spec))
@@ -1689,7 +1717,7 @@ impl ConvoyAdmission {
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
         dispatching_principal_ref: &PrincipalRef,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String, Option<ConvoyNaming>), String> {
         self.check_local_free_space_floor().await?;
         let mut admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
         if admission.vessel_placements.is_empty() {
@@ -1716,8 +1744,9 @@ impl ConvoyAdmission {
             intent.auto_attach.into(),
         )
         .await?;
+        self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         let address = convoy_address(&admission.spec.role, admission.spec.project_ref.as_deref());
-        Ok((admission.name, address))
+        Ok((admission.name, address, admission.naming))
     }
 
     pub(super) async fn check_local_free_space_floor(&self) -> Result<(), String> {
@@ -2244,6 +2273,7 @@ impl ConvoyAdmission {
             annotations,
         )
         .await?;
+        self.record_admission_naming(namespace, &admission.name, admission.naming.clone()).await;
         apply_resource_status_patch(
             &self.backend.using::<ResourceConvoy>(namespace),
             &admission.name,
@@ -2344,6 +2374,7 @@ pub(super) struct ConvoyStartTask {
 
 #[derive(bon::Builder)]
 pub struct PreparedConvoyAdmission {
+    pub(super) naming: Option<ConvoyNaming>,
     pub(super) name: String,
     pub(super) spec: ConvoySpec,
     pub(super) workflow: WorkflowTemplateSpec,
@@ -4064,6 +4095,108 @@ pub(super) struct HandlerContractFixture {
     pub(super) temp: tempfile::TempDir,
 }
 
+struct ProbedNamingUtility {
+    name: String,
+    utility: Arc<dyn AiUtility>,
+}
+
+/// Diagnostic persistence must never turn an already-created convoy into an
+/// admission error that invites a duplicate retry.
+async fn finish_naming_write(namespace: &str, name: &str, write: impl std::future::Future<Output = Result<(), ResourceError>>) {
+    if let Err(error) = write.await {
+        warn!(%namespace, %name, %error,
+            "convoy admitted; unable to persist naming provenance");
+    }
+}
+
+/// Stderr and API error bodies are untrusted and may contain credentials.
+/// Persist only fixed diagnostic categories, never arbitrary utility output.
+fn naming_failure_summary(utility: &str, error: &str) -> String {
+    let lower = error.chars().take(1024).collect::<String>().to_ascii_lowercase();
+    // Keep identifier separators inside tokens: request_id=req-401 must not
+    // resemble the HTTP status phrase "HTTP 401".
+    let words =
+        lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-').filter(|word| !word.is_empty()).collect::<Vec<_>>();
+    let has = |phrase: &[&str]| words.windows(phrase.len()).any(|window| window == phrase);
+    let summary = if has(&["invalid", "convoy", "names", "response"]) {
+        "invalid convoy names response"
+    } else if has(&["empty", "convoy", "or", "branch", "name"]) {
+        "empty convoy or branch name"
+    } else if has(&["oauth", "session", "expired"]) {
+        "authentication failed: OAuth session expired and could not be refreshed"
+    } else if has(&["authenticate"])
+        || has(&["authentication"])
+        || has(&["unauthorized"])
+        || has(&["http", "401"])
+        || has(&["status", "401"])
+    {
+        "authentication failed"
+    } else if has(&["timed", "out"]) || has(&["timeout"]) {
+        "name generation timed out"
+    } else if has(&["offline"])
+        || has(&["connection", "refused"])
+        || has(&["connection", "reset"])
+        || has(&["could", "not", "connect"])
+        || has(&["failed", "to", "connect"])
+    {
+        "utility unavailable"
+    } else if has(&["permission", "denied"]) {
+        "utility permission denied"
+    } else if has(&["no", "such", "file"]) || has(&["not", "found"]) {
+        "utility command unavailable"
+    } else if has(&["http", "429"]) || has(&["status", "429"]) || has(&["rate", "limit"]) {
+        "utility rate limited"
+    } else {
+        "utility command or API request failed (unrecognized diagnostic)"
+    };
+    // Factory identifiers are configuration-owned, not stderr. Bound them too.
+    let utility = utility.chars().take(80).collect::<String>();
+    format!("{utility}: {summary}")
+}
+
+fn resolve_admission_names(
+    generated: Option<Result<(String, ConvoyNames), String>>,
+    fallback: &str,
+    explicit: bool,
+    not_attempted_reason: &str,
+) -> (ConvoyNames, Option<ConvoyNaming>) {
+    let (names, naming) = match generated {
+        Some(Ok((utility, names))) => (names, ConvoyNaming::AiUtility { utility }),
+        None => (
+            ConvoyNames { name: fallback.to_string(), branch: fallback.to_string() },
+            ConvoyNaming::DeterministicFallback { reason: not_attempted_reason.to_string() },
+        ),
+        Some(Err(reason)) => {
+            warn!(%reason, "convoy AI naming unavailable; deterministic fallback used");
+            (ConvoyNames { name: fallback.to_string(), branch: fallback.to_string() }, ConvoyNaming::DeterministicFallback { reason })
+        }
+    };
+    (names, Some(if explicit { ConvoyNaming::Explicit } else { naming }))
+}
+
+async fn probe_admission_ai_utility(
+    factories: &[Box<AiUtilityFactory>],
+    environment: Option<&EnvironmentBag>,
+    config: &dyn ProviderConfigView,
+    probe_root: &ExecutionEnvironmentPath,
+    runner: Option<Arc<dyn CommandRunner>>,
+) -> Result<ProbedNamingUtility, String> {
+    let environment = environment.ok_or_else(|| "AI utilities: admitting environment unavailable".to_string())?;
+    let runner = runner.ok_or_else(|| "AI utilities: admitting runner unavailable".to_string())?;
+    let mut failures = Vec::new();
+    for factory in factories {
+        let utility_name = factory.descriptor().display_name.chars().take(80).collect::<String>();
+        match factory.probe(environment, config, probe_root, Arc::clone(&runner)).await {
+            Ok(utility) => return Ok(ProbedNamingUtility { name: utility_name, utility }),
+            Err(unmet) => failures.push(format!(
+                "{utility_name}: unmet probe requirements: {}",
+                unmet.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+    Err(if failures.is_empty() { "no AI utility factories configured".to_string() } else { failures.join("; ") })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4664,5 +4797,236 @@ mod tests {
         workflow.turn_delivery["verify"].to.vessel = "verify[macos]".to_string();
         allocate_roles(&mut workflow, &roles).expect("explicit concrete target");
         assert_eq!(workflow.turn_delivery["verify"].to.vessel, "verify[macos]");
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    use crate::testkits::replay::testing::capture_logs;
+    use flotilla_ai_utility::factories::claude::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
+    use flotilla_discovery_api::EnvironmentAssertion;
+    use flotilla_provider_runtime::{ChannelLabel, CommandOutput};
+    use flotilla_resources::StatusPatch;
+
+    // Double at the Claude subprocess boundary; all probes and parsing are real.
+    struct NamingRunner(Result<String, String>);
+    #[async_trait::async_trait]
+    impl CommandRunner for NamingRunner {
+        async fn run(&self, _: &str, _: &[&str], _: &std::path::Path, _: &ChannelLabel) -> Result<String, String> {
+            self.0.clone()
+        }
+        async fn run_output(&self, _: &str, _: &[&str], _: &std::path::Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.0.clone().map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
+        }
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            false
+        }
+    }
+
+    async fn naming(environment: EnvironmentBag, response: Result<String, String>, explicit: bool) -> (ConvoyNames, Option<ConvoyNaming>) {
+        let config = ConfigStore::new(DaemonHostPath::new("/unused"), DaemonHostPath::new("/unused-state"));
+        let factories: Vec<Box<AiUtilityFactory>> = vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)];
+        let generated = match probe_admission_ai_utility(
+            &factories,
+            Some(&environment),
+            &config,
+            &ExecutionEnvironmentPath::new("/unused"),
+            Some(Arc::new(NamingRunner(response))),
+        )
+        .await
+        {
+            Ok(ProbedNamingUtility { name: utility, utility: provider }) => provider
+                .generate_convoy_names("issue")
+                .await
+                .map(|names| (utility.clone(), names))
+                .map_err(|error| naming_failure_summary(&utility, &error)),
+            Err(reason) => Err(reason),
+        };
+        resolve_admission_names(Some(generated), "repair-widget-3062", explicit, "not attempted")
+    }
+
+    // Provenance does not alter fallback names or coupled AI names for any explicit/source combination.
+    #[hegel::test]
+    fn provenance_preserves_generated_names(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Covers zero/upper-bound IDs and both explicit and generated provenance.
+        let id = tc.draw(gs::integers::<usize>().min_value(0).max_value(9999));
+        let explicit = tc.draw(gs::booleans());
+        let success = tc.draw(gs::booleans());
+        let fallback = convoy_fallback_slug("Repair widget", &id.to_string());
+        let generated_names = ConvoyNames { name: format!("repair-{id}"), branch: format!("fix/repair-{id}") };
+        let generated = if success { Ok(("utility".to_string(), generated_names.clone())) } else { Err("failure".to_string()) };
+        let (names, source) = resolve_admission_names(Some(generated), &fallback, explicit, "not attempted");
+        assert_eq!(names, if success { generated_names } else { ConvoyNames { name: fallback.clone(), branch: fallback } });
+        let expected = if explicit {
+            ConvoyNaming::Explicit
+        } else if success {
+            ConvoyNaming::AiUtility { utility: "utility".into() }
+        } else {
+            ConvoyNaming::DeterministicFallback { reason: "failure".into() }
+        };
+        assert_eq!(source, Some(expected));
+    }
+
+    // ADR 0047: previous stored statuses decode without naming; new provenance survives serde.
+    #[test]
+    fn stored_naming_is_optional_and_round_trips() {
+        let old = serde_json::to_value(flotilla_resources::ConvoyStatus::default()).expect("status");
+        assert!(old.get("naming").is_none());
+        let mut status: flotilla_resources::ConvoyStatus = serde_json::from_value(old).expect("old generation");
+        assert_eq!(status.naming, None);
+        for naming in [
+            ConvoyNaming::Explicit,
+            ConvoyNaming::AiUtility { utility: "Claude CLI".into() },
+            ConvoyNaming::DeterministicFallback { reason: "Claude API: missing key".into() },
+        ] {
+            ConvoyStatusPatch::RecordNaming { naming: naming.clone() }.apply(&mut status);
+            let decoded: flotilla_resources::ConvoyStatus =
+                serde_json::from_value(serde_json::to_value(&status).expect("encode")).expect("decode");
+            assert_eq!(decoded.naming, Some(naming));
+        }
+    }
+
+    // A failed diagnostic write cannot fail an admission after the convoy exists.
+    #[tokio::test]
+    async fn naming_write_failure_is_nonfatal_and_visible() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        convoys
+            .create(
+                &InputMeta::builder().name("admitted".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).role("admitted".into()).build(),
+            )
+            .await
+            .expect("create convoy");
+        // Inject failure at the status-write boundary; the resource store is real.
+        let (_, logs) = capture_logs(
+            tracing::Level::WARN,
+            finish_naming_write("flotilla", "admitted", async { Err(ResourceError::invalid("status write failed")) }),
+        )
+        .await;
+        assert!(logs.contains("WARN") && logs.contains("unable to persist naming provenance"), "{logs}");
+        assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
+        assert_eq!(convoys.get("admitted").await.expect("convoy remains admitted").spec.role, "admitted");
+    }
+
+    // Explicit refers to the convoy name, even when its missing branch uses the fallback.
+    #[tokio::test]
+    async fn explicit_name_with_failed_branch_generation_remains_explicit() {
+        let environment = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/bin/claude"));
+        let ((names, source), logs) =
+            capture_logs(tracing::Level::WARN, naming(environment, Err("OAuth session expired token=never-store-this".into()), true)).await;
+        assert_eq!(source, Some(ConvoyNaming::Explicit));
+        assert_eq!(names.branch, "repair-widget-3062");
+        assert!(logs.contains("OAuth session expired") && !logs.contains("never-store-this"), "{logs}");
+    }
+
+    // Stderr/API bodies may contain secrets: only bounded fixed summaries reach durable evidence.
+    #[test]
+    fn diagnostics_do_not_copy_raw_utility_output() {
+        let secret = "sk-ant-private-token";
+        for error in [
+            format!("OAuth session expired token={secret}"),
+            format!("invalid convoy names response: {secret}"),
+            format!("arbitrary sensitive body {secret} {}", "x".repeat(10000)),
+            format!("401 api_key={secret}"),
+        ] {
+            let summary = naming_failure_summary(&"u".repeat(10000), &error);
+            assert!(!summary.contains(secret), "{summary}");
+            assert!(summary.len() <= 200, "{summary}");
+        }
+        let (_, naming) = resolve_admission_names(None, "fallback", false, "caller supplied reason");
+        assert_eq!(naming, Some(ConvoyNaming::DeterministicFallback { reason: "caller supplied reason".into() }));
+    }
+
+    // Identifiers containing status digits or diagnostic fragments are not failure categories.
+    #[test]
+    fn diagnostic_categories_match_words_and_http_context() {
+        for error in ["request_id=req401", "request_id=401", "connecticut", "unknown_not_found", "request-id=req-429"] {
+            assert_eq!(
+                naming_failure_summary("Claude API", error),
+                "Claude API: utility command or API request failed (unrecognized diagnostic)"
+            );
+        }
+        for (error, expected) in [
+            ("Anthropic API error (HTTP 401): private body", "authentication failed"),
+            ("HTTP 429", "utility rate limited"),
+            ("connection refused", "utility unavailable"),
+            ("binary not found", "utility command unavailable"),
+            ("invalid convoy names response: request_id=401", "invalid convoy names response"),
+        ] {
+            assert_eq!(naming_failure_summary("Claude API", error), format!("Claude API: {expected}"));
+        }
+    }
+
+    // Missing admission collaborators report the specific availability reason and use fallback naming.
+    #[tokio::test]
+    async fn unavailable_environment_and_runner_keep_their_reasons() {
+        let environment = EnvironmentBag::new();
+        let config = ConfigStore::new(DaemonHostPath::new("/unused"), DaemonHostPath::new("/unused-state"));
+        for (bag, runner, expected) in [
+            (
+                None,
+                Some(Arc::new(NamingRunner(Ok(String::new()))) as Arc<dyn CommandRunner>),
+                "AI utilities: admitting environment unavailable",
+            ),
+            (Some(&environment), None, "AI utilities: admitting runner unavailable"),
+            (None, None, "AI utilities: admitting environment unavailable"),
+        ] {
+            let result = probe_admission_ai_utility(&[], bag, &config, &ExecutionEnvironmentPath::new("/unused"), runner).await;
+            let reason = result.err().expect("missing collaborator refuses probing");
+            assert_eq!(reason, expected);
+            let ((names, source), logs) = capture_logs(tracing::Level::WARN, async {
+                resolve_admission_names(Some(Err(reason)), "fallback", false, "not attempted")
+            })
+            .await;
+            assert_eq!(names, ConvoyNames { name: "fallback".into(), branch: "fallback".into() });
+            assert_eq!(source, Some(ConvoyNaming::DeterministicFallback { reason: expected.into() }));
+            assert!(logs.contains(expected) && logs.contains("WARN"), "{logs}");
+        }
+    }
+
+    // Contract: missing API key and binary retain every factory's unmet requirements.
+    #[tokio::test]
+    async fn missing_requirements_keep_all_probe_outcomes() {
+        let ((names, source), logs) = capture_logs(tracing::Level::WARN, naming(EnvironmentBag::new(), Ok(String::new()), false)).await;
+        assert!(logs.contains("WARN") && logs.contains("deterministic fallback used"), "{logs}");
+        assert_eq!(names.name, "repair-widget-3062");
+        assert_eq!(names.branch, names.name);
+        let Some(ConvoyNaming::DeterministicFallback { reason }) = source else { panic!("fallback provenance") };
+        for expected in ["Claude API", "ANTHROPIC_API_KEY", "Claude CLI", "claude", "missing binary", "missing environment variable"] {
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
+    // Contract: CLI failures and invalid responses keep the utility and diagnostic; success and explicit names keep their source.
+    #[tokio::test]
+    async fn cli_generation_records_failures_and_sources() {
+        let environment = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/bin/claude"));
+        for (response, expected) in [
+            (Err("Failed to authenticate: OAuth session expired and could not be refreshed".to_string()), "OAuth session expired"),
+            (Ok("not json".to_string()), "invalid convoy names response"),
+            (Ok(r#"{"name":"","branch":"fix/widget"}"#.to_string()), "empty convoy or branch name"),
+        ] {
+            let ((names, source), logs) = capture_logs(tracing::Level::WARN, naming(environment.clone(), response, false)).await;
+            assert!(
+                logs.contains("WARN")
+                    && logs.contains("Claude CLI")
+                    && logs.contains(expected)
+                    && logs.contains("deterministic fallback used"),
+                "{logs}"
+            );
+            assert_eq!(names.name, "repair-widget-3062");
+            assert_eq!(names.branch, names.name);
+            let Some(ConvoyNaming::DeterministicFallback { reason }) = source else { panic!("fallback provenance") };
+            assert!(reason.contains("Claude CLI"), "{reason}");
+            assert!(reason.contains(expected), "{reason}");
+        }
+        let response = Ok(r#"{"name":"repair-widget","branch":"fix/widget"}"#.to_string());
+        let (names, source) = naming(environment.clone(), response.clone(), false).await;
+        assert_eq!(names.name, "repair-widget");
+        assert_eq!(source, Some(ConvoyNaming::AiUtility { utility: "Claude CLI".to_string() }));
+        assert_eq!(naming(environment, response, true).await.1, Some(ConvoyNaming::Explicit));
     }
 }

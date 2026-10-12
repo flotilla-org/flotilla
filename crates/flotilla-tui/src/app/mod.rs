@@ -1543,6 +1543,7 @@ mod command_effect_tests {
             repo_identity,
             repo: None,
             result: CommandValue::ConvoyStarted {
+                naming: None,
                 name: "codex-auth-fail-loud".into(),
                 attach_plan: Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach vessel")),
                 binding: None,

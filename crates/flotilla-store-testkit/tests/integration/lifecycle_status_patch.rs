@@ -147,7 +147,8 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::RecordLandingEvent { transition: None } => PatchKind::ConvoyRecordLandingEvent,
         ConvoyStatusPatch::HoldTurnDelivery { .. } => PatchKind::ConvoyHoldTurnDelivery,
         ConvoyStatusPatch::RestoreTurnActivation { .. } => PatchKind::ConvoyRestoreTurnActivation,
-        ConvoyStatusPatch::RecordEnsureAdmission { .. }
+        ConvoyStatusPatch::RecordNaming { .. }
+        | ConvoyStatusPatch::RecordEnsureAdmission { .. }
         | ConvoyStatusPatch::DiscoverSubjects { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScan { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScanFailure { .. }
@@ -307,6 +308,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        naming: None,
         promises: Default::default(),
         landing_entry: None,
         landing_settlement: None,

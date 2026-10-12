@@ -907,6 +907,21 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    if let Some(naming) = &explanation.naming {
+        match naming {
+            flotilla_protocol::ConvoyNaming::Explicit => {
+                let _ = writeln!(output, "Naming: explicit");
+            }
+            flotilla_protocol::ConvoyNaming::AiUtility { utility } => {
+                let _ = writeln!(output, "Naming: AI utility ({utility})");
+            }
+            flotilla_protocol::ConvoyNaming::DeterministicFallback { reason } => {
+                let _ = writeln!(output, "Naming: deterministic fallback ({reason})");
+            }
+        }
+    } else {
+        let _ = writeln!(output, "Naming: unknown (not recorded)");
+    }
     for hold in &explanation.holds {
         let _ = writeln!(output, "Turn delivery: {} held since={}: {}", hold.source, hold.raised_at, hold.reason);
     }

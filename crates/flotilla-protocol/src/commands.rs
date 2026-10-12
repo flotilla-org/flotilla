@@ -407,8 +407,24 @@ pub struct ExplainedSettlement {
     pub unmet: Vec<ExplainedUnmetExpectation>,
 }
 
+/// Provenance of the admitted convoy name only. Branch generation is independent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ConvoyNaming {
+    /// An explicit convoy name; its branch may still come from AI or fallback.
+    Explicit,
+    AiUtility {
+        utility: String,
+    },
+    DeterministicFallback {
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming: Option<ConvoyNaming>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promises: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1405,6 +1421,8 @@ pub enum CommandValue {
     },
     ConvoyStarted {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        naming: Option<ConvoyNaming>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach_plan: Option<crate::ResolvedAttachPlan>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

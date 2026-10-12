@@ -920,6 +920,9 @@ pub enum InputValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
+    /// ADR 0047: remove this decoder default one fleet roll after deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naming: Option<flotilla_protocol::ConvoyNaming>,
     /// Landing provenance is observational only. ADR 0047: remove the decoder
     /// defaults one fleet roll after deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1632,6 +1635,9 @@ pub enum ConvoyStatusPatch {
         vessel: String,
         observation: flotilla_protocol::EnvironmentRuntimeObservation,
     },
+    RecordNaming {
+        naming: flotilla_protocol::ConvoyNaming,
+    },
     RecordEnsureAdmission {
         config: crate::ConvoyEnsureSpec,
     },
@@ -1909,6 +1915,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::ObserveEnvironment { vessel, observation } => {
                 status.environment_observations.entry(vessel.clone()).or_default().merge(observation)
+            }
+            Self::RecordNaming { naming } => {
+                status.naming = Some(naming.clone());
             }
             Self::RecordEnsureAdmission { config } => {
                 status.ensure_admission.get_or_insert_with(|| config.clone());

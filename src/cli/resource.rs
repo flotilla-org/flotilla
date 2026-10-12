@@ -129,7 +129,7 @@ pub(crate) async fn run_control_command(cli: &Cli, mut command: Command, format:
     if matches!(result, CommandValue::Error { .. } | CommandValue::FleetPostInstall { failed: true, .. }) {
         std::process::exit(1);
     }
-    if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding } = result {
+    if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding, .. } = result {
         if should_exec_convoy_attach(format, std::io::stdin().is_terminal(), convoy_auto_attach) {
             stamp_pane_identity(&name, binding.as_ref()).await;
             return run_attach_plan(&plan);

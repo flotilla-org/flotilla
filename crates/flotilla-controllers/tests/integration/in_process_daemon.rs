@@ -2180,13 +2180,23 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
     let overridden_id = daemon.execute(start("overridden", "single-agent")).await.expect("override dispatch command");
     assert_eq!(
         recv_command_finished(&mut events, overridden_id).await,
-        CommandValue::ConvoyStarted { name: "overridden@zellij".into(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "overridden@zellij".into(),
+            attach_plan: None,
+            binding: None
+        }
     );
 
     let admitted_id = daemon.execute(start("reviewed", "implement-review")).await.expect("dispatch command");
     assert_eq!(
         recv_command_finished(&mut events, admitted_id).await,
-        CommandValue::ConvoyStarted { name: "reviewed@zellij".into(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "reviewed@zellij".into(),
+            attach_plan: None,
+            binding: None
+        }
     );
     let convoy = admitted_convoy(&backend, "reviewed").await;
     assert_eq!(convoy.spec.workflow_ref, "implement-review");
@@ -2361,6 +2371,9 @@ async fn exercise_existing_pr_admission(continuing: bool) {
     assert_eq!(
         recv_command_finished(&mut events, command_id).await,
         CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::DeterministicFallback {
+                reason: "change-request admission uses deterministic naming".into()
+            }),
             name: "convoy-adoption-of-an-existing-pr-1071@flotilla".to_string(),
             attach_plan: None,
             binding: None,
@@ -3526,7 +3539,15 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         .expect("start command accepted");
 
     let implicit_result = recv_command_finished(&mut events, implicit_command_id).await;
-    assert_eq!(implicit_result, CommandValue::ConvoyStarted { name: "local-default@flotilla".into(), attach_plan: None, binding: None });
+    assert_eq!(
+        implicit_result,
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "local-default@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
+    );
 
     let command_id = daemon
         .execute(
@@ -3568,7 +3589,15 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     })
     .await
     .expect("start command should finish");
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "explicit-default@flotilla".into(), attach_plan: None, binding: None });
+    assert_eq!(
+        result,
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "explicit-default@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
+    );
     let convoy = admitted_convoy(&backend, "explicit-default").await;
     assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-b-remote"));
     let decision =
@@ -3821,7 +3850,12 @@ async fn convoy_start_accepts_project_list_identifier() {
 
         assert_eq!(
             recv_command_finished(&mut events, start_id).await,
-            CommandValue::ConvoyStarted { name: format!("{name}@flotilla"), attach_plan: None, binding: None }
+            CommandValue::ConvoyStarted {
+                naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+                name: format!("{name}@flotilla"),
+                attach_plan: None,
+                binding: None
+            }
         );
         let convoy = admitted_convoy(&backend, &name).await;
         assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
@@ -3999,7 +4033,15 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732@flotilla".into(), attach_plan: None, binding: None });
+    assert_eq!(
+        result,
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "issue-732@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
+    );
     let persisted = admitted_convoy(&backend, "issue-732").await;
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
     assert_eq!(persisted.spec.workflow_ref, "single-agent");
@@ -4080,7 +4122,15 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             assert!(message.contains(expected_error), "{message}");
             assert!(message.contains("https://github.com flotilla-org/planning"), "{message}");
         } else {
-            assert_eq!(result, CommandValue::ConvoyStarted { name: format!("{name}@flotilla"), attach_plan: None, binding: None });
+            assert_eq!(
+                result,
+                CommandValue::ConvoyStarted {
+                    naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+                    name: format!("{name}@flotilla"),
+                    attach_plan: None,
+                    binding: None
+                }
+            );
             assert_eq!(admitted_convoy(&backend, name).await.spec.issues[0].reference, reference);
         }
     }
@@ -4148,7 +4198,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .expect("default start command accepted");
     assert_eq!(
         recv_command_finished(&mut events, default_id).await,
-        CommandValue::ConvoyStarted { name: "default-regard@flotilla".into(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "default-regard@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
     );
     let default_convoy = admitted_convoy(&backend, "default-regard").await;
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list default dispatcher regard");
@@ -4204,7 +4259,15 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     })
     .await
     .expect("batch start should finish");
-    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733@flotilla".into(), attach_plan: None, binding: None });
+    assert_eq!(
+        batch_result,
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "batch-732-733@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
+    );
     let batch = admitted_convoy(&backend, "batch-732-733").await;
     assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
     assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
@@ -4256,10 +4319,22 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .expect("offline fallback should finish");
     assert_eq!(
         fallback_result,
-        CommandValue::ConvoyStarted { name: "start-convoy-from-an-issue-732@flotilla".into(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: utility unavailable".into() }),
+            name: "start-convoy-from-an-issue-732@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
     );
     let fallback = admitted_convoy(&backend, "start-convoy-from-an-issue-732").await;
     assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
+    // Admission persists provenance and explain returns the same diagnostic.
+    let expected_naming =
+        Some(flotilla_protocol::ConvoyNaming::DeterministicFallback { reason: "counting-ai: utility unavailable".into() });
+    assert_eq!(fallback.status.as_ref().expect("admitted status").naming, expected_naming);
+    let explanation = daemon.explain_convoy_internal(Some("flotilla"), &fallback.metadata.name).await.expect("explain naming");
+    assert_eq!(explanation.naming, expected_naming);
+
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
 
     backend
@@ -4351,7 +4426,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     .expect("explicit workflow should not consult the missing default");
     assert_eq!(
         explicit_result,
-        CommandValue::ConvoyStarted { name: "explicit-workflow@explicit-workflow".into(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "explicit-workflow@explicit-workflow".into(),
+            attach_plan: None,
+            binding: None
+        }
     );
 
     let wrong_namespace_id = daemon
@@ -4540,7 +4620,15 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy@flotilla".into(), attach_plan: None, binding: None });
+    assert_eq!(
+        result,
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::AiUtility { utility: "counting-ai".into() }),
+            name: "generated-convoy@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
+    );
     let persisted = admitted_convoy(&backend, "generated-convoy").await;
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/generated-convoy"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
@@ -4569,7 +4657,12 @@ async fn convoy_admission_generates_records_and_enforces_one_live_role_generatio
     let first_id = daemon.execute(command.clone()).await.expect("first admission");
     assert_eq!(
         recv_command_finished(&mut events, first_id).await,
-        CommandValue::ConvoyStarted { name: "governor@flotilla".to_string(), attach_plan: None, binding: None }
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::Explicit),
+            name: "governor@flotilla".to_string(),
+            attach_plan: None,
+            binding: None
+        }
     );
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let first = convoys.list().await.expect("list first generation").items.pop().expect("first generation");
@@ -5063,7 +5156,15 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
 
     let retry_id = daemon.execute(command).await.expect("matching convoy start retry should be accepted");
     let retry_result = recv_command_finished(&mut events, retry_id).await;
-    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy@flotilla".into(), attach_plan: None, binding: None });
+    assert_eq!(
+        retry_result,
+        CommandValue::ConvoyStarted {
+            naming: Some(flotilla_protocol::ConvoyNaming::AiUtility { utility: "panic-once-ai".into() }),
+            name: "retried-convoy@flotilla".into(),
+            attach_plan: None,
+            binding: None
+        }
+    );
 
     drop(temp);
 }
@@ -9672,3 +9773,39 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
 }
 
 use flotilla_discovery_testkit::InProcessDiscoveryExt;
+
+// Explicit naming means the convoy name, independently of AI/fallback branch generation.
+#[tokio::test]
+async fn explicit_convoy_name_survives_failed_branch_generation() {
+    let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(true) });
+    let mut discovery = fake_discovery(false);
+    discovery.factories.ai_utilities.push(Box::new(CountingConvoyAiUtilityFactory { utility: Arc::clone(&utility) }));
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".into())
+                            .name("explicit-branch-fallback".into())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("start");
+    assert!(matches!(
+        recv_command_finished(&mut events, id).await,
+        CommandValue::ConvoyStarted { naming: Some(flotilla_protocol::ConvoyNaming::Explicit), .. }
+    ));
+    let convoy = admitted_convoy(&backend, "explicit-branch-fallback").await;
+    assert_eq!(convoy.status.as_ref().expect("status").naming, Some(flotilla_protocol::ConvoyNaming::Explicit));
+    assert_eq!(convoy.spec.r#ref.as_deref(), Some("flotilla-flotilla"));
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+}
