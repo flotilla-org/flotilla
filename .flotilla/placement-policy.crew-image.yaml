@@ -4,13 +4,18 @@ metadata:
   name: docker-crew-image-kiwi
   namespace: flotilla
   annotations:
-    flotilla.work/image-recipe: .flotilla/Dockerfile.crew
+    flotilla.work/image-recipe: .flotilla/image-layers/inputs.json
 spec:
   pool: cleat
   docker_per_vessel:
     host_ref: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3
     image:
-      image_baseline_ref: fleet-crew
+      composition:
+        selection:
+          base: spine-base
+          utilities: spine-utilities
+          harness: spine-harness
+          project: null
     memory_policy:
       host_memory_percent: 50
       expected_concurrent_crews: 4

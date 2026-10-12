@@ -13,6 +13,12 @@ impl DockerImageSourceStoreExt for DockerImageSource {
                     identity.validate()?;
                     return Ok(identity.registry_digest.as_ref().unwrap_or(&identity.local_image_id).clone());
                 }
+                if let Some(image) = &composition.literal_base {
+                    if !composition.layers.is_empty() || image.trim().is_empty() {
+                        return Err("literal image composition must have a nonempty base and no layers".into());
+                    }
+                    return Ok(image.clone());
+                }
                 composition
                     .baseline_image
                     .clone()

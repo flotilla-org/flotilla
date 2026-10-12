@@ -103,3 +103,49 @@ fn placement_baseline_provenance_round_trips_and_never_infers_literal_tags(tc: h
     assert_eq!(decoded, policy);
     assert_eq!(decoded.legacy_image_baseline_ref(), expected);
 }
+
+// ADR 0047/#2731: stored generation-1 snapshots keep their image; new
+// compositions await identity, and resolved legacy literals need no registry.
+#[hegel::test]
+fn cutover_composition_resolution_preserves_frozen_images(tc: hegel::TestCase) {
+    use flotilla_resources::{ImageComposition, ImageLayerSelection, PlacedImageIdentity};
+    // Cross empty/boundary/ordinary literal values and all three stored shapes.
+    let size = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(70));
+    let shape = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
+    let bound = tc.draw(hegel::generators::booleans());
+    let literal = if size == 0 { String::new() } else { format!("crew:{}", "a".repeat(size)) };
+    let mut composition = ImageComposition::builder()
+        .selection(ImageLayerSelection::builder().base("base".into()).build())
+        .needs(Default::default())
+        .layers(Vec::new())
+        .build();
+    match shape {
+        0 => composition.baseline_image = Some(literal.clone()),
+        1 => composition.literal_base = Some(literal.clone()),
+        _ => {}
+    }
+    if bound {
+        composition.bind(PlacedImageIdentity { local_image_id: "sha256:built".into(), registry_digest: None }).expect("bind");
+    }
+    if shape == 1 {
+        let mut frozen = flotilla_resources::FrozenImageLayers::default();
+        frozen.include(&composition).expect("no-layer literal");
+        assert_eq!(frozen, flotilla_resources::FrozenImageLayers::default(), "literal sources do not claim frozen layer revisions");
+    }
+    let image = DockerImageSource::Composition { composition: Box::new(composition) };
+    let encoded = serde_json::to_value(&image).expect("serialize new shape");
+    assert!(encoded.get("image_baseline_ref").is_none());
+    let decoded: DockerImageSource = serde_json::from_value(encoded).expect("stored composition");
+    assert_eq!(decoded, image);
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let resolved = decoded.resolve(&backend.definitions("flotilla")).await;
+        if bound {
+            assert_eq!(resolved.expect("built identity"), "sha256:built");
+        } else if shape < 2 && size > 0 {
+            assert_eq!(resolved.expect("frozen literal"), literal);
+        } else {
+            assert!(resolved.is_err(), "empty/unbuilt images cannot launch");
+        }
+    });
+}

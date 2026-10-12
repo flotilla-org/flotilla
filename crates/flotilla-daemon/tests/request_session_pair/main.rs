@@ -1503,7 +1503,11 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
             let snapshot = &convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
             let policy = backend.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("prepared snapshot");
             let docker = policy.spec.docker_per_vessel.expect("contained snapshot");
-            assert_eq!(docker.image, flotilla_resources::DockerImageSource::Literal("crew:baseline".into()));
+            let flotilla_resources::DockerImageSource::Composition { composition } = docker.image else {
+                panic!("legacy baseline must freeze as a no-layer composition");
+            };
+            assert!(composition.layers.is_empty());
+            assert_eq!(composition.literal_base.as_deref(), Some("crew:baseline"));
             assert_eq!(docker.legacy_image_baseline_ref.as_deref(), Some("fleet-crew"));
         }
         for host in [&topology.leader, &topology.follower] {

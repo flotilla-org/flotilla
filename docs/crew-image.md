@@ -1,14 +1,9 @@
 # Crew image
 
-Contained vessels use the curated image at:
-
-```text
-forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
-```
-
-The explicit release tag in `.flotilla/crew-image-baseline.yaml` is the
-deployment contract. Do not point the baseline at `latest`. All three host
-crew placements reference this one federated Definition (ADR 0039).
+Contained vessels select a composition in their placement policy. Admission
+freezes layer revisions and needs; placement binds the host-local image ID and,
+when present, the registry manifest digest. Host-local builds work without a
+registry or Forgejo CI. Arbitrary literal images remain supported.
 
 Contained crew terminal sessions run inside the environment. A Docker
 placement therefore names `pool: cleat`, meaning the cleat discovered inside
@@ -84,42 +79,35 @@ prevents the CLI from trying to spawn a local daemon if the host socket is
 unreachable; host-side managed terminals retain their normal self-healing
 spawn behavior.
 
-## Layer composition (generation 1)
+## Layer composition (generation 2)
 
 [ADR 0053](adr/0053-crew-images-compose-from-declared-layers-and-freeze-in-stages.md)
-records the replacement model. `ImageLayer` manifests declare a Dockerfile
-fragment by repository and full pinned commit, args, pins, `provides` and
-`requires`. Base/toolchain and utility layers have fixed parents; capability,
-harness and project fragments use `FROM ${BASE}`. Admission composes the
-minimum covering capability set in canonical order and refuses missing needs.
-
-The cut-over starts by authoring layers alongside the existing baseline.
-An optional selection on the baseline connects them to admission:
+records layer authority, composition and freezing. A placement selects names:
 
 ```yaml
-spec:
-  image: <the current explicit baseline release tag>
-  layers:
-    base: fleet-base
-    utilities: fleet-utilities
-    harness: fleet-harness
-    project: flotilla-project
+docker_per_vessel:
+  image:
+    composition:
+      selection:
+        base: spine-base
+        utilities: spine-utilities
+        harness: spine-harness
+        project: null
 ```
 
-Each selected name must resolve to an `ImageLayer` Definition. Utilities,
-harness and project selections may be omitted. The baseline remains the
-running image in generation 1; layers add frozen composition metadata to
-placement snapshots and the convoy's `flotilla.work/frozen-image-layers`
-annotation. Existing baselines without `layers` and arbitrary literal images
-retain their existing behavior. This does not start image builds or retire the
-CI recipe; those transitions follow in #2728–#2731.
+Each selected name resolves to an `ImageLayer` Definition. Admission adds the
+minimum capability cover for its needs and freezes the selected inputs.
+Unbuilt compositions join `ImageBuild`; the Environment waits in Provisioning
+until the concrete image is available. Build failure never selects an older
+baseline. A no-layer composition's `literal_base` is a resolved legacy image,
+not a substitute for any failed build.
 
-Frozen revisions identify the source intent. A separate Merkle recipe key
-uses resolved parent identity, input-file content hashes, normalised args/pins
-and architecture, excluding host and checkout identity. Unpinned resolved
-inputs cannot receive a shareable key. Placement records `local_image_id`
-and, when available, `registry_digest` under their distinct names. The old
-`image_digest` status field still decodes for the one-generation window.
+Existing ordinary convoys retain their frozen literal or generation-1 shadow
+image through completion and relaunch. Only new admissions use the new path.
+The `CrewImageBaseline` kind and `image_baseline_ref` source are compatibility
+readers for the generation-2 roll, not fleet authoring interfaces. Remove these
+readers in generation 3 after pre-roll validation proves no baseline references
+remain in stores or operational manifests. Do not rewrite the golden corpus.
 
 ## Why these layers pay here
 
@@ -156,222 +144,47 @@ run.
 - A multi-repository project records which member repositories an image serves
   and uses distinct entries where their stacks require distinct images.
 
-## Build and publish
+## Cut-over and roll order
 
-The Dockerfile is deliberately ordered from slowest-changing to
-fastest-changing:
+1. Validate the candidate against every host store and registered operational
+   entry under ADR 0047. Preserve frozen convoy snapshots and old images.
+2. In fleet-ops, generate and commit `ImageLayer` Definitions using the full
+   input revision and resolved base digest (command below). Configure same-arch
+   builders and optional host-action registry grants. No CI PAT is needed.
+3. Roll the fleet daemon cohort together, then apply layers before policies.
+   Update all per-host fleet-ops placement manifests and any project-map
+   operational entries still authoring `image_baseline_ref` to the selection
+   above. Update matching Docker fulfilment image selections too.
+4. Apply the per-host policies: kiwi (`placement-policy.crew-image.yaml`), feta
+   (`placement-policy.crew-image-feta.yaml`), and udder
+   (`placement-policy.crew-image-udder.yaml`). They all select the same spine.
+   Udder must declare non-builder capacity and a same-architecture builder if
+   it remains eligible; disable its Rust crew placement when none exists.
+   There is no central arm64 image build or cross-architecture builder.
+5. Verify a new admission builds/binds the selected composition, then retire
+   the `fleet-crew` baseline Definition. Keep running convoys' images available.
+6. In fleet-ops/lab operations remove the `crew-image-builder` runner and its
+   multi-node arm64 buildx worker, delete the `IMAGE_BUILDER_TOKEN` Actions
+   secret, revoke the CI `image-builder` PAT, and remove its persisted Docker
+   login. Preserve unrelated pull identities and registry credentials granted
+   to daemon host actions. These external changes are part of the same roll.
+7. After that roll and pre-roll validation of the next cohort, remove the
+   compatibility baseline decoder/registry entry in generation 3. Regenerate
+   the golden corpus only through the normal post-roll capture process.
 
-1. Ubuntu, certificates, Git, and curl;
-2. C, the stable Rust compiler and components from `rust-toolchain.toml`,
-   Node.js, and Zig;
-3. `gh` and `tea` (GitHub and Forgejo/Gitea forge CLIs) and general development and diagnostic utilities;
-4. Claude Code and Codex;
-5. Ghostty terminfo generated by a separate builder stage. Only the terminfo
-   database and its license reach the final image.
+Out-of-repo sources: **fleet-ops placement manifests** and **project-map**
+operational entries author placement/fulfilment images. No companion schema
+change is needed: `literal_base` is an optional field written by admission, and
+old authored forms still decode. Operational selection changes use the exact
+per-host policies supplied here; apply those replacements wherever fleet-ops
+or project-map still selects the baseline. Credential/runner cleanup is listed
+above. This repository cannot enact those repositories or live-host changes. Registry-less single-host installs
+apply locally authored layers and policies and skip registry/CI cleanup.
 
-**The `Build crew image` Forgejo Actions workflow does this.** Dispatch it
-from the repository's Actions tab on the lab Forgejo mirror
-(`.forgejo/workflows/crew-image.yml`) with `codex_version`,
-`claude_code_version`, `tea_version`, `cleat_ref`, and `zig_version` inputs —
-each defaults to the pin already baked into `.flotilla/Dockerfile.crew`, so a
-routine bump is just overriding the one input that changed. The workflow:
-
-- runs a multi-arch (`linux/amd64,linux/arm64`) `docker buildx build --push`
-  of `.flotilla/Dockerfile.crew` on the `crew-image-builder` runner (see
-  `ci/fork-actions/RUNNERS.md`);
-- gates on the Dockerfile's own build-time smoke checks (`claude`, `codex`,
-  `tea`, Zig, the C toolchain, and both Ghostty and fallback terminfo), which run
-  for both platforms as part of the build, then re-verifies the pushed
-  manifest by pulling it back and running adapter and non-root terminfo checks;
-- authenticates to the registry with the `image-builder` `write:package`
-  identity via the `IMAGE_BUILDER_TOKEN` repository secret — the recipe
-  itself never sees a credential, and the workflow logs back out of the
-  registry when the job ends;
-- pushes an explicit `<date>.<short-sha>.<input-hash>` tag (e.g.
-  `2026-09-23.3f6f111e.cfce0cb5`), where `<short-sha>` is the triggering
-  commit and `<input-hash>` is a short hash of the five version inputs. The
-  input hash matters because a routine bump is *just* overriding one input,
-  with no new commit — without it, two same-day dispatches against the same
-  commit but different versions would collide on one tag and silently
-  overwrite each other in the registry.
-
-Updating the fleet baseline to the newly pushed tag is a deliberate,
-separate, human-triggered follow-on step (see Placement policy below) — the
-workflow does not do it.
-
-Manual `docker buildx build --push` from a build host with both amd64 and
-arm64 workers remains the fallback when the CI runner is unavailable. A fresh
-manual build should follow the workflow's
-`<date>.<short-sha>.<input-hash>` scheme so the two paths cannot mint
-colliding tags:
-
-```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
-docker buildx build \
-  --platform linux/amd64,linux/arm64 \
-  --file .flotilla/Dockerfile.crew \
-  --tag "$IMAGE" \
-  --push \
-  .
-```
-
-Changing either `CLAUDE_CODE_VERSION` or `CODEX_VERSION` only invalidates the
-final adapter install and smoke-check layers: both arguments are declared
-after the toolchain and utility layers. Confirm cache reuse during an adapter
-upgrade with `--progress=plain`; the earlier build steps should report
-`CACHED`.
-
-Registry login is intentionally not part of the recipe. Authenticate Docker
-to `forgejo.lab.flotilla.work` on the build host before publishing.
-
-## Verify
-
-Pull the published image rather than relying on the local build cache, then
-run both adapter entry points using the tag published above:
-
-```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
-docker pull "$IMAGE"
-docker run --rm "$IMAGE" claude --version
-docker run --rm "$IMAGE" codex --version
-docker run --rm "$IMAGE" tea --version
-docker run --rm "$IMAGE" zig version
-docker run --rm "$IMAGE" python3 --version
-docker run --rm "$IMAGE" strace --version
-docker run --rm "$IMAGE" clang --version
-docker run --rm "$IMAGE" ld.lld --version
-docker run --rm "$IMAGE" make --version
-docker run --rm "$IMAGE" pkg-config --version
-docker run --rm "$IMAGE" sh -c 'test -z "${CLEAT_GHOSTTY_PREFIX+x}" && test ! -e /opt/ghostty-install'
-docker run --rm --user 12345:12345 "$IMAGE" sh -c '
-  set -eu
-  infocmp xterm-ghostty >/dev/null
-  infocmp xterm-256color >/dev/null
-  TERM=xterm-ghostty python3 -c "import curses; curses.setupterm(); assert curses.tigetnum(\"colors\") >= 256"
-  TERM=xterm-256color python3 -c "import curses; curses.setupterm(); assert curses.tigetnum(\"colors\") >= 256"
-'
-```
-
-After updating the fleet baseline and admitting a **new** contained crew,
-launch a fresh Cleat session in that vessel without a TERM or identity
-override. Inspect the child with `printf '%s\n' "$TERM"` and
-`infocmp "$TERM"`; expect `xterm-ghostty` and successful capability lookup.
-Also run `TERM=xterm-ghostty python3 -c 'import curses; curses.setupterm()'`
-and a noninteractive `sh -c 'true'`. Existing crews retain their pinned image
-and are not restarted by the image build or baseline update.
-
-Flotilla launches managed Docker environments with `--init`, so PID 1 reaps
-orphaned processes created by crew commands and process-lifecycle tests.
-
-The build-time smoke check also compiles and links a small C program with
-Clang and LLD, exercising the common C and Linux headers. To verify the
-wheelhouse cargo contract against a checkout of `ui-scratch`, mount that
-checkout as the workspace and run its debug build:
-
-```bash
-docker run --rm \
-  --volume "$UI_SCRATCH:/workspace" \
-  "$IMAGE" \
-  ./build.sh debug
-```
-
-Cargo's runtime registry, cache, and additional tool proxies live beneath
-`/tmp/flotilla-config/cargo`. Verify that an arbitrary non-root runtime user can
-populate that writable home and run a dependency-backed test:
-
-```bash
-docker run --rm --user 12345:12345 "$IMAGE" sh -c '
-  set -eu
-  test "$CARGO_HOME" = /tmp/flotilla-config/cargo
-  mkdir -p /tmp/cargo-smoke/src
-  printf "[package]\nname = \"cargo-smoke\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nanyhow = \"1\"\n" > /tmp/cargo-smoke/Cargo.toml
-  printf "#[test]\nfn dependency_is_usable() { assert_eq!(anyhow::anyhow!(\"smoke\").to_string(), \"smoke\"); }\n" > /tmp/cargo-smoke/src/lib.rs
-  cargo test --manifest-path /tmp/cargo-smoke/Cargo.toml
-  test -d "$CARGO_HOME/registry/cache"
-'
-```
-
-Rustup keeps `RUSTUP_HOME=/usr/local/rustup`, which the image makes writable
-by any runtime UID. Containers are per vessel, so a crew's writes stay in its
-own container layer. A checkout's `rust-toolchain.toml` therefore takes
-effect for `cargo` without per-crew workarounds. The image copies Flotilla's
-`rust-toolchain.toml`, reads its channel with `ci/toolchain/pin.sh`, and bakes
-that stable compiler with the components and WebAssembly target declared in
-the file. Formatting uses that same stable pin.
-Other repositories' pins install on demand into the writable vessel layer.
-The recipe checks the baked pin as a non-root UID:
-
-```bash
-docker run --rm --user 12345:12345 "$IMAGE" sh -c '
-  set -eu
-  mkdir -p /tmp/pinned && cd /tmp/pinned
-  cp /opt/flotilla/rust-toolchain.toml rust-toolchain.toml
-  . /opt/flotilla/pin.sh
-  assert_rust_pin rust-toolchain.toml
-  cargo clippy --version
-'
-```
-
-Until the image bakes cleat, run its version check against a provisioned
-environment, where Flotilla supplies the interim bind mount. The Dockerfile
-currently checks both declared agent adapters while building.
-
-## Placement policy and fleet baseline
-
-These manifests describe the target configuration. Live three-host rollout has
-not yet been verified; kiwi reported Docker unavailable during implementation.
-
-Deploy baseline support on all hosts before applying these manifests. Apply
-`.flotilla/crew-image-baseline.yaml` once, from any host in namespace
-`flotilla`, and verify `crewimagebaselines fleet-crew` resolves on each host.
-Then apply each host's policy on its own home:
-
-| Host | Policy manifest |
-| --- | --- |
-| kiwi | `.flotilla/placement-policy.crew-image.yaml` |
-| feta | `.flotilla/placement-policy.crew-image-feta.yaml` |
-| udder | `.flotilla/placement-policy.crew-image-udder.yaml` |
-
-```bash
-flotilla resource apply --file .flotilla/crew-image-baseline.yaml
-flotilla resource get crewimagebaselines fleet-crew --json
-# Run on kiwi; use the matching manifest on feta and udder.
-flotilla resource apply --file .flotilla/placement-policy.crew-image.yaml
-flotilla resource get placementpolicies docker-crew-image-kiwi --json
-```
-
-Host references are Flotilla identities. If a host is re-registered, update
-its manifest's `host_ref` and reapply it on that host. The policies promise
-the `claude-code` and `codex` adapters, which a replacement image must provide.
-
-For subsequent fleet bumps, edit only `spec.image` in
-`.flotilla/crew-image-baseline.yaml` and apply that file once. Commit the new
-pin. Do not retag or reapply the host policies. Definition replication carries
-the edit to the other hosts; it is eventually consistent, so verify the
-merged baseline on all three before starting the rollout check. Admit one
-new contained convoy per host and verify its Environment/Vessel `image_ref`
-and immutable `image_digest`. Existing prepared placements and running vessels
-keep their pinned image. A disconnected host may see its previous baseline
-until replication resumes.
-
-The checked-in policy uses this reference shape:
-
-```yaml
-docker_per_vessel:
-  image:
-    image_baseline_ref: fleet-crew
-```
-
-The reference is namespace-local. Missing, deleted, empty, or conflicted
-baselines fail admission/provisioning with the reference named in an
-`image-baseline ... missing/unresolved` error before Docker can pull. Resolve
-concurrent Definition edits explicitly; there is no image fallback.
-
-Independent placements may use a pinned digest in `docker_per_vessel.image`.
-Mutable tags are refused by environment preparation. `pull_policy` remains per placement: `always` (default),
-`if_not_present`, or `never`. This does not resolve or build the recipe in
-the retired `.flotilla/environment.yaml.legacy` recipe. For checkout environments,
-declare ImageBuild and use its resulting pinned digest; providers do not build the recipe.
+The retired `.forgejo/workflows/crew-image.yml` no longer publishes a curated
+multi-architecture tag. `ci/crew-image/test-workflow.sh` remains the existing CI
+entry point for composition, authentication-wrapper and retirement checks;
+`.github/workflows` requires no change.
 
 ## Composed spine and display acceptance
 
@@ -397,7 +210,7 @@ python3 ci/crew-image/compose.py --revision "$(git rev-parse HEAD)" \
   --base 'ubuntu@sha256:<resolved-digest>' > /tmp/fleet-image-layers.yaml
 ```
 
-These are opt-in Definitions, not an automatic fleet deployment. Select
+Commit these reviewed Definitions in the fleet charter before policy cut-over. Select
 `spine-base`, `spine-utilities`, and `spine-harness` in the placement's layer
 selection. The existing composer inserts `capability-display-x11` when the
 need-set includes `display:headless-x11`. Its probe is `xdpyinfo`, which opens

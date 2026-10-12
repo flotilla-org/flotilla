@@ -324,7 +324,7 @@ impl AdmissionActions<'_> {
                 }
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
             }
-            let placement = match self
+            let mut placement = match self
                 .convoy_admission
                 .resolve_convoy_placement(
                     &namespace,
@@ -376,6 +376,10 @@ impl AdmissionActions<'_> {
             if let Err(message) =
                 self.convoy_admission.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await
             {
+                self.events.finish(id, empty_identity, CommandValue::Error { message });
+                return Ok(id);
+            }
+            if let Err(message) = self.convoy_admission.join_convoy_placement_builds(&namespace, &mut placement).await {
                 self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }

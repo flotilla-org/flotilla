@@ -1228,6 +1228,10 @@ impl ConvoyAdmission {
         }
     }
 
+    pub(super) async fn join_convoy_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
+        PlacementBuildJoiner { backend: &self.backend, inputs: &self.image_build_inputs }.join_placement_builds(namespace, placement).await
+    }
+
     pub(super) async fn resolve_convoy_placement(
         &self,
         namespace: &str,
@@ -1454,7 +1458,7 @@ impl PlacementBuildJoiner<'_> {
     async fn join_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
         if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
             if let flotilla_resources::DockerImageSource::Composition { composition } = &mut docker.image {
-                if composition.baseline_image.is_none() && composition.identity.is_none() {
+                if composition.baseline_image.is_none() && composition.literal_base.is_none() && composition.identity.is_none() {
                     let inputs = self.inputs.read().await.clone().ok_or("image build input resolver is unavailable")?;
                     composition.build_refs = crate::image_build::ImageBuildAdmission::new(self.backend.clone(), namespace, inputs)
                         .join(&docker.host_ref, composition)
@@ -2881,12 +2885,15 @@ impl AdmissionReadContext<'_> {
                     .filter(|need| need.is_image_need())
                     .map(CapabilityNeed::capability_string)
                     .collect();
-                // The image is frozen below, but its baseline source must also
-                // survive into the prepared snapshot for the #2731 bridge.
+                // Preserve provenance only for the no-layer compatibility image.
                 if let flotilla_resources::DockerImageSource::Baseline { image_baseline_ref } = &docker.image {
                     docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
                 }
                 docker.image = freeze_admission_image(&self.backend, namespace, &docker.image, &needs).await?;
+                if matches!(&docker.image, flotilla_resources::DockerImageSource::Composition { composition } if composition.literal_base.is_none())
+                {
+                    docker.legacy_image_baseline_ref = None;
+                }
             }
             validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
         }
@@ -4790,7 +4797,8 @@ pub(super) fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) 
     required_agent_adapters(workflow.vessels.iter().flat_map(|vessel| &vessel.crew))
 }
 
-/// Generation 1 never replaces the running baseline with an unbuilt image.
+/// New admissions use built compositions; previous-generation frozen literals
+/// remain unchanged until their convoy completes.
 /// Selection is structural; revisions are frozen in the placement snapshot.
 async fn freeze_admission_image(
     backend: &ResourceBackend,
@@ -4799,16 +4807,32 @@ async fn freeze_admission_image(
     needs: &BTreeSet<String>,
 ) -> Result<flotilla_resources::DockerImageSource, String> {
     use flotilla_resources::{compose_image, DockerImageSource, FrozenImageLayers, ImageLayer};
-    let (selection, baseline_image, mut frozen) = match image {
+    let (selection, mut frozen) = match image {
         DockerImageSource::Baseline { image_baseline_ref } => {
             let baseline = flotilla_resources::CrewImageBaseline::resolve(image_baseline_ref, &backend.definitions(namespace)).await?;
             let baseline_image = baseline.image;
-            let Some(selection) = baseline.layers else { return Ok(baseline_image.into()) };
-            (selection, Some(baseline_image), FrozenImageLayers::default())
+            let Some(selection) = baseline.layers else {
+                return Ok(DockerImageSource::Composition {
+                    composition: Box::new(
+                        flotilla_resources::ImageComposition::builder()
+                            .selection(flotilla_resources::ImageLayerSelection::builder().base(image_baseline_ref.clone()).build())
+                            .needs(BTreeSet::new())
+                            .layers(Vec::new())
+                            .literal_base(baseline_image)
+                            .build(),
+                    ),
+                });
+            };
+            (selection, FrozenImageLayers::default())
         }
-        DockerImageSource::Composition { composition } => (composition.selection.clone(), composition.baseline_image.clone(), {
+        DockerImageSource::Composition { composition } if composition.literal_base.is_some() && composition.layers.is_empty() => {
+            image.resolve(&backend.definitions(namespace)).await?;
+            return Ok(image.clone());
+        }
+        DockerImageSource::Composition { composition } => (composition.selection.clone(), {
             let mut frozen = FrozenImageLayers::default();
             frozen.include(composition)?;
+            frozen.baseline_image = None;
             frozen
         }),
         DockerImageSource::Literal(_) => return image.resolve(&backend.definitions(namespace)).await.map(Into::into),
@@ -4825,7 +4849,9 @@ async fn freeze_admission_image(
         .map(|layer| (layer.metadata.name, layer.spec))
         .collect();
     let mut composition = compose_image(&selection, needs, &catalogue, &mut frozen)?;
-    composition.baseline_image = baseline_image;
+    composition.baseline_image = None;
+    // Generation 2 never carries the shadow running image into a new admission.
+    // Existing convoy snapshots are consumed directly, without this freeze step.
     if let DockerImageSource::Composition { composition: previous } = image {
         if composition.layers == previous.layers {
             composition.build_refs = previous.build_refs.clone();
@@ -4848,7 +4874,7 @@ pub(super) async fn placement_agent_adapters(
         // image identity after admission, through ImageBuild and verification.
         let detail = match &docker.image {
             flotilla_resources::DockerImageSource::Composition { composition }
-                if composition.identity.is_none() && composition.baseline_image.is_none() =>
+                if composition.identity.is_none() && composition.baseline_image.is_none() && composition.literal_base.is_none() =>
             {
                 format!("image composition based on `{}`", composition.selection.base)
             }

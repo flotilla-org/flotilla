@@ -609,10 +609,10 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
     assert_eq!(error, "image `contained-image` declares agent adapter `missing-adapter`, but interior discovery did not find it");
 }
 
-// #2941: a baseline policy must survive real admission's prepared snapshot,
-// Vessel creation and Environment preparation; an authored literal tag must refuse.
+// #2731/#2941: legacy no-layer images survive prepared snapshots and runtime
+// preparation; unbuilt layers cannot use baseline authority, and literal tags refuse.
 #[tokio::test]
-async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
+async fn fresh_contained_admission_resolves_legacy_literal_but_refuses_unbuilt_layers_and_literal_tag() {
     use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
 
@@ -742,6 +742,14 @@ async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
             .await
             .expect("admit");
         let result = wait_for_command_result(&mut events, id).await;
+        if layers {
+            assert!(
+                matches!(result, CommandValue::Error { ref message } if message.contains("image build input resolver is unavailable")),
+                "unbuilt layers must demand a builder, not run the baseline: {result:?}"
+            );
+            assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
+            continue;
+        }
         assert!(matches!(result, CommandValue::ConvoyCreated { .. }), "admission: {result:?}");
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let name = convoy_record_name(&backend, "baseline-convoy").await;
@@ -767,7 +775,14 @@ async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
         let snapshot = backend.using::<PlacementPolicy>(NAMESPACE).get(&vessel.spec.placement_policy_ref).await.expect("snapshot");
         let docker = snapshot.spec.docker_per_vessel.expect("docker snapshot");
         assert_eq!(docker.legacy_image_baseline_ref.as_deref(), baseline.then_some("fleet-crew"));
-        assert_eq!(matches!(docker.image, DockerImageSource::Composition { .. }), layers);
+        if baseline {
+            let DockerImageSource::Composition { composition } = &docker.image else { panic!("legacy literal composition") };
+            assert!(composition.layers.is_empty());
+            assert_eq!(composition.literal_base.as_deref(), Some("crew:baseline"));
+            assert!(composition.baseline_image.is_none());
+        } else {
+            assert!(matches!(docker.image, DockerImageSource::Literal(_)));
+        }
         // Mutating the live baseline after admission must not change the frozen image.
         backend
             .definitions::<CrewImageBaseline>(NAMESPACE)
