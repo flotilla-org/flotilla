@@ -6,7 +6,7 @@ For the post-r591 provider and label cleanup, see the
 ## Git boundary check
 
 Install `uv` and Python 3.9+ on your desk or CI runner; the crew image already
-provides both. From the repository root, use the same commands in every environment:
+provides both. From the repository root, use this recipe:
 
 ```bash
 uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py
@@ -16,6 +16,10 @@ uv run --with-requirements ci/git-boundary/requirements.txt python -m unittest d
 `uv` installs the pinned ast-grep dependency in its managed environment, so these
 commands do not need system pip or Python's `venv`/`ensurepip` packages. The first
 run needs access to the Python package index; later runs can reuse uv's cache.
+
+The Format CI job currently installs the parser with pip. The matching `uv`
+workflow change is included in [PR #3087](https://github.com/flotilla-org/flotilla/pull/3087)
+for operator application; once applied, CI uses this same recipe.
 
 ## Daemon logs
 
