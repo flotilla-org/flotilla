@@ -319,6 +319,7 @@ mod routing;
 mod sources;
 mod stalls;
 mod subscriptions;
+mod supervision;
 mod turn_delivery;
 mod wake;
 

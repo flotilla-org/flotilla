@@ -249,17 +249,19 @@ impl CrewActions<'_> {
                     )
                     .await
                 {
-                    Ok(()) => {
-                        self.crew
-                            .record_lifecycle_mutation_best_effort(
-                                &namespace,
-                                &name,
-                                &format!("crew_supervise_{operation:?}"),
-                                caller.as_ref(),
-                                false,
-                            )
-                            .await;
-                        CommandValue::Ok
+                    Ok(value) => {
+                        if !matches!(value, CommandValue::CrewEscalationRefused { .. }) {
+                            self.crew
+                                .record_lifecycle_mutation_best_effort(
+                                    &namespace,
+                                    &name,
+                                    &format!("crew_supervise_{operation:?}"),
+                                    caller.as_ref(),
+                                    false,
+                                )
+                                .await;
+                        }
+                        value
                     }
                     Err(message) => CommandValue::Error { message },
                 },

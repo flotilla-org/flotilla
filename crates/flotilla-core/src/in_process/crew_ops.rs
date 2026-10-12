@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{
-    CheckoutArchiveOutcome, CheckoutArchiveStatus, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
+    CheckoutArchiveOutcome, CheckoutArchiveStatus, CommandValue, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
     CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef, ResourceRef,
 };
 use flotilla_resources::{
@@ -1538,7 +1538,7 @@ impl CrewService {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn supervise(&self, request: CrewSupervisionRequest<'_>) -> Result<(), String> {
+    pub(super) async fn supervise(&self, request: CrewSupervisionRequest<'_>) -> Result<CommandValue, String> {
         let CrewSupervisionRequest { namespace, convoy_name, vessel, role, operation: action, message, actor_crew_id, principal } = request;
         if message.trim().is_empty() {
             return Err("crew supervision requires a non-empty message".to_string());
@@ -1558,7 +1558,7 @@ impl CrewService {
                 MessageAttribution::operator(Some(principal)),
             )
             .await?;
-            return Ok(());
+            return Ok(CommandValue::Ok);
         }
         let stalled = status.stalled.as_ref().ok_or_else(|| "crew is not stalled".to_string())?;
         if !stalled.leaves.iter().any(|leaf| {
@@ -1594,7 +1594,10 @@ impl CrewService {
             return Err("crew supervision requires the named supervisor or an operator principal".to_string());
         }
         if action == flotilla_protocol::CrewSupervisionAction::Escalate && stalled.rung == flotilla_resources::StallRung::Operator {
-            return Err("stall is already at the operator rung".to_string());
+            return Ok(CommandValue::CrewEscalationRefused {
+                rung: flotilla_resources::StallRung::Operator,
+                reason: "stall is already at the operator rung".into(),
+            });
         }
         let receiver =
             crate::leaf_engine::crew_role_address(convoy.spec.project_ref.as_deref().unwrap_or(namespace), convoy_name, vessel, role);
@@ -1658,8 +1661,17 @@ impl CrewService {
                     })
                 })
         };
+        let escalation = if action == flotilla_protocol::CrewSupervisionAction::Escalate {
+            let (value, condition) = self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message).await?;
+            let Some(condition) = condition else {
+                return Ok(value);
+            };
+            Some((value, condition))
+        } else {
+            None
+        };
         // Persist the ruling before mutating workflow state: a failed authority CAS
-        // must not erase the supervisor's durable decision. Fail/Escalate Messages
+        // must not erase the supervisor's durable decision. Fail/Escalate ruling Messages
         // are notifications (no expectation and no resume/activation); delivery
         // cannot itself fail work or advance a rung. The command still reports
         // any state-patch failure, so the supervisor can retry that mutation.
@@ -1701,20 +1713,37 @@ impl CrewService {
                 .map_err(|error| error.to_string())?;
             }
             flotilla_protocol::CrewSupervisionAction::Escalate => {
-                let mut condition = stalled.clone();
-                condition.supervisor = None;
-                condition.maker = Some(flotilla_resources::LeafMaker::Actor { vessel: vessel.to_string(), role: role.to_string() });
-                condition.rung = flotilla_resources::StallRung::Operator;
-                apply_resource_status_patch(
-                    &convoys,
-                    convoy_name,
-                    &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: Some(condition) },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                let (value, condition) = escalation.expect("admitted escalation");
+                let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+                let mut updated = current.status.ok_or("convoy has no status")?;
+                // Local supervisor activation legitimately changes this convoy
+                // and clears its stall. Accept only the activation proved by the
+                // admitted Message, while preserving every other current field.
+                let local_activation = updated.stalled.is_none()
+                    && condition.supervisor.as_ref().is_some_and(|supervisor| {
+                        supervisor.convoy == convoy_name
+                            && updated.crew_work.get(&supervisor.vessel).and_then(|crew| crew.get(&supervisor.role)).is_some_and(|work| {
+                                work.phase == CrewWorkPhase::Working
+                                    && condition
+                                        .supervision_message
+                                        .as_ref()
+                                        .is_some_and(|message| work.resume_brief_id.as_deref() == Some(message.name.as_str()))
+                            })
+                    });
+                let obligation_unchanged = updated.crew_work.get(vessel).and_then(|crew| crew.get(role))
+                    == status.crew_work.get(vessel).and_then(|crew| crew.get(role));
+                if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
+                    return Err("stall changed during escalation; the current ruling was preserved".into());
+                }
+                updated.stalled = Some(condition);
+                convoys
+                    .update_status(convoy_name, &current.metadata.resource_version, &updated)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(value);
             }
         }
-        Ok(())
+        Ok(CommandValue::Ok)
     }
 
     pub(super) async fn teardown(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
