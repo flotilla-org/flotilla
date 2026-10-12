@@ -1,4 +1,4 @@
-use flotilla_daemon::server::replicator::{DigestControl, DigestScheduler};
+use flotilla_replication::{DigestControl, DigestScheduler};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use flotilla_client::SocketDaemon;

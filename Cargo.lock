@@ -1691,6 +1691,7 @@ dependencies = [
  "flotilla-provider-runtime",
  "flotilla-relay-protocol",
  "flotilla-replay-testkit",
+ "flotilla-replication",
  "flotilla-resources",
  "flotilla-review-bundle-object-store",
  "flotilla-store",
@@ -1752,6 +1753,7 @@ dependencies = [
  "flotilla-daemon",
  "flotilla-daemon-api",
  "flotilla-protocol",
+ "flotilla-replication",
  "flotilla-resources",
  "flotilla-transport",
  "tokio",
@@ -2072,6 +2074,30 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "flotilla-replication"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-hmac",
+ "flotilla-build-features-os",
+ "flotilla-build-features-tracing",
+ "flotilla-build-features-types",
+ "flotilla-protocol",
+ "flotilla-resources",
+ "flotilla-store",
+ "flotilla-store-memory",
+ "futures",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -1,23 +1,22 @@
-use flotilla_store::StoreExt;
-use flotilla_store_http::HttpBackend;
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
-use flotilla_core::in_process::InProcessDaemon;
-use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::NodeId;
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
+use flotilla_protocol::{CommandValue, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
 use flotilla_resources::{
     DigestQuery, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceProvenance, WatchEvent, WatchStart,
 };
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
 use flotilla_store::ResourceBackend;
+use flotilla_store::StoreExt;
 use futures::StreamExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::remote_commands::RemoteCommandRouter;
+use crate::ports::{
+    DirectPeerConnector, PeerSources, ReplicationHost, RoutedDigestRequest, RoutedPeer, RoutedWatchItem, RoutedWatchRequest,
+};
 
 const DIGEST_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -27,18 +26,15 @@ const REPLICATION_RETRY: RetryBackoff =
 
 /// Observation replicas share the observed read view, separately from desired
 /// state. Its local generation is ephemeral; received replicas can be durable.
-#[derive(Clone, Copy)]
-pub(super) enum ReplicationStore {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicationStore {
     Durable,
     Observed,
 }
 
 impl ReplicationStore {
-    fn backend(self, daemon: &InProcessDaemon) -> ResourceBackend {
-        match self {
-            Self::Durable => daemon.resource_backend(),
-            Self::Observed => daemon.observed_resource_backend(),
-        }
+    fn backend(self, host: &ReplicationHost) -> ResourceBackend {
+        host.stores().backend(self).clone()
     }
 
     fn kind<T: Resource>(self) -> String {
@@ -53,14 +49,6 @@ impl ReplicationStore {
             Self::Durable => T::API_PATHS.kind.to_string(),
             Self::Observed => format!("observed/{}", T::API_PATHS.kind),
         }
-    }
-
-    fn http(self, path: PathBuf) -> Result<HttpBackend, String> {
-        let http = HttpBackend::from_unix_socket(path).map_err(|error| error.to_string())?;
-        Ok(match self {
-            Self::Durable => http,
-            Self::Observed => http.with_path_prefix("observed"),
-        })
     }
 }
 
@@ -82,15 +70,23 @@ enum MissingSocketTransport {
 /// Test harnesses can select authored kinds and drive digest rounds explicitly.
 /// Production keeps full-fleet replication and periodic digest scheduling.
 #[derive(Clone, Default)]
-pub(super) struct ReplicationOptions {
+pub struct ReplicationOptions {
     missing_socket_transport: MissingSocketTransport,
     kinds: Option<&'static [&'static str]>,
-    pub(super) digest_driver: Option<Arc<dyn DigestScheduler>>,
+    digest_driver: Option<Arc<dyn DigestScheduler>>,
 }
 
 impl ReplicationOptions {
-    pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
+    /// Harness options: replicate only `kinds` (all when `None`) and read
+    /// peers without a forwarded socket through the routed peer source.
+    pub fn new(kinds: Option<&'static [&'static str]>) -> Self {
         Self { kinds, digest_driver: None, missing_socket_transport: MissingSocketTransport::Routed }
+    }
+
+    /// Drive routed digest rounds explicitly instead of on a timer.
+    pub fn with_digest_driver(mut self, driver: Option<Arc<dyn DigestScheduler>>) -> Self {
+        self.digest_driver = driver;
+        self
     }
 
     fn includes<T: Resource>(&self) -> bool {
@@ -101,8 +97,11 @@ impl ReplicationOptions {
     }
 }
 
-#[derive(Default)]
-pub(super) struct PeerReplicatorSupervisors {
+/// Per-peer replication generations: starts per-kind replicators when a peer
+/// connects and cancels them when it is superseded or permanently gone.
+pub struct PeerReplicatorSupervisors {
+    host: Arc<ReplicationHost>,
+    peers: PeerSources,
     generations: HashMap<NodeId, ActiveGeneration>,
     options: ReplicationOptions,
 }
@@ -157,33 +156,31 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
-    pub(super) fn new(options: ReplicationOptions) -> Self {
-        Self { generations: HashMap::new(), options }
+    pub fn new(host: ReplicationHost, peers: PeerSources, options: ReplicationOptions) -> Self {
+        Self { host: Arc::new(host), peers, generations: HashMap::new(), options }
     }
 
-    pub(super) async fn peer_connected(
-        &mut self,
-        _router: RemoteCommandRouter,
-        daemon: Arc<InProcessDaemon>,
-        peer: NodeId,
-        generation: u64,
-        resource_socket_path: Option<PathBuf>,
-    ) {
+    /// Start replication for a peer generation. A same-generation notice only
+    /// refreshes the forwarded socket path; stale generations are ignored.
+    pub async fn peer_connected(&mut self, peer: NodeId, generation: u64, resource_socket_path: Option<PathBuf>) {
         let Some((cancellation, socket_path_source)) = self.begin_generation(&peer, generation, resource_socket_path.clone()) else {
             return;
         };
-        daemon.begin_peer_resource_replication(&peer).await;
+        self.host.health().begin(&peer).await;
         let transport = match resource_socket_path {
-            Some(_) => ReplicationTransport::Http(socket_path_source),
-            None if self.options.missing_socket_transport == MissingSocketTransport::Routed => ReplicationTransport::Routed(_router),
+            Some(_) => ReplicationTransport::Direct(socket_path_source, Arc::clone(&self.peers.direct)),
+            None if self.options.missing_socket_transport == MissingSocketTransport::Routed => {
+                ReplicationTransport::Routed(Arc::clone(&self.peers.routed))
+            }
             None => {
                 debug!(%peer, generation, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
-                ReplicationTransport::Http(socket_path_source)
+                ReplicationTransport::Direct(socket_path_source, Arc::clone(&self.peers.direct))
             }
         };
+        let host = &self.host;
         flotilla_resources::for_each_registered_resource!(
             spawn_kind,
-            &daemon,
+            host,
             &peer,
             generation,
             &transport,
@@ -192,7 +189,7 @@ impl PeerReplicatorSupervisors {
             self.options.clone()
         );
         spawn_kind::<flotilla_resources::Checkout>(
-            &daemon,
+            host,
             &peer,
             generation,
             &transport,
@@ -201,7 +198,7 @@ impl PeerReplicatorSupervisors {
             self.options.clone(),
         );
         spawn_kind::<flotilla_resources::TerminalSession>(
-            &daemon,
+            host,
             &peer,
             generation,
             &transport,
@@ -220,7 +217,7 @@ impl PeerReplicatorSupervisors {
     /// not heal from a reconnect. The generation check guards against a
     /// stale/displaced connection's belated teardown cancelling a newer,
     /// already-reconnected generation's replicators.
-    pub(super) fn peer_disconnected(&mut self, peer: &NodeId, generation: u64) {
+    pub fn peer_disconnected(&mut self, peer: &NodeId, generation: u64) {
         let is_current = self.generations.get(peer).is_some_and(|active| active.generation == generation);
         if !is_current {
             debug!(%peer, generation, "ignoring teardown for stale or already-superseded peer generation");
@@ -268,12 +265,13 @@ impl PeerReplicatorSupervisors {
 
 #[derive(Clone)]
 enum ReplicationTransport {
-    Http(SocketPathSource),
-    Routed(RemoteCommandRouter),
+    /// A direct peer store, opened at the generation's forwarded socket.
+    Direct(SocketPathSource, Arc<dyn DirectPeerConnector>),
+    Routed(Arc<dyn RoutedPeer>),
 }
 
 fn spawn_kind<T: Resource>(
-    daemon: &Arc<InProcessDaemon>,
+    host: &Arc<ReplicationHost>,
     peer: &NodeId,
     generation: u64,
     transport: &ReplicationTransport,
@@ -288,12 +286,12 @@ fn spawn_kind<T: Resource>(
         return;
     }
     match transport.clone() {
-        ReplicationTransport::Http(socket_path_source) => {
-            let relay_daemon = Arc::clone(daemon);
+        ReplicationTransport::Direct(socket_path_source, connector) => {
+            let relay_host = Arc::clone(host);
             let relay_peer = peer.clone();
             let relay_cancellation = cancellation.clone();
             tokio::spawn(async move {
-                let run_daemon = Arc::clone(&relay_daemon);
+                let run_host = Arc::clone(&relay_host);
                 let run_peer = relay_peer.clone();
                 supervise_kind(
                     relay_peer,
@@ -306,23 +304,24 @@ fn spawn_kind<T: Resource>(
                         async move { socket_path_source.resolve().await }
                     },
                     move |path| {
-                        let daemon = Arc::clone(&run_daemon);
+                        let host = Arc::clone(&run_host);
                         let peer = run_peer.clone();
+                        let connector = Arc::clone(&connector);
                         async move {
-                            let http = store.http(path)?;
-                            replicate_relay_over_http::<T>(http, &daemon, &peer, store).await
+                            let remote = connector.connect(&path, store)?;
+                            replicate_relay_direct::<T>(remote, &host, &peer, store).await
                         }
                     },
                 )
                 .await;
             });
         }
-        ReplicationTransport::Routed(router) => {
-            let relay_daemon = Arc::clone(daemon);
+        ReplicationTransport::Routed(routed) => {
+            let relay_host = Arc::clone(host);
             let relay_peer = peer.clone();
             let relay_cancellation = cancellation.clone();
             tokio::spawn(async move {
-                let run_daemon = Arc::clone(&relay_daemon);
+                let run_host = Arc::clone(&relay_host);
                 let run_peer = relay_peer.clone();
                 supervise_kind(
                     relay_peer,
@@ -332,25 +331,25 @@ fn spawn_kind<T: Resource>(
                     REPLICATION_RETRY,
                     || async { Ok(()) },
                     move |()| {
-                        let router = router.clone();
-                        let daemon = Arc::clone(&run_daemon);
+                        let routed = Arc::clone(&routed);
+                        let host = Arc::clone(&run_host);
                         let peer = run_peer.clone();
-                        async move { replicate_relay_over_routed_watch::<T>(&router, &daemon, &peer, store).await }
+                        async move { replicate_relay_over_routed_watch::<T>(&*routed, &host, &peer, store).await }
                     },
                 )
                 .await;
             });
         }
     }
-    let daemon = Arc::clone(daemon);
+    let host = Arc::clone(host);
     let peer = peer.clone();
     let transport = transport.clone();
-    let digest_control = options.digest_driver.map(|driver| driver.control(daemon.node_id(), &peer, &store.kind::<T>()));
+    let digest_control = options.digest_driver.map(|driver| driver.control(host.node_id(), &peer, &store.kind::<T>()));
     let cancellation = cancellation.clone();
     tokio::spawn(async move {
         match transport {
-            ReplicationTransport::Http(socket_path_source) => {
-                let run_daemon = Arc::clone(&daemon);
+            ReplicationTransport::Direct(socket_path_source, connector) => {
+                let run_host = Arc::clone(&host);
                 let run_peer = peer.clone();
                 supervise_kind(
                     peer,
@@ -363,13 +362,14 @@ fn spawn_kind<T: Resource>(
                         async move { socket_path_source.resolve().await }
                     },
                     move |path| {
-                        let daemon = Arc::clone(&run_daemon);
+                        let host = Arc::clone(&run_host);
                         let peer = run_peer.clone();
+                        let connector = Arc::clone(&connector);
                         async move {
-                            let http = store.http(path)?;
-                            let result = replicate_kind_over_http::<T>(http, &daemon, &peer, store).await;
+                            let remote = connector.connect(&path, store)?;
+                            let result = replicate_kind_direct::<T>(remote, &host, &peer, store).await;
                             if let Err(error) = &result {
-                                daemon.report_resource_replication_failure(&peer, &store.health_kind::<T>(), error).await;
+                                host.health().failure(&peer, &store.health_kind::<T>(), error).await;
                             }
                             result
                         }
@@ -377,8 +377,8 @@ fn spawn_kind<T: Resource>(
                 )
                 .await;
             }
-            ReplicationTransport::Routed(router) => {
-                let run_daemon = Arc::clone(&daemon);
+            ReplicationTransport::Routed(routed) => {
+                let run_host = Arc::clone(&host);
                 let run_peer = peer.clone();
                 supervise_kind(
                     peer,
@@ -388,14 +388,14 @@ fn spawn_kind<T: Resource>(
                     REPLICATION_RETRY,
                     || async { Ok(()) },
                     move |()| {
-                        let router = router.clone();
-                        let daemon = Arc::clone(&run_daemon);
+                        let routed = Arc::clone(&routed);
+                        let host = Arc::clone(&run_host);
                         let peer = run_peer.clone();
                         let digest_control = digest_control.clone();
                         async move {
-                            let result = replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer, store, digest_control).await;
+                            let result = replicate_kind_over_routed_watch::<T>(&*routed, &host, &peer, store, digest_control).await;
                             if let Err(error) = &result {
-                                daemon.report_resource_replication_failure(&peer, &store.health_kind::<T>(), error).await;
+                                host.health().failure(&peer, &store.health_kind::<T>(), error).await;
                             }
                             result
                         }
@@ -407,26 +407,30 @@ fn spawn_kind<T: Resource>(
     });
 }
 
-async fn replicate_relay_over_http<T: Resource>(
-    http: HttpBackend,
-    daemon: &Arc<InProcessDaemon>,
+/// Relay third-origin replicas held by a direct peer, until its stream ends.
+///
+/// Records whose origin root is this host or the peer itself are skipped: the
+/// direct log replicates the peer's own records. One attempt; no retry.
+pub async fn replicate_relay_direct<T: Resource>(
+    remote: ResourceBackend,
+    host: &ReplicationHost,
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let mut watch = http.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
+    let mut watch = remote.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
     while let Some(event) = watch.next().await {
         let event = event.map_err(|error| error.to_string())?;
         if let ReadWatchEvent::DeletedByName { mut tombstone, provenance } = event {
             let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance else {
                 continue;
             };
-            if &origin_root == daemon.node_id() || &origin_root == peer {
+            if &origin_root == host.node_id() || &origin_root == peer {
                 continue;
             }
             tombstone.annotations.remove("flotilla.work/origin-root");
             tombstone.annotations.remove("flotilla.work/last-synced-at");
             store
-                .backend(daemon)
+                .backend(host)
                 .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
                 .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
                 .await
@@ -442,7 +446,7 @@ async fn replicate_relay_over_http<T: Resource>(
         let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else {
             continue;
         };
-        if &origin_root == daemon.node_id() || &origin_root == peer {
+        if &origin_root == host.node_id() || &origin_root == peer {
             continue;
         }
         source.object.metadata.annotations.remove("flotilla.work/origin-root");
@@ -453,7 +457,7 @@ async fn replicate_relay_over_http<T: Resource>(
             StoredRelayEventKind::Deleted => WatchEvent::Deleted(source.object),
         };
         store
-            .backend(daemon)
+            .backend(host)
             .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
             .apply(event, last_synced_at)
             .await
@@ -533,20 +537,25 @@ impl OriginWatchFailure {
     }
 }
 
-pub(super) async fn replicate_kind_over_http<T: Resource>(
-    http: HttpBackend,
-    daemon: &Arc<InProcessDaemon>,
+/// Replicate a direct peer's own records of one kind, until its stream ends.
+///
+/// Snapshots when no replica prefix is held, resumes the origin's log from the
+/// prefix, resnapshots once when the log cannot continue, and runs the
+/// periodic digest safety net. One attempt; no retry.
+pub async fn replicate_kind_direct<T: Resource>(
+    remote: ResourceBackend,
+    host: &ReplicationHost,
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let remote = ResourceBackend::new(http).using::<T>(REPLICATION_NAMESPACE);
-    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    let remote = remote.using::<T>(REPLICATION_NAMESPACE);
+    let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
         if cursor.is_none() {
             let listed = remote.list().await.map_err(|error| error.to_string())?;
-            store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
+            store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
             writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
             cursor = writer.cursor().await.map_err(|error| error.to_string())?;
         }
@@ -559,8 +568,8 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
         };
         let result = match remote.watch(start).await {
             Ok(watch) => {
-                daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
-                apply_http_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer).await
+                host.health().healthy(peer, &store.health_kind::<T>()).await;
+                apply_direct_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer).await
             }
             Err(error) => Err(OriginWatchFailure::from_resource(error)),
         };
@@ -580,7 +589,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
     }
 }
 
-async fn apply_http_watch<T: Resource>(
+async fn apply_direct_watch<T: Resource>(
     mut watch: flotilla_resources::WatchStream<T>,
     writer: &flotilla_store::ReplicaWriter<T>,
     snapshot_version: String,
@@ -706,25 +715,12 @@ where
 }
 
 async fn fetch_routed_digest<T: Resource>(
-    router: &RemoteCommandRouter,
+    routed: &dyn RoutedPeer,
     peer: &NodeId,
     store: ReplicationStore,
     query: DigestQuery,
 ) -> Result<PartitionDigest, String> {
-    let result = router
-        .dispatch_query(
-            Command::builder()
-                .node_id(peer.clone())
-                .action(CommandAction::QueryResourceDigest { namespace: REPLICATION_NAMESPACE.into(), kind: store.kind::<T>(), query })
-                .build(),
-            uuid::Uuid::new_v4(),
-        )
-        .await?;
-    match result {
-        CommandValue::ResourceDigest(value) => Ok((*value).into()),
-        CommandValue::Error { message } => Err(message),
-        other => Err(format!("unexpected digest response: {other:?}")),
-    }
+    routed.digest(peer, RoutedDigestRequest { namespace: REPLICATION_NAMESPACE.into(), kind: store.kind::<T>(), query }).await
 }
 
 // The origin's per-kind sequence includes deletes. Never advance past a hole,
@@ -750,18 +746,18 @@ fn check_sequence<T: Resource>(version: &mut Option<String>, event: &WatchEvent<
 }
 
 async fn replicate_kind_over_routed_watch<T: Resource>(
-    router: &RemoteCommandRouter,
-    daemon: &Arc<InProcessDaemon>,
+    routed: &dyn RoutedPeer,
+    host: &ReplicationHost,
     peer: &NodeId,
     store: ReplicationStore,
     digest_control: Option<Arc<DigestControl>>,
 ) -> Result<(), String> {
-    store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
-    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    store.backend(host).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
+    let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
-        match run_routed_watch::<T>(router, daemon, peer, store, cursor, digest_control.clone()).await {
+        match run_routed_watch::<T>(routed, host, peer, store, cursor, digest_control.clone()).await {
             Err(error)
                 if flotilla_resources::ResourceError::is_invalid_message(&error)
                     || error.contains("sequence gap")
@@ -782,8 +778,8 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
 }
 
 async fn run_routed_watch<T: Resource>(
-    router: &RemoteCommandRouter,
-    daemon: &Arc<InProcessDaemon>,
+    routed: &dyn RoutedPeer,
+    host: &ReplicationHost,
     peer: &NodeId,
     store: ReplicationStore,
     prefix: Option<flotilla_resources::ReplicaCursor>,
@@ -792,29 +788,19 @@ async fn run_routed_watch<T: Resource>(
     if let Some(control) = &digest_control {
         control.ready.send_replace(false);
     }
-    let mut events = daemon.subscribe();
-    let command_id = router
-        .dispatch_execute_for_principal(
-            Command {
-                node_id: Some(peer.clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ResourceWatch {
-                    namespace: REPLICATION_NAMESPACE.to_string(),
-                    kind: store.kind::<T>(),
-                    name: None,
-                    include_replicas: false,
-                    replica_sources: false,
-                    cursor: prefix.as_ref().map(|prefix| {
-                        flotilla_protocol::ResourceCursor::from_position(prefix.resource_version.clone(), prefix.generation.clone())
-                    }),
-                },
+    let mut events = routed
+        .watch(
+            peer,
+            RoutedWatchRequest {
+                namespace: REPLICATION_NAMESPACE.to_string(),
+                kind: store.kind::<T>(),
+                replica_sources: false,
+                cursor: prefix.clone(),
             },
-            None,
         )
         .await?;
-    daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
-    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    host.health().healthy(peer, &store.health_kind::<T>()).await;
+    let writer = store.backend(host).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = prefix.is_none();
 
@@ -831,7 +817,7 @@ async fn run_routed_watch<T: Resource>(
     loop {
         let completion;
         let received = tokio::select! {
-            event = events.recv() => { completion = None; Some(event) },
+            event = events.next() => { completion = None; Some(event) },
             request = async {
                 match &mut requests {
                     Some(requests) => requests.recv().await,
@@ -841,7 +827,7 @@ async fn run_routed_watch<T: Resource>(
             _ = digest_tick.tick(), if !initializing && digest_control.is_none() => { completion = None; None },
         };
         let Some(received) = received else {
-            let result = reconcile_digest::<T, _, _>(&writer, peer, |query| fetch_routed_digest::<T>(router, peer, store, query)).await;
+            let result = reconcile_digest::<T, _, _>(&writer, peer, |query| fetch_routed_digest::<T>(routed, peer, store, query)).await;
             digest_failures.report::<T>(peer, &result);
             if matches!(result, Ok(true)) {
                 // Clear readiness before acknowledging repair so callers await
@@ -849,7 +835,7 @@ async fn run_routed_watch<T: Resource>(
                 if let Some(control) = &digest_control {
                     control.ready.send_replace(false);
                 }
-                let _ = router.dispatch_cancel(command_id).await;
+                events.cancel().await;
             }
             if let Some(completion) = completion {
                 let _ = completion.send(result.clone());
@@ -860,14 +846,7 @@ async fn run_routed_watch<T: Resource>(
             continue;
         };
         match received {
-            Ok(DaemonEvent::CommandStepUpdate {
-                command_id: event_command_id,
-                status: flotilla_protocol::StepStatus::Produced { value },
-                ..
-            }) if event_command_id == command_id => {
-                let CommandValue::ResourceWatchEvent(response) = *value else {
-                    continue;
-                };
+            RoutedWatchItem::Response(response) => {
                 if response.resource_kind != T::API_PATHS.kind {
                     continue;
                 }
@@ -877,13 +856,13 @@ async fn run_routed_watch<T: Resource>(
                         let event = match record_watch_event::<T>(record.clone()) {
                             Ok(event) => event,
                             Err(error) => {
-                                let _ = router.dispatch_cancel(command_id).await;
+                                events.cancel().await;
                                 return Err(format!("replica event decode gap: {error}"));
                             }
                         };
                         if let Some(event) = event {
                             if let Err(error) = check_sequence(&mut version, &event) {
-                                let _ = router.dispatch_cancel(command_id).await;
+                                events.cancel().await;
                                 return Err(error);
                             }
                         }
@@ -903,82 +882,65 @@ async fn run_routed_watch<T: Resource>(
                     version = Some(snapshot_version);
                 }
             }
-            Ok(DaemonEvent::CommandFinished { command_id: event_command_id, result, .. }) if event_command_id == command_id => {
-                return match result {
+            RoutedWatchItem::Finished(result) => {
+                return match *result {
                     CommandValue::Cancelled | CommandValue::Ok => Ok(()),
                     CommandValue::Error { message } => Err(message),
                     other => Err(format!("resource watch ended unexpectedly: {other:?}")),
                 };
             }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            RoutedWatchItem::Lagged(skipped) => {
                 warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource replicator lagged; reconnect will resnapshot");
-                let _ = router.dispatch_cancel(command_id).await;
+                events.cancel().await;
                 return Err("resourceVersion sequence gap: event subscriber lagged".to_string());
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon event stream closed".to_string()),
+            RoutedWatchItem::Closed => return Err("daemon event stream closed".to_string()),
         }
     }
 }
 
 async fn replicate_relay_over_routed_watch<T: Resource>(
-    router: &RemoteCommandRouter,
-    daemon: &Arc<InProcessDaemon>,
+    routed: &dyn RoutedPeer,
+    host: &ReplicationHost,
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let mut events = daemon.subscribe();
-    let command_id = router
-        .dispatch_execute_for_principal(
-            Command {
-                node_id: Some(peer.clone()),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ResourceWatch {
-                    namespace: REPLICATION_NAMESPACE.to_string(),
-                    kind: store.kind::<T>(),
-                    name: None,
-                    include_replicas: false,
-                    replica_sources: true,
-                    cursor: None,
-                },
+    let mut events = routed
+        .watch(
+            peer,
+            RoutedWatchRequest {
+                namespace: REPLICATION_NAMESPACE.to_string(),
+                kind: store.kind::<T>(),
+                replica_sources: true,
+                cursor: None,
             },
-            None,
         )
         .await?;
     loop {
-        match events.recv().await {
-            Ok(DaemonEvent::CommandStepUpdate {
-                command_id: event_command_id,
-                status: flotilla_protocol::StepStatus::Produced { value },
-                ..
-            }) if event_command_id == command_id => {
-                let CommandValue::ResourceWatchEvent(response) = *value else {
-                    continue;
-                };
+        match events.next().await {
+            RoutedWatchItem::Response(response) => {
                 if response.resource_kind == T::API_PATHS.kind {
-                    apply_relay_response::<T>(daemon, peer, *response, store).await?;
+                    apply_relay_response::<T>(host, peer, *response, store).await?;
                 }
             }
-            Ok(DaemonEvent::CommandFinished { command_id: event_command_id, result, .. }) if event_command_id == command_id => {
-                return match result {
+            RoutedWatchItem::Finished(result) => {
+                return match *result {
                     CommandValue::Cancelled | CommandValue::Ok => Ok(()),
                     CommandValue::Error { message } => Err(message),
                     other => Err(format!("resource relay watch ended unexpectedly: {other:?}")),
                 };
             }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            RoutedWatchItem::Lagged(skipped) => {
                 warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource relay lagged; reconnect will relist");
                 return Err("resource relay event subscriber lagged".to_string());
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon event stream closed".to_string()),
+            RoutedWatchItem::Closed => return Err("daemon event stream closed".to_string()),
         }
     }
 }
 
 async fn apply_relay_response<T: Resource>(
-    daemon: &Arc<InProcessDaemon>,
+    host: &ReplicationHost,
     peer: &NodeId,
     response: ResourceReadEnvelope,
     store: ReplicationStore,
@@ -992,7 +954,7 @@ async fn apply_relay_response<T: Resource>(
                 continue;
             };
             let origin = NodeId::new(origin);
-            if &origin == daemon.node_id() || &origin == peer {
+            if &origin == host.node_id() || &origin == peer {
                 continue;
             }
             let synced_at = tombstone
@@ -1005,7 +967,7 @@ async fn apply_relay_response<T: Resource>(
                         .map_err(|error| format!("decode relayed tombstone sync timestamp: {error}"))
                 })?;
             store
-                .backend(daemon)
+                .backend(host)
                 .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
                 .apply(WatchEvent::DeletedByName(tombstone), synced_at)
                 .await
@@ -1020,7 +982,7 @@ async fn apply_relay_response<T: Resource>(
             continue;
         };
         let origin = NodeId::new(origin.clone());
-        if &origin == daemon.node_id() || &origin == peer {
+        if &origin == host.node_id() || &origin == peer {
             continue;
         }
         let synced_at = object
@@ -1045,7 +1007,7 @@ async fn apply_relay_response<T: Resource>(
             WatchEvent::DeletedByName(_) => unreachable!("handled above"),
         };
         store
-            .backend(daemon)
+            .backend(host)
             .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
             .apply(event, synced_at)
             .await
@@ -1315,7 +1277,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn newer_generation_cancels_a_replicator_during_backoff() {
         let peer = NodeId::new("peer");
-        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut supervisors = test_ports::supervisors();
         let (old_cancellation, _) = supervisors.begin_generation(&peer, 7, None).expect("start old generation");
         let attempts = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(supervise_kind(
@@ -1389,7 +1351,7 @@ mod tests {
     #[test]
     fn duplicate_and_stale_notices_do_not_cause_duplicate_application() {
         let peer = NodeId::new("peer");
-        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut supervisors = test_ports::supervisors();
         let mut applications = 0;
 
         let (_, source) = supervisors.begin_generation(&peer, 4, None).expect("start generation");
@@ -1413,7 +1375,7 @@ mod tests {
     fn dropping_supervisors_cancels_all_peer_generations() {
         // Runtime teardown ends every replication generation, including watches
         // and retry backoffs, rather than leaving them to work on dead sessions.
-        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut supervisors = test_ports::supervisors();
         let (first, _) = supervisors.begin_generation(&NodeId::new("first"), 1, None).expect("first generation");
         let (second, _) = supervisors.begin_generation(&NodeId::new("second"), 2, None).expect("second generation");
         drop(supervisors);
@@ -1424,7 +1386,7 @@ mod tests {
     #[test]
     fn permanent_disconnect_cancels_and_removes_the_current_generation() {
         let peer = NodeId::new("peer");
-        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut supervisors = test_ports::supervisors();
         let (cancellation, _) = supervisors.begin_generation(&peer, 3, None).expect("start generation");
         assert!(!cancellation.is_cancelled());
 
@@ -1441,7 +1403,7 @@ mod tests {
     #[test]
     fn stale_disconnect_notice_does_not_cancel_a_newer_generation() {
         let peer = NodeId::new("peer");
-        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut supervisors = test_ports::supervisors();
         let (_old_cancellation, _) = supervisors.begin_generation(&peer, 1, None).expect("start old generation");
         let (new_cancellation, _) = supervisors.begin_generation(&peer, 2, None).expect("start newer generation");
 
@@ -1460,7 +1422,7 @@ mod tests {
     #[test]
     fn unknown_peer_disconnect_is_a_no_op() {
         let peer = NodeId::new("peer");
-        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut supervisors = test_ports::supervisors();
 
         supervisors.peer_disconnected(&peer, 1);
 
@@ -1472,7 +1434,10 @@ mod tests {
 }
 
 #[cfg(test)]
-mod relay_tests;
+mod test_ports;
+
+#[cfg(test)]
+mod port_tests;
 
 #[cfg(test)]
 mod digest_tests {

@@ -19,6 +19,11 @@ C_FREE_BASE = frozenset({
 RESOURCE_EXEMPTIONS = frozenset({
     "flotilla-manifest", "flotilla-tui", "flotilla",
 })
+# Composition, daemon and transport crates the replication engine must not reach.
+REPLICATION_FORBIDDEN = (
+    "flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-aggregator",
+    "flotilla-credentials", "flotilla-controllers", "flotilla-store-http",
+)
 # Known C packages and compiler drivers catch new anchors that reach them.
 # This is a metadata deny list, not build-script analysis: crates invoking a
 # compiler without these drivers need an explicit entry when introduced.
@@ -73,6 +78,10 @@ def violations(metadata):
                        "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
             if component in packages and target in packages and reaches(component, target):
                 errors.append(f"{component}: must not depend on {target}, directly or transitively")
+    # ADR 0060: replication syncs over dyn Store; hosts supply its ports and transports.
+    for target in REPLICATION_FORBIDDEN:
+        if "flotilla-replication" in packages and target in packages and reaches("flotilla-replication", target):
+            errors.append(f"flotilla-replication: must not depend on {target}, directly or transitively")
     for name, package in sorted(packages.items()):
         # A dev-only testkit may depend on the library it tests, closing a
         # Cargo dev cycle without introducing an upward production edge.
