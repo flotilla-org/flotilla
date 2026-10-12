@@ -1,0 +1,250 @@
+{
+ "init": [
+  "2738590842547281669"
+ ],
+ "nodes": {
+  "2738590842547281669": {
+   "promise": "Open",
+   "phase": "Active",
+   "merged": false,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Working"
+  },
+  "7823929979830850846": {
+   "promise": "Submitted",
+   "phase": "Active",
+   "merged": false,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Working"
+  },
+  "-9072527638867660967": {
+   "promise": "Open",
+   "phase": "Abandoned",
+   "merged": false,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Stopped"
+  },
+  "3024311688735278405": {
+   "promise": "Submitted",
+   "phase": "Active",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Working"
+  },
+  "6853386122601282702": {
+   "promise": "Submitted",
+   "phase": "Abandoned",
+   "merged": false,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Stopped"
+  },
+  "-5723893668647015524": {
+   "promise": "Open",
+   "phase": "Abandoned",
+   "merged": false,
+   "entryStale": false,
+   "vesselLive": false,
+   "crew": "Stopped"
+  },
+  "5039613676829752694": {
+   "promise": "Kept",
+   "phase": "Active",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Working"
+  },
+  "1905220512062483669": {
+   "promise": "Submitted",
+   "phase": "Abandoned",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Stopped"
+  },
+  "7897998148674746443": {
+   "promise": "Submitted",
+   "phase": "Abandoned",
+   "merged": false,
+   "entryStale": false,
+   "vesselLive": false,
+   "crew": "Stopped"
+  },
+  "-8366587871926496792": {
+   "promise": "Kept",
+   "phase": "Landing",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Done"
+  },
+  "2052011346456125567": {
+   "promise": "Kept",
+   "phase": "Abandoned",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Stopped"
+  },
+  "2952108252387305488": {
+   "promise": "Submitted",
+   "phase": "Abandoned",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": false,
+   "crew": "Stopped"
+  },
+  "-3917089896255886039": {
+   "promise": "Kept",
+   "phase": "Landed",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Done"
+  },
+  "3041762471091847703": {
+   "promise": "Kept",
+   "phase": "Abandoned",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": true,
+   "crew": "Done"
+  },
+  "3385994798079435962": {
+   "promise": "Kept",
+   "phase": "Abandoned",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": false,
+   "crew": "Stopped"
+  },
+  "-1260596932592352788": {
+   "promise": "Kept",
+   "phase": "Landed",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": false,
+   "crew": "Done"
+  },
+  "942453414070906578": {
+   "promise": "Kept",
+   "phase": "Abandoned",
+   "merged": true,
+   "entryStale": false,
+   "vesselLive": false,
+   "crew": "Done"
+  }
+ },
+ "edges": [
+  [
+   "2738590842547281669",
+   "submit",
+   "7823929979830850846"
+  ],
+  [
+   "2738590842547281669",
+   "abandon",
+   "-9072527638867660967"
+  ],
+  [
+   "7823929979830850846",
+   "merge",
+   "3024311688735278405"
+  ],
+  [
+   "7823929979830850846",
+   "verdictRejected",
+   "2738590842547281669"
+  ],
+  [
+   "7823929979830850846",
+   "abandon",
+   "6853386122601282702"
+  ],
+  [
+   "-9072527638867660967",
+   "teardown",
+   "-5723893668647015524"
+  ],
+  [
+   "3024311688735278405",
+   "verdictKept",
+   "5039613676829752694"
+  ],
+  [
+   "3024311688735278405",
+   "abandon",
+   "1905220512062483669"
+  ],
+  [
+   "6853386122601282702",
+   "merge",
+   "1905220512062483669"
+  ],
+  [
+   "6853386122601282702",
+   "teardown",
+   "7897998148674746443"
+  ],
+  [
+   "5039613676829752694",
+   "complete",
+   "-8366587871926496792"
+  ],
+  [
+   "5039613676829752694",
+   "abandon",
+   "2052011346456125567"
+  ],
+  [
+   "1905220512062483669",
+   "teardown",
+   "2952108252387305488"
+  ],
+  [
+   "7897998148674746443",
+   "merge",
+   "2952108252387305488"
+  ],
+  [
+   "-8366587871926496792",
+   "handoff",
+   "5039613676829752694"
+  ],
+  [
+   "-8366587871926496792",
+   "turnDelivery",
+   "5039613676829752694"
+  ],
+  [
+   "-8366587871926496792",
+   "settle",
+   "-3917089896255886039"
+  ],
+  [
+   "-8366587871926496792",
+   "abandon",
+   "3041762471091847703"
+  ],
+  [
+   "2052011346456125567",
+   "teardown",
+   "3385994798079435962"
+  ],
+  [
+   "-3917089896255886039",
+   "teardown",
+   "-1260596932592352788"
+  ],
+  [
+   "3041762471091847703",
+   "teardown",
+   "942453414070906578"
+  ]
+ ]
+}
