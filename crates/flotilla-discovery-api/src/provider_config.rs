@@ -47,8 +47,12 @@ pub struct CloudAgentConfig {
     pub preference: ProviderPreference,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AiUtilityConfig {
+    /// Model ID shared by the naming API and CLI.
+    // N→N+1 stored config compatibility; removable after the next roll.
+    #[serde(default = "default_naming_model")]
+    pub model: String,
     #[serde(flatten)]
     pub preference: ProviderPreference,
     pub claude: Option<ClaudeAiUtilityConfig>,
@@ -103,5 +107,15 @@ impl<T: ProviderConfigView + ?Sized> ProviderConfigView for std::sync::Arc<T> {
     }
     async fn load_config_for_probe(&self) -> Result<ProviderConfig, String> {
         (**self).load_config_for_probe().await
+    }
+}
+
+fn default_naming_model() -> String {
+    "claude-haiku-5-5".into()
+}
+
+impl Default for AiUtilityConfig {
+    fn default() -> Self {
+        Self { model: default_naming_model(), preference: ProviderPreference::default(), claude: None }
     }
 }

@@ -3,26 +3,26 @@ use std::{path::Path, sync::Arc};
 use async_trait::async_trait;
 use tracing::info;
 
-use super::Model;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 
 pub struct ClaudeCliAiUtility {
+    model: String,
     claude_bin: String,
     runner: Arc<dyn CommandRunner>,
 }
 
 impl ClaudeCliAiUtility {
-    pub fn new(claude_bin: String, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { claude_bin, runner }
+    pub fn new(claude_bin: String, runner: Arc<dyn CommandRunner>, model: String) -> Self {
+        Self { claude_bin, runner, model }
     }
 
     /// Run a one-shot prompt against Claude CLI with minimal overhead.
     ///
     /// Tools, skills, and session persistence are all disabled so the only
     /// tokens consumed are the system prompt + user prompt + response.
-    async fn prompt(&self, model: Model, prompt: &str) -> Result<String, String> {
-        let model_str = model.cli_alias();
+    async fn prompt(&self, prompt: &str) -> Result<String, String> {
+        let model_str = self.model.as_str();
         let args: Vec<&str> = vec![
             "--model",
             model_str,
@@ -51,7 +51,7 @@ impl super::AiUtility for ClaudeCliAiUtility {
              Output ONLY the branch name, nothing else. Use kebab-case: {context}"
         );
 
-        let output = self.prompt(Model::Haiku, &prompt).await?;
+        let output = self.prompt(&prompt).await?;
         let branch = output.trim().trim_matches(|c| c == '`' || c == '"' || c == '\'').trim().to_string();
         if branch.is_empty() {
             Err("claude returned empty output".to_string())
@@ -67,6 +67,6 @@ impl super::AiUtility for ClaudeCliAiUtility {
             "Suggest a coherent short convoy resource name and git branch name for this context. \
              Return ONLY JSON with string fields name and branch. Use lowercase kebab-case; the branch may contain one slash: {context}"
         );
-        super::parse_convoy_names(&self.prompt(Model::Haiku, &prompt).await?)
+        super::parse_convoy_names(&self.prompt(&prompt).await?)
     }
 }
