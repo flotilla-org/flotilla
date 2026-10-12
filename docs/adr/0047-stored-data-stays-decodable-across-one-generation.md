@@ -77,9 +77,9 @@ A change to a shape that project-map or an ops repository authors either stays N
 
 ### Declared-query derived indexes (#3057)
 
-The query-index roll changes SQLite's derived schema without changing serialized
-resource bodies. N→N+1 decoding remains required. This guarantee does not imply
-that an older binary can write through a newer SQLite schema: normalized query
-triggers and canonical object expression indexes require a registered custom
-function. See [the roll and rollback runbook](../fleet-install.md#declared-query-sqlite-indexes-and-rollback-3057)
-for the writer inventory and derived-schema cleanup required before N-1 runs.
+Query indexes are additive derived schema, with unchanged resource bodies and
+N→N+1 decoding. Persisted schema must not depend on custom functions. Canonical
+field values are maintained by connection-local TEMP triggers; older binaries
+and administrative SQLite writers remain compatible without rollback cleanup.
+The next native open repairs derived values after unconfigured writes. See
+[the roll and rollback notes](../fleet-install.md#declared-query-sqlite-indexes-and-rollback-3057).

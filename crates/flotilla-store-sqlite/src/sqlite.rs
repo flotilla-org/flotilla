@@ -269,9 +269,9 @@ impl SqliteBackend {
         self.local_root.clone().unwrap_or_else(|| NodeId::new("local"))
     }
 
-    /// Configure auxiliary SQL writers with the functions required by declared
-    /// relation-index triggers. This neither migrates the schema nor edits bodies.
-    /// An older writer must remove the additive relation migrations before use.
+    /// Register the connection-local projection used by native TEMP triggers.
+    /// Persisted schema never requires this function. Unconfigured writers may
+    /// leave derived values stale; the next native open repairs them.
     pub fn register_query_functions(connection: &RusqliteConnection) -> Result<(), ResourceError> {
         connection
             .create_scalar_function(
@@ -573,6 +573,27 @@ impl SqliteBackend {
             tx.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [migration])
                 .map_err(|e| Self::map_sqlite(e, "record query migration"))?;
         }
+        // Pre-release query schemas used persistent function-dependent objects.
+        // Remove those automatically before installing connection-local triggers.
+        let obsolete = {
+            let mut statement = tx.prepare("SELECT type,name FROM main.sqlite_schema WHERE type IN ('trigger','index') AND instr(sql,'flotilla_declared_values')>0")
+                .map_err(|e| Self::map_sqlite(e, "inspect obsolete query schema"))?;
+            let objects = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|e| Self::map_sqlite(e, "list obsolete query schema"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Self::map_sqlite(e, "read obsolete query schema"))?;
+            objects
+        };
+        for (object_type, name) in obsolete {
+            let quoted = name.replace('"', "\"\"");
+            tx.execute_batch(&format!("DROP {object_type} main.\"{quoted}\""))
+                .map_err(|e| Self::map_sqlite(e, "remove obsolete function-dependent schema"))?;
+            if object_type == "index" {
+                tx.execute("DELETE FROM resource_store_migrations WHERE name=?1", [&name])
+                    .map_err(|e| Self::map_sqlite(e, "remove obsolete query migration marker"))?;
+            }
+        }
         for kind in crate::declared_resource_kinds() {
             let names = kind
                 .queryable_fields
@@ -583,53 +604,39 @@ impl SqliteBackend {
             for path in kind.queryable_fields {
                 for table in ["resource_objects", "replica_objects"] {
                     let index = Self::field_index(table, kind, path);
+                    let values = format!("{index}_values");
                     let done: bool = tx
-                        .query_row("SELECT EXISTS(SELECT 1 FROM resource_store_migrations WHERE name=?1)", [&index], |r| r.get(0))
+                        .query_row("SELECT EXISTS(SELECT 1 FROM resource_store_migrations WHERE name=?1)", [&index], |row| row.get(0))
                         .map_err(|e| Self::map_sqlite(e, "inspect field migration"))?;
-                    if done {
-                        continue;
+                    if !done {
+                        tx.execute_batch(&format!("CREATE TABLE {values} (group_name TEXT,version TEXT,kind TEXT,namespace TEXT,name TEXT,origin TEXT,value TEXT,PRIMARY KEY(group_name,version,kind,namespace,name,origin,value)); CREATE INDEX {index} ON {values}(group_name,version,kind,namespace,value,name,origin);"))
+                            .map_err(|e| Self::map_sqlite(e,"create field values index"))?;
+                        tx.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [&index])
+                            .map_err(|e| Self::map_sqlite(e, "record field migration"))?;
                     }
-                    if crate::array_field_path(path).is_some() {
-                        let values = format!("{index}_values");
-                        let origin = if table == "replica_objects" { "origin_root" } else { "''" };
-                        let new_origin = if table == "replica_objects" { "NEW.origin_root" } else { "''" };
-                        let old_origin = if table == "replica_objects" { "OLD.origin_root" } else { "''" };
-                        let extracted = "j.value";
-                        // The write-only function shares canonical array/legacy
-                        // normalization with memory. Reads search persisted values.
-                        let rows = |body: &str| format!("json_each(flotilla_declared_values({body},'{path}')) j WHERE j.type='text'");
-                        let delete = format!("DELETE FROM {values} WHERE group_name=OLD.group_name AND version=OLD.version AND kind=OLD.kind AND namespace=OLD.namespace AND name=OLD.name AND origin={old_origin};");
-                        let insert = format!("INSERT OR IGNORE INTO {values} SELECT NEW.group_name,NEW.version,NEW.kind,NEW.namespace,NEW.name,{new_origin},{extracted} FROM {}", rows("NEW.body_json"));
-                        tx.execute_batch(&format!("
-                            CREATE TABLE {values} (group_name TEXT,version TEXT,kind TEXT,namespace TEXT,name TEXT,origin TEXT,value TEXT,PRIMARY KEY(group_name,version,kind,namespace,name,origin,value));
-                            CREATE INDEX {index} ON {values}(group_name,version,kind,namespace,value,name,origin);
-                            CREATE TRIGGER {index}_insert AFTER INSERT ON {table} WHEN NEW.kind='{}' BEGIN {insert}; END;
-                            CREATE TRIGGER {index}_update AFTER UPDATE ON {table} WHEN NEW.kind='{}' BEGIN {delete} {insert}; END;
-                            CREATE TRIGGER {index}_delete AFTER DELETE ON {table} WHEN OLD.kind='{}' BEGIN {delete} END;
-                            INSERT OR IGNORE INTO {values} SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},{extracted} FROM {table} o,{} AND o.kind='{}';
-                        ", kind.paths.kind,kind.paths.kind,kind.paths.kind,rows("o.body_json"),kind.paths.kind)).map_err(|e| Self::map_sqlite(e,"create array field index"))?;
-                    } else {
-                        let expression = Self::field_expression(kind, "body_json", path);
-                        tx.execute_batch(&format!("CREATE INDEX {index} ON {table}(group_name,version,kind,namespace,{expression},name) WHERE kind='{}' AND json_valid(body_json)", kind.paths.kind)).map_err(|e| Self::map_sqlite(e, "create field index"))?;
+                    let origin = if table == "replica_objects" { "origin_root" } else { "''" };
+                    let new_origin = if table == "replica_objects" { "NEW.origin_root" } else { "''" };
+                    let old_origin = if table == "replica_objects" { "OLD.origin_root" } else { "''" };
+                    let delete=format!("DELETE FROM {values} WHERE group_name=OLD.group_name AND version=OLD.version AND kind=OLD.kind AND namespace=OLD.namespace AND name=OLD.name AND origin={old_origin};");
+                    let insert=format!("INSERT OR IGNORE INTO {values} SELECT NEW.group_name,NEW.version,NEW.kind,NEW.namespace,NEW.name,{new_origin},j.value FROM json_each(flotilla_declared_values(NEW.body_json,'{path}')) j WHERE j.type='text';");
+                    // TEMP maintenance is transactional but never travels with the file.
+                    for action in ["insert", "update", "delete"] {
+                        tx.execute_batch(&format!("DROP TRIGGER IF EXISTS main.{index}_{action};"))
+                            .map_err(|e| Self::map_sqlite(e, "remove legacy field trigger"))?;
                     }
-                    tx.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [&index])
-                        .map_err(|e| Self::map_sqlite(e, "record field migration"))?;
+                    tx.execute_batch(&format!("
+                        CREATE TEMP TRIGGER IF NOT EXISTS {index}_insert AFTER INSERT ON main.{table} WHEN NEW.kind='{}' BEGIN {insert} END;
+                        CREATE TEMP TRIGGER IF NOT EXISTS {index}_update AFTER UPDATE ON main.{table} WHEN NEW.kind='{}' BEGIN {delete} {insert} END;
+                        CREATE TEMP TRIGGER IF NOT EXISTS {index}_delete AFTER DELETE ON main.{table} WHEN OLD.kind='{}' BEGIN {delete} END;
+                    ",kind.paths.kind,kind.paths.kind,kind.paths.kind)).map_err(|e| Self::map_sqlite(e,"install temporary field triggers"))?;
+                    // Unknown writers cannot maintain these projections. Repair on
+                    // every native open, including deletions and unchanged versions.
+                    tx.execute_batch(&format!("DELETE FROM {values}; INSERT OR IGNORE INTO {values} SELECT o.group_name,o.version,o.kind,o.namespace,o.name,{origin},j.value FROM main.{table} o,json_each(flotilla_declared_values(o.body_json,'{path}')) j WHERE o.kind='{}' AND j.type='text';",kind.paths.kind))
+                        .map_err(|e| Self::map_sqlite(e,"repair declared field values"))?;
                 }
             }
         }
         tx.commit().map_err(|e| Self::map_sqlite(e, "commit query indexes"))
-    }
-    fn field_expression(kind: ResourceKind, body: &str, path: &str) -> String {
-        let expression = format!("json_extract({body},'$.{path}')");
-        if kind.queryable_numeric_fields.contains(&path) {
-            // json_extract rounds unsigned integers above i64::MAX through a
-            // SQLite REAL. The JSON operator retains their exact decimal text.
-            format!("NULLIF(CAST({body} -> '$.{path}' AS TEXT),'null')")
-        } else {
-            // Object text must use the same canonical key order as memory,
-            // regardless of how an external author ordered stored JSON keys.
-            format!("CASE WHEN json_type({body},'$.{path}')='object' THEN json_extract(flotilla_declared_values({body},'{path}'),'$[0]') ELSE {expression} END")
-        }
     }
     fn field_index(table: &str, kind: ResourceKind, path: &str) -> String {
         format!(
@@ -644,7 +651,7 @@ impl SqliteBackend {
             } else if crate::array_field_path(path).is_some() {
                 ""
             } else {
-                "_scalar_v2"
+                "_scalar_v3"
             }
         )
     }
@@ -759,22 +766,12 @@ impl SqliteBackend {
         {
             predicates.push("json_valid(o.body_json)".into());
         }
-        let field_expression = |path: &str| {
-            if crate::array_field_path(path).is_some() {
-                "l.value".to_string()
-            } else {
-                Self::field_expression(kind, "o.body_json", path)
-            }
-        };
+        let field_expression = |_path: &str| "l.value".to_string();
         let field_predicate = |path: &str, predicate: String| {
-            if crate::array_field_path(path).is_some() {
-                let index = Self::field_index(table, kind, path);
-                let candidate = if replicas { "(o.name,o.origin_root)" } else { "o.name" };
-                let columns = if replicas { "l.name,l.origin" } else { "l.name" };
-                format!("{candidate} IN (SELECT {columns} FROM {index}_values l INDEXED BY {index} WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND {predicate})")
-            } else {
-                predicate
-            }
+            let index = Self::field_index(table, kind, path);
+            let candidate = if replicas { "(o.name,o.origin_root)" } else { "o.name" };
+            let columns = if replicas { "l.name,l.origin" } else { "l.name" };
+            format!("{candidate} IN (SELECT {columns} FROM {index}_values l INDEXED BY {index} WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND {predicate})")
         };
         for (path, value) in &query.fields {
             args.push(SqlValue::Text(value.clone()));
@@ -811,13 +808,9 @@ impl SqliteBackend {
             predicates.push(format!("{identity} IN (SELECT {projection} FROM {table}_labels INDEXED BY {table}_labels_lookup WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND key=?{key} AND value>=?{n} AND substr(value,1,length(?{n}))=?{n})"));
         }
         for path in &query.missing_fields {
-            if crate::array_field_path(path).is_some() {
-                let index = Self::field_index(table, kind, path);
-                let origin = if replicas { "o.origin_root" } else { "''" };
-                predicates.push(format!("NOT EXISTS(SELECT 1 FROM {index}_values l WHERE l.group_name=o.group_name AND l.version=o.version AND l.kind=o.kind AND l.namespace=o.namespace AND l.name=o.name AND l.origin={origin})"));
-            } else {
-                predicates.push(format!("{} IS NULL", field_expression(path)));
-            }
+            let index = Self::field_index(table, kind, path);
+            let origin = if replicas { "o.origin_root" } else { "''" };
+            predicates.push(format!("NOT EXISTS(SELECT 1 FROM {index}_values l WHERE l.group_name=o.group_name AND l.version=o.version AND l.kind=o.kind AND l.namespace=o.namespace AND l.name=o.name AND l.origin={origin})"));
         }
         for (path, selection) in &query.field_matches_query {
             let source_kind = selection.kind(kind).expect("validated source kind");
@@ -890,34 +883,20 @@ impl SqliteBackend {
             predicates.push(format!("(?{} IS NULL OR ?{} IS NOT NULL)", args.len(), args.len()));
             Some(message.sql_index(replicas).into())
         } else {
-            query
-                .fields
-                .keys()
-                .chain(query.field_values.keys())
-                .chain(query.present.iter())
-                .chain(query.field_prefixes.keys())
-                .chain(query.missing_fields.iter())
-                .find(|path| crate::array_field_path(path).is_none())
-                .map(|path| Self::field_index(table, kind, path))
+            None
         };
         let indexed = index.map(|index: String| format!(" INDEXED BY {index}")).unwrap_or_default();
         if let QueryColumns::Field(path) = &columns {
-            if crate::array_field_path(path).is_some() {
-                let index = Self::field_index(table, kind, path);
-                let (selection, values) = Self::declared_sql(kind, namespace, query, replicas, root, QueryColumns::Identity);
-                let candidate = if replicas { "(l.name,l.origin)" } else { "l.name" };
-                return (format!("SELECT l.value FROM {index}_values l INDEXED BY {index} WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND {candidate} IN ({selection})"),values);
-            }
+            let index = Self::field_index(table, kind, path);
+            let (selection, values) = Self::declared_sql(kind, namespace, query, replicas, root, QueryColumns::Identity);
+            let candidate = if replicas { "(l.name,l.origin)" } else { "l.name" };
+            return (format!("SELECT l.value FROM {index}_values l INDEXED BY {index} WHERE l.group_name=?1 AND l.version=?2 AND l.kind=?3 AND l.namespace=?4 AND {candidate} IN ({selection})"),values);
         }
-        let field_projection;
         let projection = match columns {
             QueryColumns::Names => "name",
             QueryColumns::Identity if replicas => "name,origin_root",
             QueryColumns::Identity => "name",
-            QueryColumns::Field(path) => {
-                field_projection = Self::field_expression(kind, "body_json", &path);
-                field_projection.as_str()
-            }
+            QueryColumns::Field(_) => unreachable!("field projections return from their indexed relation"),
             QueryColumns::LocalList => "name,body_json",
             QueryColumns::ReadRows if replicas => "body_json,origin_root,last_synced_at",
             QueryColumns::ReadRows => "body_json,NULL,NULL",
@@ -3214,16 +3193,104 @@ mod latency_tests {
     }
 
     #[tokio::test]
-    async fn independent_writer_requires_declared_query_functions() {
+    async fn unconfigured_writer_remains_compatible_and_native_open_repairs_values() {
+        use crate::StoreExt;
+        use chrono::Utc;
+        use flotilla_protocol::NodeId;
+        use flotilla_resources::{CharterPointer, Project, ProjectRepositorySpec, ProjectSpec, RepositoryKey};
+        use serde_json::Value;
+        use std::collections::BTreeMap;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resources.sqlite");
         let backend = ResourceBackend::new(SqliteBackend::open(&path).unwrap());
-        backend.using::<Host>("flotilla").create(&InputMeta::builder().name("writer".into()).build(), &HostSpec::default()).await.unwrap();
+        let spec = ProjectSpec::builder()
+            .display_name("External".into())
+            .repositories(vec![ProjectRepositorySpec::builder().repo(RepositoryKey("old".into())).build()])
+            .charter(CharterPointer::Repository { repo: "old".into(), branch: "main".into(), path: "".into() })
+            .build();
+        let object =
+            backend.definitions::<Project>("flotilla").create(&InputMeta::builder().name("external".into()).build(), &spec).await.unwrap();
+        backend
+            .replace_replicas_typed::<Project>(
+                &NodeId::new("foreign"),
+                "flotilla",
+                &crate::ResourceList { items: vec![object], resource_version: "1".into(), generation: None },
+                Utc::now(),
+                None,
+            )
+            .await
+            .unwrap();
+        drop(backend);
+        // A plain connection neither registers functions nor installs TEMP triggers.
         let connection = rusqlite::Connection::open(&path).unwrap();
-        let error = connection.execute("UPDATE resource_objects SET body_json=body_json WHERE name='writer'", []).unwrap_err();
-        assert!(error.to_string().contains("flotilla_declared_values"), "{error}");
-        SqliteBackend::register_query_functions(&connection).unwrap();
-        assert_eq!(connection.execute("UPDATE resource_objects SET body_json=body_json WHERE name='writer'", []).unwrap(), 1);
+        let references: i64 = connection
+            .query_row("SELECT count(*) FROM sqlite_schema WHERE instr(sql,'flotilla_declared_values')>0", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(references, 0, "the database file must not depend on our custom function");
+        let charter = r#"{"repo":"new","path":"","kind":"repository","branch":"main"}"#;
+        for table in ["resource_objects", "replica_objects"] {
+            assert_eq!(connection.execute(&format!("UPDATE {table} SET body_json=json_set(body_json,'$.spec.repositories',json('[{{\"repo\":\"new\"}}]'),'$.spec.charter',json(?1)) WHERE kind='Project' AND name='external'"),[charter]).unwrap(),1);
+            let index = SqliteBackend::field_index(table, crate::ResourceKind::of::<Project>(), "spec.repositories[].repo");
+            let old: i64 =
+                connection.query_row(&format!("SELECT count(*) FROM {index}_values WHERE value='old'"), [], |row| row.get(0)).unwrap();
+            assert_eq!(old, 1, "unknown writer deliberately leaves the derived table stale");
+        }
+        let before: String =
+            connection.query_row("SELECT body_json FROM resource_objects WHERE kind='Project'", [], |row| row.get(0)).unwrap();
+        drop(connection);
+        for asynchronous in [false, true] {
+            let native = if asynchronous { SqliteBackend::open_async(&path).await.unwrap() } else { SqliteBackend::open(&path).unwrap() };
+            let backend = ResourceBackend::new(native);
+            for (field, value) in
+                [("spec.repositories[].repo", "new".into()), ("spec.charter", serde_json::from_str::<Value>(charter).unwrap().to_string())]
+            {
+                let rows = backend
+                    .query_declared::<Project>(
+                        "flotilla",
+                        &crate::StoreQuery {
+                            fields: BTreeMap::from([(field.into(), value)]),
+                            include_replicas: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(rows.items.len(), 2, "both local and replica projections repair on open");
+            }
+            let old = backend
+                .query_declared::<Project>(
+                    "flotilla",
+                    &crate::StoreQuery {
+                        fields: BTreeMap::from([("spec.repositories[].repo".into(), "old".into())]),
+                        include_replicas: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(old.items.is_empty());
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let after: String =
+                connection.query_row("SELECT body_json FROM resource_objects WHERE kind='Project'", [], |row| row.get(0)).unwrap();
+            assert_eq!(before, after, "repair must not rewrite resource bodies");
+        }
+        // Deletion by an old writer must also be reflected on the next open.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute("DELETE FROM replica_objects WHERE kind='Project'", []).unwrap();
+        drop(connection);
+        let backend = ResourceBackend::new(SqliteBackend::open(&path).unwrap());
+        let rows = backend
+            .query_declared::<Project>(
+                "flotilla",
+                &crate::StoreQuery {
+                    fields: BTreeMap::from([("spec.repositories[].repo".into(), "new".into())]),
+                    include_replicas: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.items.len(), 1, "repair removes orphaned derived values");
     }
 
     #[tokio::test]
@@ -3393,7 +3460,7 @@ mod tests {
         for table in ["resource_objects", "replica_objects"] {
             let index = SqliteBackend::field_index(table, kind, "spec.repositories.*.repo_ref");
             for action in ["insert", "update", "delete"] {
-                connection.execute_batch(&format!("DROP TRIGGER {index}_{action}")).unwrap();
+                connection.execute_batch(&format!("DROP TRIGGER IF EXISTS {index}_{action}")).unwrap();
             }
             connection.execute_batch(&format!("DROP TABLE {index}_values")).unwrap();
             connection.execute("DELETE FROM resource_store_migrations WHERE name=?1", [index]).unwrap();
@@ -3484,7 +3551,7 @@ mod tests {
             connection.execute_batch(&format!("CREATE TABLE {legacy}_members AS SELECT * FROM {current}_values; CREATE INDEX {legacy} ON {legacy}_members(group_name,version,kind,namespace,value,name,origin);")).unwrap();
             connection.execute("INSERT INTO resource_store_migrations(name) VALUES (?1)", [legacy]).unwrap();
             for action in ["insert", "update", "delete"] {
-                connection.execute_batch(&format!("DROP TRIGGER {current}_{action}")).unwrap();
+                connection.execute_batch(&format!("DROP TRIGGER IF EXISTS {current}_{action}")).unwrap();
             }
             connection.execute_batch(&format!("DROP TABLE {current}_values")).unwrap();
             connection.execute("DELETE FROM resource_store_migrations WHERE name=?1", [&current]).unwrap();
@@ -3566,11 +3633,7 @@ mod tests {
                             ));
                             cases.push((
                                 crate::StoreQuery { missing_fields: [(*path).into()].into(), ..Default::default() },
-                                if crate::array_field_path(path).is_some() {
-                                    format!("sqlite_autoindex_{}_values_1", SqliteBackend::field_index(table, kind, path))
-                                } else {
-                                    SqliteBackend::field_index(table, kind, path)
-                                },
+                                format!("sqlite_autoindex_{}_values_1", SqliteBackend::field_index(table, kind, path)),
                             ));
                             let source = crate::StoreQuery::names(["source".into()], true);
                             let related = crate::StoreQuery {

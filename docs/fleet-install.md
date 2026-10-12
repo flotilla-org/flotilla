@@ -256,30 +256,20 @@ retained backups for operator recovery.
 
 ## Declared-query SQLite indexes and rollback (#3057)
 
-The declared-query migrations preserve resource bodies, so the N→N+1 decode
-contract in ADR 0047 remains intact. They are not write-compatible with N-1:
-normalized relation triggers and canonical scalar expression indexes require
-`flotilla_declared_values` on every SQLite writer connection. Native stores
-register it automatically. Auxiliary writers must call
-`SqliteBackend::register_query_functions`; an unconfigured CLI or older binary
-refuses writes, including writes of unrelated resource kinds.
+The declared-query migrations preserve resource bodies and support ordinary
+fleet-install rollback without index cleanup. Persisted tables and indexes do
+not reference custom functions. Native writers maintain canonical field values
+with connection-local TEMP triggers, like the digest index.
 
-Before rolling this candidate, inventory all direct SQL writers and either
-upgrade their connection initialization or retire them. The existing decode
-pre-roll gate does not prove writer compatibility. Do not treat a passing decode
-gate as permission to skip this check. Keep a consistent SQLite backup before
-opening the candidate store.
+Older binaries and plain SQLite connections can write without registering query
+functions. Such writes can leave the new derived values stale; each native open
+repairs them from authoritative local and replica bodies in one transaction,
+including changed values and deleted records. Resource bodies are not rewritten.
+Existing native readers are not refreshed by concurrent unconfigured writes;
+reopening the native store performs the repair. No writer inventory, function
+registration, or derived-schema cleanup is required before rollback.
 
-Before restoring an older binary, stop all store writers and back up the store,
-including its WAL. Remove the candidate's derived query objects that depend on
-`flotilla_declared_values` and their named migration records in one transaction.
-For each relation migration, remove its `_insert`, `_update`, and `_delete`
-triggers, its `_values` table (which owns the lookup index), and its migration
-record. For each scalar expression-index migration whose SQL references the
-function, remove its index and migration record. Inventory these through
-`sqlite_schema` and `resource_store_migrations`; do not drop resource tables,
-resource bodies, label/owner tables, or unrelated migrations. Verify no schema
-SQL references `flotilla_declared_values` before starting the older writer.
-The current binary recreates and backfills removed derived indexes on re-upgrade.
-Restore the consistent pre-candidate backup instead if preserving intervening
-writes is unnecessary. The rollback command alone does not perform this cleanup.
+The new field-value tables and lookup indexes are additive named migrations.
+Superseded built-in indexes may be retired after the rollback retention window;
+that housekeeping is separate from rollback itself. Native open also removes
+function-dependent objects from pre-release #3057 schemas automatically.
