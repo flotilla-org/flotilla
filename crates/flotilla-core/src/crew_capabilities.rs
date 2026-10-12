@@ -1,6 +1,9 @@
 //! Session capability reporting. Credential material stays behind the runtime
 //! port; cards contain only scope and effective permissions.
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use flotilla_resources::{
@@ -175,6 +178,8 @@ pub async fn session_card(
     text.push_str(&format!("\n### Session\nYou work at `{}` in environment `{}`.\n", spec.cwd, spec.env_ref));
     let environment =
         backend.including_replicas::<Environment>(namespace).get(&spec.env_ref).await.map_err(|error| error.to_string())?.object;
+    // Backing host/image identities are not reachable capabilities; an equivalent
+    // placement move must not generate a capability notice.
     text.push_str("\n### Reachable paths\n");
     if environment.spec.host_direct.is_some() {
         text.push_str(&format!("- `{}` (read-write)\n", spec.cwd));
@@ -224,7 +229,8 @@ pub fn reachable_paths(mounts: &[EnvironmentMount]) -> String {
     }
     let mut text = String::new();
     for (path, mode) in &paths {
-        let ancestors = paths.keys().filter(|parent| *parent != path && path.starts_with(&format!("{parent}/"))).count();
+        let ancestors = path.match_indices('/').filter(|(index, _)| *index > 0 && paths.contains_key(&path[..*index])).count()
+            + usize::from(path != "/" && paths.contains_key("/"));
         text.push_str(&format!("{}- `{path}` ({})\n", "  ".repeat(ancestors), mount_mode(*mode)));
     }
     for (repository, modes) in git {
@@ -249,6 +255,8 @@ pub fn reachable_paths(mounts: &[EnvironmentMount]) -> String {
     text
 }
 
+// The Scope footer is static consultation guidance. Actual repository/vessel scope,
+// grants, credentials and reachable endpoints/paths are retained as section rows.
 fn card_sections(card: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut sections = BTreeMap::<String, BTreeSet<String>>::new();
     let mut section = "Session".to_string();
@@ -263,18 +271,18 @@ fn card_sections(card: &str) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 fn line_identity(line: &str) -> &str {
-    // Named credentials, paths and endpoint destinations have stable row identities.
+    // Parse the renderer's row delimiters, not punctuation inside names or target paths.
     if line.trim_start().starts_with("- Credential `") {
-        return line.split(": repositories").next().unwrap_or(line);
+        return line.rsplit_once("`: repositories").map(|(name, _)| name).unwrap_or(line);
     }
-    if let Some((_, destination)) = line.split_once(" → ") {
+    if let Some((_, destination)) = line.rsplit_once(" → ") {
         return destination;
     }
-    if let Some((name, _)) = line.split_once(": ") {
-        return name;
+    if line.trim_start().starts_with("- `") {
+        return line.rsplit_once("` (").map(|(path, _)| path.trim_start()).unwrap_or(line);
     }
-    if let Some(end) = line.find("` (") {
-        return &line[..end];
+    if line.starts_with("- Git metadata for ") {
+        return line.rsplit_once(": ").map(|(name, _)| name).unwrap_or(line);
     }
     line
 }
@@ -319,7 +327,17 @@ pub fn card_delta(previous: &str, current: &str) -> String {
 /// Ephemeral baselines preserve stored resource shapes. Pending snapshots survive
 /// annotation CAS retries; delivery evidence advances the agent's delta baseline.
 #[derive(Default)]
-pub struct CapabilityCardTracker(Mutex<BTreeMap<(String, String), CardObservation>>);
+pub struct CapabilityCardTracker(Mutex<BTreeMap<(String, String), SessionCardObservation>>);
+
+type SessionCardObservation = Arc<Mutex<CardObservation>>;
+
+impl CapabilityCardTracker {
+    async fn observation(&self, namespace: &str, session: &str) -> SessionCardObservation {
+        // The map lock protects lookup/pruning only. Backend I/O holds a session's
+        // observation lock, so unrelated launches and refreshes proceed independently.
+        Arc::clone(self.0.lock().await.entry((namespace.to_string(), session.to_string())).or_default())
+    }
+}
 
 #[derive(Default)]
 struct CardObservation {
@@ -351,8 +369,8 @@ pub async fn observe_card(
     card: &str,
     tracker: &CapabilityCardTracker,
 ) -> Result<(), String> {
-    let mut observations = tracker.0.lock().await;
-    let observation = observations.entry((namespace.to_string(), session.metadata.name.clone())).or_default();
+    let observation = tracker.observation(namespace, &session.metadata.name).await;
+    let mut observation = observation.lock().await;
     let previous = session.metadata.annotations.get(DIGEST_ANNOTATION).cloned();
     if previous.as_ref().is_some_and(|previous| previous == &card_digest(card)) {
         if observation.delivered.is_none()
@@ -365,7 +383,8 @@ pub async fn observe_card(
     }
     // Pending notices supersede one another. Promote only snapshots the inbox delivered.
     let mut retired = Vec::new();
-    for (revision, (name, snapshot)) in &observation.pending {
+    let pending = observation.pending.clone();
+    for (revision, (name, snapshot)) in &pending {
         let message = match backend.clone().using::<Message>(namespace).get(name).await {
             Ok(message) => message,
             Err(ResourceError::NotFound { .. }) => {
@@ -469,6 +488,14 @@ async fn publish_card_revision(
         resource: ResourceRef::new("flotilla.work/v1", "TerminalSession", namespace, &session.metadata.name),
         revision: format!("capabilities@{revision}"),
     };
+    let supersedes = match session.metadata.annotations.get(MESSAGE_ANNOTATION) {
+        Some(name) => match backend.clone().using::<Message>(namespace).get(name).await {
+            Ok(_) => Some(name.clone()),
+            Err(ResourceError::NotFound { .. }) => None, // Reaped audit data cannot be a predecessor.
+            Err(error) => return Err(error.to_string()),
+        },
+        None => None,
+    };
     let requested = MessageSpec::builder()
         .sender(sender.into())
         .receiver(receiver)
@@ -476,13 +503,14 @@ async fn publish_card_revision(
         .body(body.to_string())
         .references(vec![subject.clone()])
         .subject(subject)
-        .maybe_supersedes(session.metadata.annotations.get(MESSAGE_ANNOTATION).cloned())
+        .maybe_supersedes(supersedes)
         .build();
     let recovered = recover_published_revision(backend, namespace, &name, &requested).await?;
     let digest = recovered
         .as_ref()
         .and_then(|message| message.metadata.annotations.get(DIGEST_ANNOTATION))
         .cloned()
+        // Previous-generation Messages without this annotation always contain full cards.
         .unwrap_or_else(|| recovered.as_ref().map(|message| card_digest(&message.spec.body)).unwrap_or_else(|| card_digest(card)));
     let spec = recovered.map(|message| message.spec).unwrap_or(requested);
     MessageInbox::new(backend.clone(), namespace)
@@ -506,8 +534,8 @@ pub async fn observe_launch_card(
 ) -> Result<(), String> {
     let session = backend.clone().using::<TerminalSession>(namespace).get(name).await.map_err(|error| error.to_string())?;
     observe_card(backend, namespace, &session, card, tracker).await?;
-    let mut observations = tracker.0.lock().await;
-    let observation = observations.entry((namespace.to_string(), name.to_string())).or_default();
+    let observation = tracker.observation(namespace, name).await;
+    let mut observation = observation.lock().await;
     observation.delivered = Some(card.to_string());
     observation.pending.clear();
     Ok(())
@@ -579,7 +607,15 @@ mod tests {
     fn reachable_paths_never_render_sources(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let root_mounted = tc.draw(gs::booleans());
         let mut mounts = Vec::new();
+        if root_mounted {
+            mounts.push(EnvironmentMount {
+                source_path: "/private-host/root".into(),
+                target_path: "/".into(),
+                mode: EnvironmentMountMode::Ro,
+            });
+        }
         for index in 0..count {
             for (suffix, mode) in [
                 ("", EnvironmentMountMode::Rw),
@@ -609,7 +645,8 @@ mod tests {
         assert!(!card.contains("private-host"));
         assert!(!card.contains(".git"));
         assert_eq!(card.matches("Git metadata for").count(), count);
-        assert!(card.contains("- `/workspace` (read-write)\n  - `/workspace/config` (read-only)"));
+        let indent = if root_mounted { "  " } else { "" };
+        assert!(card.contains(&format!("{indent}- `/workspace` (read-write)\n{indent}  - `/workspace/config` (read-only)")));
         for index in 0..count {
             assert!(card.contains(&format!("Git metadata for repo-{index}: read-write")));
             assert!(card.contains("config read-only"));
@@ -629,12 +666,30 @@ mod tests {
         assert_eq!(card_delta(after, after), "## Capability changes\n");
     }
 
+    // Colons inside target paths are part of their identity, so renamed paths remain
+    // additions/removals while a mode change for the same target remains a changed row.
+    #[test]
+    fn delta_preserves_punctuation_in_target_identity() {
+        let before = "### Paths\n- `/workspace/a: removed` (read-write)\n- `/workspace/a: same` (read-only)\n";
+        let after = "### Paths\n- `/workspace/a: added` (read-write)\n- `/workspace/a: same` (read-write)\n";
+        let delta = card_delta(before, after);
+        assert!(delta.contains("1 added, 1 removed, 1 changed."));
+        assert!(delta.contains("Removed: - `/workspace/a: removed` (read-write)"));
+        assert!(delta.contains("Added: - `/workspace/a: added` (read-write)"));
+        assert!(delta.contains("Changed: - `/workspace/a: same` (read-only) → - `/workspace/a: same` (read-write)"));
+    }
+
     // Row order is not a delivered capability change; the generation marker forces one upgrade card.
     #[test]
     fn digest_ignores_order_and_changes_generation() {
         let card = "## Your capabilities\n### Repositories\n- one\n- two\n";
         assert_eq!(card_digest(card), card_digest("## Your capabilities\n### Repositories\n- two\n- one\n"));
         assert_ne!(card_digest(card), format!("{:x}", Sha256::digest(card.as_bytes())));
+        // Consultation guidance is informational; all actual scope remains in section rows.
+        assert_eq!(
+            card_digest(&format!("{card}Scope: consult the card\n")),
+            card_digest(&format!("{card}Scope: updated consultation guidance\n"))
+        );
     }
 
     // Proxy endpoints retain the destination, never URL authentication or

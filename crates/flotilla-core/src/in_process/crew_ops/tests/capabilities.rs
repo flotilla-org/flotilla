@@ -16,7 +16,7 @@ use crate::in_process::CREDENTIAL_REFS_ANNOTATION;
 
 #[tokio::test]
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
-    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
+    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference, Vessel, VesselSpec};
 
     use crate::crew_capabilities::{CredentialCapability, SessionCapabilitySource};
     // In-memory port stands in for credential mint/delivery I/O.
@@ -165,7 +165,11 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     .expect("revocation notification");
     let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
     assert_eq!(messages.len(), 4);
-    let latest = messages.iter().find(|message| matches!(&message.spec.subject, Some(flotilla_resources::MessageReference::ControlRecord { revision, .. }) if revision == "capabilities@5")).expect("superseding delta");
+    let latest_revision = |message: &&ResourceObject<Message>| {
+        let Some(MessageReference::ControlRecord { revision, .. }) = &message.spec.subject else { return false };
+        revision == "capabilities@5"
+    };
+    let latest = messages.iter().find(latest_revision).expect("superseding delta");
     assert!(messages.iter().any(|message| Some(&message.metadata.name) == latest.spec.supersedes.as_ref()));
     assert_eq!(latest.spec.sender, "system:capabilities");
     assert_eq!(latest.spec.body, crate::crew_capabilities::card_delta(&first, &card));
@@ -300,4 +304,78 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
     let session = sessions.get("session").await.expect("session");
     let latest = messages.get(&session.metadata.annotations["flotilla.work/capabilities-message"]).await.expect("latest");
     assert_eq!(latest.spec.body, third);
+}
+
+// Reaping a pending Message loses the receipt baseline, so production refresh must publish
+// a full card without referencing the deleted predecessor, and unchanged refresh is idempotent.
+#[tokio::test]
+async fn refresh_after_reaped_message_recovers_with_full_card() {
+    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker, CredentialCapability, SessionCapabilitySource};
+    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
+    // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
+    struct Delivery(RwLock<BTreeMap<String, String>>);
+    #[async_trait]
+    impl SessionCapabilitySource for Delivery {
+        async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
+            Ok(vec![])
+        }
+        async fn endpoints(&self, _: &str, _: &str) -> Result<BTreeMap<String, String>, String> {
+            Ok(self.0.read().await.clone())
+        }
+    }
+    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("vessel".into()).build(),
+            &VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("vessel");
+    backend
+        .using::<Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("resume-env".into()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+                docker: None,
+            },
+        )
+        .await
+        .expect("environment");
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("session").await.expect("session");
+    sessions
+        .update_status(
+            "session",
+            &session.metadata.resource_version,
+            &flotilla_resources::TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
+        )
+        .await
+        .expect("running");
+    let source = Delivery(RwLock::new(BTreeMap::new()));
+    let tracker = CapabilityCardTracker::default();
+    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("initial baseline");
+    source.0.write().await.insert("API".into(), "127.0.0.1:1".into());
+    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("pending delta");
+    let session = sessions.get("session").await.expect("session");
+    let messages = backend.using::<Message>("flotilla");
+    let reaped = &session.metadata.annotations["flotilla.work/capabilities-message"];
+    assert!(messages.get(reaped).await.expect("delta").spec.body.starts_with("## Capability changes"));
+    messages.delete(reaped).await.expect("reap Message");
+    source.0.write().await.insert("API".into(), "127.0.0.1:2".into());
+    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("recover reaped Message");
+    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("unchanged refresh");
+    let session = sessions.get("session").await.expect("session");
+    assert_eq!(session.metadata.annotations["flotilla.work/capabilities-revision"], "3");
+    let all = messages.list().await.expect("messages").items;
+    assert_eq!(all.len(), 1);
+    assert!(all[0].spec.body.starts_with("## Your capabilities"));
+    assert!(all[0].spec.body.contains("127.0.0.1:2"));
+    assert!(all[0].spec.supersedes.is_none());
 }

@@ -789,6 +789,9 @@ impl CredentialStore {
         for name in credential_refs {
             let spec = self.spec(name).await?;
             if matches!(spec.consumer, CredentialConsumer::DockerRegistry { .. }) {
+                // Registry auth serves host image actions, never the session. Record the
+                // intentional absence so it cannot be confused with a reconstruction gap.
+                self.record_host_only_reference(environment_ref, name).await;
                 continue;
             }
             specs.push((name.clone(), spec));
@@ -868,6 +871,9 @@ impl CredentialStore {
         let mut pending_github_deliveries = Vec::new();
         for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
+            // Every adapter shares this guard with withdrawal: non-GitHub material
+            // must not be revoked between its file/config writes and observation commit.
+            // Sorted references keep multi-credential lock acquisition consistent.
             delivery_guards.push(self.github_app_delivery_lock(&cache_key).await.lock_owned().await);
             if let CredentialConsumer::GithubApp { permissions: declaration, .. } = &spec.consumer {
                 let requested = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
@@ -1016,6 +1022,10 @@ impl CredentialStore {
         self.prepared.lock().await.extend(prepared_cache_keys.iter().cloned());
         self.record_delivered_capabilities(&prepared_cache_keys).await;
         Ok(env.into_iter().collect())
+    }
+
+    async fn record_host_only_reference(&self, environment: &str, name: &str) {
+        self.delivered_capabilities.lock().await.entry((environment.to_string(), name.to_string())).or_insert(None);
     }
 
     async fn record_delivered_capabilities(&self, keys: &[(String, String)]) {
@@ -1367,7 +1377,9 @@ impl CredentialStore {
         Box::pin(async move {
             let mut delivered = BTreeSet::new();
             for name in granted {
-                if !matches!(self.spec(name).await?.consumer, CredentialConsumer::DockerRegistry { .. }) {
+                if matches!(self.spec(name).await?.consumer, CredentialConsumer::DockerRegistry { .. }) {
+                    self.record_host_only_reference(environment_ref, name).await;
+                } else {
                     delivered.insert(name.clone());
                 }
             }
@@ -2725,6 +2737,50 @@ mod tests {
         assert_eq!(delivered.len(), 1);
         store.prepared.lock().await.remove(&key);
         assert_eq!(store.credentials("vessel", &refs).await.expect("refresh gap"), delivered);
+        // Forgetting the backing invalidates the observation; it cannot become an empty card.
+        store.forget_environment("vessel").await.expect("forget backing");
+        assert!(store.credentials("vessel", &refs).await.is_err());
+    }
+
+    // Host registry credentials are intentionally absent from sessions, not an unknown delivery.
+    #[tokio::test]
+    async fn host_registry_reference_has_known_absent_session_delivery() {
+        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(
+                &InputMeta::builder().name("registry".into()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "test".into() },
+                    source: CredentialSource::Env { name: "ABSENT_REGISTRY_TOKEN".into() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: Default::default(),
+                },
+            )
+            .await
+            .expect("registry declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/state"),
+        );
+        let refs = BTreeSet::from(["registry".into()]);
+        assert!(store.credentials("env", &refs).await.is_err());
+        assert!(store.prepare_scoped("env", &refs, &BTreeMap::new(), runner).await.expect("classify host-only delivery").is_empty());
+        assert!(store.credentials("env", &refs).await.expect("known host-only absence").is_empty());
+        // Reconciliation also restores this classification after observation memory is forgotten.
+        store.forget_environment("env").await.expect("forget");
+        assert!(store.credentials("env", &refs).await.is_err());
+        store
+            .reconcile_work_delivery("env", &refs, &refs, &BTreeMap::new(), Arc::new(RecordingRunner::default()))
+            .await
+            .expect("reconcile host-only reference");
+        assert!(store.credentials("env", &refs).await.expect("reconciled host-only absence").is_empty());
     }
 
     // Generated operations cover remints, daemon reconstruction gaps, reconciliation, source failures,
@@ -6136,6 +6192,9 @@ impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialSto
                     capabilities.push(delivered.capability.clone());
                 }
                 Some(_) => {} // Explicit withdrawal or expiry without a delivered successor.
+                // Missing memory cannot prove non-delivery: token files can survive restart.
+                // Preparation failures block launch and are retried by reconciliation;
+                // until recovery, refusing the read preserves the last published card.
                 None => return Err(format!("credential `{name}` delivery observation unavailable for environment `{environment}`")),
             }
         }
