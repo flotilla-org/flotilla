@@ -11,6 +11,7 @@ skip-no-sandbox-tests = ["flotilla-core/skip-no-sandbox-tests", "flotilla-store/
 
 [dependencies]
 flotilla-forge-github = { path = "../flotilla-forge-github" }
+flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
 flotilla-tls = { path = "../flotilla-tls" }
 flotilla-store = { path = "../flotilla-store" }

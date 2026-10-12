@@ -20,7 +20,7 @@ use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::run_output;
 use flotilla_provider_runtime::CommandRunner;
 
-use crate::providers::issue_tracker::mission_fields;
+use crate::mission_fields;
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
 
@@ -658,14 +658,15 @@ mod tests {
     use flotilla_provider_runtime::ChannelLabel;
 
     use super::*;
-    use crate::providers::github_test_support::build_api_and_runner;
-    use crate::providers::github_test_support::repo_root_for_recording;
-    use crate::providers::issue_tracker::IssueProvider;
-    use crate::testkits::discovery::assert_provider_contract;
-    use crate::testkits::replay;
-    use crate::testkits::replay::testing::fixture_path;
-    use crate::testkits::replay::testing::MockRunner;
-    use crate::testkits::replay::Masks;
+    use flotilla_replay_testkit as replay;
+    use flotilla_replay_testkit::testing::MockRunner;
+    use flotilla_replay_testkit::Masks;
+
+    use crate::testing::assert_provider_contract;
+    use crate::testing::build_api_and_runner;
+    use crate::testing::fixture_path;
+    use crate::testing::repo_root_for_recording;
+    use crate::IssueProvider;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {
@@ -735,7 +736,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        fixture_path("issue_tracker", name)
+        fixture_path(name)
     }
 
     #[tokio::test]

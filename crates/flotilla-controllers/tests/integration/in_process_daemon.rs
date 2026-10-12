@@ -873,7 +873,7 @@ struct FreshIssueFactory;
 #[async_trait]
 impl Factory for FreshIssueFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn flotilla_core::providers::issue_tracker::IssueProvider;
+    type Output = dyn flotilla_issue_tracker::IssueProvider;
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::named(ProviderCategory::IssueProvider, "fresh-issues")
     }
@@ -914,8 +914,7 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
     let provider = Arc::new(FakeIssueProvider::new());
     provider.add_issues(vec![(reference.id.clone(), issue)]).await;
     let discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new()
-            .with_issue_tracker(provider.clone() as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+        FakeDiscoveryProviders::new().with_issue_tracker(provider.clone() as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
     let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
 
@@ -3440,7 +3439,7 @@ async fn issue_platform_need_refuses_without_a_covering_kind() {
     let provider = Arc::new(FakeIssueProvider::new());
     provider.add_issues(vec![(reference.id.clone(), issue)]).await;
     let discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     create_test_convoy_project(&daemon.resource_backend(), Some(source)).await;
@@ -4061,7 +4060,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     provider.add_issues(vec![(reference.id.clone(), issue.clone()), (reference_two.id.clone(), issue_two.clone())]).await;
     let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(false) });
     let mut discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
     discovery.factories.ai_utilities.push(Box::new(CountingConvoyAiUtilityFactory { utility: Arc::clone(&utility) }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
@@ -5228,7 +5227,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     provider.add_issues(vec![(reference.id.clone(), issue)]).await;
     let utility = Arc::new(SlowAiUtility::new());
     let mut discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
     discovery.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility: Arc::clone(&utility), probes: None }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;

@@ -405,8 +405,7 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
         )
         .await;
     let discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new()
-            .with_issue_tracker(Arc::clone(&provider) as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+        FakeDiscoveryProviders::new().with_issue_tracker(Arc::clone(&provider) as Arc<dyn flotilla_issue_tracker::IssueProvider>),
     );
     let daemon = InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), discovery, HostName::new("local"), backend).await;
     let options = RuntimeOptions {

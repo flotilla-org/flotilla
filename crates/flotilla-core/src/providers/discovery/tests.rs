@@ -1,5 +1,5 @@
 use super::*;
-use crate::providers::issue_tracker::forge_issue_source;
+use flotilla_issue_tracker::forge_issue_source;
 use flotilla_resources::{ForgeKind, ForgeSpec};
 
 #[test]

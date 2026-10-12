@@ -10,10 +10,9 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::{
-    agent_adapter::AgentAdapterRegistry,
-    providers::issue_tracker::{provider_for_source, IssueProvider},
-};
+use flotilla_issue_tracker::{provider_for_source, IssueProvider};
+
+use crate::agent_adapter::AgentAdapterRegistry;
 use flotilla_vcs::providers::CloneProvisioner;
 
 /// Common accessors shared by all descriptor types.

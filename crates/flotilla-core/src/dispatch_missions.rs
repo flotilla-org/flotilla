@@ -1,5 +1,5 @@
 //! Mission normalization and membership over one complete tracker observation.
-use crate::providers::issue_tracker::mission_fields::{class, issue_ref_from_url};
+use flotilla_issue_tracker::mission_fields::{class, issue_ref_from_url};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -417,7 +417,7 @@ impl MissionBoard {
 
 #[cfg(test)]
 mod tests {
-    use crate::providers::issue_tracker::mission_fields::parse_mission_fields;
+    use flotilla_issue_tracker::mission_fields::parse_mission_fields;
     use flotilla_protocol::ClassOfService;
     use std::cmp::Ordering;
 

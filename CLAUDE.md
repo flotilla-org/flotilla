@@ -140,6 +140,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-cloud-agent` | Cloud session provider trait, Claude/Codex/Cursor implementations, factories and detectors |
 | `flotilla-forge-forgejo` | Shared Forgejo HTTP client, authentication values and discovery-time credential resolution |
 | `flotilla-change-request` | Change-request tracker and observation-source traits, GitHub/Forgejo implementations, branch-absence observer and factories |
+| `flotilla-issue-tracker` | Source-addressed issue-provider trait, GitHub/Forgejo implementations, GitHub dispatch-board reader, mission-field decoding and factories |
 | `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, step plans, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-paths` | Shared path policy, filesystem canonicalization and protocol path context |
@@ -219,7 +220,7 @@ Provider traits live in their type crates as they are extracted, with remaining 
 
 - **Vcs** (`crates/flotilla-vcs/src/vcs.rs`, `crates/flotilla-vcs/src/providers/git.rs`, `crates/flotilla-vcs/src/providers/git_worktree.rs`)
 - **ChangeRequestTracker** (`crates/flotilla-change-request/src/lib.rs`, `crates/flotilla-change-request/src/github.rs`, `crates/flotilla-change-request/src/forgejo.rs`)
-- **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
+- **IssueProvider** (`crates/flotilla-issue-tracker/src/lib.rs`, `crates/flotilla-issue-tracker/src/github.rs`, `crates/flotilla-issue-tracker/src/forgejo.rs`)
 - **CloudAgentService** (`crates/flotilla-cloud-agent/src/claude.rs`, `crates/flotilla-cloud-agent/src/codex.rs`, `crates/flotilla-cloud-agent/src/cursor.rs`)
 - **AiUtility** (`crates/flotilla-ai-utility/src/claude_api.rs`, `crates/flotilla-ai-utility/src/claude_cli.rs`)
 - **TerminalPool** (`crates/flotilla-terminal/src/cleat.rs`, `crates/flotilla-terminal/src/passthrough.rs`)

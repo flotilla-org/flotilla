@@ -14,6 +14,7 @@ flotilla-forge-forgejo = { path = "../flotilla-forge-forgejo" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
 flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-forge-github = { path = "../flotilla-forge-github" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
@@ -37,7 +38,6 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 tracing = { workspace = true }
 indexmap = { workspace = true }
-dirs = "6"
 toml = "0.8"
 toml_edit = "0.22"
 reqwest = { workspace = true, features = ["charset", "http2", "json", "system-proxy"] }
@@ -46,7 +46,6 @@ bytes = { workspace = true }
 minijinja.workspace = true
 serde_yml = "0.0.12"
 futures.workspace = true
-urlencoding = "2"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.38.4"
