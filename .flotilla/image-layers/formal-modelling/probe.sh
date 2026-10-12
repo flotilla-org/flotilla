@@ -25,6 +25,8 @@ case "${1:-all}" in
             /opt/flotilla/formal-modelling/smoke.tla > tlc-output.txt 2>&1 \
             || { status=$?; cat tlc-output.txt; exit "$status"; }
         cat tlc-output.txt
+        # TLC release 1.7.4 reports engine version 2.19; update this check with
+        # the TLC_VERSION/TLC_SHA256 pins when selecting another release.
         grep -F 'TLC2 Version 2.19' tlc-output.txt
         verify
         ;;
