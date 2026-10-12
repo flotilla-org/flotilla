@@ -861,6 +861,8 @@ impl ConvoyStatus {
     }
 
     /// Whether shared attention originates from turn delivery rather than settlement.
+    /// New delivery advisory sources must be registered here unless they are already
+    /// keys in `turn_deliveries`, so terminal row projection can ignore them.
     pub fn is_turn_delivery_attention(&self, attention: &ConvoyAttention) -> bool {
         self.turn_deliveries.contains_key(&attention.source)
             || matches!(

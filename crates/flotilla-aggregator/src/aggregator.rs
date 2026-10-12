@@ -6558,13 +6558,20 @@ mod hold_attention_tests {
     }
 
     // #3079: terminal rows ignore delivery attention while preserving unrelated
-    // attention and durable refusal history. Exhaust all terminal phases plus Active,
+    // attention and durable refusal history. Exhaust all terminal and non-terminal phases,
     // explicit/legacy holds, and shared delivery/unrelated/empty attention slots.
     #[tokio::test]
     async fn terminal_delivery_attention_projection() {
         use flotilla_resources::ConvoyAttention;
-        for phase in [ResourceConvoyPhase::Landed, ResourceConvoyPhase::Failed, ResourceConvoyPhase::Abandoned, ResourceConvoyPhase::Active]
-        {
+        for phase in [
+            ResourceConvoyPhase::Landed,
+            ResourceConvoyPhase::Failed,
+            ResourceConvoyPhase::Abandoned,
+            ResourceConvoyPhase::Pending,
+            ResourceConvoyPhase::Active,
+            ResourceConvoyPhase::Interrupted,
+            ResourceConvoyPhase::Landing,
+        ] {
             for explicit_hold in [false, true] {
                 for source in [
                     None,
