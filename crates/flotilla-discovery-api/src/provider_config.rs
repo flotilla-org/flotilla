@@ -49,8 +49,8 @@ pub struct CloudAgentConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AiUtilityConfig {
-    /// Model ID shared by the naming API and CLI.
-    // N→N+1 stored config compatibility; removable after the next roll.
+    /// Full API model ID shared by the naming API and CLI (not a CLI alias such as `haiku`).
+    // ADR 0047: decode previous config; retain the default while this setting is optional.
     #[serde(default = "default_naming_model")]
     pub model: String,
     #[serde(flatten)]

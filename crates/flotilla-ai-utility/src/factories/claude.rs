@@ -17,6 +17,14 @@ use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::ReqwestHttpClient;
 use flotilla_provider_runtime::{CommandRunner, HttpClient};
 
+async fn naming_model(config: &dyn ProviderConfigView) -> Result<String, Vec<UnmetRequirement>> {
+    let model = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?.ai_utility.model;
+    if model.trim().is_empty() {
+        return Err(vec![UnmetRequirement::MissingConfig("ai_utility.model must be a nonempty full API model ID".into())]);
+    }
+    Ok(model)
+}
+
 // ---------------------------------------------------------------------------
 // ClaudeApiAiUtilityFactory — preferred, uses ANTHROPIC_API_KEY
 // ---------------------------------------------------------------------------
@@ -30,7 +38,7 @@ impl ClaudeApiAiUtilityFactory {
         http: Arc<dyn HttpClient>,
         config: &dyn ProviderConfigView,
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
-        let model = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?.ai_utility.model;
+        let model = naming_model(config).await?;
         Ok(Arc::new(ClaudeApiAiUtility::new(api_key, http, model)))
     }
 }
@@ -84,11 +92,7 @@ impl Factory for ClaudeCliAiUtilityFactory {
     ) -> Result<Arc<dyn AiUtility>, Vec<UnmetRequirement>> {
         if let Some(path) = env.find_binary("claude") {
             let claude_bin = path.as_path().to_string_lossy().to_string();
-            Ok(Arc::new(ClaudeCliAiUtility::new(
-                claude_bin,
-                runner,
-                config.load_config_for_probe().await.map_err(|e| vec![UnmetRequirement::MissingConfig(e)])?.ai_utility.model,
-            )))
+            Ok(Arc::new(ClaudeCliAiUtility::new(claude_bin, runner, naming_model(config).await?)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("claude".into())])
         }
@@ -224,5 +228,38 @@ mod configured_cli_tests {
             .expect("provider");
         assert_eq!(utility.generate_branch_name("issue").await.expect("branch"), "branch");
         assert_eq!(utility.generate_convoy_names("issue").await.expect("names").name, "convoy");
+    }
+}
+
+#[cfg(test)]
+mod invalid_model_tests {
+    use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory};
+    use crate::testing::ModelConfig;
+    use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement};
+    use flotilla_discovery_testkit::DiscoveryMockRunner;
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use std::sync::Arc;
+
+    // Empty or whitespace-only model config refuses probing before any remote call.
+    // Admission can use the existing MissingConfig diagnostic and deterministic fallback.
+    #[tokio::test]
+    async fn empty_model_refuses_both_factories() {
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
+            .with(EnvironmentAssertion::env_var("ANTHROPIC_API_KEY", "test-key"));
+        for model in ["", " ", "\t\n"] {
+            let config = ModelConfig(model.into());
+            let runner = Arc::new(DiscoveryMockRunner::builder().build());
+            let root = ExecutionEnvironmentPath::new("/repo");
+            for result in [
+                ClaudeApiAiUtilityFactory.probe(&env, &config, &root, runner.clone()).await,
+                ClaudeCliAiUtilityFactory.probe(&env, &config, &root, runner.clone()).await,
+            ] {
+                assert_eq!(
+                    result.err().expect("invalid model must refuse"),
+                    vec![UnmetRequirement::MissingConfig("ai_utility.model must be a nonempty full API model ID".into())]
+                );
+            }
+        }
     }
 }
