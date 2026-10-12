@@ -149,8 +149,25 @@ impl ResourceKind {
     }
 }
 
+/// The shape of one store read, so per-request read budgets can tell an
+/// indexed lookup from a scan of a whole kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReadOperation {
+    /// Every object of a kind in one namespace: local rows, replica rows or
+    /// both (`list_raw`, `list_replicas_raw`, `list_including_replicas_raw`,
+    /// `list_replica_sources_raw`). Its cost grows with the whole kind.
+    List,
+    /// Rows selected by a declared query: indexed fields, labels, owners,
+    /// names, Message history or a named read view.
+    Query,
+    /// Every visible provenance of one name.
+    Get,
+}
+
+/// Observes reads at the adapter boundary: one call per store operation, with
+/// the number of objects it decoded (or, for in-memory snapshots, visited).
 pub trait ReadObserver: std::fmt::Debug + Send + Sync {
-    fn read(&self, kind: &str, count: usize);
+    fn read(&self, kind: &str, operation: ReadOperation, objects: usize);
     fn as_any(&self) -> &dyn std::any::Any;
 }
 pub fn convert_read<A: Resource, B: Resource>(item: ReadResourceObject<A>) -> Result<ReadResourceObject<B>, ResourceError> {

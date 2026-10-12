@@ -374,3 +374,76 @@ async fn message_apply_retries_only_conflicts_with_a_finite_budget() {
     assert!(result.is_err());
     assert_eq!(attempts, 1);
 }
+
+// #3045: sending a message is an interactive request: routing it to the
+// receiver's home and admitting it at that home read the same objects however
+// many unrelated convoys, holders and messages share the namespace. Daemon
+// background tasks share the counted backend, so only the request's own task
+// is measured.
+#[tokio::test]
+async fn message_send_reads_ignore_unrelated_history() {
+    use flotilla_resources::{Message, MessageRelation, MessageSpec};
+    use flotilla_store_testkit::{assert_flat_reads, measure_reads, ReadBudget, ReadCountsBackendExt, ReadOperation, ReadSnapshot};
+    async fn send_reads(unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
+        let temp = tempfile::tempdir().expect("config directory");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-budget-test\"\n").expect("machine identity");
+        let backend = ResourceBackend::new(InMemoryBackend::default()).with_read_counts();
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("local"),
+            backend.clone(),
+        )
+        .await;
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        for index in 0..=unrelated {
+            let name = if index == 0 { "convoy".to_string() } else { format!("unrelated-{index}") };
+            convoys
+                .create(&test_meta(&name), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
+                .await
+                .expect("convoy");
+            if index != 0 {
+                backend
+                    .using::<Message>("flotilla")
+                    .create(
+                        &test_meta(&format!("history-{index}")),
+                        &MessageSpec::builder()
+                            .sender("flotilla/checks".into())
+                            .receiver(format!("flotilla/{name}/work/coder"))
+                            .relation(MessageRelation::System)
+                            .body("unrelated".into())
+                            .build(),
+                    )
+                    .await
+                    .expect("unrelated message");
+            }
+        }
+        let document = serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "send"},
+            "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+        });
+        let action = CommandAction::ResourceApply { namespace: "flotilla".into(), document: document.clone() };
+        let (target, routing) = measure_reads(daemon.resolve_command_target(&action, None)).await;
+        target.expect("route to the receiver's home");
+        let (admitted, admission) = measure_reads(daemon.apply_intent_document("flotilla", document)).await;
+        admitted.expect("admit");
+        let (routing, admission) = (routing.of(&backend), admission.of(&backend));
+        // Routing resolves the receiver's convoy and holder by name and index;
+        // admission checks the receiver's pending history and reads back its row.
+        routing.assert_within(
+            &ReadBudget::new()
+                .objects("Convoy", ReadOperation::Query, 1, 1)
+                .objects("Convoy", ReadOperation::Get, 1, 1)
+                .objects("Message", ReadOperation::Get, 1, 1)
+                .objects("TerminalSession", ReadOperation::Query, 1, 1),
+            "message routing",
+        );
+        admission.assert_within(
+            &ReadBudget::new().objects("Message", ReadOperation::Query, 1, 1).objects("Message", ReadOperation::Get, 1, 1),
+            "message admission",
+        );
+        (routing, admission)
+    }
+    assert_flat_reads([0, 40], send_reads).await;
+}

@@ -1,4 +1,4 @@
-use crate::{convert_read, transcode, ReadObserver, ResourceKind, SerializedResource};
+use crate::{convert_read, transcode, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
 use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use crate::{Store, StoreExt};
@@ -144,9 +144,9 @@ impl InMemoryBackend {
         self.read_observer.as_deref()
     }
 
-    fn count_read(&self, resource_kind: ResourceKind, count: usize) {
+    fn count_read(&self, resource_kind: ResourceKind, operation: ReadOperation, count: usize) {
         if let Some(observer) = &self.read_observer {
-            observer.read(resource_kind.paths.kind, count);
+            observer.read(resource_kind.paths.kind, operation, count);
         }
     }
 
@@ -191,7 +191,7 @@ impl InMemoryBackend {
                 }
             }
         }
-        self.count_read(ResourceKind::of::<crate::Message>(), items.len());
+        self.count_read(ResourceKind::of::<crate::Message>(), ReadOperation::Query, items.len());
         Ok(items)
     }
 
@@ -406,7 +406,7 @@ impl InMemoryBackend {
                 });
             }
         }
-        self.count_read(resource_kind, items.len());
+        self.count_read(resource_kind, ReadOperation::List, items.len());
         Ok(items)
     }
 
@@ -442,7 +442,7 @@ impl InMemoryBackend {
                 },
             ));
         }
-        self.count_read(resource_kind, items.len());
+        self.count_read(resource_kind, ReadOperation::Get, items.len());
         items.sort_by(|(left, _), (right, _)| left.cmp(right));
         Ok(items.into_iter().map(|(_, item)| item).collect())
     }
@@ -740,7 +740,7 @@ impl InMemoryBackend {
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         self.with_store(resource_kind, namespace, |store| {
             let value = store.objects.get(name).cloned().ok_or_else(|| ResourceError::not_found(name))?;
-            self.count_read(resource_kind, 1);
+            self.count_read(resource_kind, ReadOperation::Get, 1);
             Self::decode_object(resource_kind, value)
         })
         .await
@@ -839,7 +839,7 @@ impl InMemoryBackend {
 
     pub async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         self.with_store(resource_kind, namespace, |store| {
-            self.count_read(resource_kind, store.objects.len());
+            self.count_read(resource_kind, ReadOperation::List, store.objects.len());
             let mut items = Vec::with_capacity(store.objects.len());
             for value in store.objects.values().cloned() {
                 items.push(Self::decode_object(resource_kind, value)?);
@@ -862,7 +862,7 @@ impl InMemoryBackend {
 
         self.with_store(resource_kind, namespace, |store| {
             let names = store.queries.names(&crate::StoreQuery::labels(required, false, true));
-            self.count_read(resource_kind, names.len());
+            self.count_read(resource_kind, ReadOperation::Query, names.len());
             let items =
                 names.iter().map(|name| Self::decode_object(resource_kind, store.objects[name].clone())).collect::<Result<Vec<_>, _>>()?;
             Ok(ResourceList { items, resource_version: store.current_version().to_string(), generation: self.generation.clone() })
@@ -1362,7 +1362,7 @@ impl Store for InMemoryBackend {
                 }
             }
         }
-        self.count_read(kind, items.len());
+        self.count_read(kind, query.read_operation(), items.len());
         let mut items = crate::merge_query_definitions(query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult {

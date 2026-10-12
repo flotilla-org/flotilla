@@ -52,7 +52,7 @@ impl Store for HttpBackend {
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
         let result = self.query_messages(namespace, query, include_replicas).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read("Message", result.len());
+            observer.read("Message", ReadOperation::Query, result.len());
         }
         result.into_iter().map(convert_read).collect()
     }
@@ -64,7 +64,7 @@ impl Store for HttpBackend {
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         let result = HttpBackend::get_raw(self, resource_kind, namespace, name).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, 1);
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, 1);
         }
         Ok(result)
     }
@@ -82,7 +82,7 @@ impl Store for HttpBackend {
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::List, result.items.len());
         }
         Ok(result)
     }
@@ -94,7 +94,7 @@ impl Store for HttpBackend {
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_raw_matching_labels(self, resource_kind, namespace, required).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::Query, result.items.len());
         }
         Ok(result)
     }
@@ -162,7 +162,7 @@ impl Store for HttpBackend {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_including_replicas_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::List, result.items.len());
         }
         Ok(result)
     }
@@ -174,7 +174,7 @@ impl Store for HttpBackend {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_including_replicas_raw_matching_labels(self, resource_kind, namespace, required).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::Query, result.items.len());
         }
         Ok(result)
     }
@@ -186,7 +186,7 @@ impl Store for HttpBackend {
     ) -> Result<ReadResourceObject<SerializedResource>, ResourceError> {
         let result = HttpBackend::get_including_replicas_raw(self, resource_kind, namespace, name).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, 1);
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, 1);
         }
         Ok(result)
     }
@@ -198,7 +198,7 @@ impl Store for HttpBackend {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::get_all_including_replicas_raw(self, resource_kind, namespace, name).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, result.items.len());
         }
         Ok(result)
     }
@@ -209,7 +209,7 @@ impl Store for HttpBackend {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_replica_sources_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::List, result.items.len());
         }
         Ok(result)
     }
@@ -221,7 +221,7 @@ impl Store for HttpBackend {
     ) -> Result<ReadResourceList<SerializedResource>, ResourceError> {
         let result = HttpBackend::list_read_view_raw(self, resource_kind, namespace, query_key).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::Query, result.items.len());
         }
         Ok(result)
     }

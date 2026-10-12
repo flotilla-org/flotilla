@@ -594,13 +594,10 @@ async fn delivery_receiver_reads_are_bounded() {
             accepted: Default::default(),
             working: Default::default(),
         };
-        let before = memory.read_calls();
+        let before = memory.read_snapshot();
         inbox.reconcile_delivery(&transport, at(20)).await.expect("delivery pass");
-        let after = memory.read_calls();
-        counts.push(
-            ["Convoy", "TerminalSession", "ConvoyEnsure"]
-                .map(|kind| after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default()),
-        );
+        let calls = memory.read_snapshot().since(&before).calls_by_kind();
+        counts.push(["Convoy", "TerminalSession", "ConvoyEnsure"].map(|kind| calls.get(kind).copied().unwrap_or_default()));
         assert!(transport.submissions.lock().expect("submissions").is_empty());
         for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
             assert_eq!(message.status.expect("waiting status").phase, MessagePhase::Accepted);
@@ -630,14 +627,14 @@ fn receiver_snapshot_is_pure_and_refreshes(tc: hegel::TestCase) {
             .expect("convoy");
         let old = MessageReceiverSnapshot::load(&backend, "flotilla").await.expect("snapshot");
         let address = "flotilla/convoy/work/coder";
-        let before = memory.read_calls();
+        let before = memory.read_snapshot();
         for _ in 0..=repetitions {
             assert!(old.resolve(address).expect("absent").is_none());
             assert!(old.resolve("system:test").expect("system").is_none());
             assert!(old.resolve("principal:test").expect("principal").is_none());
             assert!(old.resolve("invalid").is_err());
         }
-        assert_eq!(before, memory.read_calls());
+        assert!(memory.read_snapshot().since(&before).is_empty());
         backend
             .using::<TerminalSession>("flotilla")
             .create(
@@ -1910,18 +1907,14 @@ fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
         assert_eq!(path[0].address, expected);
         let path = supervision_path(&backend, "flotilla", "child", "child/child-one/work/guide").await.expect("exclude sender");
         assert!(!path.iter().any(|contact| contact.address == "child/guide"));
-        let before = memory.read_calls();
+        let before = memory.read_snapshot();
         let book = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("contacts");
         assert_eq!(book.supervision[0].address, expected);
         // Every presence combination shares one local-plus-replica snapshot,
         // even when supervision and peer contacts resolve several addresses.
-        let after = memory.read_calls();
+        let calls = memory.read_snapshot().since(&before).calls_by_kind();
         for kind in ["Convoy", "TerminalSession", "ConvoyEnsure"] {
-            assert_eq!(
-                after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default(),
-                2,
-                "one snapshot for {kind}"
-            );
+            assert_eq!(calls.get(kind).copied().unwrap_or_default(), 2, "one snapshot for {kind}");
         }
         routing_holder(&backend, "root", "two").await;
         let next = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("refreshed contacts");
@@ -2461,138 +2454,132 @@ async fn addressed_receiver_reads_ignore_unrelated_holders() {
         Convoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
     };
     use flotilla_store::{resolve_message_receiver, MessageReceiverSnapshot};
-    use flotilla_store_testkit::ReadCountsBackendExt;
+    use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadSnapshot};
     use std::collections::BTreeMap;
-    for sqlite in [false, true] {
-        let mut samples = Vec::new();
-        for unrelated in [0, 48] {
-            let backend = if sqlite {
-                ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))
-            } else {
-                ResourceBackend::new(InMemoryBackend::default())
-            }
-            .with_read_counts();
-            for n in 0..=unrelated {
-                let name = if n == 0 { "convoy".into() } else { format!("unrelated-{n}") };
-                backend
-                    .using::<Convoy>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &ConvoySpec::builder()
-                            .workflow_ref("workflow".into())
-                            .project_ref("flotilla".into())
-                            .role(if n == 0 { "coder".into() } else { "other".into() })
-                            .build(),
-                    )
-                    .await
-                    .expect("convoy");
-                let terminal = if n == 0 { "terminal".into() } else { format!("terminal-{n}") };
-                backend
-                    .using::<TerminalSession>("flotilla")
-                    .create(
-                        &InputMeta::builder()
-                            .name(terminal)
-                            .labels(BTreeMap::from([
-                                (CONVOY_LABEL.into(), name.clone()),
-                                (ROLE_LABEL.into(), "coder".into()),
-                                (VESSEL_LABEL.into(), "work".into()),
-                            ]))
-                            .build(),
-                        &holder_spec(&name),
-                    )
-                    .await
-                    .expect("holder");
-                let ensure_name = if n == 0 { "ensure".into() } else { format!("ensure-{n}") };
-                let ensures = backend.using::<ConvoyEnsure>("flotilla");
-                ensures
-                    .create(
-                        &InputMeta::builder().name(ensure_name.clone()).build(),
-                        &ConvoyEnsureSpec::builder()
-                            .project_ref("flotilla".into())
-                            .role(if n == 0 { "coder".into() } else { format!("other-{n}") })
-                            .repositories(vec![])
-                            .build(),
-                    )
-                    .await
-                    .expect("ensure");
-                let ensure = ensures.get(&ensure_name).await.expect("local ensure version");
-                ensures
-                    .update_status(
-                        &ensure_name,
-                        &ensure.metadata.resource_version,
-                        &ConvoyEnsureStatus { convoy_ref: Some(name), ..Default::default() },
-                    )
-                    .await
-                    .expect("ensure status");
-                if n > 0 {
-                    backend
-                        .using::<Message>("flotilla")
-                        .create(&InputMeta::builder().name(format!("message-{n}")).build(), &spec(None, MessageExpectation::Reply))
-                        .await
-                        .expect("noise message");
-                }
-            }
-            let before_calls = backend.read_calls();
-            let before_objects = backend.read_counts();
-            let snapshot = MessageReceiverSnapshot::load_for_addresses(
-                &backend,
-                "flotilla",
-                &["flotilla/convoy/work/coder".into(), "flotilla/coder".into()],
-            )
-            .await
-            .expect("targeted snapshot");
-            for address in ["flotilla/convoy/work/coder", "flotilla/coder"] {
-                assert_eq!(snapshot.resolve(address).expect("resolve").expect("holder").object.metadata.name, "terminal");
-            }
-            let calls = backend.read_calls();
-            let objects = backend.read_counts();
-            let delta = |after: &BTreeMap<String, usize>, before: &BTreeMap<String, usize>, kind: &str| {
-                after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default()
-            };
-            let counts = ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"]
-                .map(|kind| (delta(&calls, &before_calls, kind), delta(&objects, &before_objects, kind)));
-            assert_eq!(counts, [(1, 1), (1, 1), (1, 1), (0, 0)]);
-            samples.push(counts);
-            // A four-part address selects its crew, even when the named convoy
-            // contains other sessions. It does not need standing-role holders.
+    // Exact per-kind (calls, decoded objects) for Convoy, TerminalSession, ConvoyEnsure, Message.
+    fn kinds(reads: &ReadSnapshot) -> [(usize, usize); 4] {
+        ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"].map(|kind| {
+            (reads.calls_by_kind().get(kind).copied().unwrap_or_default(), reads.objects_by_kind().get(kind).copied().unwrap_or_default())
+        })
+    }
+    async fn resolve_reads(sqlite: bool, unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
+        let backend = if sqlite {
+            ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"))
+        } else {
+            ResourceBackend::new(InMemoryBackend::default())
+        }
+        .with_read_counts();
+        for n in 0..=unrelated {
+            let name = if n == 0 { "convoy".into() } else { format!("unrelated-{n}") };
+            backend
+                .using::<Convoy>("flotilla")
+                .create(
+                    &InputMeta::builder().name(name.clone()).build(),
+                    &ConvoySpec::builder()
+                        .workflow_ref("workflow".into())
+                        .project_ref("flotilla".into())
+                        .role(if n == 0 { "coder".into() } else { "other".into() })
+                        .build(),
+                )
+                .await
+                .expect("convoy");
+            let terminal = if n == 0 { "terminal".into() } else { format!("terminal-{n}") };
             backend
                 .using::<TerminalSession>("flotilla")
                 .create(
                     &InputMeta::builder()
-                        .name("other-crew".into())
+                        .name(terminal)
                         .labels(BTreeMap::from([
-                            (CONVOY_LABEL.into(), "convoy".into()),
-                            (ROLE_LABEL.into(), "reviewer".into()),
+                            (CONVOY_LABEL.into(), name.clone()),
+                            (ROLE_LABEL.into(), "coder".into()),
                             (VESSEL_LABEL.into(), "work".into()),
                         ]))
                         .build(),
-                    &holder_spec("convoy"),
+                    &holder_spec(&name),
                 )
                 .await
-                .expect("other crew");
-            let before_calls = backend.read_calls();
-            let before_objects = backend.read_counts();
-            assert_eq!(
-                resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder")
+                .expect("holder");
+            let ensure_name = if n == 0 { "ensure".into() } else { format!("ensure-{n}") };
+            let ensures = backend.using::<ConvoyEnsure>("flotilla");
+            ensures
+                .create(
+                    &InputMeta::builder().name(ensure_name.clone()).build(),
+                    &ConvoyEnsureSpec::builder()
+                        .project_ref("flotilla".into())
+                        .role(if n == 0 { "coder".into() } else { format!("other-{n}") })
+                        .repositories(vec![])
+                        .build(),
+                )
+                .await
+                .expect("ensure");
+            let ensure = ensures.get(&ensure_name).await.expect("local ensure version");
+            ensures
+                .update_status(
+                    &ensure_name,
+                    &ensure.metadata.resource_version,
+                    &ConvoyEnsureStatus { convoy_ref: Some(name), ..Default::default() },
+                )
+                .await
+                .expect("ensure status");
+            if n > 0 {
+                backend
+                    .using::<Message>("flotilla")
+                    .create(&InputMeta::builder().name(format!("message-{n}")).build(), &spec(None, MessageExpectation::Reply))
                     .await
-                    .expect("explicit receiver")
-                    .expect("holder")
-                    .object
-                    .metadata
-                    .name,
-                "terminal"
-            );
-            let calls = backend.read_calls();
-            let objects = backend.read_counts();
-            assert_eq!(
-                ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"]
-                    .map(|kind| (delta(&calls, &before_calls, kind), delta(&objects, &before_objects, kind))),
-                [(1, 1), (1, 1), (0, 0), (0, 0)]
-            );
-            let before = backend.read_calls();
-            assert!(resolve_message_receiver(&backend, "flotilla", "principal:operator").await.expect("principal").is_none());
-            assert_eq!(backend.read_calls(), before, "principal addresses never load agent holders");
+                    .expect("noise message");
+            }
         }
-        assert_eq!(samples[0], samples[1]);
+        let before = backend.read_snapshot();
+        let snapshot = MessageReceiverSnapshot::load_for_addresses(
+            &backend,
+            "flotilla",
+            &["flotilla/convoy/work/coder".into(), "flotilla/coder".into()],
+        )
+        .await
+        .expect("targeted snapshot");
+        for address in ["flotilla/convoy/work/coder", "flotilla/coder"] {
+            assert_eq!(snapshot.resolve(address).expect("resolve").expect("holder").object.metadata.name, "terminal");
+        }
+        let batch = backend.read_snapshot().since(&before);
+        batch.assert_no_lists("receiver batch");
+        assert_eq!(kinds(&batch), [(1, 1), (1, 1), (1, 1), (0, 0)]);
+        // A four-part address selects its crew, even when the named convoy
+        // contains other sessions. It does not need standing-role holders.
+        backend
+            .using::<TerminalSession>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name("other-crew".into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "convoy".into()),
+                        (ROLE_LABEL.into(), "reviewer".into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                    ]))
+                    .build(),
+                &holder_spec("convoy"),
+            )
+            .await
+            .expect("other crew");
+        let before = backend.read_snapshot();
+        assert_eq!(
+            resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder")
+                .await
+                .expect("explicit receiver")
+                .expect("holder")
+                .object
+                .metadata
+                .name,
+            "terminal"
+        );
+        let resolve = backend.read_snapshot().since(&before);
+        resolve.assert_no_lists("message resolve");
+        assert_eq!(kinds(&resolve), [(1, 1), (1, 1), (0, 0), (0, 0)]);
+        let before = backend.read_snapshot();
+        assert!(resolve_message_receiver(&backend, "flotilla", "principal:operator").await.expect("principal").is_none());
+        assert!(backend.read_snapshot().since(&before).is_empty(), "principal addresses never load agent holders");
+        (batch, resolve)
+    }
+    for sqlite in [false, true] {
+        assert_flat_reads([0, 48], |unrelated| resolve_reads(sqlite, unrelated)).await;
     }
 }

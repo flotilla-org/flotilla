@@ -1449,94 +1449,87 @@ mod tests {
     // and unrelated convoys/messages cannot increase store reads or decoding.
     #[tokio::test]
     async fn attach_reads_ignore_unrelated_convoys_and_messages() {
-        for reference in ["coder", "coder@flotilla", "convoy-main", "terminal-main", "terminal-ma"] {
-            let mut samples = Vec::new();
-            for unrelated in [0, 40] {
-                let (daemon, backend, _temp) = attach_fixture().await;
-                create_identity_convoy(&backend, "convoy-main", "coder", Some("flotilla")).await;
-                let convoys = backend.using::<ResourceConvoy>("flotilla");
-                let convoy = convoys.get("convoy-main").await.expect("convoy");
-                convoys
-                    .update_status(
-                        "convoy-main",
-                        &convoy.metadata.resource_version,
-                        &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
-                    )
-                    .await
-                    .expect("convoy phase");
-                let host = daemon.local_host_id().expect("host").to_string();
+        use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadOperation, ReadSnapshot};
+        async fn attach_reads(reference: &str, unrelated: usize) -> (ReadSnapshot, ReadSnapshot) {
+            let (daemon, backend, _temp) = attach_fixture().await;
+            create_identity_convoy(&backend, "convoy-main", "coder", Some("flotilla")).await;
+            let convoys = backend.using::<ResourceConvoy>("flotilla");
+            let convoy = convoys.get("convoy-main").await.expect("convoy");
+            convoys
+                .update_status(
+                    "convoy-main",
+                    &convoy.metadata.resource_version,
+                    &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+                )
+                .await
+                .expect("convoy phase");
+            let host = daemon.local_host_id().expect("host").to_string();
+            backend
+                .using::<ResourceHost>("flotilla")
+                .create(&test_meta(&host), &HostSpec { display_name: "host".into(), connection: Default::default(), ..Default::default() })
+                .await
+                .expect("host");
+            let environment = create_test_environment(&daemon, "env-main", &host).await;
+            create_running_session(&daemon, &environment, "terminal-main", "convoy-main", "coder").await;
+            for n in 0..unrelated {
+                create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
                 backend
-                    .using::<ResourceHost>("flotilla")
+                    .using::<flotilla_resources::Message>("flotilla")
                     .create(
-                        &test_meta(&host),
-                        &HostSpec { display_name: "host".into(), connection: Default::default(), ..Default::default() },
+                        &test_meta(&format!("message-{n}")),
+                        &flotilla_resources::MessageSpec::builder()
+                            .sender("other/source".into())
+                            .receiver("other/receiver".into())
+                            .relation(flotilla_resources::MessageRelation::Peer)
+                            .body("other".into())
+                            .build(),
                     )
                     .await
-                    .expect("host");
-                let environment = create_test_environment(&daemon, "env-main", &host).await;
-                create_running_session(&daemon, &environment, "terminal-main", "convoy-main", "coder").await;
-                for n in 0..unrelated {
-                    create_identity_convoy(&backend, &format!("unrelated-{n}"), "other", Some("other")).await;
-                    backend
-                        .using::<flotilla_resources::Message>("flotilla")
-                        .create(
-                            &test_meta(&format!("message-{n}")),
-                            &flotilla_resources::MessageSpec::builder()
-                                .sender("other/source".into())
-                                .receiver("other/receiver".into())
-                                .relation(flotilla_resources::MessageRelation::Peer)
-                                .body("other".into())
-                                .build(),
-                        )
-                        .await
-                        .expect("noise message");
-                }
-                // Count this resolver's real store collaborators. Daemon startup,
-                // projection materialization and provider-retirement tasks share
-                // the same data but retain separate, uncounted backend handles.
-                let request_backend = backend.clone().with_read_counts();
-                let mut resolver = daemon.attach_resolver();
-                let request_observations = resolver.observed_resource_backend.clone().with_read_counts();
-                resolver.resource_backend = &request_backend;
-                resolver.observed_resource_backend = &request_observations;
-                // A read through the daemon handle must not leak into the
-                // request observer, even when it reads the same resource kind.
-                backend.using::<ResourceConvoy>("flotilla").get("convoy-main").await.expect("daemon read");
-                assert!(request_backend.read_calls().is_empty());
-                let calls = request_backend.read_calls();
-                let objects = request_backend.read_counts();
-                let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
-                let binding = resolved.binding.expect("binding");
-                assert_eq!(binding.session.as_deref(), Some("terminal-main"));
-                assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
-                let delta = |before: BTreeMap<String, usize>, after: BTreeMap<String, usize>| {
-                    after
-                        .into_iter()
-                        .map(|(kind, count)| {
-                            let count = count - before.get(&kind).copied().unwrap_or_default();
-                            (kind, count)
-                        })
-                        .filter(|(_, count)| *count != 0)
-                        .collect::<BTreeMap<_, _>>()
-                };
-                let reads = delta(calls, request_backend.read_calls());
-                if reference.starts_with("terminal-") {
-                    // Direct session references select no Convoy candidates. One
-                    // exact parent get restores phase without a namespace read.
-                    assert_eq!(reads.get("Convoy"), Some(&2));
-                } else {
-                    assert_eq!(reads.get("Convoy"), Some(&1));
-                }
-                assert_eq!(reads.get("TerminalSession"), Some(&1));
-                let decoded = delta(objects, request_backend.read_counts());
-                assert_eq!(decoded.get("Convoy"), Some(&1));
-                let observed_reads = request_observations.read_calls();
-                let observed_decoded = request_observations.read_counts();
-                assert_eq!(observed_reads.get("TerminalSession"), Some(&1));
-                assert_eq!(observed_decoded.get("TerminalSession"), Some(&0));
-                samples.push((reads, decoded, observed_reads, observed_decoded));
+                    .expect("noise message");
             }
-            assert_eq!(samples[0], samples[1], "{reference}");
+            // Count this resolver's real store collaborators. Daemon startup,
+            // projection materialization and provider-retirement tasks share
+            // the same data but retain separate, uncounted backend handles.
+            let request_backend = backend.clone().with_read_counts();
+            let mut resolver = daemon.attach_resolver();
+            let request_observations = resolver.observed_resource_backend.clone().with_read_counts();
+            resolver.resource_backend = &request_backend;
+            resolver.observed_resource_backend = &request_observations;
+            // A read through the daemon handle must not leak into the
+            // request observer, even when it reads the same resource kind.
+            backend.using::<ResourceConvoy>("flotilla").get("convoy-main").await.expect("daemon read");
+            assert!(request_backend.read_snapshot().is_empty());
+            let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect("attach");
+            let binding = resolved.binding.expect("binding");
+            assert_eq!(binding.session.as_deref(), Some("terminal-main"));
+            assert_eq!(binding.convoy_phase, Some(flotilla_protocol::ConvoyPhase::Failed));
+            let reads = request_backend.read_snapshot();
+            // Direct session references select no Convoy candidates; one
+            // exact parent get restores phase without a namespace read.
+            let convoy_calls = if reference.starts_with("terminal-") { 2 } else { 1 };
+            assert_eq!(reads.calls_by_kind().get("Convoy"), Some(&convoy_calls));
+            assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
+            assert_eq!(reads.calls_by_kind().get("TerminalSession"), Some(&1));
+            // Host placement lookups list the Host catalog per hop: flat in
+            // unrelated convoys and messages, but not the target. Tighten this
+            // bound when #3078 reads the catalog once per request.
+            reads.assert_within(
+                &ReadBudget::new()
+                    .objects("Convoy", ReadOperation::Query, 1, 1)
+                    .objects("Convoy", ReadOperation::Get, 1, 1)
+                    .objects("TerminalSession", ReadOperation::Query, 1, 1)
+                    .objects("TerminalSession", ReadOperation::Get, 1, 1)
+                    .objects("Environment", ReadOperation::Get, 2, 2)
+                    .calls("Host", ReadOperation::List, 8),
+                reference,
+            );
+            let observed = request_observations.read_snapshot();
+            assert_eq!(observed.calls_by_kind().get("TerminalSession"), Some(&1));
+            assert_eq!(observed.objects_by_kind().get("TerminalSession"), Some(&0));
+            (reads, observed)
+        }
+        for reference in ["coder", "coder@flotilla", "convoy-main", "terminal-main", "terminal-ma"] {
+            assert_flat_reads([0, 40], |unrelated| attach_reads(reference, unrelated)).await;
         }
     }
 

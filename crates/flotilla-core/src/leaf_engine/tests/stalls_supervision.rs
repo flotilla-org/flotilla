@@ -1421,9 +1421,45 @@ async fn steady_state_stall_judgements_do_not_read_the_store() {
         .collect();
     let now = Utc::now();
     wake.judge_stalls_at("flotilla", &objects, now).await.expect("bootstrap");
-    let before = backend.read_calls();
+    let before = backend.read_snapshot();
     for _ in 0..64 {
         wake.judge_stalls_at("flotilla", &objects, now).await.expect("steady state judgement");
     }
-    assert_eq!(backend.read_calls(), before, "judgements must use views, including nested routing helpers");
+    let reads = backend.read_snapshot().since(&before);
+    assert!(reads.is_empty(), "judgements must use views, including nested routing helpers\n{reads}");
+}
+
+// #3045: the leaf engine's steady state is served by watch views. After one
+// bootstrap pass, reconcile passes that observe convoy changes delivered by
+// watches list no whole kind, on any task: views refresh from events.
+#[tokio::test]
+async fn leaf_engine_steady_state_lists_no_kind() {
+    use flotilla_store_testkit::ReadCountsBackendExt;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    let counted = backend.clone().with_read_counts();
+    let wake = supervision_wake(&counted);
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("project".into()).build(),
+            &flotilla_resources::ProjectSpec::builder().display_name("Project".into()).build(),
+        )
+        .await
+        .expect("project");
+    for index in 0..8 {
+        create_convoy(&backend, &format!("convoy-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    }
+    wake.subscriptions.reconcile_stalls_once("flotilla").await.expect("bootstrap pass");
+    let bootstrap = counted.read_snapshot();
+    assert!(!bootstrap.lists().is_empty(), "the bootstrap pass builds its views from lists\n{bootstrap}");
+    let convoys = backend.using::<Convoy>("flotilla");
+    for index in 0..16 {
+        // A status write reaches the views as a watch event, not a relist.
+        let name = format!("convoy-{}", index % 8);
+        let convoy = convoys.get(&name).await.expect("convoy");
+        let status = convoy.status.clone().expect("status");
+        convoys.update_status(&name, &convoy.metadata.resource_version, &status).await.expect("status write");
+        wake.subscriptions.reconcile_stalls_once("flotilla").await.expect("steady state pass");
+    }
+    counted.read_snapshot().since(&bootstrap).assert_no_lists("leaf engine reconcile passes");
 }

@@ -30,6 +30,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 flotilla-store-memory = { path = "../flotilla-store-memory" }
+flotilla-store-testkit = { path = "../flotilla-store-testkit" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }
 flotilla-protocol-testkit = { path = "../flotilla-protocol-testkit" }
 tokio = { workspace = true, features = ["test-util"] }

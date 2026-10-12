@@ -239,7 +239,14 @@ impl EnsurePass<'_> {
                     }
                 };
                 if self.admission.local_host_id().as_ref() != Some(&target.reference) {
-                    let hosts = match self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await {
+                    // Read only the driver's provenances: a per-ensure namespace
+                    // list would scale reconciliation with every Host.
+                    let hosts = match self
+                        .resource_backend
+                        .including_replicas::<ResourceHost>(namespace)
+                        .get_all(target.reference.as_str())
+                        .await
+                    {
                         Ok(hosts) => hosts,
                         Err(error) => {
                             errors.push(format!(

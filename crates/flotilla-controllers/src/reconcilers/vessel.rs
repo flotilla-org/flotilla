@@ -709,6 +709,9 @@ impl Reconciler for VesselReconciler {
         let mut contained_branches = BTreeSet::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
+        // Slug allocation needs the repository catalog only when a shared clone
+        // is missing; read it at most once per prepare, not once per repository.
+        let repository_catalog = tokio::sync::OnceCell::new();
         for convoy_repository in convoy_repositories {
             let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
                 Ok(repository) => repository.spec,
@@ -752,7 +755,7 @@ impl Reconciler for VesselReconciler {
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
-                        let repository_catalog = self.repositories.list().await?;
+                        let repository_catalog = repository_catalog.get_or_try_init(|| self.repositories.list()).await?;
                         let keyed_repositories = repository_catalog
                             .items
                             .iter()

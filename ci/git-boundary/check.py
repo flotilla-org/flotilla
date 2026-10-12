@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the VCS and environment runtime implementation boundaries."""
+"""Enforce the VCS and environment runtime boundaries and the store-read guard rail."""
 import argparse
 import os
 from pathlib import Path
@@ -267,7 +267,9 @@ def module_descendant(file, modules):
     )
 
 
-def scan_sources(sources):
+def scan_sources(sources, check_file=None):
+    """Apply a per-file check (default: the operation boundary) to production sources."""
+    check_file = check_file or violations
     for file, source in sources.items():
         errors = SgRoot(source, "rust").root().find_all(kind="ERROR")
         if errors:
@@ -294,7 +296,7 @@ def scan_sources(sources):
         pending.extend(reference for reference in references if reference in sources and reference not in visited)
     excluded.difference_update(production)
     return {
-        file: violations(source, file, production=file in production)
+        file: check_file(source, file, production=file in production)
         for file, source in sources.items()
         if file in production or not (file in excluded or module_descendant(file, excluded))
     }
@@ -316,6 +318,16 @@ def main():
         for line in lines:
             print(f"{file}:{line}: operation boundary violation: use Vcs or environment capability traits; keep runtime commands and concrete adapters in their implementations")
             failed = True
+    # Imported here: store_reads builds on this module's traversal helpers.
+    import store_reads
+    try:
+        store_failures = store_reads.scan(sources)
+    except ValueError as error:
+        print(error)
+        return 1
+    for failure in store_failures:
+        print(failure)
+        failed = True
     return int(failed)
 
 

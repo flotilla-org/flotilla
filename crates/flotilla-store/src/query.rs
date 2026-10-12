@@ -178,6 +178,47 @@ impl StoreQuery {
     pub fn validate(&self, kind: ResourceKind) -> Result<(), ResourceError> {
         self.validate_at(kind, 0)
     }
+    /// How this query is counted by read observers. Without a selector it reads
+    /// the whole kind, exactly like a list; provenance options do not select.
+    pub fn read_operation(&self) -> crate::ReadOperation {
+        // Exhaustive on purpose: a new field must be classified as a selector
+        // or a provenance option here, or this stops compiling.
+        let StoreQuery {
+            labels,
+            fields,
+            field_values,
+            field_prefixes,
+            missing_fields,
+            field_matches_query,
+            merged_definitions: _,
+            owner,
+            any_of,
+            present,
+            label_prefixes,
+            all_sources_for_matches: _,
+            message,
+            include_replicas: _,
+            replicas_only: _,
+            replica_shadowing: _,
+            suppress_self_origin: _,
+        } = self;
+        let selects = !labels.is_empty()
+            || !fields.is_empty()
+            || !field_values.is_empty()
+            || !field_prefixes.is_empty()
+            || !missing_fields.is_empty()
+            || !field_matches_query.is_empty()
+            || owner.is_some()
+            || any_of.is_some()
+            || !present.is_empty()
+            || !label_prefixes.is_empty()
+            || message.is_some();
+        if selects {
+            crate::ReadOperation::Query
+        } else {
+            crate::ReadOperation::List
+        }
+    }
     fn validate_at(&self, kind: ResourceKind, depth: usize) -> Result<(), ResourceError> {
         if self.all_sources_for_matches
             && (kind.replication != crate::ReplicationClass::Definitions

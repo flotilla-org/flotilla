@@ -164,19 +164,13 @@ mod tests {
                 .await
                 .expect("idle pulse");
         }
-        let before = counted.read_counts();
-        daemon.service_forge_read_demand("flotilla", "idle-0").await.expect("idle service");
-        daemon.service_forge_read_demand("flotilla", "missing").await.expect("missing service");
-        let after = counted.read_counts();
-        assert_eq!(
-            after.get(ForgeRead::API_PATHS.kind).copied().unwrap_or_default()
-                - before.get(ForgeRead::API_PATHS.kind).copied().unwrap_or_default(),
-            1
-        );
-        assert_eq!(
-            after.get(ForgeReadHeartbeat::API_PATHS.kind).copied().unwrap_or_default()
-                - before.get(ForgeReadHeartbeat::API_PATHS.kind).copied().unwrap_or_default(),
-            1
-        );
+        let ((), reads) = flotilla_store_testkit::measure_reads(async {
+            daemon.service_forge_read_demand("flotilla", "idle-0").await.expect("idle service");
+            daemon.service_forge_read_demand("flotilla", "missing").await.expect("missing service");
+        })
+        .await;
+        let decoded = reads.of(&counted).objects_by_kind();
+        assert_eq!(decoded.get(ForgeRead::API_PATHS.kind), Some(&1));
+        assert_eq!(decoded.get(ForgeReadHeartbeat::API_PATHS.kind), Some(&1));
     }
 }

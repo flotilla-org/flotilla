@@ -2243,6 +2243,9 @@ impl AdmissionReadContext<'_> {
             .query_declared::<ResourceHost>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
             .await
             .map_err(|error| error.to_string())?;
+        // Only a refusal diagnostic needs the FulfilmentKind inventory; read it
+        // at most once per composition rather than once per crew member.
+        let fulfilment_kinds = tokio::sync::OnceCell::new();
         let mut union = BTreeSet::new();
         for vessel in &mut workflow.vessels {
             let mut vessel_needs = BTreeSet::new();
@@ -2289,10 +2292,8 @@ impl AdmissionReadContext<'_> {
                             // Acceptance is unknown on at least one observed harness:
                             // admit without a version floor.
                         } else {
-                            let kinds = self
-                                .backend
-                                .including_replicas::<FulfilmentKind>(namespace)
-                                .list()
+                            let kinds = fulfilment_kinds
+                                .get_or_try_init(|| async { self.backend.including_replicas::<FulfilmentKind>(namespace).list().await })
                                 .await
                                 .map_err(|error| error.to_string())?;
                             let names = kinds.items.iter().map(|kind| kind.object.metadata.name.as_str()).collect::<Vec<_>>();
@@ -5306,23 +5307,13 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let before = observed.read_calls();
-            let decoded_before = observed.read_counts();
+            let before = observed.read_snapshot();
             assert!(fixture.owner.resolve_observed_convoy_change_request(&keys, Some("42")).await.unwrap().is_none());
-            let reads = observed
-                .read_calls()
-                .into_iter()
-                .map(|(kind, count)| {
-                    let delta = count - before.get(&kind).copied().unwrap_or_default();
-                    assert!(delta <= 1, "{kind}: {delta} reads");
-                    (kind, delta)
-                })
-                .collect::<BTreeMap<_, _>>();
-            let decoded = observed
-                .read_counts()
-                .into_iter()
-                .map(|(kind, count)| (kind.clone(), count - decoded_before.get(&kind).copied().unwrap_or_default()))
-                .collect::<BTreeMap<_, _>>();
+            let delta = observed.read_snapshot().since(&before);
+            let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());
+            for (kind, count) in &reads {
+                assert!(*count <= 1, "{kind}: {count} reads");
+            }
             assert_eq!(reads.get("Repository"), Some(&1));
             assert_eq!(reads.get("ChangeRequest"), Some(&1));
             assert_eq!(decoded.get("Repository"), Some(&2));
@@ -5398,8 +5389,7 @@ mod tests {
                 )
                 .build();
             let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).build();
-            let before = observed.read_calls();
-            let decoded_before = observed.read_counts();
+            let before = observed.read_snapshot();
             if reuse {
                 let snapshot = fixture.owner.load_brief_definitions("flotilla", &spec, &workflow).await.unwrap();
                 let query = fixture.owner.brief_query("flotilla", "target", &spec, &workflow, &snapshot).await.unwrap().unwrap();
@@ -5433,20 +5423,11 @@ mod tests {
                 assert!(fixture.owner.write_admission_briefs("flotilla", "target", &spec, &workflow).await.expect("render briefs"));
             }
             assert_eq!(writer.0.read().await.len(), 2);
-            let reads = observed
-                .read_calls()
-                .into_iter()
-                .map(|(kind, count)| {
-                    let delta = count - before.get(&kind).copied().unwrap_or_default();
-                    assert!(delta <= 1, "{kind}: {delta} reads");
-                    (kind, delta)
-                })
-                .collect::<BTreeMap<_, _>>();
-            let decoded = observed
-                .read_counts()
-                .into_iter()
-                .map(|(kind, count)| (kind.clone(), count - decoded_before.get(&kind).copied().unwrap_or_default()))
-                .collect::<BTreeMap<_, _>>();
+            let delta = observed.read_snapshot().since(&before);
+            let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());
+            for (kind, count) in &reads {
+                assert!(*count <= 1, "{kind}: {count} reads");
+            }
             assert_eq!(decoded.get("Convoy"), Some(&0));
             outcomes.push((reads, decoded));
         }
@@ -5503,10 +5484,11 @@ mod tests {
                 })
                 .build();
             hosts.update_status("remote", &host.metadata.resource_version, &capacity(current)).await.unwrap();
-            let before = counted.read_calls();
+            let before = counted.read_snapshot();
             let result = fixture.owner.check_prepared_placement_floors("flotilla", &admission).await;
             assert_eq!(result.is_ok(), captured >= 20, "captured={captured}, current={current}: {result:?}");
-            assert_eq!(counted.read_calls(), before, "capacity validation must not reread the native store");
+            let reads = counted.read_snapshot().since(&before);
+            assert!(reads.is_empty(), "capacity validation must not reread the native store\n{reads}");
         }
     }
 
@@ -5597,30 +5579,15 @@ mod tests {
                 .name("bounded".into())
                 .branch("bounded".into())
                 .build();
-            let before = observed.read_calls();
-            let decoded_before = observed.read_counts();
+            let before = observed.read_snapshot();
             let prepared = fixture
                 .owner
                 .prepare_convoy_admission("flotilla", &intent, &PrincipalRef::implicit_for_namespace("flotilla"))
                 .await
                 .expect("prepare");
             assert_eq!(prepared.workflow.vessels.len(), 2);
-            let reads = observed
-                .read_calls()
-                .into_iter()
-                .map(|(kind, count)| {
-                    let count = count - before.get(&kind).copied().unwrap_or_default();
-                    (kind, count)
-                })
-                .collect::<BTreeMap<_, _>>();
-            let decoded = observed
-                .read_counts()
-                .into_iter()
-                .map(|(kind, count)| {
-                    let count = count - decoded_before.get(&kind).copied().unwrap_or_default();
-                    (kind, count)
-                })
-                .collect::<BTreeMap<_, _>>();
+            let delta = observed.read_snapshot().since(&before);
+            let (reads, decoded) = (delta.calls_by_kind(), delta.objects_by_kind());
             for (kind, count) in &reads {
                 assert!(*count <= 1, "{kind}: {count} admission reads");
             }

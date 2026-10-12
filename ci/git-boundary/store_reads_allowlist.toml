@@ -1,0 +1,70 @@
+# Intentional whole-kind store lists inside a loop body or per-item closure.
+# Each entry names a function, the exact number of such lists it contains and
+# why they are not per-request or per-item reads. A changed count, a stale entry
+# or a missing reason fails the check. Prefer fixing a new finding (hoist it,
+# memoize it in a OnceCell declared outside the loop, or use a declared query or
+# view) over adding an entry. See README.md, "Store read guard rail".
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process.rs"
+function = "new_with_resource_backend_and_clock"
+count = 2
+reason = """Daemon construction only. The startup loop reads the Repository catalog once per configured \
+observation root with a live remote, and repository discovery in the same iteration may author the \
+declaration a later root resolves to, so a hoisted catalog would be stale. The provider-cache eviction \
+task lists Repositories only to (re)establish its watch after a namespace change or watch failure."""
+
+[[allow]]
+path = "crates/flotilla-core/src/in_process/checkout_providers.rs"
+function = "watch_checkout_provider_lifetimes"
+reason = "List-then-watch subscription: the loop relists only to resubscribe after a namespace change or watch failure."
+
+[[allow]]
+path = "crates/flotilla-daemon/src/charter_delegation.rs"
+function = "expand_registered_charters"
+reason = "Memoized per namespace in `registration_catalogs`: the Project catalog is listed only when that namespace is first delegated."
+
+[[allow]]
+path = "crates/flotilla-daemon/src/dispatch_reconciler.rs"
+function = "refresh_convoys"
+reason = "List-then-watch subscription: the Convoy list runs only while no watch is established, then events are applied incrementally."
+
+[[allow]]
+path = "crates/flotilla-daemon/src/runtime/tasks.rs"
+function = "run_checkout_archive_gc"
+count = 2
+reason = "Hourly background sweep: each tick reads Clone and Checkout once to collect archive roots; the loop is the timer, not a per-item read."
+
+[[allow]]
+path = "crates/flotilla-daemon/src/server/replicator.rs"
+function = "replicate_kind_over_http"
+count = 2
+reason = """Replication snapshot handoff: the origin and local lists run only when no replica cursor exists \
+(first sync or a resnapshot after the origin log cannot continue). The replicator is being extracted \
+into its own crate; this entry moves with it."""
+
+[[allow]]
+path = "crates/flotilla-store/src/message_retention.rs"
+function = "compact_audit"
+reason = """Deliberate O(batches x Convoys) audit compaction outside inbox locks (see the comment there): \
+rescanning per batch keeps follow-up protection fresh without another watch lifecycle."""
+
+[[allow]]
+path = "crates/flotilla-store/src/registry.rs"
+function = "quarantine_undecodable_stored_objects"
+reason = "Startup decode quarantine of a durable store: one list per registered kind, which is the purpose of the sweep."
+
+[[allow]]
+path = "crates/flotilla-store/src/view.rs"
+function = "recover_view"
+reason = "Watch-view protocol: retry the snapshot/watch handoff with backoff after a watch expires."
+
+[[allow]]
+path = "crates/flotilla-store/src/view.rs"
+function = "handle_view_event"
+reason = "Watch-view protocol: a lost or failed event invalidates the cache and retries a complete snapshot/watch handoff with backoff."
+
+[[allow]]
+path = "crates/flotilla-store/src/view.rs"
+function = "recover_local_view"
+reason = "Local watch-view protocol: retry the snapshot/watch handoff with backoff after a watch expires."

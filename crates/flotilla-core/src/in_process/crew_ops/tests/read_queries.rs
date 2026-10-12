@@ -3,17 +3,6 @@ use flotilla_protocol::CrewCommandContext;
 use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Message, MessageRelation, MessageSpec, Vessel, VesselSpec};
 use flotilla_store::StoreExt;
 
-fn delta(before: &BTreeMap<String, usize>, after: BTreeMap<String, usize>) -> BTreeMap<String, usize> {
-    after
-        .into_iter()
-        .map(|(kind, count)| {
-            let count = count - before.get(&kind).copied().unwrap_or_default();
-            (kind, count)
-        })
-        .filter(|(_, count)| *count != 0)
-        .collect()
-}
-
 async fn create_vessel(backend: &ResourceBackend) {
     backend
         .using::<Vessel>("flotilla")
@@ -45,145 +34,169 @@ fn command_context() -> CrewCommandContext {
 // same real service scenarios, rather than measuring execution time.
 #[tokio::test]
 async fn interactive_crew_reads_ignore_unrelated_resources() {
-    for request in ["routing", "orientation", "complete", "teardown", "withdraw", "pending"] {
-        let mut counts = Vec::new();
-        for unrelated in [0, 32] {
-            let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
-            create_vessel(&backend).await;
-            for n in 0..unrelated {
-                let name = format!("unrelated-{n}");
-                backend
-                    .using::<ResourceConvoy>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &ConvoySpec::builder().workflow_ref("workflow".into()).role("other".into()).build(),
-                    )
-                    .await
-                    .expect("unrelated convoy");
-                backend
-                    .using::<Message>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(name.clone()).build(),
-                        &MessageSpec::builder()
-                            .sender("flotilla/other".into())
-                            .receiver("flotilla/other-convoy/work/coder".into())
-                            .relation(MessageRelation::Supervisor)
-                            .body("other".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("unrelated message");
-                backend
-                    .using::<ResourceTerminalSession>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("terminal-{n}")).build(),
-                        &TerminalSessionSpec::builder()
-                            .env_ref("other".into())
-                            .role("coder".into())
-                            .source(TerminalSessionSource::Tool { command: "sh".into() })
-                            .cwd("/other".into())
-                            .pool("other".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("unrelated terminal");
-                backend
-                    .using::<flotilla_resources::Artifact>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(format!("artifact-{n}")).build(),
-                        &flotilla_resources::ArtifactSpec::builder()
-                            .convoy("other".into())
-                            .producer("other".into())
-                            .kind("explainer".into())
-                            .subject("other".into())
-                            .digest("digest".into())
-                            .size(0)
-                            .media_type("text/markdown".into())
-                            .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
-                            .build(),
-                    )
-                    .await
-                    .expect("unrelated artifact");
-                backend
-                    .using::<ChangeRequest>("flotilla")
-                    .create(
-                        &InputMeta::builder().name(name).build(),
-                        &ChangeRequestSpec::builder()
-                            .service("github".into())
-                            .scope("other/repo".into())
-                            .number(n + 100)
-                            .observing_authority("other".into())
-                            .build(),
-                    )
-                    .await
-                    .expect("unrelated PR");
-            }
-            if request == "pending" {
-                let sessions = backend.using::<ResourceTerminalSession>("flotilla");
-                let session = sessions.get("session").await.expect("session");
-                sessions
-                    .update_status(
-                        "session",
-                        &session.metadata.resource_version,
-                        &flotilla_resources::TerminalSessionStatus {
-                            completion_pending: Some(flotilla_resources::CrewCompletionPending {
-                                message: None,
-                                disposition: None,
-                                decision_ledger_ref: None,
-                                force: false,
-                                principal_ref: None,
-                                attempted_at: chrono::Utc::now(),
-                                authority: "host".into(),
-                                last_error: "waiting".into(),
-                            }),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .expect("pending status");
-            }
-            let context = CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".into()),
-                convoy: Some("crew".into()),
-                vessel_ref: Some("vessel".into()),
-                role: Some("coder".into()),
-            };
-            let before_objects = backend.read_counts();
-            let before_calls = backend.read_calls();
-            match request {
-                "routing" => {
-                    assert_eq!(
-                        crew.resolve_crew_routing_context(&context).await.expect("routing").session_name.as_deref(),
-                        Some("session")
-                    );
-                }
-                "orientation" => {
-                    assert_eq!(crew.crew_list_internal(&context).await.expect("orientation").members.len(), 1);
-                }
-                "complete" => {
-                    crew.complete(&context, None, None, Some("https://example.test/ledger".into()), false, None).await.expect("completion");
-                }
-                "teardown" => {
-                    crew.teardown("flotilla", "crew", false).await.expect("teardown");
-                }
-                "withdraw" => {
-                    assert_eq!(crew.withdraw_pending_brief("flotilla", "crew").await.expect("withdraw"), None);
-                }
-                "pending" => {
-                    assert_eq!(crew.pending_crew_completions().await.expect("pending").len(), 1);
-                }
-                _ => unreachable!(),
-            }
-            counts.push((delta(&before_objects, backend.read_counts()), delta(&before_calls, backend.read_calls())));
+    use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadOperation, ReadSnapshot};
+    async fn request_reads(request: &str, unrelated: u64) -> ReadSnapshot {
+        let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+        create_vessel(&backend).await;
+        for n in 0..unrelated {
+            let name = format!("unrelated-{n}");
+            backend
+                .using::<ResourceConvoy>("flotilla")
+                .create(
+                    &InputMeta::builder().name(name.clone()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".into()).role("other".into()).build(),
+                )
+                .await
+                .expect("unrelated convoy");
+            backend
+                .using::<Message>("flotilla")
+                .create(
+                    &InputMeta::builder().name(name.clone()).build(),
+                    &MessageSpec::builder()
+                        .sender("flotilla/other".into())
+                        .receiver("flotilla/other-convoy/work/coder".into())
+                        .relation(MessageRelation::Supervisor)
+                        .body("other".into())
+                        .build(),
+                )
+                .await
+                .expect("unrelated message");
+            backend
+                .using::<ResourceTerminalSession>("flotilla")
+                .create(
+                    &InputMeta::builder().name(format!("terminal-{n}")).build(),
+                    &TerminalSessionSpec::builder()
+                        .env_ref("other".into())
+                        .role("coder".into())
+                        .source(TerminalSessionSource::Tool { command: "sh".into() })
+                        .cwd("/other".into())
+                        .pool("other".into())
+                        .build(),
+                )
+                .await
+                .expect("unrelated terminal");
+            backend
+                .using::<flotilla_resources::Artifact>("flotilla")
+                .create(
+                    &InputMeta::builder().name(format!("artifact-{n}")).build(),
+                    &flotilla_resources::ArtifactSpec::builder()
+                        .convoy("other".into())
+                        .producer("other".into())
+                        .kind("explainer".into())
+                        .subject("other".into())
+                        .digest("digest".into())
+                        .size(0)
+                        .media_type("text/markdown".into())
+                        .expires_at(chrono::Utc::now() + chrono::Duration::days(1))
+                        .build(),
+                )
+                .await
+                .expect("unrelated artifact");
+            backend
+                .using::<ChangeRequest>("flotilla")
+                .create(
+                    &InputMeta::builder().name(name).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github".into())
+                        .scope("other/repo".into())
+                        .number(n + 100)
+                        .observing_authority("other".into())
+                        .build(),
+                )
+                .await
+                .expect("unrelated PR");
         }
-        assert_eq!(counts[0], counts[1], "{request}: unrelated resources cannot increase reads or decoding");
-        if request == "routing" {
-            assert_eq!(counts[0].1.get("TerminalSession"), Some(&1));
+        if request == "pending" {
+            let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+            let session = sessions.get("session").await.expect("session");
+            sessions
+                .update_status(
+                    "session",
+                    &session.metadata.resource_version,
+                    &flotilla_resources::TerminalSessionStatus {
+                        completion_pending: Some(flotilla_resources::CrewCompletionPending {
+                            message: None,
+                            disposition: None,
+                            decision_ledger_ref: None,
+                            force: false,
+                            principal_ref: None,
+                            attempted_at: chrono::Utc::now(),
+                            authority: "host".into(),
+                            last_error: "waiting".into(),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("pending status");
         }
+        let context = CrewCommandContext {
+            crew_id: None,
+            namespace: Some("flotilla".into()),
+            convoy: Some("crew".into()),
+            vessel_ref: Some("vessel".into()),
+            role: Some("coder".into()),
+        };
+        let before = backend.read_snapshot();
+        match request {
+            "routing" => {
+                assert_eq!(crew.resolve_crew_routing_context(&context).await.expect("routing").session_name.as_deref(), Some("session"));
+            }
+            "orientation" => {
+                assert_eq!(crew.crew_list_internal(&context).await.expect("orientation").members.len(), 1);
+            }
+            "complete" => {
+                crew.complete(&context, None, None, Some("https://example.test/ledger".into()), false, None).await.expect("completion");
+            }
+            "teardown" => {
+                crew.teardown("flotilla", "crew", false).await.expect("teardown");
+            }
+            "withdraw" => {
+                assert_eq!(crew.withdraw_pending_brief("flotilla", "crew").await.expect("withdraw"), None);
+            }
+            "pending" => {
+                assert_eq!(crew.pending_crew_completions().await.expect("pending").len(), 1);
+            }
+            _ => unreachable!(),
+        }
+        backend.read_snapshot().since(&before)
+    }
+    use ReadOperation::{Get, List, Query};
+    // Each request reads named objects and indexed queries. The only
+    // whole-kind list is completion's Forge definition catalog.
+    let budgets = [
+        ("routing", ReadBudget::new().objects("TerminalSession", Query, 1, 1)),
+        (
+            "orientation",
+            ReadBudget::new()
+                .objects("Convoy", Get, 1, 1)
+                .calls("Demand", Query, 1)
+                .objects("TerminalSession", Query, 2, 1)
+                .objects("Vessel", Get, 2, 2),
+        ),
+        (
+            "complete",
+            ReadBudget::new()
+                .calls("Artifact", Query, 1)
+                .calls("ChangeRequest", Query, 1)
+                .calls("Checkout", Query, 1)
+                .objects("Convoy", Get, 4, 3)
+                .calls("Forge", List, 2)
+                .objects("TerminalSession", Query, 1, 1)
+                .objects("TerminalSession", Get, 2, 2)
+                .objects("Vessel", Get, 1, 1),
+        ),
+        ("teardown", ReadBudget::new().calls("Checkout", Query, 1).objects("Convoy", Get, 1, 1)),
+        ("withdraw", ReadBudget::new().objects("Convoy", Get, 4, 3).calls("Message", Query, 1)),
+        ("pending", ReadBudget::new().objects("TerminalSession", Query, 1, 1)),
+    ];
+    for (request, budget) in budgets {
+        // Unrelated resources cannot increase reads or decoding, per kind and operation.
+        let reads = assert_flat_reads([0, 32], |unrelated| request_reads(request, unrelated as u64)).await;
+        reads.assert_within(&budget, request);
         if request == "complete" {
-            assert_eq!(counts[0].1.get("ChangeRequest"), Some(&1));
-            assert_eq!(counts[0].1.get("Artifact"), Some(&1));
+            assert_eq!(reads.calls("ChangeRequest", Query), 1);
+            assert_eq!(reads.calls("Artifact", Query), 1);
         }
     }
 }

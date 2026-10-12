@@ -13,7 +13,7 @@ use flotilla_store::{ResourceBackend, ResourceKind};
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
-use flotilla_store_testkit::{fixtures::contract::*, ReadCountsBackendExt};
+use flotilla_store_testkit::{fixtures::contract::*, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -200,6 +200,62 @@ async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
     assert_eq!(observed.read_counts().get("Convoy"), Some(&2));
     assert_eq!(observed.read_calls().get("Convoy"), Some(&2));
     assert!(plain.read_counts().is_empty());
+    // Every adapter classifies the operation the same way.
+    let reads = observed.read_snapshot();
+    assert_eq!(reads.tally("Convoy", ReadOperation::Get), ReadTally { calls: 1, objects: 1 });
+    assert_eq!(reads.tally("Convoy", ReadOperation::List), ReadTally { calls: 1, objects: 1 });
+}
+
+// Selector-bounded reads are queries and unselective ones are lists, whichever
+// API spells them; replica-inclusive reads keep the same classification. (The
+// HTTP stand-in serves only the resource API, so this runs on local adapters.)
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn read_operations_classify_selectors(#[case] adapter: &str) {
+    use flotilla_store::StoreQuery;
+    let (plain, _server) = backend(adapter).await;
+    let resolver = plain.using::<Convoy>("flotilla");
+    for name in ["first", "second"] {
+        let meta = InputMeta::builder().name(name.into()).labels(BTreeMap::from([("pick".to_string(), name.to_string())])).build();
+        resolver.create(&meta, &ConvoyFixture::spec()).await.expect("create");
+    }
+    let observed = plain.clone().with_read_counts();
+    let measure = |reads: ReadSnapshot| reads.entries().map(|(_, operation, tally)| (operation, tally)).collect::<Vec<_>>();
+    let one = |operation, objects| vec![(operation, ReadTally { calls: 1, objects })];
+    let resolver = observed.using::<Convoy>("flotilla");
+    let replicas = observed.including_replicas::<Convoy>("flotilla");
+    let picked = StoreQuery::labels(&BTreeMap::from([("pick".to_string(), "first".to_string())]), false, true);
+    let cases: Vec<(&str, Vec<(ReadOperation, ReadTally)>)> = vec![
+        ("labels", one(ReadOperation::Query, 1)),
+        ("declared", one(ReadOperation::Query, 1)),
+        ("unselective", one(ReadOperation::List, 2)),
+        ("replica get", one(ReadOperation::Get, 1)),
+        ("replica list", vec![(ReadOperation::List, ReadTally { calls: 2, objects: 2 })]),
+    ];
+    for (case, expected) in cases {
+        let before = observed.read_snapshot();
+        match case {
+            "labels" => {
+                resolver.list_matching_labels(&picked.labels).await.expect("labels");
+            }
+            "declared" => {
+                resolver.query_declared(&picked).await.expect("declared");
+            }
+            "unselective" => {
+                resolver.query_declared(&StoreQuery::default()).await.expect("unselective");
+            }
+            "replica get" => {
+                replicas.get("first").await.expect("replica get");
+            }
+            "replica list" => {
+                replicas.list().await.expect("replica list");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(measure(observed.read_snapshot().since(&before)), expected, "{adapter}: {case}");
+    }
 }
 
 // Default refusal messages describe the port; the HTTP adapter preserves its
@@ -213,4 +269,51 @@ async fn unsupported_defaults_are_neutral_and_http_refusals_are_unchanged() {
         Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot hold replicas"));
     assert!(matches!(http.local_namespaces::<Convoy>().await,
         Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot enumerate local resource namespaces"));
+}
+
+// A named read sees the same provenances, in the same order, as the matching
+// rows of a namespace list: local first, then replicas by origin. Callers that
+// replaced a list-and-find with `get_all` keep choosing the same copy.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn get_all_orders_provenances_like_list(#[case] adapter: &str) {
+    use flotilla_protocol::NodeId;
+    use flotilla_store::StoreExt;
+    let (plain, _server) = backend(adapter).await;
+    let backend = plain.with_local_root(NodeId::new("self"));
+    backend.using::<Convoy>("flotilla").create(&ConvoyFixture::meta("alpha"), &ConvoyFixture::spec()).await.expect("local");
+    // Insert origins out of order so the read cannot rely on insertion order.
+    for origin in ["peer-c", "peer-a", "peer-b"] {
+        let peer = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new(origin));
+        for name in ["alpha", "beta"] {
+            peer.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.expect("peer row");
+        }
+        let listed = peer.using::<Convoy>("flotilla").list().await.expect("peer list");
+        backend
+            .replace_replicas_typed::<Convoy>(&NodeId::new(origin), "flotilla", &listed, chrono::Utc::now(), None)
+            .await
+            .expect("replicas");
+    }
+    let replicas = backend.including_replicas::<Convoy>("flotilla");
+    let provenances = |items: Vec<flotilla_resources::ReadResourceObject<Convoy>>| {
+        items.into_iter().filter(|item| item.object.metadata.name == "alpha").map(|item| item.provenance).collect::<Vec<_>>()
+    };
+    let named = provenances(replicas.get_all("alpha").await.expect("named").items);
+    let listed = provenances(replicas.list_replica_sources().await.expect("listed").items);
+    assert_eq!(named.len(), 4, "{adapter}: local plus three origins");
+    assert_eq!(named, listed, "{adapter}");
+    assert_eq!(
+        replicas.get_all("alpha").await.expect("named").items.first().map(|item| item.provenance.clone()),
+        replicas
+            .list()
+            .await
+            .expect("list")
+            .items
+            .into_iter()
+            .find(|item| item.object.metadata.name == "alpha")
+            .map(|item| item.provenance),
+        "{adapter}: the first visible copy is the one list-and-find chose"
+    );
 }

@@ -4,7 +4,9 @@ mod clock;
 pub use clock::VirtualClock;
 pub mod fixtures;
 mod read_counts;
-pub use read_counts::ReadCountsBackendExt;
+pub use read_counts::{
+    assert_flat_reads, measure_reads, ReadBudget, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally, ScopedReads,
+};
 mod message;
 pub use message::LegacyMessageFixture;
 

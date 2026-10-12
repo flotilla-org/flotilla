@@ -173,7 +173,7 @@ impl HttpBackend {
         let items =
             list.items.into_iter().map(|object| kind.from_k8s(object).and_then(read_resource_object)).collect::<Result<Vec<_>, _>>()?;
         if let Some(observer) = self.read_observer() {
-            observer.read(kind.paths.kind, items.len());
+            observer.read(kind.paths.kind, query.read_operation(), items.len());
         }
         Ok(crate::QueryResult { items, position, local_root })
     }
