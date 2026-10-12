@@ -1360,6 +1360,7 @@ mod tests {
                     }],
                     change_request: None,
                     instruction: None,
+                    promises: Vec::new(),
                 },
             )
             .await
@@ -1447,6 +1448,7 @@ mod tests {
                     }],
                     change_request: None,
                     instruction: None,
+                    promises: Vec::new(),
                 },
             )
             .await

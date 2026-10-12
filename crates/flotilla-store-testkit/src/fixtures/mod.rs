@@ -237,6 +237,7 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         issues: Vec::new(),
         change_request: None,
         instruction: None,
+        promises: Vec::new(),
     }
 }
 

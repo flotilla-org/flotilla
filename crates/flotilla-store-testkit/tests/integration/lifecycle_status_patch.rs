@@ -443,6 +443,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     observed_workflows: BTreeMap::new(),
                     work: status.work.clone(),
                     crew_work: status.crew_work.clone(),
+                    dispatch_promises: Vec::new(),
                     phase: ConvoyPhase::Active,
                     started_at: Some(ts(30)),
                 };

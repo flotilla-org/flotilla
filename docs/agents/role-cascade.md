@@ -165,6 +165,20 @@ refuses unknown owners or undeclared kinds before allocating vessels. The frozen
 snapshot retains both declarations and exclusions, so later template edits do
 not change a convoy's obligations.
 
+Dispatchers add obligations with repeatable `--promise kind:label[@vessel/role]`
+options to `convoy start`, for example `--promise pr:api-split --promise
+pr:ui-split --promise decision-ledger:rollout@work/reviewer`. Admission resolves
+each against the final allocated workflow and freezes the result in the Convoy
+spec's `promises` field. An omitted owner is the crew member marked
+`deliverer: true`; when no crew member, or more than one, is the deliverer,
+admission refuses and asks for an explicit `@vessel/role`. Admission also
+refuses unknown kinds, unknown vessels or roles, tool crew owners, and labels
+that are empty, use characters other than ASCII letters, digits, `-`, `_` and
+`.`, or repeat another dispatch promise's label in the convoy. Bootstrap opens
+each one as a dispatch-sourced promise whose identifier is the label, so its
+owner submits with `flotilla crew submit --promise api-split`. Crews cannot
+retract dispatch-sourced promises.
+
 Previous-generation `completion_conditions` and `completion_expectations` decode
 for one roll: ledger existence becomes a ledger promise, and stock PR readiness
 becomes the deliverer marker using the `pr` kind's readiness rule. Historical

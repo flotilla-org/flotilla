@@ -2154,6 +2154,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
                     promise_exclusions: Vec::new(),
+                    promises: Vec::new(),
                     skills: Vec::new(),
                     auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
@@ -2361,6 +2362,7 @@ async fn exercise_existing_pr_admission(continuing: bool) {
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -3532,6 +3534,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -3573,6 +3576,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -3688,6 +3692,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -3845,6 +3850,7 @@ async fn convoy_start_accepts_project_list_identifier() {
                             escalation_reason: None,
                             agent_overrides: Vec::new(),
                             promise_exclusions: Vec::new(),
+                            promises: Vec::new(),
                             skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
@@ -3865,6 +3871,131 @@ async fn convoy_start_accepts_project_list_identifier() {
         );
         let convoy = admitted_convoy(&backend, &name).await;
         assert_eq!(convoy.spec.project_ref.as_deref(), Some("flotilla"));
+    }
+}
+
+// ADR 0061 (#2987): admission resolves dispatch promises against the final
+// workflow and freezes them into the Convoy spec. The owner defaults to the
+// deliverer; explicit owners must name a crew member; refusals are loud.
+#[tokio::test]
+async fn convoy_start_freezes_dispatch_promises_and_refuses_unresolvable_ones() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    let mut no_deliverer = single_agent_workflow_spec();
+    no_deliverer.vessels[0].crew[0].deliverer = false;
+    for (name, workflow) in [("single-agent", single_agent_workflow_spec()), ("no-deliverer", no_deliverer)] {
+        backend
+            .clone()
+            .using::<WorkflowTemplate>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &workflow)
+            .await
+            .expect("workflow create");
+    }
+    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
+    backend
+        .clone()
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec {
+                charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
+                parent: None,
+                platform_matrix: Vec::new(),
+                role_needs: Default::default(),
+                skills: BTreeMap::new(),
+                display_name: "Flotilla".into(),
+                default_workflow_ref: "single-agent".into(),
+                supervision: None,
+                issue_source_bindings: Vec::new(),
+                dispatch_policy: None,
+                repositories: vec![ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                }],
+            },
+        )
+        .await
+        .expect("project create");
+
+    let mut events = daemon.subscribe();
+    let promise = |raw: &str| raw.parse::<flotilla_protocol::DispatchPromiseRequest>().expect("promise syntax");
+    let start = |name: &str, workflow: &str, promises: &[&str]| {
+        Command::builder()
+            .action(CommandAction::ConvoyStart {
+                intent: Box::new(
+                    ConvoyStartIntent::builder()
+                        .project_ref("flotilla".into())
+                        .name(name.to_string())
+                        .branch(format!("fix/{name}"))
+                        .workflow_ref(workflow.to_string())
+                        .promises(promises.iter().map(|raw| promise(raw)).collect())
+                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                        .build(),
+                ),
+            })
+            .build()
+    };
+
+    let admitted = daemon
+        .execute(start("promised", "single-agent", &["pr:api-split", "decision-ledger:design-notes@work/coder"]))
+        .await
+        .expect("convoy start command accepted");
+    assert!(matches!(recv_command_finished(&mut events, admitted).await, CommandValue::ConvoyStarted { .. }));
+    let convoy = admitted_convoy(&backend, "promised").await;
+    let dispatched = |label: &str, kind| flotilla_resources::promises::DispatchPromise {
+        label: label.into(),
+        kind,
+        vessel: "work".into(),
+        role: "coder".into(),
+    };
+    assert_eq!(
+        convoy.spec.promises,
+        vec![
+            dispatched("api-split", flotilla_resources::promises::PromiseKind::Pr),
+            dispatched("design-notes", flotilla_resources::promises::PromiseKind::DecisionLedger),
+        ]
+    );
+
+    // An explicit owner admits even when the workflow has no deliverer.
+    let explicit = daemon.execute(start("explicit", "no-deliverer", &["pr:api-split@work/coder"])).await.expect("command accepted");
+    assert!(matches!(recv_command_finished(&mut events, explicit).await, CommandValue::ConvoyStarted { .. }));
+    assert_eq!(
+        admitted_convoy(&backend, "explicit").await.spec.promises,
+        vec![dispatched("api-split", flotilla_resources::promises::PromiseKind::Pr)]
+    );
+
+    for (index, (workflow, promises, refusal)) in [
+        ("single-agent", vec!["demo-video:walkthrough"], "unknown promise kind `demo-video`"),
+        ("single-agent", vec!["pr:api-split@work/reviewer"], "unknown role `work/reviewer`"),
+        ("single-agent", vec!["pr:api-split@review/coder"], "unknown vessel `review`"),
+        ("single-agent", vec!["pr:api split"], "promise label `api split`"),
+        ("single-agent", vec!["pr:api-split", "decision-ledger:api-split"], "duplicate promise label `api-split`"),
+        ("no-deliverer", vec!["pr:api-split"], "no crew member as deliverer; name the owner with --promise pr:api-split@<vessel>/<role>"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("refused-{index}");
+        let refused = daemon.execute(start(&name, workflow, &promises)).await.expect("command accepted");
+        match recv_command_finished(&mut events, refused).await {
+            CommandValue::Error { message } => assert!(message.contains(refusal), "{promises:?}: {message}"),
+            other => panic!("{promises:?} must be refused, got {other:?}"),
+        }
     }
 }
 
@@ -3896,6 +4027,7 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4021,6 +4153,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4117,6 +4250,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                             escalation_reason: None,
                             agent_overrides: Vec::new(),
                             promise_exclusions: Vec::new(),
+                            promises: Vec::new(),
                             skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
@@ -4165,6 +4299,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4199,6 +4334,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
@@ -4252,6 +4388,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4311,6 +4448,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4419,6 +4557,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4469,6 +4608,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4515,6 +4655,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -4617,6 +4758,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -5040,6 +5182,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                                 escalation_reason: None,
                                 agent_overrides: Vec::new(),
                                 promise_exclusions: Vec::new(),
+                                promises: Vec::new(),
                                 skills: Vec::new(),
                                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                             }),
@@ -5110,6 +5253,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 escalation_reason: None,
                 agent_overrides: Vec::new(),
                 promise_exclusions: Vec::new(),
+                promises: Vec::new(),
                 skills: Vec::new(),
                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
             }),
@@ -5215,6 +5359,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
                         promise_exclusions: Vec::new(),
+                        promises: Vec::new(),
                         skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
                     }),
@@ -5253,6 +5398,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
             BTreeMap::new(),
             BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),
             BTreeMap::new(),
+            Vec::new(),
             ConvoyPhase::Pending,
             None,
         ),

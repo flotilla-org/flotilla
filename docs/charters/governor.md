@@ -88,6 +88,10 @@ routing remains part of the federation work tracked in #1188.
    ```
    Use `--need <capability>` for a dispatch-specific constraint. To pin a
    broader kind, pass `--fulfilment <kind> --escalation-reason <reason>`.
+   When the plan already names several deliverables, state them as promises
+   instead of brief prose: `--promise pr:api-split --promise pr:ui-split`.
+   Each is owned by the workflow's deliverer unless you add `@vessel/role`, and
+   the convoy cannot land until every promise is kept or retracted.
 3. Pick the harness when the default is wrong. Workflows name capabilities,
    not harnesses; `--agent [capability=]adapter[:model]` binds one for this
    dispatch and is repeatable, with the bare form applying to `code`:

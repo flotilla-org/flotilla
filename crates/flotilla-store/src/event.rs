@@ -194,6 +194,7 @@ mod tests {
                     issues: Vec::new(),
                     change_request: None,
                     instruction: None,
+                    promises: Vec::new(),
                 },
             )
             .await

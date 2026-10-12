@@ -39,6 +39,11 @@ flotilla convoy CONVOY explain
 Attach submission evidence with optional JSON metadata, for example
 `--metadata '{"commit":"HEAD_SHA"}'`.
 
+The workflow template and the dispatcher (`convoy start --promise
+kind:label[@vessel/role]`) may already have promised deliverables for you; they
+are open from the start. A dispatch-sourced promise's identifier is its label,
+for example `flotilla crew submit --promise api-split --kind pr --reference PR_URL`.
+
 Supported kinds are `pr` (kept when merged) and `decision-ledger` (kept when its
 artifact exists). Submission without a matching promise creates a crew-sourced
 promise; discovered produced PRs participate too. A closed, unmerged PR rejects

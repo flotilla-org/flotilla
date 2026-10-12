@@ -1040,6 +1040,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
         [("review-and-fix".to_string(), "42".to_string())].into_iter().collect(),
         expected_tasks,
         expected_crew_work,
+        Vec::new(),
         ConvoyPhase::Pending,
         None,
     );
@@ -1066,6 +1067,25 @@ fn bootstrap_freezes_template_promise_selection() {
     let snapshot = status.workflow_snapshot.as_ref().expect("frozen workflow");
     assert_eq!(snapshot.vessels[0].crew[0], expected);
     assert!(flotilla_resources::promises::template_declarations(&status).is_empty());
+}
+
+// ADR 0061 (#2987): the reconciler carries the spec's frozen dispatch
+// promises into Bootstrap, which opens them as dispatch-sourced promises.
+#[test]
+fn bootstrap_opens_frozen_dispatch_promises() {
+    use flotilla_resources::promises::{self, DispatchPromise, PromiseKind, PromiseSource, PromiseState};
+    let template = valid_workflow_template_object("review-and-fix");
+    let vessel = template.spec.vessels[0].name.clone();
+    let role = template.spec.vessels[0].crew[0].role.clone();
+    let mut spec = valid_convoy_spec();
+    spec.promises = vec![DispatchPromise { label: "api-split".into(), kind: PromiseKind::Pr, vessel: vessel.clone(), role: role.clone() }];
+    let convoy = convoy_object("convoy-a", spec.clone(), None);
+    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
+    let mut status = ConvoyStatus::default();
+    outcome.patch.expect("bootstrap patch").apply(&mut status);
+    let promise = promises::owned(&status, &vessel, &role).iter().find(|p| p.id == "api-split").expect("dispatch promise seeded");
+    assert_eq!((promise.source, promise.kind, promise.state), (PromiseSource::Dispatch, PromiseKind::Pr, PromiseState::Open));
+    assert!(promises::admitted_declarations(&spec.promises, &status).is_empty());
 }
 
 #[test]

@@ -1009,6 +1009,7 @@ fn bootstrap_outcome(
             [(convoy.spec.workflow_ref.clone(), template.metadata.resource_version.clone())].into_iter().collect(),
             work,
             crew_work,
+            convoy.spec.promises.clone(),
             ConvoyPhase::Pending,
             None,
         )),

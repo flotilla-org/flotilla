@@ -229,6 +229,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await
@@ -636,6 +637,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 ],
                 change_request: None,
                 instruction: Some("Keep the public seam stable.".into()),
+                promises: Vec::new(),
             },
         )
         .await
@@ -844,6 +846,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await
@@ -1158,6 +1161,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await
@@ -1314,6 +1318,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await
@@ -2654,6 +2659,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
                 }],
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await
@@ -3081,6 +3087,7 @@ async fn create_convoy_with_labeled_processes(
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,
+                promises: Vec::new(),
             },
         )
         .await
