@@ -22,6 +22,8 @@ pub fn forge_issue_source(identity: &RepoIdentity) -> IssueSource {
     IssueSource { service, scope: identity.path.clone() }
 }
 
+/// Pick the first provider that supports `source`, in registry priority order.
+/// Orchestration resolves issue sources through this, including `ProviderRegistry`.
 pub fn provider_for_source<'a>(
     mut providers: impl Iterator<Item = &'a Arc<dyn IssueProvider>>,
     source: &IssueSource,

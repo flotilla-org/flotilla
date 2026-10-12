@@ -14,6 +14,8 @@ pub fn issue_ref_from_url(url: &str) -> Result<IssueRef, String> {
     })
 }
 
+/// Decode a tracker's class-of-service field value, case-insensitively.
+/// Shared by tracker mission-field decoding and orchestration's dispatch-mission parsing.
 pub fn class(value: &str) -> Result<ClassOfService, String> {
     match value.to_ascii_lowercase().as_str() {
         "expedite" => Ok(ClassOfService::Expedite),
