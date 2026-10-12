@@ -311,7 +311,11 @@ pub trait CommandRunner: Send + Sync {
     }
 
     /// Compare the source filesystem with an existing destination directory.
-    /// Namespace-crossing runners must implement this in their own environment.
+    /// Transparent wrappers must forward this operation. Namespace-crossing
+    /// runners must compare in their own environment or explicitly refuse;
+    /// they must never fall back to inspecting the daemon's filesystem.
+    /// The operation-boundary check enforces an explicit implementation on
+    /// every production runner so newly added wrappers cannot inherit failure.
     async fn same_filesystem(&self, _source: &Path, _destination: &Path) -> Result<bool, String> {
         Err("filesystem comparison is unavailable".into())
     }
@@ -860,6 +864,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    // Native device/volume identity is compared before cloning; missing metadata
+    // is an error, not an implicit full-copy fallback. This test also compiles
+    // the Windows volume-GUID implementation in platform builds.
+    #[tokio::test]
+    async fn process_filesystem_comparison_checks_identity_and_refuses_missing_paths() {
+        let root = tempfile::tempdir().expect("root");
+        let destination = root.path().join("destination");
+        tokio::fs::create_dir(&destination).await.expect("destination");
+        assert!(ProcessCommandRunner.same_filesystem(root.path(), &destination).await.expect("same device"));
+        assert!(ProcessCommandRunner.same_filesystem(&root.path().join("missing"), &destination).await.is_err());
+        assert!(ProcessCommandRunner.same_filesystem(root.path(), &root.path().join("missing")).await.is_err());
+    }
 
     struct PanicLabeler;
 

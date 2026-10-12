@@ -94,6 +94,10 @@ impl SshCommandRunner {
 
 #[async_trait]
 impl CommandRunner for SshCommandRunner {
+    async fn same_filesystem(&self, _source: &Path, _destination: &Path) -> Result<bool, String> {
+        Err("host clone filesystem comparison must run on the owning host, not through SSH".into())
+    }
+
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         self.execute(cmd, args, cwd, label).await
     }

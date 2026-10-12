@@ -16,6 +16,18 @@ Keep that root on one filesystem. Separate mount points beneath it cause an
 explicit full-copy fallback, reported in `Vessel.status.degraded` and
 `flotilla convoy explain`; no alternates file or extra mount is introduced.
 Filesystem comparison failures refuse provisioning rather than silently copying.
+This includes native Windows volume-identity errors and unsupported runner/platform
+namespaces; only an authoritative different-filesystem result selects full copy.
+Retries inspect the existing vessel clone and retain its saved copy/hardlink mode
+and branch provenance without accessing the original source or fetching origin.
+
+Teardown preserves dirty registered worktrees, stashes, unpublished local-ref
+commits and detached worktree HEADs. Ignored build/cache outputs and generated
+`.flotilla/briefs` files are reclaimed with a clean vessel. A local tag naming an
+already published commit is not preserved as a separate name; tags pointing to
+unpublished commits prevent reclamation. Remote refs are cached publication
+facts; stale refs can conservatively refuse removal. Nested paths are normalized
+through the owning runner before membership and cleanliness checks.
 
 `worktree_on_host_and_mount: { mount_path: /workspace }` retains the previous
 shared-clone worktree strategy. `fresh_clone_in_container: { clone_path:

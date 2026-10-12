@@ -67,6 +67,7 @@ const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
 struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
     local_clone_calls: Mutex<Vec<(String, String, String, String)>>,
+    local_clone_intents: Mutex<Vec<flotilla_vcs::vcs::LocalCloneIntent>>,
     removal_attempts: Mutex<Option<watch::Sender<usize>>>,
     inspections: Mutex<usize>,
     protections: Mutex<Vec<(String, String, String, String)>>,
@@ -161,6 +162,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         env_ref: &str,
         request: flotilla_vcs::vcs::LocalCloneRequest<'_>,
     ) -> Result<(PreparedCheckout, Option<String>), String> {
+        self.local_clone_intents.lock().expect("intents").push(request.intent);
         self.local_clone_calls.lock().unwrap().push((env_ref.into(), request.source.into(), request.branch.into(), request.target.into()));
         Ok((
             PreparedCheckout { commit: Some("base-tip".into()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy },
@@ -1623,4 +1625,61 @@ async fn local_clone_waits_for_source_and_records_host_materialisation_and_teard
     assert_eq!(ready.status.as_ref().unwrap().branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
     reconciler.run_finalizer(&ready).await.unwrap();
     assert_eq!(*runtime.removals.lock().unwrap(), vec![CheckoutRemoval::LocalClone { target_path: "/host/repos/convoy/work".into() }]);
+}
+
+// A Ready sibling authorises only its own convoy's branch. Late vessels inherit
+// that remote tip without being rejected as a new forge head; other convoys refuse.
+#[tokio::test]
+async fn ready_local_sibling_authorises_shared_branch_only_within_its_convoy() {
+    use flotilla_vcs::vcs::LocalCloneIntent;
+    let backend = ResourceBackend::new(InMemoryBackend::default());
+    common::create_convoy_with_single_task(&backend, NAMESPACE, "convoy-shared", "work", REPO_URL, "crew").await;
+    common::create_convoy_with_single_task(&backend, NAMESPACE, "convoy-foreign", "work", REPO_URL, "crew").await;
+    create_ready_clone(&backend, NAMESPACE, "source", REPO_URL, "host", "/host/repos/source").await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let make_spec = |path: &str| {
+        CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+            source_clone_ref: Some("source".into()),
+            repo_ref: RepositoryKey(repo_key(REPO_URL)),
+            env_ref: "host".into(),
+            r#ref: "crew".into(),
+            base_ref: Some("main".into()),
+            target_path: path.into(),
+            url: REPO_URL.into(),
+        })
+    };
+    let mut first_meta = meta("first");
+    first_meta.labels.insert(CONVOY_LABEL.into(), "convoy-shared".into());
+    let first = checkouts.create(&first_meta, &make_spec("/host/repos/convoy-shared/first")).await.expect("first");
+    checkouts
+        .update_status(
+            "first",
+            &first.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ready sibling");
+    let mut late_meta = meta("late");
+    late_meta.labels.insert(CONVOY_LABEL.into(), "convoy-shared".into());
+    let late = checkouts.create(&late_meta, &make_spec("/host/repos/convoy-shared/late")).await.expect("late");
+    let runtime = Arc::new(RecordingCheckoutRuntime { validation_failures: Mutex::new(1), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+    assert!(matches!(reconciler.prepare(&late).await.expect("late prepare"), CheckoutPrepared::Ready { .. }));
+    assert_eq!(*runtime.local_clone_intents.lock().expect("intents"), vec![LocalCloneIntent::ShareConvoyBranch]);
+    assert_eq!(
+        *runtime.validation_failures.lock().expect("validation counter"),
+        1,
+        "the established branch is not treated as a new forge head"
+    );
+    let mut foreign_meta = meta("foreign");
+    foreign_meta.labels.insert(CONVOY_LABEL.into(), "convoy-foreign".into());
+    let foreign = checkouts.create(&foreign_meta, &make_spec("/host/repos/convoy-foreign/work")).await.expect("foreign");
+    assert!(
+        matches!(reconciler.prepare(&foreign).await.expect("foreign prepare"), CheckoutPrepared::Failed(message) if message.contains("conflicts with Checkout"))
+    );
+    assert_eq!(runtime.local_clone_intents.lock().expect("intents").len(), 1);
 }

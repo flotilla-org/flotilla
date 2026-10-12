@@ -135,7 +135,9 @@ async fn terminal_actuator_uses_literal_command_and_cwd() {
 
 #[tokio::test]
 async fn checkout_actuator_exposes_fresh_clone_transport_url() {
-    let spec = FreshCloneCheckoutSpec {
+    // Transport identity is the real repository URL for both container-fresh
+    // and host-local sources; a managed source ref must not become a transport.
+    let mut spec = FreshCloneCheckoutSpec {
         source_clone_ref: None,
         repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
         env_ref: "env-a".to_string(),
@@ -144,7 +146,9 @@ async fn checkout_actuator_exposes_fresh_clone_transport_url() {
         target_path: "/workspace".to_string(),
         url: "git@github.com:flotilla-org/flotilla.git".to_string(),
     };
-    let command = flotilla_controllers::actuators::fresh_clone_transport_url(&spec);
-
-    assert_eq!(command, "git@github.com:flotilla-org/flotilla.git");
+    for source in [None, Some("managed-clone".to_string())] {
+        spec.source_clone_ref = source;
+        let command = flotilla_controllers::actuators::fresh_clone_transport_url(&spec);
+        assert_eq!(command, "git@github.com:flotilla-org/flotilla.git");
+    }
 }

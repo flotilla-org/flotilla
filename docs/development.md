@@ -371,7 +371,14 @@ nested registrations to resolve at both host and container paths. On older Git,
 worktrees work inside the container but their absolute registrations cannot be
 used from the host after moving between path domains. Worktrees and the clone
 survive environment recreation and are removed together on clean teardown.
-Dirty main or subagent worktrees and unpublished branches preserve the clone;
+Vessels of one convoy own independent snapshots of its branch. A later vessel
+starts at the current origin tip once a Ready sibling has established that convoy's
+branch. Coordinate writes or pull the earlier vessel's changes before publishing;
+normal Git non-fast-forward refusal protects divergent histories. Other convoys
+still cannot reserve the branch without explicit continuation.
+
+Dirty main or subagent worktrees, stashes and unpublished local-ref or detached
+worktree commits preserve the clone;
 worktrees outside the vessel directory refuse reclamation.
 
 See the [placement-policy reference](placement-policy.md) for the stored strategy

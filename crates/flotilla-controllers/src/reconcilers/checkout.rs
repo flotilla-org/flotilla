@@ -396,6 +396,7 @@ where
         }
 
         let continuing = convoy.as_ref().is_some_and(|convoy| convoy.spec.continuation.as_ref() == Some(obj.spec.repo_ref()));
+        let mut sharing_ready_branch = false;
         if has_convoy_owner {
             let mut live_checkouts = Vec::new();
             for other in self.checkouts.list().await?.items {
@@ -410,6 +411,14 @@ where
                 }
                 live_checkouts.push(other);
             }
+            sharing_ready_branch = live_checkouts.iter().any(|other| {
+                other.metadata.name != obj.metadata.name && other.metadata.deletion_timestamp.is_none()
+                    && other.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready)
+                    && other.spec.repo_ref() == obj.spec.repo_ref() && other.spec.branch() == obj.spec.branch()
+                    && obj.metadata.labels.contains_key(CONVOY_LABEL)
+                    && obj.metadata.labels.get(CONVOY_LABEL) == other.metadata.labels.get(CONVOY_LABEL)
+                    && matches!((&obj.spec, &other.spec), (CheckoutSpec::FreshClone(left), CheckoutSpec::FreshClone(right)) if left.source_clone_ref.is_some() && right.source_clone_ref.is_some())
+            });
             let conflict = live_checkouts.into_iter().find(|other| {
                 other.metadata.name != obj.metadata.name
                     && other.metadata.deletion_timestamp.is_none()
@@ -438,7 +447,10 @@ where
                     other.metadata.name
                 )));
             }
-            match self.runtime.validate_new_branch(obj).await {
+            // A Ready local sibling already established this convoy's branch
+            // reservation; a late vessel may start at its newly published tip.
+            let validation = if sharing_ready_branch { Ok(None) } else { self.runtime.validate_new_branch(obj).await };
+            match validation {
                 Ok(Some(conflict)) => return Ok(CheckoutPrepared::Failed(conflict)),
                 Ok(None) => {}
                 Err(error) => {
@@ -544,18 +556,27 @@ where
                     .runtime
                     .create_local_clone_in(
                         &spec.env_ref,
-                        flotilla_vcs::vcs::LocalCloneRequest {
-                            source: &clone.spec.path,
-                            url: &spec.url,
-                            branch: &spec.r#ref,
-                            base_ref: spec.base_ref.as_deref(),
-                            target: &spec.target_path,
-                            continue_branch: continuing,
-                        },
+                        flotilla_vcs::vcs::LocalCloneRequest::builder()
+                            .source(&clone.spec.path)
+                            .url(&spec.url)
+                            .branch(&spec.r#ref)
+                            .maybe_base_ref(spec.base_ref.as_deref())
+                            .target(&spec.target_path)
+                            .intent(if continuing {
+                                flotilla_vcs::vcs::LocalCloneIntent::ContinueBranch
+                            } else if sharing_ready_branch {
+                                flotilla_vcs::vcs::LocalCloneIntent::ShareConvoyBranch
+                            } else {
+                                flotilla_vcs::vcs::LocalCloneIntent::NewBranch
+                            })
+                            .build(),
                     )
                     .await
                 {
                     Ok((prepared, message)) => {
+                        // Store the durable copy condition before marking Ready. If
+                        // the Ready write fails, retry reads the owned clone's saved
+                        // object mode and provenance without fetching or resetting it.
                         apply_status_patch(&self.checkouts, &obj.metadata.name, &CheckoutStatusPatch::ObserveDegradation { message })
                             .await?;
                         Ok(CheckoutPrepared::Ready { prepared })

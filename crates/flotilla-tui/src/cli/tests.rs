@@ -357,7 +357,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
-        degraded_checkouts: BTreeMap::from([("checkout-local".into(), "objects copied across filesystems".into())]),
+        degraded_checkouts: BTreeMap::from([("vessel-local/checkout-local".into(), "objects copied across filesystems".into())]),
         naming: None,
         promises: Vec::new(),
         landing_entry: None,
@@ -407,7 +407,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
 
     let output = format_convoy_explanation_human(&explanation);
     // #3090: the non-fatal copy fallback must remain visible in human explain.
-    assert!(output.contains("Degraded checkout checkout-local: objects copied across filesystems"));
+    assert!(output.contains("Degraded checkout vessel-local/checkout-local: objects copied across filesystems"));
     assert!(output.contains("Fulfilment: macos-scarce on comte"), "{output}");
     assert!(output.contains("Reserved platform capacity used: no unreserved capacity covers the needs"), "{output}");
     assert!(!output.contains("Escalation:"), "{output}");

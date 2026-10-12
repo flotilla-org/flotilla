@@ -1256,7 +1256,7 @@ async fn local_clone_teardown_preserves_dirty_work_and_removes_clean_clone() {
                 branch: "crew",
                 base_ref: Some("main"),
                 target: target.to_str().unwrap(),
-                continue_branch: false,
+                intent: core_vcs::LocalCloneIntent::NewBranch,
             },
         )
         .await

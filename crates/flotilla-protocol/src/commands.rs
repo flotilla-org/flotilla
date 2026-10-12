@@ -423,6 +423,7 @@ pub enum ConvoyNaming {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    /// Conditions keyed by vessel-ref/checkout-ref so shared checkout names cannot collide.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub degraded_checkouts: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

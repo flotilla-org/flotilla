@@ -359,7 +359,12 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         let vcs = runtime.vcs(path)?;
         let result = match &checkout.spec {
             CheckoutSpec::Worktree(spec) => vcs.continue_checkout(&spec.r#ref, target, reason).await?,
-            CheckoutSpec::FreshClone(spec) => vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target).await?,
+            CheckoutSpec::FreshClone(spec) if spec.source_clone_ref.is_none() => {
+                vcs.continue_fresh_clone(&spec.url, &spec.r#ref, target).await?
+            }
+            CheckoutSpec::FreshClone(_) => {
+                return Err("local clones continue through host-local clone preparation with a managed source".to_string().into())
+            }
             CheckoutSpec::Observed(_) => return Err("observed checkout cannot be continued".to_string().into()),
         };
         Ok(PreparedCheckout { commit: result.commit, branch_provenance: result.provenance })

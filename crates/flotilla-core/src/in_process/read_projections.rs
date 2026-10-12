@@ -1665,8 +1665,11 @@ impl ReadProjections<'_> {
         Ok(ConvoyExplanation {
             degraded_checkouts: selected_vessels
                 .values()
-                .filter_map(|vessel| vessel.status.as_ref())
-                .flat_map(|status| status.degraded.clone())
+                .flat_map(|vessel| {
+                    vessel.status.iter().flat_map(|status| {
+                        status.degraded.iter().map(|(checkout, message)| (format!("{}/{checkout}", vessel.metadata.name), message.clone()))
+                    })
+                })
                 .collect(),
             naming: convoy.status.as_ref().and_then(|status| status.naming.clone()),
             landing_entry: convoy
