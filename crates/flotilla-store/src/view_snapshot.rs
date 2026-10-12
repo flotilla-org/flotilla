@@ -229,12 +229,14 @@ impl Store for ViewSnapshot {
         required: &BTreeMap<String, String>,
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
         // A label selector is a query in every adapter, counted by its matches.
-        let items = self
-            .visible(self.partition(resource_kind, namespace)?)
-            .into_iter()
-            .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
-            .map(|item| item.object)
-            .filter(|item| required.iter().all(|(key, value)| item.metadata.labels.get(key) == Some(value)))
+        // Select by reference and clone only the matches.
+        let partition = self.partition(resource_kind, namespace)?;
+        let items = partition
+            .items
+            .iter()
+            .filter(|item| matches!(item.provenance, ResourceProvenance::Local) && !self.shadowed(item, partition))
+            .filter(|item| required.iter().all(|(key, value)| item.object.metadata.labels.get(key) == Some(value)))
+            .map(|item| item.object.clone())
             .collect::<Vec<_>>();
         self.observe(resource_kind, ReadOperation::Query, items.len());
         Ok(ResourceList { items, resource_version: String::new(), generation: None })

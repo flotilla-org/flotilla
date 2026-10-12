@@ -181,17 +181,38 @@ impl StoreQuery {
     /// How this query is counted by read observers. Without a selector it reads
     /// the whole kind, exactly like a list; provenance options do not select.
     pub fn read_operation(&self) -> crate::ReadOperation {
-        let selects = !self.labels.is_empty()
-            || !self.fields.is_empty()
-            || !self.field_values.is_empty()
-            || !self.field_prefixes.is_empty()
-            || !self.missing_fields.is_empty()
-            || !self.field_matches_query.is_empty()
-            || self.owner.is_some()
-            || self.any_of.is_some()
-            || !self.present.is_empty()
-            || !self.label_prefixes.is_empty()
-            || self.message.is_some();
+        // Exhaustive on purpose: a new field must be classified as a selector
+        // or a provenance option here, or this stops compiling.
+        let StoreQuery {
+            labels,
+            fields,
+            field_values,
+            field_prefixes,
+            missing_fields,
+            field_matches_query,
+            merged_definitions: _,
+            owner,
+            any_of,
+            present,
+            label_prefixes,
+            all_sources_for_matches: _,
+            message,
+            include_replicas: _,
+            replicas_only: _,
+            replica_shadowing: _,
+            suppress_self_origin: _,
+        } = self;
+        let selects = !labels.is_empty()
+            || !fields.is_empty()
+            || !field_values.is_empty()
+            || !field_prefixes.is_empty()
+            || !missing_fields.is_empty()
+            || !field_matches_query.is_empty()
+            || owner.is_some()
+            || any_of.is_some()
+            || !present.is_empty()
+            || !label_prefixes.is_empty()
+            || message.is_some();
         if selects {
             crate::ReadOperation::Query
         } else {
