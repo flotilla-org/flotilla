@@ -18,7 +18,7 @@ use flotilla_provider_runtime::CommandRunner;
 use serde_json::{json, Value};
 
 use super::{GitHubIssueProvider, BOARD_BATCH_SIZE};
-use crate::providers::issue_tracker::IssueProvider;
+use crate::IssueProvider;
 
 // Stand-in for the gh/HTTP boundary. Enforce the actual REST routes and
 // bounded GraphQL selection, and return GitHub's connection-shaped responses.

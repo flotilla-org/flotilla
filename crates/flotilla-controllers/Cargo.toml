@@ -29,6 +29,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 flotilla-ai-utility = { path = "../flotilla-ai-utility" }
 flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-cloud-agent = { path = "../flotilla-cloud-agent" }
 flotilla-store-http = { path = "../flotilla-store-http" }
 flotilla-store-sqlite = { path = "../flotilla-store-sqlite" }

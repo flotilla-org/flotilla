@@ -2,7 +2,7 @@ use flotilla_ai_utility::factories::claude::{ClaudeApiAiUtilityFactory, ClaudeCl
 use flotilla_change_request::factories::{forgejo::ForgejoChangeRequestFactory, github::GitHubChangeRequestFactory};
 use flotilla_cloud_agent::factories::{claude::ClaudeCodingAgentFactory, codex::CodexCodingAgentFactory, cursor::CursorCodingAgentFactory};
 use flotilla_environment::factories::{docker, host_direct};
-pub mod github;
+use flotilla_issue_tracker::factories::{forgejo::ForgejoIssueProviderFactory, github::GitHubIssueProviderFactory};
 
 use super::FactoryRegistry;
 use flotilla_terminal::factories::{cleat::CleatTerminalPoolFactory, passthrough::PassthroughTerminalPoolFactory};
@@ -20,7 +20,7 @@ impl FactoryRegistry {
         Self {
             vcs: vcs_factories(),
             change_requests: vec![Box::new(GitHubChangeRequestFactory), Box::new(ForgejoChangeRequestFactory)],
-            issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
+            issue_trackers: vec![Box::new(GitHubIssueProviderFactory), Box::new(ForgejoIssueProviderFactory)],
             cloud_agents: vec![Box::new(ClaudeCodingAgentFactory), Box::new(CursorCodingAgentFactory), Box::new(CodexCodingAgentFactory)],
             ai_utilities: vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)],
             terminal_pools: terminal_pool_factories(),
@@ -31,7 +31,16 @@ impl FactoryRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeSet, sync::Arc};
+
+    use flotilla_discovery_api::{EnvironmentAssertion, EnvironmentBag, Factory};
+    use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_protocol::IssueSource;
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+
     use super::*;
+    use crate::config::ConfigStore;
+    use crate::testkits::discovery::DiscoveryMockRunner;
 
     #[test]
     fn default_all_has_all_categories() {
@@ -54,5 +63,30 @@ mod tests {
         assert!(!reg.cloud_agents.is_empty());
         assert!(!reg.ai_utilities.is_empty());
         assert!(!reg.terminal_pools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgejo_origin_binds_issue_and_change_request_without_config_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lab-forgejo-coder-token"), "test-token\n").expect("write token");
+        let config = ConfigStore::with_base(dir.path().join("flotilla"));
+        let forge = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forgejo.lab.flotilla.work".into()]))
+            .https_url("https://forgejo.lab.flotilla.work".into())
+            .git_ssh_host("forgejo.lab.flotilla.work".into())
+            .build();
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::remote_host("forgejo.lab.flotilla.work", "lab", "flotilla", "origin"))
+            .with(EnvironmentAssertion::origin_forge(forge))
+            .with(EnvironmentAssertion::auth_file("forgejo", dir.path().join("lab-forgejo-coder-token")));
+        let root = ExecutionEnvironmentPath::new("/repo");
+        let runner = Arc::new(DiscoveryMockRunner::builder().build());
+        let issues = ForgejoIssueProviderFactory.probe(&bag, &config, &root, runner.clone()).await.expect("Forgejo issue source");
+        let changes = ForgejoChangeRequestFactory.probe(&bag, &config, &root, runner).await.expect("Forgejo CR source");
+        assert!(issues.supports(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/flotilla".into() }));
+        assert_eq!(ForgejoChangeRequestFactory.descriptor().implementation, "forgejo");
+        let _ = changes;
     }
 }

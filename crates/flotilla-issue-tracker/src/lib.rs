@@ -1,5 +1,10 @@
+//! Source-addressed issue providers, the GitHub dispatch-board reader and their discovery factories.
+pub mod factories;
 pub mod forgejo;
 pub mod github;
+pub mod mission_fields;
+#[cfg(test)]
+mod testing;
 
 use std::sync::Arc;
 
@@ -17,7 +22,7 @@ pub fn forge_issue_source(identity: &RepoIdentity) -> IssueSource {
     IssueSource { service, scope: identity.path.clone() }
 }
 
-pub(crate) fn provider_for_source<'a>(
+pub fn provider_for_source<'a>(
     mut providers: impl Iterator<Item = &'a Arc<dyn IssueProvider>>,
     source: &IssueSource,
 ) -> Option<Arc<dyn IssueProvider>> {
@@ -83,7 +88,7 @@ pub trait IssueProvider: Send + Sync {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -149,5 +154,3 @@ pub(crate) mod tests {
         assert_eq!(provider.max_active.load(Ordering::SeqCst), MAX_CONCURRENT_ISSUE_FETCHES);
     }
 }
-
-pub mod mission_fields;

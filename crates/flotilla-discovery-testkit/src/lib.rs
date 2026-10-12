@@ -15,10 +15,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::ChangeRequestTracker;
 use flotilla_core::providers::discovery::{DiscoveryRuntime, FactoryRegistry};
-use flotilla_core::providers::issue_tracker::IssueProvider;
 use flotilla_discovery_api::provider_config::ProviderConfigView;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_discovery_api::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement};
+use flotilla_issue_tracker::IssueProvider;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -1317,23 +1317,11 @@ pub fn fake_vcs_discovery(state: Arc<RwLock<FakeVcsState>>) -> DiscoveryRuntime 
     runtime
 }
 
-pub async fn assert_provider_contract(provider: &dyn IssueProvider, source: &IssueSource, known_id: &str, since: &str) {
-    let page = provider.query(source, &IssueQuery::default(), 1, 30).await.expect("provider contract: initial query");
-    assert!(!page.items.is_empty(), "provider contract requires seeded open issues");
-    assert!(page.items.iter().all(|issue| issue.state == IssueState::Open));
-    assert!(page.items.iter().all(|issue| issue.reference.source == *source));
-    assert!(page.items.windows(2).all(|rows| rows[0].as_of >= rows[1].as_of), "initial query must be updated-descending");
-
-    let reference = IssueRef { source: source.clone(), id: known_id.to_string() };
-    let fetched = provider.fetch_by_id(&reference).await.expect("provider contract: opaque fetch-by-id");
-    assert_eq!(fetched.reference, reference);
-
-    let changes = provider.list_changed_since(source, since, 30).await.expect("provider contract: changed-since");
-    assert!(changes.updated.iter().all(|issue| issue.state == IssueState::Open));
-    assert!(changes.updated.iter().all(|issue| issue.reference.source == *source));
-    assert!(changes.closed.iter().all(|reference| reference.source == *source));
-    assert!(changes.updated.iter().all(|issue| !changes.closed.iter().any(|reference| reference == &issue.reference)));
-}
+// The contract lives beside the trait; this crate's fake and the provider
+// crate's own tests compile it against their respective trait builds.
+#[path = "../../flotilla-issue-tracker/src/provider_contract.rs"]
+mod provider_contract;
+pub use provider_contract::assert_provider_contract;
 
 mod in_process;
 pub use in_process::InProcessDiscoveryExt;

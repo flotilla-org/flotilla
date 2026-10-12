@@ -187,13 +187,14 @@ mod tests {
     };
 
     use super::*;
-    use crate::providers::issue_tracker::IssueProvider;
-    use crate::testkits::discovery::assert_provider_contract;
-    use crate::testkits::replay;
-    use crate::testkits::replay::testing::fixture_path;
-    use crate::testkits::replay::testing::MockRunner;
-    use crate::testkits::replay::Masks;
     use flotilla_provider_runtime::ChannelLabel;
+    use flotilla_replay_testkit as replay;
+    use flotilla_replay_testkit::testing::MockRunner;
+    use flotilla_replay_testkit::Masks;
+
+    use crate::testing::assert_provider_contract;
+    use crate::testing::fixture_path;
+    use crate::IssueProvider;
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {
@@ -264,7 +265,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        fixture_path("issue_tracker", name)
+        fixture_path(name)
     }
 
     fn replay_auth() -> ForgejoAuth {

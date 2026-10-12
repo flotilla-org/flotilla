@@ -10,8 +10,8 @@ use flotilla_protocol::{
 use super::*;
 use flotilla_vcs::vcs::Vcs;
 use flotilla_change_request::ChangeRequestTracker;
+use flotilla_issue_tracker::IssueProvider;
 use crate::{providers::{
-        issue_tracker::IssueProvider,
         types::{
             ChangeRequest, Checkout, CloudAgentSession, Issue,
         },

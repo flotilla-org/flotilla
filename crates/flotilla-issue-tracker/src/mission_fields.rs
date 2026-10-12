@@ -14,7 +14,7 @@ pub fn issue_ref_from_url(url: &str) -> Result<IssueRef, String> {
     })
 }
 
-pub(crate) fn class(value: &str) -> Result<ClassOfService, String> {
+pub fn class(value: &str) -> Result<ClassOfService, String> {
     match value.to_ascii_lowercase().as_str() {
         "expedite" => Ok(ClassOfService::Expedite),
         "standard" => Ok(ClassOfService::Standard),

@@ -8,7 +8,6 @@ use hegel::generators as gs;
 use super::*;
 use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
 use crate::providers::discovery::detectors::generic::CommandDetector;
-use crate::providers::discovery::factories::github::GitHubIssueProviderFactory;
 use crate::testkits::discovery::fake_discovery;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use crate::testkits::discovery::FakeIssueProvider;
@@ -19,6 +18,7 @@ use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_discovery_api::UnmetRequirement;
+use flotilla_issue_tracker::factories::github::GitHubIssueProviderFactory;
 
 struct CountingVcsFactory {
     inner: FakeVcsFactory,
@@ -368,7 +368,7 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
         CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Forge, ForgeKind, ForgeSpec,
     };
 
-    use crate::providers::discovery::factories::github::ForgejoIssueProviderFactory;
+    use flotilla_issue_tracker::factories::forgejo::ForgejoIssueProviderFactory;
 
     let temp = tempfile::tempdir().expect("config");
     let config_dir = temp.path().join("config");

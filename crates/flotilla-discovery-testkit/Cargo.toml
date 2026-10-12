@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 flotilla-change-request = { path = "../flotilla-change-request" }
+flotilla-issue-tracker = { path = "../flotilla-issue-tracker" }
 flotilla-environment = { path = "../flotilla-environment" }
 flotilla-vcs = { path = "../flotilla-vcs" }
 flotilla-terminal = { path = "../flotilla-terminal" }
