@@ -1652,3 +1652,82 @@ impl From<StoredEventKind> for WatchAction {
         }
     }
 }
+
+#[cfg(test)]
+mod paused_watch_tests {
+    use super::*;
+    use flotilla_resources::{WorkflowTemplate, WorkflowTemplateSpec};
+    use futures::FutureExt;
+    use std::time::Duration;
+
+    // A watch paused by select! must not reserve the store mutex and prevent
+    // the selected handler from reading or writing that same store (#3097).
+    #[tokio::test(start_paused = true)]
+    async fn paused_definition_watch_does_not_block_store_writer() {
+        let memory = InMemoryBackend::default();
+        let backend = crate::ResourceBackend::new(memory.clone()).with_local_root(NodeId::new("home"));
+        let workflows = backend.using::<WorkflowTemplate>("test");
+        let mut watch = backend.including_replicas::<WorkflowTemplate>("test").watch().await.expect("watch");
+        let meta = InputMeta::builder().name("workflow".to_string()).build();
+        let spec = WorkflowTemplateSpec::builder().build();
+        workflows.create(&meta, &spec).await.expect("create watched definition");
+        let guard = memory.stores.lock().await;
+        assert!(watch.next().now_or_never().is_none(), "lookup waits for the store");
+        tokio::task::yield_now().await;
+        // Deliberately leave the watch unpolled, as an event handler does.
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), workflows.delete("workflow"))
+            .await
+            .expect("a paused watch must not deadlock its event handler")
+            .expect("delete");
+        tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("lookup makes progress")
+            .expect("event")
+            .expect("lookup completes");
+    }
+
+    // Self-origin suppression also reads the store while polling a watch. A
+    // paused replica event must allow a local write and deliver its local event.
+    #[tokio::test(start_paused = true)]
+    async fn paused_self_origin_watch_does_not_block_store_writer() {
+        use flotilla_resources::{Host, HostSpec};
+        let memory = InMemoryBackend::default();
+        let root = NodeId::new("home");
+        let backend = crate::ResourceBackend::new(memory.clone()).with_local_root(root.clone());
+        let source = crate::ResourceBackend::new(InMemoryBackend::default()).with_local_root(root.clone());
+        let meta = InputMeta::builder().name("host".to_string()).build();
+        let spec = HostSpec { display_name: "home".into(), ..Default::default() };
+        let hosts = backend.using::<Host>("test");
+        source.using::<Host>("test").create(&meta, &spec).await.expect("source host");
+        let mut watch = backend.including_replicas::<Host>("test").watch().await.expect("watch");
+        backend
+            .replica_writer::<Host>(root, "test")
+            .replace(&source.using::<Host>("test").list().await.expect("source list"), Utc::now())
+            .await
+            .expect("replica event");
+        let guard = memory.stores.lock().await;
+        assert!(watch.next().now_or_never().is_none());
+        tokio::task::yield_now().await;
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), hosts.create(&meta, &spec))
+            .await
+            .expect("a paused self-origin lookup must not deadlock a local writer")
+            .expect("local host");
+        let mut event = tokio::time::timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("lookup makes progress")
+            .expect("event")
+            .expect("lookup completes");
+        if matches!(&event, crate::ReadWatchEvent::Added(item) if matches!(item.provenance, ResourceProvenance::Replica { .. })) {
+            // The lookup may complete before the local writer; that replica
+            // event was not yet shadowed and must precede the local event.
+            event = tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .expect("local event makes progress")
+                .expect("local event")
+                .expect("local event succeeds");
+        }
+        assert!(matches!(event, crate::ReadWatchEvent::Added(item) if item.provenance == ResourceProvenance::Local));
+    }
+}
