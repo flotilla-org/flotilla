@@ -36,12 +36,11 @@ count = 2
 reason = "Hourly background sweep: each tick reads Clone and Checkout once to collect archive roots; the loop is the timer, not a per-item read."
 
 [[allow]]
-path = "crates/flotilla-daemon/src/server/replicator.rs"
-function = "replicate_kind_over_http"
+path = "crates/flotilla-replication/src/replicator.rs"
+function = "replicate_kind_direct"
 count = 2
 reason = """Replication snapshot handoff: the origin and local lists run only when no replica cursor exists \
-(first sync or a resnapshot after the origin log cannot continue). The replicator is being extracted \
-into its own crate; this entry moves with it."""
+(first sync or a resnapshot after the origin log cannot continue)."""
 
 [[allow]]
 path = "crates/flotilla-store/src/message_retention.rs"
