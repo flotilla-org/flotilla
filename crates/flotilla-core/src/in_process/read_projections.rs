@@ -1795,7 +1795,7 @@ fn explained_unclaimed_work(
     sessions: &[ReadResourceObject<ResourceTerminalSession>],
     convoy_name: &str,
 ) -> Vec<ExplainedUnclaimedWork> {
-    let Some(status) = status else { return Vec::new() };
+    let Some(status) = status.filter(|status| !status.phase.is_terminal()) else { return Vec::new() };
     status
         .crew_work
         .iter()
@@ -3172,6 +3172,28 @@ mod tests {
         let comment = tc.draw(gs::booleans());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(decision_ledger_explanation_case(pr_bound, projection_failure, comment));
+    }
+
+    // A terminal convoy has no working crew obligations, even when its stored
+    // record predates crew settlement. The pure projection is the consumer seam.
+    #[test]
+    fn terminal_convoy_has_no_unclaimed_work() {
+        let mut status = ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            work: BTreeMap::from([("work".into(), flotilla_resources::WorkState::builder().phase(ResourceWorkPhase::Complete).build())]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(explained_unclaimed_work(Some(&status), &[], "job").len(), 1);
+        for phase in
+            [flotilla_resources::ConvoyPhase::Abandoned, flotilla_resources::ConvoyPhase::Landed, flotilla_resources::ConvoyPhase::Failed]
+        {
+            status.phase = phase;
+            assert!(explained_unclaimed_work(Some(&status), &[], "job").is_empty());
+        }
     }
 
     async fn decision_ledger_explanation_case(pr_bound: bool, projection_failure: bool, comment: bool) {

@@ -289,6 +289,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
     CrewWorkState {
         completion_turn: None,
         pending_follow_up: None,
+        completion_authority: Default::default(),
         phase,
         resumed_at: None,
         resume_brief_id: None,

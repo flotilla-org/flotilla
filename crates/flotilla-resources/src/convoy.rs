@@ -952,6 +952,7 @@ pub enum InputValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(remote = "Self")]
 pub struct ConvoyStatus {
     /// ADR 0047: remove this decoder default one fleet roll after deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1037,6 +1038,36 @@ pub struct ConvoyStatus {
     /// Mutating lifecycle requests retained for operator explanation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<LifecycleMutation>,
+}
+
+// Keep one serde field definition while allowing decode-time lifecycle repair.
+impl Serialize for ConvoyStatus {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConvoyStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut status = Self::deserialize(deserializer)?;
+        // ADR 0047: previous-generation abandonment left crew phases active.
+        // Remove this normalization one fleet roll after #3112, once stored
+        // abandoned records have been rewritten or reaped. Never invent an
+        // authority: only abandoned vessel work carries attributable evidence.
+        if status.phase == ConvoyPhase::Abandoned {
+            for (vessel, crew) in &mut status.crew_work {
+                let work = status.work.get(vessel).filter(|work| work.phase == WorkPhase::Abandoned);
+                for state in crew.values_mut().filter(|state| !state.phase.is_terminal()) {
+                    state.phase = CrewWorkPhase::Failed;
+                    state.completion_authority =
+                        work.map_or(WorkCompletionAuthority::Unattributed, |work| work.completion_authority.clone());
+                    state.finished_at = state.finished_at.or(work.and_then(|work| work.finished_at)).or(status.finished_at);
+                    state.message = work.and_then(|work| work.message.clone()).or_else(|| status.message.clone());
+                }
+            }
+        }
+        Ok(status)
+    }
 }
 
 /// Frozen completion claims that triggered the existing Active → Landing rule.
@@ -1541,6 +1572,12 @@ pub struct CrewWorkState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_follow_up: Option<flotilla_protocol::ResourceRef>,
     pub phase: CrewWorkPhase,
+    /// Authority that terminalized this role on convoy abandonment.
+    /// Defaults to crew rollup, matching vessel work. Keep this default while
+    /// serialization omits CrewRollup; it also decodes prior records (ADR 0047).
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "WorkCompletionAuthority::is_crew_rollup")]
+    pub completion_authority: WorkCompletionAuthority,
     /// A resumed stalled crew is in grace until its new brief is delivered and
     /// a later idle observation ends that turn. The default decodes prior
     /// stored statuses; remove it one fleet roll after this change.
@@ -1633,6 +1670,12 @@ pub enum CrewWorkPhase {
     Done,
     HandedBack,
     Failed,
+}
+
+impl CrewWorkPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::HandedBack | Self::Failed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2273,6 +2316,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.message = Some(format!("abandoned by {actor}: {reason}"));
                 for state in status.work.values_mut().filter(|state| !state.phase.is_terminal()) {
                     state.phase = WorkPhase::Abandoned;
+                    state.completion_authority = authority.clone();
+                    state.finished_at.get_or_insert(*finished_at);
+                    state.message = Some(reason.clone());
+                }
+                for state in status.crew_work.values_mut().flat_map(BTreeMap::values_mut).filter(|state| !state.phase.is_terminal()) {
+                    state.phase = CrewWorkPhase::Failed;
                     state.completion_authority = authority.clone();
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(reason.clone());
@@ -3263,6 +3312,143 @@ mod subject_tests {
             expected_change_request_leaves(&unlinked, &BTreeMap::new()).expect("subject leaves").is_empty(),
             "a claim message alone cannot bypass the persisted subject set"
         );
+    }
+
+    // Abandon must settle every non-terminal role without changing prior claims.
+    // Exhaustive phase coverage includes empty vessels, multiple vessels, and
+    // duplicate/stale patches; this pure lifecycle patch needs no collaborators.
+    #[test]
+    fn abandon_settles_crew_work() {
+        let at = DateTime::from_timestamp(100, 0).unwrap();
+        let earlier = DateTime::from_timestamp(50, 0).unwrap();
+        for prior_time in [None, Some(earlier)] {
+            let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() };
+            status.crew_work.insert("empty".into(), BTreeMap::new());
+            for phase in [
+                CrewWorkPhase::Pending,
+                CrewWorkPhase::Working,
+                CrewWorkPhase::Interrupted,
+                CrewWorkPhase::Stalled,
+                CrewWorkPhase::Done,
+                CrewWorkPhase::HandedBack,
+                CrewWorkPhase::Failed,
+            ] {
+                status.crew_work.insert(
+                    format!("{phase:?}"),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        CrewWorkState::builder().phase(phase).maybe_finished_at(prior_time).message("prior".into()).build(),
+                    )]),
+                );
+            }
+            let before = status.clone();
+            let patch = ConvoyStatusPatch::MarkConvoyAbandoned {
+                expected_phase: ConvoyPhase::Active,
+                finished_at: at,
+                authority: WorkCompletionAuthority::HumanOverride,
+                reason: "cancelled assignment".into(),
+            };
+            let mut stale = status.clone();
+            stale.phase = ConvoyPhase::Interrupted;
+            let stale_before = stale.clone();
+            patch.apply(&mut stale);
+            assert_eq!(stale, stale_before);
+            patch.apply(&mut status);
+            assert_eq!(status.phase, ConvoyPhase::Abandoned);
+            for (vessel, crew) in &status.crew_work {
+                for (role, state) in crew {
+                    let prior = &before.crew_work[vessel][role];
+                    if matches!(prior.phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack | CrewWorkPhase::Failed) {
+                        assert_eq!(state, prior);
+                    } else {
+                        assert_eq!(state.phase, CrewWorkPhase::Failed);
+                        assert_eq!(state.completion_authority, WorkCompletionAuthority::HumanOverride);
+                        assert_eq!(state.finished_at, prior_time.or(Some(at)));
+                        assert_eq!(state.message.as_deref(), Some("cancelled assignment"));
+                    }
+                }
+            }
+            let settled = status.clone();
+            patch.apply(&mut status);
+            assert_eq!(status, settled);
+        }
+    }
+
+    // Previous-generation abandoned records decode to terminal crew work;
+    // live/other terminal convoys and already-terminal claims remain unchanged.
+    #[hegel::test]
+    fn abandoned_stored_crew_is_normalized(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Span every convoy/crew phase, empty and mixed crew maps, missing
+        // work evidence, and optional prior timestamps. No external boundaries.
+        let phases = [
+            ConvoyPhase::Pending,
+            ConvoyPhase::Active,
+            ConvoyPhase::Interrupted,
+            ConvoyPhase::Landing,
+            ConvoyPhase::Landed,
+            ConvoyPhase::Failed,
+            ConvoyPhase::Abandoned,
+        ];
+        let at = DateTime::from_timestamp(100, 0).unwrap();
+        let mut status = ConvoyStatus {
+            phase: phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))],
+            finished_at: Some(at),
+            message: Some("abandoned by operator: stop".into()),
+            ..Default::default()
+        };
+        let has_work = tc.draw(gs::booleans());
+        if has_work {
+            status.work.insert(
+                "work".into(),
+                WorkState::builder()
+                    .phase(WorkPhase::Abandoned)
+                    .completion_authority(WorkCompletionAuthority::HumanOverride)
+                    .finished_at(at)
+                    .message("stop".into())
+                    .build(),
+            );
+        }
+        if tc.draw(gs::booleans()) {
+            for phase in [
+                CrewWorkPhase::Pending,
+                CrewWorkPhase::Working,
+                CrewWorkPhase::Interrupted,
+                CrewWorkPhase::Stalled,
+                CrewWorkPhase::Done,
+                CrewWorkPhase::HandedBack,
+                CrewWorkPhase::Failed,
+            ] {
+                status.crew_work.entry("work".into()).or_default().insert(
+                    format!("{phase:?}"),
+                    CrewWorkState::builder()
+                        .phase(phase)
+                        .maybe_finished_at(tc.draw(gs::booleans()).then_some(at))
+                        .message("prior".into())
+                        .build(),
+                );
+            }
+        }
+        // Old writers omit the new authority field; default is skipped on write.
+        let encoded = serde_json::to_value(&status).unwrap();
+        let decoded: ConvoyStatus = serde_json::from_value(encoded).unwrap();
+        for (vessel, crew) in &decoded.crew_work {
+            for (role, state) in crew {
+                let prior = &status.crew_work[vessel][role];
+                if status.phase == ConvoyPhase::Abandoned && !prior.phase.is_terminal() {
+                    assert_eq!(state.phase, CrewWorkPhase::Failed);
+                    assert_eq!(state.finished_at, Some(at));
+                    assert_eq!(
+                        state.completion_authority,
+                        if has_work { WorkCompletionAuthority::HumanOverride } else { WorkCompletionAuthority::Unattributed }
+                    );
+                    assert_eq!(state.message.as_deref(), Some(if has_work { "stop" } else { "abandoned by operator: stop" }));
+                } else {
+                    assert_eq!(state, prior);
+                }
+            }
+        }
+        assert_eq!(serde_json::from_value::<ConvoyStatus>(serde_json::to_value(&decoded).unwrap()).unwrap(), decoded);
     }
 
     #[test]

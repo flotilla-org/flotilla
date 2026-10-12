@@ -2218,7 +2218,7 @@ impl Aggregator {
             entry.repository_key = self.convoy_subject_repository_key(convoy, &entry.subject);
         }
         let phase = status.map(|status| status.phase).unwrap_or_default();
-        let vessels: Vec<VesselRow> = status
+        let mut vessels: Vec<VesselRow> = status
             .and_then(|status| status.workflow_snapshot.as_ref())
             .map(|snapshot| {
                 snapshot
@@ -2236,6 +2236,13 @@ impl Aggregator {
                     .collect()
             })
             .unwrap_or_default();
+        // Abandoned crews owe no further work, including before teardown has
+        // removed their last session observations from this projection.
+        if phase == ResourceConvoyPhase::Abandoned {
+            for vessel in &mut vessels {
+                vessel.surface_state = SurfaceState::Available;
+            }
+        }
         let attention_demand = self
             .demands
             .values()
@@ -2273,6 +2280,8 @@ impl Aggregator {
             || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
         {
             SurfaceState::NeedsYou
+        } else if phase == ResourceConvoyPhase::Abandoned {
+            SurfaceState::Available
         } else if let Some(stalled) = status.and_then(|status| status.stalled.as_ref()) {
             stalled_surface_state(stalled)
         } else if vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available) && !vessels.is_empty() {
@@ -5874,6 +5883,48 @@ mod tests {
         let row = emitted_vessel(convoy).await;
         assert_eq!(row.readiness.state, ReadinessState::Ready);
         assert!(row.readiness.blockers.is_empty());
+    }
+
+    // Abandoned convoys report no working crew surface, with or without a
+    // frozen workflow or stale crew phases from previous-generation records.
+    #[tokio::test]
+    async fn abandoned_convoy_has_no_working_crew_surface() {
+        use flotilla_resources::{CrewWorkPhase, CrewWorkState};
+        for snapshot in [false, true] {
+            for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Working, CrewWorkPhase::Stalled, CrewWorkPhase::Interrupted] {
+                let state = AggregatorProjectionState::new();
+                let (event_tx, _) = broadcast::channel(8);
+                let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+                let mut convoy =
+                    convoy_with_work().convoy_phase(ResourceConvoyPhase::Abandoned).work_phase(ResourceWorkPhase::Abandoned).call();
+                let status = convoy.status.as_mut().unwrap();
+                if !snapshot {
+                    status.workflow_snapshot = None;
+                }
+                status
+                    .crew_work
+                    .insert("implement".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(phase).build())]));
+                if snapshot {
+                    let mut session = session_object("terminal-abandoned-coder").await;
+                    session.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
+                    session.metadata.labels.insert(VESSEL_LABEL.into(), "implement".into());
+                    session.spec.role = "coder".into();
+                    session.status.as_mut().unwrap().attention = Some(TerminalAttention {
+                        state: TerminalAttentionState::Working,
+                        as_of: Utc::now(),
+                        source: TerminalAttentionSource::Screen,
+                    });
+                    let source = ReadResourceObject { object: session, provenance: ResourceProvenance::Local };
+                    aggregator.terminal_sessions.insert(session_key(&source), source);
+                }
+                aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+                let result = state.result_set().await;
+                let row = &result.rows.as_convoys().unwrap()[0];
+                assert_eq!(row.phase, ConvoyPhase::Abandoned);
+                assert_eq!(row.surface_state, SurfaceState::Available);
+                assert!(row.vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available));
+            }
+        }
     }
 
     #[tokio::test]
