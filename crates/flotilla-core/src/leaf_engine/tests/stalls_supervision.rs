@@ -1570,3 +1570,25 @@ async fn stale_stall_snapshot_publishes_one_supervisor_message() {
         stall_message_scenario(false, restart).await;
     }
 }
+
+// Only the authority may judge a convoy. An old caller map must not actuate a
+// replica that remains visible after its local record has been removed.
+#[tokio::test]
+async fn replica_only_convoy_in_caller_snapshot_is_not_judged() {
+    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let source = convoys.get("stalled-work").await.expect("source");
+    convoys.delete("stalled-work").await.expect("remove local authority");
+    backend
+        .replica_writer::<Convoy>(NodeId::new("other-authority"), "flotilla")
+        .apply(WatchEvent::Added(source.clone()), Utc::now())
+        .await
+        .expect("replica");
+    let visible = backend.including_replicas::<Convoy>("flotilla").get("stalled-work").await.expect("visible replica");
+    assert!(matches!(visible.provenance, flotilla_resources::ResourceProvenance::Replica { .. }));
+    let objects = HashMap::from([("stalled-work".into(), source)]);
+    wake.sync_rows("flotilla", &objects).await.expect("old rows");
+    wake.judge_stalls_at("flotilla", &objects, Utc::now()).await.expect("judge obsolete caller map");
+    assert!(delivery.requests.lock().expect("requests").is_empty(), "a replica must never emit a supervision turn");
+    assert!(convoys.get("stalled-work").await.is_err(), "judging must not recreate local authority");
+}

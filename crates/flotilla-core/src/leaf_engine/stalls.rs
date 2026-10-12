@@ -215,6 +215,9 @@ pub(super) fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> 
 }
 
 impl ReconcilerWake {
+    /// Judge locally authored convoys using the caller's current row snapshot.
+    /// Obsolete, removed, or replica-only snapshots are skipped; the caller's
+    /// convoy-watch handler must refresh the map and rebuild its rows.
     pub(super) async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, impl ConvoyRead>) -> Result<(), String> {
         self.judge_stalls_at(namespace, convoys, self.subscriptions.inner.clock.now()).await
     }
@@ -288,7 +291,17 @@ impl ReconcilerWake {
             // Rows belong to the caller's convoy revision. A judge tick can win
             // the select before its convoy-watch wake; do not publish a new
             // episode from that stale revision. The watch will rebuild the rows.
-            if current_versions.get(&convoy.metadata.name).copied() != Some(&convoy.metadata.resource_version) {
+            // Only the authority judges stalls: a removed local record or a
+            // replica-only copy must not be actuated from an old caller map.
+            let current_version = current_versions.get(&convoy.metadata.name).copied();
+            if current_version != Some(&convoy.metadata.resource_version) {
+                tracing::trace!(
+                    namespace,
+                    convoy = %convoy.metadata.name,
+                    snapshot_version = %convoy.metadata.resource_version,
+                    ?current_version,
+                    "skipping obsolete or non-local stall snapshot"
+                );
                 continue;
             }
             let Some(status) = &convoy.status else { continue };

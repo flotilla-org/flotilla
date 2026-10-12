@@ -1373,6 +1373,28 @@ fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
     }
 }
 
+fn is_same_crew_stall(
+    status: &ConvoyStatus,
+    vessel: &str,
+    role: &str,
+    leaf: &Leaf,
+    reason: StallReason,
+    proposed_disposition: Option<StallProposedDisposition>,
+    message: &str,
+) -> bool {
+    status
+        .crew_work
+        .get(vessel)
+        .and_then(|crew| crew.get(role))
+        .is_some_and(|state| state.phase == CrewWorkPhase::Stalled && state.message.as_deref() == Some(message))
+        && status.stalled.as_ref().is_some_and(|stall| {
+            stall.source == StallEvidenceSource::Crew
+                && stall.reason == Some(reason)
+                && stall.proposed_disposition == proposed_disposition
+                && stall.leaves.iter().any(|prior| prior.address == leaf.address && prior.field_path == leaf.field_path)
+        })
+}
+
 fn clear_nudge_budget(status: &mut ConvoyStatus, vessel: &str, role: &str) {
     for obligation in &mut status.nudge_obligations {
         if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
@@ -2430,21 +2452,13 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 // Repeating a report is still the same episode, even after its
                 // maker has moved to a supervisor. Keep the delivery identity,
                 // consumed rung, and nudge budget rather than notifying again.
-                if status
-                    .crew_work
-                    .get(vessel)
-                    .and_then(|crew| crew.get(role))
-                    .is_some_and(|state| state.phase == CrewWorkPhase::Stalled && state.message.as_ref() == Some(message))
-                    && status.stalled.as_ref().is_some_and(|stall| {
-                        stall.source == StallEvidenceSource::Crew
-                            && stall.reason == Some(*reason)
-                            && stall.proposed_disposition == *proposed_disposition
-                            && stall.leaves.iter().any(|leaf| {
-                                matches!(&leaf.address, LeafAddress::Work { convoy: source, work } if source == convoy && work == vessel)
-                                    && leaf.field_path == format!(".crew.{role}.phase")
-                            })
-                    })
-                {
+                let leaf = Leaf {
+                    address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
+                    field_path: format!(".crew.{role}.phase"),
+                    operator: LeafOperator::Equal,
+                    literal: "Done".into(),
+                };
+                if is_same_crew_stall(status, vessel, role, &leaf, *reason, *proposed_disposition, message) {
                     return;
                 }
                 clear_nudge_budget(status, vessel, role);
@@ -2459,12 +2473,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(message.clone());
                 }
                 status.stalled = Some(StalledCondition {
-                    leaves: vec![Leaf {
-                        address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
-                        field_path: format!(".crew.{role}.phase"),
-                        operator: LeafOperator::Equal,
-                        literal: "Done".into(),
-                    }],
+                    leaves: vec![leaf],
                     maker: Some(LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() }),
                     evidence: message.clone(),
                     source: StallEvidenceSource::Crew,
