@@ -270,3 +270,50 @@ async fn unsupported_defaults_are_neutral_and_http_refusals_are_unchanged() {
     assert!(matches!(http.local_namespaces::<Convoy>().await,
         Err(ResourceError::Invalid { message }) if message == "HTTP backends cannot enumerate local resource namespaces"));
 }
+
+// A named read sees the same provenances, in the same order, as the matching
+// rows of a namespace list: local first, then replicas by origin. Callers that
+// replaced a list-and-find with `get_all` keep choosing the same copy.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn get_all_orders_provenances_like_list(#[case] adapter: &str) {
+    use flotilla_protocol::NodeId;
+    use flotilla_store::StoreExt;
+    let (plain, _server) = backend(adapter).await;
+    let backend = plain.with_local_root(NodeId::new("self"));
+    backend.using::<Convoy>("flotilla").create(&ConvoyFixture::meta("alpha"), &ConvoyFixture::spec()).await.expect("local");
+    // Insert origins out of order so the read cannot rely on insertion order.
+    for origin in ["peer-c", "peer-a", "peer-b"] {
+        let peer = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new(origin));
+        for name in ["alpha", "beta"] {
+            peer.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.expect("peer row");
+        }
+        let listed = peer.using::<Convoy>("flotilla").list().await.expect("peer list");
+        backend
+            .replace_replicas_typed::<Convoy>(&NodeId::new(origin), "flotilla", &listed, chrono::Utc::now(), None)
+            .await
+            .expect("replicas");
+    }
+    let replicas = backend.including_replicas::<Convoy>("flotilla");
+    let provenances = |items: Vec<flotilla_resources::ReadResourceObject<Convoy>>| {
+        items.into_iter().filter(|item| item.object.metadata.name == "alpha").map(|item| item.provenance).collect::<Vec<_>>()
+    };
+    let named = provenances(replicas.get_all("alpha").await.expect("named").items);
+    let listed = provenances(replicas.list_replica_sources().await.expect("listed").items);
+    assert_eq!(named.len(), 4, "{adapter}: local plus three origins");
+    assert_eq!(named, listed, "{adapter}");
+    assert_eq!(
+        replicas.get_all("alpha").await.expect("named").items.first().map(|item| item.provenance.clone()),
+        replicas
+            .list()
+            .await
+            .expect("list")
+            .items
+            .into_iter()
+            .find(|item| item.object.metadata.name == "alpha")
+            .map(|item| item.provenance),
+        "{adapter}: the first visible copy is the one list-and-find chose"
+    );
+}
