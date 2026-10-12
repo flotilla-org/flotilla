@@ -3429,9 +3429,9 @@ mod tests {
     #[tokio::test]
     async fn scoped_listing_reads_and_decodes_are_bounded() {
         use flotilla_resources::{CrewSessionStatus, Message, MessageRelation, MessageSpec, Selector, TerminalBrief, TerminalCrewContext};
-        use flotilla_store_testkit::ReadCountsBackendExt;
-        let mut measurements = Vec::new();
-        for n in [0, 200] {
+        use flotilla_store_testkit::{assert_flat_reads, ReadBudget, ReadCountsBackendExt, ReadOperation};
+        assert_flat_reads([0, 200], |n| async move {
+            let mut measurements = Vec::new();
             let mut fixture = ProjectionFixture::new();
             let memory = InMemoryBackend::default().with_read_counts();
             fixture.backend = ResourceBackend::new(memory.clone());
@@ -3512,37 +3512,27 @@ mod tests {
                 }
             }
             for (project, crew, convoy) in [(Some("app"), None, None), (None, Some("target"), None), (None, None, Some("target"))] {
-                let before = memory.read_calls();
-                let decoded_before = memory.read_counts();
+                let before = memory.read_snapshot();
                 let response = fixture.projections().fleet_request("flotilla", project, crew, convoy).await.expect("scoped listing");
                 assert_eq!(response.rows.len(), 1);
                 assert_eq!(response.rows[0].convoy_ref.as_deref(), Some("target"));
-                let reads = memory
-                    .read_calls()
+                let reads = memory.read_snapshot().since(&before);
+                // At most one indexed read per kind. The only whole-kind list
+                // is the Project definition catalog, which scoping consults.
+                let budget = ["Checkout", "Demand", "Environment", "FleetDesignation", "Host"]
                     .into_iter()
-                    .map(|(kind, count)| {
-                        let delta = count - before.get(&kind).copied().unwrap_or_default();
-                        assert!(delta <= 1, "{kind}: {delta} reads");
-                        (kind, delta)
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                let decoded = memory
-                    .read_counts()
-                    .into_iter()
-                    .map(|(kind, count)| {
-                        let delta = count - decoded_before.get(&kind).copied().unwrap_or_default();
-                        (kind, delta)
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                assert_eq!(decoded.get("Convoy"), Some(&1));
-                assert_eq!(decoded.get("TerminalSession"), Some(&1));
-                assert_eq!(decoded.get("Message").copied().unwrap_or_default(), 0);
-                measurements.push((reads, decoded));
+                    .fold(ReadBudget::new(), |budget, kind| budget.calls(kind, ReadOperation::Query, 1))
+                    .objects("Convoy", ReadOperation::Query, 1, 1)
+                    .objects("TerminalSession", ReadOperation::Query, 1, 1)
+                    .calls("Project", ReadOperation::List, 1);
+                reads.assert_within(&budget, "scoped fleet listing");
+                assert_eq!(reads.objects_by_kind().get("TerminalSession"), Some(&1));
+                assert_eq!(reads.objects_by_kind().get("Message").copied().unwrap_or_default(), 0);
+                measurements.push(reads);
             }
-        }
-        for index in 0..3 {
-            assert_eq!(measurements[index], measurements[index + 3]);
-        }
+            measurements
+        })
+        .await;
     }
 
     // #3005: unrelated message history must not add store reads to explain;
@@ -3553,9 +3543,8 @@ mod tests {
             ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Message, MessageRelation, MessageSpec, Selector, TerminalBrief,
             TerminalCrewContext,
         };
-        use flotilla_store_testkit::ReadCountsBackendExt;
-        let mut counts = Vec::new();
-        for (n, adopted) in [(10, false), (200, false), (10, true), (200, true)] {
+        use flotilla_store_testkit::{assert_flat_reads, ReadCountsBackendExt, ReadSnapshot};
+        async fn explain(n: usize, adopted: bool) -> ReadSnapshot {
             let mut fixture = ProjectionFixture::new();
             let memory = InMemoryBackend::default().with_read_counts();
             fixture.backend = ResourceBackend::new(memory.clone());
@@ -3721,43 +3710,32 @@ mod tests {
                     .await
                     .expect("unrelated convoy");
             }
-            let before = memory.read_calls();
-            let decoded_before = memory.read_counts();
+            let before = memory.read_snapshot();
             let explanation = fixture.projections().explain_convoy("flotilla", "guide@flotilla").await.expect("explain");
             assert_eq!(
                 explanation.messages.iter().map(|message| message.name.as_str()).collect::<Vec<_>>(),
                 vec!["alias".to_string(), format!("message-{n}")]
             );
-            let delta = memory
-                .read_calls()
-                .into_iter()
-                .map(|(kind, count)| {
-                    let count = count - before.get(&kind).copied().unwrap_or_default();
-                    (kind, count)
-                })
-                .collect::<BTreeMap<_, _>>();
-            // One combined read per kind; growing unrelated convoys or inbox
-            // history cannot add reads or decoded objects to this explanation.
-            for (kind, count) in &delta {
-                assert!(*count <= 1, "{kind}: {count} reads");
+            // One combined indexed read per kind; growing unrelated convoys or
+            // inbox history cannot add reads or decoded objects to this explanation.
+            let reads = memory.read_snapshot().since(&before);
+            // Only adopted roles consult the definition catalogs as whole kinds.
+            let catalogs: &[(&str, usize)] = if adopted { &[("CrewDefaults", 1), ("Project", 1)] } else { &[] };
+            assert_eq!(reads.lists().entries().map(|(kind, _, tally)| (kind, tally.calls)).collect::<Vec<_>>(), catalogs);
+            for (kind, operation, tally) in reads.entries() {
+                assert!(tally.calls <= 1, "{kind} {operation:?}: {} reads", tally.calls);
             }
             for kind in ["Convoy", "TerminalSession", "ConvoyEnsure", "Message"] {
-                assert_eq!(delta.get(kind), Some(&1), "one indexed inventory for {kind}");
+                assert_eq!(reads.calls_by_kind().get(kind), Some(&1), "one indexed inventory for {kind}");
             }
-            let decoded = memory
-                .read_counts()
-                .into_iter()
-                .map(|(kind, count)| {
-                    let count = count - decoded_before.get(&kind).copied().unwrap_or_default();
-                    (kind, count)
-                })
-                .collect::<BTreeMap<_, _>>();
-            assert_eq!(decoded.get("Convoy"), Some(&1));
-            assert_eq!(decoded.get("Message"), Some(&2));
-            counts.push((delta, decoded));
+            assert_eq!(reads.objects_by_kind().get("Convoy"), Some(&1));
+            assert_eq!(reads.objects_by_kind().get("Message"), Some(&2));
+            reads
         }
-        assert_eq!(counts[0], counts[1], "namespace history must not multiply ensured-role reads");
-        assert_eq!(counts[2], counts[3], "namespace history must not multiply adopted-role reads");
+        for adopted in [false, true] {
+            // Namespace history must not multiply ensured- or adopted-role reads.
+            assert_flat_reads([10, 200], |n| explain(n, adopted)).await;
+        }
     }
 
     // Both crew and convoy surfaces share the durable projection. Waiting

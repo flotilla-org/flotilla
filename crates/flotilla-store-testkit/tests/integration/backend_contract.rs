@@ -13,7 +13,7 @@ use flotilla_store::{ResourceBackend, ResourceKind};
 use flotilla_store_http::HttpBackend;
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_store_sqlite::SqliteBackend;
-use flotilla_store_testkit::{fixtures::contract::*, ReadCountsBackendExt};
+use flotilla_store_testkit::{fixtures::contract::*, ReadCountsBackendExt, ReadOperation, ReadSnapshot, ReadTally};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -200,6 +200,62 @@ async fn read_observers_cross_the_store_trait(#[case] adapter: &str) {
     assert_eq!(observed.read_counts().get("Convoy"), Some(&2));
     assert_eq!(observed.read_calls().get("Convoy"), Some(&2));
     assert!(plain.read_counts().is_empty());
+    // Every adapter classifies the operation the same way.
+    let reads = observed.read_snapshot();
+    assert_eq!(reads.tally("Convoy", ReadOperation::Get), ReadTally { calls: 1, objects: 1 });
+    assert_eq!(reads.tally("Convoy", ReadOperation::List), ReadTally { calls: 1, objects: 1 });
+}
+
+// Selector-bounded reads are queries and unselective ones are lists, whichever
+// API spells them; replica-inclusive reads keep the same classification. (The
+// HTTP stand-in serves only the resource API, so this runs on local adapters.)
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn read_operations_classify_selectors(#[case] adapter: &str) {
+    use flotilla_store::StoreQuery;
+    let (plain, _server) = backend(adapter).await;
+    let resolver = plain.using::<Convoy>("flotilla");
+    for name in ["first", "second"] {
+        let meta = InputMeta::builder().name(name.into()).labels(BTreeMap::from([("pick".to_string(), name.to_string())])).build();
+        resolver.create(&meta, &ConvoyFixture::spec()).await.expect("create");
+    }
+    let observed = plain.clone().with_read_counts();
+    let measure = |reads: ReadSnapshot| reads.entries().map(|(_, operation, tally)| (operation, tally)).collect::<Vec<_>>();
+    let one = |operation, objects| vec![(operation, ReadTally { calls: 1, objects })];
+    let resolver = observed.using::<Convoy>("flotilla");
+    let replicas = observed.including_replicas::<Convoy>("flotilla");
+    let picked = StoreQuery::labels(&BTreeMap::from([("pick".to_string(), "first".to_string())]), false, true);
+    let cases: Vec<(&str, Vec<(ReadOperation, ReadTally)>)> = vec![
+        ("labels", one(ReadOperation::Query, 1)),
+        ("declared", one(ReadOperation::Query, 1)),
+        ("unselective", one(ReadOperation::List, 2)),
+        ("replica get", one(ReadOperation::Get, 1)),
+        ("replica list", vec![(ReadOperation::List, ReadTally { calls: 2, objects: 2 })]),
+    ];
+    for (case, expected) in cases {
+        let before = observed.read_snapshot();
+        match case {
+            "labels" => {
+                resolver.list_matching_labels(&picked.labels).await.expect("labels");
+            }
+            "declared" => {
+                resolver.query_declared(&picked).await.expect("declared");
+            }
+            "unselective" => {
+                resolver.query_declared(&StoreQuery::default()).await.expect("unselective");
+            }
+            "replica get" => {
+                replicas.get("first").await.expect("replica get");
+            }
+            "replica list" => {
+                replicas.list().await.expect("replica list");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(measure(observed.read_snapshot().since(&before)), expected, "{adapter}: {case}");
+    }
 }
 
 // Default refusal messages describe the port; the HTTP adapter preserves its

@@ -7,7 +7,7 @@ use flotilla_resources::{
     FrozenImageLayer, Host, ImageBuild, ImageBuildCapacity, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageComposition,
     ImageInputStability, ImageLayerParent, InputMeta, ResolvedImageInputs, ResourceError,
 };
-use flotilla_store::ResourceBackend;
+use flotilla_store::{ResourceBackend, StoreQuery};
 
 pub fn canonical_image_architecture(architecture: &str) -> &str {
     match architecture {
@@ -187,6 +187,9 @@ impl ImageBuildAdmission {
         let mut joined = Vec::new();
         let mut parent_key = None;
         let mut parent_digest: Option<String> = None;
+        // Pinned layers share one replica-inclusive inventory per join; builds
+        // created by earlier layers are not yet Built, so they cannot match.
+        let shareable_builds = tokio::sync::OnceCell::new();
         for (index, (layer, source)) in composition.layers.iter().zip(resolved).enumerate() {
             let digest = match (&parent_digest, &layer.spec.parent) {
                 (Some(digest), _) => digest.clone(),
@@ -218,20 +221,20 @@ impl ImageBuildAdmission {
             // A pinned recipe's built execution can serve every same-architecture
             // host. Unpinned execution keys remain scoped to their original demand.
             let shared = if inputs.stability == ImageInputStability::Pinned {
-                self.backend
-                    .including_replicas::<ImageBuild>(&self.namespace)
-                    .list()
+                shareable_builds
+                    .get_or_try_init(|| async { self.backend.including_replicas::<ImageBuild>(&self.namespace).list().await })
                     .await
                     .map_err(|error| error.to_string())?
                     .items
-                    .into_iter()
-                    .map(|source| source.object)
+                    .iter()
+                    .map(|source| &source.object)
                     .filter(|build| {
                         build.spec.recipe_key == recipe_key
                             && build.spec.inputs == inputs
                             && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
                     })
                     .min_by_key(|build| (build.spec.host_ref != placement_host, build.metadata.name.clone()))
+                    .cloned()
             } else {
                 None
             };
@@ -239,12 +242,17 @@ impl ImageBuildAdmission {
                 .as_ref()
                 .map(|build| build.metadata.name.clone())
                 .unwrap_or_else(|| format!("image-build-{}-{}", recipe_key.trim_start_matches("sha256:"), host_ref));
+            // The layer name is a declared field: read this layer's history only.
             let old_inputs = builds
-                .list()
+                .query_declared(&StoreQuery {
+                    fields: BTreeMap::from([("spec.layer.name".into(), layer.name.clone())]),
+                    ..StoreQuery::default()
+                })
                 .await
                 .map_err(|error| error.to_string())?
                 .items
                 .into_iter()
+                .map(|old| old.object)
                 .filter(|old| {
                     old.spec.layer.name == layer.name
                         && old.spec.inputs.architecture == inputs.architecture

@@ -61,3 +61,52 @@ file boundaries, literal forms, and shared production/test source inclusions.
 Runtime executable paths and borrowed command literals are checked as well as
 bare names, including supervised process spawning and binary probes. Literal
 instance names passed to `select(kind, Some(...))` are checked structurally.
+
+## Store read guard rail
+
+`store_reads.py` (run by `check.py`, tested through `test_check.py` via
+`store_reads_tests.py`) rejects a **whole-kind store list repeated per loop
+iteration or per item** in production code. Such a list re-reads every object of
+a kind for each item, so its cost grows with unrelated objects; read budgets in
+tests (`flotilla_store_testkit::ReadBudget`, `assert_flat_reads`) catch the
+same regression at run time for the scenarios they cover.
+
+A **whole-kind list** is:
+
+- a zero-argument `.list()` on a typed resolver: a `using`, `including_replicas`
+  or `definitions` call, a local `let`-bound to one (through `clone`/borrows), or
+  an unresolved receiver such as a field (`self.convoys`) or parameter;
+- any call named `list_raw`, `list_typed`, `list_sources`, `list_replica_sources`,
+  `list_replicas_raw`/`_typed`, `list_replica_sources_raw`/`_typed`,
+  `list_including_replicas_raw`/`_typed`, `list_resource_kind` (and its
+  replica variants) or `list_and_watch`.
+
+Label-selected lists (`list_matching_labels`), declared queries, named reads
+(`get`, `get_all`, `list_names`) and watch views are not whole-kind lists.
+
+A list **repeats** when, between it and its enclosing `fn`, there is a `loop`,
+a `while` (body or condition), the body of a `for` (not its iterator
+expression), or a closure passed to a per-item iterator/stream adapter (`map`,
+`then`, `for_each`, `filter_map`, `fold`, `any`, `retain`, ...). Two shapes are
+exempt because they read each partition once:
+
+- a **partition sweep**: the `for` binding or closure parameter itself selects
+  the listed namespace or store (`for ns in namespaces { backend.using::<T>(&ns).list() }`,
+  `for source in &sources { source.list() }`); a field of the item
+  (`&item.namespace`) does not count;
+- a **memoized read**: a closure passed to `get_or_init`/`get_or_try_init` on a
+  `OnceCell` declared outside the loop.
+
+Remaining intentional repeats are listed in `store_reads_allowlist.toml` by
+file and function, with the exact number of such lists and a reason. New
+findings, changed counts, stale entries and entries without a reason fail.
+Prefer hoisting, a `OnceCell`, a declared query or a view over a new entry.
+
+Scope, like the boundary checks: this is syntax, not type or data-flow analysis.
+Known false positives: a `.list()` on an unresolved non-store receiver in a loop
+(allowlist or rename it), and `map` closures on `Option`/`Result`. Known false
+negatives: lists reached through a helper function called in a loop, receivers
+bound by destructuring or by a non-resolver expression, unselective declared
+queries (`query_declared(&StoreQuery::default())`, which read observers count as
+`ReadOperation::List`), recursion, and loops expressed by re-spawned tasks.
+Test code is exempt through the shared `cfg(test)`/integration-test traversal.

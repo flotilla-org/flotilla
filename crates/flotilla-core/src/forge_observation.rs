@@ -717,7 +717,7 @@ mod tests {
                 .await
                 .expect("unrelated pulse");
         }
-        let before = counted.read_counts();
+        let before = counted.read_snapshot();
         let reads = ForgeReads::new(peer, "flotilla".into());
         let started = tokio::time::Instant::now();
         // Model the daemon's outer interactive deadline: the observation must
@@ -733,12 +733,9 @@ mod tests {
         assert_eq!(started.elapsed(), REMOTE_READ_TIMEOUT);
         // Empty named reads return no counted records. The parent is returned
         // exactly once by the initial status lookup and once by the recheck.
+        let decoded = counted.read_snapshot().since(&before).objects_by_kind();
         for (kind, expected) in [(ForgeRead::API_PATHS.kind, 2), (ForgeReadHeartbeat::API_PATHS.kind, 0)] {
-            assert_eq!(
-                counted.read_counts().get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default(),
-                expected,
-                "waiting reads only the named demand pair"
-            );
+            assert_eq!(decoded.get(kind).copied().unwrap_or_default(), expected, "waiting reads only the named demand pair");
         }
     }
 

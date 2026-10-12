@@ -1,7 +1,7 @@
 use crate::Store;
 #[cfg(test)]
 use crate::StoreExt;
-use crate::{convert_read, transcode, ReadObserver, ResourceKind, SerializedResource};
+use crate::{convert_read, transcode, ReadObserver, ReadOperation, ResourceKind, SerializedResource};
 use crate::{watch, DigestQuery, MessageQuery, PartitionDigest, ResourcePosition};
 use crate::{SerializedReadWatchEvent, SerializedWatchEvent, SerializedWatchStream, WatchAction, WatchObject, WatchPayload};
 use std::{
@@ -2777,7 +2777,7 @@ impl Store for SqliteBackend {
             })
             .await?;
         if let Some(observer) = &self.read_observer {
-            observer.read(kind.paths.kind, items.len());
+            observer.read(kind.paths.kind, completion_query.read_operation(), items.len());
         }
         items = crate::merge_query_definitions(&completion_query, items, &self.local_root())?;
         crate::sort_query_items(&mut items);
@@ -2829,7 +2829,7 @@ impl Store for SqliteBackend {
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
         let result = self.query_messages(namespace, query, include_replicas).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read("Message", result.len());
+            observer.read("Message", ReadOperation::Query, result.len());
         }
         result.into_iter().map(convert_read).collect()
     }
@@ -2849,7 +2849,7 @@ impl Store for SqliteBackend {
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
         let result = SqliteBackend::list_replicas_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::List, result.len());
         }
         Ok(result)
     }
@@ -2861,7 +2861,7 @@ impl Store for SqliteBackend {
     ) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
         let result = SqliteBackend::get_replicas_raw(self, resource_kind, namespace, name).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, result.len());
         }
         Ok(result)
     }
@@ -2938,7 +2938,7 @@ impl Store for SqliteBackend {
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         let result = SqliteBackend::get_raw(self, resource_kind, namespace, name).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, 1);
+            observer.read(resource_kind.paths.kind, ReadOperation::Get, 1);
         }
         Ok(result)
     }
@@ -2975,7 +2975,7 @@ impl Store for SqliteBackend {
     async fn list_raw(&self, resource_kind: ResourceKind, namespace: &str) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = SqliteBackend::list_raw(self, resource_kind, namespace).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::List, result.items.len());
         }
         Ok(result)
     }
@@ -2987,7 +2987,7 @@ impl Store for SqliteBackend {
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
         let result = SqliteBackend::list_raw_matching_labels(self, resource_kind, namespace, required).await?;
         if let Some(observer) = self.read_observer() {
-            observer.read(resource_kind.paths.kind, result.items.len());
+            observer.read(resource_kind.paths.kind, ReadOperation::Query, result.items.len());
         }
         Ok(result)
     }

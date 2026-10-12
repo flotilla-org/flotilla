@@ -3586,25 +3586,7 @@ mod tests {
         let run = tokio::spawn(async move {
             Aggregator::new(run_state, HostName::new("kiwi"), event_tx)
                 .with_attach_resolver(attach_resolver)
-                .run(
-                    AggregatorResolvers::builder()
-                        .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
-                        .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
-                        .durable_demands(durable.clone().using::<Demand>("flotilla"))
-                        .durable_environments(durable.clone().using::<Environment>("flotilla"))
-                        .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
-                        .durable_projects(durable.including_replicas::<Project>("flotilla"))
-                        .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
-                        .durable_regards(durable.using::<Regard>("flotilla"))
-                        .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
-                        .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
-                        .durable_clones(durable.using::<CloneResource>("flotilla"))
-                        .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
-                        .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
-                        .observed_checkouts(observed.using::<Checkout>("flotilla"))
-                        .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
-                        .build(),
-                )
+                .run(namespace_resolvers(&durable, &observed))
                 .await
         });
 
@@ -3632,6 +3614,92 @@ mod tests {
         assert_eq!(convoy.vessels[0].materialize.as_deref(), Some("terminal-convoy-a-implement-coder"));
         assert!(awareness.rows.as_awareness().expect("awareness rows").iter().any(|node| node.label == "widgets"));
 
+        assert!(!run.is_finished(), "the resource watches remain live");
+        run.abort();
+        let _ = run.await;
+    }
+
+    fn namespace_resolvers(durable: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+        AggregatorResolvers::builder()
+            .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
+            .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
+            .durable_demands(durable.clone().using::<Demand>("flotilla"))
+            .durable_environments(durable.clone().using::<Environment>("flotilla"))
+            .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
+            .durable_projects(durable.including_replicas::<Project>("flotilla"))
+            .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
+            .durable_regards(durable.using::<Regard>("flotilla"))
+            .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
+            .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
+            .durable_clones(durable.using::<CloneResource>("flotilla"))
+            .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
+            .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
+            .observed_checkouts(observed.using::<Checkout>("flotilla"))
+            .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
+            .build()
+    }
+
+    // #3045: after bootstrap the Aggregator maintains result sets from watch
+    // events alone. Creating, changing and deleting resources of every watched
+    // durable kind republishes rows without any whole-kind list, on any task.
+    #[tokio::test]
+    async fn steady_state_applies_events_without_listing() {
+        use flotilla_store_testkit::ReadCountsBackendExt;
+        let durable = ResourceBackend::new(InMemoryBackend::default());
+        let observed = ResourceBackend::new(InMemoryBackend::observed());
+        let (counted_durable, counted_observed) = (durable.clone().with_read_counts(), observed.clone().with_read_counts());
+        let convoys = durable.clone().using::<Convoy>("flotilla");
+        let seed = convoy_with_vessel("convoy-a").await;
+        let created = convoys.create(&InputMeta::builder().name("convoy-a".into()).build(), &seed.spec).await.expect("seed convoy");
+        convoys.update_status("convoy-a", &created.metadata.resource_version, seed.status.as_ref().expect("status")).await.expect("status");
+
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let run_state = state.clone();
+        let resolvers = namespace_resolvers(&counted_durable, &counted_observed);
+        let run = tokio::spawn(async move { Aggregator::new(run_state, HostName::new("kiwi"), event_tx).run(resolvers).await });
+        async fn wait_for(receiver: &mut broadcast::Receiver<DaemonEvent>, name: &str) {
+            let names = |event: &DaemonEvent| match event {
+                DaemonEvent::ResultSet(result) if result.query() == (QueryId::Convoys { scope: None }) => {
+                    result.rows.as_convoys().map(|rows| rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>())
+                }
+                DaemonEvent::ResultDelta(delta) => delta.changes.as_convoys().map(|rows| rows.iter().map(|row| row.name.clone()).collect()),
+                _ => None,
+            };
+            timeout(Duration::from_secs(5), async {
+                while !names(&receiver.recv().await.expect("aggregator event")).is_some_and(|names| names.iter().any(|n| n == name)) {}
+            })
+            .await
+            .unwrap_or_else(|_| panic!("aggregator publishes {name}"));
+        }
+        wait_for(&mut event_rx, "convoy-a").await;
+        let durable_bootstrap = counted_durable.read_snapshot();
+        let observed_bootstrap = counted_observed.read_snapshot();
+        assert!(!durable_bootstrap.lists().is_empty(), "bootstrap lists each watched kind once");
+
+        for index in 0..8 {
+            let name = format!("convoy-{index}");
+            let seed = convoy_with_vessel(&name).await;
+            let created = convoys.create(&InputMeta::builder().name(name.clone()).build(), &seed.spec).await.expect("convoy");
+            convoys.update_status(&name, &created.metadata.resource_version, seed.status.as_ref().expect("status")).await.expect("status");
+            durable
+                .clone()
+                .using::<Project>("flotilla")
+                .create(&InputMeta::builder().name(format!("project-{index}")).build(), &project_object("widgets").await.spec)
+                .await
+                .expect("project");
+            let session = session_object(&format!("terminal-{index}")).await;
+            durable
+                .clone()
+                .using::<TerminalSession>("flotilla")
+                .create(&InputMeta::builder().name(session.metadata.name.clone()).build(), &session.spec)
+                .await
+                .expect("session");
+        }
+        convoys.delete("convoy-0").await.expect("delete convoy");
+        wait_for(&mut event_rx, "convoy-7").await;
+        counted_durable.read_snapshot().since(&durable_bootstrap).assert_no_lists("aggregator durable watches");
+        counted_observed.read_snapshot().since(&observed_bootstrap).assert_no_lists("aggregator observed watches");
         assert!(!run.is_finished(), "the resource watches remain live");
         run.abort();
         let _ = run.await;

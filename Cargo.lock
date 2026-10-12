@@ -1112,6 +1112,7 @@ dependencies = [
  "flotilla-store",
  "flotilla-store-memory",
  "flotilla-store-sqlite",
+ "flotilla-store-testkit",
  "flotilla-tls",
  "futures",
  "hegeltest",

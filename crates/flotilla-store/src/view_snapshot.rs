@@ -1,6 +1,6 @@
 //! Immutable request snapshot composed from watch views. Existing typed
 //! resolvers can consume it without changing their query or routing contracts.
-use crate::{ReadObserver, ResourceKind, SerializedResource, Store};
+use crate::{ReadObserver, ReadOperation, ResourceKind, SerializedResource, Store};
 use flotilla_protocol::NodeId;
 use flotilla_resources::*;
 use serde_json::Value;
@@ -46,16 +46,45 @@ impl ViewSnapshot {
         );
         Ok(())
     }
-    fn items(&self, kind: ResourceKind, namespace: &str) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+    fn partition(&self, kind: ResourceKind, namespace: &str) -> Result<&SnapshotPartition, ResourceError> {
         self.objects
             .get(&(kind.paths.kind.into(), namespace.into()))
-            .map(|partition| {
-                if let Some(observer) = &self.observer {
-                    observer.read(kind.paths.kind, partition.items.len());
-                }
-                partition.items.iter().filter(|item| !self.shadowed(item, partition)).cloned().collect()
-            })
             .ok_or_else(|| ResourceError::invalid(format!("kind {} missing from view snapshot", kind.paths.kind)))
+    }
+    fn observe(&self, kind: ResourceKind, operation: ReadOperation, objects: usize) {
+        if let Some(observer) = &self.observer {
+            observer.read(kind.paths.kind, operation, objects);
+        }
+    }
+    /// A whole-kind list: visits every object in the partition.
+    fn items(&self, kind: ResourceKind, namespace: &str) -> Result<Vec<ReadResourceObject<SerializedResource>>, ResourceError> {
+        let partition = self.partition(kind, namespace)?;
+        self.observe(kind, ReadOperation::List, partition.items.len());
+        Ok(self.visible(partition))
+    }
+    fn visible(&self, partition: &SnapshotPartition) -> Vec<ReadResourceObject<SerializedResource>> {
+        partition.items.iter().filter(|item| !self.shadowed(item, partition)).cloned().collect()
+    }
+    /// Visible provenances of one name, without cloning the partition.
+    fn named(
+        &self,
+        kind: ResourceKind,
+        namespace: &str,
+        name: &str,
+        local_only: bool,
+    ) -> Result<Option<ReadResourceObject<SerializedResource>>, ResourceError> {
+        let partition = self.partition(kind, namespace)?;
+        let found = partition
+            .items
+            .iter()
+            .find(|item| {
+                item.object.metadata.name == name
+                    && !self.shadowed(item, partition)
+                    && (!local_only || matches!(item.provenance, ResourceProvenance::Local))
+            })
+            .cloned();
+        self.observe(kind, ReadOperation::Get, usize::from(found.is_some()));
+        Ok(found)
     }
     fn shadowed(&self, item: &ReadResourceObject<SerializedResource>, partition: &SnapshotPartition) -> bool {
         matches!(&item.provenance, ResourceProvenance::Replica { origin_root, .. }
@@ -114,9 +143,7 @@ impl Store for ViewSnapshot {
                 }
             })
             .collect();
-        if let Some(observer) = &self.observer {
-            observer.read(kind.paths.kind, items.len());
-        }
+        self.observe(kind, query.read_operation(), items.len());
         crate::sort_query_items(&mut items);
         Ok(crate::QueryResult {
             local_root: self.root.clone(),
@@ -170,11 +197,7 @@ impl Store for ViewSnapshot {
         namespace: &str,
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
-        self.items(resource_kind, namespace)?
-            .into_iter()
-            .find(|item| item.object.metadata.name == name && matches!(item.provenance, ResourceProvenance::Local))
-            .map(|item| item.object)
-            .ok_or_else(|| ResourceError::not_found(name))
+        self.named(resource_kind, namespace, name, true)?.map(|item| item.object).ok_or_else(|| ResourceError::not_found(name))
     }
     async fn current_position_raw(&self, _resource_kind: ResourceKind, _namespace: &str) -> Result<ResourcePosition, ResourceError> {
         Err(self.unsupported_operation("mutating or watching view snapshots"))
@@ -205,9 +228,16 @@ impl Store for ViewSnapshot {
         namespace: &str,
         required: &BTreeMap<String, String>,
     ) -> Result<ResourceList<SerializedResource>, ResourceError> {
-        let mut listed = self.list_raw(resource_kind, namespace).await?;
-        listed.items.retain(|item| required.iter().all(|(key, value)| item.metadata.labels.get(key) == Some(value)));
-        Ok(listed)
+        // A label selector is a query in every adapter, counted by its matches.
+        let items = self
+            .visible(self.partition(resource_kind, namespace)?)
+            .into_iter()
+            .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+            .map(|item| item.object)
+            .filter(|item| required.iter().all(|(key, value)| item.metadata.labels.get(key) == Some(value)))
+            .collect::<Vec<_>>();
+        self.observe(resource_kind, ReadOperation::Query, items.len());
+        Ok(ResourceList { items, resource_version: String::new(), generation: None })
     }
     async fn create_raw(
         &self,
@@ -271,9 +301,6 @@ impl Store for ViewSnapshot {
         namespace: &str,
         name: &str,
     ) -> Result<ReadResourceObject<SerializedResource>, ResourceError> {
-        self.items(kind, namespace)?
-            .into_iter()
-            .find(|item| item.object.metadata.name == name)
-            .ok_or_else(|| ResourceError::not_found(name))
+        self.named(kind, namespace, name, false)?.ok_or_else(|| ResourceError::not_found(name))
     }
 }

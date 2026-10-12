@@ -2914,6 +2914,9 @@ impl InProcessDaemon {
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
+        // Read the Convoy inventory at most once per pass, and only once an
+        // adopted Checkout needs it, rather than once per adopted Checkout.
+        let convoys = tokio::sync::OnceCell::new();
         for checkout in checkouts.list().await.map_err(|error| error.to_string())?.items {
             if checkout.metadata.lifecycle_authority().map_err(|error| error.to_string())? != Some(LifecycleAuthority::Adopted) {
                 continue;
@@ -2925,15 +2928,12 @@ impl InProcessDaemon {
             let vcs = self.vcs_for_checkout(&self.local_environment_id, Path::new(path)).await?;
             let convoy_ref = checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str);
             let source_root = checkout.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str);
-            let convoy = self
-                .resource_backend
-                .clone()
-                .including_replicas::<ResourceConvoy>(namespace)
-                .list()
+            let convoy = convoys
+                .get_or_try_init(|| async { self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await })
                 .await
                 .map_err(|error| error.to_string())?
                 .items
-                .into_iter()
+                .iter()
                 .find_map(|source| {
                     let origin_matches = match (source_root, &source.provenance) {
                         (Some(expected), ResourceProvenance::Replica { origin_root, .. }) => origin_root.as_str() == expected,
@@ -2947,7 +2947,7 @@ impl InProcessDaemon {
                         },
                         |expected| source.object.metadata.name == expected,
                     );
-                    (origin_matches && association_matches).then_some(source.object)
+                    (origin_matches && association_matches).then(|| source.object.clone())
                 });
             let integration = if let Some(convoy) = convoy.as_ref() {
                 let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout, &forges);

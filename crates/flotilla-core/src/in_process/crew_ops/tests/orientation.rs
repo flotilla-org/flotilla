@@ -166,10 +166,6 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
 async fn crew_list_never_reads_message_history() {
     use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec};
 
-    fn delta(before: &BTreeMap<String, usize>, after: &BTreeMap<String, usize>, kind: &str) -> usize {
-        after.get(kind).copied().unwrap_or_default() - before.get(kind).copied().unwrap_or_default()
-    }
-
     let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
     backend
         .using::<flotilla_resources::Vessel>("flotilla")
@@ -191,13 +187,12 @@ async fn crew_list_never_reads_message_history() {
         vessel_ref: Some("crew-work".into()),
         role: Some("coder".into()),
     };
-    let memory = &backend;
-    let before = memory.read_counts();
+    let before = backend.read_snapshot();
     let expected = crew.crew_list_internal(&context).await.unwrap();
     assert_eq!(expected.members[0].role, "coder");
-    let baseline = memory.read_counts();
-    let convoy_reads = delta(&before, &baseline, "Convoy");
-    assert_eq!(delta(&before, &baseline, "Message"), 0);
+    let expected_reads = backend.read_snapshot().since(&before);
+    assert_eq!(expected_reads.calls_by_kind().get("Message"), None);
+    expected_reads.assert_no_lists("crew list");
     let messages = backend.using::<Message>("flotilla");
     for index in 0..2003 {
         let receiver = if index < 2000 { format!("flotilla/other-{index}/work/coder") } else { "flotilla/crew/work/coder".into() };
@@ -230,11 +225,11 @@ async fn crew_list_never_reads_message_history() {
                 messages.delete(&record.metadata.name).await.unwrap();
             }
         }
-        let before = memory.read_counts();
+        let before = backend.read_snapshot();
         let response = crew.crew_list_internal(&context).await.unwrap();
-        let after = memory.read_counts();
-        assert_eq!(delta(&before, &after, "Message"), 0, "orientation must not read messages (replicated={replicated})");
-        assert_eq!(delta(&before, &after, "Convoy"), convoy_reads, "orientation must not resolve message receivers");
+        // Identical reads per kind and operation: no Message read and no
+        // receiver resolution, however large or replicated the history.
+        assert_eq!(backend.read_snapshot().since(&before), expected_reads, "orientation reads (replicated={replicated})");
         assert_eq!(response, expected, "history must not affect crew state");
         assert!(serde_json::to_value(response).unwrap()["members"][0].get("messages").is_none(), "orientation has no inbox wire field");
     }
