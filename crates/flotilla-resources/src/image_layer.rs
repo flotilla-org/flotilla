@@ -122,6 +122,9 @@ pub struct FrozenImageLayers {
 impl FrozenImageLayers {
     /// Append newly used capabilities without changing already frozen inputs.
     pub fn include(&mut self, composition: &ImageComposition) -> Result<(), String> {
+        if composition.literal_base.is_some() && composition.layers.is_empty() {
+            return Ok(());
+        }
         if self.selection.as_ref().is_some_and(|selection| selection != &composition.selection) {
             return Err("convoy vessels must share their frozen image selection".into());
         }
@@ -155,10 +158,14 @@ pub struct ImageComposition {
     pub needs: BTreeSet<String>,
     #[serde(default)]
     pub layers: Vec<FrozenImageLayer>,
-    /// Generation 1 runs the authoritative baseline while recording layers.
-    /// Remove this bridge when generation 2 placements use built compositions.
+    /// Generation-1 frozen snapshots retain their literal until completion.
+    /// Decode bridge: remove after the generation-2 fleet roll (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_image: Option<String>,
+    /// A retired baseline resolves to a no-layer composition of its literal.
+    /// This is a source image, not a fallback from failed layer builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub literal_base: Option<String>,
     /// Bound only when placed, never inferred from an admission-time tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<PlacedImageIdentity>,

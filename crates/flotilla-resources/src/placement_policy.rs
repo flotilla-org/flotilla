@@ -145,8 +145,9 @@ pub enum DockerCheckoutStrategy {
 #[serde(untagged)]
 pub enum DockerImageSource {
     Literal(String),
-    // Generation 1 baseline remains authoritative. Retire after generation 2
-    // stops writing baseline references and its subsequent fleet roll.
+    // Compatibility reader only: generation-2 fleet policies use Composition.
+    // Resolve old references into no-layer literal compositions at admission.
+    // Remove with CrewImageBaseline in generation 3 after the cut-over roll.
     Baseline { image_baseline_ref: String },
     Composition { composition: Box<crate::ImageComposition> },
 }

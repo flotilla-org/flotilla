@@ -82,8 +82,14 @@ copied and it has no peers. Its scratch Git repository needs no forge
 credential. The scratch checkout has a private local bare repository as a
 `file://` remote, so convoy admission has a clonable transport; the host
 worktree checkout mode keeps that path outside the container. The generation
-carries its frozen crew-image baseline; the canary uses that image with
-`docker_per_vessel`, the shared crew memory-policy default
+no longer packages a crew-image baseline. The canary reads the newest Ready
+local Docker Environment's `local_image_id` through the installed host client
+(with auto-spawn forbidden), then freezes that concrete image in a no-layer
+composition for the isolated daemon. It does not build or discover image tags.
+An operator can select another built local ID or pinned registry reference with
+`FLEET_CANARY_IMAGE`; missing/malformed evidence fails the gate rather than
+selecting an older image. The canary uses `if_not_present` acquisition with
+`docker_per_vessel` and the shared crew memory-policy default
 (currently 80% of host RAM divided among four crews, with zero swap). The
 `fleet-canary` adapter is available only when `FLOTILLA_FLEET_CANARY=1` is
 discovered. It uses normal agent
@@ -273,3 +279,14 @@ The new field-value tables and lookup indexes are additive named migrations.
 Superseded built-in indexes may be retired after the rollback retention window;
 that housekeeping is separate from rollback itself. Native open also removes
 function-dependent objects from pre-release #3057 schemas automatically.
+
+### Crew-image cut-over rollback boundary
+
+The candidate validator accepts the retired `crew-image-baseline.yaml` payload
+through the compatibility roll so previous generation **bundles** remain valid.
+This does not guarantee that the previous binary can decode resources written
+by the candidate. Its `ImageComposition` decoder denies unknown fields and
+rejects new `literal_base` snapshots. ADR 0047 guarantees N→N+1 decoding only.
+After new stored writes, rollback needs a decoder-compatible build or explicit
+stored-data recovery. The pre-activation canary uses a private temporary store
+and does not cross that boundary in the live fleet store.

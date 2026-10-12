@@ -179,3 +179,23 @@ Authors to coordinate: this repository's `.flotilla/crew-image-baseline.yaml`
 and placement manifests, and out-of-repo project-map operational entries and
 fleet-ops manifests. Their existing baseline/image/grant forms remain decodable
 in generation 1; no companion deployment edit is required by this slice.
+
+### Generation-2 cut-over (#2731)
+
+Fleet placement manifests now author `Composition` selections, with admission
+filling frozen layers and placement binding built identity. New layered
+admissions discard generation-1 `baseline_image` shadow metadata, so a failed
+or pending build cannot run the old baseline. Existing frozen snapshots retain
+that metadata until completion. Legacy baselines without layers resolve to a
+no-layer composition with `literal_base`; literal image sources remain permanent.
+
+Under ADR 0047, `literal_base` is optional/defaulted, and previous composition,
+convoy, vessel and environment records remain decodable. The baseline kind and
+source remain compatibility readers through the generation-2 roll. Their
+physical removal is generation 3, after a fleet roll and candidate validation
+prove those references absent; deleting them in the same roll would violate
+ADR 0047. The golden corpus is unchanged.
+
+The baseline authoring manifest and Forgejo image workflow are retired.
+`docs/crew-image.md` lists per-host policy updates, fleet-ops/project-map
+companions, CI PAT/runner cleanup and the ordered generation-2/3 roll.

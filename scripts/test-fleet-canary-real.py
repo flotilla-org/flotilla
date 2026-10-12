@@ -33,7 +33,6 @@ def main():
         cleat.write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo "cleat 0.1.0"; exit 0; fi\necho "pre-Docker admission test" >&2\nexit 1\n')
         cleat.chmod(0o755)
         shutil.copyfile(source / 'scripts/fleet-canary-agent.sh', release / 'fleet-canary-agent.sh')
-        shutil.copyfile(source / '.flotilla/crew-image-baseline.yaml', release / 'crew-image-baseline.yaml')
         # Fixture for the generation's frozen skill bundle; no downloads or credentials.
         skills = release / 'share/flotilla/skills'
         (skills / 'skills/testing').mkdir(parents=True)
@@ -52,7 +51,7 @@ def main():
         environment = canary.isolated_environment(release, probe)
         with (root / 'commands.log').open('w') as log:
             commands = canary.Commands(environment, log)
-            gate = canary.Canary(release, probe, commands, timeout=30)
+            gate = canary.Canary(release, probe, commands, timeout=30, image="sha256:" + "a" * 64)
             try:
                 # #2854: real setup and admission must accept the credential-free
                 # repository and persist the convoy before Docker launch is needed.
@@ -64,7 +63,7 @@ def main():
                 gate.apply('PlacementPolicy', 'memory-default', {
                     'pool': 'cleat', 'docker_per_vessel': {
                         'host_ref': gate.list('hosts')[0]['metadata']['name'],
-                        'image': {'image_baseline_ref': 'fleet-crew'},
+                        'image': canary.canary_image(gate.image),
                         'checkout': {'worktree_on_host_and_mount': {'mount_path': '/workspace'}}}})
                 policy = gate.list('placementpolicies')
                 authored = next(item for item in policy if item['metadata']['name'] == 'fleet-canary')

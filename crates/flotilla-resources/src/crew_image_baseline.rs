@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{resource::define_resource, NoStatusPatch, ReplicationClass};
 
 // Image selection is fleet resolver configuration, not host runtime state.
-// Generation 1 keeps this kind authoritative alongside layers. Retire it only
-// after generation 2 stops writing baselines plus the next fleet roll.
+// Compatibility-only in generation 2 (#2731): no fleet manifests author it.
+// Keep registration for the previous stored generation; remove in generation 3
+// after the cut-over fleet roll and validation of stored/operational references.
 define_resource!(
     CrewImageBaseline,
     "crewimagebaselines",

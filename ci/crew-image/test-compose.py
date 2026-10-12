@@ -14,6 +14,12 @@ from compose import ROOT, dockerfile, manifests
 
 
 class Composition(unittest.TestCase):
+    def test_retired_image_publication_inputs_are_absent(self):
+        # #2731: composition admission replaces the curated baseline and CI
+        # publisher. Check retirement when this suite is invoked directly too.
+        self.assertFalse((ROOT / '.forgejo/workflows/crew-image.yml').exists())
+        self.assertFalse((ROOT / '.flotilla/crew-image-baseline.yaml').exists())
+
     def test_compatibility_file_is_generated_from_spine(self):
         # The compatibility build and independent fleet stages use one source.
         self.assertEqual((ROOT / '.flotilla/Dockerfile.crew').read_text(), dockerfile())
@@ -60,6 +66,25 @@ class Composition(unittest.TestCase):
                 default = re.search(r'^ARG ' + name + r'=(.+)$', fragment, re.M)
                 self.assertIsNotNone(default, name)
                 self.assertEqual(default.group(1), pin['value'], name)
+
+    def test_harness_pin_keeps_recorded_hook_trust_contract(self):
+        # The production harness pin, rather than a retired CI input, determines
+        # which recorded upstream hook contract the trust decoder must use.
+        catalogue = json.loads((ROOT / '.flotilla/image-layers/inputs.json').read_text())
+        harness = next(layer for layer in catalogue['layers'] if layer['stage'] == 'harness')
+        version = harness['pins']['CODEX_VERSION']['value']
+        fixture = 'codex-hooks-list-' + version + '.json'
+        agents = ROOT / 'crates/flotilla-core/src/agents'
+        self.assertTrue((agents / 'fixtures' / fixture).is_file())
+        self.assertIn('include_str!("fixtures/' + fixture + '")', (agents / 'hooks.rs').read_text())
+
+    def test_harness_preserves_terminfo_without_overriding_terminal_identity(self):
+        # The generated compatibility recipe still exercises the production
+        # fragments; moving builds out of CI must preserve terminal support.
+        text = dockerfile()
+        self.assertIn('infocmp xterm-ghostty', text)
+        self.assertIn('ghostty-src/LICENSE', text)
+        self.assertIsNone(re.search(r'^ENV TERM( |=)', text, re.M))
 
     def test_unresolved_manifest_inputs_are_refused(self):
         for revision, base in [('main', 'ubuntu@sha256:' + 'b' * 64),
