@@ -49,10 +49,17 @@ use crate::{
     checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
     config::ConfigStore,
     fleet::crew_attention,
-    leaf_engine::{LeafSubscriptionTable, TurnDeliveryActuator},
+    leaf_engine::{EscalationAdmission, LeafSubscriptionTable, TurnDeliveryActuator},
     providers::change_request::observation::ChangeRequestRef,
     resource_explain::explain_unmet_expectation,
 };
+
+/// An authorized supervision decision; escalation carries its admitted recipient.
+enum SupervisorRuling {
+    Resume,
+    Fail,
+    Escalate { receiver: String, condition: Box<flotilla_resources::StalledCondition> },
+}
 
 /// Owns every participant in the convoy message transaction. Completion,
 /// resume, withdrawal, and observation-driven release share the same lock map.
@@ -1661,19 +1668,13 @@ impl CrewService {
                     })
                 })
         };
-        use crate::leaf_engine::EscalationAdmission;
-        enum Ruling {
-            Resume,
-            Fail,
-            Escalate { receiver: String, condition: Box<flotilla_resources::StalledCondition> },
-        }
         let ruling = match action {
-            flotilla_protocol::CrewSupervisionAction::Resume => Ruling::Resume,
-            flotilla_protocol::CrewSupervisionAction::Fail => Ruling::Fail,
+            flotilla_protocol::CrewSupervisionAction::Resume => SupervisorRuling::Resume,
+            flotilla_protocol::CrewSupervisionAction::Fail => SupervisorRuling::Fail,
             flotilla_protocol::CrewSupervisionAction::Escalate => {
                 match self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message, vessel, role).await? {
                     EscalationAdmission::Refused(value) => return Ok(*value),
-                    EscalationAdmission::Admitted { receiver, condition } => Ruling::Escalate { receiver, condition },
+                    EscalationAdmission::Admitted { receiver, condition } => SupervisorRuling::Escalate { receiver, condition },
                 }
             }
         };
@@ -1682,7 +1683,7 @@ impl CrewService {
         // are notifications (no expectation and no resume/activation); delivery
         // cannot itself fail work or advance a rung. The command still reports
         // any state-patch failure, so the supervisor can retry that mutation.
-        if !matches!(ruling, Ruling::Resume) {
+        if !matches!(ruling, SupervisorRuling::Resume) {
             let name = flotilla_resources::message_record_name(&receiver, &sender, &format!("supervision:{}", uuid::Uuid::new_v4()));
             let intent = flotilla_resources::MessageSpec::builder()
                 .sender(sender.clone())
@@ -1694,7 +1695,7 @@ impl CrewService {
             self.publish_message_intent(namespace, &name, &intent).await?;
         }
         match ruling {
-            Ruling::Resume => {
+            SupervisorRuling::Resume => {
                 self.convoy_resume_with_sender_internal(
                     namespace,
                     convoy_name,
@@ -1705,7 +1706,7 @@ impl CrewService {
                 )
                 .await?;
             }
-            Ruling::Fail => {
+            SupervisorRuling::Fail => {
                 apply_resource_status_patch(
                     &convoys,
                     convoy_name,
@@ -1719,7 +1720,7 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-            Ruling::Escalate { receiver, condition } => {
+            SupervisorRuling::Escalate { receiver, condition } => {
                 let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
                 let mut updated = current.status.ok_or("convoy has no status")?;
                 // Local supervisor activation legitimately changes this convoy
