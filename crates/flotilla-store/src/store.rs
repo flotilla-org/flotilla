@@ -269,6 +269,14 @@ pub trait Store: std::fmt::Debug + Send + Sync {
     ) -> Result<bool, ResourceError> {
         Ok(false)
     }
+    /// One store inventory for discovery; keys are registered plural names.
+    async fn namespace_inventory(&self) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
+        let mut inventory = BTreeMap::new();
+        for kind in crate::declared_resource_kinds() {
+            inventory.insert(kind.paths.plural.to_string(), self.stored_namespaces_raw(kind).await?);
+        }
+        Ok(inventory)
+    }
     async fn local_namespaces_raw(&self, _resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
         Err(self.unsupported_operation("enumerating local resource namespaces"))
     }
@@ -307,6 +315,35 @@ pub trait Store: std::fmt::Debug + Send + Sync {
         _bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
         Err(self.unsupported_operation("replicas"))
+    }
+    /// Apply a bounded group of replica events. Persistent backends commit once
+    /// per batch; the default preserves the same event semantics in memory.
+    async fn apply_replica_batch_raw(
+        &self,
+        resource_kind: ResourceKind,
+        origin_root: &NodeId,
+        namespace: &str,
+        events: &[(WatchEvent<SerializedResource>, chrono::DateTime<Utc>)],
+    ) -> Result<(), ResourceError> {
+        for (event, synced_at) in events {
+            match event {
+                WatchEvent::Added(object) => {
+                    self.apply_replica_raw(resource_kind, origin_root, namespace, StoredReplicaEventKind::Added, object, *synced_at).await?
+                }
+                WatchEvent::Modified(object) => {
+                    self.apply_replica_raw(resource_kind, origin_root, namespace, StoredReplicaEventKind::Modified, object, *synced_at)
+                        .await?
+                }
+                WatchEvent::Deleted(object) => {
+                    self.apply_replica_raw(resource_kind, origin_root, namespace, StoredReplicaEventKind::Deleted, object, *synced_at)
+                        .await?
+                }
+                WatchEvent::DeletedByName(tombstone) => {
+                    self.apply_replica_tombstone_raw(resource_kind, origin_root, namespace, tombstone, *synced_at).await?
+                }
+            }
+        }
+        Ok(())
     }
     async fn apply_replica_raw(
         &self,

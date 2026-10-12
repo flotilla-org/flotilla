@@ -8,7 +8,10 @@ use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant},
 };
 
@@ -50,6 +53,7 @@ type WatchersByStore = HashMap<StoreKey, WatchChannel<StoredEvent>>;
 type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>;
 type CleanupKey = (StoreKey, &'static str);
 
+const READER_COUNT: usize = 4;
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const SLOW_STORE_OPERATION: Duration = Duration::from_millis(100);
@@ -66,7 +70,13 @@ struct ReplicaMutation {
 #[builder(builder_type(vis = "pub(in crate::sqlite)"))]
 pub struct SqliteBackend {
     connection: Connection,
-    read_connection: Option<Connection>,
+    read_connections: Vec<Connection>,
+    reader_slots: Arc<tokio::sync::Semaphore>,
+    available_readers: Arc<Mutex<Vec<usize>>>,
+    discovery_slots: Arc<tokio::sync::Semaphore>,
+    discovery_readers: Arc<Mutex<Vec<usize>>>,
+    writer_depth: Arc<AtomicUsize>,
+    read_depth: Arc<AtomicUsize>,
     // Mutations notify and watches register from the connection thread so a
     // committed event cannot land between replay and live delivery.
     watchers: Arc<Mutex<WatchersByStore>>,
@@ -77,6 +87,40 @@ pub struct SqliteBackend {
     read_observer: Option<Arc<dyn ReadObserver>>,
     // Serialize cross-kind Project/FleetDesignation admission across clones.
     pub(crate) hierarchy_admission: Arc<tokio::sync::Mutex<()>>,
+}
+
+// The worker owns leases and depth claims, including after a caller disappears.
+struct ReaderLease {
+    index: usize,
+    available: Arc<Mutex<Vec<usize>>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl Drop for ReaderLease {
+    fn drop(&mut self) {
+        if let Ok(mut available) = self.available.lock() {
+            available.push(self.index);
+        }
+    }
+}
+struct ReadCaller(Arc<AtomicBool>);
+impl Drop for ReadCaller {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+struct DepthClaim {
+    depth: Arc<AtomicUsize>,
+}
+impl DepthClaim {
+    fn new(depth: Arc<AtomicUsize>) -> Self {
+        depth.fetch_add(1, Ordering::Relaxed);
+        Self { depth }
+    }
+}
+impl Drop for DepthClaim {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +180,11 @@ impl StoredEventKind {
 }
 
 impl SqliteBackend {
+    #[cfg(test)]
+    pub(crate) fn writer_for_test(&self) -> Connection {
+        self.connection.clone()
+    }
+
     pub fn with_read_observer(mut self, observer: std::sync::Arc<dyn ReadObserver>) -> Self {
         self.read_observer = Some(observer);
         self
@@ -190,30 +239,39 @@ impl SqliteBackend {
         let connection =
             RusqliteConnection::open(&path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         let mut backend = Self::from_connection(connection, event_retention)?;
-        let read = RusqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
-        Self::register_digest_functions(&read)?;
-        Self::register_query_functions(&read)?;
-        read.busy_timeout(READ_BUSY_TIMEOUT)
-            .map_err(|err| ResourceError::other(format!("configure sqlite resource read busy timeout: {err}")))?;
-        backend.read_connection = Some(read.into());
+        for _ in 0..READER_COUNT {
+            let read = RusqliteConnection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|err| ResourceError::other(format!("open sqlite resource reader: {err}")))?;
+            Self::register_digest_functions(&read)?;
+            Self::register_query_functions(&read)?;
+            read.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))?;
+            backend.read_connections.push(read.into());
+        }
+        backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
+        backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
+        backend.discovery_readers = Arc::new(Mutex::new(vec![READER_COUNT - 1]));
         Ok(backend)
     }
 
     pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
         let connection = Connection::open(&path).await.map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         let mut backend = Self::from_async_connection(connection, EventRetention::default()).await?;
-        let read = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        for _ in 0..READER_COUNT {
+            let read = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .await
+                .map_err(|err| ResourceError::other(format!("open sqlite resource reader: {err}")))?;
+            read.call(|connection| {
+                Self::register_digest_functions(connection)?;
+                Self::register_query_functions(connection)?;
+                connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))
+            })
             .await
-            .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
-        read.call(|connection| {
-            Self::register_digest_functions(connection)?;
-            Self::register_query_functions(connection)?;
-            connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| ResourceError::other(format!("configure sqlite read timeout: {err}")))
-        })
-        .await
-        .map_err(Self::map_connection_error)?;
-        backend.read_connection = Some(read);
+            .map_err(Self::map_connection_error)?;
+            backend.read_connections.push(read);
+        }
+        backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
+        backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
+        backend.discovery_readers = Arc::new(Mutex::new(vec![READER_COUNT - 1]));
         Ok(backend)
     }
 
@@ -231,7 +289,13 @@ impl SqliteBackend {
         Self::initialize_connection(&mut connection, event_retention)?;
         Ok(Self {
             connection: connection.into(),
-            read_connection: None,
+            read_connections: Vec::new(),
+            reader_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            available_readers: Arc::new(Mutex::new(vec![0])),
+            discovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            discovery_readers: Arc::new(Mutex::new(vec![0])),
+            writer_depth: Arc::default(),
+            read_depth: Arc::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
             pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
@@ -249,7 +313,13 @@ impl SqliteBackend {
             .map_err(Self::map_connection_error)?;
         Ok(Self {
             connection,
-            read_connection: None,
+            read_connections: Vec::new(),
+            reader_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            available_readers: Arc::new(Mutex::new(vec![0])),
+            discovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            discovery_readers: Arc::new(Mutex::new(vec![0])),
+            writer_depth: Arc::default(),
+            read_depth: Arc::default(),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
             pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
@@ -923,11 +993,27 @@ impl SqliteBackend {
         F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
     {
         let started = Instant::now();
-        let result = self.connection.call(operation).await.map_err(Self::map_connection_error);
-        if started.elapsed() >= SLOW_STORE_OPERATION {
-            tracing::warn!(operation = operation_name, elapsed_ms = started.elapsed().as_millis(), "slow sqlite store operation");
-        }
-        result
+        let depth = DepthClaim::new(self.writer_depth.clone());
+        self.connection
+            .call(move |connection| {
+                let queue_wait = started.elapsed();
+                let queue_depth = depth.depth.load(Ordering::Relaxed).saturating_sub(1);
+                drop(depth);
+                let execution = Instant::now();
+                let result = operation(connection);
+                if started.elapsed() >= SLOW_STORE_OPERATION {
+                    tracing::warn!(
+                        operation = operation_name,
+                        queue_wait_ms = queue_wait.as_millis(),
+                        execution_ms = execution.elapsed().as_millis(),
+                        queue_depth,
+                        "slow sqlite store operation"
+                    );
+                }
+                result
+            })
+            .await
+            .map_err(Self::map_connection_error)
     }
 
     async fn read_call<R, F>(&self, operation_name: &'static str, operation: F) -> Result<R, ResourceError>
@@ -935,18 +1021,89 @@ impl SqliteBackend {
         R: Send + 'static,
         F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
     {
+        self.read_call_with_pool(operation_name, operation, false).await
+    }
+
+    async fn read_call_with_pool<R, F>(&self, operation_name: &'static str, operation: F, discovery: bool) -> Result<R, ResourceError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
+    {
         let started = Instant::now();
-        let connection = self.read_connection.as_ref().unwrap_or(&self.connection);
-        // A timeout bounds the caller, but tokio-rusqlite still runs a queued
-        // closure. SQLite's busy timeout bounds lock waits once it reaches the
-        // worker; a stalled worker can still leave later reads queued.
-        let result = tokio::time::timeout(READ_DEADLINE, connection.call(operation)).await;
-        if started.elapsed() >= SLOW_STORE_OPERATION {
-            tracing::warn!(operation = operation_name, elapsed_ms = started.elapsed().as_millis(), "slow sqlite store read");
-        }
+        let alive = Arc::new(AtomicBool::new(true));
+        let _caller = ReadCaller(alive.clone());
+        let depth = DepthClaim::new(self.read_depth.clone());
+        let execution_started = Arc::new(Mutex::new(None::<Instant>));
+        let worker_execution_started = execution_started.clone();
+        // Reserve the fourth WAL worker for inventory: discovery cannot queue
+        // behind either resource reads or the replication writer.
+        let (slots, available) = if discovery && !self.read_connections.is_empty() {
+            (&self.discovery_slots, &self.discovery_readers)
+        } else {
+            (&self.reader_slots, &self.available_readers)
+        };
+        let result = tokio::time::timeout(READ_DEADLINE, async {
+            let permit = slots.clone().acquire_owned().await.map_err(|_| ResourceError::other("sqlite reader pool closed"))?;
+            let index = available
+                .lock()
+                .map_err(|_| ResourceError::other("sqlite reader pool poisoned"))?
+                .pop()
+                .ok_or_else(|| ResourceError::other("sqlite reader pool empty"))?;
+            let lease = ReaderLease { index, available: available.clone(), _permit: permit };
+            let connection = self.read_connections.get(index).unwrap_or(&self.connection);
+            connection
+                .call(move |connection| {
+                    let _lease = lease;
+                    let queue_wait = started.elapsed();
+                    let queue_depth = depth.depth.load(Ordering::Relaxed).saturating_sub(1);
+                    drop(depth);
+                    if !alive.load(Ordering::Acquire) || queue_wait >= READ_DEADLINE {
+                        if queue_wait >= SLOW_STORE_OPERATION {
+                            tracing::warn!(
+                                operation = operation_name,
+                                queue_wait_ms = queue_wait.as_millis(),
+                                execution_ms = 0,
+                                queue_depth,
+                                "skipped abandoned sqlite read"
+                            );
+                        }
+                        return Err(ResourceError::other("resource store busy: read deadline exceeded"));
+                    }
+                    let execution = Instant::now();
+                    if let Ok(mut timing) = worker_execution_started.lock() {
+                        *timing = Some(execution);
+                    }
+                    let result = operation(connection);
+                    if started.elapsed() >= SLOW_STORE_OPERATION {
+                        tracing::warn!(
+                            operation = operation_name,
+                            queue_wait_ms = queue_wait.as_millis(),
+                            execution_ms = execution.elapsed().as_millis(),
+                            queue_depth,
+                            "slow sqlite store read"
+                        );
+                    }
+                    result
+                })
+                .await
+                .map_err(Self::map_connection_error)
+        })
+        .await;
         match result {
-            Ok(result) => result.map_err(Self::map_connection_error),
-            Err(_) => Err(ResourceError::other("resource store busy: read deadline exceeded")),
+            Ok(result) => result,
+            Err(_) => {
+                let execution = execution_started.lock().ok().and_then(|timing| *timing);
+                let queue_wait = execution.map_or_else(|| started.elapsed(), |execution| execution.duration_since(started));
+                let execution_time = execution.map_or(Duration::ZERO, |execution| execution.elapsed());
+                tracing::warn!(
+                    operation = operation_name,
+                    queue_wait_ms = queue_wait.as_millis(),
+                    execution_ms = execution_time.as_millis(),
+                    queue_depth = self.read_depth.load(Ordering::Relaxed),
+                    "sqlite read deadline exceeded"
+                );
+                Err(ResourceError::other("resource store busy: read deadline exceeded"))
+            }
         }
     }
 
@@ -1776,16 +1933,27 @@ impl SqliteBackend {
         namespace: &str,
         mutation: ReplicaMutation,
     ) -> Result<(), ResourceError> {
-        let ReplicaMutation { kind, name, value, synced_at } = mutation;
+        self.apply_replica_values(resource_kind, origin_root, namespace, vec![mutation]).await
+    }
+
+    async fn apply_replica_values(
+        &self,
+        resource_kind: ResourceKind,
+        origin_root: &NodeId,
+        namespace: &str,
+        mutations: Vec<ReplicaMutation>,
+    ) -> Result<(), ResourceError> {
         let key = Self::store_key(resource_kind, namespace);
-        let operation_key = key.clone();
+        let origin_root = origin_root.clone();
         let origin = origin_root.to_string();
-        let body =
-            serde_json::to_string(&value).map_err(|err| ResourceError::decode(format!("encode sqlite replica event JSON: {err}")))?;
-        let synced = synced_at.to_rfc3339();
-        let changed = self
-            .call("apply replica event", move |connection| {
-                let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica event"))?;
+        let watchers = self.replica_watchers.clone();
+        self.call("apply replica batch", move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin replica batch"))?;
+            let mut changed = Vec::new();
+            for mutation in mutations {
+                let ReplicaMutation { kind, name, value, synced_at } = mutation;
+                let body = serde_json::to_string(&value).map_err(|err| ResourceError::decode(err.to_string()))?;
+                let synced = synced_at.to_rfc3339();
                 let existing = tx
                     .query_row(
                         r#"
@@ -1823,7 +1991,7 @@ impl SqliteBackend {
                     }
                 };
                 if unchanged {
-                    return Ok(false);
+                    continue;
                 }
 
                 match kind {
@@ -1871,19 +2039,16 @@ impl SqliteBackend {
                         .map_err(|err| Self::map_sqlite(err, "write sqlite replica tombstone"))?;
                     }
                 }
-                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica event"))?;
-                Ok(true)
-            })
-            .await?;
-        if !changed {
-            return Ok(());
-        }
-        Self::notify_replica_watchers(
-            &self.replica_watchers,
-            &operation_key,
-            StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind, object: value },
-        );
-        Ok(())
+                changed.push(StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind, object: value });
+            }
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit replica batch"))?;
+            // Publish from the writer after commit, in exactly commit order.
+            for event in changed {
+                Self::notify_replica_watchers(&watchers, &key, event);
+            }
+            Ok(())
+        })
+        .await
     }
 
     pub async fn invalidate_replica_cursor_raw(
@@ -2836,6 +3001,23 @@ impl Store for SqliteBackend {
     async fn delete_decode_quarantine_raw(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<bool, ResourceError> {
         SqliteBackend::delete_decode_quarantine_raw(self, resource_kind, namespace, name).await
     }
+    async fn namespace_inventory(&self) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
+        self.read_call_with_pool("discovery namespace inventory", |connection| {
+            let mut inventory = crate::declared_resource_kinds().into_iter().map(|kind| (kind.paths.plural.to_string(), Vec::new())).collect::<BTreeMap<_, _>>();
+            let kinds = crate::declared_resource_kinds();
+            let mut statement = connection.prepare("SELECT group_name, version, kind, namespace FROM resource_objects UNION SELECT group_name, version, kind, namespace FROM replica_objects ORDER BY namespace")
+                .map_err(|err| Self::map_sqlite(err, "prepare namespace inventory"))?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
+                .map_err(|err| Self::map_sqlite(err, "query namespace inventory"))?;
+            for row in rows {
+                let (group, version, kind, namespace) = row.map_err(|err| Self::map_sqlite(err, "read namespace inventory"))?;
+                if let Some(descriptor) = kinds.iter().find(|descriptor| descriptor.paths.group == group && descriptor.paths.version == version && descriptor.paths.kind == kind) {
+                    inventory.get_mut(descriptor.paths.plural).expect("registered kind").push(namespace);
+                }
+            }
+            Ok(inventory)
+        }, true).await
+    }
     async fn local_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
         SqliteBackend::local_namespaces_raw(self, resource_kind).await
     }
@@ -2882,6 +3064,38 @@ impl Store for SqliteBackend {
         bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
         SqliteBackend::replace_replicas_raw(self, resource_kind, origin_root, namespace, listed, synced_at, bucket).await
+    }
+    async fn apply_replica_batch_raw(
+        &self,
+        resource_kind: ResourceKind,
+        origin_root: &NodeId,
+        namespace: &str,
+        events: &[(WatchEvent<SerializedResource>, DateTime<Utc>)],
+    ) -> Result<(), ResourceError> {
+        for batch in events.chunks(64) {
+            let mutations = batch
+                .iter()
+                .map(|(event, synced_at)| {
+                    let (kind, name, value) = match event {
+                        WatchEvent::Added(object) => {
+                            (StoredReplicaEventKind::Added, object.metadata.name.clone(), Self::encode_object(resource_kind, object)?)
+                        }
+                        WatchEvent::Modified(object) => {
+                            (StoredReplicaEventKind::Modified, object.metadata.name.clone(), Self::encode_object(resource_kind, object)?)
+                        }
+                        WatchEvent::Deleted(object) => {
+                            (StoredReplicaEventKind::Deleted, object.metadata.name.clone(), Self::encode_object(resource_kind, object)?)
+                        }
+                        WatchEvent::DeletedByName(tombstone) => {
+                            (StoredReplicaEventKind::Deleted, tombstone.name.clone(), Self::encode_tombstone(resource_kind, tombstone))
+                        }
+                    };
+                    Ok(ReplicaMutation { kind, name, value, synced_at: *synced_at })
+                })
+                .collect::<Result<Vec<_>, ResourceError>>()?;
+            self.apply_replica_values(resource_kind, origin_root, namespace, mutations).await?;
+        }
+        Ok(())
     }
     async fn apply_replica_raw(
         &self,
@@ -3144,7 +3358,8 @@ mod latency_tests {
         let directory = tempfile::tempdir().expect("store directory");
         let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
         let hosts = ResourceBackend::new(backend.clone()).using::<Host>("flotilla");
-        let read_connection = backend.read_connection.clone().expect("file-backed read connection");
+        let read_connection = backend.read_connections[super::READER_COUNT - 2].clone();
+        let _other_readers = backend.reader_slots.acquire_many((super::READER_COUNT - 2) as u32).await.unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocked_read = tokio::spawn(async move {
@@ -3917,5 +4132,119 @@ impl From<StoredEventKind> for WatchAction {
             StoredEventKind::Modified => Self::Modified,
             StoredEventKind::Deleted => Self::Deleted,
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_contract {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Discovery owns reserved inventory capacity and must answer while every
+    // general resource reader is deliberately stalled.
+    #[tokio::test]
+    async fn discovery_bypasses_saturated_resource_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(directory.path().join("queue.sqlite")).unwrap();
+        let mut releases = Vec::new();
+        let mut tasks = Vec::new();
+        for connection in &backend.read_connections[..READER_COUNT - 1] {
+            let connection = connection.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            tasks.push(tokio::spawn(async move {
+                connection
+                    .call(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok::<_, ResourceError>(())
+                    })
+                    .await
+                    .unwrap();
+            }));
+            entered_rx.await.unwrap();
+            releases.push(release_tx);
+        }
+        let result = tokio::time::timeout(Duration::from_millis(100), backend.namespace_inventory()).await;
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(!result.unwrap().unwrap().is_empty());
+    }
+
+    // Deadlines expire queued reads before they execute, even when the caller
+    // waits for the error rather than cancelling its future.
+    #[tokio::test]
+    async fn expired_reads_do_not_execute() {
+        let backend = SqliteBackend::open_in_memory().unwrap();
+        let blocked = backend.connection.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::spawn(async move {
+            blocked
+                .call(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, ResourceError>(())
+                })
+                .await
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        let executed = Arc::new(AtomicUsize::new(0));
+        let count = executed.clone();
+        let result = backend
+            .read_call("expired read", move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        backend.read_call("recovered read", |_| Ok(())).await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("read deadline exceeded"));
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+    }
+
+    // A read abandoned while queued must never execute, and subsequent reads
+    // must recover as soon as the deliberately blocked worker is released.
+    #[tokio::test]
+    async fn abandoned_reads_are_shed() {
+        let backend = SqliteBackend::open_in_memory().unwrap();
+        let blocked = backend.connection.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::spawn(async move {
+            blocked
+                .call(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, ResourceError>(())
+                })
+                .await
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        let executed = Arc::new(AtomicUsize::new(0));
+        let count = executed.clone();
+        let read_backend = backend.clone();
+        let abandoned = tokio::spawn(async move {
+            read_backend
+                .read_call("abandoned read", move |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        abandoned.abort();
+        let _ = abandoned.await;
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), backend.read_call("recovered read", |_| Ok(()))).await.unwrap().unwrap();
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
     }
 }

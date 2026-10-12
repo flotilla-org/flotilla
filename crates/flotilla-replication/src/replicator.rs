@@ -417,51 +417,53 @@ pub async fn replicate_relay_direct<T: Resource>(
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let mut watch = remote.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
-    while let Some(event) = watch.next().await {
-        let event = event.map_err(|error| error.to_string())?;
-        if let ReadWatchEvent::DeletedByName { mut tombstone, provenance } = event {
-            let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance else {
+    let mut watch =
+        remote.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?.ready_chunks(64);
+    while let Some(events) = watch.next().await {
+        let mut batches = std::collections::BTreeMap::<NodeId, Vec<(WatchEvent<T>, chrono::DateTime<Utc>)>>::new();
+        for event in events {
+            let event = event.map_err(|error| error.to_string())?;
+            if let ReadWatchEvent::DeletedByName { mut tombstone, provenance } = event {
+                let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance else {
+                    continue;
+                };
+                if &origin_root == host.node_id() || &origin_root == peer {
+                    continue;
+                }
+                tombstone.annotations.remove("flotilla.work/origin-root");
+                tombstone.annotations.remove("flotilla.work/last-synced-at");
+                batches.entry(origin_root).or_default().push((WatchEvent::DeletedByName(tombstone), last_synced_at));
+                continue;
+            }
+            let (kind, mut source) = match event {
+                ReadWatchEvent::Added(source) => (StoredRelayEventKind::Added, source),
+                ReadWatchEvent::Modified(source) => (StoredRelayEventKind::Modified, source),
+                ReadWatchEvent::Deleted(source) => (StoredRelayEventKind::Deleted, source),
+                ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
+            };
+            let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else {
                 continue;
             };
             if &origin_root == host.node_id() || &origin_root == peer {
                 continue;
             }
-            tombstone.annotations.remove("flotilla.work/origin-root");
-            tombstone.annotations.remove("flotilla.work/last-synced-at");
+            source.object.metadata.annotations.remove("flotilla.work/origin-root");
+            source.object.metadata.annotations.remove("flotilla.work/last-synced-at");
+            let event = match kind {
+                StoredRelayEventKind::Added => WatchEvent::Added(source.object),
+                StoredRelayEventKind::Modified => WatchEvent::Modified(source.object),
+                StoredRelayEventKind::Deleted => WatchEvent::Deleted(source.object),
+            };
+            batches.entry(origin_root).or_default().push((event, last_synced_at));
+        }
+        for (origin, batch) in batches {
             store
                 .backend(host)
-                .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
-                .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
+                .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
+                .apply_stamped_batch(&batch)
                 .await
                 .map_err(|error| error.to_string())?;
-            continue;
         }
-        let (kind, mut source) = match event {
-            ReadWatchEvent::Added(source) => (StoredRelayEventKind::Added, source),
-            ReadWatchEvent::Modified(source) => (StoredRelayEventKind::Modified, source),
-            ReadWatchEvent::Deleted(source) => (StoredRelayEventKind::Deleted, source),
-            ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
-        };
-        let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else {
-            continue;
-        };
-        if &origin_root == host.node_id() || &origin_root == peer {
-            continue;
-        }
-        source.object.metadata.annotations.remove("flotilla.work/origin-root");
-        source.object.metadata.annotations.remove("flotilla.work/last-synced-at");
-        let event = match kind {
-            StoredRelayEventKind::Added => WatchEvent::Added(source.object),
-            StoredRelayEventKind::Modified => WatchEvent::Modified(source.object),
-            StoredRelayEventKind::Deleted => WatchEvent::Deleted(source.object),
-        };
-        store
-            .backend(host)
-            .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
-            .apply(event, last_synced_at)
-            .await
-            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -590,7 +592,7 @@ pub async fn replicate_kind_direct<T: Resource>(
 }
 
 async fn apply_direct_watch<T: Resource>(
-    mut watch: flotilla_resources::WatchStream<T>,
+    watch: flotilla_resources::WatchStream<T>,
     writer: &flotilla_store::ReplicaWriter<T>,
     snapshot_version: String,
     remote: &flotilla_store::TypedResolver<T>,
@@ -598,6 +600,7 @@ async fn apply_direct_watch<T: Resource>(
 ) -> Result<(), OriginWatchFailure> {
     // Relay updates share the writer but cannot move this direct stream's
     // expected sequence. Its position starts at the authoritative snapshot.
+    let mut watch = watch.ready_chunks(64);
     let mut version = Some(snapshot_version);
     let mut digest_failures = DigestFailures::default();
     let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
@@ -617,9 +620,11 @@ async fn apply_direct_watch<T: Resource>(
                 continue;
             }
         };
-        let event = event.map_err(OriginWatchFailure::from_resource)?;
-        check_sequence(&mut version, &event).map_err(OriginWatchFailure::SnapshotRequired)?;
-        writer.apply_direct(event, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
+        let batch = event.into_iter().collect::<Result<Vec<_>, _>>().map_err(OriginWatchFailure::from_resource)?;
+        for event in &batch {
+            check_sequence(&mut version, event).map_err(OriginWatchFailure::SnapshotRequired)?;
+        }
+        writer.apply_direct_batch(&batch, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
     }
 }
 
@@ -945,6 +950,7 @@ async fn apply_relay_response<T: Resource>(
     response: ResourceReadEnvelope,
     store: ReplicationStore,
 ) -> Result<(), String> {
+    let mut batches = std::collections::BTreeMap::<NodeId, Vec<(WatchEvent<T>, chrono::DateTime<Utc>)>>::new();
     for record in response.records {
         let Some(event) = record_watch_event::<T>(record)? else {
             continue;
@@ -966,12 +972,7 @@ async fn apply_relay_response<T: Resource>(
                         .map(|value| value.with_timezone(&Utc))
                         .map_err(|error| format!("decode relayed tombstone sync timestamp: {error}"))
                 })?;
-            store
-                .backend(host)
-                .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
-                .apply(WatchEvent::DeletedByName(tombstone), synced_at)
-                .await
-                .map_err(|error| error.to_string())?;
+            batches.entry(origin).or_default().push((WatchEvent::DeletedByName(tombstone), synced_at));
             continue;
         }
         let object = match &event {
@@ -1006,10 +1007,13 @@ async fn apply_relay_response<T: Resource>(
             WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
             WatchEvent::DeletedByName(_) => unreachable!("handled above"),
         };
+        batches.entry(origin).or_default().push((event, synced_at));
+    }
+    for (origin, batch) in batches {
         store
             .backend(host)
             .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
-            .apply(event, synced_at)
+            .apply_stamped_batch(&batch)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -1023,6 +1027,7 @@ async fn apply_response<T: Resource>(
     response: ResourceReadEnvelope,
 ) -> Result<(), String> {
     let (resource_version, generation) = response.cursor.position()?;
+    let mut batch = Vec::new();
     for record in response.records {
         if record.record_type == ResourceRecordType::Bookmark {
             if *initializing {
@@ -1048,9 +1053,10 @@ async fn apply_response<T: Resource>(
             let WatchEvent::Added(object) = event else { unreachable!("matched added event") };
             initial.push(object);
         } else {
-            writer.apply_direct(event, Utc::now()).await.map_err(|error| error.to_string())?;
+            batch.push(event);
         }
     }
+    writer.apply_direct_batch(&batch, Utc::now()).await.map_err(|error| error.to_string())?;
     Ok(())
 }
 
