@@ -869,6 +869,17 @@ impl ConvoyStatus {
             .collect()
     }
 
+    /// Whether shared attention originates from turn delivery rather than settlement.
+    /// New delivery advisory sources must be registered here unless they are already
+    /// keys in `turn_deliveries`, so terminal row projection can ignore them.
+    pub fn is_turn_delivery_attention(&self, attention: &ConvoyAttention) -> bool {
+        self.turn_deliveries.contains_key(&attention.source)
+            || matches!(
+                attention.source.as_str(),
+                ConvoyAttention::QUEUED_TURN_SOURCE | ConvoyAttention::MISSING_TURN_HOOK_SOURCE | ConvoyAttention::SUPERVISOR_TURN_SOURCE
+            )
+    }
+
     pub fn produces(&self, subject: &Subject) -> bool {
         self.subjects.iter().any(|entry| &entry.subject == subject && entry.relationship == Relationship::Produces)
     }
@@ -1434,6 +1445,7 @@ impl TurnDeliveryOutcome {
 }
 
 impl ConvoyAttention {
+    pub const SUPERVISOR_TURN_SOURCE: &'static str = "supervisor-turn-delivery";
     pub const QUEUED_TURN_SOURCE: &'static str = "queued-turn-delivery";
     pub const MISSING_TURN_HOOK_SOURCE: &'static str = "missing-turn-hook";
 }
@@ -2147,7 +2159,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 // One-generation cleanup for attention written by the original #2285 patch.
                 if !status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())
-                    && status.attention.as_ref().is_some_and(|attention| attention.source == "supervisor-turn-delivery")
+                    && status.attention.as_ref().is_some_and(|attention| attention.source == ConvoyAttention::SUPERVISOR_TURN_SOURCE)
                 {
                     status.attention = None;
                 }
@@ -3325,7 +3337,7 @@ mod subject_tests {
     #[test]
     fn supervisor_turn_acknowledgment_clears_only_prior_generation_delivery_attention() {
         let old_attention = ConvoyAttention {
-            source: "supervisor-turn-delivery".to_string(),
+            source: ConvoyAttention::SUPERVISOR_TURN_SOURCE.to_string(),
             reason: "Pending delivery".to_string(),
             raised_at: Utc::now(),
         };
