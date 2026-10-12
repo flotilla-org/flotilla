@@ -8,8 +8,8 @@ use std::{
 use flotilla_core::{
     config::ConfigStore,
     log_file::{rotating_log_writer, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE},
-    providers::discovery::DiscoveryRuntime,
 };
+use flotilla_discovery::DiscoveryRuntime;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_policy::PathPolicy;
 use tracing::{info, Subscriber};

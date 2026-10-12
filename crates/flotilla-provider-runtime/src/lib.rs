@@ -1,7 +1,9 @@
 //! Provider invocation infrastructure shared by adapters and their test doubles.
-//! This crate owns command/HTTP execution, channel labels and host probes;
+//! This crate owns command/HTTP execution, channel labels and host probes,
+//! including injected free-space measurement;
 //! provider traits, discovery assembly and resource stores live elsewhere.
 
+pub mod available_space;
 pub mod observation_error;
 pub use observation_error::ObservationError;
 mod git_config_guard;

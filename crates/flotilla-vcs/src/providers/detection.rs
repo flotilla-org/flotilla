@@ -7,29 +7,16 @@ use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::RepoDetector;
 use flotilla_discovery_api::VcsKind;
 
+use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector};
 use flotilla_discovery_api::HostDetector;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
 
-pub struct GitBinaryDetector;
-
-pub fn git_binary_detector() -> GitBinaryDetector {
-    GitBinaryDetector
-}
-
-#[async_trait]
-impl HostDetector for GitBinaryDetector {
-    async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        let Ok(output) = run!(runner, "git", &["--version"], Path::new("/")) else {
-            return Vec::new();
-        };
-        match parse_first_dotted_version(&output) {
-            Some(version) => vec![EnvironmentAssertion::versioned_binary("git", "git", version)],
-            None => vec![EnvironmentAssertion::binary("git", "git")],
-        }
-    }
+/// Detect the Git binary by command name with its dotted version.
+pub fn git_binary_detector() -> impl HostDetector {
+    CommandDetector::new("git", &["--version"], parse_first_dotted_version)
 }
 
 /// Bootstrap probes used before checkout-scoped provider construction.
@@ -95,50 +82,6 @@ pub fn remote_assertion(url: &str, remote_name: &str) -> Option<EnvironmentAsser
     let host = detect_host_from_url(url)?;
     let (owner, repo) = extract_owner_repo(url)?;
     Some(EnvironmentAssertion::remote_host(host, owner, repo, remote_name))
-}
-
-fn parse_first_dotted_version(output: &str) -> Option<String> {
-    let mut start = None;
-    let mut dot_count = 0;
-    let mut saw_digit = false;
-
-    for (idx, ch) in output.char_indices() {
-        if start.is_none() {
-            if ch.is_ascii_digit() {
-                start = Some(idx);
-                saw_digit = true;
-            }
-            continue;
-        }
-
-        if ch.is_ascii_digit() {
-            saw_digit = true;
-            continue;
-        }
-
-        if ch == '.' {
-            dot_count += 1;
-            saw_digit = false;
-            continue;
-        }
-
-        if dot_count > 0 && saw_digit {
-            let start = start.expect("version start must exist");
-            return Some(output[start..idx].to_string());
-        }
-
-        start = if ch.is_ascii_digit() { Some(idx) } else { None };
-        dot_count = 0;
-        saw_digit = ch.is_ascii_digit();
-    }
-
-    if let Some(start) = start {
-        if dot_count > 0 && saw_digit {
-            return Some(output[start..].trim().to_string());
-        }
-    }
-
-    None
 }
 
 // ---------------------------------------------------------------------------

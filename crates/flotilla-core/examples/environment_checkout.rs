@@ -12,9 +12,9 @@
 use std::{path::Path, sync::Arc};
 
 use flotilla_core::config::ConfigStore;
-use flotilla_core::providers::discovery::detectors::default_host_detectors;
-use flotilla_core::providers::discovery::run_host_detectors;
-use flotilla_core::providers::discovery::FactoryRegistry;
+use flotilla_discovery::detectors::default_host_detectors;
+use flotilla_discovery::run_host_detectors;
+use flotilla_discovery::FactoryRegistry;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::CreateOpts;

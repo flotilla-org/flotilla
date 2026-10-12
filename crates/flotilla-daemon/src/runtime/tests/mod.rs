@@ -31,8 +31,6 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::StandingConvoyBackingInspector;
 use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE;
-use flotilla_core::providers::registry::ProviderRegistry;
-use flotilla_core::providers::types::ChangeRequest as ProviderChangeRequest;
 use flotilla_credentials::crew_git_identity_environment;
 use flotilla_credentials::AgentMaterialRegistry;
 use flotilla_credentials::CredentialRefreshError;
@@ -41,6 +39,7 @@ use flotilla_credentials::CONTAINER_CODEX_HOME;
 use flotilla_credentials::FLOTILLA_SKILLS_DIR_ENV;
 use flotilla_credentials_testkit::GITHUB_APP_TEST_PRIVATE_KEY;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_discovery_testkit::fake_discovery_with_provider_set;
 use flotilla_discovery_testkit::git_process_discovery;
 use flotilla_discovery_testkit::DiscoveryMockRunner;
@@ -60,6 +59,7 @@ use flotilla_environment::environment::ProvisionedMount;
 use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
+use flotilla_protocol::ChangeRequest as ProviderChangeRequest;
 use flotilla_protocol::{
     CanonicalHostId, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, EnvironmentId, HostName, HostSummary, ImageId,
     NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementTargetHost, TerminalStatus,

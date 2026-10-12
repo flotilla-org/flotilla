@@ -1,9 +1,9 @@
-use crate::providers::discovery::status::{provider_names_from_registry, ProviderNameEntry};
+use flotilla_discovery::status::{provider_names_from_registry, ProviderNameEntry};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 pub use flotilla_protocol::{CategoryLabels, EnvironmentId, RepoLabels};
 
-use crate::providers::registry::{ProviderRegistry, ProviderSet};
+use flotilla_discovery::registry::{ProviderRegistry, ProviderSet};
 
 pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     fn labels<T: ?Sized>(set: &ProviderSet<T>) -> CategoryLabels {

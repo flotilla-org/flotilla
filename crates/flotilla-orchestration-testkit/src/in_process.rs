@@ -1,7 +1,8 @@
+//! Test hooks over the in-process daemon's environment manager and discovery.
 use async_trait::async_trait;
 use flotilla_core::in_process::discover_repo_for_environment;
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_core::providers::discovery::DiscoveryResult;
+use flotilla_discovery::DiscoveryResult;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_environment::environment::EnvironmentHandle;
 use flotilla_protocol::EnvironmentId;

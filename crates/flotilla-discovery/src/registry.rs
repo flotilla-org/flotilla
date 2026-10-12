@@ -349,7 +349,7 @@ mod environment_tests {
     // same-kind instances, including ambiguity, exact hits and an absent identity.
     #[hegel::test]
     fn provider_selection_is_kind_and_instance_scoped(tc: hegel::TestCase) {
-        use crate::providers::registry::ProviderRegistry;
+        use crate::registry::ProviderRegistry;
         use flotilla_discovery_api::ProviderCategory;
         use flotilla_discovery_api::ProviderDescriptor;
         use flotilla_environment::environment::{

@@ -39,8 +39,7 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec};
 
     use super::*;
-    use crate::config::ConfigStore;
-    use crate::testkits::discovery::DiscoveryMockRunner;
+    use crate::testing::{DiscoveryMockRunner, TestConfig};
 
     #[test]
     fn default_all_has_all_categories() {
@@ -55,7 +54,7 @@ mod tests {
 
     #[test]
     fn process_runtime_constructs_external_providers() {
-        let runtime = super::super::DiscoveryRuntime::for_process();
+        let runtime = crate::DiscoveryRuntime::for_process();
         let reg = &runtime.factories;
         assert!(!reg.vcs.is_empty());
         assert!(!reg.change_requests.is_empty());
@@ -69,7 +68,7 @@ mod tests {
     async fn forgejo_origin_binds_issue_and_change_request_without_config_section() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lab-forgejo-coder-token"), "test-token\n").expect("write token");
-        let config = ConfigStore::with_base(dir.path().join("flotilla"));
+        let config = TestConfig::new(&dir.path().join("flotilla"));
         let forge = ForgeSpec::builder()
             .forge_id("lab".into())
             .kind(ForgeKind::Forgejo)

@@ -70,6 +70,9 @@ use flotilla_store_testkit::VirtualClock;
 #[path = "ensure_scenarios/admission.rs"]
 mod admission;
 pub use admission::*;
+
+mod in_process;
+pub use in_process::InProcessDiscoveryExt;
 #[path = "ensure_scenarios/retry.rs"]
 mod retry;
 pub use retry::*;

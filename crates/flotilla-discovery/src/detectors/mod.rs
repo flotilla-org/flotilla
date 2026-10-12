@@ -2,9 +2,8 @@ use flotilla_cloud_agent::detectors::{self as cloud_agent, claude, codex, cursor
 use flotilla_discovery_api::host_environment_keys;
 use flotilla_discovery_api::{HostDetector, RepoDetector};
 pub mod cmux;
-pub mod generic;
 
-use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
+use flotilla_discovery_api::detectors::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
 use flotilla_vcs::providers::detection::{git_binary_detector, VcsRepoDetector};
 
@@ -43,8 +42,9 @@ pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::testkits::discovery::TestEnvVars;
+    use crate::run_host_detectors;
+    use crate::testing::DiscoveryMockRunner;
+    use crate::testing::TestEnvVars;
     use flotilla_discovery_api::EnvironmentAssertion;
 
     #[test]
@@ -57,52 +57,45 @@ mod tests {
         assert!(!default_repo_detectors().is_empty());
     }
 
+    // The default list's environment detectors report exactly the injected value.
     #[tokio::test]
-    async fn simple_env_var_detectors_are_table_driven() {
+    async fn default_env_var_detectors_are_table_driven() {
         let runner = DiscoveryMockRunner::builder().build();
-        let cases = [
-            ("cursor-env", "CURSOR_API_KEY", "cursor-secret"),
-            ("zellij-env", "ZELLIJ", "0"),
-            ("zellij-session", "ZELLIJ_SESSION_NAME", "my-session"),
-        ];
+        let cases = [("CURSOR_API_KEY", "cursor-secret"), ("ZELLIJ", "0"), ("ZELLIJ_SESSION_NAME", "my-session")];
 
-        for (_detector_name, key, value) in cases {
-            let detector = EnvVarDetector::new(key);
-            let env = TestEnvVars::new([(key, value)]);
-            let assertions = detector.detect(&runner, &env).await;
+        for (key, value) in cases {
+            let bag = run_host_detectors(&default_host_detectors(), &runner, &TestEnvVars::new([(key, value)])).await;
 
-            assert!(matches!(
-                assertions.as_slice(),
-                [EnvironmentAssertion::EnvVarSet { key: found_key, value: found_value }]
-                if found_key == key && found_value == value
-            ));
+            assert_eq!(bag.assertions(), [EnvironmentAssertion::env_var(key, value)], "{key}");
         }
     }
 
+    // The default list issues each command probe with its historical arguments;
+    // the mock answers only that exact command, so any argument drift fails.
     #[tokio::test]
     #[allow(clippy::type_complexity)]
-    async fn simple_command_detectors_are_table_driven() {
-        let cases: Vec<(&str, &str, &[&str], &str, Option<&str>)> = vec![
-            ("git-binary", "git", &["--version"], "git version 2.43.0\n", Some("2.43.0")),
-            ("curl-binary", "curl", &["--version"], "curl 8.7.1 (arm64-apple-darwin)\n", Some("8.7.1")),
-            ("gh-cli", "gh", &["--version"], "gh version 2.49.0\n", Some("2.49.0")),
-            ("cursor-agent", "agent", &["--version"], "0.1.0\n", Some("0.1.0")),
-            ("zellij-binary", "zellij", &["--version"], "zellij 0.40.1\n", Some("0.40.1")),
-            ("cleat", "cleat", &["--version"], "cleat 0.1.0\n", Some("0.1.0")),
-            ("gemini", "gemini", &["--version"], "gemini 1.0.0\n", Some("1.0.0")),
-            ("codex", "codex", &["--version"], "codex-cli 0.5.0\n", Some("0.5.0")),
+    async fn default_command_detectors_are_table_driven() {
+        let resolve = |command: &'static str| ("sh", vec!["-c", "command -v \"$1\"", "flotilla-binary-discovery", command]);
+        let cases: Vec<(&str, &[&str], &str, Option<(&str, Vec<&str>)>, &str, &str)> = vec![
+            ("git", &["--version"], "git version 2.43.0\n", None, "git", "2.43.0"),
+            ("curl", &["--version"], "curl 8.7.1 (arm64-apple-darwin)\n", None, "curl", "8.7.1"),
+            ("gh", &["--version"], "gh version 2.49.0\n", None, "gh", "2.49.0"),
+            ("agent", &["--version"], "0.1.0\n", None, "agent", "0.1.0"),
+            ("zellij", &["--version"], "zellij 0.40.1\n", None, "zellij", "0.40.1"),
+            ("cleat", &["--version"], "cleat 0.1.0\n", None, "cleat", "0.1.0"),
+            ("gemini", &["--version"], "gemini 1.0.0\n", None, "gemini", "1.0.0"),
+            ("codex", &["--version"], "codex-cli 0.5.0\n", Some(resolve("codex")), "/tools/codex", "0.5.0"),
+            ("claude", &["--version"], "1.0.20 (Claude Code)\n", Some(resolve("claude")), "/tools/claude", "1.0.20"),
         ];
 
-        for (_detector_name, command, args, output, version) in cases {
-            let runner = DiscoveryMockRunner::builder().on_run(command, args, Ok(output.into())).build();
-            let detector = CommandDetector::new(command, args, parse_first_dotted_version);
-            let assertions = detector.detect(&runner, &TestEnvVars::default()).await;
+        for (command, args, output, resolution, path, version) in cases {
+            let mut runner = DiscoveryMockRunner::builder().on_run(command, args, Ok(output.into()));
+            if let Some((shell, shell_args)) = resolution {
+                runner = runner.on_run(shell, &shell_args, Ok(format!("{path}\n")));
+            }
+            let bag = run_host_detectors(&default_host_detectors(), &runner.build(), &TestEnvVars::default()).await;
 
-            assert!(matches!(
-                assertions.as_slice(),
-                [EnvironmentAssertion::BinaryAvailable { name, version: found_version, .. }]
-                if name == command && found_version.as_deref() == version
-            ));
+            assert_eq!(bag.assertions(), [EnvironmentAssertion::versioned_binary(command, path, version)], "{command}");
         }
     }
 
@@ -113,8 +106,6 @@ mod tests {
     #[tokio::test]
     async fn default_detectors_surface_agent_adapter_binaries() {
         use std::sync::Arc;
-
-        use crate::providers::discovery::run_host_detectors;
 
         let runner = DiscoveryMockRunner::builder()
             .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))

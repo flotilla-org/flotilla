@@ -7,7 +7,8 @@ use std::{
 use flotilla_discovery_api::UnmetRequirement;
 use flotilla_protocol::EnvironmentId;
 
-use crate::{model::RepoModel, providers::registry::ProviderRegistry};
+use crate::model::RepoModel;
+use flotilla_discovery::registry::ProviderRegistry;
 
 pub(crate) struct RepoRootState {
     pub(crate) path: PathBuf,

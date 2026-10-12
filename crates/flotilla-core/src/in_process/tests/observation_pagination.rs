@@ -114,4 +114,4 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     }
 }
 
-use crate::testkits::discovery::InProcessDiscoveryExt;
+use crate::testkits::in_process_ext::InProcessDiscoveryExt;

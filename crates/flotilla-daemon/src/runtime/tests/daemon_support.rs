@@ -322,11 +322,11 @@ pub(super) fn test_agent_material_registry(env: Arc<dyn EnvVars>) -> AgentMateri
     AgentMaterialRegistry::with_codex_delivery_support(env, true)
 }
 
-use flotilla_discovery_testkit::InProcessDiscoveryExt;
+use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
 // Real built-in detection providers over an injected subprocess stand-in.
 pub(super) fn detection_registry(runner: Arc<dyn CommandRunner>) -> Arc<ProviderRegistry> {
-    use flotilla_core::providers::registry::command_provider_registry;
+    use flotilla_discovery::registry::command_provider_registry;
     use flotilla_environment::environment::EnvironmentKind;
     Arc::new(command_provider_registry(&[EnvironmentKind::Docker, EnvironmentKind::HostDirect], runner))
 }

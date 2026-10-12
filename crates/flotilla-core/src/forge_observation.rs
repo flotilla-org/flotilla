@@ -22,7 +22,7 @@ use futures::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::Mutex;
 
-use crate::providers::types::ChangeRequest;
+use flotilla_protocol::ChangeRequest;
 
 pub(crate) const OWNER_LOCAL_INCREMENTAL_READ_ERROR: &str = "incremental forge reads are owner-local";
 

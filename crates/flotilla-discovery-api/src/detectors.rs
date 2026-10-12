@@ -1,16 +1,24 @@
+//! Generic host-probe detectors shared by discovery assembly and the provider
+//! type crates: environment-variable presence, command version probes, binary
+//! path resolution inside the runner's environment, and version parsing.
+//! Provider crates compose these for their type-specific detectors; one
+//! implementation keeps command arguments, path resolution, warnings and
+//! version parsing identical everywhere (#3049).
+
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use flotilla_discovery_api::EnvironmentAssertion;
-use flotilla_discovery_api::HostDetector;
-use tracing::warn;
-
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;
+use tracing::warn;
 
+use crate::{EnvironmentAssertion, HostDetector};
+
+/// Extracts a version from a successful probe's standard output.
 pub type VersionParser = fn(&str) -> Option<String>;
 
+/// Asserts an environment variable's value when the injected environment sets it.
 pub struct EnvVarDetector {
     key: &'static str,
 }
@@ -28,6 +36,9 @@ impl HostDetector for EnvVarDetector {
     }
 }
 
+/// Runs `command args` from `/` and asserts the binary when the probe succeeds.
+/// The asserted path is the command name unless [`CommandDetector::with_resolved_path`]
+/// requests the absolute executable path resolved inside the runner's environment.
 pub struct CommandDetector {
     command: &'static str,
     args: &'static [&'static str],
@@ -73,7 +84,13 @@ impl HostDetector for CommandDetector {
     }
 }
 
-pub(super) async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
+/// Resolve a command that already passed its probe to the absolute executable
+/// path inside the runner's environment.
+///
+/// This is deliberately a second runner call, not a `which`-style lookup on
+/// the daemon host: the runner may be remote or provisioned, so the daemon's
+/// own `PATH` can name a different binary or none.
+pub async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
     // Resolve inside the runner's environment: provisioned and remote runners
     // intentionally do not share the daemon process's PATH.
     let output = match runner
@@ -100,19 +117,20 @@ pub(super) async fn resolve_binary_path(runner: &dyn CommandRunner, command: &st
     }
 }
 
+/// The first token of digits containing at least one dot, such as `2.43.0`.
 pub fn parse_first_dotted_version(output: &str) -> Option<String> {
     let mut start = None;
     let mut dot_count = 0;
     let mut saw_digit = false;
 
     for (idx, ch) in output.char_indices() {
-        if start.is_none() {
+        let Some(begin) = start else {
             if ch.is_ascii_digit() {
                 start = Some(idx);
                 saw_digit = true;
             }
             continue;
-        }
+        };
 
         if ch.is_ascii_digit() {
             saw_digit = true;
@@ -126,8 +144,7 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
         }
 
         if dot_count > 0 && saw_digit {
-            let start = start.expect("version start must exist");
-            return Some(output[start..idx].to_string());
+            return Some(output[begin..idx].to_string());
         }
 
         start = if ch.is_ascii_digit() { Some(idx) } else { None };
@@ -146,11 +163,33 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::testkits::discovery::DiscoveryMockRunner;
-    use crate::testkits::discovery::TestEnvVars;
-    use crate::testkits::replay::testing::capture_logs;
+    use std::collections::HashMap;
+
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
+    use flotilla_replay_testkit::testing::{capture_logs, MockRunner};
+
+    use super::*;
+
+    const RESOLVE_ARGS: [&str; 4] = ["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"];
+
+    #[derive(Default)]
+    struct TestEnvVars(HashMap<String, String>);
+
+    impl TestEnvVars {
+        fn new<const N: usize>(values: [(&str, &str); N]) -> Self {
+            Self(values.into_iter().map(|(key, value)| (key.to_string(), value.to_string())).collect())
+        }
+    }
+
+    impl EnvVars for TestEnvVars {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    fn call(cmd: &str, args: &[&str]) -> (String, Vec<String>) {
+        (cmd.to_string(), args.iter().map(|arg| arg.to_string()).collect())
+    }
 
     #[test]
     fn parse_first_dotted_version_handles_supported_outputs() {
@@ -171,22 +210,20 @@ mod tests {
     #[tokio::test]
     async fn env_var_detector_reads_from_env_source() {
         let detector = EnvVarDetector::new("CURSOR_API_KEY");
-        let runner = DiscoveryMockRunner::builder().build();
+        let runner = MockRunner::new(vec![]);
         let env = TestEnvVars::new([("CURSOR_API_KEY", "secret")]);
 
         let assertions = detector.detect(&runner, &env).await;
 
-        assert!(matches!(
-            assertions.as_slice(),
-            [EnvironmentAssertion::EnvVarSet { key, value }]
-            if key == "CURSOR_API_KEY" && value == "secret"
-        ));
+        assert_eq!(assertions, vec![EnvironmentAssertion::env_var("CURSOR_API_KEY", "secret")]);
+        assert!(detector.detect(&runner, &TestEnvVars::default()).await.is_empty());
+        assert!(runner.calls().is_empty(), "environment detection never runs commands");
     }
 
     #[tokio::test]
     async fn command_detector_uses_command_name_for_assertion() {
         let detector = CommandDetector::new("gh", &["--version"], parse_first_dotted_version);
-        let runner = DiscoveryMockRunner::builder().on_run("gh", &["--version"], Ok("gh version 2.49.0\n".into())).build();
+        let runner = MockRunner::new(vec![Ok("gh version 2.49.0\n".into())]);
 
         let assertions = detector.detect(&runner, &TestEnvVars::default()).await;
 
@@ -197,15 +234,32 @@ mod tests {
                 && *path == ExecutionEnvironmentPath::new("gh")
                 && version.as_deref() == Some("2.49.0")
         ));
+        assert_eq!(runner.calls(), vec![call("gh", &["--version"])]);
+    }
+
+    #[tokio::test]
+    async fn command_detector_without_version_asserts_unversioned_binary() {
+        let detector = CommandDetector::new("cleat", &["--version"], parse_first_dotted_version);
+        let runner = MockRunner::new(vec![Ok("cleat development build\n".into())]);
+
+        assert_eq!(detector.detect(&runner, &TestEnvVars::default()).await, vec![EnvironmentAssertion::binary("cleat", "cleat")]);
+    }
+
+    #[tokio::test]
+    async fn resolved_path_detector_issues_probe_then_resolution_in_runner_environment() {
+        let detector = CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path();
+        let runner = MockRunner::new(vec![Ok("codex-cli 0.5.0\n".into()), Ok("/tools/codex\n".into())]);
+
+        let assertions = detector.detect(&runner, &TestEnvVars::default()).await;
+
+        assert_eq!(assertions, vec![EnvironmentAssertion::versioned_binary("codex", "/tools/codex", "0.5.0")]);
+        assert_eq!(runner.calls(), vec![call("codex", &["--version"]), call("sh", &RESOLVE_ARGS)]);
     }
 
     #[tokio::test]
     async fn resolved_path_detector_warns_when_lookup_fails_after_successful_probe() {
         let detector = CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path();
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))
-            .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Err("sh is unavailable".into()))
-            .build();
+        let runner = MockRunner::new(vec![Ok("codex-cli 0.5.0\n".into()), Err("sh is unavailable".into())]);
         let (assertions, logs) = capture_logs(tracing::Level::WARN, detector.detect(&runner, &TestEnvVars::default())).await;
 
         assert!(assertions.is_empty());
@@ -216,10 +270,7 @@ mod tests {
     #[tokio::test]
     async fn resolved_path_detector_warns_when_lookup_returns_relative_path() {
         let detector = CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path();
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))
-            .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Ok("bin/codex\n".into()))
-            .build();
+        let runner = MockRunner::new(vec![Ok("codex-cli 0.5.0\n".into()), Ok("bin/codex\n".into())]);
         let (assertions, logs) = capture_logs(tracing::Level::WARN, detector.detect(&runner, &TestEnvVars::default())).await;
 
         assert!(assertions.is_empty());
@@ -230,10 +281,11 @@ mod tests {
     #[tokio::test]
     async fn resolved_path_detector_keeps_missing_binary_quiet() {
         let detector = CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path();
-        let runner = DiscoveryMockRunner::builder().on_run("codex", &["--version"], Err("command not found".into())).build();
+        let runner = MockRunner::new(vec![Err("command not found".into())]);
         let (assertions, logs) = capture_logs(tracing::Level::WARN, detector.detect(&runner, &TestEnvVars::default())).await;
 
         assert!(assertions.is_empty());
         assert!(logs.is_empty(), "ordinary missing-binary detection should remain quiet: {logs}");
+        assert_eq!(runner.calls(), vec![call("codex", &["--version"])], "a failed probe never resolves a path");
     }
 }

@@ -17,8 +17,8 @@ use super::support::{test_meta, SuspendedBoardProvider};
 use crate::config::ConfigStore;
 use crate::forge_observation::OWNER_LOCAL_INCREMENTAL_READ_ERROR;
 use crate::in_process::InProcessDaemon;
-use crate::providers::types::ChangeRequest;
 use crate::testkits::discovery::{fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
+use flotilla_protocol::ChangeRequest;
 
 // #2868: three daemons sharing a Project poll its source once per pass.
 // Nonowners obtain board facts through real resource replication; explicit

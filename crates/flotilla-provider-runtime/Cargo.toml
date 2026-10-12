@@ -20,7 +20,11 @@ uuid = { workspace = true, features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(not(unix))'.dependencies]
+sysinfo = "0.38.4"
+
 [dev-dependencies]
+hegeltest = "=0.48.1"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

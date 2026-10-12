@@ -21,6 +21,7 @@ members = [
     "crates/flotilla-daemon",
     "crates/flotilla-daemon-api",
     "crates/flotilla-daemon-testkit",
+    "crates/flotilla-discovery",
     "crates/flotilla-discovery-api",
     "crates/flotilla-discovery-testkit",
     "crates/flotilla-forge-forgejo",

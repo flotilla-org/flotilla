@@ -248,6 +248,29 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"),
         )), [])
 
+    def test_discovery_is_native_and_independent(self):
+        # Issue #2749 / ADR 0060: discovery assembles the provider type crates, never composition or storage.
+        self.assertEqual(layer("flotilla-discovery"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-discovery", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-discovery: must not depend on {target}, directly or transitively"])
+        type_crates = ("flotilla-agent", "flotilla-vcs", "flotilla-terminal", "flotilla-environment", "flotilla-cloud-agent",
+                       "flotilla-ai-utility", "flotilla-change-request", "flotilla-issue-tracker")
+        # Type crates may test through the discovery testkit, closing a dev-only cycle.
+        self.assertEqual(violations(graph(
+            package("flotilla-discovery", normal=type_crates + ("flotilla-discovery-api",)),
+            *(package(name, normal=("flotilla-discovery-api",), dev=("flotilla-discovery-testkit",)) for name in type_crates),
+            package("flotilla-discovery-api", normal=("flotilla-provider-runtime",)), package("flotilla-provider-runtime"),
+            package("flotilla-core", normal=("flotilla-discovery",) + type_crates),
+            package("flotilla-discovery-testkit", normal=("flotilla-discovery",)),
+        )), [])
+
     def test_replication_is_native_and_independent(self):
         # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
         self.assertEqual(layer("flotilla-replication"), "native")

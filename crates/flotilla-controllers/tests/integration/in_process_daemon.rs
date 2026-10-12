@@ -21,15 +21,12 @@ use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::config::ConfigStore;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::model::RepoModel;
-use flotilla_core::providers::discovery::DiscoveryRuntime;
-use flotilla_core::providers::types::ChangeRequest;
-use flotilla_core::providers::types::CloudAgentSession;
-use flotilla_core::providers::types::SessionStatus;
 use flotilla_core::repository_inspection::LocalCheckoutInspection;
 use flotilla_core::repository_inspection::RepositoryContinuity;
 use flotilla_core::repository_inspection::RepositoryInspection;
 use flotilla_core::repository_inspection::RepositoryInspector;
 use flotilla_daemon_api::daemon::DaemonHandle;
+use flotilla_discovery::DiscoveryRuntime;
 use flotilla_discovery_api::provider_config;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
@@ -61,9 +58,11 @@ use flotilla_environment::environment::ProvisionedEnvironment;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::qualified_path::HostId;
 use flotilla_protocol::qualified_path::QualifiedPath;
+use flotilla_protocol::ChangeRequest;
 use flotilla_protocol::Checkout;
 use flotilla_protocol::CheckoutSelector;
 use flotilla_protocol::CheckoutTarget;
+use flotilla_protocol::CloudAgentSession;
 use flotilla_protocol::Command;
 use flotilla_protocol::CommandAction;
 use flotilla_protocol::CommandValue;
@@ -88,6 +87,7 @@ use flotilla_protocol::PeerConnectionState;
 use flotilla_protocol::ProviderData;
 use flotilla_protocol::RepoIdentity;
 use flotilla_protocol::RepoSelector;
+use flotilla_protocol::SessionStatus;
 use flotilla_protocol::StepStatus;
 use flotilla_protocol::StreamKey;
 use flotilla_protocol::SystemInfo;
@@ -5597,13 +5597,13 @@ hostname = "buildbox.example"
     let mut discovery = fake_discovery(false);
     discovery.runner = ssh_runner;
     discovery.host_detectors = Arc::new(vec![
-        Box::new(flotilla_core::providers::discovery::detectors::generic::CommandDetector::new(
+        Box::new(flotilla_discovery_api::detectors::CommandDetector::new(
             "git",
             &["--version"],
-            flotilla_core::providers::discovery::detectors::generic::parse_first_dotted_version,
+            flotilla_discovery_api::detectors::parse_first_dotted_version,
         )),
-        Box::new(flotilla_core::providers::discovery::detectors::generic::EnvVarDetector::new("TERM")),
-        Box::new(flotilla_core::providers::discovery::detectors::generic::EnvVarDetector::new("COLORTERM")),
+        Box::new(flotilla_discovery_api::detectors::EnvVarDetector::new("TERM")),
+        Box::new(flotilla_discovery_api::detectors::EnvVarDetector::new("COLORTERM")),
     ]);
     let daemon = InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
 
@@ -9937,7 +9937,7 @@ async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_
     assert_eq!(messages.get("namespace-message").await.expect("retained evidence").status, Some(next));
 }
 
-use flotilla_discovery_testkit::InProcessDiscoveryExt;
+use flotilla_orchestration_testkit::InProcessDiscoveryExt;
 
 // Explicit naming means the convoy name, independently of AI/fallback branch generation.
 #[tokio::test]

@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::HostDetector;
 
-use super::helpers::parse_first_dotted_version;
-use super::helpers::resolve_binary_path;
+use flotilla_discovery_api::detectors::{parse_first_dotted_version, resolve_binary_path};
 use flotilla_provider_runtime::run;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;

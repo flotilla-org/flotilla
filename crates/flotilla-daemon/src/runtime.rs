@@ -23,10 +23,9 @@ use flotilla_controllers::reconcilers::{
     convoy_ensure::EnsureReconciler, CheckoutReconciler, CloneReconciler, EnvironmentReconciler, ForgeDefaultBranchResolver,
     RepositoryReconciler, TerminalSessionReconciler, VesselReconciler,
 };
-use flotilla_core::{
-    checkout_integration::LANDING_EVIDENCE_TTL, config::ConfigStore, in_process::InProcessDaemon, providers::registry::ProviderRegistry,
-};
+use flotilla_core::{checkout_integration::LANDING_EVIDENCE_TTL, config::ConfigStore, in_process::InProcessDaemon};
 use flotilla_credentials::{AgentMaterialRegistry, CredentialStore};
+use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::CanonicalHostId;

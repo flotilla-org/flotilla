@@ -6,14 +6,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hegel::generators as gs;
 
 use super::*;
-use crate::providers::discovery::detectors::generic::parse_first_dotted_version;
-use crate::providers::discovery::detectors::generic::CommandDetector;
 use crate::testkits::discovery::fake_discovery;
 use crate::testkits::discovery::fake_discovery_with_runner;
 use crate::testkits::discovery::FakeIssueProvider;
 use crate::testkits::discovery::FakeVcsFactory;
 use crate::testkits::discovery::FakeVcsState;
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_discovery_api::detectors::parse_first_dotted_version;
+use flotilla_discovery_api::detectors::CommandDetector;
 use flotilla_discovery_api::Factory;
 use flotilla_discovery_api::ProviderCategory;
 use flotilla_discovery_api::ProviderDescriptor;
