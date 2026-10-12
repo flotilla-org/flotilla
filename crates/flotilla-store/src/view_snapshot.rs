@@ -97,6 +97,8 @@ impl ViewSnapshot {
                     && !self.shadowed(item, partition)
                     && (!local_only || matches!(item.provenance, ResourceProvenance::Local))
             })
+            // Preserve the old sorted-list lookup: local first, then replica
+            // origin order. Partition identity keys do not encode that order.
             .min_by_key(|item| match &item.provenance {
                 ResourceProvenance::Local => (0, None),
                 ResourceProvenance::Replica { origin_root, .. } => (1, Some(origin_root)),

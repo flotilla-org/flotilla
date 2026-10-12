@@ -135,6 +135,9 @@ async fn memory_scenario(n: usize) -> Vec<(usize, usize, usize, usize)> {
         tokio::task::yield_now().await;
         let subscribed = counters();
         eprintln!("N={n} M={m} subscriber_live_delta={}", subscribed.0.saturating_sub(before.0));
+        // These count requested Rust bytes, independent of allocator rounding
+        // and RSS. Budgets leave ample room above measured bookkeeping while
+        // rejecting an additional inventory at the populated fixture sizes.
         assert!(subscribed.0.saturating_sub(before.0) < 256 * 1024, "subscriber must not retain another inventory");
         for k in [1, 8, 32] {
             let start = counters();

@@ -179,10 +179,15 @@ impl<T: Resource> ViewState<T> {
         }
         Ok(())
     }
+    // Definitions with a local root publish merged rows; all other views publish source rows.
+    fn snapshots_source_rows(&self) -> bool {
+        T::REPLICATION_CLASS != ReplicationClass::Definitions || self.local_root.is_none()
+    }
     fn remove_source(&mut self, namespace: &str, name: &str, provenance: &ResourceProvenance) {
         let key = Self::key(namespace, name, provenance);
         Arc::make_mut(&mut self.index).update(&key, None);
-        if let Some(snapshot) = self.snapshot.as_mut().filter(|_| self.definitions.is_none()) {
+        let snapshots_source_rows = self.snapshots_source_rows();
+        if let Some(snapshot) = self.snapshot.as_mut().filter(|_| snapshots_source_rows) {
             let snapshot = Arc::make_mut(snapshot);
             snapshot.items.remove(&key);
             if matches!(provenance, ResourceProvenance::Local) {
@@ -203,7 +208,8 @@ impl<T: Resource> ViewState<T> {
         self.shared_list.take();
         // Release the view's own index handle before mutating it. Only an
         // outstanding immutable snapshot should trigger copy-on-write.
-        if T::REPLICATION_CLASS != ReplicationClass::Definitions || self.local_root.is_none() {
+        let snapshots_source_rows = self.snapshots_source_rows();
+        if snapshots_source_rows {
             if let Some(snapshot) = &mut self.snapshot {
                 Arc::make_mut(snapshot).index = Arc::new(QueryIndex::default());
             }
@@ -213,9 +219,7 @@ impl<T: Resource> ViewState<T> {
                 let key = Self::key(&item.object.metadata.namespace, &item.object.metadata.name, &item.provenance);
                 let value = serde_json::to_value(item.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
                 Arc::make_mut(&mut self.index).update(&key, Some(&value));
-                if let Some(snapshot) =
-                    self.snapshot.as_mut().filter(|_| T::REPLICATION_CLASS != ReplicationClass::Definitions || self.local_root.is_none())
-                {
+                if let Some(snapshot) = self.snapshot.as_mut().filter(|_| snapshots_source_rows) {
                     let serialized = serialize_read(&item)?;
                     let snapshot = Arc::make_mut(snapshot);
                     snapshot.items.insert(key.clone(), Arc::new(serialized));
@@ -329,6 +333,10 @@ impl<T: Resource> ViewState<T> {
     }
 }
 
+// Once a snapshot is initialized, updates must also convert its changed row.
+// Conversion errors intentionally fail the watch update rather than publishing
+// stale serialized evidence beside a newer typed generation. Cold views defer
+// this conversion until their first snapshot read.
 fn serialize_read<T: Resource>(item: &ReadResourceObject<T>) -> Result<ReadResourceObject<crate::SerializedResource>, ResourceError> {
     Ok(ReadResourceObject { object: crate::transcode(&item.object)?, provenance: item.provenance.clone() })
 }
