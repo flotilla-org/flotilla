@@ -492,7 +492,14 @@ impl DaemonServer {
         self.startup_ready.send_replace(true);
         loop {
             tokio::select! {
-                accept_result = listener.accept(), if accept_retry_at.is_none() => {
+                accept_result = next_connection_event(async {
+                    if accept_retry_at.is_none() {
+                        listener.accept().await
+                    } else {
+                        std::future::pending().await
+                    }
+                }, &mut connection_tasks) => {
+                    let Some(accept_result) = accept_result else { continue };
                     match accept_result {
                         Ok((stream, _addr)) => {
                             accept_error_backoff.reset();
@@ -596,6 +603,20 @@ impl DaemonServer {
 
         info!("daemon server stopped");
         Ok(())
+    }
+}
+
+/// Wait for an accept or a completed connection, including during accept backoff.
+/// Returning `None` lets the accept loop continue after releasing a task allocation.
+async fn next_connection_event<T>(accept: impl std::future::Future<Output = T>, connection_tasks: &mut JoinSet<()>) -> Option<T> {
+    tokio::select! {
+        result = accept => Some(result),
+        result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+            if let Some(Err(error)) = result {
+                warn!(%error, "daemon connection task failed");
+            }
+            None
+        }
     }
 }
 
