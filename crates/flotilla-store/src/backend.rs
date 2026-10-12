@@ -458,24 +458,57 @@ impl<T: Resource> ReplicaWriter<T> {
         self.backend.apply_replica_typed(&self.origin_root, &self.namespace, kind, &object, synced_at).await
     }
 
+    pub async fn apply_batch(&self, events: &[crate::WatchEvent<T>], synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        for batch in events.chunks(crate::replica::REPLICA_BATCH_SIZE) {
+            let serialized = crate::transcode::<_, Vec<crate::WatchEvent<crate::SerializedResource>>>(batch)?;
+            let stamped = serialized.into_iter().map(|event| (event, synced_at)).collect::<Vec<_>>();
+            self.backend.apply_replica_batch_raw(crate::ResourceKind::of::<T>(), &self.origin_root, &self.namespace, &stamped).await?;
+        }
+        Ok(())
+    }
+
+    /// Relay batches retain each event's originating sync time for conflict resolution.
+    pub async fn apply_stamped_batch(&self, events: &[(crate::WatchEvent<T>, DateTime<Utc>)]) -> Result<(), ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        for batch in events.chunks(crate::replica::REPLICA_BATCH_SIZE) {
+            let serialized = crate::transcode::<_, Vec<(crate::WatchEvent<crate::SerializedResource>, DateTime<Utc>)>>(batch)?;
+            self.backend.apply_replica_batch_raw(crate::ResourceKind::of::<T>(), &self.origin_root, &self.namespace, &serialized).await?;
+        }
+        Ok(())
+    }
+
+    /// Prove the entire contiguous batch before applying any of it. A crash
+    /// before cursor advancement replays idempotent events rather than skipping them.
+    pub async fn apply_direct_batch(&self, events: &[crate::WatchEvent<T>], synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let previous = self.cursor().await?.ok_or_else(|| ResourceError::invalid("replica prefix missing; snapshot required"))?;
+        let mut version = previous.resource_version.parse::<u64>().map_err(|err| ResourceError::invalid(err.to_string()))?;
+        let mut next = previous.resource_version.clone();
+        for event in events {
+            next = match event {
+                crate::WatchEvent::Added(object) | crate::WatchEvent::Modified(object) | crate::WatchEvent::Deleted(object) => {
+                    object.metadata.resource_version.clone()
+                }
+                crate::WatchEvent::DeletedByName(tombstone) => tombstone.resource_version.clone(),
+            };
+            let next_version = next.parse::<u64>().map_err(|err| ResourceError::invalid(err.to_string()))?;
+            if version.checked_add(1) != Some(next_version) {
+                return Err(ResourceError::invalid("replica sequence gap; snapshot required"));
+            }
+            version = next_version;
+        }
+        self.apply_batch(events, synced_at).await?;
+        self.backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
+    }
+
     /// Apply a direct origin event, then commit its contiguous prefix. Relay
     /// `apply` never advances this cursor. A crash between these operations only
     /// replays an already-applied event; it cannot skip a missing event.
     pub async fn apply_direct(&self, event: crate::WatchEvent<T>, synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
-        let previous = self.cursor().await?.ok_or_else(|| ResourceError::invalid("replica prefix missing; snapshot required"))?;
-        let next = match &event {
-            crate::WatchEvent::Added(object) | crate::WatchEvent::Modified(object) | crate::WatchEvent::Deleted(object) => {
-                &object.metadata.resource_version
-            }
-            crate::WatchEvent::DeletedByName(tombstone) => &tombstone.resource_version,
-        }
-        .clone();
-        let prior = previous.resource_version.parse::<u64>().map_err(|err| ResourceError::invalid(err.to_string()))?;
-        if prior.checked_add(1) != next.parse::<u64>().ok() {
-            return Err(ResourceError::invalid("replica sequence gap; snapshot required"));
-        }
-        self.apply(event, synced_at).await?;
-        self.backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
+        self.apply_direct_batch(&[event], synced_at).await
     }
 
     /// Require a new authoritative snapshot without removing cached objects.

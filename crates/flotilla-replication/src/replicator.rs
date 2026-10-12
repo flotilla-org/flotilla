@@ -417,60 +417,44 @@ pub async fn replicate_relay_direct<T: Resource>(
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let mut watch = remote.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
-    while let Some(event) = watch.next().await {
-        let event = event.map_err(|error| error.to_string())?;
-        if let ReadWatchEvent::DeletedByName { mut tombstone, provenance } = event {
+    let mut watch = remote
+        .watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE)
+        .await
+        .map_err(|error| error.to_string())?
+        .ready_chunks(flotilla_store::replica::REPLICA_BATCH_SIZE);
+    while let Some(events) = watch.next().await {
+        let mut batches = std::collections::BTreeMap::<NodeId, Vec<(WatchEvent<T>, chrono::DateTime<Utc>)>>::new();
+        for event in events {
+            let (mut event, provenance) = match event.map_err(|error| error.to_string())? {
+                ReadWatchEvent::Added(source) => (WatchEvent::Added(source.object), source.provenance),
+                ReadWatchEvent::Modified(source) => (WatchEvent::Modified(source.object), source.provenance),
+                ReadWatchEvent::Deleted(source) => (WatchEvent::Deleted(source.object), source.provenance),
+                ReadWatchEvent::DeletedByName { tombstone, provenance } => (WatchEvent::DeletedByName(tombstone), provenance),
+            };
             let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance else {
                 continue;
             };
             if &origin_root == host.node_id() || &origin_root == peer {
                 continue;
             }
-            tombstone.annotations.remove("flotilla.work/origin-root");
-            tombstone.annotations.remove("flotilla.work/last-synced-at");
+            let annotations = match &mut event {
+                WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => &mut object.metadata.annotations,
+                WatchEvent::DeletedByName(tombstone) => &mut tombstone.annotations,
+            };
+            annotations.remove("flotilla.work/origin-root");
+            annotations.remove("flotilla.work/last-synced-at");
+            batches.entry(origin_root).or_default().push((event, last_synced_at));
+        }
+        for (origin, batch) in batches {
             store
                 .backend(host)
-                .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
-                .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
+                .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
+                .apply_stamped_batch(&batch)
                 .await
                 .map_err(|error| error.to_string())?;
-            continue;
         }
-        let (kind, mut source) = match event {
-            ReadWatchEvent::Added(source) => (StoredRelayEventKind::Added, source),
-            ReadWatchEvent::Modified(source) => (StoredRelayEventKind::Modified, source),
-            ReadWatchEvent::Deleted(source) => (StoredRelayEventKind::Deleted, source),
-            ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
-        };
-        let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else {
-            continue;
-        };
-        if &origin_root == host.node_id() || &origin_root == peer {
-            continue;
-        }
-        source.object.metadata.annotations.remove("flotilla.work/origin-root");
-        source.object.metadata.annotations.remove("flotilla.work/last-synced-at");
-        let event = match kind {
-            StoredRelayEventKind::Added => WatchEvent::Added(source.object),
-            StoredRelayEventKind::Modified => WatchEvent::Modified(source.object),
-            StoredRelayEventKind::Deleted => WatchEvent::Deleted(source.object),
-        };
-        store
-            .backend(host)
-            .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
-            .apply(event, last_synced_at)
-            .await
-            .map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum StoredRelayEventKind {
-    Added,
-    Modified,
-    Deleted,
 }
 
 async fn supervise_kind<I, S, SourceFut, F, Fut>(
@@ -590,7 +574,7 @@ pub async fn replicate_kind_direct<T: Resource>(
 }
 
 async fn apply_direct_watch<T: Resource>(
-    mut watch: flotilla_resources::WatchStream<T>,
+    watch: flotilla_resources::WatchStream<T>,
     writer: &flotilla_store::ReplicaWriter<T>,
     snapshot_version: String,
     remote: &flotilla_store::TypedResolver<T>,
@@ -598,6 +582,7 @@ async fn apply_direct_watch<T: Resource>(
 ) -> Result<(), OriginWatchFailure> {
     // Relay updates share the writer but cannot move this direct stream's
     // expected sequence. Its position starts at the authoritative snapshot.
+    let mut watch = watch.ready_chunks(flotilla_store::replica::REPLICA_BATCH_SIZE);
     let mut version = Some(snapshot_version);
     let mut digest_failures = DigestFailures::default();
     let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
@@ -617,9 +602,13 @@ async fn apply_direct_watch<T: Resource>(
                 continue;
             }
         };
-        let event = event.map_err(OriginWatchFailure::from_resource)?;
-        check_sequence(&mut version, &event).map_err(OriginWatchFailure::SnapshotRequired)?;
-        writer.apply_direct(event, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
+        let batch = event.into_iter().collect::<Result<Vec<_>, _>>().map_err(OriginWatchFailure::from_resource)?;
+        // `version` is speculative until apply succeeds. Every apply error
+        // must terminate this stream so reconnect resumes the durable prefix.
+        for event in &batch {
+            check_sequence(&mut version, event).map_err(OriginWatchFailure::SnapshotRequired)?;
+        }
+        writer.apply_direct_batch(&batch, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
     }
 }
 
@@ -945,6 +934,7 @@ async fn apply_relay_response<T: Resource>(
     response: ResourceReadEnvelope,
     store: ReplicationStore,
 ) -> Result<(), String> {
+    let mut batches = std::collections::BTreeMap::<NodeId, Vec<(WatchEvent<T>, chrono::DateTime<Utc>)>>::new();
     for record in response.records {
         let Some(event) = record_watch_event::<T>(record)? else {
             continue;
@@ -966,12 +956,7 @@ async fn apply_relay_response<T: Resource>(
                         .map(|value| value.with_timezone(&Utc))
                         .map_err(|error| format!("decode relayed tombstone sync timestamp: {error}"))
                 })?;
-            store
-                .backend(host)
-                .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
-                .apply(WatchEvent::DeletedByName(tombstone), synced_at)
-                .await
-                .map_err(|error| error.to_string())?;
+            batches.entry(origin).or_default().push((WatchEvent::DeletedByName(tombstone), synced_at));
             continue;
         }
         let object = match &event {
@@ -1006,10 +991,13 @@ async fn apply_relay_response<T: Resource>(
             WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
             WatchEvent::DeletedByName(_) => unreachable!("handled above"),
         };
+        batches.entry(origin).or_default().push((event, synced_at));
+    }
+    for (origin, batch) in batches {
         store
             .backend(host)
             .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
-            .apply(event, synced_at)
+            .apply_stamped_batch(&batch)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -1023,6 +1011,9 @@ async fn apply_response<T: Resource>(
     response: ResourceReadEnvelope,
 ) -> Result<(), String> {
     let (resource_version, generation) = response.cursor.position()?;
+    // Decode failures discard this uncommitted batch. The caller aborts the
+    // watch, then resumes from the durable cursor, which only advances below.
+    let mut batch = Vec::new();
     for record in response.records {
         if record.record_type == ResourceRecordType::Bookmark {
             if *initializing {
@@ -1048,9 +1039,10 @@ async fn apply_response<T: Resource>(
             let WatchEvent::Added(object) = event else { unreachable!("matched added event") };
             initial.push(object);
         } else {
-            writer.apply_direct(event, Utc::now()).await.map_err(|error| error.to_string())?;
+            batch.push(event);
         }
     }
+    writer.apply_direct_batch(&batch, Utc::now()).await.map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1119,6 +1111,50 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // A later decode error cannot advance past earlier, uncommitted records:
+    // reconnect replays from the durable prefix and applies those records.
+    #[tokio::test]
+    async fn failed_response_replays_from_unadvanced_prefix() {
+        use flotilla_resources::{Host, HostSpec, InputMeta};
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let object = backend
+            .using::<Host>(REPLICATION_NAMESPACE)
+            .create(&InputMeta::builder().name("peer-host".into()).build(), &HostSpec::default())
+            .await
+            .unwrap();
+        let writer = backend.replica_writer::<Host>(NodeId::new("peer"), REPLICATION_NAMESPACE);
+        writer.replace(&ResourceList { items: vec![], resource_version: "0".into(), generation: None }, Utc::now()).await.unwrap();
+        let record = ResourceReadRecord {
+            record_type: ResourceRecordType::Added,
+            provenance: flotilla_protocol::ResourceRecordProvenance::Local { node_id: NodeId::new("peer") },
+            object: Some(serde_json::to_value(object.to_k8s_object()).unwrap()),
+        };
+        let envelope = |records| ResourceReadEnvelope {
+            api_version: "flotilla.work/v1".into(),
+            resource_kind: "Host".into(),
+            plural: "hosts".into(),
+            namespace: REPLICATION_NAMESPACE.into(),
+            cursor: flotilla_protocol::ResourceCursor::from_position("1", None),
+            records,
+        };
+        let mut invalid = record.clone();
+        invalid.object = None;
+        assert!(apply_response(&writer, &mut Vec::new(), &mut false, envelope(vec![record.clone(), invalid])).await.is_err());
+        assert_eq!(writer.cursor().await.unwrap().unwrap().resource_version, "0");
+        assert!(backend
+            .store()
+            .list_replicas_raw(flotilla_store::ResourceKind::of::<Host>(), REPLICATION_NAMESPACE)
+            .await
+            .unwrap()
+            .is_empty());
+        apply_response(&writer, &mut Vec::new(), &mut false, envelope(vec![record])).await.unwrap();
+        assert_eq!(writer.cursor().await.unwrap().unwrap().resource_version, "1");
+        assert_eq!(
+            backend.store().list_replicas_raw(flotilla_store::ResourceKind::of::<Host>(), REPLICATION_NAMESPACE).await.unwrap().len(),
+            1
+        );
+    }
 
     #[test]
     fn routed_replication_decodes_name_tombstones() {

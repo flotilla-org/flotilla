@@ -748,6 +748,30 @@ switch_to() {
   atomic_link "releases/$generation" "$CURRENT_LINK"
 }
 
+# Retry transient daemon overload only. Decode and frozen-reference refusals
+# still fail immediately, and no activation happens before validation succeeds.
+# Discovery currently reports only status, so its bounded 500 retry is retained;
+# unrelated 500 diagnostics are not treated as evidence of store overload.
+validate_live_store() {
+  local candidate="$1"
+  shift
+  local attempt delay
+  local output="$WORK_DIR/live-store-validation.log"
+  for attempt in 1 2 3 4; do
+    if "$candidate" --socket "$DAEMON_SOCKET" resource validate --from-daemon "$@" >"$output" 2>&1; then
+      cat "$output"
+      return 0
+    fi
+    cat "$output" >&2
+    if [[ "$attempt" == 4 ]] || ! grep -Eq 'daemon kind discovery failed: 500 Internal Server Error|resource store busy|503 Service Unavailable' "$output"; then
+      return 1
+    fi
+    delay=$((1 << (attempt - 1)))
+    printf 'fleet-install: transient live-store validation failure; retrying in %ss\n' "$delay" >&2
+    sleep "$delay"
+  done
+}
+
 activate_staged_generation() {
   local generation="$1"
   local rollback_generation="$2"
@@ -764,7 +788,7 @@ activate_staged_generation() {
     if [[ -n "$SKILL_PROBE_TOKENS" ]]; then
       validation_args+=(--skill-probe-tokens "$SKILL_PROBE_TOKENS")
     fi
-    "$release/bin/flotilla" --socket "$DAEMON_SOCKET" resource validate --from-daemon "${validation_args[@]}" \
+    validate_live_store "$release/bin/flotilla" "${validation_args[@]}" \
       || die "candidate generation $generation failed live-store or frozen-reference validation"
   fi
   # Verification is the only activation step that needs this process's work

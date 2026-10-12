@@ -1431,6 +1431,33 @@ impl Store for InMemoryBackend {
     async fn delete_decode_quarantine_raw(&self, resource_kind: ResourceKind, namespace: &str, name: &str) -> Result<bool, ResourceError> {
         InMemoryBackend::delete_decode_quarantine_raw(self, resource_kind, namespace, name).await
     }
+    async fn namespace_inventory(&self) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
+        let mut inventory = crate::declared_resource_kinds()
+            .into_iter()
+            .map(|kind| (kind.paths.plural.to_string(), std::collections::BTreeSet::new()))
+            .collect::<BTreeMap<_, _>>();
+        {
+            let stores = self.stores.lock().await;
+            for (key, _) in stores.iter().filter(|(_, store)| !store.objects.is_empty()) {
+                if let Some(namespaces) = inventory.get_mut(&key.2) {
+                    namespaces.insert(key.3.clone());
+                }
+            }
+        }
+        if let Some(backend) = &self.durable_replicas {
+            for (kind, namespaces) in backend.namespace_inventory().await? {
+                inventory.entry(kind).or_default().extend(namespaces);
+            }
+        } else {
+            let replicas = self.replicas.lock().await;
+            for ((_, key), _) in replicas.partitions.iter().filter(|(_, partition)| !partition.objects.is_empty()) {
+                if let Some(namespaces) = inventory.get_mut(&key.2) {
+                    namespaces.insert(key.3.clone());
+                }
+            }
+        }
+        Ok(inventory.into_iter().map(|(kind, namespaces)| (kind, namespaces.into_iter().collect())).collect())
+    }
     async fn local_namespaces_raw(&self, resource_kind: ResourceKind) -> Result<Vec<String>, ResourceError> {
         InMemoryBackend::local_namespaces_raw(self, resource_kind).await
     }
@@ -1469,6 +1496,36 @@ impl Store for InMemoryBackend {
         bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
         InMemoryBackend::replace_replicas_raw(self, resource_kind, origin_root, namespace, listed, synced_at, bucket).await
+    }
+    async fn apply_replica_batch_raw(
+        &self,
+        resource_kind: ResourceKind,
+        origin_root: &NodeId,
+        namespace: &str,
+        events: &[(crate::WatchEvent<SerializedResource>, chrono::DateTime<Utc>)],
+    ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.apply_replica_batch_raw(resource_kind, origin_root, namespace, events).await;
+        }
+        for (event, synced_at) in events {
+            match event {
+                crate::WatchEvent::Added(object) => {
+                    self.apply_replica_raw(resource_kind, origin_root, namespace, StoredReplicaEventKind::Added, object, *synced_at).await?
+                }
+                crate::WatchEvent::Modified(object) => {
+                    self.apply_replica_raw(resource_kind, origin_root, namespace, StoredReplicaEventKind::Modified, object, *synced_at)
+                        .await?
+                }
+                crate::WatchEvent::Deleted(object) => {
+                    self.apply_replica_raw(resource_kind, origin_root, namespace, StoredReplicaEventKind::Deleted, object, *synced_at)
+                        .await?
+                }
+                crate::WatchEvent::DeletedByName(tombstone) => {
+                    self.apply_replica_tombstone_raw(resource_kind, origin_root, namespace, tombstone, *synced_at).await?
+                }
+            }
+        }
+        Ok(())
     }
     async fn apply_replica_raw(
         &self,

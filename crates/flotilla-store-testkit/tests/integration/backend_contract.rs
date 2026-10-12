@@ -317,3 +317,15 @@ async fn get_all_orders_provenances_like_list(#[case] adapter: &str) {
         "{adapter}: the first visible copy is the one list-and-find chose"
     );
 }
+
+#[tokio::test]
+async fn replica_burst_recovers_in_memory() {
+    assert_replica_burst_recovers(ResourceBackend::new(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn replica_burst_recovers_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = SqliteBackend::open(directory.path().join("queue.sqlite")).unwrap();
+    assert_replica_burst_recovers(ResourceBackend::new(backend)).await;
+}

@@ -1,3 +1,6 @@
+/// Cap replica transactions so catch-up yields the writer between batches.
+pub const REPLICA_BATCH_SIZE: usize = 64;
+
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 

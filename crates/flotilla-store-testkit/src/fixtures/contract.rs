@@ -1297,3 +1297,121 @@ pub async fn assert_replica_snapshot_reconciliation(backend: ResourceBackend) {
     assert!(writer.cursor().await.expect("cursor").is_none());
     assert_eq!(read.list().await.expect("preserved cached rows").items.len(), 2);
 }
+
+// Replication catch-up must leave interactive reads usable and recover within
+// the read deadline once the burst ends. The same scenario runs on both stores.
+pub async fn assert_replica_burst_recovers(backend: ResourceBackend) {
+    assert_replica_burst_recovers_with(backend, std::future::ready(None)).await;
+}
+
+pub async fn assert_replica_burst_recovers_with(
+    backend: ResourceBackend,
+    before_burst: impl std::future::Future<Output = Option<tokio::sync::oneshot::Sender<()>>>,
+) {
+    use flotilla_protocol::NodeId;
+    use std::time::Duration;
+    let hosts = backend.using::<Host>("queue-contract");
+    let seed = hosts.create(&InputMeta::builder().name("interactive".into()).build(), &HostSpec::default()).await.unwrap();
+    let writer = backend.replica_writer::<Host>(NodeId::new("remote"), "queue-contract");
+    writer
+        .replace(&flotilla_resources::ResourceList { items: vec![], resource_version: "0".into(), generation: None }, chrono::Utc::now())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    // Cover empty, singleton, transaction boundaries and a multi-batch burst.
+    for version in 1..=129 {
+        let mut object = seed.clone();
+        object.metadata.name = format!("replica-{version}");
+        object.metadata.resource_version = version.to_string();
+        events.push(WatchEvent::Added(object));
+    }
+    writer.apply_direct_batch(&[], chrono::Utc::now()).await.unwrap();
+    let release = before_burst.await;
+    let (burst_started, burst_ready) = tokio::sync::oneshot::channel();
+    let write = tokio::spawn(async move {
+        burst_started.send(()).unwrap();
+        for batch in [&events[..1], &events[1..64], &events[64..129]] {
+            writer.apply_direct_batch(batch, chrono::Utc::now()).await.unwrap();
+        }
+        // Replay duplicates without moving the direct prefix.
+        writer.apply_batch(&events, chrono::Utc::now()).await.unwrap();
+        assert_eq!(writer.cursor().await.unwrap().unwrap().resource_version, "129");
+        // A gap must refuse the batch without moving its proven prefix.
+        let mut gap = seed.clone();
+        gap.metadata.resource_version = "131".into();
+        assert!(writer.apply_direct_batch(&[WatchEvent::Modified(gap)], chrono::Utc::now()).await.is_err());
+        assert_eq!(writer.cursor().await.unwrap().unwrap().resource_version, "129");
+    });
+    burst_ready.await.unwrap();
+    // The burst is underway and the writer remains blocked until this read
+    // finishes; scheduler sleeps cannot decide whether the seam is exercised.
+    tokio::time::timeout(Duration::from_secs(2), hosts.get("interactive")).await.unwrap().unwrap();
+    if let Some(release) = release {
+        release.send(()).unwrap();
+    }
+    for _ in 0..32 {
+        tokio::time::timeout(Duration::from_secs(2), hosts.get("interactive")).await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(30), write).await.unwrap().unwrap();
+    let recovered =
+        tokio::time::timeout(Duration::from_secs(2), backend.including_replicas::<Host>("queue-contract").list()).await.unwrap().unwrap();
+    assert_eq!(recovered.items.len(), 130);
+    // A relay batch keeps individual sync times: an older object must not
+    // resurrect a newer name-only tombstone in the same batch.
+    let writer = backend.replica_writer::<Host>(NodeId::new("remote"), "queue-contract");
+    let now = chrono::Utc::now();
+    let mut stale = hosts.get("interactive").await.unwrap();
+    stale.metadata.name = "replica-1".into();
+    writer
+        .apply_stamped_batch(&[
+            (
+                WatchEvent::DeletedByName(flotilla_resources::ResourceTombstone {
+                    name: "replica-1".into(),
+                    namespace: "queue-contract".into(),
+                    resource_version: "130".into(),
+                    annotations: Default::default(),
+                }),
+                now + chrono::Duration::seconds(1),
+            ),
+            (WatchEvent::Added(stale), now),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(backend.including_replicas::<Host>("queue-contract").list().await.unwrap().items.len(), 129);
+    let inventory = flotilla_store::registered_resource_namespaces(&backend).await.unwrap();
+    assert!(inventory["hosts"].contains(&"queue-contract".to_string()));
+    assert_tombstone_only_namespaces_are_absent(backend).await;
+}
+
+// Discovery inventories only live objects. Local deletion and replica
+// tombstones must both remove the last live object's namespace from inventory.
+pub async fn assert_tombstone_only_namespaces_are_absent(backend: ResourceBackend) {
+    let namespace = "tombstone-only";
+    let hosts = backend.using::<Host>(namespace);
+    let object = hosts.create(&InputMeta::builder().name("last".into()).build(), &HostSpec::default()).await.unwrap();
+    let inventory = flotilla_store::registered_resource_namespaces(&backend).await.unwrap();
+    assert!(inventory["hosts"].contains(&namespace.to_string()));
+    hosts.delete("last").await.unwrap();
+    let inventory = flotilla_store::registered_resource_namespaces(&backend).await.unwrap();
+    assert!(!inventory["hosts"].contains(&namespace.to_string()));
+    let writer = backend.replica_writer::<Host>(flotilla_protocol::NodeId::new("remote"), namespace);
+    let synced = chrono::Utc::now();
+    writer.apply(WatchEvent::Added(object), synced).await.unwrap();
+    let inventory = flotilla_store::registered_resource_namespaces(&backend).await.unwrap();
+    assert!(inventory["hosts"].contains(&namespace.to_string()));
+    writer
+        .apply(
+            WatchEvent::DeletedByName(flotilla_resources::ResourceTombstone {
+                name: "last".into(),
+                namespace: namespace.into(),
+                resource_version: "2".into(),
+                annotations: Default::default(),
+            }),
+            synced + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    let inventory = flotilla_store::registered_resource_namespaces(&backend).await.unwrap();
+    assert!(!inventory["hosts"].contains(&namespace.to_string()));
+}
