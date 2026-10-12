@@ -319,6 +319,8 @@ mod routing;
 mod sources;
 mod stalls;
 mod subscriptions;
+mod supervision;
+pub(crate) use supervision::EscalationAdmission;
 mod turn_delivery;
 mod wake;
 

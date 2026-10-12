@@ -1304,6 +1304,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     match result {
         CommandValue::LedgerCommentCreationReserved { granted } => format!("ledger comment creation granted: {granted}"),
         CommandValue::Ok => "ok".to_string(),
+        CommandValue::CrewEscalated { receiver } => format!("escalated to {receiver}"),
+        CommandValue::CrewEscalationRefused { rung, reason } => format!("escalation refused at {rung} rung: {reason}"),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
         CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),
         CommandValue::ResourceReconciled { message, .. } => message.clone(),

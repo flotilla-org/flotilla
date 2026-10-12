@@ -898,3 +898,19 @@ fn convoy_list_shows_landed_trigger_without_a_crew_session() {
     };
     assert!(super::format_fleet_list_human(&response).contains(reason));
 }
+
+// The command reports the actual receiver, or names the rung it refused.
+#[test]
+fn escalation_outcomes_name_receiver_or_missing_rung() {
+    assert_eq!(
+        format_command_result(&CommandValue::CrewEscalated { receiver: "project/governor".into() }),
+        "escalated to project/governor"
+    );
+    assert_eq!(
+        format_command_result(&CommandValue::CrewEscalationRefused {
+            rung: flotilla_protocol::StallRung::Operator,
+            reason: "no receiver bound".into(),
+        }),
+        "escalation refused at operator rung: no receiver bound"
+    );
+}

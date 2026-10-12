@@ -126,7 +126,10 @@ pub(crate) async fn run_control_command(cli: &Cli, mut command: Command, format:
         Ok(result) => result,
         Err(message) => exit_command_error(message, format),
     };
-    if matches!(result, CommandValue::Error { .. } | CommandValue::FleetPostInstall { failed: true, .. }) {
+    if matches!(
+        result,
+        CommandValue::Error { .. } | CommandValue::CrewEscalationRefused { .. } | CommandValue::FleetPostInstall { failed: true, .. }
+    ) {
         std::process::exit(1);
     }
     if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding, .. } = result {

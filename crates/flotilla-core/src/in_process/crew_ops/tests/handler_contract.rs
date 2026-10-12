@@ -146,3 +146,65 @@ async fn direct_crew_contract_stall_errors_and_routing_refusal() {
         );
     }
 }
+
+// Glue: the supervision handler must expose the typed missing-receiver refusal
+// in CommandFinished and must not record a successful lifecycle mutation.
+#[tokio::test]
+async fn escalation_refusal_reaches_command_finished() {
+    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    flotilla_store::apply_status_patch(
+        &convoys,
+        "crew",
+        &flotilla_resources::external_patches::mark_crew_stalled(
+            "crew".into(),
+            "work".into(),
+            "coder".into(),
+            chrono::Utc::now(),
+            flotilla_protocol::StallReason::Scope,
+            None,
+            "blocked".into(),
+        ),
+    )
+    .await
+    .expect("stall");
+    let convoy = convoys.get("crew").await.expect("source");
+    let mut status = convoy.status.expect("status");
+    let stalled = status.stalled.as_mut().expect("stall");
+    stalled.rung = flotilla_protocol::StallRung::Governor;
+    stalled.supervision_index = Some(1);
+    stalled.supervisor =
+        Some(flotilla_resources::StallSupervisor { convoy: "governor".into(), vessel: "watch".into(), role: "governor".into() });
+    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("owner");
+    let recording = Arc::new(RecordingEventSink::default());
+    let sink: Arc<dyn EventSink> = recording.clone();
+    let clock: Arc<dyn flotilla_resources::Clock> = Arc::new(SystemClock);
+    let node = NodeId::new("handler");
+    let actions = CrewActions {
+        port: &UnusedSubjects,
+        crew: &crew,
+        resource_backend: &backend,
+        clock: &clock,
+        events: ActionEvents { sink: &sink, node_id: &node },
+    };
+    let command = Command::builder()
+        .action(CommandAction::CrewSupervise {
+            namespace: Some("flotilla".into()),
+            convoy: "crew".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            operation: flotilla_protocol::CrewSupervisionAction::Escalate,
+            message: "raise this".into(),
+            actor_crew_id: None,
+        })
+        .build();
+    actions
+        .execute_action_crew_supervise(1, &command, &None, &Some(PrincipalRef::implicit_for_namespace("flotilla")))
+        .await
+        .expect("command dispatch");
+    assert!(matches!(
+        result(&recording.events(), 1, &node),
+        CommandValue::CrewEscalationRefused { rung: flotilla_protocol::StallRung::Operator, .. }
+    ));
+    assert_eq!(convoys.get("crew").await.expect("source").status, Some(status));
+}

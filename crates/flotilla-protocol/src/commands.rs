@@ -1368,6 +1368,15 @@ pub enum CommandValue {
     },
     Ok,
     CrewFollowUpDelivered,
+    /// The named receiver admitted the next supervision obligation.
+    CrewEscalated {
+        receiver: String,
+    },
+    /// No transfer occurred; the current supervisor still owns the stall.
+    CrewEscalationRefused {
+        rung: crate::StallRung,
+        reason: String,
+    },
     /// The claim is still unmet; a CLI caller waits and retries at this deadline.
     CrewCompletionWaiting {
         reason: String,

@@ -164,6 +164,12 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::CrewCompletionWaiting { reason, retry_at } => {
             app.set_status_message(Some(format!("crew completion waiting until {retry_at}: {reason}")));
         }
+        CommandValue::CrewEscalated { receiver } => {
+            app.set_status_message(Some(format!("escalated to {receiver}")));
+        }
+        CommandValue::CrewEscalationRefused { rung, reason } => {
+            app.set_error_message(format!("escalation refused at {rung} rung: {reason}"));
+        }
         CommandValue::CrewFollowUpDelivered => {
             app.set_status_message(Some(flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string()));
         }
