@@ -14,7 +14,9 @@ spec:
         selection:
           base: spine-base
           utilities: spine-utilities
-          harness: spine-harness
+          harnesses:
+            - harness-claude-code
+            - harness-codex
           project: null
     memory_policy:
       host_memory_percent: 50

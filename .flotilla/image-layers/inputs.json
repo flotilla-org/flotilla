@@ -46,11 +46,21 @@
         "TEA_VERSION": {
           "value": "0.16.0",
           "source": "https://dl.gitea.com/tea/"
+        },
+        "ZIG_VERSION": {
+          "value": "0.16.0",
+          "source": "https://ziglang.org/download/index.json"
+        },
+        "CLEAT_REF": {
+          "value": "e233d6d244da0ba495858582c9364ad062572159",
+          "source": "https://github.com/flotilla-org/cleat"
         }
       },
       "sources": {
         "gh": "https://cli.github.com/packages",
-        "apt": "selected Ubuntu base apt sources"
+        "apt": "selected Ubuntu base apt sources",
+        "uv": "https://astral.sh/uv/install.sh",
+        "ghostty": "cleat tools/ghostty-toolchain.toml at CLEAT_REF"
       },
       "provides": [
         "utility:git",
@@ -173,41 +183,40 @@
       }
     },
     {
-      "name": "spine-harness",
+      "name": "harness-codex",
       "stage": "harness",
-      "fragment": ".flotilla/image-layers/harness.Dockerfile",
+      "fragment": ".flotilla/image-layers/harness-codex.Dockerfile",
       "pins": {
-        "ZIG_VERSION": {
-          "value": "0.16.0",
-          "source": "https://ziglang.org/download/index.json"
-        },
-        "CLEAT_REF": {
-          "value": "e233d6d244da0ba495858582c9364ad062572159",
-          "source": "https://github.com/flotilla-org/cleat"
-        },
-        "CLAUDE_CODE_VERSION": {
-          "value": "2.1.287",
-          "source": "https://registry.npmjs.org/@anthropic-ai/claude-code"
-        },
         "CODEX_VERSION": {
           "value": "0.160.0",
           "source": "https://registry.npmjs.org/@openai/codex"
         }
       },
-      "sources": {
-        "uv": "https://astral.sh/uv/install.sh",
-        "ghostty": "cleat tools/ghostty-toolchain.toml at CLEAT_REF"
-      },
       "provides": [
-        "harness:codex@0.160.0",
-        "harness:claude-code@2.1.287"
+        "harness:codex@0.160.0"
       ],
       "probes": {
         "harness:codex@0.160.0": [
           "sh",
           "-c",
           "codex --version | grep -E '(^|[^0-9])0\\.160\\.0([^0-9.]|$)'"
-        ],
+        ]
+      }
+    },
+    {
+      "name": "harness-claude-code",
+      "stage": "harness",
+      "fragment": ".flotilla/image-layers/harness-claude-code.Dockerfile",
+      "pins": {
+        "CLAUDE_CODE_VERSION": {
+          "value": "2.1.287",
+          "source": "https://registry.npmjs.org/@anthropic-ai/claude-code"
+        }
+      },
+      "provides": [
+        "harness:claude-code@2.1.287"
+      ],
+      "probes": {
         "harness:claude-code@2.1.287": [
           "sh",
           "-c",

@@ -104,6 +104,30 @@ COPY --from=zig-toolchain /opt/zig /opt/zig
 RUN ln -s /opt/zig/zig /usr/local/bin/zig \
     && test "$(zig version)" = "${ZIG_VERSION}"
 
+# Builder stage: generate xterm-ghostty terminfo from cleat's pinned source.
+ARG BASE
+FROM spine-base AS ghostty-builder
+ARG ZIG_VERSION=0.16.0
+ARG CLEAT_REF=e233d6d244da0ba495858582c9364ad062572159
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git build-essential ncurses-bin \
+    && rm -rf /var/lib/apt/lists/*
+COPY ci/crew-image/emit-ghostty-terminfo.zig /tmp/emit-ghostty-terminfo.zig
+# Cleat's preparation script reads the Ghostty revision from its own
+# tools/ghostty-toolchain.toml. Verify Zig matches that same pin.
+RUN git clone --filter=blob:none --no-checkout https://github.com/flotilla-org/cleat.git /src/cleat \
+    && cd /src/cleat \
+    && git fetch --depth 1 origin "${CLEAT_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(sed -n '/^\[zig\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' tools/ghostty-toolchain.toml)" = "${ZIG_VERSION}" \
+    && ./tools/prepare-ghostty-vt.sh \
+    && cd /src/cleat/.tools/ghostty-src \
+    && cp /tmp/emit-ghostty-terminfo.zig src/emit-ghostty-terminfo.zig \
+    && zig run src/emit-ghostty-terminfo.zig > /tmp/ghostty.terminfo \
+    && mkdir -p /src/cleat/.tools/ghostty-install/share/terminfo \
+    && tic -x -o /src/cleat/.tools/ghostty-install/share/terminfo /tmp/ghostty.terminfo \
+    && test -f /src/cleat/.tools/ghostty-install/share/terminfo/x/xterm-ghostty
+
 ARG BASE
 FROM spine-base AS spine-utilities
 ARG TARGETARCH
@@ -154,40 +178,6 @@ RUN chmod 0755 /usr/local/bin/tea && tea --version
 ENV CARGO_HOME=/tmp/flotilla-config/cargo
 ENV PATH="/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Builder stage: generate xterm-ghostty terminfo from cleat's pinned source.
-ARG BASE
-FROM spine-utilities AS ghostty-builder
-ARG ZIG_VERSION=0.16.0
-ARG CLEAT_REF=e233d6d244da0ba495858582c9364ad062572159
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git build-essential ncurses-bin \
-    && rm -rf /var/lib/apt/lists/*
-COPY ci/crew-image/emit-ghostty-terminfo.zig /tmp/emit-ghostty-terminfo.zig
-# Cleat's preparation script reads the Ghostty revision from its own
-# tools/ghostty-toolchain.toml. Verify Zig matches that same pin.
-RUN git clone --filter=blob:none --no-checkout https://github.com/flotilla-org/cleat.git /src/cleat \
-    && cd /src/cleat \
-    && git fetch --depth 1 origin "${CLEAT_REF}" \
-    && git checkout --detach FETCH_HEAD \
-    && test "$(sed -n '/^\[zig\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' tools/ghostty-toolchain.toml)" = "${ZIG_VERSION}" \
-    && ./tools/prepare-ghostty-vt.sh \
-    && cd /src/cleat/.tools/ghostty-src \
-    && cp /tmp/emit-ghostty-terminfo.zig src/emit-ghostty-terminfo.zig \
-    && zig run src/emit-ghostty-terminfo.zig > /tmp/ghostty.terminfo \
-    && mkdir -p /src/cleat/.tools/ghostty-install/share/terminfo \
-    && tic -x -o /src/cleat/.tools/ghostty-install/share/terminfo /tmp/ghostty.terminfo \
-    && test -f /src/cleat/.tools/ghostty-install/share/terminfo/x/xterm-ghostty
-
-FROM spine-utilities AS spine-harness
-# 4. Agent adapters. Keep this fastest-moving layer last.
-ARG CLAUDE_CODE_VERSION=2.1.287
-ARG CODEX_VERSION=0.160.0
-
-RUN npm install --global \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-        "@openai/codex@${CODEX_VERSION}" \
-    && npm cache clean --force
-
 # Ghostty terminfo comes from the same pinned source as libghostty-vt (see
 # CLEAT_REF and tools/ghostty-toolchain.toml in that checkout). It is MIT
 # licensed; retain the source licence alongside the installed database.
@@ -196,7 +186,6 @@ COPY --from=ghostty-builder /src/cleat/.tools/ghostty-src/LICENSE /usr/share/doc
 RUN infocmp xterm-ghostty >/dev/null \
     && infocmp xterm-256color >/dev/null
 
-ENV DISABLE_AUTOUPDATER=1
 ENV SHELL=/bin/zsh
 
 RUN curl -LsSf https://astral.sh/uv/install.sh \
@@ -204,9 +193,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh \
 
 # Build-time smoke check: declaring these adapters in a PlacementPolicy is a
 # promise that both entry points are executable in the image.
-RUN claude --version \
-    && codex --version \
-    && tea --version \
+RUN tea --version \
     && python3 --version \
     && uv --version \
     && strace --version \
@@ -235,3 +222,18 @@ RUN setpriv --reuid=12345 --regid=12345 --clear-groups sh -euc ' \
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
+
+ARG BASE
+FROM spine-utilities AS harness-claude-code
+ARG CLAUDE_CODE_VERSION=2.1.287
+RUN npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && npm cache clean --force \
+    && claude --version
+ENV DISABLE_AUTOUPDATER=1
+
+ARG BASE
+FROM harness-claude-code AS harness-codex
+ARG CODEX_VERSION=0.160.0
+RUN npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
+    && codex --version

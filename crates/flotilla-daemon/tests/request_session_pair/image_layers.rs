@@ -36,7 +36,8 @@ fn layer(stage: ImageLayerStage, provides: &[&str]) -> ImageLayerSpec {
 
 // Behaviour (#2727/#2728): routing freezes baseline or explicit composition
 // on the selected host. Two admitted convoys share a pinned execution; the
-// legacy baseline selections also demand builds after the cut-over.
+// legacy baseline selections also demand builds after the cut-over. #3136:
+// explicit Claude and implicit Codex needs select two independent harnesses.
 async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: bool) {
     let hosts = vec![empty_daemon_named("image-home").await, empty_daemon_named("image-issuer").await];
     let home = Arc::clone(&hosts[0]);
@@ -66,7 +67,12 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
                 DockerImageSource::Composition {
                     composition: Box::new(
                         ImageComposition::builder()
-                            .selection(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build())
+                            .selection(
+                                ImageLayerSelection::builder()
+                                    .base("base".into())
+                                    .harnesses(std::collections::BTreeSet::from(["harness".into()]))
+                                    .build(),
+                            )
                             .needs(BTreeSet::new())
                             .layers(vec![
                                 FrozenImageLayer { name: "base".into(), spec: layer(ImageLayerStage::Base, &["os:debian-family"]) },
@@ -106,6 +112,7 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         ("base", layer(ImageLayerStage::Base, &["os:debian-family"])),
         ("display", layer(ImageLayerStage::Capability, &["display:headless-x11"])),
         ("harness", layer(ImageLayerStage::Harness, &["harness:codex@0.160.0"])),
+        ("harness-claude", layer(ImageLayerStage::Harness, &["harness:claude-code@2.1.287"])),
     ] {
         backend
             .definitions::<ImageLayer>("flotilla")
@@ -119,7 +126,12 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
             &InputMeta::builder().name("fleet-crew".into()).build(),
             &CrewImageBaselineSpec {
                 image: "crew:authoritative".into(),
-                layers: Some(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build()),
+                layers: Some(
+                    ImageLayerSelection::builder()
+                        .base("base".into())
+                        .harnesses(std::collections::BTreeSet::from(["harness".into()]))
+                        .build(),
+                ),
             },
         )
         .await
@@ -134,6 +146,7 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
             && issuer.including_replicas::<FulfilmentKind>("flotilla").get("layered-docker").await.is_ok()
             && issuer.including_replicas::<PlacementPolicy>("flotilla").get("layered-docker").await.is_ok()
             && issuer.definitions::<ImageLayer>("flotilla").get("harness").await.is_ok()
+            && issuer.definitions::<ImageLayer>("flotilla").get("harness-claude").await.is_ok()
             && issuer.definitions::<ImageLayer>("flotilla").get("display").await.is_ok()
             && issuer.definitions::<ImageLayer>("flotilla").get("base").await.is_ok()
             && issuer.definitions::<CrewImageBaseline>("flotilla").get("fleet-crew").await.is_ok()
@@ -146,7 +159,7 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
                 .project_ref("flotilla".into())
                 .name("layered-work".into())
                 .branch("test/layered-work".into())
-                .needs(vec![need.into()])
+                .needs(vec![need.into(), "harness:claude-code>=2.1.287".into()])
                 .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                 .build(),
         ),
@@ -170,7 +183,7 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
     let frozen: FrozenImageLayers =
         serde_json::from_str(convoys[0].metadata.annotations.get(IMAGE_LAYERS_ANNOTATION).expect("frozen layer record"))
             .expect("decode layers");
-    assert_eq!(frozen.layers.keys().map(String::as_str).collect::<Vec<_>>(), ["base", "display", "harness"]);
+    assert_eq!(frozen.layers.keys().map(String::as_str).collect::<Vec<_>>(), ["base", "display", "harness", "harness-claude"]);
     assert_eq!(frozen.baseline_image, None);
     let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("joined builds").items;
     assert_eq!(builds.len(), 1, "admission joins the first stage before accepting the convoy");
@@ -181,7 +194,7 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
                 .project_ref("flotilla".into())
                 .name("layered-work-second".into())
                 .branch("test/layered-work-second".into())
-                .needs(vec![need.into()])
+                .needs(vec![need.into(), "harness:claude-code>=2.1.287".into()])
                 .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                 .build(),
         ),

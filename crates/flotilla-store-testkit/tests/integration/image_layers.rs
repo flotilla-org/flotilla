@@ -26,7 +26,12 @@ fn layer(stage: ImageLayerStage, provides: &[&str]) -> ImageLayerSpec {
 }
 
 fn selection() -> ImageLayerSelection {
-    ImageLayerSelection::builder().base("base".into()).utilities("utils".into()).harness("harness".into()).project("project".into()).build()
+    ImageLayerSelection::builder()
+        .base("base".into())
+        .utilities("utils".into())
+        .harnesses(std::collections::BTreeSet::from(["harness".into()]))
+        .project("project".into())
+        .build()
 }
 
 fn catalogue() -> BTreeMap<String, ImageLayerSpec> {
@@ -63,14 +68,14 @@ fn canonical_minimal_cover(tc: hegel::TestCase) {
         needs.insert("browser:chromium".into());
     }
     let result = compose_image(&selection(), &needs, &entries.into_iter().collect(), &mut FrozenImageLayers::default()).expect("compose");
-    let mut expected = vec!["base", "utils"];
+    let mut expected = vec!["base", "utils", "project"];
     if display {
         expected.push("a-display");
     }
     if browser {
         expected.push("z-browser");
     }
-    expected.extend(["harness", "project"]);
+    expected.push("harness");
     assert_eq!(result.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(), expected);
     let empty = compose_image(&selection(), &BTreeSet::new(), &catalogue(), &mut FrozenImageLayers::default()).expect("empty needs");
     assert_eq!(empty.layers.len(), 4);
@@ -453,9 +458,122 @@ fn relevant_layer_limit_has_an_atomic_boundary() {
             assert_eq!(composition.layers.iter().filter(|layer| layer.spec.stage == ImageLayerStage::Capability).count(), 1);
         } else {
             let error = result.expect_err("65 relevant layers exceed the supported limit");
-            assert!(error.contains("65 relevant capability layers"), "{error}");
+            assert!(error.contains("65 relevant optional image layers"), "{error}");
             assert!(error.contains("goal:one"));
             assert!(frozen.layers.is_empty());
         }
+    }
+}
+
+// #3136: explicit harness needs choose the minimum cover through the same
+// search as capabilities; defaults apply only without harness needs.
+#[hegel::test]
+fn harness_cover_and_volatility_order(tc: hegel::TestCase) {
+    // Empty, either, and both harness needs, with duplicate insertion, plus a
+    // capability prerequisite supplied by the earlier project stage.
+    let codex = tc.draw(gs::booleans());
+    let claude = tc.draw(gs::booleans());
+    let mut catalogue = catalogue();
+    catalogue.insert("a-claude".into(), layer(ImageLayerStage::Harness, &["harness:claude-code@2.1.287"]));
+    catalogue.get_mut("a-display").expect("valid fixture").requires.insert("project:flotilla".into());
+    let mut needs = BTreeSet::from(["display:headless-x11".into()]);
+    if codex {
+        needs.insert("harness:codex>=0.160".into());
+        needs.insert("harness:codex>=0.160".into());
+    }
+    if claude {
+        needs.insert("harness:claude-code".into());
+    }
+    let result = compose_image(&selection(), &needs, &catalogue, &mut FrozenImageLayers::default()).expect("valid fixture");
+    let mut expected = vec!["base", "utils", "project", "a-display"];
+    if claude {
+        expected.push("a-claude");
+    }
+    if codex || !claude {
+        expected.push("harness");
+    }
+    assert_eq!(result.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(), expected);
+    // A harness providing an additional capability beats a separate capability
+    // layer, proving that both stages participate in one minimum-cover search.
+    catalogue.insert("combined-harness".into(), layer(ImageLayerStage::Harness, &["harness:codex@0.160.0", "display:headless-x11"]));
+    let needs = BTreeSet::from(["harness:codex".into(), "harness:claude-code".into(), "display:headless-x11".into()]);
+    let result = compose_image(&selection(), &needs, &catalogue, &mut FrozenImageLayers::default()).expect("valid fixture");
+    assert_eq!(result.layers.last().expect("valid fixture").name, "combined-harness");
+    assert_eq!(result.layers.len(), 5);
+}
+
+// ADR 0047: previous selections decode, new writes contain only harnesses,
+// unknown fields still refuse, and frozen layer order/identity survives decoding.
+#[test]
+fn legacy_harness_selection_and_frozen_composition_keep_decoding() {
+    for harness in [serde_json::Value::Null, serde_json::json!("harness")] {
+        let legacy = serde_json::json!({"base":"base", "utilities":"utils", "project":"project", "harness":harness});
+        let selection: ImageLayerSelection = serde_json::from_value(legacy.clone()).expect("valid fixture");
+        assert_eq!(selection.harnesses.len(), usize::from(!harness.is_null()));
+        let current = serde_json::to_value(&selection).expect("valid fixture");
+        assert!(current.get("harness").is_none());
+        assert!(current.get("harnesses").is_some());
+        assert_eq!(serde_json::from_value::<ImageLayerSelection>(current).expect("valid fixture"), selection);
+        let mut unknown = legacy;
+        unknown["typo"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ImageLayerSelection>(unknown).is_err());
+    }
+    let mut composition =
+        compose_image(&selection(), &BTreeSet::new(), &catalogue(), &mut FrozenImageLayers::default()).expect("valid fixture");
+    composition.layers.swap(2, 3); // Recorded previous-generation harness → project order.
+    composition.bind(PlacedImageIdentity { local_image_id: "sha256:recorded".into(), registry_digest: None }).expect("valid fixture");
+    let mut record = serde_json::to_value(&composition).expect("valid fixture");
+    record["selection"].as_object_mut().expect("valid fixture").remove("harnesses");
+    record["selection"]["harness"] = serde_json::json!("harness");
+    assert_eq!(serde_json::from_value::<flotilla_resources::ImageComposition>(record).expect("valid fixture"), composition);
+}
+
+// Defaults may include multiple harnesses; each one's prerequisites must be
+// provided by lower project/capability stages, and ties resolve lexically.
+#[test]
+fn default_harness_set_and_transitive_prerequisites() {
+    let mut catalogue = catalogue();
+    let mut claude = layer(ImageLayerStage::Harness, &["harness:claude-code@2.1.287"]);
+    claude.requires.insert("display:headless-x11".into());
+    catalogue.insert("a-claude".into(), claude.clone());
+    catalogue.insert("z-claude".into(), claude);
+    let mut selection = selection();
+    selection.harnesses.insert("a-claude".into());
+    let mut frozen = FrozenImageLayers::default();
+    let result = compose_image(&selection, &BTreeSet::new(), &catalogue, &mut frozen).expect("default set");
+    assert_eq!(
+        result.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
+        ["base", "utils", "project", "a-display", "a-claude", "harness"]
+    );
+    let result = compose_image(&selection, &BTreeSet::from(["harness:claude-code".into()]), &catalogue, &mut FrozenImageLayers::default())
+        .expect("minimal explicit set");
+    assert_eq!(
+        result.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
+        ["base", "utils", "project", "a-display", "a-claude"]
+    );
+}
+
+// Harness candidates share the capability search's exact 64-layer bound and
+// unsatisfiable version refusals, without mutating the frozen catalogue.
+#[test]
+fn harness_cover_refusal_and_search_bound() {
+    for count in [64, 65] {
+        let mut catalogue = catalogue();
+        for index in 0..count {
+            catalogue.insert(format!("h-{index:02}"), layer(ImageLayerStage::Harness, &["harness:other@1.0"]));
+        }
+        let mut frozen = FrozenImageLayers::default();
+        let result = compose_image(&selection(), &BTreeSet::from(["harness:other".into()]), &catalogue, &mut frozen);
+        if count == 64 {
+            assert_eq!(result.expect("valid fixture").layers.last().expect("valid fixture").name, "h-00");
+        } else {
+            assert!(result.expect_err("refused composition").contains("search limit"));
+            assert_eq!(frozen, FrozenImageLayers::default());
+        }
+        let mut frozen = FrozenImageLayers::default();
+        assert!(compose_image(&selection(), &BTreeSet::from(["harness:other>=2".into()]), &catalogue, &mut frozen)
+            .expect_err("refused composition")
+            .contains("harness:other>=2"));
+        assert_eq!(frozen, FrozenImageLayers::default());
     }
 }

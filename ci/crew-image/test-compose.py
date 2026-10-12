@@ -26,14 +26,53 @@ class Composition(unittest.TestCase):
         text = dockerfile()
         self.assertNotIn('xvfb', text)
         self.assertLess(text.index(' AS spine-base'), text.index(' AS spine-utilities'))
-        self.assertLess(text.index(' AS spine-utilities'), text.index(' AS spine-harness'))
-        self.assertIn('FROM spine-utilities AS ghostty-builder', text)
-        self.assertIn('FROM spine-utilities AS spine-harness', text)
+        self.assertLess(text.index(' AS spine-utilities'), text.index(' AS harness-claude-code'))
+        self.assertIn('FROM spine-base AS ghostty-builder', text)
+        self.assertIn('FROM spine-utilities AS harness-claude-code', text)
+
+    def test_project_capabilities_and_harnesses_follow_volatility_order(self):
+        # #3136: catalogue insertion order cannot put volatile harnesses below
+        # project dependencies. Reuse a real fragment for the project boundary.
+        source = Path.read_text
+        inputs = ROOT / '.flotilla/image-layers/inputs.json'
+        catalogue = json.loads(source(inputs))
+        catalogue['layers'].append({'name': 'project-test', 'stage': 'project',
+                                    'fragment': '.flotilla/image-layers/display-x11.Dockerfile'})
+        catalogue['layers'].reverse()
+        def reordered(path, *args, **kwargs):
+            return json.dumps(catalogue) if path == inputs else source(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', reordered):
+            text = dockerfile(display=True, formal_modelling=True)
+        names = ['spine-base', 'spine-utilities', 'project-test',
+                 'capability-display-x11', 'capability-formal-modelling',
+                 'harness-claude-code', 'harness-codex']
+        offsets = [text.index(' AS ' + name) for name in names]
+        self.assertEqual(offsets, sorted(offsets))
+        for parent, child in zip(names, names[1:]):
+            self.assertIn('FROM ' + parent + ' AS ' + child, text)
+
+    def test_harness_fragments_have_independent_pins_provides_and_probes(self):
+        # A bump of one harness must not install the other harness. Shared
+        # terminal support lives in utilities and remains below either harness.
+        records = [json.loads(doc) for doc in manifests('a' * 40, 'sha256:' + 'b' * 64).split('\n---\n')]
+        harnesses = [r['spec'] for r in records if r['spec']['stage'] == 'harness']
+        self.assertEqual(len(harnesses), 2)
+        for spec in harnesses:
+            self.assertEqual(len(spec['provides']), 1)
+            self.assertEqual(set(spec['probes']), set(spec['provides']))
+            self.assertEqual(len(spec['pins']), 1)
+            text = (ROOT / spec['fragment']).read_text()
+            self.assertIn('FROM ${BASE}', text)
+            self.assertEqual(text.count('npm install --global'), 1)
+            self.assertEqual('@anthropic-ai/claude-code' in text,
+                             spec['provides'][0].startswith('harness:claude-code@'))
+            self.assertEqual('@openai/codex' in text,
+                             spec['provides'][0].startswith('harness:codex@'))
 
     def test_display_is_inserted_before_harness_with_real_parent(self):
         text = dockerfile(display=True)
         self.assertIn('FROM spine-utilities AS capability-display-x11', text)
-        self.assertIn('FROM capability-display-x11 AS spine-harness', text)
+        self.assertIn('FROM capability-display-x11 AS harness-claude-code', text)
         self.assertIn('ENV LIBGL_ALWAYS_SOFTWARE=1', text)
         for package in ['xvfb', 'xauth', 'libgl1-mesa-dri', 'x11-utils']:
             self.assertIn(package, text)
@@ -45,7 +84,7 @@ class Composition(unittest.TestCase):
             base = 'ubuntu@sha256:' + 'b' * 64
             records = [json.loads(doc) for doc in manifests(revision, base).split('\n---\n')]
             self.assertEqual([r['spec']['stage'] for r in records],
-                             ['base', 'utilities', 'capability', 'capability', 'harness'])
+                             ['base', 'utilities', 'capability', 'capability', 'harness', 'harness'])
             for record in records:
                 self.assertEqual(record['spec']['revision'], revision)
                 self.assertTrue((ROOT / record['spec']['fragment']).is_file())
@@ -88,7 +127,7 @@ class Composition(unittest.TestCase):
         # The production harness pin, rather than a retired CI input, determines
         # which recorded upstream hook contract the trust decoder must use.
         catalogue = json.loads((ROOT / '.flotilla/image-layers/inputs.json').read_text())
-        harness = next(layer for layer in catalogue['layers'] if layer['stage'] == 'harness')
+        harness = next(layer for layer in catalogue['layers'] if layer['name'] == 'harness-codex')
         version = harness['pins']['CODEX_VERSION']['value']
         fixture = 'codex-hooks-list-' + version + '.json'
         agents = ROOT / 'crates/flotilla-agent/src'
@@ -159,7 +198,7 @@ import json, os, pathlib, sys
 args = sys.argv[1:]
 if args[:2] == ['buildx', 'build']:
     text = pathlib.Path(args[args.index('--file') + 1]).read_text()
-    assert 'FROM capability-display-x11 AS spine-harness' in text
+    assert 'FROM capability-display-x11 AS harness-claude-code' in text
     assert '--load' in args and '--push' not in args
 elif args[:1] == ['run']:
     assert '--network=none' in args and '--pull=never' in args
@@ -268,7 +307,7 @@ args = sys.argv[1:]
 if args[:2] == ['buildx', 'build']:
     text = pathlib.Path(args[args.index('--file') + 1]).read_text()
     assert 'FROM spine-utilities AS capability-formal-modelling' in text
-    assert 'FROM capability-formal-modelling AS spine-harness' in text
+    assert 'FROM capability-formal-modelling AS harness-claude-code' in text
     assert 'capability-display-x11' not in text
     assert '--load' in args and '--push' not in args
 elif args[0] == 'run':

@@ -31,10 +31,12 @@ layers remain supported, without requiring Nix, a registry or lab Forgejo CI.
 
 ## Selection and ordering
 
-The caller cascades the base, utilities, harness and project selection. The
-composer preserves that selection, adds a minimum-cardinality set of
-capability layers whose provides cover the need-set, and verifies requires
-against the layers below each layer. Equal covers break ties by name. Needs
+The caller cascades the base, utilities, project and default harness set. The
+composer preserves the fixed base/utilities/project selection and adds a
+minimum-cardinality set of capability and harness layers whose provides cover the need-set, and verifies requires
+against the layers below each layer. The same bounded search selects both stages. A default harness set is fixed
+only when no need names a `harness:*` capability; explicit harness needs select
+from the catalogue instead. Equal covers break ties by canonical stage/name. Needs
 from dispatch `--need`, issue labels, project `role_needs`, template roles and
 adapter minimum versions compose by union. An unsatisfiable need refuses
 admission by name. Admission does not wait for a proposal to be adopted.
@@ -46,8 +48,12 @@ named search-limit error, leaving freezing untouched. This bounds admission
 work without substituting a nonminimal greedy cover. Split an over-complex
 catalogue or need-set before retrying.
 
-Stacking is canonical: base/toolchains, utilities, capabilities sorted by
-name, harness, project. Only base/toolchains and utilities have fixed parents;
+Stacking for new admissions is canonical: base/toolchains, utilities, project,
+capabilities sorted by name, harnesses sorted by name. The most frequently
+changing stage sits on top: harness bumps must not rebuild expensive project
+dependencies. Frozen compositions retain their recorded order and realised
+identities on relaunch. Selection writes `harnesses` as a set; the previous
+single `harness` field decodes into a singleton for one generation (ADR 0047). Only base/toolchains and utilities have fixed parents;
 capability, harness and project fragments start `FROM ${BASE}`, supplied with
 the actual parent digest. This amends #2271's earlier parent rule. Restacking
 a Dockerfile that executes RUN requires a rebuild. Manifest-only OCI rebasing
@@ -80,9 +86,10 @@ never call a local ID a registry digest. Tags are labels, not frozen identity.
 
 Freezing has three stages:
 
-1. Admission freezes base, utilities, harness, project and the initially used
-   capability layer revisions in content-hashed placement snapshots, with the
-   accumulated frozen catalogue on the convoy. All vessels share base/harness.
+1. Admission freezes base, utilities, project and the initially used
+   capability and harness layer revisions in content-hashed placement snapshots, with the
+   accumulated frozen catalogue on the convoy. All vessels share the base and
+   default harness selection; need-selected harnesses may differ.
 2. A dynamically added vessel composes against the frozen catalogue. A newly
    needed capability is frozen and appended atomically; old entries never
    change. Failed composition leaves the catalogue untouched.

@@ -60,9 +60,9 @@ pub struct ImageLayerSpec {
 pub enum ImageLayerStage {
     Base,
     Utilities,
+    Project,
     Capability,
     Harness,
-    Project,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,14 +101,42 @@ pub struct FrozenImageLayer {
 }
 
 /// A selection is cascaded by the caller; the composer never picks another
-/// base or harness to paper over an unsatisfiable need.
+/// base to paper over an unsatisfiable need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ImageLayerSelectionRecord")]
 pub struct ImageLayerSelection {
     pub base: String,
     pub utilities: Option<String>,
-    pub harness: Option<String>,
+    #[builder(default)]
+    #[serde(default)]
+    pub harnesses: BTreeSet<String>,
     pub project: Option<String>,
+}
+
+// ADR 0047: remove the single-harness decoder bridge one fleet roll after #3136.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageLayerSelectionRecord {
+    base: String,
+    utilities: Option<String>,
+    #[serde(default)]
+    harnesses: BTreeSet<String>,
+    harness: Option<String>,
+    project: Option<String>,
+}
+
+impl TryFrom<ImageLayerSelectionRecord> for ImageLayerSelection {
+    type Error = String;
+    fn try_from(record: ImageLayerSelectionRecord) -> Result<Self, Self::Error> {
+        let mut harnesses = record.harnesses;
+        if let Some(harness) = record.harness {
+            if !harnesses.is_empty() {
+                return Err("image selection contains both harness and harnesses".into());
+            }
+            harnesses.insert(harness);
+        }
+        Ok(Self { base: record.base, utilities: record.utilities, harnesses, project: record.project })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +163,7 @@ impl FrozenImageLayers {
             if self.layers.get(&layer.name).is_some_and(|previous| previous != &layer.spec) {
                 return Err(format!("convoy image layer `{}` differs from its frozen revision", layer.name));
             }
-            if matches!(layer.spec.stage, ImageLayerStage::Base | ImageLayerStage::Harness)
+            if layer.spec.stage == ImageLayerStage::Base
                 && self.layers.iter().any(|(name, spec)| name != &layer.name && spec.stage == layer.spec.stage)
             {
                 return Err(format!("convoy cannot use two {:?} image layers", layer.spec.stage));
@@ -284,9 +312,16 @@ pub fn compose_image(
     for (name, stage) in [
         (Some(&selection.base), ImageLayerStage::Base),
         (selection.utilities.as_ref(), ImageLayerStage::Utilities),
-        (selection.harness.as_ref(), ImageLayerStage::Harness),
         (selection.project.as_ref(), ImageLayerStage::Project),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        selection
+            .harnesses
+            .iter()
+            .filter(|_| !needs.iter().any(|need| need.starts_with("harness:")))
+            .map(|name| (Some(name), ImageLayerStage::Harness)),
+    ) {
         if let Some(name) = name {
             let spec = available.get(name).ok_or_else(|| format!("image layer `{name}` missing"))?;
             spec.validate().map_err(|error| format!("image layer `{name}`: {error}"))?;
@@ -298,9 +333,12 @@ pub fn compose_image(
     }
     let mut optional = available
         .iter()
-        .filter(|(_, spec)| spec.stage == ImageLayerStage::Capability)
+        .filter(|(name, spec)| {
+            matches!(spec.stage, ImageLayerStage::Capability | ImageLayerStage::Harness) && !fixed.iter().any(|layer| &layer.name == *name)
+        })
         .map(|(name, spec)| FrozenImageLayer { name: name.clone(), spec: spec.clone() })
         .collect::<Vec<_>>();
+    optional.sort_by(|left, right| (left.spec.stage, &left.name).cmp(&(right.spec.stage, &right.name)));
     // Only providers of requested capabilities or their transitive prerequisites
     // can affect a minimum cover. Fixed upper layers' requires participate too.
     let mut relevant = needs.clone();
@@ -317,14 +355,16 @@ pub fn compose_image(
         }
     }
     optional.retain(|layer| layer.spec.provides.iter().any(|provided| relevant.iter().any(|need| capability_satisfies(provided, need))));
-    // Capability order is lexical: an impossible earlier prerequisite cannot
-    // become satisfiable by selecting a later layer or the harness/project.
-    let mut possible = fixed
-        .iter()
-        .filter(|layer| layer.spec.stage < ImageLayerStage::Capability)
-        .flat_map(|layer| layer.spec.provides.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    // Prune in canonical stage/name order, including fixed predecessors. This
+    // is a viability bound; the shared exact search verifies the chosen chain.
+    let mut possible = BTreeSet::new();
+    let mut predecessors = fixed.iter().collect::<Vec<_>>();
+    predecessors.sort_by_key(|layer| (layer.spec.stage, &layer.name));
+    let mut predecessors = predecessors.into_iter().peekable();
     optional.retain(|layer| {
+        while predecessors.peek().is_some_and(|fixed| (fixed.spec.stage, &fixed.name) < (layer.spec.stage, &layer.name)) {
+            possible.extend(predecessors.next().expect("peeked predecessor").spec.provides.clone());
+        }
         let viable = layer.spec.validate().is_ok()
             && layer.spec.requires.iter().all(|need| possible.iter().any(|provided| capability_satisfies(provided, need)));
         if viable {
@@ -335,7 +375,7 @@ pub fn compose_image(
     // Exact set cover is NP-hard even after pruning. Refuse excessive work
     // explicitly rather than monopolising admission or returning a greedy cover.
     if optional.len() > 64 {
-        return Err(format!("image composition search limit: {} relevant capability layers for needs {:?}", optional.len(), needs));
+        return Err(format!("image composition search limit: {} relevant optional image layers for needs {:?}", optional.len(), needs));
     }
     // A conservative first-release ceiling: at most 10,000 nodes, each with
     // at most 64 optional layers. Count work, not time, so identical catalogues

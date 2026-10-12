@@ -91,12 +91,12 @@ docker_per_vessel:
       selection:
         base: spine-base
         utilities: spine-utilities
-        harness: spine-harness
+        harnesses: [harness-claude-code, harness-codex]
         project: null
 ```
 
 Each selected name resolves to an `ImageLayer` Definition. Admission adds the
-minimum capability cover for its needs and freezes the selected inputs.
+minimum capability and harness cover for its needs and freezes the selected inputs.
 Unbuilt compositions join `ImageBuild`; the Environment waits in Provisioning
 until the concrete image is available. Build failure never selects an older
 baseline. A no-layer composition's `literal_base` is a resolved legacy image,
@@ -230,7 +230,8 @@ python3 ci/crew-image/compose.py --revision "$(git rev-parse HEAD)" \
 ```
 
 Commit these reviewed Definitions in the fleet charter before policy cut-over. Select
-`spine-base`, `spine-utilities`, and `spine-harness` in the placement's layer
+`spine-base`, `spine-utilities`, and the default harness set
+`[harness-claude-code, harness-codex]` in the placement's layer
 selection. The existing composer inserts `capability-display-x11` when the
 need-set includes `display:headless-x11`. Its probe is `xdpyinfo`, which opens
 the display rather than accepting a binary/version or process-existence check.
@@ -315,3 +316,23 @@ UID with an unwritable home. Java 21 is required by the pinned Apalache release.
 The standalone `tlc` probe also checks a bundled TLA+ spec directly. Builds
 require BuildKit for `TARGETARCH`; the acceptance command uses Buildx. Run
 image-build acceptance before publishing this layer.
+
+
+### Multi-harness roll (#3136)
+
+Roll the candidate decoder before applying the new stored selection shape.
+Validate live stores and the unchanged golden corpus with the candidate. Frozen
+convoys retain their recorded layer order and realised identities on relaunch.
+For new admissions the chain is base → utilities → project → capabilities
+(sorted by name) → harnesses (sorted by name), keeping volatile harness installs
+above expensive project dependencies.
+
+Regenerate `robert/fleet`'s `image-layers/fleet-image-layers.yaml` with the command
+above using the merged Flotilla revision and the existing resolved base digest.
+Review and commit the generated definitions, then apply them through the normal
+fleet operational manifest workflow. Apply the three per-host policies from
+`.flotilla/placement-policy.crew-image{,-feta,-udder}.yaml` after those definitions
+are available. These policies retain both harnesses as defaults; explicit
+`harness:*` needs select only the minimum covering layers. Retire the old
+`spine-harness` definition after no frozen convoy references it. Do not rewrite
+existing convoy snapshots or realised image identities.
