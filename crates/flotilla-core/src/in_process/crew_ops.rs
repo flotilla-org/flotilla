@@ -1661,14 +1661,15 @@ impl CrewService {
                     })
                 })
         };
-        let escalation = if action == flotilla_protocol::CrewSupervisionAction::Escalate {
-            let (value, condition) = self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message).await?;
-            let Some(condition) = condition else {
-                return Ok(value);
-            };
-            Some((value, condition))
-        } else {
-            None
+        use crate::leaf_engine::EscalationAdmission;
+        let escalation = match action {
+            flotilla_protocol::CrewSupervisionAction::Escalate => {
+                match self.leaf_subscriptions.escalate_stall(namespace, &convoy, &sender, message, vessel, role).await? {
+                    EscalationAdmission::Refused(value) => return Ok(*value),
+                    admitted => Some(admitted),
+                }
+            }
+            _ => None,
         };
         // Persist the ruling before mutating workflow state: a failed authority CAS
         // must not erase the supervisor's durable decision. Fail/Escalate ruling Messages
@@ -1686,8 +1687,8 @@ impl CrewService {
                 .build();
             self.publish_message_intent(namespace, &name, &intent).await?;
         }
-        match action {
-            flotilla_protocol::CrewSupervisionAction::Resume => {
+        match (action, escalation) {
+            (flotilla_protocol::CrewSupervisionAction::Resume, _) => {
                 self.convoy_resume_with_sender_internal(
                     namespace,
                     convoy_name,
@@ -1698,7 +1699,7 @@ impl CrewService {
                 )
                 .await?;
             }
-            flotilla_protocol::CrewSupervisionAction::Fail => {
+            (flotilla_protocol::CrewSupervisionAction::Fail, _) => {
                 apply_resource_status_patch(
                     &convoys,
                     convoy_name,
@@ -1712,8 +1713,7 @@ impl CrewService {
                 .await
                 .map_err(|error| error.to_string())?;
             }
-            flotilla_protocol::CrewSupervisionAction::Escalate => {
-                let (value, condition) = escalation.expect("admitted escalation");
+            (_, Some(EscalationAdmission::Admitted { receiver, condition })) => {
                 let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
                 let mut updated = current.status.ok_or("convoy has no status")?;
                 // Local supervisor activation legitimately changes this convoy
@@ -1733,15 +1733,16 @@ impl CrewService {
                 let obligation_unchanged = updated.crew_work.get(vessel).and_then(|crew| crew.get(role))
                     == status.crew_work.get(vessel).and_then(|crew| crew.get(role));
                 if updated.phase.is_terminal() || !obligation_unchanged || (updated.stalled != status.stalled && !local_activation) {
-                    return Err("stall changed during escalation; the current ruling was preserved".into());
+                    return Err("stall changed during escalation; the current ruling was preserved; the next receiver may already have been notified".into());
                 }
-                updated.stalled = Some(condition);
+                updated.stalled = Some(*condition);
                 convoys
                     .update_status(convoy_name, &current.metadata.resource_version, &updated)
                     .await
                     .map_err(|error| error.to_string())?;
-                return Ok(value);
+                return Ok(CommandValue::CrewEscalated { receiver });
             }
+            _ => return Err("escalation admission is missing".into()),
         }
         Ok(CommandValue::Ok)
     }

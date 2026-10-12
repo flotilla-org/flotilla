@@ -139,16 +139,26 @@ pub(super) async fn resolve_target(
     Ok(candidate)
 }
 
+pub(crate) enum EscalationAdmission {
+    Admitted { receiver: String, condition: Box<StalledCondition> },
+    Refused(Box<flotilla_protocol::CommandValue>),
+}
+
 impl super::LeafSubscriptionTable {
     /// Admit the next supervisor's obligation before transferring ownership. A
     /// failed lookup or delivery leaves the source stall and its cursor intact.
+    /// Admission is durable before the caller commits ownership: if its later
+    /// publication or CAS fails, the receiver may already have been notified.
+    /// The deterministic producer key makes retrying that admission idempotent.
     pub(crate) async fn escalate_stall(
         &self,
         namespace: &str,
         convoy: &ResourceObject<Convoy>,
         sender: &str,
         message: &str,
-    ) -> Result<(flotilla_protocol::CommandValue, Option<StalledCondition>), String> {
+        source_vessel: &str,
+        source_role: &str,
+    ) -> Result<EscalationAdmission, String> {
         use flotilla_protocol::CommandValue;
         use flotilla_resources::{LeafMaker, StallSupervisor};
         let backend = &self.inner.backend;
@@ -164,10 +174,7 @@ impl super::LeafSubscriptionTable {
         for (index, target) in policy.iter().enumerate() {
             let mut probe = stalled.clone();
             if let Some((target_convoy, vessel, role, _)) =
-                match resolve_target(backend, namespace, convoy, &mut probe, target, &convoys, &ensures).await {
-                    Ok(candidate) => candidate,
-                    Err(reason) => return Ok((CommandValue::CrewEscalationRefused { rung: target_rung(target), reason }, None)),
-                }
+                resolve_target(backend, namespace, convoy, &mut probe, target, &convoys, &ensures).await?
             {
                 if stalled
                     .supervisor
@@ -182,10 +189,7 @@ impl super::LeafSubscriptionTable {
         let mut missing_rung = StallRung::Operator;
         for (index, target) in policy.iter().enumerate().skip(start) {
             missing_rung = target_rung(target);
-            let candidate = match resolve_target(backend, namespace, convoy, &mut condition, target, &convoys, &ensures).await {
-                Ok(candidate) => candidate,
-                Err(reason) => return Ok((CommandValue::CrewEscalationRefused { rung: missing_rung, reason }, None)),
-            };
+            let candidate = resolve_target(backend, namespace, convoy, &mut condition, target, &convoys, &ensures).await?;
             let Some((target_convoy, vessel, role, rung)) = candidate else {
                 continue;
             };
@@ -214,12 +218,12 @@ impl super::LeafSubscriptionTable {
                 match flotilla_store::resolve_message_receiver(backend, namespace, &receiver).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        return Ok((
-                            CommandValue::CrewEscalationRefused { rung, reason: format!("receiver `{receiver}` is not bound") },
-                            None,
-                        ))
+                        return Ok(EscalationAdmission::Refused(Box::new(CommandValue::CrewEscalationRefused {
+                            rung,
+                            reason: format!("receiver `{receiver}` is not bound"),
+                        })))
                     }
-                    Err(reason) => return Ok((CommandValue::CrewEscalationRefused { rung, reason: reason.to_string() }, None)),
+                    Err(reason) => return Err(reason.to_string()),
                 }
             }
             let intent = super::CrewTurnIntent::builder()
@@ -243,10 +247,10 @@ impl super::LeafSubscriptionTable {
             let admission = match actuator.deliver(&intent).await {
                 Ok(admission) => admission,
                 Err(reason) => {
-                    return Ok((
-                        CommandValue::CrewEscalationRefused { rung, reason: format!("receiver `{receiver}` is unreachable: {reason}") },
-                        None,
-                    ))
+                    return Ok(EscalationAdmission::Refused(Box::new(CommandValue::CrewEscalationRefused {
+                        rung,
+                        reason: format!("receiver `{receiver}` is unreachable: {reason}"),
+                    })))
                 }
             };
             condition.rung = rung;
@@ -259,19 +263,16 @@ impl super::LeafSubscriptionTable {
                 role: role.clone(),
             });
             condition.maker = if rung == StallRung::Operator {
-                stalled_source_actor(stalled).map(|(vessel, role)| LeafMaker::Actor { vessel: vessel.into(), role: role.into() })
+                Some(LeafMaker::Actor { vessel: source_vessel.into(), role: source_role.into() })
             } else {
                 Some(LeafMaker::Supervisor { convoy: target_convoy, vessel, role })
             };
-            return Ok((CommandValue::CrewEscalated { receiver }, Some(condition)));
+            return Ok(EscalationAdmission::Admitted { receiver, condition: Box::new(condition) });
         }
-        Ok((
-            CommandValue::CrewEscalationRefused {
-                rung: missing_rung,
-                reason: "no next-rung receiver is bound; handle this stall or raise it with the operator".into(),
-            },
-            None,
-        ))
+        Ok(EscalationAdmission::Refused(Box::new(CommandValue::CrewEscalationRefused {
+            rung: missing_rung,
+            reason: "no next-rung receiver is bound; handle this stall or raise it with the operator".into(),
+        })))
     }
 }
 
