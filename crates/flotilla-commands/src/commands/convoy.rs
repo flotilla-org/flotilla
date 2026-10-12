@@ -1004,6 +1004,14 @@ mod tests {
                 .expect_err("malformed dispatch promise");
             assert!(error.to_string().contains("kind:label[@vessel/role]"), "{malformed}: {error}");
         }
+        // The owner follows the last `@`: an `@` in a label either reaches
+        // admission's label refusal intact or is explained here.
+        let error = ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--promise", "pr:team@api"])
+            .expect_err("owner without role");
+        assert!(error.to_string().contains("labels cannot contain `@`"), "{error}");
+        let request: DispatchPromiseRequest = "pr:team@api@work/coder".parse().expect("owner after last @");
+        assert_eq!(request.label, "team@api");
+        assert_eq!(request.owner, Some(PromiseOwner { vessel: "work".into(), role: "coder".into() }));
     }
 
     #[test]

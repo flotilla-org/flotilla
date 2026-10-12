@@ -1082,6 +1082,7 @@ mod tests {
             (vec!["pr:-x"], "promise label `-x` must start with an ASCII letter or digit"),
             (vec!["pr:--force"], "promise label `--force` must start with an ASCII letter or digit"),
             (vec!["pr:.."], "promise label `..` must start with an ASCII letter or digit"),
+            (vec!["pr:team@api@work/coder"], "promise label `team@api` must start with an ASCII letter or digit"),
             (vec!["pr:x", "decision-ledger:x@work/reviewer"], "duplicate promise label `x` (already promised by work/coder)"),
         ] {
             let error = resolve(&raw).expect_err("refused");

@@ -722,14 +722,17 @@ impl std::str::FromStr for DispatchPromiseRequest {
     type Err = String;
 
     /// `kind:label[@vessel/role]`. Only syntax is checked here; kind, owner
-    /// and label rules belong to admission.
+    /// and label rules belong to admission. The owner follows the last `@`,
+    /// so a label containing `@` reaches admission's label-charset refusal.
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let syntax = || format!("promise must be kind:label[@vessel/role]: {raw}");
         let (kind, rest) = raw.split_once(':').filter(|(kind, rest)| !kind.is_empty() && !rest.is_empty()).ok_or_else(syntax)?;
-        let (label, owner) = match rest.split_once('@') {
+        let (label, owner) = match rest.rsplit_once('@') {
             Some((label, owner)) => {
-                let (vessel, role) =
-                    owner.split_once('/').filter(|(vessel, role)| !vessel.is_empty() && !role.is_empty()).ok_or_else(syntax)?;
+                let (vessel, role) = owner
+                    .split_once('/')
+                    .filter(|(vessel, role)| !vessel.is_empty() && !role.is_empty())
+                    .ok_or_else(|| format!("{}; the owner after `@` is vessel/role, and labels cannot contain `@`", syntax()))?;
                 (label, Some(PromiseOwner { vessel: vessel.to_string(), role: role.to_string() }))
             }
             None => (rest, None),
