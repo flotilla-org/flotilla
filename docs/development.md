@@ -188,7 +188,7 @@ In a GitHub PR stack, CI's `Stack scope` job limits the expensive jobs (Test, th
 - the lowest unmerged layer, which merges next;
 - the top layer, which carries the whole changeset.
 
-Middle layers run Format, Clippy and the cheap checks. The skipped required Test check counts as passing. Platform path classification diffs against the stack's base, so the top layer's platform jobs cover the whole stack. PRs outside a stack, pushes to `main` and merge-group runs are unchanged. The `ci:full` label forces the full set on any layer.
+Middle layers run Format, Clippy and the cheap checks. The skipped required Test check counts as passing. Platform path classification diffs against the stack's base, so the top layer's platform jobs cover the whole stack. PRs outside a stack, pushes to `main` and merge-group runs are unchanged. The `ci:full` label forces the full set on any layer. CI reads the label live, but adding it starts no run: push again or re-run the workflow.
 
 Merge a stack **one layer at a time, or whole**. When a layer merges, the next becomes the lowest unmerged layer and gets the full run before it merges. A partial `gh stack merge` (layers 1–k, below the top) would land layer k without a full Test run.
 

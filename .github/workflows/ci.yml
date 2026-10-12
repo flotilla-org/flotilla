@@ -24,7 +24,8 @@ jobs:
   # layers run the cheap checks; each becomes the lowest layer, and gets the
   # full run, before it merges. Merge a stack one layer at a time or whole:
   # a partial `gh stack merge` would land a middle layer without a full run.
-  # The ci:full label forces the full run on any layer.
+  # The ci:full label forces the full run on any layer; it is read live, so
+  # it applies to the next push or a re-run of the workflow.
   stack-scope:
     name: Stack scope
     runs-on: ubuntu-latest
@@ -44,10 +45,12 @@ jobs:
         run: |
           full=true
           if [ "$EVENT" = pull_request ] && [ "$STACK" != null ]; then
-            position=$(jq -r '.position' <<<"$STACK")
-            size=$(jq -r '.size' <<<"$STACK")
-            stack_base=$(jq -r '.base.ref' <<<"$STACK")
-            if [ "$position" != "$size" ] && [ "$stack_base" != "$BASE_REF" ]; then
+            position=$(jq -r '.position // empty' <<<"$STACK")
+            size=$(jq -r '.size // empty' <<<"$STACK")
+            stack_base=$(jq -r '.base.ref // empty' <<<"$STACK")
+            # A payload missing any field fails safe by running the full set.
+            if [ -n "$position" ] && [ -n "$size" ] && [ -n "$stack_base" ] \
+              && [ "$position" != "$size" ] && [ "$stack_base" != "$BASE_REF" ]; then
               full=false
               # A failed label lookup fails safe by running the full set.
               if ! labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name') \
@@ -96,7 +99,7 @@ jobs:
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.stack.base.sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           # Pushes to main always run; PRs and merge groups run only when the
           # scripts, CI helpers, crew image or workflows they test changed.
@@ -303,7 +306,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ github.token }}
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          # In a PR stack, diff against the stack's base so the top layer's
+          # platform jobs cover the whole changeset.
+          BASE: ${{ github.event.pull_request.stack.base.sha || github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           # Read labels live rather than from the event payload, so re-running
           # the workflow after adding ci:full honours the label. A failed
