@@ -5446,3 +5446,61 @@ async fn remote_checkout_completion_is_headless() {
         }
     );
 }
+
+// Finished connections must be reaped while accepting remains open; an in-flight
+// connection must remain owned until shutdown drains it (issue #3103).
+#[hegel::test]
+fn completed_connection_tasks_are_bounded(tc: hegel::TestCase) {
+    // Empty, singleton, and repeated batches with interleaved live connections.
+    let batches = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(16));
+    let batch_size = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(32));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let mut tasks = tokio::task::JoinSet::new();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        tasks.spawn(async {
+            let _ = release_rx.await;
+        });
+        for _ in 0..batches {
+            for _ in 0..batch_size {
+                // In-memory boundary: a short-lived client handler exits on EOF.
+                let (client, mut server) = tokio::io::duplex(1);
+                tasks.spawn(async move {
+                    let mut byte = [0];
+                    assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+                });
+                drop(client);
+            }
+            for _ in 0..batch_size {
+                let event =
+                    tokio::time::timeout(Duration::from_secs(1), super::next_connection_event(std::future::pending::<()>(), &mut tasks))
+                        .await
+                        .expect("completed connections must be reaped without another accept");
+                assert!(event.is_none());
+            }
+            assert_eq!(tasks.len(), 1, "only the live connection may remain retained");
+        }
+        // An empty collector must still accept, and successful accepts must not
+        // cancel the live connection that shutdown will later await.
+        assert_eq!(super::next_connection_event(async { 7 }, &mut tasks).await, Some(7));
+        assert_eq!(tasks.len(), 1);
+        release_tx.send(()).unwrap();
+        assert!(tasks.join_next().await.unwrap().is_ok());
+        assert!(tasks.is_empty());
+        assert_eq!(super::next_connection_event(async { 9 }, &mut tasks).await, Some(9));
+    });
+}
+
+// Panic and cancellation must both release their retained task entries.
+#[tokio::test]
+async fn failed_connection_tasks_are_reaped() {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async {
+        panic!("connection panic");
+    });
+    tasks.spawn(std::future::pending()).abort();
+    for _ in 0..2 {
+        assert!(super::next_connection_event(std::future::pending::<()>(), &mut tasks).await.is_none());
+    }
+    assert!(tasks.is_empty());
+}
