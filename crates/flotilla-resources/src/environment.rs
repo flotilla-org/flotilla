@@ -5,7 +5,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry};
 
-define_resource!(Environment, "environments", EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch);
+define_resource!(
+    Environment,
+    "environments",
+    EnvironmentSpec,
+    EnvironmentStatus,
+    EnvironmentStatusPatch,
+    replication = crate::ReplicationClass::None,
+    queryable = &["metadata.name", "spec.host_direct.host_ref"]
+);
 
 /// Resource reference for a host's direct execution environment.
 pub fn host_direct_environment_name(host_ref: &str) -> String {

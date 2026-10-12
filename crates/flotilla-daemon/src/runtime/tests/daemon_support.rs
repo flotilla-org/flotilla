@@ -210,6 +210,7 @@ pub(super) async fn sqlite_daemon(tracked_repos: Vec<PathBuf>, config: Arc<Confi
 }
 
 pub(super) fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {
+    SqliteBackend::register_query_functions(connection).expect("configure independent corruption writer");
     connection
         .execute(
             r#"

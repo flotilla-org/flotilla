@@ -74,3 +74,12 @@ A change to a shape that project-map or an ops repository authors either stays N
 - Crews get an unambiguous rule: "wire free, storage N→N+1".
 - **Cost:** the corpus must be refreshed after each roll, and a retired-field shim must be deleted one roll after it is added. Legacy shims should carry a comment naming the roll after which they can go.
 - **Supersedes** the Development Phase paragraph of CLAUDE.md, which is rewritten to match.
+
+### Declared-query derived indexes (#3057)
+
+Query indexes are additive derived schema, with unchanged resource bodies and
+N→N+1 decoding. Persisted schema must not depend on custom functions. Canonical
+field values are maintained by connection-local TEMP triggers; older binaries
+and administrative SQLite writers remain compatible without rollback cleanup.
+The next native open repairs derived values after unconfigured writes. See
+[the roll and rollback notes](../fleet-install.md#declared-query-sqlite-indexes-and-rollback-3057).

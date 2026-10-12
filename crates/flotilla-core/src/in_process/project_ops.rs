@@ -14,10 +14,13 @@ use flotilla_protocol::{
 use flotilla_resources::{
     normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyRepositorySpec,
     DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceError,
-    ResourceObject, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, ReadResourceList, ReadResourceObject, Repository, RepositoryIdentity,
+    RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, WorkflowTemplate, WorkflowTemplateSpec,
+    WriterIdentity, MANAGED_BY_LABEL,
 };
-use flotilla_store::{apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend};
+use flotilla_store::{
+    apply_status_patch as apply_resource_status_patch, ensure_repository, EventRecorder, ResourceBackend, StoreQuery, ViewSnapshot,
+};
 use tracing::{debug, warn};
 
 use super::{
@@ -37,6 +40,37 @@ use crate::{
         LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
     },
 };
+
+/// Request-local evidence builder. Definition catalogs preserve their merged
+/// semantics while ordinary inventories retain each source's provenance.
+pub(super) struct RequestSnapshot<'a> {
+    namespace: &'a str,
+    snapshot: ViewSnapshot,
+}
+impl<'a> RequestSnapshot<'a> {
+    pub(super) fn new(backend: &ResourceBackend, namespace: &'a str) -> Result<Self, String> {
+        Ok(Self { namespace, snapshot: ViewSnapshot::new(Some(backend.local_root().map_err(|error| error.to_string())?)) })
+    }
+    pub(super) fn insert<T: Resource>(&mut self, inventory: ReadResourceList<T>) -> Result<(), String> {
+        self.snapshot.insert(self.namespace, inventory).map_err(|error| error.to_string())
+    }
+    pub(super) fn insert_definitions<T: Resource>(&mut self, objects: Vec<ResourceObject<T>>) -> Result<(), String> {
+        self.insert(ReadResourceList {
+            items: objects.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect(),
+        })
+    }
+    pub(super) async fn copy<T: Resource>(&mut self, backend: &ResourceBackend) -> Result<(), String> {
+        self.insert(
+            backend
+                .query_declared::<T>(self.namespace, &StoreQuery { include_replicas: true, ..Default::default() })
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    }
+    pub(super) fn finish(self) -> ResourceBackend {
+        ResourceBackend::new(self.snapshot)
+    }
+}
 
 /// A refresh refusal preserves file identity independently of its display text.
 struct OperationalEntryRefusal {
@@ -291,11 +325,12 @@ impl ProjectService<'_> {
                 .resource_backend
                 .clone()
                 .using::<Repository>(&namespace)
-                .list()
+                .query_declared(&repository_catalog_query(target))
                 .await
                 .map_err(|error| error.to_string())?
                 .items
                 .into_iter()
+                .map(|source| source.object)
                 .filter(|repository| repository_matches_target(repository, target))
                 .collect::<Vec<_>>();
             let [repository] = matches.as_slice() else {
@@ -560,7 +595,24 @@ impl ProjectService<'_> {
 
     pub(super) async fn reconcile_bound_charters(&self) -> Result<(), String> {
         let namespace = self.provisioning_namespace();
-        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let projects = self
+            .resource_backend
+            .definitions::<Project>(&namespace)
+            .list_selected(flotilla_store::StoreQuery {
+                any_of: Some(vec![
+                    flotilla_store::StoreQuery {
+                        field_prefixes: BTreeMap::from([("spec.charter".into(), "{".into())]),
+                        ..Default::default()
+                    },
+                    flotilla_store::StoreQuery {
+                        fields: BTreeMap::from([("spec.repositories.*.charter_store.host".into(), self.repository_index.host.to_string())]),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
         let desired = projects
             .iter()
             .filter(|project| project.spec.charter.is_none())
@@ -575,7 +627,18 @@ impl ProjectService<'_> {
             })
             .collect::<BTreeSet<_>>();
         let roots = self.resource_backend.using::<flotilla_resources::ManifestRoot>(&namespace);
-        for root in roots.list().await.map_err(|error| error.to_string())?.items {
+        for root in roots
+            .query_declared(&flotilla_store::StoreQuery {
+                labels: BTreeMap::from([(MANAGED_BY_LABEL.into(), "ops-charter".into())]),
+                fields: BTreeMap::from([("spec.host".into(), self.repository_index.host.to_string())]),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .map(|source| source.object)
+        {
             if root.spec.host == self.repository_index.host
                 && root.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("ops-charter")
                 && !desired.contains(&root.metadata.name)
@@ -877,10 +940,19 @@ impl ProjectService<'_> {
         let desired_workflow_names =
             workflows.keys().map(|name| crate::ops_entry::materialized_workflow_name(project_name, name)).collect::<BTreeSet<_>>();
         let project_workflow_prefix = format!("{project_name}--");
-        for stale in templates.list().await.map_err(|error| error.to_string())?.into_iter().filter(|template| {
-            template.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
-                && !desired_workflow_names.contains(&template.metadata.name)
-        }) {
+        for stale in templates
+            .list_selected(flotilla_store::StoreQuery {
+                fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/materialized-project\"".into(), project_name.into())]),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|template| {
+                template.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                    && !desired_workflow_names.contains(&template.metadata.name)
+            })
+        {
             templates.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
             let logical_name = stale.metadata.name.strip_prefix(&project_workflow_prefix).unwrap_or(&stale.metadata.name);
             changes.push(format!("deleted WorkflowTemplate/{logical_name}"));
@@ -935,10 +1007,19 @@ impl ProjectService<'_> {
             }
         }
         *refused_entry_path = None;
-        for stale in convoy_ensures.list().await.map_err(|error| error.to_string())?.into_iter().filter(|ensure| {
-            ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
-                && !ensures.contains_key(&ensure.metadata.name)
-        }) {
+        for stale in convoy_ensures
+            .list_selected(flotilla_store::StoreQuery {
+                fields: BTreeMap::from([("metadata.annotations.\"flotilla.work/materialized-project\"".into(), project_name.into())]),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|ensure| {
+                ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                    && !ensures.contains_key(&ensure.metadata.name)
+            })
+        {
             if let Some(convoy_ref) = stale.status.as_ref().and_then(|status| status.convoy_ref.as_deref()) {
                 self.operations.reap_ensured_convoy(&namespace, &stale.metadata.name, convoy_ref, false).await?;
             }
@@ -1007,10 +1088,24 @@ impl ProjectService<'_> {
                 changes.push(format!("Repository/{} verification commands", member.repo));
             }
         }
-        for stale in repositories.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|repository| {
-            repository.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
-                && !current_code_members.contains(&RepositoryKey(repository.metadata.name.clone()))
-        }) {
+        for stale in repositories
+            .query_declared(&flotilla_store::StoreQuery {
+                fields: BTreeMap::from([(
+                    "metadata.annotations.\"flotilla.work/verification-command-project\"".into(),
+                    project_name.into(),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .map(|source| source.object)
+            .filter(|repository| {
+                repository.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
+                    && !current_code_members.contains(&RepositoryKey(repository.metadata.name.clone()))
+            })
+        {
             let mut meta = InputMeta::from(&stale.metadata);
             meta.annotations.remove(VERIFICATION_PROJECT_ANNOTATION);
             meta.annotations.remove(VERIFICATION_PROVENANCE_ANNOTATION);
@@ -1088,7 +1183,15 @@ impl ProjectService<'_> {
                 errors.push(error.to_string());
             }
         }
-        match self.resource_backend.definitions::<ConvoyEnsure>(namespace).list().await {
+        match self
+            .resource_backend
+            .definitions::<ConvoyEnsure>(namespace)
+            .list_selected(flotilla_store::StoreQuery {
+                fields: BTreeMap::from([("spec.project_ref".into(), project_name.into())]),
+                ..Default::default()
+            })
+            .await
+        {
             Ok(ensures) => {
                 for ensure in ensures.into_iter().filter(|ensure| ensure.spec.project_ref == project_name) {
                     if let Err(error) = apply_resource_status_patch(
@@ -1267,11 +1370,24 @@ impl ProjectService<'_> {
             Vec::new()
         } else {
             repositories
-                .list()
+                .query_declared(&flotilla_store::StoreQuery {
+                    any_of: Some(vec![
+                        flotilla_store::StoreQuery {
+                            fields: BTreeMap::from([("metadata.name".into(), target.into())]),
+                            ..Default::default()
+                        },
+                        flotilla_store::StoreQuery {
+                            fields: BTreeMap::from([("spec.catalog_targets.*".into(), target.into())]),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                })
                 .await
                 .map_err(|error| error.to_string())?
                 .items
                 .into_iter()
+                .map(|source| source.object)
                 .filter(|repository| repository_matches_target(repository, target))
                 .collect::<Vec<_>>()
         };
@@ -1415,6 +1531,37 @@ impl ProjectService<'_> {
     }
 }
 
+/// Read a complete participating definition catalog in one store operation,
+/// merging authors and tombstones before the request performs in-memory joins.
+fn repository_catalog_query(target: &str) -> flotilla_store::StoreQuery {
+    flotilla_store::StoreQuery {
+        any_of: Some(vec![
+            flotilla_store::StoreQuery { fields: BTreeMap::from([("metadata.name".into(), target.into())]), ..Default::default() },
+            flotilla_store::StoreQuery { fields: BTreeMap::from([("spec.catalog_targets.*".into(), target.into())]), ..Default::default() },
+        ]),
+        ..Default::default()
+    }
+}
+
+pub(super) async fn read_definition_catalog<T: flotilla_resources::Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<Vec<flotilla_resources::ResourceObject<T>>, String> {
+    backend
+        .query_declared::<T>(
+            namespace,
+            &flotilla_store::StoreQuery {
+                include_replicas: true,
+                suppress_self_origin: false,
+                merged_definitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|listed| listed.items.into_iter().map(|item| item.object).collect())
+        .map_err(|error| error.to_string())
+}
+
 pub(super) async fn repository_transport_url_with_backend(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1447,28 +1594,76 @@ pub(super) async fn snapshot_project_repositories_with_backend(
         .await
         .map(|project| project.object)
         .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
-    let repositories = backend.including_replicas::<Repository>(namespace);
-    let repository_sources = repositories.list_replica_sources().await.map_err(|error| error.to_string())?;
+    snapshot_project_repositories_from_project(backend, namespace, &project, selected).await
+}
+
+pub(super) async fn snapshot_project_repositories_from_project(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project: &ResourceObject<Project>,
+    selected: Option<&[RepositoryKey]>,
+) -> Result<Vec<ConvoyRepositorySpec>, String> {
+    let project_ref = &project.metadata.name;
+    let entries = project
+        .spec
+        .repositories
+        .iter()
+        .filter(|entry| {
+            entry.roles.is_empty()
+                || entry.roles.contains(&ProjectRepositoryRole::Code)
+                || selected.is_some_and(|selected| selected.contains(&entry.repo))
+        })
+        .collect::<Vec<_>>();
+    let repository_sources = backend
+        .query_declared::<Repository>(
+            namespace,
+            &flotilla_store::StoreQuery::names(entries.iter().map(|entry| entry.repo.to_string()), true),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut repositories = BTreeMap::new();
+    for source in &repository_sources.items {
+        // Declared results sort local before replicas, matching point-read precedence.
+        repositories.entry(source.object.metadata.name.clone()).or_insert(&source.object);
+    }
+    let forge_names = repositories.values().filter_map(|repository| match repository.spec.identity() {
+        RepositoryIdentity::Forge { forge_ref, .. } => Some(forge_ref.clone()),
+        _ => None,
+    });
+    let forges = backend
+        .definitions::<Forge>(namespace)
+        .list_names(forge_names)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|forge| (forge.metadata.name, forge.spec))
+        .collect::<BTreeMap<_, _>>();
     let mut unresolved = Vec::new();
     let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
-    for entry in &project.spec.repositories {
-        if !entry.roles.is_empty()
-            && !entry.roles.contains(&ProjectRepositoryRole::Code)
-            && selected.is_none_or(|selected| !selected.contains(&entry.repo))
-        {
-            continue;
-        }
-        match repositories.get(&entry.repo.to_string()).await {
-            Ok(repository) => {
-                let repository = repository.object;
+    for entry in entries {
+        match repositories.get(&entry.repo.to_string()) {
+            Some(repository) => {
                 if let Err(error) = repository.spec.verify_key(&entry.repo) {
                     unresolved.push(error);
                     continue;
                 }
-                let url = match repository_transport_url_with_backend(backend, namespace, &repository.spec).await {
-                    Ok(url) => url,
-                    Err(error) => {
-                        unresolved.push(format!("repository {}: {error}", entry.repo));
+                let url = match repository.spec.identity() {
+                    RepositoryIdentity::Forge { forge_ref, owner, repo_name } => match forges.get(forge_ref) {
+                        Some(forge) => format!("{}/{owner}/{repo_name}", forge.https_url.trim_end_matches('/')),
+                        None => {
+                            unresolved.push(format!("repository {}: Forge {forge_ref} unavailable", entry.repo));
+                            continue;
+                        }
+                    },
+                    RepositoryIdentity::Remote { .. } => match repository.spec.live_remote() {
+                        Some(remote) => remote.to_string(),
+                        None => {
+                            unresolved.push(format!("repository {}: no transport remote", entry.repo));
+                            continue;
+                        }
+                    },
+                    RepositoryIdentity::Local { .. } => {
+                        unresolved.push(format!("repository {}: local Repository has no transport URL", entry.repo));
                         continue;
                     }
                 };
@@ -1498,7 +1693,7 @@ pub(super) async fn snapshot_project_repositories_with_backend(
                     snapshot.3.insert(subpath.clone());
                 }
             }
-            Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
+            None => unresolved.push(format!("repository {}: unavailable", entry.repo)),
         }
     }
     for (repo_ref, (_, _, default_ref, _)) in &snapshots {

@@ -15,7 +15,8 @@ define_resource!(
     FulfilmentKindSpec,
     (),
     NoStatusPatch,
-    replication = ReplicationClass::HomeBoundRuntime
+    replication = ReplicationClass::HomeBoundRuntime,
+    queryable = &["metadata.name", "spec.host_ref"]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

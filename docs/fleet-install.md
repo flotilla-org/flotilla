@@ -253,3 +253,23 @@ Every target needs `python3` on its non-interactive SSH/guest-exec PATH,
 including comte on macOS; an interactive shell-only PATH setup is insufficient.
 A failed rollback names the original failure, each unrestored file, and both
 retained backups for operator recovery.
+
+## Declared-query SQLite indexes and rollback (#3057)
+
+The declared-query migrations preserve resource bodies and support ordinary
+fleet-install rollback without index cleanup. Persisted tables and indexes do
+not reference custom functions. Native writers maintain canonical field values
+with connection-local TEMP triggers, like the digest index.
+
+Older binaries and plain SQLite connections can write without registering query
+functions. Such writes can leave the new derived values stale; each native open
+repairs them from authoritative local and replica bodies in one transaction,
+including changed values and deleted records. Resource bodies are not rewritten.
+Existing native readers are not refreshed by concurrent unconfigured writes;
+reopening the native store performs the repair. No writer inventory, function
+registration, or derived-schema cleanup is required before rollback.
+
+The new field-value tables and lookup indexes are additive named migrations.
+Superseded built-in indexes may be retired after the rollback retention window;
+that housekeeping is separate from rollback itself. Native open also removes
+function-dependent objects from pre-release #3057 schemas automatically.

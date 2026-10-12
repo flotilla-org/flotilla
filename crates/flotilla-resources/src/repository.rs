@@ -12,7 +12,8 @@ define_resource!(
     RepositoryStatus,
     RepositoryStatusPatch,
     replication = crate::ReplicationClass::ConvergentFacts,
-    validate_spec_update = validate_repository_spec_update
+    validate_spec_update = validate_repository_spec_update,
+    queryable = &["metadata.name", "metadata.annotations.\"flotilla.work/verification-command-project\"", "spec.catalog_targets.*"]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

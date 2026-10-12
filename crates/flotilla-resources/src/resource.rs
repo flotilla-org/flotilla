@@ -27,6 +27,25 @@ macro_rules! define_resource {
             const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
         }
     };
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path, queryable = $fields:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = $fields;
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+            const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+
+            fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), $crate::ResourceError> {
+                $validator(current, requested)
+            }
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -141,6 +160,9 @@ pub trait Resource: Send + Sync + 'static {
     /// Removing a declaration refuses new queries but retains its additive SQLite
     /// index and migration record; dropping obsolete indexes needs a named migration.
     const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
+    /// Numeric fields use a text expression index so the wire equality vocabulary
+    /// has the same canonical scalar representation on every backend.
+    const QUERYABLE_NUMERIC_FIELDS: &'static [&'static str] = &[];
     const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 
     /// Opt in to sibling validation at the authoritative write boundary.

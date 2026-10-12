@@ -15,7 +15,8 @@ impl Resource for ChangeRequest {
     type StatusPatch = ChangeRequestStatusPatch;
 
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "changerequests", kind: "ChangeRequest" };
-    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "status.state.value"];
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "status.state.value", "spec.service", "spec.scope", "spec.number"];
+    const QUERYABLE_NUMERIC_FIELDS: &'static [&'static str] = &["spec.number"];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
 
     fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), ResourceError> {

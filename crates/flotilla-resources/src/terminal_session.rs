@@ -34,6 +34,7 @@ define_resource!(
         "spec.env_ref",
         "spec.source.context.convoy",
         "spec.source.context.vessel_ref",
+        "metadata.labels.\"flotilla.work/convoy\"",
         "metadata.annotations.\"flotilla.work/role-address\""
     ]
 );

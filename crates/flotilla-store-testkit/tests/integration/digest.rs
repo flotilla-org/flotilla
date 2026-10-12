@@ -120,6 +120,7 @@ async fn sqlite_bootstraps_preexisting_local_and_replica_rows() {
     let replica_root = writer.digest(None).await.expect("replica digest").root.clone();
     drop((local, writer, backend));
     let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    SqliteBackend::register_query_functions(&raw).expect("configure independent writer");
     raw.execute_batch(
         "DROP TABLE digest_nodes; DROP TABLE digest_entries;
         DELETE FROM resource_store_migrations WHERE name='digest-index-v1';",
@@ -153,6 +154,7 @@ async fn quarantine_cannot_prove_authoritative_absence() {
             .expect("create");
     }
     let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    SqliteBackend::register_query_functions(&raw).expect("configure independent writer");
     raw.execute("UPDATE resource_objects SET body_json='{}' WHERE name='poisoned'", []).expect("corrupt");
     drop(raw);
     let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("reopen"));

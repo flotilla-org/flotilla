@@ -64,7 +64,7 @@ async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_
         .await
         .expect("legacy stray snapshot");
     drop(backend);
-    let connection = rusqlite::Connection::open(&path).expect("raw store");
+    let connection = open_raw_connection(&path).expect("raw store");
     connection
         .execute("DELETE FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1'", [])
         .expect("simulate pre-migration store");
@@ -82,7 +82,7 @@ async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_
 
     let migrated = ResourceBackend::new(SqliteBackend::open(&path).expect("migrate store"));
     assert!(migrated.using::<WorkflowTemplate>("flotilla").list().await.expect("list templates").items.is_empty());
-    let connection = rusqlite::Connection::open(&path).expect("inspect migrated store");
+    let connection = open_raw_connection(&path).expect("inspect migrated store");
     let quarantined_templates: usize = connection
         .query_row(
             "SELECT COUNT(*) FROM resource_decode_quarantine WHERE group_name = 'flotilla.work' AND version = 'v1' AND kind = 'WorkflowTemplate'",
@@ -113,7 +113,7 @@ fn replica_point_lookup_uses_resource_name_index() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("resources.sqlite");
     drop(SqliteBackend::open(&path).expect("initialize sqlite backend"));
-    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let connection = open_raw_connection(&path).expect("open raw sqlite connection");
 
     let plan = connection
         .query_row(
@@ -381,7 +381,7 @@ async fn undecodable_replica_partition_is_dropped_and_forces_full_resync() {
         backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, Utc::now()).await.expect("persist replica");
     }
     {
-        let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+        let connection = open_raw_connection(&path).expect("open raw sqlite connection");
         connection
             .execute(
                 "UPDATE replica_objects SET body_json = '{}' WHERE origin_root = ?1 AND name = ?2",
@@ -480,7 +480,7 @@ async fn raw_delete_preserves_finalization_then_prevents_relay_resurrection() {
     let authority_root = flotilla_protocol::NodeId::new("9ad3ffb1931f9996979535186f45027f");
     drop(SqliteBackend::open(&path).expect("initialize sqlite backend"));
     {
-        let connection = rusqlite::Connection::open(&path).expect("open raw sqlite fixture connection");
+        let connection = open_raw_connection(&path).expect("open raw sqlite fixture connection");
         connection
             .execute(
                 "INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
@@ -640,7 +640,7 @@ async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
             .await
             .expect("create object to corrupt");
     }
-    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let connection = open_raw_connection(&path).expect("open raw sqlite connection");
     let changed = connection
         .execute(
             "UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2",
@@ -676,7 +676,7 @@ async fn deleting_a_quarantined_object_clears_its_decode_diagnosis() {
             .await
             .expect("create object to corrupt");
     }
-    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let connection = open_raw_connection(&path).expect("open raw sqlite connection");
     let changed = connection
         .execute(
             "UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2",
@@ -713,7 +713,7 @@ async fn deleting_a_non_replicated_quarantined_object_clears_its_decode_diagnosi
             .await
             .expect("create object to corrupt");
     }
-    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let connection = open_raw_connection(&path).expect("open raw sqlite connection");
     let changed = connection
         .execute(
             "UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2",
@@ -746,7 +746,7 @@ async fn delayed_sqlite_open_does_not_stall_tokio_executor() {
     let blocker_path = path.clone();
     let (locked_tx, locked_rx) = std_mpsc::channel();
     let blocker = thread::spawn(move || {
-        let connection = rusqlite::Connection::open(blocker_path).expect("blocking connection should open");
+        let connection = open_raw_connection(blocker_path).expect("blocking connection should open");
         connection.execute_batch("CREATE TABLE startup_lock (value INTEGER); BEGIN EXCLUSIVE").expect("exclusive transaction should begin");
         locked_tx.send(()).expect("lock acquisition should be reported");
         thread::sleep(Duration::from_millis(400));
@@ -826,7 +826,7 @@ fn file_backend_enables_wal_and_busy_timeout() {
     let path = dir.path().join("resources.sqlite");
     let backend = SqliteBackend::open(&path).expect("sqlite backend should open");
 
-    let connection = rusqlite::Connection::open(&path).expect("inspection connection should open");
+    let connection = open_raw_connection(&path).expect("inspection connection should open");
     let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0)).expect("read journal mode");
     let busy_timeout_ms: u64 = connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).expect("read busy timeout");
 
@@ -931,7 +931,7 @@ async fn compaction_removes_a_superseded_event_quarantine_with_its_event() {
     drop(resolver);
     drop(backend);
 
-    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let connection = open_raw_connection(&path).expect("open raw sqlite connection");
     let body: String = connection
         .query_row("SELECT body_json FROM resource_events WHERE event_version = 1", [], |row| row.get(0))
         .expect("read first event body");
@@ -1050,7 +1050,7 @@ async fn snapshot_skips_unchanged_sqlite_rows_while_applying_changes() {
     }
     let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new("origin"), "flotilla");
     writer.replace(&source.list().await.expect("snapshot"), Utc::now()).await.expect("seed");
-    let connection = rusqlite::Connection::open(&path).expect("raw sqlite");
+    let connection = open_raw_connection(&path).expect("raw sqlite");
     connection
         .execute_batch(
             r#"
@@ -1087,7 +1087,7 @@ async fn legacy_replica_cursor_requires_one_snapshot_before_resume() {
     let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("open"));
     backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, chrono::Utc::now()).await.expect("seed");
     drop(backend);
-    let connection = rusqlite::Connection::open(&path).expect("raw store");
+    let connection = open_raw_connection(&path).expect("raw store");
     connection.execute("ALTER TABLE replica_cursors DROP COLUMN complete_prefix", []).expect("simulate previous-generation schema");
     drop(connection);
     let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("upgrade"));
@@ -1096,4 +1096,12 @@ async fn legacy_replica_cursor_requires_one_snapshot_before_resume() {
     assert_eq!(backend.including_replicas::<Convoy>("flotilla").list().await.expect("preserved replicas").items.len(), 1);
     writer.replace(&listed, chrono::Utc::now()).await.expect("repair proof");
     assert_eq!(writer.cursor().await.expect("proven cursor").expect("prefix").resource_version, listed.resource_version);
+}
+
+// Corruption and fixture-import writers use the same functions as production
+// connections, without running migrations or changing their test payloads.
+fn open_raw_connection(path: impl AsRef<std::path::Path>) -> rusqlite::Result<rusqlite::Connection> {
+    let connection = rusqlite::Connection::open(path)?;
+    flotilla_store_sqlite::SqliteBackend::register_query_functions(&connection).expect("configure raw SQLite writer");
+    Ok(connection)
 }

@@ -16,6 +16,7 @@ impl Resource for ImageBuild {
     type Status = ImageBuildStatus;
     type StatusPatch = ImageBuildStatusPatch;
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "imagebuilds", kind: "ImageBuild" };
+    const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name", "spec.layer.name"];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
 
     fn validate_spec(_meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {

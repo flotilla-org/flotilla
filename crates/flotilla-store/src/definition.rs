@@ -99,6 +99,30 @@ impl<T: Resource> DefinitionResolver<T> {
         Ok(merged)
     }
 
+    /// Read a named inventory once while merging every author for each name.
+    pub async fn list_names(&self, names: impl IntoIterator<Item = String>) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+        ensure_definitions::<T>()?;
+        let mut query = crate::StoreQuery::names(names, true);
+        query.suppress_self_origin = false;
+        query.merged_definitions = true;
+        Ok(self.backend.query_declared::<T>(&self.namespace, &query).await?.items.into_iter().map(|item| item.object).collect())
+    }
+
+    /// Select definition names through declared indexes, then merge every
+    /// author of each selected name. Predicates may need checking after merge.
+    pub async fn list_selected(&self, mut selection: crate::StoreQuery) -> Result<Vec<ResourceObject<T>>, ResourceError> {
+        ensure_definitions::<T>()?;
+        selection.include_replicas = true;
+        selection.suppress_self_origin = false;
+        let query = crate::StoreQuery {
+            include_replicas: true,
+            suppress_self_origin: false,
+            merged_definitions: true,
+            ..crate::StoreQuery::related("metadata.name", "metadata.name", selection)
+        };
+        Ok(self.backend.query_declared::<T>(&self.namespace, &query).await?.items.into_iter().map(|item| item.object).collect())
+    }
+
     pub async fn create(&self, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         self.create_as(&WriterIdentity::operator().with_source("definition-create"), meta, spec).await
     }

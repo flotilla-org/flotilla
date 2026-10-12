@@ -14,7 +14,15 @@ pub const CREDENTIAL_PERMISSIONS_ANNOTATION: &str = "flotilla.work/credential-pe
 pub const CREDENTIAL_PERMISSIONS_ENV: &str = "FLOTILLA_CREDENTIAL_PERMISSIONS";
 pub const CREDENTIAL_PERMISSIONS_SESSION_TAG: &str = "flotilla-credential-permissions";
 
-define_resource!(CredentialSpec, "credentialspecs", CredentialSpecSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
+define_resource!(
+    CredentialSpec,
+    "credentialspecs",
+    CredentialSpecSpec,
+    (),
+    NoStatusPatch,
+    replication = ReplicationClass::Definitions,
+    queryable = &["metadata.name", "spec.consumer.adapter"]
+);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CredentialGrant;
 impl crate::Resource for CredentialGrant {
@@ -23,6 +31,14 @@ impl crate::Resource for CredentialGrant {
     type StatusPatch = NoStatusPatch;
     const API_PATHS: crate::ApiPaths =
         crate::ApiPaths { group: "flotilla.work", version: "v1", plural: "credentialgrants", kind: "CredentialGrant" };
+    const QUERYABLE_FIELDS: &'static [&'static str] = &[
+        "metadata.name",
+        "spec.selector.projects.*",
+        "spec.selector.roles.*",
+        "spec.selector.repositories.*",
+        "spec.selector.host_action",
+        "spec.selector.repository_trust",
+    ];
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
     fn validate_spec(_meta: &crate::InputMeta, spec: &Self::Spec) -> Result<(), crate::ResourceError> {
         let selector = &spec.selector;

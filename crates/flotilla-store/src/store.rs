@@ -41,6 +41,7 @@ pub struct ResourceKind {
     pub paths: ApiPaths,
     pub replication: ReplicationClass,
     pub queryable_fields: &'static [&'static str],
+    pub queryable_numeric_fields: &'static [&'static str],
     pub validate_namespace: bool,
     decode: fn(Value) -> Result<ResourceObject<SerializedResource>, ResourceError>,
     validate_spec_fn: fn(&InputMeta, &Value) -> Result<(), ResourceError>,
@@ -60,6 +61,7 @@ impl ResourceKind {
             paths: T::API_PATHS,
             replication: T::REPLICATION_CLASS,
             queryable_fields: T::QUERYABLE_FIELDS,
+            queryable_numeric_fields: T::QUERYABLE_NUMERIC_FIELDS,
             validate_namespace: T::VALIDATE_NAMESPACE_SPEC,
             decode: |value| {
                 // Validate the registered type before exposing a stored row as
@@ -211,6 +213,17 @@ pub trait Store: std::fmt::Debug + Send + Sync {
         _query: &crate::StoreQuery,
     ) -> Result<crate::QueryResult, ResourceError> {
         Err(self.unsupported_operation("declared queries"))
+    }
+    /// Internal indexed projection used by composed stores to resolve semijoins.
+    /// It returns field values without reading or decoding resource bodies.
+    async fn query_values_raw(
+        &self,
+        _kind: ResourceKind,
+        _namespace: &str,
+        _query: &crate::StoreQuery,
+        _field: &str,
+    ) -> Result<std::collections::BTreeSet<String>, ResourceError> {
+        Err(self.unsupported_operation("indexed field projections"))
     }
     async fn query_messages_raw(
         &self,

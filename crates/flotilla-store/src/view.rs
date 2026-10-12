@@ -190,6 +190,33 @@ impl<T: Resource> ViewState<T> {
     pub fn query(&self, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
         Ok(materialize(self.select(query)?))
     }
+    fn resolve_query(&self, query: &StoreQuery) -> Result<StoreQuery, ResourceError> {
+        let mut resolved = query.clone();
+        resolved.field_matches_query.clear();
+        let (_, index) = self.definitions.as_ref().map(|(objects, index)| (objects, index)).unwrap_or((&self.objects, &self.index));
+        for (field, source) in &query.field_matches_query {
+            if source.kind(ResourceKind::of::<T>())?.paths.kind != T::API_PATHS.kind {
+                return Err(ResourceError::invalid("source kind missing from single-kind view"));
+            }
+            let names = self
+                .select(&source.query)?
+                .into_iter()
+                .map(|item| Self::key(&item.object.metadata.namespace, &item.object.metadata.name, &item.provenance))
+                .collect();
+            let values = index.values(&source.field, &names);
+            let values = match resolved.field_values.remove(field) {
+                Some(existing) => existing.into_iter().filter(|value| values.contains(value)).collect(),
+                None => values.into_iter().collect(),
+            };
+            resolved.field_values.insert(field.clone(), values);
+        }
+        resolved.any_of = query
+            .any_of
+            .as_ref()
+            .map(|queries| queries.iter().map(|query| self.resolve_query(query)).collect::<Result<_, _>>())
+            .transpose()?;
+        Ok(resolved)
+    }
     fn select(&self, query: &StoreQuery) -> Result<Vec<Arc<ReadResourceObject<T>>>, ResourceError> {
         query.validate(ResourceKind::of::<T>())?;
         if query.message.is_some() {
@@ -198,6 +225,8 @@ impl<T: Resource> ViewState<T> {
         if query.replica_shadowing.is_some() {
             return Err(ResourceError::invalid("view owns its replica shadowing scope"));
         }
+        let resolved = self.resolve_query(query)?;
+        let query = &resolved;
         let (objects, index) = self.definitions.as_ref().map(|(objects, index)| (objects, index)).unwrap_or((&self.objects, &self.index));
         let items = index
             .names(query)

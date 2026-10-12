@@ -11,7 +11,8 @@ define_resource!(
     CheckoutStatus,
     CheckoutStatusPatch,
     replication = ReplicationClass::HomeBoundRuntime,
-    queryable = &["metadata.name", "status.phase"]
+    queryable =
+        &["metadata.name", "status.phase", "spec.repo_ref", "spec.env_ref", "spec.host_ref", "metadata.labels.\"flotilla.work/convoy\""]
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
