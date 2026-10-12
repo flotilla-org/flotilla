@@ -369,31 +369,6 @@ diagnosis; use absolute host worktree paths for contained placement. Backlink
 mounts that overlap the vessel workspace mount also refuse before Docker runs,
 preventing duplicate targets and overlays of another repository's workspace.
 
-Crews can create additional worktrees in an independent local clone. Its writable
-administration directory, config, hooks and registrations belong to that crew;
-no writable grant is added to the shared clone's `worktrees` parent. Clone with
-`--no-hardlinks --dissociate` so object files are independent too (no alternates or dependency
-on shared-clone garbage collection). Flotilla's VCS clone provisioner uses this
-same mode for local clones. This is the supported subagent-worktree recipe, run
-from the vessel checkout:
-
-```bash
-crew_scratch=$(mktemp -d)
-crew_origin=$(git remote get-url origin)
-git clone --no-hardlinks --dissociate . "$crew_scratch/repo"
-git -C "$crew_scratch/repo" remote set-url origin "$crew_origin"
-git -C "$crew_scratch/repo" worktree add -b crew/subagent "$crew_scratch/subagent" HEAD
-```
-
-Give the subagent `$crew_scratch/subagent`. Commit there, then fetch its branch
-from the private clone into the vessel and cherry-pick it, or push the branch to
-origin and fetch it normally. Keep stack operations and PR creation in the vessel
-checkout; they now resolve that checkout's own registration. The private clone
-starts with committed state only; commit work before cloning if it must carry.
-Remove the private worktrees with `git worktree remove`, then remove the scratch
-directory when finished. Scratch clones and their worktrees are crew-owned,
-ephemeral data; Flotilla does not register or deliver them as vessel Checkouts.
-
 Docker cannot update these bind mounts in place. When checkout membership or
 resolved administration paths change, vessel reconciliation holds provisioning
 and requests environment recreation before launching crews. A Ready vessel

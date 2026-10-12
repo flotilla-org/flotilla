@@ -32,9 +32,7 @@ impl CloneProvisioner for GitCloneProvisioner {
     async fn clone_repo(&self, repo_url: &str, target_path: &ExecutionEnvironmentPath) -> Result<(), String> {
         let target =
             target_path.as_path().to_str().ok_or_else(|| format!("target path is not valid UTF-8: {}", target_path.as_path().display()))?;
-        self.runner
-            .run("git", &["clone", "--no-hardlinks", "--dissociate", repo_url, target], Path::new("/"), &ChannelLabel::Default)
-            .await?;
+        self.runner.run("git", &["clone", repo_url, target], Path::new("/"), &ChannelLabel::Default).await?;
         Ok(())
     }
 
@@ -133,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clone_repo_uses_independent_objects() {
+    async fn clone_repo_issues_plain_git_clone() {
         let runner = Arc::new(RecordingRunner::with_responses(vec![Ok(String::new())]));
         let provisioner = super::GitCloneProvisioner::new(runner.clone());
 
@@ -146,13 +144,7 @@ mod tests {
             runner.calls(),
             vec![(
                 "git".to_string(),
-                vec![
-                    "clone".to_string(),
-                    "--no-hardlinks".to_string(),
-                    "--dissociate".to_string(),
-                    "git@github.com:flotilla-org/flotilla.git".to_string(),
-                    "/tmp/flotilla".to_string()
-                ],
+                vec!["clone".to_string(), "git@github.com:flotilla-org/flotilla.git".to_string(), "/tmp/flotilla".to_string()],
                 PathBuf::from("/")
             )]
         );
@@ -172,13 +164,7 @@ mod tests {
             runner.calls(),
             vec![(
                 "git".to_string(),
-                vec![
-                    "clone".to_string(),
-                    "--no-hardlinks".to_string(),
-                    "--dissociate".to_string(),
-                    "https://forgejo.lab/fork-issues/zellij".to_string(),
-                    "/tmp/zellij".to_string()
-                ],
+                vec!["clone".to_string(), "https://forgejo.lab/fork-issues/zellij".to_string(), "/tmp/zellij".to_string()],
                 PathBuf::from("/")
             )]
         );
