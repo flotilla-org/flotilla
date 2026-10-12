@@ -184,6 +184,9 @@ impl CommandRunner for BudgetedRunner {
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.inner.exists(cmd, args).await
     }
+    async fn read_file(&self, path: &Path) -> Result<String, String> {
+        self.inner.read_file(path).await
+    }
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
         self.inner.read_file_to(source, destination).await
     }

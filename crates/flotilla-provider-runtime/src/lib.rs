@@ -287,6 +287,13 @@ pub trait CommandRunner: Send + Sync {
         Err("command runner does not support binary file writes".to_string())
     }
 
+    /// Read UTF-8 text in the runner's filesystem namespace.
+    async fn read_file(&self, path: &Path) -> Result<String, String> {
+        let path = path.to_str().ok_or("file path is not UTF-8")?;
+        let args = ["--", path];
+        self.run("cat", &args, Path::new("/"), &command_channel_label("cat", &args)).await
+    }
+
     /// Copy a file from this runner's environment to the daemon host.
     async fn read_file_to(&self, _source: &Path, _destination: &Path) -> Result<(), String> {
         Err("command runner does not support binary file reads".to_string())
@@ -565,6 +572,10 @@ impl CommandRunner for ProcessCommandRunner {
         } else {
             Err(format!("{cmd} exited with {status}"))
         }
+    }
+
+    async fn read_file(&self, path: &Path) -> Result<String, String> {
+        tokio::fs::read_to_string(path).await.map_err(|error| format!("read {}: {error}", path.display()))
     }
 
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {

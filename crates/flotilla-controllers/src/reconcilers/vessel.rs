@@ -45,9 +45,8 @@ const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
-// Compare the grants we own, independent of serialization order and unrelated
-// policy mounts. Legacy config/hooks overlays identify old shared roots too, so
-// removing an entire repository still detects its stale writable grants.
+// Compare our Git grants and checkout aliases, independent of order and
+// unrelated policy mounts. Legacy protection roots identify stale grants too.
 fn git_mounts_match(existing: &[EnvironmentMount], desired: &[EnvironmentMount]) -> bool {
     let roots = existing
         .iter()
@@ -59,13 +58,16 @@ fn git_mounts_match(existing: &[EnvironmentMount], desired: &[EnvironmentMount])
         })
         .filter_map(|mount| PathBuf::from(&mount.source_path).parent().map(PathBuf::from))
         .collect::<BTreeSet<_>>();
+    let under_metadata = |mount: &EnvironmentMount| {
+        roots.iter().any(|root| PathBuf::from(&mount.source_path).starts_with(root) || PathBuf::from(&mount.target_path).starts_with(root))
+    };
+    let aliases = desired.iter().filter(|mount| !under_metadata(mount)).collect::<Vec<_>>();
     let grants = |mounts: &[EnvironmentMount]| {
         mounts
             .iter()
             .filter(|mount| {
-                roots
-                    .iter()
-                    .any(|root| PathBuf::from(&mount.source_path).starts_with(root) || PathBuf::from(&mount.target_path).starts_with(root))
+                under_metadata(mount)
+                    || aliases.iter().any(|alias| alias.source_path == mount.source_path || alias.target_path == mount.target_path)
             })
             .map(|mount| (mount.source_path.clone(), mount.target_path.clone(), mount.mode == EnvironmentMountMode::Rw))
             .collect::<BTreeSet<_>>()
@@ -138,6 +140,7 @@ impl VesselReconciler {
 
     async fn contained_git_mounts(&self, checkouts: &[(String, Option<String>)]) -> Result<Vec<EnvironmentMount>, ResourceError> {
         let mut directories = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+        let mut backlinks = BTreeMap::<PathBuf, PathBuf>::new();
         for (checkout_name, clone_ref) in checkouts {
             let clone_ref = clone_ref.as_ref().ok_or_else(|| {
                 ResourceError::invalid(format!("contained worktree placement requires checkout {checkout_name} to be a managed worktree"))
@@ -161,9 +164,19 @@ impl VesselReconciler {
             // Reject unrelated paths rather than granting a broader writable mount.
             if !metadata.common_dir.is_absolute()
                 || !metadata.admin_dir.is_absolute()
+                || !metadata.registered_checkout_dir.is_absolute()
+                || metadata.registered_checkout_dir.parent().is_none()
+                || metadata.registered_checkout_dir.starts_with(&metadata.common_dir)
+                || metadata.registered_checkout_dir.components().any(|part| matches!(part, std::path::Component::ParentDir))
                 || metadata.admin_dir.parent() != Some(metadata.common_dir.join("worktrees").as_path())
             {
                 return Err(ResourceError::invalid(format!("checkout {checkout_name} has an invalid Git administration directory")));
+            }
+            let source = PathBuf::from(&spec.target_path);
+            if let Some(previous) = backlinks.insert(metadata.registered_checkout_dir, source.clone()) {
+                if previous != source {
+                    return Err(ResourceError::invalid("contained checkout backlinks collide"));
+                }
             }
             directories.entry(metadata.common_dir).or_default().insert(metadata.admin_dir);
         }
@@ -180,6 +193,13 @@ impl VesselReconciler {
             for admin in admins {
                 mounts.push(mount(admin, EnvironmentMountMode::Rw));
             }
+        }
+        for (target, source) in backlinks {
+            mounts.push(EnvironmentMount {
+                source_path: source.to_string_lossy().into_owned(),
+                target_path: target.to_string_lossy().into_owned(),
+                mode: EnvironmentMountMode::Rw,
+            });
         }
         Ok(mounts)
     }
@@ -993,7 +1013,10 @@ impl Reconciler for VesselReconciler {
                                 docker.mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if !git_mounts_match(&existing_git_mounts, &git_mounts) {
+                        if !git_mounts_match(
+                            &existing_git_mounts,
+                            &git_mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>(),
+                        ) {
                             return Ok(VesselPrepared {
                                 patch: PlannedPatch::EnvironmentRecreation {
                                     observed_policy_ref: placement_policy.metadata.name.clone(),
@@ -1828,20 +1851,33 @@ mod tests {
             )
             .await
             .expect("checkout");
-        let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
+        let valid = WorktreeMetadata {
+            common_dir: "/clone/.git".into(),
+            admin_dir: "/clone/.git/worktrees/actual".into(),
+            registered_checkout_dir: "/recorded/own".into(),
+        };
         let reconciler = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
         assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
         let own = ("own".into(), Some("clone".into()));
         let one = reconciler.contained_git_mounts(std::slice::from_ref(&own)).await.expect("own mounts");
         let repeated = reconciler.contained_git_mounts(&[own.clone(), own.clone()]).await.expect("duplicate");
         assert_eq!(one, repeated, "duplicate checkout membership must not duplicate grants");
-        assert_eq!(one.len(), 5);
+        assert_eq!(one.len(), 6);
+        assert!(
+            one.iter()
+                .any(|mount| mount.source_path == "/own" && mount.target_path == "/recorded/own" && mount.mode == EnvironmentMountMode::Rw),
+            "Git backlink must resolve inside the vessel"
+        );
         assert_eq!(one[3].source_path, "/clone/.git/worktrees");
         assert_eq!(one[3].mode, EnvironmentMountMode::Ro);
         assert_eq!(one[4].source_path, "/clone/.git/worktrees/actual");
         assert_eq!(one[4].mode, EnvironmentMountMode::Rw);
         for metadata in [
             Err("transport unavailable".into()),
+            Ok(WorktreeMetadata { registered_checkout_dir: "relative/own".into(), ..valid.clone() }),
+            Ok(WorktreeMetadata { registered_checkout_dir: "/".into(), ..valid.clone() }),
+            Ok(WorktreeMetadata { registered_checkout_dir: "/clone/.git/hooks".into(), ..valid.clone() }),
+            Ok(WorktreeMetadata { registered_checkout_dir: "/recorded/../own".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { common_dir: "relative/.git".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { admin_dir: "/clone/.git".into(), ..valid.clone() }),
             Ok(WorktreeMetadata { admin_dir: "/sibling".into(), ..valid.clone() }),
@@ -1855,6 +1891,43 @@ mod tests {
             matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
             "missing resolver must retry without guessing paths or failing the vessel"
         );
+    }
+
+    // #3082: only matching checkout aliases permit launch. Generate each
+    // drift dimension (missing, source, target, access), with arbitrary ordering
+    // and unrelated policy grants; these must not mask a missing backlink.
+    #[hegel::test]
+    fn checkout_backlink_grants_detect_drift(tc: hegel::TestCase) {
+        use flotilla_resources::{EnvironmentMount, EnvironmentMountMode};
+        let change = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4));
+        let desired = vec![
+            EnvironmentMount {
+                source_path: "/clone/.git/config".into(),
+                target_path: "/clone/.git/config".into(),
+                mode: EnvironmentMountMode::Ro,
+            },
+            EnvironmentMount { source_path: "/physical/own".into(), target_path: "/recorded/own".into(), mode: EnvironmentMountMode::Rw },
+        ];
+        let mut existing = desired.clone();
+        match change {
+            0 => {}
+            1 => {
+                existing.pop();
+            }
+            2 => existing[1].source_path = "/wrong/checkout".into(),
+            3 => existing[1].target_path = "/wrong/backlink".into(),
+            4 => existing[1].mode = EnvironmentMountMode::Ro,
+            _ => unreachable!(),
+        }
+        existing.push(EnvironmentMount {
+            source_path: "/policy/cache".into(),
+            target_path: "/cache".into(),
+            mode: EnvironmentMountMode::Rw,
+        });
+        if tc.draw(hegel::generators::booleans()) {
+            existing.reverse();
+        }
+        assert_eq!(super::git_mounts_match(&existing, &desired), change == 0);
     }
 
     // Glue: append Git's fixed settings without replacing policy or credential environment.

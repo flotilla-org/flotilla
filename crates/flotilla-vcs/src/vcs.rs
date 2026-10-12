@@ -87,6 +87,8 @@ impl From<String> for CheckoutMaterialisationError {
 pub struct WorktreeMetadata {
     pub common_dir: PathBuf,
     pub admin_dir: PathBuf,
+    /// Checkout path recorded by Git, including any host-side alias.
+    pub registered_checkout_dir: PathBuf,
 }
 
 pub struct CheckoutMaterialisation {
@@ -783,7 +785,19 @@ impl Vcs for FlotillaVcs {
         if !common_dir.is_absolute() || !admin_dir.is_absolute() || admin_dir == common_dir {
             return Err(format!("checkout {} is not a linked Git worktree with absolute metadata paths", target.display()));
         }
-        Ok(WorktreeMetadata { common_dir, admin_dir })
+        let backlink = self.runner.read_file(&admin_dir.join("gitdir")).await?;
+        let backlink = PathBuf::from(backlink.trim());
+        if !backlink.is_absolute() || backlink.file_name() != Some(std::ffi::OsStr::new(".git")) {
+            return Err("Git worktree backlink must name an absolute .git file".into());
+        }
+        let registered_checkout_dir = backlink.parent().ok_or("Git worktree backlink has no checkout parent")?.to_path_buf();
+        let registered_admin = GitCliBackend::checkout_root(&registered_checkout_dir, &*self.runner)
+            .run(&["rev-parse", "--path-format=absolute", "--git-dir"])
+            .await?;
+        if Path::new(registered_admin.trim()) != admin_dir {
+            return Err("Git worktree backlink resolves to a different registration".into());
+        }
+        Ok(WorktreeMetadata { common_dir, admin_dir, registered_checkout_dir })
     }
 
     async fn materialise_checkout(
@@ -2645,6 +2659,7 @@ mod tests {
                 .expect("create");
             let metadata = vcs.worktree_metadata(&target).await.expect("typed metadata");
             assert_eq!(metadata.common_dir, source.join(".git"));
+            assert_eq!(metadata.registered_checkout_dir, target);
             assert_eq!(
                 std::fs::read_to_string(metadata.admin_dir.join("gitdir")).expect("backlink").trim(),
                 target.join(".git").to_str().expect("backlink path")
@@ -2658,6 +2673,122 @@ mod tests {
         assert_ne!(admins[0], admins[1], "same basename must not alias admin overlays");
         assert!(vcs.worktree_metadata(&source).await.is_err(), "independent clone has no linked registration");
         assert!(vcs.worktree_metadata(&root.join("absent")).await.is_err(), "missing checkout fails closed");
+    }
+
+    // #3082: preserve Git's actual backlink spelling, even when it differs
+    // from the provisioned path; malformed and cross-checkout backlinks refuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_metadata_preserves_and_validates_backlinks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("physical root");
+        let source = root.join("source");
+        std::fs::create_dir(&source).expect("source");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let vcs = test_fl(&source, Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        let target = root.join("checkout with spaces");
+        vcs.materialise_checkout("crew/work", Some("main"), target.to_str().unwrap(), "managed").await.expect("checkout");
+        let admin = vcs.worktree_metadata(&target).await.expect("physical metadata").admin_dir;
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).expect("alias");
+        let registered = alias.join("checkout with spaces");
+        let backlink = admin.join("gitdir");
+        let recorded = format!("{}\n", registered.join(".git").display());
+        std::fs::write(&backlink, &recorded).expect("aliased backlink");
+        assert_eq!(vcs.worktree_metadata(&target).await.expect("aliased metadata").registered_checkout_dir, registered);
+        assert_eq!(std::fs::read_to_string(&backlink).unwrap(), recorded, "inspection must not repair host paths");
+        for invalid in ["relative/.git\n".to_string(), format!("{}\n", source.join(".git").display()), format!("{}\n", target.display())] {
+            std::fs::write(&backlink, invalid).expect("invalid backlink");
+            assert!(vcs.worktree_metadata(&target).await.is_err(), "invalid backlink must refuse a grant");
+        }
+        std::fs::remove_file(&backlink).expect("missing backlink");
+        assert!(vcs.worktree_metadata(&target).await.is_err(), "missing backlink must refuse a grant");
+    }
+
+    // #3082: a private local clone gives crews writable administration for
+    // extra worktrees without changing shared config, hooks or registrations.
+    // This host-side scenario uses the production VCS clone/worktree seams.
+    #[tokio::test]
+    async fn private_clone_supports_crew_worktrees_without_shared_administration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("physical root");
+        let source = root.join("source");
+        std::fs::create_dir(&source).expect("source");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let runner = Arc::new(flotilla_provider_runtime::ProcessCommandRunner);
+        let vcs = test_fl(&source, runner.clone(), true);
+        let vessel = root.join("vessel");
+        vcs.materialise_checkout("crew/work", Some("main"), vessel.to_str().unwrap(), "managed").await.expect("vessel");
+        let config = source.join(".git/config");
+        let hooks = source.join(".git/hooks");
+        let registrations = source.join(".git/worktrees");
+        let before_config = std::fs::read(&config).unwrap();
+        let before_registration = std::fs::read(registrations.join("vessel/gitdir")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (path, mode) in [(&config, 0o444), (&hooks, 0o555), (&registrations, 0o555)] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        let private = root.join("private");
+        vcs.clone_repository(vessel.to_str().unwrap(), &private).await.expect("private local clone");
+        let private_vcs = test_fl(&private, runner, true);
+        for index in 0..2 {
+            let target = root.join(format!("subagent-{index}"));
+            private_vcs
+                .materialise_checkout(&format!("crew/subagent-{index}"), Some("HEAD"), target.to_str().unwrap(), "crew-owned")
+                .await
+                .expect("additional worktree");
+            let metadata = private_vcs.worktree_metadata(&target).await.expect("private administration");
+            assert_eq!(metadata.common_dir, private.join(".git"));
+            assert_eq!(metadata.registered_checkout_dir, target);
+        }
+        git(&private, &["config", "--local", "crew.private", "true"]);
+        std::fs::write(private.join(".git/hooks/crew-owned"), "private hook").expect("writable private hooks");
+        assert_eq!(std::fs::read(&config).unwrap(), before_config);
+        assert!(!hooks.join("crew-owned").exists());
+        assert_eq!(std::fs::read(registrations.join("vessel/gitdir")).unwrap(), before_registration);
+        assert_eq!(std::fs::read_dir(&registrations).unwrap().count(), 1, "private worktrees must not register in the shared clone");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let head = vcs.read_repository(&source, RepositoryRead::HeadRevision).await.expect("head");
+            let head = head.trim();
+            let object = format!("objects/{}/{}", &head[..2], &head[2..]);
+            assert_ne!(
+                std::fs::metadata(source.join(".git").join(&object)).unwrap().ino(),
+                std::fs::metadata(private.join(".git").join(object)).unwrap().ino(),
+                "private objects must not hardlink shared objects"
+            );
+            for (path, mode) in [(&config, 0o644), (&hooks, 0o755), (&registrations, 0o755)] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        assert!(!private.join(".git/objects/info/alternates").exists(), "scratch must survive shared object pruning");
+    }
+
+    // #3082: a source that already borrows objects must not transmit its
+    // garbage-collection dependency to the crew's independent clone.
+    #[tokio::test]
+    async fn private_clone_dissociates_existing_alternates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("physical root");
+        let shared = root.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        git(&shared, &["init", "-b", "main"]);
+        git(&shared, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let source = root.join("source");
+        git(&root, &["clone", "--shared", shared.to_str().unwrap(), source.to_str().unwrap()]);
+        assert!(source.join(".git/objects/info/alternates").exists(), "fixture must borrow its objects");
+        let vcs = test_fl(&source, Arc::new(flotilla_provider_runtime::ProcessCommandRunner), true);
+        let private = root.join("private");
+        vcs.clone_repository(source.to_str().unwrap(), &private).await.expect("private clone");
+        assert!(!private.join(".git/objects/info/alternates").exists(), "private clone must own borrowed objects too");
+        std::fs::remove_dir_all(&shared).unwrap();
+        git(&private, &["log", "-1", "--oneline"]);
     }
 
     // #2688: a post-add protection failure leaves a locked registration,

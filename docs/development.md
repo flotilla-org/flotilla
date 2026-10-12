@@ -357,7 +357,38 @@ The shared Git metadata remains writable for objects and refs, while `config`,
 submounts expose only the vessel's own administration directories, resolved by
 Git through the typed VCS boundary. Siblings registered after container startup
 inherit the same read-only parent. Metadata mounts use the same absolute host
-paths inside the container, preserving `.git` pointers and host backlinks.
+paths inside the container, preserving `.git` pointers. The checkout is also
+mounted at the path recorded in its administration directory's `gitdir` backlink,
+as well as at the vessel working directory (usually `/workspace`). Mounting only
+metadata at host paths leaves that backlink unresolved: tools that enumerate
+worktrees then try to open an absent host checkout. The VCS boundary reads and
+validates the actual backlink, so symlinked host roots need no path guessing or
+in-container `git worktree repair` (which would corrupt the host backlink).
+
+Crews can create additional worktrees in an independent local clone. Its writable
+administration directory, config, hooks and registrations belong to that crew;
+no writable grant is added to the shared clone's `worktrees` parent. Clone with
+`--no-hardlinks --dissociate` so object files are independent too (no alternates or dependency
+on shared-clone garbage collection). Flotilla's VCS clone provisioner uses this
+same mode for local clones. This is the supported subagent-worktree recipe, run
+from the vessel checkout:
+
+```bash
+crew_scratch=$(mktemp -d)
+crew_origin=$(git remote get-url origin)
+git clone --no-hardlinks --dissociate . "$crew_scratch/repo"
+git -C "$crew_scratch/repo" remote set-url origin "$crew_origin"
+git -C "$crew_scratch/repo" worktree add -b crew/subagent "$crew_scratch/subagent" HEAD
+```
+
+Give the subagent `$crew_scratch/subagent`. Commit there, then fetch its branch
+from the private clone into the vessel and cherry-pick it, or push the branch to
+origin and fetch it normally. Keep stack operations and PR creation in the vessel
+checkout; they now resolve that checkout's own registration. The private clone
+starts with committed state only; commit work before cloning if it must carry.
+Remove the private worktrees with `git worktree remove`, then remove the scratch
+directory when finished. Scratch clones and their worktrees are crew-owned,
+ephemeral data; Flotilla does not register or deliver them as vessel Checkouts.
 
 Docker cannot update these bind mounts in place. When checkout membership or
 resolved administration paths change, vessel reconciliation holds provisioning

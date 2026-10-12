@@ -883,6 +883,7 @@ fn create_uses_requested_mount_modes_in_docker_arguments(tc: hegel::TestCase) {
             working_directory: None,
             provisioned_mounts: vec![
                 ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
+                ProvisionedMount::new("/host/workspace", "/recorded/checkout", ProvisionedMountMode::Rw),
                 ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
                 ProvisionedMount::new(common, common, ProvisionedMountMode::Rw),
                 ProvisionedMount::new(format!("{common}/config"), format!("{common}/config"), ProvisionedMountMode::Ro),
@@ -912,6 +913,8 @@ fn create_uses_requested_mount_modes_in_docker_arguments(tc: hegel::TestCase) {
             args.windows(2).any(|pair| pair == ["-v", "/host/reference-repo:/ref/repo:ro"]),
             "read-only reference mount should be passed to docker as :ro; args: {args:?}",
         );
+        // #3082: the backlink alias accompanies the working-directory mount.
+        assert!(args.windows(2).any(|pair| pair == ["-v", "/host/workspace:/recorded/checkout:rw"]));
         // #2682: the parent protects all siblings, including registrations created later.
         for protected in ["config", "hooks", "worktrees"] {
             let expected = format!("type=bind,source={common}/{protected},target={common}/{protected},readonly");

@@ -63,7 +63,7 @@ impl WorktreeMetadataResolver for TestWorktreeMetadata {
         let common_dir = std::path::PathBuf::from(clone.spec.path).join(".git");
         let name = std::path::Path::new(target).file_name().expect("target name").to_string_lossy();
         let admin_dir = common_dir.join("worktrees").join(format!("resolved-{name}"));
-        Ok(WorktreeMetadata { common_dir, admin_dir })
+        Ok(WorktreeMetadata { common_dir, admin_dir, registered_checkout_dir: target.into() })
     }
 }
 
@@ -967,7 +967,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         _ => None,
     });
     let mounts = mounts.expect("docker environment should be created");
-    assert_eq!(mounts.len(), 11);
+    assert_eq!(mounts.len(), 13);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
     assert_eq!(mounts[1].source_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
@@ -985,7 +985,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
 
     // #2682: writable exceptions are exactly the vessel's resolved admins;
     // all current and future siblings inherit the read-only parent.
-    for slice in mounts[1..].as_chunks::<5>().0 {
+    for slice in mounts[1..11].as_chunks::<5>().0 {
         assert_eq!(slice[4].mode, flotilla_resources::EnvironmentMountMode::Rw);
         assert!(slice[4].source_path.starts_with(&format!("{}/worktrees/resolved-", slice[0].source_path)));
         assert_eq!(slice[4].target_path, slice[4].source_path);
@@ -1753,6 +1753,11 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                         target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-c".to_string(),
                         mode: flotilla_resources::EnvironmentMountMode::Rw,
                     },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Rw,
+                    },
                 ])
         )
     }));
@@ -2040,6 +2045,11 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
             flotilla_resources::EnvironmentMount {
                 source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
                 target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Rw,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
                 mode: flotilla_resources::EnvironmentMountMode::Rw,
             },
         ],
