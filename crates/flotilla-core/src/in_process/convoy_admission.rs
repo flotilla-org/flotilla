@@ -584,16 +584,10 @@ impl ConvoyAdmission {
     }
 
     async fn admission_ai_utility(&self) -> Result<ProbedNamingUtility, String> {
-        let environment = self
-            .environment_manager
-            .environment_bag(&self.local_environment_id)
-            .ok_or_else(|| "AI utilities: admitting environment unavailable".to_string())?;
-        let runner = self
-            .environment_manager
-            .environment_runner(&self.local_environment_id)
-            .ok_or_else(|| "AI utilities: admitting runner unavailable".to_string())?;
+        let environment = self.environment_manager.environment_bag(&self.local_environment_id);
+        let runner = self.environment_manager.environment_runner(&self.local_environment_id);
         let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
-        probe_admission_ai_utility(&self.discovery.factories.ai_utilities, &environment, &self.config, &probe_root, runner).await
+        probe_admission_ai_utility(&self.discovery.factories.ai_utilities, environment.as_ref(), &self.config, &probe_root, runner).await
     }
 
     pub(super) async fn resolve_convoy_issue(
@@ -4182,11 +4176,13 @@ fn resolve_admission_names(
 
 async fn probe_admission_ai_utility(
     factories: &[Box<AiUtilityFactory>],
-    environment: &EnvironmentBag,
+    environment: Option<&EnvironmentBag>,
     config: &dyn ProviderConfigView,
     probe_root: &ExecutionEnvironmentPath,
-    runner: Arc<dyn CommandRunner>,
+    runner: Option<Arc<dyn CommandRunner>>,
 ) -> Result<ProbedNamingUtility, String> {
+    let environment = environment.ok_or_else(|| "AI utilities: admitting environment unavailable".to_string())?;
+    let runner = runner.ok_or_else(|| "AI utilities: admitting runner unavailable".to_string())?;
     let mut failures = Vec::new();
     for factory in factories {
         let utility_name = factory.descriptor().display_name.chars().take(80).collect::<String>();
@@ -4833,10 +4829,10 @@ mod naming_tests {
         let factories: Vec<Box<AiUtilityFactory>> = vec![Box::new(ClaudeApiAiUtilityFactory), Box::new(ClaudeCliAiUtilityFactory)];
         let generated = match probe_admission_ai_utility(
             &factories,
-            &environment,
+            Some(&environment),
             &config,
             &ExecutionEnvironmentPath::new("/unused"),
-            Arc::new(NamingRunner(response)),
+            Some(Arc::new(NamingRunner(response))),
         )
         .await
         {
@@ -4961,6 +4957,33 @@ mod naming_tests {
             ("invalid convoy names response: request_id=401", "invalid convoy names response"),
         ] {
             assert_eq!(naming_failure_summary("Claude API", error), format!("Claude API: {expected}"));
+        }
+    }
+
+    // Missing admission collaborators report the specific availability reason and use fallback naming.
+    #[tokio::test]
+    async fn unavailable_environment_and_runner_keep_their_reasons() {
+        let environment = EnvironmentBag::new();
+        let config = ConfigStore::new(DaemonHostPath::new("/unused"), DaemonHostPath::new("/unused-state"));
+        for (bag, runner, expected) in [
+            (
+                None,
+                Some(Arc::new(NamingRunner(Ok(String::new()))) as Arc<dyn CommandRunner>),
+                "AI utilities: admitting environment unavailable",
+            ),
+            (Some(&environment), None, "AI utilities: admitting runner unavailable"),
+            (None, None, "AI utilities: admitting environment unavailable"),
+        ] {
+            let result = probe_admission_ai_utility(&[], bag, &config, &ExecutionEnvironmentPath::new("/unused"), runner).await;
+            let reason = result.err().expect("missing collaborator refuses probing");
+            assert_eq!(reason, expected);
+            let ((names, source), logs) = capture_logs(tracing::Level::WARN, async {
+                resolve_admission_names(Some(Err(reason)), "fallback", false, "not attempted")
+            })
+            .await;
+            assert_eq!(names, ConvoyNames { name: "fallback".into(), branch: "fallback".into() });
+            assert_eq!(source, Some(ConvoyNaming::DeterministicFallback { reason: expected.into() }));
+            assert!(logs.contains(expected) && logs.contains("WARN"), "{logs}");
         }
     }
 
