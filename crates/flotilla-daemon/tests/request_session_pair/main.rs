@@ -2749,6 +2749,7 @@ async fn fleet_post_install_target_scenario(remote: bool, background_events: usi
     };
     if remote {
         // Refusal arrives in the dispatch response; no completion subscription is needed.
+        // The observer drains each injected event before the next is sent.
         assert!(matches!(dispatch.await, Err(message) if message.contains("must run on the installing host")));
         assert!(!directory.path().join("diagnostics").exists());
     } else {
@@ -2759,6 +2760,7 @@ async fn fleet_post_install_target_scenario(remote: bool, background_events: usi
         let completion = async {
             loop {
                 if let DaemonEvent::CommandFinished { command_id, node_id, result, .. } = events.recv().await.expect("daemon event") {
+                    // Match dispatch's error type so try_join can cancel this waiter on rejection.
                     return Ok::<_, String>((command_id, node_id, result));
                 }
             }
