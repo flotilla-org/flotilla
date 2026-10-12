@@ -86,6 +86,10 @@ impl HostDetector for CommandDetector {
 
 /// Resolve a command that already passed its probe to the absolute executable
 /// path inside the runner's environment.
+///
+/// This is deliberately a second runner call, not a `which`-style lookup on
+/// the daemon host: the runner may be remote or provisioned, so the daemon's
+/// own `PATH` can name a different binary or none.
 pub async fn resolve_binary_path(runner: &dyn CommandRunner, command: &str) -> Option<PathBuf> {
     // Resolve inside the runner's environment: provisioned and remote runners
     // intentionally do not share the daemon process's PATH.
@@ -120,13 +124,13 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
     let mut saw_digit = false;
 
     for (idx, ch) in output.char_indices() {
-        if start.is_none() {
+        let Some(begin) = start else {
             if ch.is_ascii_digit() {
                 start = Some(idx);
                 saw_digit = true;
             }
             continue;
-        }
+        };
 
         if ch.is_ascii_digit() {
             saw_digit = true;
@@ -140,8 +144,7 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
         }
 
         if dot_count > 0 && saw_digit {
-            let start = start.expect("version start must exist");
-            return Some(output[start..idx].to_string());
+            return Some(output[begin..idx].to_string());
         }
 
         start = if ch.is_ascii_digit() { Some(idx) } else { None };
