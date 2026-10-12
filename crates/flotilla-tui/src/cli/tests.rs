@@ -301,7 +301,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         named.naming = Some(naming);
         assert!(format_convoy_explanation_human(&named).contains(expected));
     }
-    assert!(!format_convoy_explanation_human(&explanation).contains("Naming:"));
+    assert!(format_convoy_explanation_human(&explanation).contains("Naming: unknown (not recorded)"));
     let mut all_active = explanation.clone();
     for ledger in &mut all_active.decision_ledgers {
         ledger.completed_while_crew_active = true;

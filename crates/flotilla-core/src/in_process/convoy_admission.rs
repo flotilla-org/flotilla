@@ -4118,25 +4118,39 @@ async fn finish_naming_write(namespace: &str, name: &str, write: impl std::futur
 /// Stderr and API error bodies are untrusted and may contain credentials.
 /// Persist only fixed diagnostic categories, never arbitrary utility output.
 fn naming_failure_summary(utility: &str, error: &str) -> String {
-    let lower = error.to_ascii_lowercase();
-    let summary = if lower.contains("oauth session expired") {
+    let lower = error.chars().take(1024).collect::<String>().to_ascii_lowercase();
+    // Keep identifier separators inside tokens: request_id=req-401 must not
+    // resemble the HTTP status phrase "HTTP 401".
+    let words =
+        lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-').filter(|word| !word.is_empty()).collect::<Vec<_>>();
+    let has = |phrase: &[&str]| words.windows(phrase.len()).any(|window| window == phrase);
+    let summary = if has(&["invalid", "convoy", "names", "response"]) {
+        "invalid convoy names response"
+    } else if has(&["empty", "convoy", "or", "branch", "name"]) {
+        "empty convoy or branch name"
+    } else if has(&["oauth", "session", "expired"]) {
         "authentication failed: OAuth session expired and could not be refreshed"
-    } else if lower.contains("authenticate") || lower.contains("authentication") || lower.contains("unauthorized") || lower.contains("401")
+    } else if has(&["authenticate"])
+        || has(&["authentication"])
+        || has(&["unauthorized"])
+        || has(&["http", "401"])
+        || has(&["status", "401"])
     {
         "authentication failed"
-    } else if lower.contains("invalid convoy names response") {
-        "invalid convoy names response"
-    } else if lower.contains("empty convoy or branch name") {
-        "empty convoy or branch name"
-    } else if lower.contains("timed out") || lower.contains("timeout") {
+    } else if has(&["timed", "out"]) || has(&["timeout"]) {
         "name generation timed out"
-    } else if lower.contains("offline") || lower.contains("connect") {
+    } else if has(&["offline"])
+        || has(&["connection", "refused"])
+        || has(&["connection", "reset"])
+        || has(&["could", "not", "connect"])
+        || has(&["failed", "to", "connect"])
+    {
         "utility unavailable"
-    } else if lower.contains("permission denied") {
+    } else if has(&["permission", "denied"]) {
         "utility permission denied"
-    } else if lower.contains("no such file") || lower.contains("not found") {
+    } else if has(&["no", "such", "file"]) || has(&["not", "found"]) {
         "utility command unavailable"
-    } else if lower.contains("429") || lower.contains("rate limit") {
+    } else if has(&["http", "429"]) || has(&["status", "429"]) || has(&["rate", "limit"]) {
         "utility rate limited"
     } else {
         "utility command or API request failed (unrecognized diagnostic)"
@@ -4928,6 +4942,26 @@ mod naming_tests {
         }
         let (_, naming) = resolve_admission_names(None, "fallback", false, "caller supplied reason");
         assert_eq!(naming, Some(ConvoyNaming::DeterministicFallback { reason: "caller supplied reason".into() }));
+    }
+
+    // Identifiers containing status digits or diagnostic fragments are not failure categories.
+    #[test]
+    fn diagnostic_categories_match_words_and_http_context() {
+        for error in ["request_id=req401", "request_id=401", "connecticut", "unknown_not_found", "request-id=req-429"] {
+            assert_eq!(
+                naming_failure_summary("Claude API", error),
+                "Claude API: utility command or API request failed (unrecognized diagnostic)"
+            );
+        }
+        for (error, expected) in [
+            ("Anthropic API error (HTTP 401): private body", "authentication failed"),
+            ("HTTP 429", "utility rate limited"),
+            ("connection refused", "utility unavailable"),
+            ("binary not found", "utility command unavailable"),
+            ("invalid convoy names response: request_id=401", "invalid convoy names response"),
+        ] {
+            assert_eq!(naming_failure_summary("Claude API", error), format!("Claude API: {expected}"));
+        }
     }
 
     // Contract: missing API key and binary retain every factory's unmet requirements.

@@ -919,6 +919,8 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 let _ = writeln!(output, "Naming: deterministic fallback ({reason})");
             }
         }
+    } else {
+        let _ = writeln!(output, "Naming: unknown (not recorded)");
     }
     for hold in &explanation.holds {
         let _ = writeln!(output, "Turn delivery: {} held since={}: {}", hold.source, hold.raised_at, hold.reason);
