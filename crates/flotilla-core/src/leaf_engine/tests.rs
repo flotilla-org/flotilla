@@ -1018,6 +1018,8 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: 
             convoys.get("checks-wake").await.expect("held convoy").status
         );
         controller.abort();
+        // The stalled scenario ends at Landed; cached-row and claimed-crew
+        // assertions below exercise the non-stalled path before landing.
         return;
     }
     let stale_row = table
