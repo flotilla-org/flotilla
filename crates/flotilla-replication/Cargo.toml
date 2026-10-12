@@ -1,0 +1,37 @@
+# ADR 0060: store-to-store replication; no composition-root or transport dependencies.
+[package]
+name = "flotilla-replication"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-store = { path = "../flotilla-store" }
+async-trait.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# Only CancellationToken is used. The extra features match the native layer's
+# tokio-util selection without anchoring the HTTP stack (flotilla-build-features-http).
+tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+flotilla-store-memory = { path = "../flotilla-store-memory" }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
+
+# Keep native library features stable across build and test commands.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-hmac = { path = "../flotilla-build-features-hmac" }
+flotilla-build-features-os = { path = "../flotilla-build-features-os" }
+flotilla-build-features-tracing = { path = "../flotilla-build-features-tracing" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }

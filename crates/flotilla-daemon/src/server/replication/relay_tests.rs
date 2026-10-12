@@ -16,7 +16,9 @@ use flotilla_store::ResourceBackend;
 use flotilla_test_support::TestSocketDir;
 use tokio::{io::AsyncReadExt, net::UnixListener, task::JoinSet};
 
-use super::{replicate_kind_over_http, replicate_relay_over_http, ReplicationStore};
+use flotilla_replication::{replicate_kind_direct, replicate_relay_direct, ReplicationStore};
+
+use super::replication_host;
 use crate::server::resource_http::{serve_resource_http, serve_resource_http_with_daemon};
 
 async fn await_template(daemon: &InProcessDaemon, name: &str, expected: &WorkflowTemplateSpec) {
@@ -179,15 +181,16 @@ async fn governor_relay_contract(storage: TestBackend) {
         let peer = roots[source].0.node_id().clone();
         let path = roots[source].1.clone();
         tasks.spawn(async move {
-            let direct = replicate_kind_over_http::<WorkflowTemplate>(
-                HttpBackend::from_unix_socket(&path).expect("HTTP client"),
-                &daemon,
+            let host = replication_host(&daemon);
+            let direct = replicate_kind_direct::<WorkflowTemplate>(
+                ResourceBackend::new(HttpBackend::from_unix_socket(&path).expect("HTTP client")),
+                &host,
                 &peer,
                 ReplicationStore::Durable,
             );
-            let relay = replicate_relay_over_http::<WorkflowTemplate>(
-                HttpBackend::from_unix_socket(&path).expect("HTTP client"),
-                &daemon,
+            let relay = replicate_relay_direct::<WorkflowTemplate>(
+                ResourceBackend::new(HttpBackend::from_unix_socket(&path).expect("HTTP client")),
+                &host,
                 &peer,
                 ReplicationStore::Durable,
             );
@@ -286,15 +289,16 @@ async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
         let peer = roots[source].0.node_id().clone();
         let path = roots[source].1.clone();
         tasks.spawn(async move {
-            let direct = replicate_kind_over_http::<Checkout>(
-                HttpBackend::from_unix_socket(&path).expect("HTTP client").with_path_prefix("observed"),
-                &daemon,
+            let host = replication_host(&daemon);
+            let direct = replicate_kind_direct::<Checkout>(
+                ResourceBackend::new(HttpBackend::from_unix_socket(&path).expect("HTTP client").with_path_prefix("observed")),
+                &host,
                 &peer,
                 ReplicationStore::Observed,
             );
-            let relay = replicate_relay_over_http::<Checkout>(
-                HttpBackend::from_unix_socket(&path).expect("HTTP client").with_path_prefix("observed"),
-                &daemon,
+            let relay = replicate_relay_direct::<Checkout>(
+                ResourceBackend::new(HttpBackend::from_unix_socket(&path).expect("HTTP client").with_path_prefix("observed")),
+                &host,
                 &peer,
                 ReplicationStore::Observed,
             );

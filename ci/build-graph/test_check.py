@@ -193,6 +193,30 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
         )), [])
 
+    def test_replication_is_native_and_independent(self):
+        # ADR 0060: replication reaches stores only through dyn Store, not daemon or HTTP crates.
+        self.assertEqual(layer("flotilla-replication"), "native")
+        for target in ("flotilla-core", "flotilla-daemon", "flotilla-daemon-api", "flotilla-aggregator",
+                       "flotilla-credentials", "flotilla-controllers", "flotilla-store-http"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-replication", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-replication: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-replication", normal=("flotilla-store", "flotilla-resources", "flotilla-protocol")),
+            package("flotilla-daemon", normal=("flotilla-replication", "flotilla-store-http")),
+            package("flotilla-store", normal=("flotilla-resources", "flotilla-protocol")),
+            package("flotilla-store-http", normal=("flotilla-store",)),
+            package("flotilla-resources", normal=("flotilla-protocol",)), package("flotilla-protocol"),
+        )), [])
+        # A dev-only in-memory store keeps engine tests off the HTTP stack too.
+        self.assertEqual(violations(graph(
+            package("flotilla-replication", dev=("flotilla-store-memory",)), package("flotilla-store-memory"),
+        )), [])
+
     def test_testkit_names(self):
         for name in ("flotilla-store-testkit", "future-testkit", "flotilla-test-support"):
             self.assertTrue(is_testkit(name))

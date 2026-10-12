@@ -9,6 +9,7 @@ use std::{
 use flotilla_core::{in_process::InProcessDaemon, step::RemoteStepBatchRequest};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{ConfigLabel, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, RepoIdentity};
+use flotilla_replication::{DigestScheduler, PeerReplicatorSupervisors, ReplicationOptions};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
@@ -17,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     remote_commands::RemoteCommandRouter,
-    replicator::{PeerReplicatorSupervisors, ReplicationOptions},
+    replication::{peer_sources, replication_host},
     shared::sync_peer_query_state,
     PeerConnectedNotice, PeerConnectionEvent, SshTransport,
 };
@@ -189,8 +190,8 @@ impl PeerRuntime {
         self
     }
 
-    pub fn with_digest_driver(mut self, driver: Option<Arc<dyn super::replicator::DigestScheduler>>) -> Self {
-        self.replication_options.digest_driver = driver;
+    pub fn with_digest_driver(mut self, driver: Option<Arc<dyn DigestScheduler>>) -> Self {
+        self.replication_options = self.replication_options.with_digest_driver(driver);
         self
     }
 
@@ -590,21 +591,19 @@ impl PeerRuntime {
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tasks.spawn(async move {
-            let mut peer_replicators = PeerReplicatorSupervisors::new(replication_options);
+            // Composition: the daemon's stores, identity and health, with
+            // direct peers over forwarded sockets and routed peers over the router.
+            let mut peer_replicators = PeerReplicatorSupervisors::new(
+                replication_host(&outbound_daemon),
+                peer_sources(Arc::clone(&outbound_daemon), outbound_remote_command_router),
+                replication_options,
+            );
 
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
                     PeerConnectionEvent::Connected(notice) => {
                         debug!(peer = %notice.peer, generation = notice.generation, "starting peer resource replication");
-                        peer_replicators
-                            .peer_connected(
-                                outbound_remote_command_router.clone(),
-                                Arc::clone(&outbound_daemon),
-                                notice.peer.clone(),
-                                notice.generation,
-                                notice.resource_socket_path,
-                            )
-                            .await;
+                        peer_replicators.peer_connected(notice.peer.clone(), notice.generation, notice.resource_socket_path).await;
                         send_link_state(&outbound_daemon, &outbound_peer_manager, &notice.peer, notice.generation).await;
                     }
                     PeerConnectionEvent::Disconnected { peer, generation } => {

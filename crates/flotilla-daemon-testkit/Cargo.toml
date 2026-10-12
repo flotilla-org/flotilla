@@ -10,6 +10,7 @@ flotilla-daemon-api = { path = "../flotilla-daemon-api" }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }

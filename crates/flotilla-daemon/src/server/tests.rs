@@ -30,6 +30,7 @@ use flotilla_protocol::{
     RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
+use flotilla_replication::{replicate_kind_direct, ReplicationStore};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, FulfilmentFacts,
     FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
@@ -65,8 +66,7 @@ use super::remote_commands::PendingRemoteCancelMap;
 use super::remote_commands::PendingRemoteCommand;
 use super::remote_commands::PendingRemoteCommandMap;
 use super::remote_commands::RemoteCommandRouter;
-use super::replicator::replicate_kind_over_http;
-use super::replicator::ReplicationStore;
+use super::replication::replication_host;
 use super::request_dispatch::RequestDispatcher;
 use super::resource_http::serve_resource_http;
 use super::shared::sync_peer_query_state;
@@ -389,7 +389,13 @@ async fn http_replication_resnapshots_after_quarantined_history() {
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
     let replicator = tokio::spawn(async move {
-        replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication, ReplicationStore::Durable).await
+        replicate_kind_direct::<Convoy>(
+            ResourceBackend::new(http),
+            &replication_host(&holder_for_replication),
+            &origin_for_replication,
+            ReplicationStore::Durable,
+        )
+        .await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -506,7 +512,13 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
     let replicator = tokio::spawn(async move {
-        replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication, ReplicationStore::Durable).await
+        replicate_kind_direct::<Convoy>(
+            ResourceBackend::new(http),
+            &replication_host(&holder_for_replication),
+            &origin_for_replication,
+            ReplicationStore::Durable,
+        )
+        .await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -643,7 +655,13 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
     let replicator = tokio::spawn(async move {
-        replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication, ReplicationStore::Durable).await
+        replicate_kind_direct::<Convoy>(
+            ResourceBackend::new(http),
+            &replication_host(&holder_for_replication),
+            &origin_for_replication,
+            ReplicationStore::Durable,
+        )
+        .await
     });
 
     tokio::time::timeout(Duration::from_secs(2), async {

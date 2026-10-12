@@ -30,6 +30,7 @@ flotilla-core = { path = "../flotilla-core" }
 flotilla-credentials = { path = "../flotilla-credentials" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
+flotilla-replication = { path = "../flotilla-replication" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
 tender = { path = "../tender" }

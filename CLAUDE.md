@@ -152,7 +152,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-daemon-api` | `DaemonHandle` interface, query subscription token, build identity and lifecycle lock file |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
-| `flotilla-daemon` | Runtime supervision, socket server, resource replication, peer networking, multi-host command routing |
+| `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
 | `flotilla-aggregator` | Durable/observed resource query projection and demand-backed issue materialization |
 | `flotilla-resources` | Resource kinds, lifecycle authority, pure helpers, and typed list/watch shapes; no storage dependencies |
@@ -161,6 +161,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-store-sqlite` | SQLite persistence, schema, transactions and decode quarantine |
 | `flotilla-store-http` | Kubernetes-isomorphic HTTP storage client |
 | `flotilla-store-testkit` | Shared backend contracts, fixtures and per-request read counters |
+| `flotilla-replication` | Store-to-store replication over `dyn Store`: list/watch/resume, origin filtering, digest scheduling; host ports for stores, identity, health and peer sources |
 | `flotilla-review-bundle-object-store` | Object-store/S3 byte adapter for the review-bundle port |
 | `flotilla-tls` | Shared TLS provider selection and HTTP client construction |
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |
@@ -201,7 +202,9 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-aggregator/src/lib.rs` | Runtime-facing aggregator future; owns daemon collaborator and watch-source wiring |
 | `crates/flotilla-aggregator/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
 | `crates/flotilla-credentials/src/lib.rs` | Runtime-facing credential/material operations and agent-environment composition |
-| `crates/flotilla-daemon/src/server/replicator.rs` | Federates resource stores over `HttpBackend` |
+| `crates/flotilla-replication/src/replicator.rs` | Store-to-store replication engine: per-kind list/watch/resume, relay origin filtering, digest repair, peer generations |
+| `crates/flotilla-replication/src/ports.rs` | Replication host ports: local stores and node identity, health, direct and routed peer sources |
+| `crates/flotilla-daemon/src/server/replication.rs` | Daemon port implementations: `InProcessDaemon` stores/health, `HttpBackend` direct peers, routed watches over the remote command router |
 | `crates/flotilla-tui/src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
 | `crates/flotilla-tui/src/app/executor.rs` | Thin executor: routes to core, interprets results into UI state |
 | `crates/flotilla-tui/src/app/key_handlers.rs` | Key handling logic per binding mode |

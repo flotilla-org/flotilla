@@ -5,7 +5,7 @@ pub mod environment_sockets;
 mod peer_connection;
 pub mod peer_runtime;
 pub mod remote_commands;
-pub mod replicator;
+mod replication;
 mod request_dispatch;
 mod resource_http;
 mod shared;
