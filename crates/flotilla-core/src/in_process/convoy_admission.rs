@@ -2972,6 +2972,12 @@ impl AdmissionReadContext<'_> {
         }
         let (workflow_ref, mut workflow) =
             self.resolve_convoy_admission_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent).await?;
+        let exclusions = intent
+            .promise_exclusions
+            .iter()
+            .map(|(owner, kind)| Ok(flotilla_resources::TemplatePromise { owner: owner.clone(), kind: kind.parse()? }))
+            .collect::<Result<Vec<_>, String>>()?;
+        workflow.exclude_template_promises(&exclusions)?;
         let mut allocation_roles = expand_allocation_roles(&mut workflow, &project.spec)?;
         self.compose_convoy_needs(namespace, &project.spec, &issues, intent, &mut workflow).await?;
         refresh_allocation_role_crews(&workflow, &mut allocation_roles)?;

@@ -407,17 +407,19 @@ fn turn_delivery_can_subscribe_to_an_artifact_leaf() {
 fn previous_generation_completion_conditions_still_decode() {
     let old = r#"{"role":"coder","selector":{"capability":"code"},"completion_expectations":["decision-ledger","change-request-ready"]}"#;
     let decoded: flotilla_resources::CrewSpec = serde_json::from_str(old).expect("previous generation crew record");
-    assert!(decoded
-        .completion_conditions
-        .iter()
-        .all(|condition| matches!(condition, flotilla_resources::CrewCompletionExpectation::Condition(_))));
-    let written = serde_json::to_value(decoded).expect("new conditions");
-    assert!(written["completion_conditions"][0].is_object());
-    assert!(written["completion_conditions"][1].is_object());
+    assert_eq!(decoded.promises, vec![flotilla_resources::TemplatePromise::decision_ledger("coder")]);
+    assert!(decoded.deliverer);
+    assert!(decoded.completion_conditions.is_empty());
+    let written = serde_json::to_value(decoded).expect("new promises");
+    assert!(written.get("completion_conditions").is_none());
+    assert!(written.get("completion_expectations").is_none());
+    assert_eq!(written["promises"][0]["kind"], "decision-ledger");
 }
 
 #[test]
-fn template_yaml_declares_a_new_artifact_completion_kind() {
+// ADR 0047: a historical custom leaf without a supported promise kind keeps
+// its constraints when rewritten; it must not be turned into a free-form promise.
+fn previous_custom_artifact_checks_round_trip_without_losing_constraints() {
     let spec = parse_spec(
         r#"
 vessels:
@@ -442,6 +444,11 @@ vessels:
         flotilla_resources::CrewCompletionExpectation::Condition(flotilla_resources::CompletionCondition::Artifact { kind, .. })
             if kind == "toy-report"
     ));
+    assert!(spec.vessels[0].crew[0].promises.is_empty());
+    let rewritten = serde_json::to_value(&spec).expect("rewrite historical custom check");
+    assert!(rewritten["vessels"][0]["crew"][0].get("completion_conditions").is_none());
+    assert_eq!(rewritten["vessels"][0]["crew"][0]["legacy_checks"][0]["literal"], "approved");
+    assert_eq!(serde_json::from_value::<WorkflowTemplateSpec>(rewritten).expect("read new shape"), spec);
 }
 
 #[test]
