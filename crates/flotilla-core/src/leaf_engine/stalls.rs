@@ -11,8 +11,8 @@ use flotilla_resources::{
     TerminalSessionPhase, TerminalSessionSource, TurnDeliveryRule, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 
-use super::sources::{change_request_sources, freshest_change_requests};
-use super::wake::ReconcilerWake;
+use super::sources::freshest_change_request_refs;
+use super::wake::{ConvoyRead, ReconcilerWake};
 use super::{CrewTurnIntent, LeafWatcher, UnableEvidenceKey};
 use crate::{in_process::convoy_message_address, providers::change_request::observation::ChangeRequestRef};
 
@@ -215,42 +215,38 @@ pub(super) fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> 
 }
 
 impl ReconcilerWake {
-    pub(super) async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
+    pub(super) async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, impl ConvoyRead>) -> Result<(), String> {
         self.judge_stalls_at(namespace, convoys, self.subscriptions.inner.clock.now()).await
     }
 
     pub(super) async fn judge_stalls_at(
         &self,
         namespace: &str,
-        convoys: &HashMap<String, ResourceObject<Convoy>>,
+        convoys: &HashMap<String, impl ConvoyRead>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let backend = &self.subscriptions.inner.backend;
         let cell = self.views(namespace).await?;
         let views = cell.get().expect("initialized views");
-        let projects = views.projects.list().await.map_err(|error| error.to_string())?.items;
-        let available_convoys = views.convoys.list().await.map_err(|error| error.to_string())?.items;
-        let available_ensures = views.ensures.list().await.map_err(|error| error.to_string())?.items;
-        let sessions = views.sessions.list().await.map_err(|error| error.to_string())?.items;
-        let observation_list = views.change_requests.list().await.map_err(|error| error.to_string())?;
-        let progress_observations = freshest_change_requests(&change_request_sources(observation_list.clone()));
-        let observations = observation_list.items;
-        let checkouts = views.checkouts.list().await.map_err(|error| error.to_string())?.items;
-        let vessels = views.vessels.list().await.map_err(|error| error.to_string())?.items;
-        let messages = views.messages.list().await.map_err(|error| error.to_string())?.items;
+        let mut snapshot = flotilla_store::ViewSnapshot::new(backend.local_root().ok());
+        let projects = views.projects.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        let available_convoys = views.convoys.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        let available_ensures = views.ensures.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        let sessions_list = views.sessions.snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        let sessions = &sessions_list.items;
+        let observation_list = views.change_requests.shared_list().await.map_err(|error| error.to_string())?;
+        let progress_observations = freshest_change_request_refs(&observation_list.items);
+        let observations = &observation_list.items;
+        let checkouts_list = views.checkouts.shared_list().await.map_err(|error| error.to_string())?;
+        let checkouts = &checkouts_list.items;
+        let vessels_list = views.vessels.shared_list().await.map_err(|error| error.to_string())?;
+        let vessels = &vessels_list.items;
+        let messages_list = views.messages.shared_list().await.map_err(|error| error.to_string())?;
+        let messages = &messages_list.items;
         // Routing helpers retain their public Store-based interface, but all
         // their reads come from the same request snapshot of the watched kinds.
-        let mut snapshot = flotilla_store::ViewSnapshot::new(backend.local_root().ok());
-        snapshot.insert(namespace, flotilla_resources::ReadResourceList { items: projects.clone() }).map_err(|error| error.to_string())?;
-        snapshot
-            .insert(namespace, flotilla_resources::ReadResourceList { items: available_convoys.clone() })
-            .map_err(|error| error.to_string())?;
-        snapshot
-            .insert(namespace, flotilla_resources::ReadResourceList { items: available_ensures.clone() })
-            .map_err(|error| error.to_string())?;
-        snapshot.insert(namespace, flotilla_resources::ReadResourceList { items: sessions.clone() }).map_err(|error| error.to_string())?;
-        snapshot.insert(namespace, views.defaults.list().await.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
-        snapshot.insert(namespace, views.fleet.list().await.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+        views.defaults.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
+        views.fleet.insert_snapshot(namespace, &mut snapshot).await.map_err(|error| error.to_string())?;
         let read_backend = flotilla_store::ResourceBackend::from_arc(std::sync::Arc::new(snapshot));
         let inbox = self
             .subscriptions
@@ -261,22 +257,33 @@ impl ReconcilerWake {
             .entry(namespace.to_string())
             .or_insert_with(|| flotilla_store::MessageInbox::new(backend.clone(), namespace))
             .clone();
-        flotilla_store::reconcile_charter_notifications_with_view(
+        let receivers = flotilla_store::MessageReceiverSnapshot::load_from_shared_observations(
+            &read_backend,
+            namespace,
+            available_convoys.clone(),
+            sessions_list.clone(),
+            available_ensures.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        flotilla_store::reconcile_charter_notifications_with_receivers(
             &inbox,
             self.subscriptions.inner.charter_brief_renderer.as_ref(),
             now,
             &read_backend,
+            &receivers,
+            &projects,
         )
         .await
         .map_err(|error| error.to_string())?;
         let rows = self.subscriptions.rows().await;
         self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
-        for convoy in convoys.values() {
+        for convoy in convoys.values().map(ConvoyRead::convoy) {
             let Some(status) = &convoy.status else { continue };
-            let selected_sessions = select_convoy_children(convoy, &sessions);
-            self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, &messages, now).await?;
-            let selected_vessels = select_convoy_children(convoy, &vessels);
-            let selected_checkouts = select_convoy_children(convoy, &checkouts);
+            let selected_sessions = select_convoy_children(convoy, sessions);
+            self.observe_queued_turns_from_messages(namespace, convoy, &selected_sessions, messages, now).await?;
+            let selected_vessels = select_convoy_children(convoy, vessels);
+            let selected_checkouts = select_convoy_children(convoy, checkouts);
             let mut obligations = status.nudge_obligations.clone();
             let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing);
             if holding {
@@ -806,6 +813,7 @@ impl ReconcilerWake {
             }
             let project_policy = convoy.spec.project_ref.as_ref().and_then(|project| {
                 projects
+                    .items
                     .iter()
                     .find(|source| source.object.metadata.name == *project)
                     .and_then(|source| source.object.spec.supervision.clone())
@@ -1061,6 +1069,7 @@ impl ReconcilerWake {
                             &policy,
                             status.crew_work.iter().map(|(vessel, crew)| (vessel, crew.keys().collect::<Vec<_>>())).collect::<Vec<_>>(),
                             available_convoys
+                                .items
                                 .iter()
                                 .filter(|candidate| candidate.object.metadata.name != convoy.metadata.name
                                     && candidate.object.spec.project_ref == convoy.spec.project_ref)
@@ -1086,10 +1095,12 @@ impl ReconcilerWake {
                                 })
                                 .collect::<BTreeMap<_, _>>(),
                             available_ensures
+                                .items
                                 .iter()
                                 .map(|ensure| (&ensure.object.metadata.name, &ensure.object.metadata.resource_version))
                                 .collect::<BTreeMap<_, _>>(),
                             projects
+                                .items
                                 .iter()
                                 .map(|project| (&project.object.metadata.name, &project.object.metadata.resource_version))
                                 .collect::<BTreeMap<_, _>>()
@@ -1138,6 +1149,7 @@ impl ReconcilerWake {
                                 }
                                 SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => {
                                     let owned = available_ensures
+                                        .items
                                         .iter()
                                         .map(|source| &source.object)
                                         .find(|ensure| {
@@ -1147,6 +1159,7 @@ impl ReconcilerWake {
                                         .and_then(|ensure| ensure.status.as_ref())
                                         .and_then(|status| status.convoy_ref.as_deref());
                                     let candidate = available_convoys
+                                        .items
                                         .iter()
                                         .map(|source| &source.object)
                                         .filter(|candidate| {
@@ -1181,6 +1194,7 @@ impl ReconcilerWake {
                                                 format!("required crew {vessel}/{role} is absent")
                                             } else {
                                                 let matching = available_convoys
+                                                    .items
                                                     .iter()
                                                     .filter(|source| {
                                                         source.object.spec.project_ref.as_deref() == Some(project)

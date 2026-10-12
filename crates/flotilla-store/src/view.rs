@@ -86,13 +86,23 @@ type DefinitionIdentity = (String, String);
 pub struct ViewState<T: Resource> {
     objects: ViewObjects<T>,
     sources: BTreeMap<DefinitionIdentity, BTreeSet<String>>,
-    index: QueryIndex,
-    definitions: Option<(ViewObjects<T>, QueryIndex)>,
+    index: Arc<QueryIndex>,
+    definitions: Option<(ViewObjects<T>, Arc<QueryIndex>)>,
     local_root: Option<NodeId>,
+    snapshot: Option<Arc<crate::view_snapshot::SnapshotPartition>>,
+    shared_list: std::sync::OnceLock<Arc<ReadResourceList<T>>>,
 }
 impl<T: Resource> ViewState<T> {
     pub fn new(local_root: Option<NodeId>) -> Self {
-        Self { objects: BTreeMap::new(), sources: BTreeMap::new(), index: QueryIndex::default(), definitions: None, local_root }
+        Self {
+            objects: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            index: Arc::new(QueryIndex::default()),
+            definitions: None,
+            local_root,
+            snapshot: None,
+            shared_list: std::sync::OnceLock::new(),
+        }
     }
     fn key(namespace: &str, name: &str, provenance: &ResourceProvenance) -> String {
         let origin = match provenance {
@@ -140,21 +150,46 @@ impl<T: Resource> ViewState<T> {
             .map(|item| clone_read_object(item))
             .collect();
         let merged = crate::definition::merge_cached_definitions(sources, root)?;
-        let (objects, index) = self.definitions.get_or_insert_with(|| (BTreeMap::new(), QueryIndex::default()));
+        let (objects, index) = self.definitions.get_or_insert_with(|| (BTreeMap::new(), Arc::new(QueryIndex::default())));
         let key = Self::key(&identity.0, &identity.1, &ResourceProvenance::Local);
+        if let Some(snapshot) = &mut self.snapshot {
+            Arc::make_mut(snapshot).index = Arc::new(QueryIndex::default());
+        }
         if let Some(object) = merged.into_iter().next() {
             let value = serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
-            index.update(&key, Some(&value));
-            objects.insert(key, Arc::new(ReadResourceObject { object, provenance: ResourceProvenance::Local }));
+            let item = ReadResourceObject { object, provenance: ResourceProvenance::Local };
+            Arc::make_mut(index).update(&key, Some(&value));
+            if let Some(snapshot) = &mut self.snapshot {
+                let serialized = serialize_read(&item)?;
+                let snapshot = Arc::make_mut(snapshot);
+                snapshot.items.insert(key.clone(), Arc::new(serialized));
+                snapshot.local_names.insert(item.object.metadata.name.clone());
+                snapshot.index = index.clone();
+            }
+            objects.insert(key, Arc::new(item));
         } else {
-            index.update(&key, None);
+            Arc::make_mut(index).update(&key, None);
+            if let Some(snapshot) = &mut self.snapshot {
+                let snapshot = Arc::make_mut(snapshot);
+                snapshot.items.remove(&key);
+                snapshot.local_names.remove(&identity.1);
+                snapshot.index = index.clone();
+            }
             objects.remove(&key);
         }
         Ok(())
     }
     fn remove_source(&mut self, namespace: &str, name: &str, provenance: &ResourceProvenance) {
         let key = Self::key(namespace, name, provenance);
-        self.index.update(&key, None);
+        Arc::make_mut(&mut self.index).update(&key, None);
+        if let Some(snapshot) = self.snapshot.as_mut().filter(|_| self.definitions.is_none()) {
+            let snapshot = Arc::make_mut(snapshot);
+            snapshot.items.remove(&key);
+            if matches!(provenance, ResourceProvenance::Local) {
+                snapshot.local_names.remove(name);
+            }
+            snapshot.index = self.index.clone();
+        }
         self.objects.remove(&key);
         let identity = (namespace.to_owned(), name.to_owned());
         if let Some(keys) = self.sources.get_mut(&identity) {
@@ -165,11 +200,30 @@ impl<T: Resource> ViewState<T> {
         }
     }
     fn apply_source(&mut self, event: ReadWatchEvent<T>) -> Result<(), ResourceError> {
+        self.shared_list.take();
+        // Release the view's own index handle before mutating it. Only an
+        // outstanding immutable snapshot should trigger copy-on-write.
+        if T::REPLICATION_CLASS != ReplicationClass::Definitions || self.local_root.is_none() {
+            if let Some(snapshot) = &mut self.snapshot {
+                Arc::make_mut(snapshot).index = Arc::new(QueryIndex::default());
+            }
+        }
         match event {
             ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) => {
                 let key = Self::key(&item.object.metadata.namespace, &item.object.metadata.name, &item.provenance);
                 let value = serde_json::to_value(item.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
-                self.index.update(&key, Some(&value));
+                Arc::make_mut(&mut self.index).update(&key, Some(&value));
+                if let Some(snapshot) =
+                    self.snapshot.as_mut().filter(|_| T::REPLICATION_CLASS != ReplicationClass::Definitions || self.local_root.is_none())
+                {
+                    let serialized = serialize_read(&item)?;
+                    let snapshot = Arc::make_mut(snapshot);
+                    snapshot.items.insert(key.clone(), Arc::new(serialized));
+                    if matches!(item.provenance, ResourceProvenance::Local) {
+                        snapshot.local_names.insert(item.object.metadata.name.clone());
+                    }
+                    snapshot.index = self.index.clone();
+                }
                 if T::REPLICATION_CLASS == ReplicationClass::Definitions {
                     self.sources
                         .entry((item.object.metadata.namespace.clone(), item.object.metadata.name.clone()))
@@ -186,6 +240,23 @@ impl<T: Resource> ViewState<T> {
             }
         }
         Ok(())
+    }
+    fn snapshot_partition(&mut self) -> Result<Arc<crate::view_snapshot::SnapshotPartition>, ResourceError> {
+        if self.snapshot.is_none() {
+            let (objects, index) =
+                self.definitions.as_ref().map(|(objects, index)| (objects, index)).unwrap_or((&self.objects, &self.index));
+            let mut items = BTreeMap::new();
+            let mut local_names = BTreeSet::new();
+            for (key, item) in objects {
+                if matches!(item.provenance, ResourceProvenance::Local) {
+                    local_names.insert(item.object.metadata.name.clone());
+                }
+                let serialized = serialize_read(item)?;
+                items.insert(key.clone(), Arc::new(serialized));
+            }
+            self.snapshot = Some(Arc::new(crate::view_snapshot::SnapshotPartition { items, index: index.clone(), local_names }));
+        }
+        Ok(self.snapshot.as_ref().expect("initialized snapshot").clone())
     }
     pub fn query(&self, query: &StoreQuery) -> Result<ReadResourceList<T>, ResourceError> {
         Ok(materialize(self.select(query)?))
@@ -256,6 +327,10 @@ impl<T: Resource> ViewState<T> {
             .collect();
         Ok(items)
     }
+}
+
+fn serialize_read<T: Resource>(item: &ReadResourceObject<T>) -> Result<ReadResourceObject<crate::SerializedResource>, ResourceError> {
+    Ok(ReadResourceObject { object: crate::transcode(&item.object)?, provenance: item.provenance.clone() })
 }
 
 // The fixed public list shape owns its bodies. Selection only clones Arc
@@ -434,6 +509,35 @@ impl<T: Resource> WatchView<T> {
         let selected = self.state.read().await.select(query)?;
         Ok(materialize(selected))
     }
+    /// Immutable inventory shared by all readers of this view generation.
+    /// Owned public lists remain available for callers that need ownership.
+    pub async fn shared_list(&self) -> Result<Arc<ReadResourceList<T>>, ResourceError> {
+        self.flush().await?;
+        let state = self.state.read().await;
+        let query = StoreQuery { include_replicas: true, ..StoreQuery::default() };
+        if let Some(listed) = state.shared_list.get() {
+            return Ok(listed.clone());
+        }
+        let listed = Arc::new(materialize(state.select(&query)?));
+        Ok(state.shared_list.get_or_init(|| listed).clone())
+    }
+    /// Add this generation's maintained objects and equality index. The
+    /// partition is shared; a watch update leaves existing snapshots immutable.
+    pub async fn insert_snapshot(&self, namespace: &str, snapshot: &mut crate::ViewSnapshot) -> Result<(), ResourceError> {
+        self.snapshot(namespace, snapshot).await.map(drop)
+    }
+    /// Freeze typed evidence and the Store partition from the same generation.
+    pub async fn snapshot(&self, namespace: &str, snapshot: &mut crate::ViewSnapshot) -> Result<Arc<ReadResourceList<T>>, ResourceError> {
+        self.flush().await?;
+        let mut state = self.state.write().await;
+        snapshot.insert_partition::<T>(namespace, state.snapshot_partition()?);
+        if state.shared_list.get().is_none() {
+            let query = StoreQuery { include_replicas: true, ..StoreQuery::default() };
+            let listed = Arc::new(materialize(state.select(&query)?));
+            state.shared_list.get_or_init(|| listed);
+        }
+        Ok(state.shared_list.get().expect("initialized inventory").clone())
+    }
     pub async fn definitions(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         if T::REPLICATION_CLASS != ReplicationClass::Definitions {
             return Err(ResourceError::invalid("definition view requires a definitions kind"));
@@ -605,6 +709,7 @@ mod tests {
         };
         let mut view = ViewState::new(Some(NodeId::new("root")));
         view.replace(ReadResourceList { items: (0..size).map(|index| item(index, "old")).collect() }).unwrap();
+        view.snapshot_partition().unwrap();
         for round in 0..8 {
             for counter in &counters {
                 counter.store(0, Ordering::SeqCst);
@@ -618,6 +723,7 @@ mod tests {
             }
             let query = StoreQuery { labels: BTreeMap::from([("team".into(), team)]), ..StoreQuery::default() };
             assert_eq!(view.query(&query).unwrap().items.len(), 1);
+            assert_eq!(view.snapshot_partition().unwrap().index.names(&query).len(), 1);
             let old = StoreQuery { labels: BTreeMap::from([("team".into(), "old".into())]), ..StoreQuery::default() };
             assert_eq!(view.query(&old).unwrap().items.len(), size - 1);
             view.apply(ReadWatchEvent::Deleted(item(selected, "deleted"))).unwrap();

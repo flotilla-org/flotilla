@@ -297,7 +297,7 @@ impl ResourceBackend {
 }
 
 /// Inverted equality indexes maintained with the object map under its lock.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryIndex {
     names: BTreeSet<String>,
     entries: BTreeMap<(String, String), BTreeSet<String>>,

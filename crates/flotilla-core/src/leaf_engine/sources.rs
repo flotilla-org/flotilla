@@ -23,6 +23,27 @@ pub(super) fn change_request_sources(list: flotilla_resources::ReadResourceList<
     sources
 }
 
+/// Select borrowed observations for a pass without cloning their status bodies.
+pub(super) fn freshest_change_request_refs(items: &[ReadResourceObject<ChangeRequest>]) -> HashMap<&str, &ResourceObject<ChangeRequest>> {
+    let mut selected: HashMap<&str, &ReadResourceObject<ChangeRequest>> = HashMap::new();
+    fn rank(item: &ReadResourceObject<ChangeRequest>) -> (chrono::DateTime<chrono::Utc>, &str, bool) {
+        (
+            item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at),
+            item.object.spec.observing_authority.as_str(),
+            matches!(item.provenance, ResourceProvenance::Local),
+        )
+    }
+    // Watch inventories are sorted by name and origin. On exact replica ties,
+    // select the last origin, matching BTreeMap::iter().max_by_key below.
+    for item in items {
+        let current = selected.entry(item.object.metadata.name.as_str()).or_insert(item);
+        if rank(item) >= rank(current) {
+            *current = item;
+        }
+    }
+    selected.into_iter().map(|(name, item)| (name, &item.object)).collect()
+}
+
 pub(super) fn update_freshest_change_request(
     name: &str,
     sources: &ChangeRequestSources,
@@ -92,4 +113,43 @@ pub(super) fn freshest_issues(sources: &IssueSources) -> HashMap<String, Resourc
 pub(super) struct LeafObservationStaleness {
     pub(super) change_request: Duration,
     pub(super) issue: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Borrowing observations must preserve the existing selection, including
+    // exact freshness/authority ties between replica origins and local priority.
+    #[hegel::test]
+    fn borrowed_freshness_matches_owned_selection(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(16));
+        let mut inventory = BTreeMap::new();
+        for _ in 0..count {
+            let name = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+            let origin = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let day = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+            let authority = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
+            let value = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"ChangeRequest",
+                "metadata":{"namespace":"test", "name":format!("cr-{name}"), "resourceVersion":"1",
+                    "creationTimestamp":format!("2026-01-{day:02}T00:00:00Z"), "annotations":{"source":origin.to_string()}},
+                "spec":{"service":"github", "scope":"test/repo", "number":name, "observing_authority":authority.to_string()}});
+            let object = ResourceObject::<ChangeRequest>::from_k8s_object(serde_json::from_value(value).unwrap()).unwrap();
+            let provenance = if origin == 0 {
+                ResourceProvenance::Local
+            } else {
+                ResourceProvenance::Replica { origin_root: NodeId::new(format!("root-{origin}")), last_synced_at: chrono::Utc::now() }
+            };
+            // A view holds one object per identity and supplies canonical order.
+            inventory.insert((name, origin), ReadResourceObject { object, provenance });
+        }
+        let items: Vec<_> = inventory.into_values().collect();
+        let expected = freshest_change_requests(&change_request_sources(flotilla_resources::ReadResourceList { items: items.clone() }));
+        let actual = freshest_change_request_refs(&items);
+        assert_eq!(actual.len(), expected.len());
+        for (name, object) in actual {
+            assert_eq!(serde_json::to_value(object).unwrap(), serde_json::to_value(&expected[name]).unwrap());
+        }
+    }
 }

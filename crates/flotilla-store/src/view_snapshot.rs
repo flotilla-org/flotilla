@@ -10,12 +10,12 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-struct SnapshotPartition {
-    items: Vec<ReadResourceObject<SerializedResource>>,
-    index: Arc<crate::QueryIndex>,
-    local_names: BTreeSet<String>,
+pub(crate) struct SnapshotPartition {
+    pub(crate) items: BTreeMap<String, Arc<ReadResourceObject<SerializedResource>>>,
+    pub(crate) index: Arc<crate::QueryIndex>,
+    pub(crate) local_names: BTreeSet<String>,
 }
-type SnapshotObjects = BTreeMap<(String, String), SnapshotPartition>;
+type SnapshotObjects = BTreeMap<(String, String), Arc<SnapshotPartition>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct ViewSnapshot {
@@ -29,26 +29,38 @@ impl ViewSnapshot {
     }
     pub fn insert<T: Resource>(&mut self, namespace: &str, listed: ReadResourceList<T>) -> Result<(), ResourceError> {
         let mut index = crate::QueryIndex::default();
-        for (identity, item) in listed.items.iter().enumerate() {
-            let value = serde_json::to_value(item.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
-            index.update(&identity.to_string(), Some(&value));
+        let mut items = BTreeMap::new();
+        let mut local_names = BTreeSet::new();
+        for (identity, item) in listed.items.into_iter().enumerate() {
+            // Cold request snapshots still own their selected evidence, but
+            // serialize each typed body only once for both storage and indexing.
+            let mut value = serde_json::to_value(item.object.to_k8s_object()).map_err(|error| ResourceError::decode(error.to_string()))?;
+            let identity = identity.to_string();
+            index.update(&identity, Some(&value));
+            if matches!(item.provenance, ResourceProvenance::Local) {
+                local_names.insert(item.object.metadata.name.clone());
+            }
+            let fields = value.as_object_mut().expect("resource object");
+            let object = ResourceObject::<SerializedResource> {
+                metadata: crate::transcode(item.object.metadata)?,
+                spec: fields.remove("spec").expect("resource spec"),
+                status: fields.remove("status").filter(|value| !value.is_null()),
+            };
+            items.insert(identity, Arc::new(ReadResourceObject { object, provenance: item.provenance }));
         }
-        let local_names = listed
-            .items
-            .iter()
-            .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
-            .map(|item| item.object.metadata.name.clone())
-            .collect();
-        let listed = crate::convert_read_list(listed)?;
         Arc::make_mut(&mut self.objects).insert(
             (T::API_PATHS.kind.into(), namespace.into()),
-            SnapshotPartition { items: listed.items, index: Arc::new(index), local_names },
+            Arc::new(SnapshotPartition { items, index: Arc::new(index), local_names }),
         );
         Ok(())
+    }
+    pub(crate) fn insert_partition<T: Resource>(&mut self, namespace: &str, partition: Arc<SnapshotPartition>) {
+        Arc::make_mut(&mut self.objects).insert((T::API_PATHS.kind.into(), namespace.into()), partition);
     }
     fn partition(&self, kind: ResourceKind, namespace: &str) -> Result<&SnapshotPartition, ResourceError> {
         self.objects
             .get(&(kind.paths.kind.into(), namespace.into()))
+            .map(Arc::as_ref)
             .ok_or_else(|| ResourceError::invalid(format!("kind {} missing from view snapshot", kind.paths.kind)))
     }
     fn observe(&self, kind: ResourceKind, operation: ReadOperation, objects: usize) {
@@ -63,7 +75,10 @@ impl ViewSnapshot {
         Ok(self.visible(partition))
     }
     fn visible(&self, partition: &SnapshotPartition) -> Vec<ReadResourceObject<SerializedResource>> {
-        partition.items.iter().filter(|item| !self.shadowed(item, partition)).cloned().collect()
+        let mut items: Vec<_> =
+            partition.items.values().filter(|item| !self.shadowed(item, partition)).map(|item| item.as_ref().clone()).collect();
+        crate::sort_query_items(&mut items);
+        items
     }
     /// Visible provenances of one name, without cloning the partition.
     fn named(
@@ -76,13 +91,17 @@ impl ViewSnapshot {
         let partition = self.partition(kind, namespace)?;
         let found = partition
             .items
-            .iter()
-            .find(|item| {
+            .values()
+            .filter(|item| {
                 item.object.metadata.name == name
                     && !self.shadowed(item, partition)
                     && (!local_only || matches!(item.provenance, ResourceProvenance::Local))
             })
-            .cloned();
+            .min_by_key(|item| match &item.provenance {
+                ResourceProvenance::Local => (0, None),
+                ResourceProvenance::Replica { origin_root, .. } => (1, Some(origin_root)),
+            })
+            .map(|item| item.as_ref().clone());
         self.observe(kind, ReadOperation::Get, usize::from(found.is_some()));
         Ok(found)
     }
@@ -128,12 +147,13 @@ impl Store for ViewSnapshot {
         let partition = self
             .objects
             .get(&(kind.paths.kind.into(), namespace.into()))
+            .map(Arc::as_ref)
             .ok_or_else(|| ResourceError::invalid(format!("kind {} missing from view snapshot", kind.paths.kind)))?;
         let mut items: Vec<_> = partition
             .index
             .names(query)
             .into_iter()
-            .map(|identity| partition.items[identity.parse::<usize>().expect("snapshot index identity")].clone())
+            .map(|identity| partition.items[&identity].as_ref().clone())
             .filter(|item| !query.suppress_self_origin || !self.shadowed(item, partition))
             .filter(|item| {
                 if query.replicas_only {
@@ -169,13 +189,14 @@ impl Store for ViewSnapshot {
         let partition = self
             .objects
             .get(&(kind.paths.kind.into(), namespace.into()))
+            .map(Arc::as_ref)
             .ok_or_else(|| ResourceError::invalid("source kind missing from view snapshot"))?;
         let names = partition
             .index
             .names(&query)
             .into_iter()
             .filter(|identity| {
-                let item = &partition.items[identity.parse::<usize>().expect("snapshot identity")];
+                let item = &partition.items[identity];
                 (!query.suppress_self_origin || !self.shadowed(item, partition))
                     && (query.include_replicas || matches!(item.provenance, ResourceProvenance::Local))
                     && (!query.replicas_only || matches!(item.provenance, ResourceProvenance::Replica { .. }))
@@ -233,7 +254,7 @@ impl Store for ViewSnapshot {
         let partition = self.partition(resource_kind, namespace)?;
         let items = partition
             .items
-            .iter()
+            .values()
             .filter(|item| matches!(item.provenance, ResourceProvenance::Local) && !self.shadowed(item, partition))
             .filter(|item| required.iter().all(|(key, value)| item.object.metadata.labels.get(key) == Some(value)))
             .map(|item| item.object.clone())
