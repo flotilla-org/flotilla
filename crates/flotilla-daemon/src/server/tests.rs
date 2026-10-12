@@ -30,6 +30,7 @@ use flotilla_protocol::{
     RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
     StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
+use flotilla_replication::{replicate_kind_direct, ReplicationStore};
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, CrewSessionStatus, FulfilmentFacts,
     FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
@@ -83,7 +84,6 @@ use crate::peer::ConnectionMeta;
 use crate::startup::test_support::GatedCredentialPreflight;
 use crate::testkits::server::apply_convoy_replica_feed;
 use crate::testkits::server::seed_trusted_remote_convoy_project;
-use flotilla_replication::{replicate_kind_direct, ReplicationStore};
 
 #[tokio::test(start_paused = true)]
 async fn aborting_peer_runtime_releases_connection_and_replication_owners() {

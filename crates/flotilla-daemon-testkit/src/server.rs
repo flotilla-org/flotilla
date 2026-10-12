@@ -1,4 +1,3 @@
-use flotilla_replication::{DigestControl, DigestScheduler};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use flotilla_client::SocketDaemon;
@@ -8,6 +7,7 @@ use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
     CommandCaller, GoodbyeReason, HostName, NodeId, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
 };
+use flotilla_replication::{DigestControl, DigestScheduler};
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 

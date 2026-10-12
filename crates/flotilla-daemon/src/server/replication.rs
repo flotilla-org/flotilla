@@ -18,6 +18,7 @@ use flotilla_resources::PartitionDigest;
 use flotilla_store::ResourceBackend;
 use flotilla_store_http::HttpBackend;
 use tokio::sync::broadcast;
+use tracing::debug;
 
 use super::remote_commands::RemoteCommandRouter;
 
@@ -155,7 +156,10 @@ impl RoutedWatch for RoutedResourceWatch {
     }
 
     async fn cancel(&self) {
-        let _ = self.router.dispatch_cancel(self.command_id).await;
+        // A failed cancel can leave the remote watch running until its peer drops.
+        if let Err(error) = self.router.dispatch_cancel(self.command_id).await {
+            debug!(command_id = self.command_id, %error, "routed replication watch cancel failed");
+        }
     }
 }
 
