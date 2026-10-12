@@ -1218,6 +1218,7 @@ mod tests {
     use crate::adapter::build_crew_brief_with_options;
     use crate::adapter::AgentAdapterRegistry;
     use crate::adapter::AgentLaunchRequest;
+    use crate::adapter::AgentRequirement;
     use crate::adapter::CapabilityTable;
     use crate::adapter::CrewAssignment;
     use crate::adapter::CrewBriefMember;
@@ -1899,6 +1900,27 @@ mod tests {
         assert_eq!(table.resolve("code-review").expect("example review alias").adapter, "claude-code");
 
         assert_eq!(table.resolve("architect").expect_err("unknown capability must fail"), "unknown agent capability `architect`");
+    }
+
+    #[test]
+    fn ambient_only_requirements_resolve_to_their_scope_without_a_delivery_slot() {
+        let scope = flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE;
+        let table = CapabilityTable::seeded()
+            .with_requirement("ambient", AgentRequirement::ambient_only("ambient-harness", Some("m1".into()), scope))
+            .with_requirement("coding", AgentRequirement::ambient_only("replacement", None, scope));
+
+        let ambient = table.resolve("ambient").expect("added capability");
+        assert_eq!((ambient.adapter.as_str(), ambient.model.as_deref()), ("ambient-harness", Some("m1")));
+        assert_eq!(ambient.credential_delivery_slot(), None);
+        assert_eq!(ambient.ambient_credential_scope(), Some(scope));
+        assert_eq!(table.resolve("coding").expect("replaced capability").adapter, "replacement");
+
+        // A model-only override keeps the table's credential policy.
+        let mut reskinned = flotilla_resources::Selector::for_capability("ambient");
+        reskinned.model = Some("m2".to_string());
+        let requirement = table.resolve_selector(&reskinned).expect("model override");
+        assert_eq!((requirement.model.as_deref(), requirement.credential_delivery_slot()), (Some("m2"), None));
+        assert_eq!(requirement.ambient_credential_scope(), Some(scope));
     }
 
     #[test]
