@@ -26,7 +26,7 @@ pub(crate) async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand,
         &socket_path,
         &config_dir,
         &state_dir,
-        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
+        host_daemon_socket_required(std::env::var_os(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
     )
     .await
     .map_err(|error| color_eyre::eyre::eyre!(error))?;

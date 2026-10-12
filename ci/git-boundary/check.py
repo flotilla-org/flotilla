@@ -18,10 +18,10 @@ RUNTIME_METHODS = RUN_METHODS | {"run_with_timeout", "run_to_file", "run_from_fi
 # Discovery's version probe is an implementation operation too. No directory
 # exemption: adding a new adapter requires an explicit boundary decision.
 RUNTIME_IMPLEMENTATIONS = {
-    VCS + "providers/environment/docker.rs",
-    VCS + "providers/environment/docker_image.rs",
-    VCS + "providers/environment/runner.rs",
-    VCS + "providers/discovery/factories/docker.rs",
+    "crates/flotilla-environment/src/environment/docker.rs",
+    "crates/flotilla-environment/src/environment/docker_image.rs",
+    "crates/flotilla-environment/src/environment/runner.rs",
+    "crates/flotilla-environment/src/factories/docker.rs",
 }
 CONCRETE_RUNTIME_TYPES = {
     "DockerEnvironmentProvider", "DockerEnvironmentProviderInner",
@@ -183,7 +183,7 @@ def runtime_violation(node, path):
     if path not in RUNTIME_IMPLEMENTATIONS and raw_command(node, RUNTIME_BINARIES, RUNTIME_METHODS):
         return True
     # Match imports as well as qualified references and constructor aliases.
-    providers = path.startswith(VCS + "providers/")
+    providers = path.startswith("crates/flotilla-environment/src/")
     if not providers and path != COMPOSITION_ROOT and node.kind() in {"identifier", "type_identifier"}:
         if node.text().removeprefix("r#") in CONCRETE_RUNTIME_TYPES:
             return True

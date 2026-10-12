@@ -26,9 +26,7 @@ pub(crate) async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<(
                 &socket_path,
                 &config_dir,
                 &state_dir,
-                host_daemon_socket_required(
-                    std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref(),
-                ),
+                host_daemon_socket_required(std::env::var_os(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
                 options,
             )
             .await

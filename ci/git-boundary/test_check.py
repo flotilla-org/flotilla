@@ -174,6 +174,26 @@ class RuntimeBoundaryTests(unittest.TestCase):
                      check.VCS + 'providers/environment/host_direct.rs', check.VCS + 'providers/vcs/git.rs']:
             self.assertEqual(check.violations(source, path), [1])
 
+    # Moving an implementation permits runtime commands only in its exact file.
+    # Former paths, neighboring modules and lookalike crates remain forbidden.
+    def test_environment_extraction_paths(self):
+        source = 'fn f() { runner.run("docker", &[], cwd, label); }'
+        for path in [check.VCS + 'providers/environment/docker.rs',
+                     check.VCS + 'providers/environment/docker_image.rs',
+                     check.VCS + 'providers/environment/runner.rs',
+                     check.VCS + 'providers/discovery/factories/docker.rs',
+                     'crates/flotilla-environment/src/environment/host_direct.rs',
+                     'crates/flotilla-environment/src/environment/new.rs',
+                     'crates/flotilla-environment-extra/src/environment/docker.rs']:
+            with self.subTest(path=path):
+                self.assertEqual(check.violations(source, path), [1])
+        for path in ['crates/flotilla-environment/src/environment/docker.rs',
+                     'crates/flotilla-environment/src/environment/docker_image.rs',
+                     'crates/flotilla-environment/src/environment/runner.rs',
+                     'crates/flotilla-environment/src/factories/docker.rs']:
+            with self.subTest(path=path):
+                self.assertEqual(check.violations(source, path), [])
+
     # Concrete adapter imports (including renamed imports), types and calls stay
     # inside providers or the exact composition root; resource DTOs stay usable.
     def test_concrete_runtime_types(self):
@@ -181,9 +201,10 @@ class RuntimeBoundaryTests(unittest.TestCase):
             for source in [f'use adapters::{name} as Adapter;', f'fn f(x: &{name}) {{}}',
                            f'fn f() {{ adapters::{name}::new(runner); }}']:
                 self.assertEqual(check.violations(source, 'src/a.rs'), [1])
-                for path in [check.VCS + 'providers/environment/new.rs', check.COMPOSITION_ROOT]:
+                for path in ['crates/flotilla-environment/src/environment/new.rs', check.COMPOSITION_ROOT]:
                     self.assertEqual(check.violations(source, path), [])
                 self.assertEqual(check.violations(source, check.COMPOSITION_ROOT.replace('.rs', '/helper.rs')), [1])
+                self.assertEqual(check.violations(source, check.VCS + 'providers/environment/new.rs'), [1])
         self.assertEqual(check.violations('fn f(x: DockerEnvironmentSpec, y: EnvironmentKind) {}', 'src/a.rs'), [])
 
     # Selection by kind or configured instance is legal. Hardcoded runtime names

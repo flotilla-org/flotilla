@@ -6,10 +6,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::providers::environment::runner::CONTAINED_CODEX_HOME;
-use flotilla_core::providers::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
-use flotilla_core::providers::environment::ProvisionedMount;
-use flotilla_core::providers::environment::ProvisionedMountMode;
+use flotilla_environment::environment::runner::CONTAINED_CODEX_HOME;
+use flotilla_environment::environment::runner::CONTAINED_WRITABLE_CONFIG_BASE;
+use flotilla_environment::environment::ProvisionedMount;
+use flotilla_environment::environment::ProvisionedMountMode;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;

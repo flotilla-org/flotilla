@@ -22,7 +22,7 @@ use crate::blob_store::{BlobStore, TieredBlobStore};
 
 pub(crate) struct LocalImageBuildRunner {
     pub distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
-    pub builder: Option<Arc<dyn flotilla_core::providers::environment::ImageBuilder>>,
+    pub builder: Option<Arc<dyn flotilla_environment::environment::ImageBuilder>>,
     pub cache_name: Option<String>,
     pub vcs: Arc<dyn Vcs>,
     pub directory: PathBuf,
@@ -152,7 +152,7 @@ impl LocalImageBuildRunner {
         }
         let cache_name = self.cache_name.as_deref().ok_or_else(|| transient("image builder has no named cache".into()))?;
         let probe_script = flotilla_core::agent_process::with_preludes("exec \"$@\"");
-        let request = flotilla_core::providers::environment::image::ImageLayerBuild::builder()
+        let request = flotilla_environment::environment::image::ImageLayerBuild::builder()
             .name(name)
             .spec(spec)
             .parent_digest(parent_digest)
@@ -371,7 +371,7 @@ mod runner_contract {
 
     use super::*;
     use crate::blob_store::{BlobDigest, MemoryBlobStore};
-    use flotilla_core::providers::environment::docker_image::{classify_build_failure, failure_summary, BUILD_TIMEOUT, PROBE_TIMEOUT};
+    use flotilla_environment::environment::docker_image::{classify_build_failure, failure_summary, BUILD_TIMEOUT, PROBE_TIMEOUT};
     use flotilla_resources::ImageLayerParent;
 
     // Stands in for Docker processes and enforces the documented Buildx/run
@@ -515,7 +515,7 @@ mod runner_contract {
         let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![("memory".into(), Arc::new(MemoryBlobStore::default()))]));
         let builder = LocalImageBuildRunner {
             distributor: None,
-            builder: Some(Arc::new(flotilla_core::providers::environment::docker_image::BuildxImageBuilder::for_cache(
+            builder: Some(Arc::new(flotilla_environment::environment::docker_image::BuildxImageBuilder::for_cache(
                 runner,
                 "test-cache".into(),
             ))),

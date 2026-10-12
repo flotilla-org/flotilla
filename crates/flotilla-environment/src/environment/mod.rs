@@ -18,7 +18,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentStatus, ExecutionEnvironmentPath, ImageId};
 use serde::{Deserialize, Serialize};
 
@@ -396,22 +395,4 @@ pub fn command_provider(kind: EnvironmentKind, runner: Arc<dyn CommandRunner>) -
         EnvironmentKind::Docker => Arc::new(docker::DockerEnvironmentProvider::new(runner)),
         EnvironmentKind::HostDirect => Arc::new(host_direct::HostDirectEnvironmentProvider::new(runner, HashMap::new())),
     }
-}
-
-/// Compose detection-only endpoint providers with their canonical instance
-/// descriptors. This is for callers without a discovered provider registry.
-pub fn command_provider_registry(kinds: &[EnvironmentKind], runner: Arc<dyn CommandRunner>) -> super::registry::ProviderRegistry {
-    let mut registry = super::registry::ProviderRegistry::new();
-    for &kind in kinds {
-        let name = match kind {
-            EnvironmentKind::Docker => "docker",
-            EnvironmentKind::HostDirect => "host-direct",
-        };
-        registry.environment_providers.insert(
-            name,
-            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, name),
-            command_provider(kind, runner.clone()),
-        );
-    }
-    registry
 }

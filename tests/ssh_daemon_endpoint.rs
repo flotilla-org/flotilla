@@ -212,7 +212,7 @@ async fn installer_health_rejects_incompatible_wire_without_reexec_or_spawn() {
             .env_remove("FLOTILLA_REEXEC_BUILD")
             .env_remove("FLOTILLA_DAEMON_SOCKET")
             .env_remove("FLOTILLA_DAEMON")
-            .env_remove(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV)
+            .env_remove(flotilla_environment::environment::CONTAINED_DAEMON_REQUIRED_ENV)
             .kill_on_drop(true);
         let output = tokio::time::timeout(Duration::from_secs(5), command.output()).await.expect("CLI finishes").expect("CLI output");
         server.abort();

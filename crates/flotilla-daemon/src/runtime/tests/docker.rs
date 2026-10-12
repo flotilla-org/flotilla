@@ -613,7 +613,7 @@ async fn provisioned_environment_discovers_and_registers_interior_agent_adapters
 // Vessel creation and Environment preparation; an authored literal tag must refuse.
 #[tokio::test]
 async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
-    use flotilla_core::providers::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
     use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
 
     // Exhaust baseline sources with/without layers and an authored literal.
@@ -832,7 +832,7 @@ async fn fresh_contained_admission_prepares_baseline_but_refuses_literal_tag() {
 // policy admits them. A literal policy or an unowned tag is never admitted.
 #[tokio::test]
 async fn legacy_baseline_admission_recovers_old_records_and_preserves_frozen_provenance() {
-    use flotilla_core::providers::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
+    use flotilla_environment::environment::{docker::DockerEnvironmentProvider, EnvironmentProvider, PrepareOpts};
     let temp = TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     fs::create_dir_all(&config_base).expect("config directory");

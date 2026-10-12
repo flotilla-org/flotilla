@@ -90,8 +90,8 @@ mod tests {
     use flotilla_protocol::HostEnvironment;
 
     use super::*;
-    use crate::providers::environment::ProvisionedMount;
     use crate::testkits::discovery::DiscoveryMockRunner;
+    use flotilla_environment::environment::ProvisionedMount;
 
     // Glue: the sampler queries only the current process and reports bytes.
     #[test]
@@ -100,11 +100,11 @@ mod tests {
     }
 
     use crate::environment_manager::EnvironmentManager;
-    use crate::providers::environment::EnvironmentHandle;
-    use crate::providers::environment::ProvisionedEnvironment;
     use crate::testkits::discovery::TestEnvVars as FixtureEnvVars;
     use flotilla_discovery_api::EnvironmentAssertion;
     use flotilla_discovery_api::EnvironmentBag;
+    use flotilla_environment::environment::EnvironmentHandle;
+    use flotilla_environment::environment::ProvisionedEnvironment;
     use flotilla_provider_runtime::CommandRunner;
 
     #[test]

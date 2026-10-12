@@ -23,8 +23,6 @@ use crate::environment_manager::EnvironmentManager;
 use crate::event_sink::RecordingEventSink;
 use crate::provider_data::ProviderData;
 use crate::providers::change_request::ChangeRequestTracker;
-use crate::providers::environment::ProvisionedMount;
-use crate::providers::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 use crate::providers::issue_tracker::IssueProvider;
 use crate::providers::registry::ProviderRegistry;
 use crate::providers::types::*;
@@ -37,6 +35,8 @@ use crate::testkits::discovery::test_vcs_resolver;
 use crate::testkits::discovery::DiscoveryMockRunner;
 use crate::testkits::discovery::TestEnvVars;
 use crate::testkits::replay::testing::MockRunner;
+use flotilla_environment::environment::ProvisionedMount;
+use flotilla_environment::environment::{EnvironmentKind, PrepareOpts, PreparedEnvironment, ProvisionOpts};
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
@@ -1578,7 +1578,7 @@ async fn checkout_service_validate_target_propagates_checkout_manager_error() {
 
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
 
-use crate::providers::environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
+use flotilla_environment::environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment};
 
 struct MockEnvironmentProvider {
     create_results: tokio::sync::Mutex<Vec<Result<EnvironmentHandle, String>>>,

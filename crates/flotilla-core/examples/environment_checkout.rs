@@ -15,10 +15,10 @@ use flotilla_core::config::ConfigStore;
 use flotilla_core::providers::discovery::detectors::default_host_detectors;
 use flotilla_core::providers::discovery::run_host_detectors;
 use flotilla_core::providers::discovery::FactoryRegistry;
-use flotilla_core::providers::environment::CreateOpts;
-use flotilla_core::providers::environment::EnvironmentKind;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_environment::environment::CreateOpts;
+use flotilla_environment::environment::EnvironmentKind;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 use flotilla_provider_runtime::ChannelLabel;
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Ensure image (using a minimal image with git)
     println!("\n--- Ensuring image ---");
     let spec = EnvironmentSpec { image: ImageSource::Registry(image), token_env_vars: vec![] };
-    let resource_spec = flotilla_core::providers::environment::legacy_environment_spec(&spec)?;
+    let resource_spec = flotilla_environment::environment::legacy_environment_spec(&spec)?;
     let prepared = provider.prepare(&resource_spec, &Default::default()).await?;
 
     // 3. Create environment
@@ -70,10 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         image_pull_policy: Default::default(),
         prepared_auth: Default::default(),
         tools: Vec::new(),
-        provisioned_mounts: vec![flotilla_core::providers::environment::ProvisionedMount::new(
+        provisioned_mounts: vec![flotilla_environment::environment::ProvisionedMount::new(
             reference_repo.as_path().to_path_buf(),
             "/ref/repo",
-            flotilla_core::providers::environment::ProvisionedMountMode::Ro,
+            flotilla_environment::environment::ProvisionedMountMode::Ro,
         )],
         cpu_limit: None,
         memory_policy: Default::default(),

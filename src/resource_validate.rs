@@ -12,9 +12,10 @@ use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
-    providers::environment::{command_provider, EnvironmentKind},
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
 };
+#[cfg(unix)]
+use flotilla_environment::environment::{command_provider, EnvironmentKind};
 #[cfg(unix)]
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 #[cfg(unix)]

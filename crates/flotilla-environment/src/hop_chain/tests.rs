@@ -14,7 +14,6 @@ use super::{
     resolver::HopResolver,
     Hop, HopPlan, ResolutionContext, ResolvedAction,
 };
-use crate::config::{HostsConfig, RemoteHostConfig, SshConfig};
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 
@@ -39,33 +38,12 @@ fn nested(arg: &Arg) -> &[Arg] {
 }
 
 fn ssh_resolver() -> SshRemoteHopResolver {
-    let hosts = HashMap::from([
-        (
-            "udder".to_string(),
-            RemoteHostConfig {
-                hostname: "udder.example".to_string(),
-                expected_host_name: "udder".to_string(),
-                expected_node_id: None,
-                user: Some("alice".to_string()),
-                ssh_multiplex: Some(false),
-                agentless_ssh: false,
-            },
-        ),
-        (
-            "jump".to_string(),
-            RemoteHostConfig {
-                hostname: "jump.example".to_string(),
-                expected_host_name: "jump".to_string(),
-                expected_node_id: None,
-                user: None,
-                ssh_multiplex: Some(false),
-                agentless_ssh: false,
-            },
-        ),
-    ]);
     SshRemoteHopResolver::new(
         DaemonHostPath::new(std::env::temp_dir().join("flotilla-hop-chain-tests")),
-        HostsConfig { ssh: SshConfig { multiplex: false }, hosts },
+        vec![
+            (HostName::new("udder"), super::remote::SshConnection { target: "alice@udder.example".into(), multiplex: false }),
+            (HostName::new("jump"), super::remote::SshConnection { target: "jump.example".into(), multiplex: false }),
+        ],
     )
 }
 
@@ -407,4 +385,35 @@ fn missing_environment_adapter_names_the_environment() {
     let error = resolver.resolve(&plan, &mut context()).expect_err("missing adapter should fail");
 
     assert_eq!(error, "no environment transport available for environment: missing");
+}
+
+// Resolved connections preserve first-match host lookup and multiplex selection.
+// Generate both multiplex choices, absent/present/duplicate hosts and user targets.
+#[hegel::test]
+fn resolved_ssh_connections_preserve_lookup_and_multiplex(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let multiplex = tc.draw(gs::booleans());
+    let user = tc.draw(gs::booleans());
+    let host = HostName::new("remote");
+    let target = if user { "alice@remote.example" } else { "remote.example" };
+    let connections = (0..count)
+        .map(|index| {
+            (
+                host.clone(),
+                super::remote::SshConnection { target: if index == 0 { target.into() } else { "duplicate.example".into() }, multiplex },
+            )
+        })
+        .collect();
+    let dir = tempfile::tempdir().expect("config base");
+    let resolver = SshRemoteHopResolver::new(DaemonHostPath::new(dir.path()), connections);
+    let result = resolver.one_hop_command_args(&host, vec![Arg::Literal("true".into())]);
+    if count == 0 {
+        assert_eq!(result.expect_err("missing host"), "unknown remote host: remote");
+    } else {
+        let args = result.expect("resolved host");
+        assert!(args.contains(&Arg::Quoted(target.into())));
+        assert!(!args.contains(&Arg::Quoted("duplicate.example".into())));
+        assert_eq!(args.contains(&Arg::Literal("ControlMaster=auto".into())), multiplex);
+    }
 }

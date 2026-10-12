@@ -471,7 +471,7 @@ impl CommandRunner for UnselectedProbeRunner {
 // and two matching instances, present/absent prior facts and pool availability.
 #[hegel::test]
 fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
-    use flotilla_core::providers::environment::{command_provider, EnvironmentKind};
+    use flotilla_environment::environment::{command_provider, EnvironmentKind};
     let docker = tc.draw(hegel::generators::booleans());
     let ambiguous = tc.draw(hegel::generators::booleans());
     let prior = tc.draw(hegel::generators::booleans());

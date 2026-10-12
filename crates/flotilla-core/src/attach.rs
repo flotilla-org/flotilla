@@ -7,6 +7,12 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_environment::hop_chain::{
+    environment::DockerEnvironmentHopResolver,
+    remote::{NoopRemoteHopResolver, SshConnection, SshRemoteHopResolver},
+    resolver::HopResolver,
+    Hop, HopPlan, ResolutionContext,
+};
 use flotilla_protocol::{
     arg::Arg,
     commands::AttachMode,
@@ -28,12 +34,6 @@ use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::ConfigStore,
     environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
-    hop_chain::{
-        environment::DockerEnvironmentHopResolver,
-        remote::{ssh_resolver_from_config, NoopRemoteHopResolver},
-        resolver::HopResolver,
-        Hop, HopPlan, ResolutionContext,
-    },
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
     providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
 };
@@ -584,7 +584,19 @@ impl<'a> AttachResolver<'a> {
             return Err(format!("unreachable next hop for host '{target_host}': route points back to local host"));
         }
 
-        let resolver = ssh_resolver_from_config(self.config.base_path())?;
+        let hosts = self.config.load_hosts()?;
+        let connections = hosts
+            .hosts
+            .iter()
+            .map(|(label, host)| {
+                let target = match &host.user {
+                    Some(user) => format!("{user}@{}", host.hostname),
+                    None => host.hostname.clone(),
+                };
+                (HostName::new(&host.expected_host_name), SshConnection { target, multiplex: hosts.resolved_ssh_multiplex(label) })
+            })
+            .collect();
+        let resolver = SshRemoteHopResolver::new(self.config.base_path().clone(), connections);
         let command = recursive_attach_command(target_host, reference, seat);
         resolver
             .one_hop_command_args(&next_hop, command)

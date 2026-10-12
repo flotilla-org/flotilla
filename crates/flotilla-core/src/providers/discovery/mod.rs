@@ -13,7 +13,7 @@ use flotilla_discovery_api::{Factory, HostDetector, ProviderCategory, ProviderDe
 use flotilla_provider_runtime::{EnvVars, ProcessEnvVars};
 use futures::StreamExt;
 
-use crate::providers::environment::EnvironmentProvider;
+use flotilla_environment::environment::EnvironmentProvider;
 pub mod detectors;
 pub mod factories;
 

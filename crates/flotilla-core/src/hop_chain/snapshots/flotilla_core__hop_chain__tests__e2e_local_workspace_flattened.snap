@@ -1,5 +1,0 @@
----
-source: crates/flotilla-core/src/hop_chain/tests.rs
-expression: flat
----
-cleat attach main__shell__0 --cwd '/home/alice/dev/my-repo'

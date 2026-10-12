@@ -2,7 +2,7 @@ use flotilla_terminal::{TerminalEnvVars, TerminalPool, TerminalSession as PoolSe
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_core::providers::environment::{
+use flotilla_environment::environment::{
     EnvironmentProvider, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use flotilla_paths::path_context::DaemonHostPath;
@@ -17,22 +17,22 @@ struct FakeEnvironmentProvider;
 
 #[async_trait]
 impl EnvironmentProvider for FakeEnvironmentProvider {
-    fn kind(&self) -> flotilla_core::providers::environment::EnvironmentKind {
-        flotilla_core::providers::environment::EnvironmentKind::Docker
+    fn kind(&self) -> flotilla_environment::environment::EnvironmentKind {
+        flotilla_environment::environment::EnvironmentKind::Docker
     }
     async fn prepare(
         &self,
         _spec: &flotilla_resources::EnvironmentSpec,
-        _opts: &flotilla_core::providers::environment::PrepareOpts,
-    ) -> Result<flotilla_core::providers::environment::PreparedEnvironment, String> {
-        Ok(flotilla_core::providers::environment::PreparedEnvironment::new(&Arc::new(()), ()))
+        _opts: &flotilla_environment::environment::PrepareOpts,
+    ) -> Result<flotilla_environment::environment::PreparedEnvironment, String> {
+        Ok(flotilla_environment::environment::PreparedEnvironment::new(&Arc::new(()), ()))
     }
 
     async fn provision(
         &self,
         _id: EnvironmentId,
-        _image: &flotilla_core::providers::environment::PreparedEnvironment,
-        _opts: flotilla_core::providers::environment::ProvisionOpts,
+        _image: &flotilla_environment::environment::PreparedEnvironment,
+        _opts: flotilla_environment::environment::ProvisionOpts,
     ) -> Result<Arc<dyn ProvisionedEnvironment>, String> {
         unimplemented!("test double")
     }

@@ -30,6 +30,7 @@ absolute-paths-allowed-crates = [
     "flotilla_commands",
     "flotilla_controllers",
     "flotilla_core",
+    "flotilla_environment",
     "flotilla_credentials",
     "flotilla_credentials_testkit",
     "flotilla_daemon",

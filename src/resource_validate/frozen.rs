@@ -8,7 +8,7 @@ use std::{
 };
 
 use color_eyre::{eyre::eyre, Result};
-use flotilla_core::providers::environment::EnvironmentProvider;
+use flotilla_environment::environment::EnvironmentProvider;
 #[cfg(test)]
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
@@ -1040,8 +1040,8 @@ mod tests {
                 local: None,
                 calls: std::sync::Mutex::new(0),
             });
-            let provider = flotilla_core::providers::environment::command_provider(
-                flotilla_core::providers::environment::EnvironmentKind::Docker,
+            let provider = flotilla_environment::environment::command_provider(
+                flotilla_environment::environment::EnvironmentKind::Docker,
                 runner.clone(),
             );
             let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
@@ -1067,10 +1067,8 @@ mod tests {
             local: Some(local),
             calls: std::sync::Mutex::new(0),
         });
-        let provider = flotilla_core::providers::environment::command_provider(
-            flotilla_core::providers::environment::EnvironmentKind::Docker,
-            runner.clone(),
-        );
+        let provider =
+            flotilla_environment::environment::command_provider(flotilla_environment::environment::EnvironmentKind::Docker, runner.clone());
         let options = ProbeOptions::default();
         let probes = CandidateProbes { options: &options, inventory: &[], runner: runner.as_ref(), provider: provider.as_ref() };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -1133,10 +1131,8 @@ mod tests {
             local: None,
             calls: std::sync::Mutex::new(0),
         });
-        let provider = flotilla_core::providers::environment::command_provider(
-            flotilla_core::providers::environment::EnvironmentKind::Docker,
-            runner.clone(),
-        );
+        let provider =
+            flotilla_environment::environment::command_provider(flotilla_environment::environment::EnvironmentKind::Docker, runner.clone());
         CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() }
             .image(&digest)
             .await

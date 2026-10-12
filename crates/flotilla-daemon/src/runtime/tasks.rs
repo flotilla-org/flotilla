@@ -11,16 +11,13 @@ use std::{
 use chrono::{DateTime, Utc};
 use flotilla_controllers::reconcilers::checkout::runtime::sweep_host_empty_convoy_directories;
 use flotilla_controllers::reconcilers::VesselPlacementProjector;
+use flotilla_core::providers::registry::command_provider_registry;
 use flotilla_core::{
-    aggregator_projection::AggregatorProjectionState,
-    demand_lifecycle::DemandLifecycle,
-    in_process::InProcessDaemon,
-    providers::{
-        environment::{command_provider_registry, EnvironmentKind},
-        registry::ProviderRegistry,
-    },
+    aggregator_projection::AggregatorProjectionState, demand_lifecycle::DemandLifecycle, in_process::InProcessDaemon,
+    providers::registry::ProviderRegistry,
 };
 use flotilla_credentials::CredentialStore;
+use flotilla_environment::environment::EnvironmentKind;
 use flotilla_protocol::{CanonicalHostId, NodeId};
 use flotilla_resources::{
     Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, Host, HostStatusPatch, ReadWatchEvent, Resource, ResourceError,

@@ -20,11 +20,11 @@ impl CommandRunner for MemoryIncidentRunner {
             "docker" if args.first() == Some(&"ps") => Ok("container\tenv-memory-incident\timage\t[]".into()),
             "docker" if args == ["inspect", "container"] && self.inspect_error => Err("inspect unavailable".into()),
             "docker" if args == ["inspect", "container"] => {
-                Ok(include_str!("../../../../flotilla-core/src/providers/environment/fixtures/oomd-exit137.json").into())
+                Ok(include_str!("../../../../flotilla-environment/src/environment/fixtures/oomd-exit137.json").into())
             }
             "docker" if args.starts_with(&["inspect", "--format", "{{.State.Status}}"]) => Ok(self.status.into()),
             "journalctl" if args.contains(&"--unit=systemd-oomd") => {
-                Ok(include_str!("../../../../flotilla-core/src/providers/environment/fixtures/oomd-journal.txt").into())
+                Ok(include_str!("../../../../flotilla-environment/src/environment/fixtures/oomd-journal.txt").into())
             }
             "journalctl" => Err("kernel journal denied".into()),
             _ => Err(format!("unexpected subprocess: {cmd} {args:?}")),
@@ -146,7 +146,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         )
         .await
         .expect("vessel ready");
-    let provider = flotilla_core::providers::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner::default()));
+    let provider = flotilla_environment::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner::default()));
     let handles = provider.list().await.expect("list backing");
     let state = Arc::new(ControllerRuntimeState::new(
         daemon.clone(),
@@ -276,7 +276,7 @@ async fn observation_error_preserves_terminal_liveness_and_retries_running_backi
         let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
         let env_id = EnvironmentId::new("env-memory-incident");
         create_ready_docker_environment(&daemon, env_id.as_str(), "container", BTreeSet::new()).await;
-        let provider = flotilla_core::providers::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner {
+        let provider = flotilla_environment::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner {
             status: if terminal { "exited" } else { "running" },
             inspect_error: true,
         }));

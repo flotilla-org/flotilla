@@ -177,13 +177,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
-    use crate::testkits::replay::testing::MockRunner;
-    use crate::testkits::replay::testing::TimeoutOnlyRunner;
     use flotilla_provider_runtime::command_timeout_message;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandOutput;
     use flotilla_provider_runtime::CommandRunner;
     use flotilla_provider_runtime::ProcessCommandRunner;
+    use flotilla_replay_testkit::testing::MockRunner;
+    use flotilla_replay_testkit::testing::TimeoutOnlyRunner;
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_docker_exec() {
