@@ -185,9 +185,13 @@ impl ImageBuilder for BuildxImageBuilder {
             return Err(deterministic("build requires its bound named cache".into()));
         }
         if let Some(auth) = auth {
-            let base = match &spec.layer.spec.parent {
-                ImageLayerParent::Image(image) => image.as_str(),
-                _ => parent_digest,
+            let base = if spec.is_link_producer() {
+                spec.layer.spec.link.as_ref().expect("link producer").builder_image.as_str()
+            } else {
+                match &spec.layer.spec.parent {
+                    ImageLayerParent::Image(image) => image.as_str(),
+                    _ => parent_digest,
+                }
             };
             auth.validate(base, HostImageAction::ImagePull).map_err(deterministic)?;
         }
@@ -197,6 +201,20 @@ impl ImageBuilder for BuildxImageBuilder {
             "x86_64" | "amd64" => "amd64",
             "aarch64" | "arm64" => "arm64",
             other => other,
+        };
+        let generated_fragment = if let Some(link) = &spec.layer.spec.link {
+            let text = if let Some(source) = &spec.link_source {
+                link.splice_dockerfile(&spec.layer.name, &source.identity.local_image_id).map_err(deterministic)?
+            } else {
+                let fragment =
+                    std::fs::read_to_string(context.join(&spec.layer.spec.fragment)).map_err(|error| deterministic(error.to_string()))?;
+                link.producer_dockerfile(&spec.layer.name, &fragment).map_err(deterministic)?
+            };
+            let path = config.path().join("link.Dockerfile");
+            self.runner.write_file(&path, &text).await.map_err(transient)?;
+            Some(path.to_str().ok_or_else(|| deterministic("link Dockerfile path is not UTF-8".into()))?.to_string())
+        } else {
+            None
         };
         let tag = format!("flotilla-build:{:x}", Sha256::digest(format!("{name}\0{}", spec.recipe_key)));
         let mut args = vec![
@@ -213,31 +231,50 @@ impl ImageBuilder for BuildxImageBuilder {
             "--tag".into(),
             tag.clone(),
             "--file".into(),
-            spec.layer.spec.fragment.clone(),
+            generated_fragment.unwrap_or_else(|| spec.layer.spec.fragment.clone()),
         ];
-        let base = match &spec.layer.spec.parent {
-            ImageLayerParent::Image(image) => image.clone(),
-            _ => {
-                // Buildx's default Docker driver consumes images from the host
-                // store. Give the exact local ID a content-derived label for FROM;
-                // record the ID, never this label, as the parent identity.
-                let label = format!("flotilla-parent:{:x}", Sha256::digest(parent_digest));
-                self.runner
-                    .run_with_timeout(
-                        "docker",
-                        &["--config", config_arg, "image", "tag", parent_digest, &label],
-                        context,
-                        &ChannelLabel::Default,
-                        CLI_TIMEOUT,
-                    )
-                    .await
-                    .map_err(transient)?;
-                label
+        let base = if spec.is_link_producer() {
+            spec.layer.spec.link.as_ref().expect("link producer").builder_image.clone()
+        } else {
+            match &spec.layer.spec.parent {
+                ImageLayerParent::Image(image) => image.clone(),
+                _ => {
+                    let label = format!("flotilla-parent:{:x}", Sha256::digest(parent_digest));
+                    self.runner
+                        .run_with_timeout(
+                            "docker",
+                            &["--config", config_arg, "image", "tag", parent_digest, &label],
+                            context,
+                            &ChannelLabel::Default,
+                            CLI_TIMEOUT,
+                        )
+                        .await
+                        .map_err(transient)?;
+                    label
+                }
             }
         };
+        if let Some(source) = &spec.link_source {
+            // A local config digest is not a registry repository reference.
+            // Bind that exact COPY source through a named BuildKit image context
+            // backed by an immutable, digest-derived label in the owning cache.
+            let id = &source.identity.local_image_id;
+            let label = format!("flotilla-link-source:{}", id.trim_start_matches("sha256:"));
+            self.runner
+                .run_with_timeout(
+                    "docker",
+                    &["--config", config_arg, "image", "tag", id, &label],
+                    context,
+                    &ChannelLabel::Default,
+                    CLI_TIMEOUT,
+                )
+                .await
+                .map_err(transient)?;
+            args.extend(["--build-context".into(), format!("{id}=docker-image://{label}")]);
+        }
         let mut build_args = spec.layer.spec.args.clone();
         build_args.extend(spec.layer.spec.pins.iter().map(|(name, pin)| (name.clone(), pin.value.clone())));
-        build_args.insert("BASE".into(), base);
+        build_args.insert(if spec.is_link_producer() { "BUILDER" } else { "BASE" }.into(), base);
         for (name, value) in build_args {
             args.extend(["--build-arg".into(), format!("{name}={value}")]);
         }
@@ -271,7 +308,7 @@ impl ImageBuilder for BuildxImageBuilder {
         let identity = PlacedImageIdentity { local_image_id: identity.trim().into(), registry_digest: None };
         identity.validate().map_err(deterministic)?;
         let mut verified = BTreeSet::new();
-        for provide in &spec.layer.spec.provides {
+        for provide in spec.layer.spec.provides.iter().filter(|_| !spec.is_link_producer()) {
             let command = spec
                 .layer
                 .spec

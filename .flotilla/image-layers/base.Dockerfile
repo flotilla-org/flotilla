@@ -101,3 +101,6 @@ RUN case "${TARGETARCH}" in \
 COPY --from=zig-toolchain /opt/zig /opt/zig
 RUN ln -s /opt/zig/zig /usr/local/bin/zig \
     && test "$(zig version)" = "${ZIG_VERSION}"
+
+# Link-layer entry points remain available without changing the runtime image config.
+ENV PATH="/opt/flotilla/bin:${PATH}"

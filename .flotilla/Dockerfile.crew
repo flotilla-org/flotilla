@@ -104,6 +104,9 @@ COPY --from=zig-toolchain /opt/zig /opt/zig
 RUN ln -s /opt/zig/zig /usr/local/bin/zig \
     && test "$(zig version)" = "${ZIG_VERSION}"
 
+# Link-layer entry points remain available without changing the runtime image config.
+ENV PATH="/opt/flotilla/bin:${PATH}"
+
 # Builder stage: generate xterm-ghostty terminfo from cleat's pinned source.
 ARG BASE
 FROM spine-base AS ghostty-builder
@@ -176,7 +179,7 @@ RUN chmod 0755 /usr/local/bin/tea && tea --version
 # checkout's rust-toolchain.toml can install its pinned toolchain or missing
 # components on demand.
 ENV CARGO_HOME=/tmp/flotilla-config/cargo
-ENV PATH="/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV PATH="/opt/flotilla/bin:/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Ghostty terminfo comes from the same pinned source as libghostty-vt (see
 # CLEAT_REF and tools/ghostty-toolchain.toml in that checkout). It is MIT
@@ -223,17 +226,151 @@ RUN setpriv --reuid=12345 --regid=12345 --clear-groups sh -euc ' \
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
 
-ARG BASE
-FROM spine-utilities AS harness-claude-code
+ARG BUILDER
+FROM ubuntu:24.04 AS producer-harness-claude-code
+# Isolated link producer instructions; the composer owns FROM, audit and export.
+ARG TARGETARCH
+ARG NODE_VERSION=24.18.0
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN cd /tmp \
+    && case "${TARGETARCH}" in amd64) node_arch=x64 ;; arm64) node_arch=arm64 ;; *) exit 1 ;; esac \
+    && node_archive="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+    && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/${node_archive}" \
+    && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" \
+    && grep " ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict - \
+    && tar -xJf "${node_archive}" -C /usr/local --strip-components=1 \
+    && rm "${node_archive}" SHASUMS256.txt \
+    && node --version \
+    && npm --version
 ARG CLAUDE_CODE_VERSION=2.1.287
-RUN npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && npm cache clean --force \
-    && claude --version
-ENV DISABLE_AUTOUPDATER=1
+RUN mkdir -p /out/opt/flotilla/layers/harness-claude-code /out/opt/flotilla/bin \
+    && npm install --prefix /out/opt/flotilla/layers/harness-claude-code --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && ln -s /opt/flotilla/layers/harness-claude-code/bin/claude /out/opt/flotilla/bin/claude \
+    && npm cache clean --force
+RUN mkdir -p /out/etc/flotilla/prelude.d \
+    && printf 'export DISABLE_AUTOUPDATER=1\n' > /out/etc/flotilla/prelude.d/80-harness-claude-code.sh
 
-ARG BASE
-FROM harness-claude-code AS harness-codex
+FROM ubuntu:24.04 AS audit-harness-claude-code
+COPY --from=producer-harness-claude-code /out/ /out/
+USER 0:0
+RUN <<'FLOTILLA_LINK_AUDIT'
+unset FLOTILLA_LINK_OUTPUT_ROOT
+set -- 'harness-claude-code' '/etc/flotilla/prelude.d/80-harness-claude-code.sh' '/opt/flotilla/bin/claude' '/opt/flotilla/layers/harness-claude-code/'
+# Embedded by the composer in the isolated builder stage. Only /out is exported.
+set -eu
+layer=$1
+shift
+root=${FLOTILLA_LINK_OUTPUT_ROOT:-/out}
+private="/opt/flotilla/layers/$layer/"
+test -d "$root${private}"
+paths=$(mktemp)
+trap 'rm -f "$paths"' EXIT
+find "$root" -mindepth 1 -printf '%P\n' > "$paths"
+while IFS= read -r relative; do
+    path="/$relative"
+    allowed=0
+    for output do
+        case "$output" in
+            */) case "$path/" in "$output"*) allowed=1 ;; esac ;;
+            *) test "$path" != "$output" || allowed=1 ;;
+        esac
+        # Necessary parent directories may be shared; they must be directories.
+        case "$output" in "$path/"*) test ! -d "$root$path" || allowed=1 ;; esac
+    done
+    test "$allowed" = 1 || { echo "link output outside allowed paths: $path" >&2; exit 1; }
+    if test -L "$root$path"; then
+        case "$path" in
+            /opt/flotilla/bin/*) target=$(readlink "$root$path"); case "$target" in "$private"*) ;; *) exit 1 ;; esac; resolved=$(realpath -m "$root$target"); case "$resolved" in "$root${private}"*) ;; *) exit 1 ;; esac; test -e "$resolved" ;;
+            "$private"*) target=$(realpath -m "$root$path"); case "$target" in "$root${private}"*) ;; *) exit 1 ;; esac ;;
+            *) exit 1 ;;
+        esac
+    else
+        case "$path" in /opt/flotilla/bin/*) echo "bin output must be a symlink: $path" >&2; exit 1 ;; esac
+    fi
+done < "$paths"
+for output do
+    test -e "$root$output" || test -L "$root$output"
+done
+
+FLOTILLA_LINK_AUDIT
+FROM scratch AS output-harness-claude-code
+COPY --from=audit-harness-claude-code --chown=0:0 /out/ /
+
+FROM spine-utilities AS harness-claude-code
+COPY --link --from=output-harness-claude-code --chown=0:0 /opt/flotilla/layers/harness-claude-code/ /opt/flotilla/layers/harness-claude-code/
+COPY --link --from=output-harness-claude-code --chown=0:0 /opt/flotilla/bin/ /opt/flotilla/bin/
+COPY --link --from=output-harness-claude-code --chown=0:0 /etc/flotilla/prelude.d/ /etc/flotilla/prelude.d/
+
+ARG BUILDER
+FROM ubuntu:24.04 AS producer-harness-codex
+# Isolated link producer instructions; the composer owns FROM, audit and export.
+ARG TARGETARCH
+ARG NODE_VERSION=24.18.0
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN cd /tmp \
+    && case "${TARGETARCH}" in amd64) node_arch=x64 ;; arm64) node_arch=arm64 ;; *) exit 1 ;; esac \
+    && node_archive="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" \
+    && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/${node_archive}" \
+    && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" \
+    && grep " ${node_archive}$" SHASUMS256.txt | sha256sum --check --strict - \
+    && tar -xJf "${node_archive}" -C /usr/local --strip-components=1 \
+    && rm "${node_archive}" SHASUMS256.txt \
+    && node --version \
+    && npm --version
 ARG CODEX_VERSION=0.160.0
-RUN npm install --global "@openai/codex@${CODEX_VERSION}" \
-    && npm cache clean --force \
-    && codex --version
+RUN mkdir -p /out/opt/flotilla/layers/harness-codex /out/opt/flotilla/bin \
+    && npm install --prefix /out/opt/flotilla/layers/harness-codex --global "@openai/codex@${CODEX_VERSION}" \
+    && ln -s /opt/flotilla/layers/harness-codex/bin/codex /out/opt/flotilla/bin/codex \
+    && npm cache clean --force
+
+FROM ubuntu:24.04 AS audit-harness-codex
+COPY --from=producer-harness-codex /out/ /out/
+USER 0:0
+RUN <<'FLOTILLA_LINK_AUDIT'
+unset FLOTILLA_LINK_OUTPUT_ROOT
+set -- 'harness-codex' '/opt/flotilla/bin/codex' '/opt/flotilla/layers/harness-codex/'
+# Embedded by the composer in the isolated builder stage. Only /out is exported.
+set -eu
+layer=$1
+shift
+root=${FLOTILLA_LINK_OUTPUT_ROOT:-/out}
+private="/opt/flotilla/layers/$layer/"
+test -d "$root${private}"
+paths=$(mktemp)
+trap 'rm -f "$paths"' EXIT
+find "$root" -mindepth 1 -printf '%P\n' > "$paths"
+while IFS= read -r relative; do
+    path="/$relative"
+    allowed=0
+    for output do
+        case "$output" in
+            */) case "$path/" in "$output"*) allowed=1 ;; esac ;;
+            *) test "$path" != "$output" || allowed=1 ;;
+        esac
+        # Necessary parent directories may be shared; they must be directories.
+        case "$output" in "$path/"*) test ! -d "$root$path" || allowed=1 ;; esac
+    done
+    test "$allowed" = 1 || { echo "link output outside allowed paths: $path" >&2; exit 1; }
+    if test -L "$root$path"; then
+        case "$path" in
+            /opt/flotilla/bin/*) target=$(readlink "$root$path"); case "$target" in "$private"*) ;; *) exit 1 ;; esac; resolved=$(realpath -m "$root$target"); case "$resolved" in "$root${private}"*) ;; *) exit 1 ;; esac; test -e "$resolved" ;;
+            "$private"*) target=$(realpath -m "$root$path"); case "$target" in "$root${private}"*) ;; *) exit 1 ;; esac ;;
+            *) exit 1 ;;
+        esac
+    else
+        case "$path" in /opt/flotilla/bin/*) echo "bin output must be a symlink: $path" >&2; exit 1 ;; esac
+    fi
+done < "$paths"
+for output do
+    test -e "$root$output" || test -L "$root$output"
+done
+
+FLOTILLA_LINK_AUDIT
+FROM scratch AS output-harness-codex
+COPY --from=audit-harness-codex --chown=0:0 /out/ /
+
+FROM harness-claude-code AS harness-codex
+COPY --link --from=output-harness-codex --chown=0:0 /opt/flotilla/layers/harness-codex/ /opt/flotilla/layers/harness-codex/
+COPY --link --from=output-harness-codex --chown=0:0 /opt/flotilla/bin/ /opt/flotilla/bin/

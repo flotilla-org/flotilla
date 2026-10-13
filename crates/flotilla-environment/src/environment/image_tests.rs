@@ -432,3 +432,166 @@ fn reference_observation_contract(tc: hegel::TestCase) {
         assert!(cache.inspect("crew:test").await.is_err(), "typed digest inspection still refuses tags");
     });
 }
+
+// Process boundary stand-in: validates generated Buildx recipes and rejects
+// probes against the isolated producer. No container runtime is started.
+#[derive(Default)]
+struct LinkDockerStandIn {
+    images: Mutex<BTreeMap<String, String>>,
+    probes: Mutex<Vec<String>>,
+}
+#[async_trait]
+impl CommandRunner for LinkDockerStandIn {
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        true
+    }
+    async fn write_file(&self, path: &Path, text: &str) -> Result<(), String> {
+        std::fs::write(path, text).map_err(|error| error.to_string())
+    }
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+        let output = self.run_output(cmd, args, cwd, label).await?;
+        if output.success() {
+            Ok(output.stdout)
+        } else {
+            Err(output.stderr)
+        }
+    }
+    async fn run_output(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        assert_eq!(cmd, "docker");
+        assert_eq!(args[0], "--config");
+        let args = &args[2..];
+        let stdout = match args {
+            ["image", "inspect", "--format", "{{.Id}}", tag] => {
+                let Some(id) = self.images.lock().expect("images").get(*tag).cloned() else {
+                    return Ok(CommandOutput { stdout: String::new(), stderr: "absent".into(), exit_code: Some(1) });
+                };
+                id
+            }
+            ["image", "tag", parent, _] => {
+                assert!(*parent == digest(3) || *parent == digest(10));
+                String::new()
+            }
+            ["buildx", "build", rest @ ..] => {
+                let file = rest.windows(2).find(|pair| pair[0] == "--file").expect("Dockerfile")[1];
+                let text = std::fs::read_to_string(file).expect("generated recipe");
+                let id = if text.contains("FROM scratch") {
+                    assert!(rest.windows(2).any(|pair| pair[0] == "--build-arg" && pair[1].starts_with("BUILDER=")));
+                    assert!(!rest.windows(2).any(|pair| pair[0] == "--build-arg" && pair[1].starts_with("BASE=")));
+                    assert!(text.contains("FROM ${BUILDER} AS flotilla-link-audit"));
+                    assert!(text.contains("COPY --from=flotilla-link-audit --chown=0:0 /out/ /"));
+                    digest(10)
+                } else {
+                    assert!(rest.windows(2).any(|pair| pair[0] == "--build-arg" && pair[1].starts_with("BASE=")));
+                    assert!(text
+                        .lines()
+                        .all(|line| line.starts_with("ARG ") || line.starts_with("FROM ") || line.starts_with("COPY --link ")));
+                    assert!(text.contains(&format!("COPY --link --from={} --chown=0:0", digest(10))));
+                    assert!(rest.windows(2).any(|pair| pair[0] == "--build-context"
+                        && pair[1].starts_with(&format!("{}=docker-image://flotilla-link-source:", digest(10)))));
+                    digest(20)
+                };
+                let tag = rest.windows(2).find(|pair| pair[0] == "--tag").expect("tag")[1];
+                self.images.lock().expect("images").insert(tag.into(), id);
+                String::new()
+            }
+            ["run", rest @ ..] => {
+                let image = rest[rest.iter().position(|arg| *arg == "sh").expect("probe shell") + 1];
+                assert_eq!(image, digest(20), "probes must run against the spliced runtime image");
+                assert_eq!(rest.last(), Some(&"test-tool"));
+                self.probes.lock().expect("probes").push(image.into());
+                String::new()
+            }
+            other => panic!("unexpected process: {other:?}"),
+        };
+        Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
+    }
+}
+
+// #3136: producer execution audits files without runtime probes, and splicing
+// executes only COPY --link before probing the realised runtime image.
+#[tokio::test]
+async fn link_producer_and_splice_use_separate_keys_and_probe_only_spliced_image() {
+    use super::image::ImageLayerBuild;
+    use flotilla_resources::{
+        FrozenImageLayer, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageInputStability, ImageLayerParent, ImageLayerSpec,
+        ImageLayerStage, LinkImageLayer, LinkImageSource, ResolvedImageInputs, ResolvedLinkInputs,
+    };
+    let directory = tempfile::tempdir().expect("context");
+    std::fs::write(directory.path().join("Dockerfile"), "RUN mkdir -p /out/opt/flotilla/layers/harness-test\n").expect("fragment");
+    let link = LinkImageLayer {
+        builder_image: digest(1),
+        outputs: BTreeSet::from(["/opt/flotilla/layers/harness-test/".into(), "/opt/flotilla/bin/test-tool".into()]),
+    };
+    let layer = FrozenImageLayer {
+        name: "harness-test".into(),
+        spec: ImageLayerSpec::builder()
+            .stage(ImageLayerStage::Harness)
+            .parent(ImageLayerParent::Rebasable)
+            .link(link.clone())
+            .repository("https://example.test/images".into())
+            .revision("a".repeat(40))
+            .fragment("Dockerfile".into())
+            .provides(BTreeSet::from(["harness:test".into()]))
+            .probes(BTreeMap::from([("harness:test".into(), vec!["test-tool".into()])]))
+            .build(),
+    };
+    let inputs = ResolvedImageInputs::builder()
+        .parent_digest(String::new())
+        .architecture("amd64".into())
+        .content_hashes(vec![digest(2)])
+        .stability(ImageInputStability::Pinned)
+        .link(ResolvedLinkInputs { definition: link, requires: BTreeSet::new() })
+        .build();
+    let mut spec = ImageBuildSpec::builder()
+        .recipe_key(inputs.recipe_key().expect("producer key"))
+        .inputs(inputs)
+        .layer(layer)
+        .host_ref("local".into())
+        .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1 })
+        .attempt(0)
+        .reason(ImageBuildReason { description: "test".into(), old_inputs: BTreeMap::new(), new_inputs: BTreeMap::new() })
+        .build();
+    let runner = Arc::new(LinkDockerStandIn::default());
+    let builder = BuildxImageBuilder::for_cache(runner.clone(), "test-cache".into());
+    let mut log = String::new();
+    let (identity, verified) = builder
+        .build_layer(
+            ImageLayerBuild::builder()
+                .name("producer")
+                .spec(&spec)
+                .parent_digest("")
+                .context(directory.path())
+                .cache_name("test-cache")
+                .probe_script("exec \"$@\"")
+                .build(),
+            None,
+            &mut log,
+        )
+        .await
+        .expect("producer");
+    assert!(verified.is_empty());
+    assert!(runner.probes.lock().expect("probes").is_empty());
+    spec.link_source = Some(LinkImageSource { build_ref: "producer".into(), recipe_key: spec.recipe_key.clone(), identity });
+    spec.inputs.link = None;
+    spec.inputs.link_recipe_keys = vec![spec.recipe_key.clone()];
+    spec.inputs.parent_digest = digest(3);
+    spec.recipe_key = spec.inputs.recipe_key().expect("splice key");
+    let (identity, verified) = builder
+        .build_layer(
+            ImageLayerBuild::builder()
+                .name("splice")
+                .spec(&spec)
+                .parent_digest(&digest(3))
+                .context(directory.path())
+                .cache_name("test-cache")
+                .probe_script("exec \"$@\"")
+                .build(),
+            None,
+            &mut log,
+        )
+        .await
+        .expect("splice");
+    assert_eq!(identity.local_image_id, digest(20));
+    assert_eq!(verified, BTreeSet::from(["harness:test".into()]));
+    assert_eq!(runner.probes.lock().expect("probes").len(), 1);
+}

@@ -206,7 +206,8 @@ impl<R: ImageBuildRunner + 'static> Reconciler for ImageBuildReconciler<R> {
         let patch = match prepared {
             ImageBuildPrepared::None => None,
             ImageBuildPrepared::Result(ImageBuildResult::Built { identity, verified_provides, log_ref }) => {
-                let valid = identity.validate().is_ok() && obj.spec.layer.spec.provides.is_subset(verified_provides);
+                let valid = identity.validate().is_ok()
+                    && (obj.spec.is_link_producer() || obj.spec.layer.spec.provides.is_subset(verified_provides));
                 if valid {
                     Some(ImageBuildStatusPatch::Built {
                         at: now,

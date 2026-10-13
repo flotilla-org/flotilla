@@ -70,7 +70,7 @@ RUN chmod 0755 /usr/local/bin/tea && tea --version
 # checkout's rust-toolchain.toml can install its pinned toolchain or missing
 # components on demand.
 ENV CARGO_HOME=/tmp/flotilla-config/cargo
-ENV PATH="/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV PATH="/opt/flotilla/bin:/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Ghostty terminfo comes from the same pinned source as libghostty-vt (see
 # CLEAT_REF and tools/ghostty-toolchain.toml in that checkout). It is MIT

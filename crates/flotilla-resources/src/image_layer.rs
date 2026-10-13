@@ -15,8 +15,12 @@ impl Resource for ImageLayer {
     type StatusPatch = NoStatusPatch;
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "imagelayers", kind: "ImageLayer" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
-    fn validate_spec(_meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
-        spec.validate().map_err(ResourceError::decode)
+    fn validate_spec(meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
+        spec.validate().map_err(ResourceError::decode)?;
+        if let Some(link) = &spec.link {
+            link.validate(&meta.name).map_err(ResourceError::decode)?;
+        }
+        Ok(())
     }
 }
 
@@ -26,6 +30,9 @@ impl Resource for ImageLayer {
 #[serde(deny_unknown_fields)]
 pub struct ImageLayerSpec {
     pub stage: ImageLayerStage,
+    /// Absence denotes an ordinary layer, including previous-generation records (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkImageLayer>,
     pub parent: ImageLayerParent,
     pub repository: String,
     pub revision: String,
@@ -53,6 +60,74 @@ pub struct ImageLayerSpec {
     #[builder(default)]
     #[serde(default)]
     pub input_stability: ImageInputStability,
+}
+
+/// A self-contained file producer, independent of the realised runtime parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkImageLayer {
+    pub builder_image: String,
+    /// The private tree is a directory; bin symlinks and preludes are exact paths.
+    pub outputs: BTreeSet<String>,
+}
+
+pub const LINK_AUDIT_SCRIPT: &str = include_str!("../../../ci/crew-image/link-audit.sh");
+
+impl LinkImageLayer {
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let safe = |value: &str| {
+            !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) && value != "." && value != ".."
+        };
+        if !safe(name) || self.builder_image.is_empty() || self.builder_image.chars().any(char::is_whitespace) {
+            return Err("link layer needs a safe name and declared builder image".into());
+        }
+        let tree = format!("/opt/flotilla/layers/{name}/");
+        if !self.outputs.contains(&tree) {
+            return Err(format!("link layer {name} must export its private tree {tree}"));
+        }
+        for path in &self.outputs {
+            let bin = path.strip_prefix("/opt/flotilla/bin/").is_some_and(safe);
+            let prelude = path.strip_prefix("/etc/flotilla/prelude.d/").is_some_and(|file| {
+                file.len() > 3 && file.as_bytes()[..2].iter().all(u8::is_ascii_digit) && file[2..] == format!("-{name}.sh")
+            });
+            if path != &tree && !bin && !prelude {
+                return Err(format!("link layer {name} writes outside its allowed paths: {path}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The composer owns FROM, export and audit instructions. Authored fragments
+    /// contain only builder-stage instructions and write their output under /out.
+    pub fn producer_dockerfile(&self, name: &str, fragment: &str) -> Result<String, String> {
+        self.validate(name)?;
+        if fragment
+            .lines()
+            .any(|line| matches!(line.split_whitespace().next().map(str::to_ascii_uppercase).as_deref(), Some("FROM" | "ONBUILD")))
+        {
+            return Err("link producer fragments cannot declare FROM or ONBUILD".into());
+        }
+        let outputs = self.outputs.iter().map(|path| format!(" '{path}'")).collect::<String>();
+        Ok(format!("ARG BUILDER\nFROM ${{BUILDER}} AS flotilla-link-producer\n{fragment}\nFROM ${{BUILDER}} AS flotilla-link-audit\nCOPY --from=flotilla-link-producer /out/ /out/\nUSER 0:0\nRUN <<'FLOTILLA_LINK_AUDIT'\nunset FLOTILLA_LINK_OUTPUT_ROOT\nset -- '{name}'{outputs}\n{LINK_AUDIT_SCRIPT}\nFLOTILLA_LINK_AUDIT\nFROM scratch\nCOPY --from=flotilla-link-audit --chown=0:0 /out/ /\n"))
+    }
+
+    pub fn splice_dockerfile(&self, name: &str, source: &str) -> Result<String, String> {
+        self.validate(name)?;
+        if !is_sha256(source) && !source.rsplit_once('@').is_some_and(|(_, digest)| is_sha256(digest)) {
+            return Err("link splice needs a realised image digest".into());
+        }
+        let mut text = "ARG BASE\nFROM ${BASE}\n".to_string();
+        let mut paths = vec![format!("/opt/flotilla/layers/{name}/")];
+        for prefix in ["/opt/flotilla/bin/", "/etc/flotilla/prelude.d/"] {
+            if self.outputs.iter().any(|path| path.starts_with(prefix)) {
+                paths.push(prefix.into());
+            }
+        }
+        for path in paths {
+            text.push_str(&format!("COPY --link --from={source} --chown=0:0 {path} {path}\n"));
+        }
+        Ok(text)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -100,6 +175,12 @@ pub struct FrozenImageLayer {
     pub spec: ImageLayerSpec,
 }
 
+impl FrozenImageLayer {
+    fn order_key(&self) -> (bool, ImageLayerStage, &str) {
+        (self.spec.link.is_some(), if self.spec.link.is_some() { ImageLayerStage::Base } else { self.spec.stage }, &self.name)
+    }
+}
+
 /// A selection is cascaded by the caller; the composer never picks another
 /// base to paper over an unsatisfiable need.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -113,7 +194,8 @@ pub struct ImageLayerSelection {
     pub project: Option<String>,
 }
 
-// ADR 0047: remove the single-harness decoder bridge one fleet roll after #3136.
+// ADR 0047: remove after the next fleet roll, once live-store validation and
+// the roll-refreshed corpus contain no legacy single `harness` selections.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImageLayerSelectionRecord {
@@ -222,18 +304,29 @@ impl PlacedImageIdentity {
 }
 
 impl ImageComposition {
-    /// Derive every stage key in frozen chain order. Actual parent digests
-    /// remain build inputs, while the parent key supplies Merkle invalidation.
+    pub fn build_stage_count(&self) -> usize {
+        self.layers.len() + self.layers.iter().filter(|layer| layer.spec.link.is_some()).count()
+    }
+
+    /// Derive runtime chain keys in frozen order. Link producers have independent
+    /// keys folded into their splice keys; ordinary parents supply Merkle invalidation.
     pub fn recipe_keys(&self, inputs: &[ResolvedImageInputs]) -> Result<Vec<String>, String> {
         if inputs.len() != self.layers.len() {
             return Err("resolved image inputs do not match the frozen layer chain".into());
         }
         let mut keys = Vec::with_capacity(inputs.len());
-        for input in inputs {
+        for (layer, input) in self.layers.iter().zip(inputs) {
             if inputs.first().is_some_and(|first| first.architecture != input.architecture) {
                 return Err("image composition cannot mix architectures".into());
             }
             let mut resolved = input.clone();
+            if let Some(definition) = &layer.spec.link {
+                resolved.link_recipe_keys.clear();
+                resolved.link = Some(ResolvedLinkInputs { definition: definition.clone(), requires: layer.spec.requires.clone() });
+                let producer = resolved.recipe_key()?;
+                resolved.link = None;
+                resolved.link_recipe_keys = vec![producer];
+            }
             resolved.parent_recipe_key = keys.last().cloned();
             keys.push(resolved.recipe_key()?);
         }
@@ -283,11 +376,24 @@ impl ImageLayerSpec {
             return Err("image layer revision must be a full pinned commit".into());
         }
         match (&self.stage, &self.parent) {
+            (_, ImageLayerParent::Rebasable) if self.link.is_some() && self.stage != ImageLayerStage::Base => {}
             (ImageLayerStage::Base, ImageLayerParent::Image(image))
                 if is_sha256(image) || image.rsplit_once('@').is_some_and(|(_, digest)| is_sha256(digest)) => {}
             (ImageLayerStage::Utilities, ImageLayerParent::Layer(_)) => {}
             (ImageLayerStage::Capability | ImageLayerStage::Harness | ImageLayerStage::Project, ImageLayerParent::Rebasable) => {}
             _ => return Err(format!("invalid parent for {:?} image layer", self.stage)),
+        }
+        if let Some(link) = &self.link {
+            if self.stage == ImageLayerStage::Base {
+                return Err("a link layer needs an ordinary runtime base".into());
+            }
+            if self.stage == ImageLayerStage::Harness && self.provides.iter().filter(|provide| provide.starts_with("harness:")).count() != 1
+            {
+                return Err("a harness link layer must provide exactly one harness capability".into());
+            }
+            if link.builder_image.is_empty() {
+                return Err("link builder image is empty".into());
+            }
         }
         for capability in self.provides.iter().chain(&self.requires) {
             validate_capability(capability)?;
@@ -315,6 +421,8 @@ pub fn compose_image(
         (selection.project.as_ref(), ImageLayerStage::Project),
     ]
     .into_iter()
+    // Defaults apply only without a harness need. Explicit harness needs use
+    // the minimal catalogue cover and may omit unrelated default harnesses.
     .chain(
         selection
             .harnesses
@@ -325,6 +433,9 @@ pub fn compose_image(
         if let Some(name) = name {
             let spec = available.get(name).ok_or_else(|| format!("image layer `{name}` missing"))?;
             spec.validate().map_err(|error| format!("image layer `{name}`: {error}"))?;
+            if let Some(link) = &spec.link {
+                link.validate(name)?;
+            }
             if spec.stage != stage {
                 return Err(format!("image layer `{name}` is not a {stage:?} layer"));
             }
@@ -338,7 +449,7 @@ pub fn compose_image(
         })
         .map(|(name, spec)| FrozenImageLayer { name: name.clone(), spec: spec.clone() })
         .collect::<Vec<_>>();
-    optional.sort_by(|left, right| (left.spec.stage, &left.name).cmp(&(right.spec.stage, &right.name)));
+    optional.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
     // Only providers of requested capabilities or their transitive prerequisites
     // can affect a minimum cover. Fixed upper layers' requires participate too.
     let mut relevant = needs.clone();
@@ -355,14 +466,19 @@ pub fn compose_image(
         }
     }
     optional.retain(|layer| layer.spec.provides.iter().any(|provided| relevant.iter().any(|need| capability_satisfies(provided, need))));
+    for layer in &optional {
+        if let Some(link) = &layer.spec.link {
+            link.validate(&layer.name)?;
+        }
+    }
     // Prune in canonical stage/name order, including fixed predecessors. This
     // is a viability bound; the shared exact search verifies the chosen chain.
     let mut possible = BTreeSet::new();
     let mut predecessors = fixed.iter().collect::<Vec<_>>();
-    predecessors.sort_by_key(|layer| (layer.spec.stage, &layer.name));
+    predecessors.sort_by_key(|layer| layer.order_key());
     let mut predecessors = predecessors.into_iter().peekable();
     optional.retain(|layer| {
-        while predecessors.peek().is_some_and(|fixed| (fixed.spec.stage, &fixed.name) < (layer.spec.stage, &layer.name)) {
+        while predecessors.peek().is_some_and(|fixed| fixed.order_key() < layer.order_key()) {
             possible.extend(predecessors.next().expect("peeked predecessor").spec.provides.clone());
         }
         let viable = layer.spec.validate().is_ok()
@@ -421,7 +537,18 @@ fn covering_subset(
     *search_budget -= 1;
     if remaining == 0 {
         let mut chain = fixed.iter().chain(selected.iter()).cloned().collect::<Vec<_>>();
-        chain.sort_by(|left, right| (left.spec.stage, &left.name).cmp(&(right.spec.stage, &right.name)));
+        chain.sort_by(|left, right| left.order_key().cmp(&right.order_key()));
+        let mut paths = BTreeSet::new();
+        for layer in &chain {
+            if let Some(link) = &layer.spec.link {
+                link.validate(&layer.name).map_err(|_| ())?;
+                for path in &link.outputs {
+                    if !paths.insert(path) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         let mut provides = BTreeSet::new();
         let mut previous: Option<&str> = None;
         for layer in &chain {
@@ -458,6 +585,12 @@ fn covering_subset(
 /// identity. Ordered maps normalise args and pins before hashing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ResolvedImageInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<ResolvedLinkInputs>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_recipe_keys: Vec<String>,
+    /// A runtime parent for ordinary/splice executions; empty for link producers.
     pub parent_digest: String,
     pub parent_recipe_key: Option<String>,
     pub content_hashes: Vec<String>,
@@ -468,6 +601,13 @@ pub struct ResolvedImageInputs {
     pub architecture: String,
     /// Explicit builder evidence: unresolved package/base inputs are refused.
     pub stability: ImageInputStability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedLinkInputs {
+    pub definition: LinkImageLayer,
+    pub requires: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,7 +626,7 @@ impl ResolvedImageInputs {
             (ImageInputStability::Unpinned, Some(nonce)) if !nonce.is_empty() => {
                 let mut validated = self.clone();
                 validated.stability = ImageInputStability::Pinned;
-                let resolved = validated.recipe_key()?;
+                let resolved = validated.canonical_key(false)?;
                 Ok(format!(
                     "sha256:{:x}",
                     Sha256::digest(
@@ -501,19 +641,45 @@ impl ResolvedImageInputs {
     /// Only resolved, pinned inputs have a shareable Merkle key. Callers must
     /// refuse unresolved inputs rather than manufacture a cache identity.
     pub fn recipe_key(&self) -> Result<String, String> {
+        self.canonical_key(true)
+    }
+
+    fn canonical_key(&self, shareable: bool) -> Result<String, String> {
         if self.stability != ImageInputStability::Pinned
-            || !is_sha256(&self.parent_digest)
-            || self.parent_recipe_key.as_ref().is_some_and(|key| !is_sha256(key))
+            || (self.link.is_none() && !is_sha256(&self.parent_digest))
+            || (self.link.is_none() && self.parent_recipe_key.as_ref().is_some_and(|key| !is_sha256(key)))
             || self.architecture.is_empty()
             || self.content_hashes.is_empty()
             || self.content_hashes.iter().any(|hash| !is_sha256(hash))
+            || (self.link.is_some() && !self.link_recipe_keys.is_empty())
+            || self.link_recipe_keys.iter().any(|key| !is_sha256(key))
             || self.pins.values().any(|value| value.is_empty())
         {
             return Err("cannot share an image recipe key with unresolved inputs".into());
         }
+        if shareable
+            && self.link.as_ref().is_some_and(|link| {
+                !is_sha256(&link.definition.builder_image)
+                    && !link.definition.builder_image.rsplit_once('@').is_some_and(|(_, digest)| is_sha256(digest))
+            })
+        {
+            return Err("cannot share a link recipe with an unresolved builder image".into());
+        }
         let mut canonical = self.clone();
         canonical.content_hashes.sort();
-        let bytes = serde_json::to_vec(&("flotilla-image-recipe-v1", canonical)).map_err(|error| error.to_string())?;
+        let bytes = if let Some(link) = &canonical.link {
+            serde_json::to_vec(&(
+                "flotilla-link-recipe-v1",
+                &canonical.architecture,
+                &canonical.content_hashes,
+                &canonical.args,
+                &canonical.pins,
+                link,
+            ))
+            .map_err(|error| error.to_string())?
+        } else {
+            serde_json::to_vec(&("flotilla-image-recipe-v1", canonical)).map_err(|error| error.to_string())?
+        };
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 }

@@ -29,13 +29,13 @@ mod crew_image_baseline;
 pub mod image_build;
 pub use image_build::{
     ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildReason, ImageBuildReservation,
-    ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch,
+    ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch, LinkImageSource,
 };
 mod image_layer;
 pub use image_layer::{
     capability_satisfies, compose_image, validate_capability, FrozenImageLayer, FrozenImageLayers, ImageComposition, ImageInputAdoption,
-    ImageInputPin, ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage,
-    PlacedImageIdentity, ResolvedImageInputs, IMAGE_LAYERS_ANNOTATION,
+    ImageInputPin, ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage, LinkImageLayer,
+    PlacedImageIdentity, ResolvedImageInputs, ResolvedLinkInputs, IMAGE_LAYERS_ANNOTATION, LINK_AUDIT_SCRIPT,
 };
 pub mod delivery_hold;
 #[doc(hidden)]

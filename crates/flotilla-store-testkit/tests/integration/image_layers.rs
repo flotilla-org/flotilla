@@ -577,3 +577,112 @@ fn harness_cover_refusal_and_search_bound() {
         assert_eq!(frozen, FrozenImageLayers::default());
     }
 }
+
+fn link_definition(name: &str, binary: &str) -> flotilla_resources::LinkImageLayer {
+    flotilla_resources::LinkImageLayer {
+        builder_image: format!("ubuntu@sha256:{}", "d".repeat(64)),
+        outputs: BTreeSet::from([format!("/opt/flotilla/layers/{name}/"), format!("/opt/flotilla/bin/{binary}")]),
+    }
+}
+
+// Amendment #3136: producer keys are independent of any runtime parent, while
+// source, architecture, pins and runtime requirements remain cache inputs.
+#[hegel::test]
+fn link_recipe_excludes_parent_and_splice_depends_on_both(tc: hegel::TestCase) {
+    // Both architectures and every independent input category; parent values
+    // deliberately include unresolved values to prove they are fully excluded.
+    let mut inputs = ResolvedImageInputs::builder()
+        .parent_digest("unused-parent".into())
+        .parent_recipe_key("unused-key".into())
+        .content_hashes(vec![format!("sha256:{}", "b".repeat(64))])
+        .architecture(if tc.draw(gs::booleans()) { "amd64" } else { "arm64" }.into())
+        .link(flotilla_resources::ResolvedLinkInputs {
+            definition: link_definition("harness-test", "tool"),
+            requires: BTreeSet::from(["toolchain:node".into()]),
+        })
+        .stability(ImageInputStability::Pinned)
+        .build();
+    let key = inputs.recipe_key().expect("producer key");
+    inputs.parent_digest = format!("sha256:{}", "a".repeat(64));
+    inputs.parent_recipe_key = Some(format!("sha256:{}", "c".repeat(64)));
+    assert_eq!(key, inputs.recipe_key().expect("another parent"));
+    let mut changed = inputs.clone();
+    match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
+        0 => changed.architecture = if inputs.architecture == "amd64" { "arm64" } else { "amd64" }.into(),
+        1 => changed.content_hashes[0] = format!("sha256:{}", "e".repeat(64)),
+        2 => {
+            changed.pins.insert("VERSION".into(), "different".into());
+        }
+        3 => {
+            changed.link.as_mut().expect("link").requires.insert("runtime:glibc>=2.39".into());
+        }
+        _ => changed.link.as_mut().expect("link").definition.builder_image = format!("sha256:{}", "f".repeat(64)),
+    }
+    let changed_key = changed.recipe_key().expect("changed producer key");
+    assert_ne!(key, changed_key);
+    inputs.link = None;
+    inputs.link_recipe_keys = vec![key];
+    let splice = inputs.recipe_key().expect("splice key");
+    let mut new_parent = inputs.clone();
+    new_parent.parent_recipe_key = Some(format!("sha256:{}", "f".repeat(64)));
+    assert_ne!(splice, new_parent.recipe_key().expect("new parent splice"));
+    inputs.link_recipe_keys = vec![changed_key];
+    assert_ne!(splice, inputs.recipe_key().expect("new producer splice"));
+}
+
+// Link layers splice last by name, declare self-contained paths and cannot
+// collide. Failed covers leave stored freezing unchanged.
+#[test]
+fn link_composer_enforces_order_paths_and_collisions() {
+    let mut catalogue = catalogue();
+    catalogue.remove("harness");
+    for (name, binary) in [("a-claude", "claude"), ("z-codex", "codex")] {
+        let mut spec = layer(ImageLayerStage::Harness, &[&format!("harness:{binary}")]);
+        spec.link = Some(link_definition(name, binary));
+        spec.requires.insert("project:flotilla".into());
+        catalogue.insert(name.into(), spec);
+    }
+    let needs = BTreeSet::from(["harness:claude".into(), "harness:codex".into(), "browser:chromium".into()]);
+    let result = compose_image(&selection(), &needs, &catalogue, &mut FrozenImageLayers::default()).expect("link cover");
+    assert_eq!(
+        result.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
+        ["base", "utils", "project", "z-browser", "a-claude", "z-codex"]
+    );
+    assert_eq!(result.build_stage_count(), 8);
+    let link = catalogue.get_mut("z-codex").expect("codex").link.as_mut().expect("link");
+    link.outputs.insert("/opt/flotilla/bin/claude".into());
+    let mut frozen = FrozenImageLayers::default();
+    assert!(compose_image(&selection(), &needs, &catalogue, &mut frozen).is_err());
+    assert_eq!(frozen, FrozenImageLayers::default());
+    let link = catalogue.get_mut("z-codex").expect("codex").link.as_mut().expect("link");
+    link.outputs.remove("/opt/flotilla/bin/claude");
+    link.outputs.insert("/etc/profile".into());
+    assert!(compose_image(&selection(), &needs, &catalogue, &mut frozen).expect_err("outside path").contains("outside"));
+    assert_eq!(frozen, FrozenImageLayers::default());
+}
+
+// Volatility ordering places project dependencies below optional capabilities;
+// a project cannot require a capability above it, and refusal leaves freezing atomic.
+#[test]
+fn project_requirement_cannot_be_supplied_by_later_capability() {
+    let mut catalogue = catalogue();
+    catalogue.get_mut("project").expect("project").requires.insert("display:headless-x11".into());
+    let mut frozen = FrozenImageLayers::default();
+    let error = compose_image(&selection(), &BTreeSet::from(["display:headless-x11".into()]), &catalogue, &mut frozen)
+        .expect_err("project cannot depend on an upper capability");
+    assert!(error.contains("display:headless-x11"));
+    assert_eq!(frozen, FrozenImageLayers::default());
+}
+
+// New harness link definitions provide one harness capability; previous
+// ordinary multi-harness bundles retain their original validity for the roll.
+#[test]
+fn harness_link_cardinality_does_not_reject_legacy_ordinary_bundles() {
+    for count in 0..=2 {
+        let provides = (0..count).map(|index| format!("harness:h-{index}")).collect::<Vec<_>>();
+        let mut spec = layer(ImageLayerStage::Harness, &provides.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(spec.validate().is_ok());
+        spec.link = Some(link_definition("harness-test", "tool"));
+        assert_eq!(spec.validate().is_ok(), count == 1);
+    }
+}

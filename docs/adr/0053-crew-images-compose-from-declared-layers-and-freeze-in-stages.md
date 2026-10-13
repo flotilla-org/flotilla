@@ -54,12 +54,60 @@ changing stage sits on top: harness bumps must not rebuild expensive project
 dependencies. Frozen compositions retain their recorded order and realised
 identities on relaunch. Selection writes `harnesses` as a set; the previous
 single `harness` field decodes into a singleton for one generation (ADR 0047). Only base/toolchains and utilities have fixed parents;
-capability, harness and project fragments start `FROM ${BASE}`, supplied with
-the actual parent digest. This amends #2271's earlier parent rule. Restacking
+ordinary capability, harness and project fragments start `FROM ${BASE}`, supplied
+with the actual parent digest. Project layers cannot require an optional
+capability supplied above them; such a composition refuses rather than restacking.
+Link producers are the exception below. This amends #2271's earlier parent rule. Restacking
 a Dockerfile that executes RUN requires a rebuild. Manifest-only OCI rebasing
 is safe only for separately declared pure file-content producers with no RUN;
 parent substitution alone is not proof of that property. Optional Nix-produced
 file layers may exploit it later.
+
+### Link layers (2026-10-13 amendment to #3136)
+
+An optional `link` declaration contains a builder image and exported paths.
+Old records default to ordinary layers for one generation (ADR 0047); existing
+frozen layers are never converted. Ordinary stages retain volatility ordering;
+link layers splice last, sorted by name regardless of their capability stage.
+Layers that modify lower state (apt, `/etc/profile`, `ldconfig`) remain ordinary.
+
+The producer is an independent ImageBuild execution per architecture. Its key
+covers source content, architecture, args, pins, exported paths, the declared
+builder image and runtime `requires`; it excludes the runtime parent digest and
+recipe key. Context-free producer fragments (no COPY, ADD or mounts) hash only
+that fragment and verification metadata, so unrelated edits or another harness
+bump do not change their keys. Context-consuming fragments conservatively hash
+the whole acquired context. Harness link layers provide exactly one harness
+capability; old ordinary bundles remain decodable and frozen copies keep their
+original semantics. Remove the old bundle from the live catalogue after policy
+cut-over so new admissions cannot choose its smaller bundled cover.
+Pinned producer demands join existing queued, building or completed
+executions across compositions/hosts. Unresolved builder images remain unpinned
+and use demand-specific execution nonces, preserving the #3137 pinning boundary.
+
+The composer owns the producer's FROM instructions. Authored fragments contain
+only builder-stage instructions, write under `/out`, and cannot declare FROM or
+ONBUILD. A clean stage from the declared builder image copies `/out` and audits
+its actual files, symlinks and declared output presence before exporting to a
+scratch image with numeric ownership `0:0`. Thus builder instructions cannot
+replace the audit shell. Allowed outputs are a private directory
+`/opt/flotilla/layers/<layer>/`, exact symlinks `/opt/flotilla/bin/<tool>` into that
+private tree, and optional `/etc/flotilla/prelude.d/<NN>-<layer>.sh` files.
+Necessary parent directories are structural scaffolding. The composer rejects
+invalid declarations and overlapping output paths between selected link layers;
+the producer audit rejects actual undeclared paths and escaping symlinks.
+
+A splice has its own ImageBuild execution, keyed by the realised parent and its
+recipe key plus the producer key. Its generated Dockerfile contains FROM and
+COPY --link instructions only, copying audited directories from the realised
+producer image. Directory copies preserve shipped symlinks. For local-only
+images, the provider binds the exact config digest using a digest-derived local
+label and a [BuildKit named image context](https://docs.docker.com/reference/cli/docker/buildx/build/#build-context),
+so a local config ID is never mistaken for a registry manifest digest. Runtime
+Node/glibc requirements must be satisfied below the splice. Capability probes
+run against the spliced image, never the scratch producer. Producer and splice
+executions remain separate in frozen build references; provisioning waits for
+all executions before binding the final identity.
 
 One composition is selected per distinct need-set; an unrelated extra layer
 is never added as a convenience. Compose capability satisfiability comes from

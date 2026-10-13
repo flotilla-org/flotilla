@@ -221,7 +221,40 @@ where
                                 reason.map(|reason| format!(": {reason}")).unwrap_or_default()
                             ));
                         };
-                        if original.image_composition.as_ref().is_some_and(|composition| progress.len() < composition.layers.len()) {
+                        if original.image_composition.as_ref().is_some_and(|composition| progress.len() < composition.build_stage_count()) {
+                            // Producers are independent of the parent chain; keep
+                            // their audit failures visible while the runtime parent is built.
+                            let producers = original
+                                .image_composition
+                                .as_ref()
+                                .expect("composition")
+                                .layers
+                                .iter()
+                                .filter(|layer| layer.spec.link.is_some())
+                                .count();
+                            for reference in progress.iter().take(producers) {
+                                let mut producer = match flotilla_store::read_image_build(&self.backend, &self.namespace, reference).await {
+                                    Ok(producer) => producer,
+                                    Err(ResourceError::NotFound { .. }) => continue,
+                                    Err(error) => return Err(error),
+                                };
+                                for _ in 0..3 {
+                                    match flotilla_store::read_image_build(
+                                        &self.backend,
+                                        &self.namespace,
+                                        &format!("{}-retry", producer.metadata.name),
+                                    )
+                                    .await
+                                    {
+                                        Ok(retry) => producer = retry,
+                                        Err(ResourceError::NotFound { .. }) => break,
+                                        Err(error) => return Err(error),
+                                    }
+                                }
+                                if let Some(failure) = producer.status.as_ref().and_then(|status| status.failure.as_ref()) {
+                                    return waiting(format!("ImageBuild {} failed: {}", producer.metadata.name, failure.reason));
+                                }
+                            }
                             return waiting(format!("ImageBuild {} built; awaiting next composition stage", build.metadata.name));
                         }
                         let identity = status.identity.as_ref().ok_or_else(|| ResourceError::invalid("built image has no identity"))?;

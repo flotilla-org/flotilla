@@ -82,14 +82,49 @@ fn hash_context(directory: &Path) -> Result<Vec<String>, String> {
 }
 
 fn hash_layer_inputs_blocking(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
-    let mut hashes = hash_context(context)?;
-    let verification = serde_json::to_vec(&(
-        &layer.spec.fragment,
-        &layer.spec.provides,
-        &layer.spec.requires,
-        &layer.spec.probes,
-        flotilla_agent::process::with_preludes("exec \"$@\""),
-    ))
+    let mut hashes = if layer.spec.link.is_some() {
+        let fragment = std::fs::read_to_string(context.join(&layer.spec.fragment)).map_err(|error| error.to_string())?;
+        let mut normalized = String::new();
+        for line in fragment.lines() {
+            if let Some(continued) = line.trim_end().strip_suffix('\\') {
+                normalized.push_str(continued);
+            } else {
+                normalized.push_str(line);
+                normalized.push('\n');
+            }
+        }
+        let consumes_context = normalized.contains("--mount")
+            || normalized
+                .lines()
+                .any(|line| matches!(line.split_whitespace().next().map(str::to_ascii_uppercase).as_deref(), Some("COPY" | "ADD")));
+        if consumes_context {
+            hash_context(context)?
+        } else {
+            vec![format!("sha256:{:x}", Sha256::digest(fragment.as_bytes()))]
+        }
+    } else {
+        hash_context(context)?
+    };
+    let verification = if let Some(link) = &layer.spec.link {
+        serde_json::to_vec(&(
+            "flotilla-link-inputs-v2",
+            &layer.spec.fragment,
+            &layer.spec.provides,
+            &layer.spec.requires,
+            &layer.spec.probes,
+            link,
+            flotilla_resources::LINK_AUDIT_SCRIPT,
+            flotilla_agent::process::with_preludes("exec \"$@\""),
+        ))
+    } else {
+        serde_json::to_vec(&(
+            &layer.spec.fragment,
+            &layer.spec.provides,
+            &layer.spec.requires,
+            &layer.spec.probes,
+            flotilla_agent::process::with_preludes("exec \"$@\""),
+        ))
+    }
     .map_err(|error| error.to_string())?;
     hashes.push(format!("sha256:{:x}", Sha256::digest(verification)));
     Ok(hashes)
@@ -144,6 +179,22 @@ impl LocalImageBuildRunner {
                 }
             }
             distributor.ensure(&parent).await.map_err(transient)?;
+        }
+        if let Some(link) = &spec.link_source {
+            let source = flotilla_store::read_image_build(&self.backend, &self.namespace, &link.build_ref)
+                .await
+                .map_err(|error| transient(error.to_string()))?;
+            if !spec.accepts_link_source(&source.spec)
+                || source.spec.recipe_key != link.recipe_key
+                || source.status.as_ref().is_none_or(|status| {
+                    status.phase != flotilla_resources::ImageBuildPhase::Built || status.identity.as_ref() != Some(&link.identity)
+                })
+            {
+                return Err(deterministic("link source differs from its frozen producer evidence".into()));
+            }
+            if let Some(distributor) = &self.distributor {
+                distributor.ensure(&source).await.map_err(transient)?;
+            }
         }
         let context = self.context(&spec.layer).await.map_err(transient)?;
         let hashes = hash_layer_inputs(&context, &spec.layer).await.map_err(deterministic)?;
@@ -270,6 +321,49 @@ mod tests {
 
     use super::*;
     use flotilla_resources::ImageLayerParent;
+
+    // Parent-independent, context-free producers must also be independent of
+    // unrelated source edits. Context-consuming fragments retain the safe full
+    // context dependency. No VCS or container process runs in this property.
+    #[hegel::test]
+    fn link_source_hashes_ignore_unrelated_edits_unless_context_is_consumed(tc: hegel::TestCase) {
+        // Context-free RUN, COPY, ADD and a continued bind mount cover all source
+        // acquisition shapes; edits to the own fragment always invalidate it.
+        let kind = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+        let fragment = match kind {
+            0 => "RUN echo self-contained\n",
+            1 => "COPY asset /out/opt/flotilla/layers/link/asset\n",
+            2 => "ADD asset /out/opt/flotilla/layers/link/asset\n",
+            _ => "RUN --mou\\\nnt=type=bind,source=asset,target=/asset cat /asset\n",
+        };
+        let directory = tempfile::tempdir().expect("context");
+        std::fs::write(directory.path().join("Dockerfile"), fragment).expect("fragment");
+        std::fs::write(directory.path().join("asset"), "before").expect("asset");
+        let layer = FrozenImageLayer {
+            name: "link".into(),
+            spec: ImageLayerSpec::builder()
+                .stage(ImageLayerStage::Capability)
+                .parent(ImageLayerParent::Rebasable)
+                .repository("https://example.test/images".into())
+                .revision("a".repeat(40))
+                .fragment("Dockerfile".into())
+                .link(flotilla_resources::LinkImageLayer {
+                    builder_image: format!("sha256:{}", "a".repeat(64)),
+                    outputs: BTreeSet::from(["/opt/flotilla/layers/link/".into()]),
+                })
+                .build(),
+        };
+        let initial = hash_layer_inputs_blocking(directory.path(), &layer).expect("initial inputs");
+        std::fs::write(directory.path().join("asset"), "another harness or source changed").expect("edit other input");
+        let changed = hash_layer_inputs_blocking(directory.path(), &layer).expect("changed inputs");
+        if kind == 0 {
+            assert_eq!(initial, changed);
+        } else {
+            assert_ne!(initial, changed);
+        }
+        std::fs::write(directory.path().join("Dockerfile"), format!("{fragment}RUN echo own-change\n")).expect("own edit");
+        assert_ne!(changed, hash_layer_inputs_blocking(directory.path(), &layer).expect("own inputs"));
+    }
 
     // A declared builder projects a remote demand only once, writes evidence
     // at its own authority, and replication returns that evidence to admission.

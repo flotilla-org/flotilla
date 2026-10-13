@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use flotilla_resources::{
     FrozenImageLayer, Host, ImageBuild, ImageBuildCapacity, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageComposition,
-    ImageInputStability, ImageLayerParent, InputMeta, ResolvedImageInputs, ResourceError,
+    ImageInputStability, ImageLayerParent, InputMeta, LinkImageSource, ResolvedImageInputs, ResolvedLinkInputs, ResourceError,
 };
 use flotilla_store::{ResourceBackend, StoreQuery};
 
@@ -60,7 +60,14 @@ impl ImageBuildAdmission {
         let mut parent_key = None;
         let mut parent_digest: Option<String> = None;
         let mut result = None;
-        for layer in &composition.layers {
+        let mut link_sources = BTreeMap::new();
+        let plan = composition
+            .layers
+            .iter()
+            .filter(|layer| layer.spec.link.is_some())
+            .map(|layer| (layer, true))
+            .chain(composition.layers.iter().map(|layer| (layer, false)));
+        for (layer, producer) in plan {
             let source = self.inputs.resolve(layer, architecture).await?;
             if source.architecture != architecture {
                 return Err("image input resolver changed target architecture".into());
@@ -68,18 +75,35 @@ impl ImageBuildAdmission {
             if source.stability != ImageInputStability::Pinned {
                 return Ok(None);
             }
-            let digest = match (&parent_digest, &layer.spec.parent) {
-                (Some(digest), _) => digest.clone(),
-                (None, ImageLayerParent::Image(image)) => image.rsplit_once('@').map_or(image.as_str(), |(_, digest)| digest).to_string(),
-                _ => return Ok(None),
+            let link_source = if !producer && layer.spec.link.is_some() {
+                Some(link_sources.get(&layer.name).cloned().ok_or("link producer is not built")?)
+            } else {
+                None
+            };
+            let digest = if producer {
+                String::new()
+            } else {
+                match (&parent_digest, &layer.spec.parent) {
+                    (Some(digest), _) => digest.clone(),
+                    (None, ImageLayerParent::Image(image)) => {
+                        image.rsplit_once('@').map_or(image.as_str(), |(_, digest)| digest).to_string()
+                    }
+                    _ => return Ok(None),
+                }
             };
             let inputs = ResolvedImageInputs::builder()
                 .parent_digest(digest)
-                .maybe_parent_recipe_key(parent_key.clone())
-                .architecture(source.architecture)
-                .content_hashes(source.content_hashes)
-                .args(source.args)
-                .pins(source.pins)
+                .maybe_parent_recipe_key(if producer { None } else { parent_key.clone() })
+                .maybe_link(if producer {
+                    layer.spec.link.clone().map(|definition| ResolvedLinkInputs { definition, requires: layer.spec.requires.clone() })
+                } else {
+                    None
+                })
+                .link_recipe_keys(link_source.as_ref().map(|source: &LinkImageSource| vec![source.recipe_key.clone()]).unwrap_or_default())
+                .architecture(source.architecture.clone())
+                .content_hashes(source.content_hashes.clone())
+                .args(source.args.clone())
+                .pins(source.pins.clone())
                 .stability(source.stability)
                 .build();
             let key = inputs.recipe_key()?;
@@ -96,6 +120,17 @@ impl ImageBuildAdmission {
             let Some(status) = found.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built) else {
                 return Ok(None);
             };
+            if producer {
+                link_sources.insert(
+                    layer.name.clone(),
+                    LinkImageSource {
+                        build_ref: found.metadata.name.clone(),
+                        recipe_key: key,
+                        identity: status.identity.clone().ok_or("built link has no identity")?,
+                    },
+                );
+                continue;
+            }
             parent_digest = Some(status.identity.as_ref().ok_or("built image has no identity")?.local_image_id.clone());
             parent_key = Some(key);
             result = Some(found);
@@ -127,8 +162,12 @@ impl ImageBuildAdmission {
         let architecture = canonical_image_architecture(architecture);
         if let Some(mut completed) = self.completed(architecture, composition).await? {
             let mut chain = Vec::new();
+            let mut producers = BTreeMap::new();
             for _ in 0..composition.layers.len() {
                 chain.push(completed.metadata.name.clone());
+                if let Some(link) = &completed.spec.link_source {
+                    producers.insert(completed.spec.layer.name.clone(), link.build_ref.clone());
+                }
                 let Some(parent) = &completed.spec.parent_build_ref else {
                     break;
                 };
@@ -137,7 +176,11 @@ impl ImageBuildAdmission {
             }
             chain.reverse();
             if chain.len() == composition.layers.len() {
-                return Ok(chain);
+                let mut refs = producers.into_values().collect::<Vec<_>>();
+                refs.extend(chain);
+                if refs.len() == composition.build_stage_count() {
+                    return Ok(refs);
+                }
             }
         }
         let capacity = |host: &flotilla_resources::ResourceObject<Host>| -> Result<Option<ImageBuildCapacity>, String> {
@@ -145,7 +188,7 @@ impl ImageBuildAdmission {
         };
         let default_reservation = ImageBuildReservation { cpu: 1, disk_bytes: 1024 * 1024 * 1024 };
         let selected = match capacity(placement)? {
-            None => Some((placement_host.to_string(), default_reservation)),
+            None => Some((placement_host.to_string(), default_reservation.clone())),
             Some(ImageBuildCapacity::Builder { architecture: build_arch, slots, reservation })
                 if canonical_image_architecture(&build_arch) == architecture && slots > 0 =>
             {
@@ -174,6 +217,43 @@ impl ImageBuildAdmission {
             }
         }
         let (host_ref, reservation) = selected.ok_or_else(|| format!("no host can build images for architecture {architecture}"))?;
+        // Pinned producers have no placement parent: select one canonical
+        // eligible builder per architecture, so concurrent demands from different
+        // hosts author the same execution even before replication catches up.
+        let producer_builder = hosts
+            .iter()
+            .filter(|host| {
+                host.metadata.deletion_timestamp.is_none()
+                    && host.status.as_ref().is_none_or(|status| {
+                        status.ready
+                            && status
+                                .description
+                                .as_ref()
+                                .and_then(|summary| summary.system.arch.as_deref())
+                                .is_none_or(|actual| canonical_image_architecture(actual) == architecture)
+                    })
+            })
+            .filter_map(|host| match &host.spec.image_build_capacity {
+                Some(ImageBuildCapacity::Builder { architecture: target, slots, reservation })
+                    if canonical_image_architecture(target) == architecture && *slots > 0 =>
+                {
+                    Some((host.metadata.name.clone(), reservation.clone()))
+                }
+                None if host.status.as_ref().is_some_and(|status| {
+                    status.capabilities.get("docker").and_then(serde_json::Value::as_bool) == Some(true)
+                        && status
+                            .description
+                            .as_ref()
+                            .and_then(|summary| summary.system.arch.as_deref())
+                            .is_some_and(|target| canonical_image_architecture(target) == architecture)
+                }) =>
+                {
+                    Some((host.metadata.name.clone(), default_reservation.clone()))
+                }
+                _ => None,
+            })
+            .min_by_key(|(host, _)| host.clone())
+            .unwrap_or_else(|| (host_ref.clone(), reservation.clone()));
         let mut resolved = Vec::new();
         for layer in &composition.layers {
             let input = self.inputs.resolve(layer, architecture).await?;
@@ -190,24 +270,57 @@ impl ImageBuildAdmission {
         // Pinned layers share one replica-inclusive inventory per join; builds
         // created by earlier layers are not yet Built, so they cannot match.
         let shareable_builds = tokio::sync::OnceCell::new();
-        for (index, (layer, source)) in composition.layers.iter().zip(resolved).enumerate() {
-            let digest = match (&parent_digest, &layer.spec.parent) {
-                (Some(digest), _) => digest.clone(),
-                (None, ImageLayerParent::Image(image)) => image.rsplit_once('@').map_or(image.as_str(), |(_, digest)| digest).to_string(),
-                _ => return Err("first image stage requires a pinned base image".into()),
+        let mut link_sources = BTreeMap::new();
+        let producers = composition
+            .layers
+            .iter()
+            .zip(resolved.iter())
+            .filter(|(layer, _)| layer.spec.link.is_some())
+            .map(|(layer, source)| (layer, source, true));
+        let ordinary = composition.layers.iter().zip(resolved.iter()).map(|(layer, source)| (layer, source, false));
+        for (index, (layer, source, producer)) in producers.chain(ordinary).enumerate() {
+            let (stage_host, stage_reservation) = if producer && source.stability == ImageInputStability::Pinned {
+                (&producer_builder.0, &producer_builder.1)
+            } else {
+                (&host_ref, &reservation)
+            };
+            let link_source = if !producer && layer.spec.link.is_some() {
+                let Some(source) = link_sources.get(&layer.name).cloned() else {
+                    break;
+                };
+                Some(source)
+            } else {
+                None
+            };
+            let digest = if producer {
+                String::new()
+            } else {
+                match (&parent_digest, &layer.spec.parent) {
+                    (Some(digest), _) => digest.clone(),
+                    (None, ImageLayerParent::Image(image)) => {
+                        image.rsplit_once('@').map_or(image.as_str(), |(_, digest)| digest).to_string()
+                    }
+                    _ => return Err("first image stage requires a pinned base image".into()),
+                }
             };
             let inputs = ResolvedImageInputs::builder()
                 .parent_digest(digest)
-                .maybe_parent_recipe_key(parent_key.clone())
-                .architecture(source.architecture)
-                .content_hashes(source.content_hashes)
-                .args(source.args)
-                .pins(source.pins)
+                .maybe_parent_recipe_key(if producer { None } else { parent_key.clone() })
+                .maybe_link(if producer {
+                    layer.spec.link.clone().map(|definition| ResolvedLinkInputs { definition, requires: layer.spec.requires.clone() })
+                } else {
+                    None
+                })
+                .link_recipe_keys(link_source.as_ref().map(|source: &LinkImageSource| vec![source.recipe_key.clone()]).unwrap_or_default())
+                .architecture(source.architecture.clone())
+                .content_hashes(source.content_hashes.clone())
+                .args(source.args.clone())
+                .pins(source.pins.clone())
                 .stability(source.stability)
                 .build();
             let old = match composition.build_refs.get(index) {
                 Some(name) => match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
-                    Ok(old) if old.spec.inputs == inputs && old.spec.host_ref == host_ref => Some(old),
+                    Ok(old) if old.spec.inputs == inputs && old.spec.host_ref == *stage_host => Some(old),
                     Ok(_) | Err(ResourceError::NotFound { .. }) => None,
                     Err(error) => return Err(error.to_string()),
                 },
@@ -215,7 +328,7 @@ impl ImageBuildAdmission {
             };
             let nonce = old.and_then(|old| old.spec.execution_nonce).or_else(|| {
                 (inputs.stability == flotilla_resources::ImageInputStability::Unpinned)
-                    .then(|| format!("{host_ref}:{}", uuid::Uuid::new_v4()))
+                    .then(|| format!("{stage_host}:{}", uuid::Uuid::new_v4()))
             });
             let recipe_key = inputs.execution_key(nonce.as_deref())?;
             // A pinned recipe's built execution can serve every same-architecture
@@ -231,7 +344,14 @@ impl ImageBuildAdmission {
                     .filter(|build| {
                         build.spec.recipe_key == recipe_key
                             && build.spec.inputs == inputs
-                            && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
+                            && (build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
+                                || (producer
+                                    && build.status.as_ref().is_none_or(|status| {
+                                        matches!(
+                                            status.phase,
+                                            flotilla_resources::ImageBuildPhase::Queued | flotilla_resources::ImageBuildPhase::Building
+                                        )
+                                    })))
                     })
                     .min_by_key(|build| (build.spec.host_ref != placement_host, build.metadata.name.clone()))
                     .cloned()
@@ -241,7 +361,7 @@ impl ImageBuildAdmission {
             let name = shared
                 .as_ref()
                 .map(|build| build.metadata.name.clone())
-                .unwrap_or_else(|| format!("image-build-{}-{}", recipe_key.trim_start_matches("sha256:"), host_ref));
+                .unwrap_or_else(|| format!("image-build-{}-{}", recipe_key.trim_start_matches("sha256:"), stage_host));
             // The layer name is a declared field: read this layer's history only.
             let old_inputs = builds
                 .query_declared(&StoreQuery {
@@ -256,23 +376,33 @@ impl ImageBuildAdmission {
                 .filter(|old| {
                     old.spec.layer.name == layer.name
                         && old.spec.inputs.architecture == inputs.architecture
-                        && old.spec.host_ref == host_ref
+                        && old.spec.is_link_producer() == producer
+                        && old.spec.link_source.is_some() == link_source.is_some()
+                        && old.spec.host_ref == *stage_host
                         && old.spec.recipe_key != recipe_key
                 })
                 .max_by_key(|old| old.metadata.creation_timestamp)
                 .map(|old| old.spec.reason.new_inputs)
                 .unwrap_or_default();
+            let description = if producer {
+                "link producer demand"
+            } else if link_source.is_some() {
+                "link splice demand"
+            } else {
+                "composition demand"
+            };
             let spec = ImageBuildSpec::builder()
                 .recipe_key(recipe_key.clone())
                 .maybe_execution_nonce(nonce)
                 .inputs(inputs.clone())
                 .layer(layer.clone())
-                .host_ref(host_ref.clone())
-                .reservation(reservation.clone())
-                .maybe_parent_build_ref(parent.clone())
+                .host_ref(stage_host.clone())
+                .reservation(stage_reservation.clone())
+                .maybe_parent_build_ref(if producer { None } else { parent.clone() })
+                .maybe_link_source(link_source)
                 .attempt(0)
                 .reason(ImageBuildReason {
-                    description: "composition demand".into(),
+                    description: description.into(),
                     old_inputs,
                     new_inputs: BTreeMap::from([
                         ("architecture".into(), inputs.architecture.clone()),
@@ -297,8 +427,6 @@ impl ImageBuildAdmission {
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            parent = Some(name.clone());
-            parent_key = Some(recipe_key);
             joined.push(name.clone());
             let mut execution =
                 flotilla_store::read_image_build(&self.backend, &self.namespace, &name).await.map_err(|error| error.to_string())?;
@@ -310,7 +438,23 @@ impl ImageBuildAdmission {
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            let Some(status) = execution.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built) else {
+            let status = execution.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built);
+            if producer {
+                if let Some(status) = status {
+                    link_sources.insert(
+                        layer.name.clone(),
+                        LinkImageSource {
+                            build_ref: execution.metadata.name.clone(),
+                            recipe_key,
+                            identity: status.identity.clone().ok_or("built link producer has no identity")?,
+                        },
+                    );
+                }
+                continue;
+            }
+            parent = Some(name.clone());
+            parent_key = Some(recipe_key);
+            let Some(status) = status else {
                 break;
             };
             parent_digest = Some(status.identity.as_ref().ok_or("built parent has no identity")?.local_image_id.clone());

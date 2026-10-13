@@ -389,3 +389,186 @@ async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_iden
     assert_eq!(ready.local_image_id, Some(format!("sha256:{}", "3".repeat(64))));
     assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
 }
+
+// #3136 amendment: independently queued producers are shared across distinct
+// parents and same-architecture hosts. Only splices depend on the runtime chain.
+#[hegel::test]
+fn link_producers_share_execution_across_parents_and_hosts(tc: hegel::TestCase) {
+    // Both supported architectures and one/two link layers; host and parent
+    // differ between two simultaneous demands. No process or network runs.
+    let architecture = if tc.draw(hegel::generators::booleans()) { "amd64" } else { "arm64" };
+    let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(2));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        let capacity = Some(ImageBuildCapacity::Builder {
+            architecture: architecture.into(),
+            slots: 2,
+            reservation: ImageBuildReservation { cpu: 1, disk_bytes: 1 },
+        });
+        host(&backend, "local", architecture, capacity.clone()).await;
+        host(&backend, "other", architecture, capacity).await;
+        let admission = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs));
+        let mut left = composition();
+        for index in 0..count {
+            let name = format!("harness-{index}");
+            let mut layer = left.layers[0].clone();
+            layer.name = name.clone();
+            layer.spec.stage = ImageLayerStage::Capability;
+            layer.spec.parent = ImageLayerParent::Rebasable;
+            layer.spec.link = Some(flotilla_resources::LinkImageLayer {
+                builder_image: format!("sha256:{}", "d".repeat(64)),
+                outputs: BTreeSet::from([format!("/opt/flotilla/layers/{name}/"), format!("/opt/flotilla/bin/tool-{index}")]),
+            });
+            left.layers.push(layer);
+        }
+        let mut right = left.clone();
+        for layer in right.layers.iter_mut().skip(1) {
+            layer.spec.revision = "b".repeat(40);
+        }
+        right.layers[0].spec.parent = ImageLayerParent::Image(format!("sha256:{}", "e".repeat(64)));
+        left.build_refs = admission.join("local", &left).await.expect("left demand");
+        right.build_refs = admission.join("other", &right).await.expect("right demand");
+        assert_eq!(&left.build_refs[..count], &right.build_refs[..count]);
+        assert_ne!(left.build_refs.last(), right.build_refs.last());
+        let builds = backend.using::<ImageBuild>("test");
+        for reference in &left.build_refs[..count] {
+            let producer = builds.get(reference).await.expect("producer");
+            assert!(producer.spec.is_link_producer());
+            assert_eq!(producer.spec.host_ref, "local");
+            assert!(producer.spec.parent_build_ref.is_none());
+            assert!(producer.spec.inputs.parent_recipe_key.is_none());
+        }
+        let runner = Arc::new(Runner { calls: AtomicUsize::new(0), failure: None });
+        let local = ImageBuildReconciler::new(runner.clone(), backend.clone(), "test", "local");
+        let other = ImageBuildReconciler::new(runner.clone(), backend.clone(), "test", "other");
+        for _ in 0..count + 2 {
+            for build in builds.list().await.expect("executions").items {
+                let reconciler = if build.spec.host_ref == "local" { &local } else { &other };
+                tick(&backend, reconciler, &build.metadata.name).await;
+                tick(&backend, reconciler, &build.metadata.name).await;
+            }
+            left.build_refs = admission.join("local", &left).await.expect("continue left");
+            right.build_refs = admission.join("other", &right).await.expect("continue right");
+        }
+        assert_eq!(left.build_refs.len(), left.build_stage_count());
+        assert_eq!(right.build_refs.len(), right.build_stage_count());
+        let all = builds.list().await.expect("completed executions").items;
+        assert_eq!(all.iter().filter(|build| build.spec.is_link_producer()).count(), count);
+        for composition in [&left, &right] {
+            for reference in &composition.build_refs[count + 1..] {
+                let splice = builds.get(reference).await.expect("splice");
+                assert!(splice.spec.link_source.is_some());
+                let source = builds.get(&splice.spec.link_source.as_ref().expect("source").build_ref).await.expect("producer evidence");
+                assert!(splice.spec.accepts_link_source(&source.spec));
+                let mut changed = source.spec.clone();
+                changed.inputs.content_hashes = vec![format!("sha256:{}", "f".repeat(64))];
+                assert!(!splice.spec.accepts_link_source(&changed));
+                assert!(splice.spec.parent_build_ref.is_some());
+                assert_eq!(splice.spec.inputs.link_recipe_keys.len(), 1);
+                assert_eq!(splice.status.expect("splice status").phase, ImageBuildPhase::Built);
+            }
+        }
+        assert!(admission.completed(architecture, &left).await.expect("completed lookup").is_some());
+        // Architecture is a producer input, so another architecture cannot reuse
+        // the current producer or runtime chain.
+        assert!(admission
+            .completed(if architecture == "amd64" { "arm64" } else { "amd64" }, &left)
+            .await
+            .expect("architecture lookup")
+            .is_none());
+    });
+}
+
+// Provisioning must not bind the completed ordinary parent while independent
+// producers or splices remain unfinished. Each transition uses the real store.
+#[hegel::test]
+fn environment_waits_for_producers_and_every_splice(tc: hegel::TestCase) {
+    // One/two producers and both architectures, crossing the former logical
+    // layer-count completion boundary before any producer has completed.
+    let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(2));
+    let fail_audit = tc.draw(hegel::generators::booleans());
+    let arch = if tc.draw(hegel::generators::booleans()) { "amd64" } else { "arm64" };
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+        host(&backend, "local", arch, None).await;
+        let inputs = Arc::new(Inputs);
+        let admission = ImageBuildAdmission::new(backend.clone(), "test", inputs.clone());
+        let mut composition = composition();
+        for index in 0..count {
+            let name = format!("harness-{index}");
+            let mut layer = composition.layers[0].clone();
+            layer.name = name.clone();
+            layer.spec.stage = ImageLayerStage::Capability;
+            layer.spec.parent = ImageLayerParent::Rebasable;
+            layer.spec.link = Some(flotilla_resources::LinkImageLayer {
+                builder_image: format!("sha256:{}", "d".repeat(64)),
+                outputs: BTreeSet::from([format!("/opt/flotilla/layers/{name}/")]),
+            });
+            composition.layers.push(layer);
+        }
+        composition.build_refs = admission.join("local", &composition).await.expect("initial demand");
+        let producer_refs = composition.build_refs[..count].to_vec();
+        let root = composition.build_refs.last().expect("root").clone();
+        let docker = serde_json::from_value(
+            serde_json::json!({"host_ref":"local", "image":"", "image_build_ref":root, "image_composition":composition}),
+        )
+        .expect("Docker spec");
+        let environments = backend.using::<Environment>("test");
+        environments
+            .create(&InputMeta::builder().name("linked".into()).build(), &EnvironmentSpec { host_direct: None, docker: Some(docker) })
+            .await
+            .expect("environment");
+        let environment = EnvironmentReconciler::new(Arc::new(Docker), backend.clone(), "test").with_image_build_inputs(Some(inputs));
+        let runner = Arc::new(Runner { calls: AtomicUsize::new(0), failure: None });
+        let reconciler = ImageBuildReconciler::new(runner, backend.clone(), "test", "local");
+        tick(&backend, &reconciler, &root).await;
+        tick(&backend, &reconciler, &root).await;
+        let obj = environments.get("linked").await.expect("environment");
+        let prepared = environment.prepare(&obj).await.expect("wait for producers");
+        let patch = environment.reconcile(&obj, &prepared, Utc::now()).patch.expect("wait patch");
+        apply_status_patch(&environments, "linked", &patch).await.expect("wait status");
+        assert_eq!(environments.get("linked").await.expect("waiting").status.expect("status").phase, EnvironmentPhase::Provisioning);
+        if fail_audit {
+            let producer = &producer_refs[0];
+            apply_status_patch(
+                &backend.using::<ImageBuild>("test"),
+                producer,
+                &flotilla_resources::ImageBuildStatusPatch::Failed {
+                    at: Utc::now(),
+                    failure: ImageBuildFailure { class: ImageBuildFailureClass::Deterministic, reason: "output audit refused".into() },
+                    log_ref: "audit-log".into(),
+                },
+            )
+            .await
+            .expect("failed audit");
+            let obj = environments.get("linked").await.expect("environment");
+            let prepared = environment.prepare(&obj).await.expect("failed producer wait");
+            let patch = environment.reconcile(&obj, &prepared, Utc::now()).patch.expect("failed producer patch");
+            apply_status_patch(&environments, "linked", &patch).await.expect("waiting status");
+            let status = environments.get("linked").await.expect("waiting").status.expect("status");
+            assert_eq!(status.phase, EnvironmentPhase::Provisioning);
+            assert!(status.message.expect("failure message").contains("output audit refused"));
+            return;
+        }
+        for producer in producer_refs {
+            tick(&backend, &reconciler, &producer).await;
+            tick(&backend, &reconciler, &producer).await;
+        }
+        for _ in 0..count {
+            let obj = environments.get("linked").await.expect("environment");
+            let prepared = environment.prepare(&obj).await.expect("wait for splice");
+            let patch = environment.reconcile(&obj, &prepared, Utc::now()).patch.expect("splice wait patch");
+            apply_status_patch(&environments, "linked", &patch).await.expect("wait status");
+            let status = environments.get("linked").await.expect("waiting").status.expect("status");
+            assert_eq!(status.phase, EnvironmentPhase::Provisioning);
+            let splice = status.image_build_refs.last().expect("splice");
+            tick(&backend, &reconciler, splice).await;
+            tick(&backend, &reconciler, splice).await;
+        }
+        let obj = environments.get("linked").await.expect("environment");
+        let prepared = environment.prepare(&obj).await.expect("ready");
+        let patch = environment.reconcile(&obj, &prepared, Utc::now()).patch.expect("ready patch");
+        apply_status_patch(&environments, "linked", &patch).await.expect("ready status");
+        assert_eq!(environments.get("linked").await.expect("ready").status.expect("status").phase, EnvironmentPhase::Ready);
+    });
+}

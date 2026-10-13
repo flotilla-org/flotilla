@@ -60,10 +60,13 @@ class Composition(unittest.TestCase):
         for spec in harnesses:
             self.assertEqual(len(spec['provides']), 1)
             self.assertEqual(set(spec['probes']), set(spec['provides']))
-            self.assertEqual(len(spec['pins']), 1)
+            self.assertEqual(set(spec['pins']), {'NODE_VERSION', 'CODEX_VERSION' if spec['provides'][0].startswith('harness:codex@') else 'CLAUDE_CODE_VERSION'})
             text = (ROOT / spec['fragment']).read_text()
-            self.assertIn('FROM ${BASE}', text)
-            self.assertEqual(text.count('npm install --global'), 1)
+            self.assertNotIn('FROM ', text)
+            self.assertIn('/out/opt/flotilla/layers/', text)
+            self.assertEqual(spec['requires'], ['toolchain:node>=24.18.0', 'runtime:glibc>=2.39'])
+            self.assertIn('/opt/flotilla/layers/' + ('harness-codex/' if spec['provides'][0].startswith('harness:codex@') else 'harness-claude-code/'), spec['link']['outputs'])
+            self.assertEqual(text.count('npm install --prefix'), 1)
             self.assertEqual('@anthropic-ai/claude-code' in text,
                              spec['provides'][0].startswith('harness:claude-code@'))
             self.assertEqual('@openai/codex' in text,
@@ -159,6 +162,48 @@ class Composition(unittest.TestCase):
                 return source(path, *args, **kwargs) + ('\nRUN echo changed\n' if path == selected else '')
             with patch.object(Path, 'read_text', edited):
                 self.assertNotEqual(dockerfile(display=True, formal_modelling=True), original)
+
+
+class LinkAudit(unittest.TestCase):
+    def test_output_audit_enforces_namespaces_symlinks_and_declared_files(self):
+        # Real filesystem audit; vary valid, undeclared, escaping and missing
+        # outputs without starting a container or modifying /out on the host.
+        for invalid in [None, 'outside', 'undeclared-bin', 'bin-file', 'escape', 'missing']:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                private = root / 'opt/flotilla/layers/harness-test'
+                private.mkdir(parents=True)
+                (private / 'tool').write_text('self-contained executable')
+                binary = root / 'opt/flotilla/bin/tool'
+                binary.parent.mkdir(parents=True)
+                binary.symlink_to('/opt/flotilla/layers/harness-test/tool')
+                if invalid == 'outside':
+                    (root / 'etc').mkdir()
+                    (root / 'etc/profile').write_text('forbidden')
+                elif invalid == 'undeclared-bin':
+                    binary.with_name('other').symlink_to('/opt/flotilla/layers/harness-test/tool')
+                elif invalid == 'bin-file':
+                    binary.unlink()
+                    binary.write_text('not a symlink')
+                elif invalid == 'escape':
+                    binary.unlink()
+                    binary.symlink_to('/opt/flotilla/layers/harness-test/../../../../etc/passwd')
+                elif invalid == 'missing':
+                    binary.unlink()
+                result = subprocess.run(['sh', str(ROOT / 'ci/crew-image/link-audit.sh'),
+                                         'harness-test', '/opt/flotilla/layers/harness-test/', '/opt/flotilla/bin/tool'],
+                                        env=dict(os.environ, FLOTILLA_LINK_OUTPUT_ROOT=str(root)), capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, invalid is None, (invalid, result.stderr))
+
+    def test_compatibility_splice_is_copy_only_and_keeps_probes_in_runtime(self):
+        text = dockerfile()
+        self.assertIn('ENV PATH="/opt/flotilla/bin:', text)
+        self.assertIn('FROM ubuntu:24.04 AS audit-harness-codex', text)
+        for name in ['harness-claude-code', 'harness-codex']:
+            stage = text.split(' AS ' + name + '\n', 1)[1].split('\nFROM ', 1)[0]
+            self.assertNotIn('RUN ', stage)
+            self.assertNotIn('ENV ', stage)
+            self.assertIn('COPY --link --from=output-' + name + ' --chown=0:0', stage)
 
 
 class AcceptanceCommand(unittest.TestCase):

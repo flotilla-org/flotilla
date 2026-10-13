@@ -323,9 +323,16 @@ image-build acceptance before publishing this layer.
 Roll the candidate decoder before applying the new stored selection shape.
 Validate live stores and the unchanged golden corpus with the candidate. Frozen
 convoys retain their recorded layer order and realised identities on relaunch.
-For new admissions the chain is base → utilities → project → capabilities
-(sorted by name) → harnesses (sorted by name), keeping volatile harness installs
-above expensive project dependencies.
+For new admissions ordinary layers follow base → utilities → project →
+capabilities → ordinary harnesses (each optional stage sorted by name). Link
+layers splice last by name. The two fleet harnesses are independent link
+producers built from declared Ubuntu 24.04 builders, using the existing Node pin.
+Their output is audited and spliced with COPY --link; their probes run against
+the resulting runtime image. Node and glibc are declared lower-layer runtime
+requirements. The base and utilities expose `/opt/flotilla/bin` on PATH.
+Parent bumps change splice keys while retaining pinned producer keys. Current
+fleet inputs remain unpinned until #3137 and therefore use non-shareable execution
+nonces; this change makes no reproducible cache claim for those inputs.
 
 Regenerate `robert/fleet`'s `image-layers/fleet-image-layers.yaml` with the command
 above using the merged Flotilla revision and the existing resolved base digest.
@@ -333,6 +340,8 @@ Review and commit the generated definitions, then apply them through the normal
 fleet operational manifest workflow. Apply the three per-host policies from
 `.flotilla/placement-policy.crew-image{,-feta,-udder}.yaml` after those definitions
 are available. These policies retain both harnesses as defaults; explicit
-`harness:*` needs select only the minimum covering layers. Retire the old
-`spine-harness` definition after no frozen convoy references it. Do not rewrite
+`harness:*` needs select only the minimum covering layers. After all policy cut-overs, remove `spine-harness` from the live catalogue so
+new multi-harness admissions cannot prefer its one-layer bundled cover. Frozen
+convoys retain their own layer specs and source revisions; they do not need the
+old live definition to relaunch. Retain those frozen copies and identities. Do not rewrite
 existing convoy snapshots or realised image identities.

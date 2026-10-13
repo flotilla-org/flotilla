@@ -990,14 +990,20 @@ An independently versioned contribution to a crew image. It declares the
 capabilities it provides and what must be available beneath it (ADR 0053).
 _Avoid_: composed image definition (compositions are computed).
 
+**Link Layer**:
+An Image Layer that contributes a self-contained set of files without modifying
+what is beneath it. The same contribution can serve different Image Compositions.
+_Avoid_: rebuilt parent stage (an ordinary layer has that dependency).
+
 **Image Composition**:
-The base, utilities, needed capabilities, harness and project layers selected
+The base, utilities, project, needed capabilities and harness layers selected
 for a vessel's need-set, in canonical order. Convoy members share the frozen
-base and harness; newly needed capabilities extend the frozen selection.
+base and default harness selection; newly needed layers extend the frozen catalogue.
 
 **Recipe Key**:
-The identity of resolved build inputs and their parent chain for one target
-architecture. Equal pinned inputs share a key across hosts; the key is distinct
+The identity of resolved build inputs for one target architecture. Ordinary
+layers include their parent chain; a Link Layer contribution is independent of
+that chain, while its placement into an Image Composition depends on both. Equal pinned inputs share a key across hosts; the key is distinct
 from the actual built image identity.
 
 **Environment Provider**:

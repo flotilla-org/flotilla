@@ -24,6 +24,27 @@ impl Resource for ImageBuild {
             return Err(ResourceError::invalid("image build recipe key does not match resolved inputs"));
         }
         spec.layer.spec.validate().map_err(ResourceError::invalid)?;
+        if let Some(link) = &spec.layer.spec.link {
+            link.validate(&spec.layer.name).map_err(ResourceError::invalid)?;
+            if spec.is_link_producer() {
+                if spec.parent_build_ref.is_some()
+                    || spec.inputs.parent_recipe_key.is_some()
+                    || spec.inputs.link.as_ref().is_none_or(|input| input.definition != *link || input.requires != spec.layer.spec.requires)
+                    || !spec.inputs.link_recipe_keys.is_empty()
+                {
+                    return Err(ResourceError::invalid("link producer has inconsistent or parent-dependent inputs"));
+                }
+            } else {
+                let source = spec.link_source.as_ref().expect("splice source");
+                source.identity.validate().map_err(ResourceError::invalid)?;
+                if source.build_ref.is_empty() || spec.inputs.link.is_some() || spec.inputs.link_recipe_keys != [source.recipe_key.clone()]
+                {
+                    return Err(ResourceError::invalid("link splice has inconsistent source inputs"));
+                }
+            }
+        } else if spec.link_source.is_some() || spec.inputs.link.is_some() || !spec.inputs.link_recipe_keys.is_empty() {
+            return Err(ResourceError::invalid("ordinary image build contains link inputs"));
+        }
         if spec.host_ref.is_empty() || spec.reservation.cpu == 0 || spec.reservation.disk_bytes == 0 {
             return Err(ResourceError::invalid("image build needs a host and positive CPU and disk reservation"));
         }
@@ -54,6 +75,9 @@ impl Resource for ImageBuild {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct ImageBuildSpec {
+    /// Absent for ordinary builds and independent link producers (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_source: Option<LinkImageSource>,
     pub recipe_key: String,
     pub execution_nonce: Option<String>,
     pub inputs: ResolvedImageInputs,
@@ -73,6 +97,37 @@ pub struct ImageBuildReason {
     pub description: String,
     pub old_inputs: BTreeMap<String, String>,
     pub new_inputs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkImageSource {
+    pub build_ref: String,
+    pub recipe_key: String,
+    pub identity: PlacedImageIdentity,
+}
+
+impl ImageBuildSpec {
+    pub fn is_link_producer(&self) -> bool {
+        self.layer.spec.link.is_some() && self.link_source.is_none()
+    }
+    /// Revision/repository metadata can change while resolved producer inputs
+    /// remain identical. Reuse those files without accepting changed content,
+    /// architecture, runtime requirements or output namespaces.
+    pub fn accepts_link_source(&self, source: &Self) -> bool {
+        let Some(link) = &self.layer.spec.link else {
+            return false;
+        };
+        source.is_link_producer()
+            && source.layer.name == self.layer.name
+            && source.layer.spec.provides == self.layer.spec.provides
+            && source.layer.spec.probes == self.layer.spec.probes
+            && source.inputs.architecture == self.inputs.architecture
+            && source.inputs.content_hashes == self.inputs.content_hashes
+            && source.inputs.args == self.inputs.args
+            && source.inputs.pins == self.inputs.pins
+            && source.inputs.link.as_ref().is_some_and(|inputs| inputs.definition == *link && inputs.requires == self.layer.spec.requires)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
