@@ -10,7 +10,7 @@ flotilla_run_with_preludes() (
     if { [ -e "$flotilla_prelude_dir" ] && { [ ! -r "$flotilla_prelude_dir" ] || [ ! -x "$flotilla_prelude_dir" ]; }; } \
         || { [ ! -e "$flotilla_prelude_dir" ] && [ -n "$flotilla_prelude_parent" ] && [ -d "$flotilla_prelude_parent" ] \
             && [ ! -x "$flotilla_prelude_parent" ]; }; then
-        printf 'Flotilla prelude directory is not readable: %s\n' "$flotilla_prelude_dir" >&2
+        printf 'Flotilla prelude directory is not readable or searchable: %s\n' "$flotilla_prelude_dir" >&2
         exit 1
     fi
     if [ -d "$flotilla_prelude_dir" ]; then

@@ -218,6 +218,16 @@ mod tests {
         let preludes = parent.join("prelude.d");
         std::fs::create_dir_all(&preludes).expect("preludes");
         std::fs::write(preludes.join("40-step.sh"), "export FLOTILLA_TEST_TRACE=ran\n").expect("prelude");
+        // Restore searchable modes even when an assertion fails, so the tempdir can be removed.
+        struct Restore<'a>(&'a [&'a std::path::Path]);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                for dir in self.0 {
+                    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+        let _restore = Restore(&[parent.as_path(), preludes.as_path()]);
         for (dir, mode) in [(&preludes, 0o644), (&parent, 0o644)] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
             let result = Command::new("sh")
@@ -230,12 +240,10 @@ mod tests {
                 .expect("launch shell");
             let stderr = String::from_utf8(result.stderr).expect("stderr");
             assert_eq!(String::from_utf8(result.stdout).expect("stdout"), "", "{}", dir.display());
-            assert!(stderr.contains("Flotilla prelude directory is not readable"), "{stderr}");
+            assert!(stderr.contains("Flotilla prelude directory is not readable or searchable"), "{stderr}");
             let receipt = std::fs::read_to_string(cwd.path().join(exit_receipt("prelude-test"))).expect("receipt");
             assert_eq!(receipt.trim(), "1");
         }
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).expect("restore");
-        std::fs::set_permissions(&preludes, std::fs::Permissions::from_mode(0o755)).expect("restore");
     }
     // Fake only the environment subprocess boundary; files remain real-backed.
     #[derive(Default)]
