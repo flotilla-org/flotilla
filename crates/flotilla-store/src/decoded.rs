@@ -58,9 +58,15 @@ impl DecodedObject {
             Ok(object) => return Ok(*object),
             Err(object) => object,
         };
+        let name = (self.name)(object.as_ref()).to_string();
         match object.downcast::<ResourceObject<SerializedResource>>() {
             Ok(object) => typed_object(*object),
-            Err(_) => Err(ResourceError::other(format!("decoded row is not a {}", T::API_PATHS.kind))),
+            Err(_) => {
+                // A row decoded for one kind and unwrapped as another is a
+                // programming error in the caller, not a data error.
+                debug_assert!(false, "decoded row '{name}' unwrapped as {}", T::API_PATHS.kind);
+                Err(ResourceError::other(format!("decoded row '{name}' is not a {}", T::API_PATHS.kind)))
+            }
         }
     }
 
