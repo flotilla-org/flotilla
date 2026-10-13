@@ -37,6 +37,15 @@ class BootstrapValidationTests(unittest.TestCase):
             for path in ("fleet-canary.sh", "../fleet-canary.py", "bin/fleet-canary.py"):
                 self.assertFalse(validation.allowed_payload(path, platform))
 
+    # cleat's database and license are release data. Earlier generations may
+    # omit them so health rollback remains valid.
+    def test_terminfo_payload_accepts_release_data_without_requiring_old_generations(self):
+        for platform in validation.PLATFORMS:
+            for path in ("share/terminfo/x/xterm-ghostty", "share/terminfo/LICENSE"):
+                self.assertTrue(validation.allowed_payload(path, platform))
+                self.assertNotIn(path, validation.REQUIRED_PAYLOAD)
+            self.assertFalse(validation.allowed_payload("share/other/xterm-ghostty", platform))
+
     # Exercise the executable boundary with installer argument ordering, including
     # a dash-leading package name. Validation failures produce concise refusals.
     def test_cli_dispatch(self):

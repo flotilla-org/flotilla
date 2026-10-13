@@ -110,6 +110,15 @@ impl EnvironmentTool {
 ///
 /// The source is deliberately described as a host path rather than as a bind
 /// mount. Bind mounting is one provider's delivery strategy, not the contract.
+/// Generation tools deliver stable real directories for `tools`, `bin`, `lib`,
+/// and `share/terminfo`, mounted/copied to the matching `/opt/flotilla` children.
+/// Relative links from the latter three follow `tools/current`, which selects
+/// `tools/<identity>`. Preserve these links and expose atomic replacement to
+/// running vessels: Docker binds the real directories; k8s populates a shared
+/// volume; sandboxes upload a generation before replacing the current link.
+/// ReadOnly describes guest access; the provider owns and rewrites the source.
+/// Do not mount resolved generation children (they pin the vessel), or the whole
+/// `/opt/flotilla` parent (it would hide image-owned harnesses).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentToolAsset {
     pub host_path: DaemonHostPath,

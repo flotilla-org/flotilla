@@ -64,6 +64,10 @@ struct LocalToolContext<'a> {
 // Enrollment order is delivery order. Add new local-host tools here; runtime
 // and provider delivery plumbing do not need to know their identities.
 type ToolRegistration = fn(&LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory>;
+#[cfg(unix)]
+const REGISTERED_TOOLS: &[ToolRegistration] = &[FleetToolsTool::for_local_host, RustBuildLimitsTool::for_local_host];
+
+#[cfg(not(unix))]
 const REGISTERED_TOOLS: &[ToolRegistration] =
     &[FlotillaCliTool::for_local_host, CleatTool::for_local_host, RustBuildLimitsTool::for_local_host];
 
@@ -139,6 +143,71 @@ impl EnvironmentToolProvisioner {
             Arc::new(FlotillaCliTool { binary_path: Ok(flotilla_binary_path), daemon_socket_path: Ok(daemon_socket_path) }),
             Arc::new(FailingTool { name: "cleat", error: error.into() }),
         ])
+    }
+}
+
+/// Stable real directory assets let bind mounts see link replacement without
+/// masking image-owned harnesses. Other providers can populate volumes/upload.
+#[cfg(unix)]
+struct FleetToolsTool {
+    cli: Arc<dyn EnvironmentToolFactory>,
+    cleat: Arc<dyn EnvironmentToolFactory>,
+    root: PathBuf,
+}
+#[cfg(unix)]
+impl FleetToolsTool {
+    fn for_local_host(context: &LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory> {
+        Arc::new(Self {
+            cli: FlotillaCliTool::for_local_host(context),
+            cleat: CleatTool::for_local_host(context),
+            root: context.config.state_dir().join("environment-tools/fleet").as_path().to_path_buf(),
+        })
+    }
+}
+#[cfg(unix)]
+#[async_trait]
+impl EnvironmentToolFactory for FleetToolsTool {
+    fn provider_kinds(&self) -> &[EnvironmentToolProviderKind] {
+        &[DOCKER_PROVIDER_KIND]
+    }
+    async fn prepare(&self, name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
+        let mut cli = self.cli.prepare(name, context).await?;
+        let cleat = self.cleat.prepare(name, context).await?;
+        let binary = cleat.assets[0].host_path.as_path();
+        // The library prefix owns terminfo too; both come from the same pin.
+        let library = cleat.assets[1].host_path.as_path();
+        let prefix = library.parent().and_then(Path::parent).ok_or("cleat library has no installation prefix")?;
+        let terminfo = prefix.join("share/terminfo");
+        let flotilla = cli.assets[0].host_path.as_path().join("flotilla");
+        flotilla_environment::tools::publish(
+            &self.root,
+            &flotilla_environment::tools::ToolsSource { flotilla: &flotilla, cleat: binary, library, terminfo: &terminfo },
+        )
+        .map_err(|error| format!("publish fleet tools: {error}"))?;
+        cli.assets.remove(0);
+        for directory in ["tools", "bin", "lib", "share/terminfo"] {
+            cli.assets.push(EnvironmentToolAsset::new(
+                self.root.join(directory),
+                Path::new("/opt/flotilla").join(directory),
+                EnvironmentToolAssetKind::Directory,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "generation tools",
+            ));
+        }
+        cli.assets.extend(cleat.assets.into_iter().skip(2));
+        cli.environment.extend(cleat.environment.into_iter().filter(|update| {
+            !matches!(update,
+            EnvironmentVariableUpdate::PrependPath { name, .. } if name == "LD_LIBRARY_PATH")
+        }));
+        // Candidate cleat uses $ORIGIN/../lib. A current-link LD_LIBRARY_PATH
+        // would mix an already-selected old binary with a newly-flipped library.
+        cli.environment.push(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/bin"));
+        cli.environment.push(EnvironmentVariableUpdate::set(
+            "TERMINFO_DIRS",
+            "/opt/flotilla/share/terminfo:/usr/share/terminfo",
+            "cleat terminfo",
+        ));
+        Ok(cli)
     }
 }
 
@@ -664,6 +733,48 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    // Generation tools expose stable real directories and complete assets,
+    // preserving image siblings while later link replacement remains visible.
+    #[tokio::test]
+    async fn fleet_tools_publish_complete_generations_through_stable_directory_assets() {
+        let temp = TempDir::new().unwrap();
+        let release = temp.path().join("release");
+        for directory in ["bin", "lib", "share/terminfo/x"] {
+            fs::create_dir_all(release.join(directory)).unwrap();
+        }
+        for file in ["bin/flotilla", "bin/cleat", "lib/libghostty-vt.so.0", "share/terminfo/x/xterm-ghostty"] {
+            fs::write(release.join(file), b"first").unwrap();
+        }
+        let factory = FleetToolsTool {
+            cli: Arc::new(FlotillaCliTool {
+                binary_path: Ok(DaemonHostPath::new(release.join("bin/flotilla"))),
+                daemon_socket_path: Ok(DaemonHostPath::new(temp.path().join("run/flotilla.sock"))),
+            }),
+            cleat: Arc::new(CleatTool {
+                binary_path: Ok(DaemonHostPath::new(release.join("bin/cleat"))),
+                ghostty_library_path: OnceCell::new_with(Some(DaemonHostPath::new(release.join("lib/libghostty-vt.so.0")))),
+                state_root: temp.path().join("state/cleat"),
+                runner: None,
+            }),
+            root: temp.path().join("provider"),
+        };
+        let tool = factory.prepare("vessel", &TestToolContext).await.unwrap();
+        let parent = tool.assets.iter().find(|asset| asset.environment_path.as_path() == Path::new("/opt/flotilla/bin")).unwrap();
+        assert_eq!(parent.host_path.as_path(), factory.root.join("bin"));
+        assert!(tool.assets.iter().all(|asset| asset.environment_path.as_path() != Path::new("/opt/flotilla")));
+        assert_eq!(parent.kind, EnvironmentToolAssetKind::Directory);
+        assert!(tool
+            .environment
+            .iter()
+            .all(|update| !matches!(update, EnvironmentVariableUpdate::PrependPath { name, .. } if name == "LD_LIBRARY_PATH")));
+        assert!(tool.assets.iter().all(|asset| asset.kind != EnvironmentToolAssetKind::File
+            || asset.environment_path.as_path() == Path::new(ENVIRONMENT_FLOTILLA_PATH)));
+        fs::write(release.join("bin/cleat"), b"second").unwrap();
+        factory.prepare("another-vessel", &TestToolContext).await.unwrap();
+        assert_eq!(fs::read(parent.host_path.as_path().join("cleat")).unwrap(), b"second");
+        assert_eq!(fs::read(factory.root.join("share/terminfo/x/xterm-ghostty")).unwrap(), b"first");
+    }
 
     #[test]
     fn resolves_detected_host_binary_names_through_path() {
