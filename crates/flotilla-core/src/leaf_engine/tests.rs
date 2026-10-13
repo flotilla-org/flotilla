@@ -699,7 +699,7 @@ async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
 
 // #2701: a merged PR wakes an unclaimed crew exactly once, including after
 // subscription reconstruction. A claimed or terminal crew is never reopened.
-async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
+async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool, stalled: bool, open_ledger: bool) {
     use flotilla_protocol::Relationship;
     use flotilla_resources::{Observation, ObservedChangeRequestState, SubjectDiscoverySource};
     let backend = ResourceBackend::new(InMemoryBackend::default());
@@ -721,6 +721,7 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         started_at: Some(base),
+        observed_workflow_ref: Some("single-agent".into()),
         workflow_snapshot: Some(WorkflowSnapshot {
             cascade: None,
             stall_nudges: workflow.stall_nudges,
@@ -761,11 +762,20 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
         )
         .await
         .expect("PR record");
-    // Pending, stalled and terminal crews do not owe an active settlement turn.
-    for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Stalled, CrewWorkPhase::Done, CrewWorkPhase::Failed, CrewWorkPhase::HandedBack] {
+    // Pending and terminal crews do not owe an active settlement turn.
+    for (phase, finished_at) in [
+        (CrewWorkPhase::Pending, None),
+        (CrewWorkPhase::Done, None),
+        (CrewWorkPhase::Failed, None),
+        (CrewWorkPhase::HandedBack, None),
+        (CrewWorkPhase::Working, Some(base)),
+        (CrewWorkPhase::Interrupted, Some(base)),
+        (CrewWorkPhase::Stalled, Some(base)),
+    ] {
         let current = convoys.get("checks-wake").await.expect("convoy");
         let mut status = current.status.expect("status");
         status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = phase;
+        status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").finished_at = finished_at;
         let updated = convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("inactive crew");
         wake.sync_rows("flotilla", &HashMap::from([("checks-wake".into(), updated)])).await.expect("inactive subscriptions");
         assert!(
@@ -780,6 +790,57 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
     let current = convoys.get("checks-wake").await.expect("convoy");
     let mut status = current.status.expect("status");
     status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = CrewWorkPhase::Interrupted;
+    status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").finished_at = None;
+    if stalled {
+        use flotilla_resources::promises::{self, PromiseKind, PromiseOperation, PromiseSource, Submission};
+        promises::apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Submit {
+                id: "implementation-pr".into(),
+                kind: PromiseKind::Pr,
+                source: PromiseSource::Crew,
+                submission: Submission {
+                    reference: "cr/github.com/flotilla-org/flotilla/2596".into(),
+                    metadata: BTreeMap::new(),
+                    submitted_at: base,
+                    verdict: None,
+                },
+            },
+        );
+        promises::apply(
+            &mut status,
+            "work",
+            "coder",
+            &PromiseOperation::Declare {
+                id: "settlement-ledger".into(),
+                kind: PromiseKind::DecisionLedger,
+                source: if open_ledger { PromiseSource::Template } else { PromiseSource::Crew },
+            },
+        );
+        if !open_ledger {
+            promises::apply(
+                &mut status,
+                "work",
+                "coder",
+                &PromiseOperation::Retract { id: "settlement-ledger".into(), reason: "not required in this scenario".into() },
+            );
+        }
+        external_patches::mark_crew_stalled(
+            "checks-wake".into(),
+            "work".into(),
+            "coder".into(),
+            base,
+            flotilla_resources::StallReason::Infra,
+            None,
+            "waiting on PR".into(),
+        )
+        .apply(&mut status);
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+        assert!(status.crew_work["work"]["coder"].finished_at.is_none());
+        assert_eq!(status.stalled.as_ref().expect("crew stall").rung, StallRung::Operator);
+    }
     convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("yielded crew");
     let observed = flotilla_resources::ChangeRequestStatus {
         state: Observation::known(ObservedChangeRequestState::Merged, Utc::now()),
@@ -794,6 +855,25 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
     };
     let record = records.get(&name).await.expect("record");
     let record = records.update_status(&name, &record.metadata.resource_version, &observed).await.expect("merged observation");
+    if stalled {
+        let current = convoys.get("checks-wake").await.expect("convoy");
+        let mut status = current.status.expect("status");
+        flotilla_resources::promises::next_observation(
+            &status,
+            "checks-wake",
+            &BTreeMap::from([(name.clone(), record.clone())]),
+            &BTreeMap::new(),
+            Utc::now(),
+            Duration::from_secs(60),
+        )
+        .expect("PR merge keeps submitted promise")
+        .apply(&mut status);
+        assert_eq!(
+            flotilla_resources::promises::owned(&status, "work", "coder")[0].state,
+            flotilla_resources::promises::PromiseState::Kept
+        );
+        convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("kept PR");
+    }
     for _ in 0..repeats {
         let objects = HashMap::from([("checks-wake".into(), convoys.get("checks-wake").await.expect("convoy"))]);
         wake.sync_rows("flotilla", &objects).await.expect("subscriptions");
@@ -843,6 +923,18 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
         let current = convoys.get("checks-wake").await.expect("convoy");
         assert_eq!(current.status.expect("status").turn_deliveries["merged-unclaimed"].episodes.len(), 1);
     }
+    let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
+    // With no pending promises, merged settlement preserves the existing brief
+    // without appending an empty promise-resolution section.
+    if !stalled {
+        assert!(!brief.contains("Resolve these non-terminal promises"));
+    }
+    if stalled {
+        assert_eq!(brief.contains("- `settlement-ledger` (decision-ledger)"), open_ledger);
+        assert!(!brief.contains("- `implementation-pr`"));
+        let current = convoys.get("checks-wake").await.expect("resumed");
+        assert_eq!(current.status.as_ref().expect("status").crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    }
     let subject = actuator.requests.lock().unwrap()[0].message_subject.clone().unwrap();
     if unknown_head {
         assert!(matches!(subject, flotilla_resources::MessageReference::ControlRecord { resource, revision }
@@ -854,9 +946,87 @@ async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
     assert!(actuator.requests.lock().expect("requests")[0].brief.contains("decision ledger"));
     let current = convoys.get("checks-wake").await.expect("convoy");
     let mut status = current.status.expect("status");
-    let crew = status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew");
-    crew.phase = CrewWorkPhase::Done;
-    crew.finished_at = Some(base);
+    if stalled {
+        if open_ledger {
+            let artifacts = backend.using::<Artifact>("flotilla");
+            let ledger_name = flotilla_resources::artifact_record_name("checks-wake", "coder", "decision-ledger", "checks-wake");
+            let ledger = artifacts
+                .create(
+                    &InputMeta::builder().name(ledger_name.clone()).build(),
+                    &flotilla_resources::ArtifactSpec::builder()
+                        .convoy("checks-wake".into())
+                        .producer("coder".into())
+                        .kind("decision-ledger".into())
+                        .subject("checks-wake".into())
+                        .digest("ledger-digest".into())
+                        .size(1)
+                        .media_type("text/markdown".into())
+                        .expires_at(Utc::now() + chrono::Duration::days(1))
+                        .build(),
+                )
+                .await
+                .expect("ledger artifact");
+            let artifacts = BTreeMap::from([(ledger_name, ledger)]);
+            while let Some(patch) = flotilla_resources::promises::next_observation(
+                &status,
+                "checks-wake",
+                &BTreeMap::from([(name.clone(), record.clone())]),
+                &artifacts,
+                Utc::now(),
+                Duration::from_secs(60),
+            ) {
+                patch.apply(&mut status);
+            }
+        }
+        assert!(flotilla_resources::promises::pending(&status, "work", "coder").is_empty());
+    }
+    external_patches::mark_crew_completed_with_context(
+        "work".into(),
+        "coder".into(),
+        Utc::now(),
+        Some("settled".into()),
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+    if stalled {
+        convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("crew completes");
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: convoys.clone(),
+                // Primary status watches drive completion rollup; use the
+                // explicit merged observation rather than a network refresher.
+                secondaries: Vec::new(),
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+                    .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(60)),
+                resync_interval: Duration::from_secs(3600),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
+        let landed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if convoys.get("checks-wake").await.expect("convoy").status.expect("status").phase == ConvoyPhase::Landed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            landed.is_ok(),
+            "merged stalled crew completes and convoy lands: {:?}",
+            convoys.get("checks-wake").await.expect("held convoy").status
+        );
+        controller.abort();
+        // The stalled scenario ends at Landed; cached-row and claimed-crew
+        // assertions below exercise the non-stalled path before landing.
+        return;
+    }
     let stale_row = table
         .rows()
         .await
