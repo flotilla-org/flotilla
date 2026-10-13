@@ -107,7 +107,8 @@ fn placement_baseline_provenance_round_trips_and_never_infers_literal_tags(tc: h
 // ADR 0062: a composed placement freezes `Built { identity, image_build_ref }`;
 // it has no launchable reference until its ImageBuild is Built, so resolution
 // refuses rather than substituting another image. The ADR 0053 composition
-// form decodes as an omitted image (ADR 0047), and literals stay literal.
+// form decodes as the image it carried, or as omitted (ADR 0047), and
+// literals stay literal.
 #[hegel::test]
 fn composed_sources_never_resolve_to_another_image(tc: hegel::TestCase) {
     let size = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(70));
@@ -122,7 +123,13 @@ fn composed_sources_never_resolve_to_another_image(tc: hegel::TestCase) {
         .image
     };
     assert_eq!(policy(serde_json::to_value(&built).expect("encode")), Some(built.clone()));
-    assert_eq!(policy(json!({"composition": {"selection": {"base": "base"}, "layers": [], "literal_base": literal}})), None);
+    // An ADR 0053 composition keeps the literal base it carried; an empty one
+    // carried nothing and decodes as omitted.
+    assert_eq!(
+        policy(json!({"composition": {"selection": {"base": "base"}, "layers": [], "literal_base": literal}})),
+        (size > 0).then(|| DockerImageSource::Literal(literal.clone()))
+    );
+    assert_eq!(policy(json!({"composition": {"selection": {"base": "base"}, "layers": []}})), None);
     assert_eq!(policy(json!(literal)), Some(DockerImageSource::Literal(literal.clone())));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
