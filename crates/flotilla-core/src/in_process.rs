@@ -5,6 +5,7 @@
 
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
+use flotilla_resources::ResumeIntent;
 use flotilla_store::ResolvedCascadeStoreExt;
 use flotilla_store_memory::InMemoryBackend;
 
@@ -5352,9 +5353,9 @@ impl InProcessDaemon {
         prompt: &str,
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
-        reopen: bool,
+        intent: ResumeIntent,
     ) -> Result<ConvoyResumeOutcome, String> {
-        if !reopen {
+        if intent == ResumeIntent::Reminder {
             return self.crew_ops.resume(namespace, name, prompt, requested_vessel, requested_role).await;
         }
         self.crew_ops
@@ -5362,10 +5363,9 @@ impl InProcessDaemon {
                 namespace,
                 name,
                 prompt,
-                requested_vessel,
-                requested_role,
+                (requested_vessel, requested_role),
                 crew_ops::MessageAttribution::operator(None),
-                reopen,
+                intent,
             )
             .await
     }

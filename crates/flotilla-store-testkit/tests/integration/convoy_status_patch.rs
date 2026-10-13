@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{TimeZone, Utc};
@@ -791,8 +792,15 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         lifecycle_mutations: Vec::new(),
     };
 
-    external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string(), None, true)
-        .apply(&mut status);
+    external_patches::resume_crew_work(
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(20),
+        "Rebase onto main".to_string(),
+        None,
+        ResumeIntent::Reopen,
+    )
+    .apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.work["implement"].phase, WorkPhase::Running);
@@ -1490,8 +1498,15 @@ fn turn_activation_restoration_preserves_concurrent_status(tc: hegel::TestCase) 
         ..Default::default()
     };
     let mut activated = previous.clone();
-    external_patches::resume_crew_work("implement".into(), "coder".into(), ts(20), "continue".into(), Some("intent".into()), true)
-        .apply(&mut activated);
+    external_patches::resume_crew_work(
+        "implement".into(),
+        "coder".into(),
+        ts(20),
+        "continue".into(),
+        Some("intent".into()),
+        ResumeIntent::Reopen,
+    )
+    .apply(&mut activated);
     let mut current = activated.clone();
     if target_changed {
         current.crew_work.get_mut("implement").expect("crew").get_mut("coder").expect("target").message = Some("newer action".into());
@@ -1604,7 +1619,8 @@ fn landing_claims_wait_for_every_crew_and_remain_frozen(tc: hegel::TestCase) {
     assert_eq!(decoded.phase, ConvoyPhase::Landing);
     assert!(decoded.landing_entry.is_none() && decoded.landing_settlement.is_none());
 
-    external_patches::resume_crew_work("work".into(), roles[0].clone(), ts(110), "review follow-up".into(), None, true).apply(&mut status);
+    external_patches::resume_crew_work("work".into(), roles[0].clone(), ts(110), "review follow-up".into(), None, ResumeIntent::Reopen)
+        .apply(&mut status);
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.landing_entry.as_ref(), Some(&entry), "historical evidence survives reopening");
     external_patches::mark_crew_completed_with_context(

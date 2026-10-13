@@ -41,7 +41,7 @@ pub enum ConvoyVerb {
     Unlink(ConvoyUnlinkArgs),
     /// Abandon a convoy, archive best-effort, and tear it down
     Abandon(ConvoyAbandonArgs),
-    /// Send a follow-up brief to convoy crew
+    /// Send crew a message; use --reopen to reactivate a settled completion
     Resume(ConvoyResumeArgs),
     /// Start a convoy through Project-scoped admission completion
     Start(Box<ConvoyStartArgs>),
@@ -89,12 +89,9 @@ pub struct ConvoyAbandonArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct ConvoyResumeArgs {
-    /// Explicitly reopen an accepted crew completion
-    #[arg(long, conflicts_with = "withdraw")]
-    pub reopen: bool,
     /// Convoy role or role@project address
     pub name: String,
-    /// Follow-up brief delivered to the existing crew session
+    /// Message for the existing crew; Done work in Landing or with all promises terminal stays complete unless --reopen is set
     #[arg(long, required_unless_present = "withdraw", conflicts_with = "withdraw")]
     pub prompt: Option<String>,
     /// Withdraw the brief waiting for the next turn boundary
@@ -106,6 +103,9 @@ pub struct ConvoyResumeArgs {
     /// Crew role; inferred when exactly one active or completed crew member matches
     #[arg(long)]
     pub role: Option<String>,
+    /// Explicitly reopen an accepted crew completion
+    #[arg(long, conflicts_with = "withdraw")]
+    pub reopen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]

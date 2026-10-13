@@ -932,8 +932,6 @@ pub enum CommandAction {
         reason: String,
     },
     ConvoyResume {
-        #[serde(default)]
-        reopen: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
         name: String,
@@ -942,6 +940,8 @@ pub enum CommandAction {
         vessel: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
+        #[serde(default)]
+        reopen: bool,
     },
     ConvoyWithdrawPendingBrief {
         #[serde(default, skip_serializing_if = "Option::is_none")]

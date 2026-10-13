@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -1780,7 +1781,7 @@ async fn resume_after_claim_preserves_landing() {
         timestamp(20) + chrono::Duration::milliseconds(1),
         "please complete".into(),
         None,
-        false,
+        ResumeIntent::Reminder,
     )
     .apply(&mut status);
     assert_eq!(status, claimed);
@@ -1791,7 +1792,7 @@ async fn resume_after_claim_preserves_landing() {
         resumed_at: timestamp(20) + chrono::Duration::milliseconds(2),
         prompt: "continue".into(),
         brief_id: None,
-        reopen: true,
+        intent: ResumeIntent::Reopen,
     }
     .apply(&mut explicitly_reopened);
     assert_eq!(explicitly_reopened.phase, ConvoyPhase::Active);

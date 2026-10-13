@@ -179,8 +179,15 @@ If a completed convoy's PR needs a rebase or late follow-up before landing,
 return ownership to its intact crew and warm vessel:
 
 ```sh
-flotilla convoy resume <name> --prompt "Rebase onto main and shepherd the PR"
+flotilla convoy resume <name> --reopen --prompt "Rebase onto main and shepherd the PR"
 ```
+
+Plain `convoy resume` delivers information to a Done crew when the convoy is
+Landing or every promise is terminal. It preserves the accepted completion and
+reports "crew already claimed; delivered without reopening". The empty promise
+set counts as terminal even if other crew members still have live work. Use
+`--reopen` when assigning new work to that completed crew; it records who reopened
+the work and when. A Landed convoy remains terminal.
 
 When more than one completed crew member matches, add `--vessel <name>` and
 `--role <role>`. Use direct `cleat send` only for live corrective intervention,

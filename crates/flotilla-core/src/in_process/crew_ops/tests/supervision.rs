@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use flotilla_store_memory::InMemoryBackend;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -823,7 +824,7 @@ impl TurnDeliveryActuator for Delivery {
                     Utc::now(),
                     request.brief.clone(),
                     Some(record.metadata.name.clone()),
-                    true,
+                    ResumeIntent::Reopen,
                 ),
             )
             .await

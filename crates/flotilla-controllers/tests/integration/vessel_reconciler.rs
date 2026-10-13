@@ -1,4 +1,5 @@
 use flotilla_resources::Actuation;
+use flotilla_resources::ResumeIntent;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -2450,7 +2451,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             Utc::now(),
             "review carried revision".into(),
             Some("handoff-message".into()),
-            true,
+            ResumeIntent::Reopen,
         ),
     )
     .await

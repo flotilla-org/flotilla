@@ -1,3 +1,4 @@
+use flotilla_resources::ResumeIntent;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -28,7 +29,7 @@ async fn working_resume_uses_message_delivery_instead_of_pending_brief_release()
     status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
     convoys.update_status(&current.metadata.name, &current.metadata.resource_version, &status).await.expect("working crew");
     daemon
-        .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"), false)
+        .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue intent");
     daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("migration scan");
@@ -46,7 +47,8 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    let resume = || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), true);
+    let resume =
+        || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), ResumeIntent::Reopen);
     assert!(resume().await.expect_err("staging should fail").contains("credential staging failed"));
     assert_eq!(
         convoys.get("resume-staging").await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
@@ -76,7 +78,7 @@ async fn resume_retries_a_racing_session_write_after_staging() {
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
     let outcome = daemon
-        .convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), true)
+        .convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"), ResumeIntent::Reopen)
         .await
         .expect("stale session write retried");
     assert_eq!(outcome, ConvoyResumeOutcome::Queued { displaced: None });
@@ -414,7 +416,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
             chrono::Utc::now(),
             "implicit stall test".to_string(),
             None,
-            true,
+            ResumeIntent::Reopen,
         ),
     )
     .await
@@ -505,7 +507,8 @@ async fn claimed_resume_delivers_information_without_reopening() {
     let (daemon, backend, probe) = resume_staging_fixture().await;
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let claimed = convoys.get("resume-staging").await.unwrap().status.unwrap();
-    let outcome = daemon.convoy_resume_internal("flotilla", "resume-staging", "please complete", None, None, false).await.unwrap();
+    let outcome =
+        daemon.convoy_resume_internal("flotilla", "resume-staging", "please complete", None, None, ResumeIntent::Reminder).await.unwrap();
     assert_eq!(outcome, ConvoyResumeOutcome::Informational);
     assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
     assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -516,7 +519,7 @@ async fn claimed_resume_delivers_information_without_reopening() {
     let sessions = backend.using::<ResourceTerminalSession>("flotilla");
     let session = sessions.get("resume-staging-session").await.unwrap();
     sessions.delete(&session.metadata.name).await.unwrap();
-    daemon.convoy_resume_internal("flotilla", "resume-staging", "duplicate reminder", None, None, false).await.unwrap();
+    daemon.convoy_resume_internal("flotilla", "resume-staging", "duplicate reminder", None, None, ResumeIntent::Reminder).await.unwrap();
     assert_eq!(convoys.get("resume-staging").await.unwrap().status.unwrap(), claimed);
 }
 

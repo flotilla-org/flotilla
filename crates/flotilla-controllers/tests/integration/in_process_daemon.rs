@@ -1,5 +1,7 @@
 #![allow(dead_code, unused_imports, clippy::empty_line_after_outer_attr)]
 
+use flotilla_resources::ResumeIntent;
+
 use flotilla_store_sqlite::SqliteBackend;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -8710,7 +8712,7 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
         .expect("replicate terminal session");
 
     let outcome = authority
-        .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"), false)
+        .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("resume remote crew session");
     assert!(matches!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { .. }));
@@ -8765,7 +8767,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
         .expect("mark crew working");
 
     daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"), false)
+        .convoy_resume_internal("flotilla", "busy-convoy", "Check the edge case", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief for busy crew");
 
@@ -8778,7 +8780,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     assert_eq!(first.spec.receiver, "flotilla/busy-convoy/work/coder");
     assert_eq!(first.spec.sender, "principal:implicit");
     let outcome = daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"), false)
+        .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("replace pending brief");
     assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Check the edge case".to_string()) });
@@ -8807,7 +8809,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     .await
     .expect("mark convoy terminal");
     let error = daemon
-        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"), false)
+        .convoy_resume_internal("flotilla", "busy-convoy", "too late", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect_err("terminal convoy should refuse a brief");
     assert!(error.contains("terminal phase `Landed`"), "unexpected refusal: {error}");
@@ -8981,12 +8983,12 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .expect("mark review crew session running");
 
     let queued = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"), false)
+        .convoy_resume_internal("flotilla", "idle-convoy", "Finish the current turn", Some("work"), Some("coder"), ResumeIntent::Reminder)
         .await
         .expect("queue brief while crew is working");
     assert_eq!(queued, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
     let unrelated = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"), true)
+        .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"), ResumeIntent::Reopen)
         .await
         .expect("resume unrelated crew");
     assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
@@ -9129,7 +9131,14 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
         .await
         .expect("create crew session");
     daemon
-        .convoy_resume_internal("flotilla", "turn-boundary", "Begin the follow-up turn", Some("work"), Some("coder"), false)
+        .convoy_resume_internal(
+            "flotilla",
+            "turn-boundary",
+            "Begin the follow-up turn",
+            Some("work"),
+            Some("coder"),
+            ResumeIntent::Reminder,
+        )
         .await
         .expect("queue pending brief");
 

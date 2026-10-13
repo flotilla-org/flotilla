@@ -1919,7 +1919,7 @@ pub enum ConvoyStatusPatch {
         message: String,
     },
     ResumeCrewWork {
-        reopen: bool,
+        intent: ResumeIntent,
         vessel: String,
         role: String,
         resumed_at: DateTime<Utc>,
@@ -1966,9 +1966,19 @@ pub enum ConvoyStatusPatch {
     },
 }
 
+/// Whether resume is ordinary information or an explicit request for new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeIntent {
+    Reminder,
+    Reopen,
+}
+
 impl ConvoyStatus {
     /// A settled crew claim needs explicit operator intent to reopen, including
     /// the interval before the controller observes the transition to Landing.
+    /// An empty promise set counts as all terminal, including multi-crew convoys:
+    /// other crews may still be Working, but that does not revoke this Done claim.
+    /// Promises are checked convoy-wide; new work for the claimed crew requires Reopen.
     pub fn crew_claim_is_settled(&self, vessel: &str, role: &str) -> bool {
         self.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_some_and(|state| state.phase == CrewWorkPhase::Done)
             && (self.phase == ConvoyPhase::Landing
@@ -2534,8 +2544,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
-            Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, reopen } => {
-                if !reopen && status.crew_claim_is_settled(vessel, role) {
+            Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, intent } => {
+                if *intent == ResumeIntent::Reminder && status.crew_claim_is_settled(vessel, role) {
                     return;
                 }
                 let held_sources: Vec<_> = status
@@ -2601,7 +2611,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.superseded_claims.push(claim.clone());
                 }
                 Self::ResumeCrewWork {
-                    reopen: true,
+                    intent: ResumeIntent::Reopen,
                     vessel: vessel.clone(),
                     role: role.clone(),
                     resumed_at: claim.claimed_at,
@@ -3003,9 +3013,9 @@ pub mod external_patches {
         resumed_at: DateTime<Utc>,
         prompt: String,
         brief_id: Option<String>,
-        reopen: bool,
+        intent: ResumeIntent,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, reopen }
+        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id, intent }
     }
 
     pub fn record_turn_delivery(
@@ -3832,7 +3842,7 @@ mod hold_state_tests {
             assert_eq!(status.turn_deliveries["checks-settled"].hold.as_ref().expect("hold").raised_at, at);
         }
         ConvoyStatusPatch::ResumeCrewWork {
-            reopen: true,
+            intent: ResumeIntent::Reopen,
             vessel: "work".into(),
             role: "reviewer".into(),
             resumed_at: at,
@@ -3842,7 +3852,7 @@ mod hold_state_tests {
         .apply(&mut status);
         assert!(status.turn_deliveries["checks-settled"].hold.is_some());
         ConvoyStatusPatch::ResumeCrewWork {
-            reopen: true,
+            intent: ResumeIntent::Reopen,
             vessel: "work".into(),
             role: "coder".into(),
             resumed_at: at,
@@ -3945,7 +3955,7 @@ mod claimed_resume_tests {
                                 resumed_at: DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::milliseconds(1),
                                 prompt: "continue".into(),
                                 brief_id: None,
-                                reopen,
+                                intent: if reopen { ResumeIntent::Reopen } else { ResumeIntent::Reminder },
                             };
                             for _ in 0..2 {
                                 patch.apply(&mut status);
