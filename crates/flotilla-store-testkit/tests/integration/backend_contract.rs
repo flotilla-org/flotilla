@@ -523,7 +523,7 @@ async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(fa
 
     backend
         .store()
-        .apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Modified(corrected), at + chrono::Duration::seconds(1))])
+        .apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Modified(corrected.clone()), at + chrono::Duration::seconds(1))])
         .await
         .unwrap();
     assert_eq!(backend.store().list_replicas_typed::<Convoy>("flotilla").await.unwrap().len(), 3);
@@ -538,6 +538,13 @@ async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(fa
             .await
             .unwrap();
     }
+    // A stale valid event cannot clear a newer rejection or replace the last
+    // accepted version. Only an accepted delivery or authoritative omission can.
+    let quarantines_before = backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines;
+    backend.store().apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Modified(corrected), at)]).await.unwrap();
+    let quarantines_after = backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines;
+    assert_eq!(quarantines_after.len(), quarantines_before.len());
+    assert!(quarantines_after.iter().any(|entry| entry.origin_root == origin && entry.name == "bad"));
     backend
         .store()
         .replace_replicas_raw(

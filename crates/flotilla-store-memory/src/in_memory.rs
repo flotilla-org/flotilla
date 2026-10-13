@@ -353,6 +353,8 @@ impl InMemoryBackend {
         diagnostics.field_ownership_violations = violations.clone();
         diagnostics.replica_quarantines =
             self.replicas.lock().await.quarantines.values().map(|(_, diagnostic)| diagnostic.clone()).collect();
+        // Replica writes delegate exclusively when a durable store is configured;
+        // the in-memory quarantine map stays empty, so these lists cannot overlap.
         if let Some(backend) = &self.durable_replicas {
             if let Some(durable) = backend.store().diagnostics().await? {
                 diagnostics.replica_quarantines.extend(durable.replica_quarantines);

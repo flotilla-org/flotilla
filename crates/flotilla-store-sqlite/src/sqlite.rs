@@ -826,6 +826,10 @@ impl SqliteBackend {
                 INSERT INTO {labels} SELECT {new_identity},key,value FROM ({label_values});
                 INSERT INTO {owners} SELECT DISTINCT {new_identity},json_array(json_extract(value,'$.apiVersion'),json_extract(value,'$.kind'),json_extract(value,'$.name')) FROM json_each({body},'$.metadata.ownerReferences');
             ");
+            // As with declared-value projections, repair derived metadata on
+            // every writer open: O(objects) backfill plus trigger replacement.
+            // This transaction precedes read-only worker initialization; readers
+            // never run it. SQLite serializes concurrent writers (or reports busy).
             for action in ["insert", "update", "delete"] {
                 tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {table}_query_{action};"))
                     .map_err(|e| Self::map_sqlite(e, "replace metadata query trigger"))?;
@@ -2068,20 +2072,20 @@ impl SqliteBackend {
                 for (name, body) in &encoded {
                     let mutation = ReplicaMutation { kind: StoredReplicaEventKind::Added, name: name.clone(), value: serde_json::from_str(body).map_err(|err| ResourceError::decode(err.to_string()))?, synced_at };
                     let applied = Self::apply_replica_record(&tx, resource_kind, &key, &origin, &mutation, || {
-                    if old.get(name).is_some_and(|(old_body, _)| old_body == body) {
-                        return Ok(true);
-                    }
-                    tx.execute_cached(
-                        REPLICA_OBJECT_UPSERT_SQL,
-                        params![origin, key.0, key.1, key.2, key.3, name, body, synced],
-                    )
-                    .map_err(|err| Self::map_replica_sqlite(err, "insert sqlite replica object"))?;
-                    tx.execute_cached(
-                        REPLICA_TOMBSTONE_CLEAR_SQL,
-                        params![origin, key.0, key.1, key.2, key.3, name],
-                    )
-                    .map_err(|err| Self::map_replica_sqlite(err, "clear authoritative snapshot tombstone"))?;
-                    Ok(true)
+                        if old.get(name).is_some_and(|(old_body, _)| old_body == body) {
+                            return Ok(true);
+                        }
+                        tx.execute_cached(
+                            REPLICA_OBJECT_UPSERT_SQL,
+                            params![origin, key.0, key.1, key.2, key.3, name, body, synced],
+                        )
+                        .map_err(|err| Self::map_replica_sqlite(err, "insert sqlite replica object"))?;
+                        tx.execute_cached(
+                            REPLICA_TOMBSTONE_CLEAR_SQL,
+                            params![origin, key.0, key.1, key.2, key.3, name],
+                        )
+                        .map_err(|err| Self::map_replica_sqlite(err, "clear authoritative snapshot tombstone"))?;
+                        Ok(true)
                     })?;
                     if applied { accepted.insert(name.clone()); }
                 }
@@ -2311,7 +2315,9 @@ impl SqliteBackend {
                 tx.execute_cached("RELEASE replica_record", []).map_err(|err| Self::map_sqlite(err, "release rejected replica"))?;
                 // Preserve payload, stable event type and receipt time for operator
                 // inspection. This is forensic evidence, not a replay queue;
-                // compact diagnostics deliberately omit the payload.
+                // compact diagnostics deliberately omit the payload. One full body per
+                // rejected origin/identity has no TTL or byte cap; corrected delivery
+                // or authoritative omission removes it. Peers are trusted fleet nodes.
                 let event_type = match mutation.kind {
                     StoredReplicaEventKind::Added => "ADDED",
                     StoredReplicaEventKind::Modified => "MODIFIED",
