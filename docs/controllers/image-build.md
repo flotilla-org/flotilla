@@ -56,8 +56,11 @@ backoff and the attempt limit below apply to it.
 A daemon restart during `Building` loses the running job. The restarted
 reconciler finds the build still `Building` with its slot held and runs the
 same attempt again from the start. In push mode the registry build cache keeps
-finished steps cheap. Local delivery has no persistent cache beyond the owned
-builder's own BuildKit state, so a restart can repeat the whole build.
+finished steps cheap. Local delivery has no registry cache. It reuses only the
+steps already cached in the owned builder's BuildKit state, and repeats the
+whole build when that state is gone. A daemon that exits without dropping the
+job does not signal its Buildx client. That client finishes on its own, and
+BuildKit shares identical in-flight steps with the re-run.
 
 ### Failures and retries
 
