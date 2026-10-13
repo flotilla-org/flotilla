@@ -17,6 +17,20 @@ use flotilla_store_testkit::fixtures::{convoy_meta, convoy_spec};
 use flotilla_store_testkit::ReadCountsBackendExt;
 use std::collections::BTreeMap;
 
+// Represents an already-stored legacy row, bypassing registered kind admission
+// solely to test that indexed semijoins do not decode their source bodies.
+#[derive(Debug, Clone)]
+struct LegacyChangeRequest;
+impl flotilla_resources::Resource for LegacyChangeRequest {
+    type Spec = serde_json::Value;
+    type Status = <flotilla_resources::ChangeRequest as flotilla_resources::Resource>::Status;
+    type StatusPatch = <flotilla_resources::ChangeRequest as flotilla_resources::Resource>::StatusPatch;
+    const API_PATHS: flotilla_resources::ApiPaths = <flotilla_resources::ChangeRequest as flotilla_resources::Resource>::API_PATHS;
+    const QUERYABLE_FIELDS: &'static [&'static str] = <flotilla_resources::ChangeRequest as flotilla_resources::Resource>::QUERYABLE_FIELDS;
+    const QUERYABLE_NUMERIC_FIELDS: &'static [&'static str] =
+        <flotilla_resources::ChangeRequest as flotilla_resources::Resource>::QUERYABLE_NUMERIC_FIELDS;
+}
+
 // HTTP boundary stand-in: it rejects missing/invalid query parameters and
 // executes the received contract against an independent real memory store.
 async fn endpoint(
@@ -359,7 +373,9 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
         assert_eq!(selected.items.iter().map(|source| source.object.metadata.name.clone()).collect::<Vec<_>>(), [name], "{number}");
     }
     // Explicit JSON null is missing in numeric indexes on every backend. A
-    // semijoin projects the raw source name without decoding its invalid spec.
+    // semijoin projects a preexisting raw source name without decoding its
+    // invalid spec. Use the legacy descriptor for injection: normal registered
+    // ChangeRequest admission now quarantines this malformed incoming record.
     let null_source = ResourceBackend::new(InMemoryBackend::default());
     null_source
         .using::<flotilla_resources::ChangeRequest>("flotilla")
@@ -378,7 +394,7 @@ async fn contract(backend: &ResourceBackend, authority: &ResourceBackend) {
     raw["items"][0]["spec"]["number"] = serde_json::Value::Null;
     authority
         .replace_replicas_raw(
-            flotilla_store::ResourceKind::of::<flotilla_resources::ChangeRequest>(),
+            flotilla_store::ResourceKind::of::<LegacyChangeRequest>(),
             &NodeId::new("null-source"),
             "flotilla",
             &serde_json::from_value(raw).unwrap(),
