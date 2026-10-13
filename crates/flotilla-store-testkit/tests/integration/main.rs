@@ -4,6 +4,7 @@ mod controller_loop;
 mod convoy_in_memory;
 mod convoy_status_patch;
 mod crew_image_baseline;
+mod decode_once;
 mod digest;
 mod field_ownership;
 mod forge_identity;

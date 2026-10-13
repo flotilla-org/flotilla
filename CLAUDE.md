@@ -74,7 +74,7 @@ depend on the native feature selections.
 Workspace tests require Python 3.9+ and Cargo on PATH (`python` on Windows, `python3` elsewhere) for this guard.
 
 `flotilla-store-testkit` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
-The store-testkit `watch_allocations` and daemon `daemon_allocations` targets stay separate because they install process-wide counting allocators.
+The store-testkit `watch_allocations` and `decode_cost` targets and the daemon `daemon_allocations` target stay separate because they install process-wide counting allocators.
 `flotilla-daemon` uses that target for general integration tests and `tests/request_session_pair/main.rs` for routing scenarios.
 Run `cargo test -p <package> --locked --test integration` for the integration target, and
 `cargo test -p flotilla-daemon --locked --test request_session_pair` for routing scenarios. Append a former target's module name or a test name

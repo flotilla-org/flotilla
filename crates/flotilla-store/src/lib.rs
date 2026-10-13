@@ -14,6 +14,8 @@ mod convoy;
 pub use convoy::*;
 mod crew_image_baseline;
 pub use crew_image_baseline::*;
+mod decoded;
+pub use decoded::*;
 mod definition;
 pub use definition::*;
 mod event;

@@ -66,14 +66,14 @@ impl<T: Resource> ViewSource<T> for StoreViewSource<T> {
             store.watch_replicas_typed::<T>(&self.namespace).await?
         };
         let query = StoreQuery { include_replicas: true, suppress_self_origin: false, ..StoreQuery::default() };
-        let listed = store.query_raw(ResourceKind::of::<T>(), &self.namespace, &query).await?;
+        let listed = store.query_decoded(ResourceKind::of::<T>(), &self.namespace, &query).await?;
         let position = listed.position.clone();
         let start = match position.generation {
             Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: position.resource_version },
             None => WatchStart::FromVersion(position.resource_version),
         };
         let local = store.watch_typed::<T>(&self.namespace, start).await?.map(|event| event.map(ReadWatchEvent::local));
-        let items = crate::convert_read_list(listed.into_list())?;
+        let items = ReadResourceList { items: listed.into_typed()? };
         Ok((items, futures::stream::select(local, replicas).boxed()))
     }
 }
