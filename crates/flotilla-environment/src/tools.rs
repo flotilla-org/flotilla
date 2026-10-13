@@ -28,6 +28,7 @@ fn publish_with(
     mut transfer: impl FnMut(&mut fs::File, &mut fs::File, &mut Sha256, u64) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
     let _lock = publication_lock(root)?;
+    clear_staging(root)?;
     let mut files = vec![
         (PathBuf::from("bin/flotilla"), source.flotilla.to_path_buf()),
         (PathBuf::from("bin/cleat"), source.cleat.to_path_buf()),
@@ -53,6 +54,8 @@ fn publish_with(
             let name = name.to_string_lossy();
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
+            use std::os::unix::fs::PermissionsExt;
+            hash.update(metadata.permissions().mode().to_le_bytes());
             hash.update(metadata.len().to_le_bytes());
             transfer(&mut source, &mut output, &mut hash, metadata.len())?;
             fs::set_permissions(&destination, metadata.permissions())?;
@@ -115,6 +118,23 @@ fn copy_asset(mut source: impl io::Read, mut output: impl io::Write, hash: &mut 
     Ok(())
 }
 
+// Only call while holding the publication lock: no live publisher can own
+// these intermediates, including after a daemon restart.
+fn clear_staging(root: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(root.join("tools")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(".staging-") && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn publication_lock(root: &Path) -> io::Result<fs::File> {
     fs::create_dir_all(root)?;
     let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(root.join(".lock"))?;
@@ -158,6 +178,7 @@ pub fn prune(root: &Path, unused: impl FnMut(&Path) -> bool) -> io::Result<()> {
 }
 
 fn prune_locked(root: &Path, mut unused: impl FnMut(&Path) -> bool) -> io::Result<()> {
+    clear_staging(root)?;
     let current = match fs::read_link(root.join("tools/current")) {
         Ok(current) => current,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -261,6 +282,41 @@ fn prune_local_for(root: &Path, processes: &Path, owner: u32) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Mode-only rolls must publish the requested executable permissions.
+    // Abandoned crash intermediates are collected by publication and pruning.
+    #[test]
+    fn mode_changes_publish_new_generations_and_crash_staging_is_collected() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("provider");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("terminfo/x")).unwrap();
+        for file in ["flotilla", "cleat", "library", "terminfo/x/xterm-ghostty"] {
+            fs::write(source.join(file), b"unchanged").unwrap();
+        }
+        let assets = ToolsSource {
+            flotilla: &source.join("flotilla"),
+            cleat: &source.join("cleat"),
+            library: &source.join("library"),
+            terminfo: &source.join("terminfo"),
+        };
+        fs::set_permissions(assets.cleat, fs::Permissions::from_mode(0o644)).unwrap();
+        let previous = publish(&root, &assets).unwrap();
+        let crashed = root.join("tools/.staging-crashed");
+        fs::create_dir_all(&crashed).unwrap();
+        fs::write(crashed.join("partial"), b"partial").unwrap();
+        fs::set_permissions(assets.cleat, fs::Permissions::from_mode(0o755)).unwrap();
+        let current = publish(&root, &assets).unwrap();
+        assert_ne!(previous, current);
+        assert_eq!(fs::metadata(root.join("bin/cleat")).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!crashed.exists());
+        fs::create_dir_all(&crashed).unwrap();
+        prune(&root, |_| false).unwrap();
+        assert!(!crashed.exists());
+        assert!(previous.is_dir());
+        assert!(current.is_dir());
+    }
+
     // Wrap real file readers at the transfer seam to deterministically model
     // shrink/growth after metadata, plus an I/O failure after a staged copy.
     // None may flip current or leave behind partial staging directories.
