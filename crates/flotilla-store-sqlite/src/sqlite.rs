@@ -1263,6 +1263,9 @@ impl SqliteBackend {
                 .map_err(Self::map_connection_error)
         };
         tokio::pin!(read);
+        // A queue deadline lets a read that has started run to completion. A
+        // poisoned timing lock reads as "not started", which deliberately falls
+        // back to the total deadline rather than waiting without a bound.
         let result = match tokio::time::timeout(READ_DEADLINE, &mut read).await {
             Err(_) if deadline == ReadDeadline::Queue && execution_started.lock().ok().and_then(|timing| *timing).is_some() => {
                 Ok(read.await)
