@@ -38,7 +38,7 @@ struct Model {
 
 /// A plain stream kind with configured event retention, so the scenario's
 /// compaction model does not depend on any registered kind's retention.
-struct ReplayProbe;
+struct ProbeResource;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ProbeSpec {
@@ -55,13 +55,13 @@ impl flotilla_resources::StatusPatch<ProbeStatus> for ProbePatch {
     }
 }
 
-impl Resource for ReplayProbe {
+impl Resource for ProbeResource {
     type Spec = ProbeSpec;
     type Status = ProbeStatus;
     type StatusPatch = ProbePatch;
 
     const API_PATHS: flotilla_resources::ApiPaths =
-        flotilla_resources::ApiPaths { group: "flotilla.work", version: "v1", plural: "replayprobes", kind: "ReplayProbe" };
+        flotilla_resources::ApiPaths { group: "flotilla.work", version: "v1", plural: "proberesources", kind: "ProbeResource" };
     const REPLICATION_CLASS: flotilla_resources::ReplicationClass = flotilla_resources::ReplicationClass::None;
 }
 
@@ -71,7 +71,7 @@ fn spec(label: String) -> ProbeSpec {
 
 /// Apply one write and append its event to the model. Every write changes the
 /// object, so each commits exactly one event; the stream position confirms it.
-async fn apply(backend: &SqliteBackend, hosts: &TypedResolver<ReplayProbe>, model: &Mutex<Model>, write: Write) {
+async fn apply(backend: &SqliteBackend, hosts: &TypedResolver<ProbeResource>, model: &Mutex<Model>, write: Write) {
     let name = NAMES[write.name].to_string();
     let (current, label) = {
         let mut model = model.lock().expect("model");
@@ -93,7 +93,7 @@ async fn apply(backend: &SqliteBackend, hosts: &TypedResolver<ReplayProbe>, mode
             "DELETED"
         }
     };
-    let position = backend.current_position_raw(ResourceKind::of::<ReplayProbe>(), NAMESPACE).await.expect("stream position");
+    let position = backend.current_position_raw(ResourceKind::of::<ProbeResource>(), NAMESPACE).await.expect("stream position");
     let version: u64 = position.resource_version.parse().expect("numeric position");
     let mut model = model.lock().expect("model");
     let expected = model.events.last().map_or(1, |(last, _, _)| last + 1);
@@ -106,7 +106,7 @@ async fn apply(backend: &SqliteBackend, hosts: &TypedResolver<ReplayProbe>, mode
     model.events.push((version, action, name));
 }
 
-fn seen(event: WatchEvent<ReplayProbe>) -> Seen {
+fn seen(event: WatchEvent<ProbeResource>) -> Seen {
     let (action, metadata) = match event {
         WatchEvent::Added(object) => ("ADDED", object.metadata),
         WatchEvent::Modified(object) => ("MODIFIED", object.metadata),
@@ -165,7 +165,7 @@ fn watch_delivers_each_event_after_its_start_exactly_once(tc: hegel::TestCase) {
     runtime.block_on(async move {
         let directory = tempfile::tempdir().expect("store directory");
         let mut backend = open(file, retention, &directory);
-        let hosts = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+        let hosts = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
         let model = Arc::new(Mutex::new(Model::default()));
         for write in before {
             apply(&backend, &hosts, &model, write).await;
@@ -197,7 +197,7 @@ fn watch_delivers_each_event_after_its_start_exactly_once(tc: hegel::TestCase) {
             }
         }));
 
-        let watched = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+        let watched = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
         let watch = tokio::time::timeout(Duration::from_secs(30), watched.watch(WatchStart::FromVersion(from.to_string())))
             .await
             .expect("the watch starts without waiting on its own writes");
@@ -257,7 +257,7 @@ async fn watch_replay_runs_on_a_reader_while_a_write_commits() {
     const SEEDED: u64 = 300;
     let directory = tempfile::tempdir().expect("store directory");
     let mut backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
-    let hosts = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let hosts = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     let meta = InputMeta::builder().name("feta".to_string()).build();
     let mut current = hosts.create(&meta, &spec("x".repeat(4096))).await.expect("create probe");
     for index in 1..SEEDED {
@@ -272,7 +272,7 @@ async fn watch_replay_runs_on_a_reader_while_a_write_commits() {
         entered_tx.send(()).expect("announce replay");
         release_rx.lock().expect("release").recv().expect("release replay");
     }));
-    let watched = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let watched = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     let before = backend.prepare_counters();
     let watch = tokio::spawn(async move { watched.watch(WatchStart::FromVersion("0".to_string())).await });
     tokio::task::spawn_blocking(move || entered_rx.recv().expect("replay entered its snapshot")).await.expect("wait for replay");
@@ -311,11 +311,11 @@ async fn watch_replay_runs_on_a_reader_while_a_write_commits() {
 async fn watch_replay_outlasting_the_read_deadline_completes() {
     let directory = tempfile::tempdir().expect("store directory");
     let mut backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
-    let hosts = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let hosts = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     let meta = InputMeta::builder().name("feta".to_string()).build();
     hosts.create(&meta, &spec("feta".to_string())).await.expect("create probe");
     backend.replay_probe.in_snapshot = Some(Arc::new(|| std::thread::sleep(super::READ_DEADLINE + Duration::from_millis(300))));
-    let watched = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let watched = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     let mut watch = watched.watch(WatchStart::FromVersion("0".to_string())).await.expect("a slow replay is not shed");
     let event = watch.next().await.expect("event").expect("decodes");
     assert_eq!(seen(event), (1, "ADDED", "feta".to_string()));
@@ -327,7 +327,7 @@ async fn watch_replay_outlasting_the_read_deadline_completes() {
 async fn watch_replay_queued_past_the_read_deadline_reports_busy() {
     let directory = tempfile::tempdir().expect("store directory");
     let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
-    let hosts = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let hosts = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &spec("feta".to_string())).await.expect("create probe");
     let _others = single_resource_reader(&backend).await;
     let reader = backend.read_connections[super::READER_COUNT - 2].clone();
@@ -359,7 +359,7 @@ async fn watch_replay_queued_past_the_read_deadline_reports_busy() {
 async fn watch_without_replay_does_not_use_a_reader() {
     let directory = tempfile::tempdir().expect("store directory");
     let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
-    let hosts = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let hosts = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     let created =
         hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &spec("feta".to_string())).await.expect("create probe");
     for start in [WatchStart::Now, WatchStart::FromVersion(created.metadata.resource_version.clone())] {
@@ -384,14 +384,14 @@ async fn measure_watch_replay_writer_stall() {
     const BODY: usize = 25 * 1024;
     let directory = tempfile::tempdir().expect("store directory");
     let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
-    let hosts = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+    let hosts = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
     let meta = InputMeta::builder().name("convoy-sized".to_string()).build();
     let mut current = hosts.create(&meta, &spec("x".repeat(BODY))).await.expect("create");
     for index in 1..EVENTS {
         current =
             hosts.update(&meta, &current.metadata.resource_version, &spec(format!("{index}{}", "x".repeat(BODY)))).await.expect("update");
     }
-    let key = SqliteBackend::store_key(ResourceKind::of::<ReplayProbe>(), NAMESPACE);
+    let key = SqliteBackend::store_key(ResourceKind::of::<ProbeResource>(), NAMESPACE);
     let through: u64 = current.metadata.resource_version.parse().expect("version");
 
     let mut on_writer = Vec::new();
@@ -401,7 +401,7 @@ async fn measure_watch_replay_writer_stall() {
         backend
             .call("measure replay on writer", move |connection| {
                 SqliteBackend::replay_events(
-                    ResourceKind::of::<ReplayProbe>(),
+                    ResourceKind::of::<ProbeResource>(),
                     connection,
                     &key,
                     0,
@@ -418,7 +418,7 @@ async fn measure_watch_replay_writer_stall() {
 
     let mut stalls = Vec::new();
     for _ in 0..5 {
-        let watched = ResourceBackend::new(backend.clone()).using::<ReplayProbe>(NAMESPACE);
+        let watched = ResourceBackend::new(backend.clone()).using::<ProbeResource>(NAMESPACE);
         let watch = tokio::spawn(async move { watched.watch(WatchStart::FromVersion("0".to_string())).await.map(|_| ()) });
         let mut longest = Duration::ZERO;
         while !watch.is_finished() {
@@ -438,5 +438,5 @@ async fn measure_watch_replay_writer_stall() {
 fn probe_is_a_stream_with_configured_retention() {
     // glue: the scenario's compaction model assumes the probe keeps the
     // configured number of events (not the one-event observation class).
-    assert_eq!(ReplayProbe::REPLICATION_CLASS.event_retention(3), 3);
+    assert_eq!(ProbeResource::REPLICATION_CLASS.event_retention(3), 3);
 }
