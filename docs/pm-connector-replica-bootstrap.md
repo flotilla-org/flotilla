@@ -31,7 +31,9 @@ carries TTLs. The expiry tick can remove landed subjects but sends nothing when
 the projection is unchanged. Wheelhouse issue 378 supplies atomic application,
 window seeding and the companion protocol documentation. A snapshot 404 switches
 this process to the legacy single-message transport with 30-second TTLs and
-10-second full reassertions. Zellij retains that TTL behavior.
+10-second full reassertions. If Wheelhouse is upgraded in place after that 404,
+restart the connector to adopt connection liveness; daemon reconnects do not
+renegotiate the fallback. Zellij retains that TTL behavior.
 
 The catalog advances only after acknowledged delivery. Failed atomic publications
 retry unchanged with exponential delays from 250 ms to 2 seconds, within a
