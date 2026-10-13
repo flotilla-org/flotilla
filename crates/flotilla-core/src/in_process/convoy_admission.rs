@@ -1485,6 +1485,9 @@ impl PlacementBuildJoiner<'_> {
 /// Write composed images into the placement: the convoy-level policy carries
 /// the first vessel's image, and when vessels differ every vessel gets its own
 /// pinned snapshot (identical values share one snapshot by content).
+/// The convoy-level policy takes the first vessel's image (map order) only so
+/// it holds a valid spec; when vessels' images differ, the returned per-vessel
+/// placement pins are authoritative and every vessel reads its own snapshot.
 fn apply_vessel_images(
     placement: &mut PlacementResolution,
     images: BTreeMap<String, PlacementPolicySpec>,
@@ -1513,7 +1516,12 @@ async fn resolve_vessel_images(
     let selection = match project_ref {
         Some(project) => match backend.including_replicas::<Project>(namespace).get(project).await {
             Ok(project) => project.object.spec.image,
-            Err(ResourceError::NotFound { .. }) => None,
+            // A named project that is absent must not silently compose from
+            // installation defaults: that would build an image the project
+            // never selected.
+            Err(ResourceError::NotFound { .. }) => {
+                return Err(format!("composed image: project `{project}` is not defined, so its image selection is unknown"))
+            }
             Err(error) => return Err(error.to_string()),
         },
         None => None,

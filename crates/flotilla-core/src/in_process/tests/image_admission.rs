@@ -260,6 +260,18 @@ async fn duplicate_and_unresolvable_needs_refuse_without_builds() {
     assert!(fixture.backend.using::<ImageBuild>(NS).list().await.expect("builds").items.is_empty());
 }
 
+// PR #3178 review: a named project that is not defined refuses rather than
+// composing from installation defaults the project never selected.
+#[tokio::test]
+async fn missing_project_refuses_instead_of_using_installation_defaults() {
+    let fixture = fixture(catalogue(), None).await;
+    fixture.backend.using::<Project>(NS).delete("flotilla").await.expect("delete project");
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
+    let error = admit(&fixture, &workflow).await.expect_err("missing project");
+    assert!(error.contains("project `flotilla` is not defined"), "{error}");
+    assert!(fixture.backend.using::<ImageBuild>(NS).list().await.expect("builds").items.is_empty());
+}
+
 // With a fleet image cache, the lowest-named same-architecture builder pushes
 // to the registry, whichever host the vessel is placed on.
 #[tokio::test]

@@ -74,6 +74,12 @@ pub(crate) async fn apply_stdlib_layers(
         definitions.apply(&meta, &layer.clone().into()).await.map_err(|error| format!("apply stdlib image layer `{name}`: {error}"))?;
         application.applied.push(name);
     }
+    // An empty shipped set never deletes: a release cannot usefully ship no
+    // stdlib, so an empty set means lost release data, and deleting would wipe
+    // every stdlib definition the fleet's admissions resolve against.
+    if shipped.is_empty() {
+        return Ok(application);
+    }
     for stale in local.list().await.map_err(|error| error.to_string())?.items {
         let stdlib =
             stale.metadata.deletion_timestamp.is_none() && stale.spec.current().is_some_and(|spec| spec.source == ImageLayerSource::Stdlib);
@@ -201,5 +207,16 @@ mod tests {
             .map(|layer| layer.metadata.name)
             .collect::<BTreeSet<_>>();
         assert_eq!(names, BTreeSet::from([installation_name, base_name]));
+    }
+
+    // PR #3178 review: an empty shipped set means lost release data (a
+    // packaging error), so it must never wipe the definitions admissions use.
+    #[tokio::test]
+    async fn empty_release_never_deletes_stdlib_definitions() {
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let layers = parse_stdlib_layers(FIXTURE).expect("fixture parses");
+        apply_stdlib_layers(&backend, "flotilla", &layers).await.expect("first application");
+        assert_eq!(apply_stdlib_layers(&backend, "flotilla", &[]).await.expect("empty release"), StdlibApplication::default());
+        assert_eq!(backend.definitions::<ImageLayer>("flotilla").list().await.expect("layers").len(), layers.len());
     }
 }

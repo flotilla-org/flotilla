@@ -12,13 +12,14 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let root = manifest_dir.join("../../stdlib/image-layers");
     println!("cargo::rerun-if-changed={}", root.display());
+    // A missing root is a packaging error, not an empty stdlib: building on
+    // regardless would ship a release whose startup sees no stdlib at all.
+    assert!(root.is_dir(), "stdlib image layer root {} is missing", root.display());
     let mut layers = Vec::new();
-    if root.is_dir() {
-        for entry in std::fs::read_dir(&root).unwrap_or_else(|error| panic!("read {}: {error}", root.display())) {
-            let path = entry.unwrap_or_else(|error| panic!("read {}: {error}", root.display())).path();
-            if path.is_dir() {
-                layers.push(path);
-            }
+    for entry in std::fs::read_dir(&root).unwrap_or_else(|error| panic!("read {}: {error}", root.display())) {
+        let path = entry.unwrap_or_else(|error| panic!("read {}: {error}", root.display())).path();
+        if path.is_dir() {
+            layers.push(path);
         }
     }
     layers.sort();
