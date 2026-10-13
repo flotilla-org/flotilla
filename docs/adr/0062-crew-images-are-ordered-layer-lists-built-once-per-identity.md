@@ -2,8 +2,8 @@
 
 **Status:** Accepted (owner re-grill, 2026-10-13)
 **Date:** 2026-10-13
-**Supersedes:** ADR 0053 (declared layers, cover search, staged freeze); ADR 0039 (CrewImageBaseline, already retired by #3116)
-**Amends:** ADR 0058 (environment providers realise image selections or prove provides by probe)
+**Supersedes:** [ADR 0053](0053-crew-images-compose-from-declared-layers-and-freeze-in-stages.md) (declared layers, cover search, staged freeze); [ADR 0039](0039-crew-image-baseline-is-a-federated-definition.md) (CrewImageBaseline, already retired by #3116)
+**Amends:** [ADR 0058, environment providers](0058-environment-providers-own-lifecycle-and-runtime-capabilities.md) (providers realise image selections or prove provides by probe)
 **Relates to:** ADR 0047 (stored data stays decodable for one generation), #2731/#3116 (image cut-over), PR #3138 (abandoned)
 
 ## Context

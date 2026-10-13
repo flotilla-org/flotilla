@@ -289,7 +289,7 @@ trusted/contained as workflow words.
 **Capability Need**:
 A namespaced capability a role's work requires, such as `platform:linux`,
 `display:headless-x11`, `harness:codex>=0.160.0` or `toolchain:rust`
-(ADRs 0046 and 0053). Needs attach to roles and compose by union across layers that
+(ADRs 0046 and 0053; ADR 0062 supersedes 0053's composition rules). Needs attach to roles and compose by union across layers that
 only add: template role, project, issue, derived, dispatch. The result is
 frozen at admission. An uncovered need refuses admission by name.
 _Avoid_: Stance, trust level (provenance proves little; the principle is
@@ -987,7 +987,8 @@ HTTP-over-UDS (and, for cleat, a C ABI for native embedding):
 
 **Image Layer**:
 An independently versioned contribution to a crew image. It declares the
-capabilities it provides and what must be available beneath it (ADR 0053).
+capabilities it provides and what must be available beneath it (ADR 0053,
+superseded by ADR 0062: layers are ordered by tier and selected by name and provides).
 _Avoid_: composed image definition (compositions are computed).
 
 **Image Composition**:
