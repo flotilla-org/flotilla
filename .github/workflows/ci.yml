@@ -202,6 +202,9 @@ jobs:
           FLOTILLA_TEST_CLEAT_OLD: ${{ runner.temp }}/cleat-environment/old/cleat
           FLOTILLA_TEST_CLEAT_NEW: ${{ runner.temp }}/cleat-environment/new/cleat
         run: |
+          # Record the runner CPU: the contract binaries are cached across runners.
+          grep -m1 'model name' /proc/cpuinfo
+          grep -m1 -o -E 'avx512f|avx2' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
           ci/cleat-environment/test.sh
       - uses: actions/upload-artifact@v4
         if: always() && steps.filter.outputs.run == 'true'
