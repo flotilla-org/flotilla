@@ -31,7 +31,7 @@ uuid = { workspace = true, features = ["v4"] }
 serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
-rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 tokio-rusqlite = "0.7"
 flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
 flotilla-store-testkit = { path = "../flotilla-store-testkit" }

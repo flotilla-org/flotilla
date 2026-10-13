@@ -116,7 +116,7 @@ impl SqliteBackend {
     fn digest_hashes(connection: &RusqliteConnection, key: &StoreKey, origin: &str) -> Result<Vec<String>, ResourceError> {
         let mut hashes = vec![hash_entries(&BTreeMap::new()); DIGEST_FANOUT];
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 "SELECT bucket,hash FROM digest_nodes WHERE origin=?1
                 AND group_name=?2
                 AND version=?3
@@ -146,7 +146,7 @@ impl SqliteBackend {
         self.read_call("read authoritative digest", move |connection| {
             let tx = connection.transaction().map_err(|error| Self::map_sqlite(error, "begin consistent digest read"))?;
             let quarantined: bool = tx
-                .query_row(
+                .query_row_cached(
                     "SELECT EXISTS(SELECT 1 FROM resource_decode_quarantine WHERE group_name=?1
                 AND version=?2
                 AND kind=?3
@@ -163,7 +163,7 @@ impl SqliteBackend {
                 .select(&query)?;
             if let DigestQuery::Snapshot { bucket, .. } = query {
                 let mut statement = tx
-                    .prepare(
+                    .prepare_cached(
                         "SELECT o.body_json
                 FROM digest_entries d JOIN resource_objects o USING(group_name,version,kind,namespace,name) WHERE d.origin=''
                 AND d.group_name=?1
@@ -216,7 +216,7 @@ impl SqliteBackend {
                 return Err(ResourceError::invalid("replica set changed during digest repair"));
             }
             let changed = tx
-                .execute(
+                .execute_cached(
                     "UPDATE replica_cursors SET resource_version=?6 WHERE origin_root=?1
                 AND group_name=?2
                 AND version=?3
