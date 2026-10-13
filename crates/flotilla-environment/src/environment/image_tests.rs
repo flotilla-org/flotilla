@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -8,13 +8,7 @@ use async_trait::async_trait;
 use flotilla_resources::is_image_digest;
 use hegel::generators as gs;
 
-use super::{
-    docker::DockerEnvironmentProvider,
-    docker_image::BuildxImageBuilder,
-    host_direct::HostDirectEnvironmentProvider,
-    image::{BuiltImage, ImageComposition},
-    EnvironmentProvider, ImageBuilder,
-};
+use super::{docker::DockerEnvironmentProvider, host_direct::HostDirectEnvironmentProvider, EnvironmentProvider};
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
@@ -23,8 +17,8 @@ fn digest(index: usize) -> String {
     format!("sha256:{index:064x}")
 }
 
-// Subprocess boundary stand-in. Enforces Docker's argv and Buildx export
-// contract; two independent instances model separate cache endpoints.
+// Subprocess boundary stand-in. Enforces Docker's cache argv contract; two
+// independent instances model separate cache endpoints.
 #[derive(Default)]
 struct DockerStandIn {
     held: Mutex<BTreeSet<String>>,
@@ -94,32 +88,6 @@ impl CommandRunner for DockerStandIn {
                 let id = std::fs::read_to_string(path).expect("archive");
                 assert!(is_image_digest(&id));
                 held.insert(id);
-                Ok(String::new())
-            }
-            ["image", "tag", id, tag] => {
-                assert!(held.contains(*id));
-                assert!(tag.starts_with("registry.example/team/image:flotilla-"));
-                Ok(String::new())
-            }
-            ["push", tag] => {
-                assert!(private, "registry operations require isolated configuration");
-                assert!(tag.starts_with("registry.example/team/image:flotilla-"));
-                Ok(format!("digest: {} size: 123", digest(9)))
-            }
-            ["buildx", "build", rest @ ..] => {
-                assert!(rest.windows(2).any(|p| p == ["--platform", "linux/amd64"]));
-                assert!(rest.windows(2).any(|p| p == ["--file", "Dockerfile"]));
-                assert!(rest.windows(2).any(|p| p == ["--build-arg", "BASE=parent"]));
-                assert_eq!(rest.last(), Some(&"."));
-                let output = rest.windows(2).find(|p| p[0] == "--output").expect("archive exporter")[1];
-                std::fs::write(output.strip_prefix("type=docker,dest=").expect("Docker archive"), digest(1)).expect("archive");
-                let metadata = rest.windows(2).find(|p| p[0] == "--metadata-file").expect("metadata file")[1];
-                std::fs::write(
-                    metadata,
-                    serde_json::json!({"containerimage.config.digest": if self.corrupt { "invalid".to_string() } else { digest(1) }})
-                        .to_string(),
-                )
-                .expect("metadata");
                 Ok(String::new())
             }
             other => panic!("unexpected Docker invocation: {other:?}"),
@@ -193,55 +161,6 @@ async fn cache_refuses_mutable_references_and_propagates_runtime_failures() {
     assert!(runner.calls.lock().expect("calls").is_empty());
     assert!(cache.inventory().await.is_err());
     assert!(cache.has(&digest(1)).await.is_err());
-}
-
-// A build emits an immutable digest before loading a specifically named cache
-// or publishing a registry digest; the target cache is verified after import.
-#[tokio::test]
-async fn builder_contract_build_load_and_push() {
-    let directory = tempfile::tempdir().expect("directory");
-    let runner = Arc::new(DockerStandIn::default());
-    let builder: Arc<dyn ImageBuilder> = Arc::new(BuildxImageBuilder::new(runner.clone()));
-    let args = BTreeMap::from([("BASE".into(), "parent".into())]);
-    let image = builder
-        .build(
-            ImageComposition { context: directory.path(), fragment: "Dockerfile", architecture: "amd64", args: &args },
-            &directory.path().join("image.tar"),
-            None,
-        )
-        .await
-        .expect("build");
-    assert_eq!(image.digest, digest(1));
-    assert!(!directory.path().join("image.metadata.json").exists());
-    let target = DockerEnvironmentProvider::new(Arc::new(DockerStandIn::default()));
-    let cache = target.local_image_cache().expect("target");
-    assert!(!cache.has(&image.digest).await.expect("absent"));
-    assert!(builder.load(&image, "", cache).await.is_err());
-    builder.load(&image, "cache-b", cache).await.expect("load");
-    assert!(cache.has(&image.digest).await.expect("loaded"));
-    assert_eq!(
-        builder.push(&image, "registry.example/team/image", None).await.expect("push"),
-        format!("registry.example/team/image@{}", digest(9))
-    );
-    let bad = BuiltImage { digest: digest(2), archive: image.archive };
-    assert!(builder.load(&bad, "cache-b", cache).await.expect_err("mismatch").contains("does not match"));
-}
-
-// Invalid Buildx metadata is never admitted as immutable build evidence.
-#[tokio::test]
-async fn builder_contract_refuses_invalid_digest() {
-    let directory = tempfile::tempdir().expect("directory");
-    let builder = BuildxImageBuilder::new(Arc::new(DockerStandIn { corrupt: true, ..Default::default() }));
-    let args = BTreeMap::from([("BASE".into(), "parent".into())]);
-    assert!(builder
-        .build(
-            ImageComposition { context: directory.path(), fragment: "Dockerfile", architecture: "amd64", args: &args },
-            &directory.path().join("image.tar"),
-            None
-        )
-        .await
-        .expect_err("invalid digest")
-        .contains("valid config digest"));
 }
 
 // Local-only commands preserve the provider endpoint without constructing an

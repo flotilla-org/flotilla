@@ -26,7 +26,7 @@ RUNTIME_IMPLEMENTATIONS = {
 CONCRETE_RUNTIME_TYPES = {
     "DockerEnvironmentProvider", "DockerEnvironmentProviderInner",
     "DockerProvisionedEnvironment", "DockerEnvironmentRunner",
-    "HostDirectEnvironmentProvider", "BuildxImageBuilder",
+    "HostDirectEnvironmentProvider", "OwnedBuildKitService",
 }
 COMPOSITION_ROOT = "crates/flotilla-daemon/src/runtime.rs"
 

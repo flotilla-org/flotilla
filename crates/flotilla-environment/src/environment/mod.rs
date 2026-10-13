@@ -2,10 +2,11 @@ pub mod docker;
 pub mod docker_image;
 pub mod host_direct;
 pub mod image;
+pub mod image_dockerfile;
 pub mod registry_auth;
 pub mod registry_client;
 pub mod runner;
-pub use image::{ImageBuilder, LocalImageCache};
+pub use image::{ImageBuildService, LocalImageCache, OwnedBuilderSettings};
 pub use registry_auth::RegistryAuth;
 
 #[cfg(test)]
@@ -286,8 +287,9 @@ pub trait EnvironmentProvider: Send + Sync {
     fn local_image_cache(&self) -> Option<&dyn LocalImageCache> {
         None
     }
-    /// Optional builder using the same endpoint as this instance's local cache.
-    fn image_builder(&self) -> Option<Arc<dyn ImageBuilder>> {
+    /// Optional owned build service using the same endpoint as this
+    /// instance's local cache, bound to the host's owned builder settings.
+    fn image_build_service(&self, _builder: OwnedBuilderSettings) -> Option<Arc<dyn ImageBuildService>> {
         None
     }
     /// Read-only detection before provisioning. Image-backed providers run in
@@ -386,6 +388,9 @@ mod registry_client_tests;
 
 #[cfg(test)]
 mod image_tests;
+
+#[cfg(test)]
+mod image_build_tests;
 
 /// Compose the built-in provider for a known command endpoint. Callers with a
 /// discovered registry must select its existing instance instead.

@@ -1,0 +1,37 @@
+# OS base (ADR 0062, decision A2). The version is `<release>.<apt snapshot
+# date>`: bumping either the index digest or the snapshot is a new version.
+# Resolve both when the definition is updated, never at admission:
+#   from: Docker-Content-Digest of registry-1.docker.io/v2/library/ubuntu/manifests/24.04
+#         requested as an OCI image index (multi-arch), not a per-platform manifest;
+#   apt-snapshot: a timestamp served by https://snapshot.ubuntu.com/ubuntu/<timestamp>/.
+name: base-ubuntu-24.04
+version: 24.04.20261012
+tier: base
+from: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+provides: [os:ubuntu, os:ubuntu@24.04]
+requires: []
+pins:
+  apt-snapshot:
+    # Every layer's apt reads this snapshot through the sources the base
+    # writes, so package versions are part of the base definition.
+    version: 20261012T000000Z
+probe: |
+  set -eu
+  . /etc/os-release
+  test "$VERSION_ID" = 24.04
+  grep -q 'https://snapshot.ubuntu.com/ubuntu/20261012T000000Z' /etc/apt/sources.list.d/ubuntu.sources
+  test -s /etc/ssl/certs/ca-certificates.crt
+  for tool in curl git bash cc make pkg-config unzip xz tini; do
+      command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }
+  done
+  locale -a | grep -qx 'en_US.utf8'
+  test "$LANG" = en_US.UTF-8
+  case ":$PATH:" in /opt/flotilla/bin:*) ;; *) echo "PATH must start with /opt/flotilla/bin: $PATH" >&2; exit 1 ;; esac
+  test "$TERMINFO_DIRS" = /opt/flotilla/share/terminfo:/usr/share/terminfo
+  work="$(mktemp -d)"
+  printf '#include <stdio.h>\nint main(void) { puts("c toolchain ready"); return 0; }\n' > "$work/probe.c"
+  cc -o "$work/probe" "$work/probe.c"
+  "$work/probe"
+  rm -rf "$work"
+context_files: []
+build_secrets: []

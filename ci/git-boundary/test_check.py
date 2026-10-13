@@ -236,7 +236,7 @@ class RuntimeBoundaryTests(unittest.TestCase):
     # testkit files imported by production, but exempts genuine fixture modules.
     def test_runtime_test_context(self):
         for source in ['fn f() { Command::new("docker"); }',
-                       'use adapters::BuildxImageBuilder;',
+                       'use adapters::OwnedBuildKitService;',
                        'fn f() { registry.environment_providers.get("docker"); }']:
             for path in ['crates/a/tests/fixture.rs', 'crates/a-testkit/src/lib.rs']:
                 self.assertEqual(check.violations(source, path), [])

@@ -1,16 +1,24 @@
 //! Docker cache and Buildx implementations. Tool configuration is operation-local.
-use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use flotilla_resources::{is_image_digest, HostImageAction, ImageBuildFailureClass, PlacedImageIdentity};
+use flotilla_provider_runtime::{ChannelLabel, CommandOutput, CommandRunner};
+use flotilla_resources::{
+    image_identity, is_image_digest, HostImageAction, ImageBuildFailure, ImageBuildFailureClass, ImageLayerProbe, ImageProbeOutcome,
+    PlacedImageIdentity,
+};
 
 use super::{
     docker::DockerEnvironmentProvider,
-    image::{BuiltImage, ImageComposition},
-    ImageBuilder, LocalImageCache, RegistryAuth,
+    image::{BuiltImage, FailedImageBuild, ImageBuildRequest, ImageBuildService, ImageDeliveryTarget, OwnedBuilderSettings},
+    image_dockerfile::{generate_build, GeneratedBuild},
+    LocalImageCache, RegistryAuth,
 };
-use flotilla_provider_runtime::ChannelLabel;
-use flotilla_provider_runtime::CommandRunner;
 
 pub fn validate_digest(reference: &str) -> Result<(), String> {
     if is_image_digest(reference) || reference.rsplit_once('@').is_some_and(|(repo, digest)| !repo.is_empty() && is_image_digest(digest)) {
@@ -129,100 +137,378 @@ impl LocalImageCache for DockerEnvironmentProvider {
     }
 }
 
-pub struct BuildxImageBuilder {
+/// The owned-BuildKit implementation of [`ImageBuildService`]: one generated
+/// multi-stage Dockerfile per identity × architecture, built by the host's
+/// owned Buildx builder and either pushed with a registry build cache or loaded
+/// into the local store, then probed layer by layer on the result.
+pub struct OwnedBuildKitService {
     runner: Arc<dyn CommandRunner>,
+    settings: OwnedBuilderSettings,
 }
-impl BuildxImageBuilder {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+
+impl OwnedBuildKitService {
+    pub fn new(runner: Arc<dyn CommandRunner>, settings: OwnedBuilderSettings) -> Self {
+        Self { runner, settings }
     }
 }
-#[async_trait]
-impl ImageBuilder for BuildxImageBuilder {
-    async fn publish(&self, digest: &str, repository: &str, auth: Option<&RegistryAuth>) -> Result<String, String> {
-        validate_digest(digest)?;
-        if let Some(auth) = auth {
-            auth.validate(repository, HostImageAction::ImagePush)?;
-        }
-        let tag = format!("{repository}:flotilla-{}", digest.trim_start_matches("sha256:"));
-        run(self.runner.as_ref(), &["image", "tag", digest, &tag], None).await?;
-        let output = run(self.runner.as_ref(), &["push", &tag], auth).await?;
-        let digest = output
-            .split_once("digest:")
-            .and_then(|(_, t)| t.split_whitespace().next())
-            .filter(|d| is_image_digest(d))
-            .ok_or("registry push did not report a manifest digest")?;
-        Ok(format!("{repository}@{digest}"))
+
+/// Unprivileged probe identity and its writable home.
+pub const PROBE_USER: &str = "65534:65534";
+pub const PROBE_HOME: &str = "/tmp/flotilla-probe-home";
+/// Local tag repository for single-host (`--load`) builds.
+pub const LOCAL_IMAGE_REPOSITORY: &str = "flotilla-image";
+
+/// `<first 40 hex of identity>-<architecture>`, matching the ImageBuild name.
+pub fn image_tag(identity: &str, architecture: &str) -> String {
+    let hex = identity.strip_prefix("sha256:").unwrap_or(identity);
+    format!("{}-{architecture}", &hex[..hex.len().min(40)])
+}
+
+fn failure(class: ImageBuildFailureClass, reason: impl Into<String>) -> ImageBuildFailure {
+    ImageBuildFailure { class, reason: reason.into().chars().take(MAX_REASON_CHARS).collect() }
+}
+fn recipe(reason: impl Into<String>) -> ImageBuildFailure {
+    failure(ImageBuildFailureClass::Recipe, reason)
+}
+fn infrastructure(reason: impl Into<String>) -> ImageBuildFailure {
+    failure(ImageBuildFailureClass::Infrastructure, reason)
+}
+
+/// A private per-build directory. Dropping it removes the Dockerfile, the
+/// contexts and the metadata, including when the build is cancelled.
+struct BuildWorkspace(PathBuf);
+impl Drop for BuildWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
-    async fn build(&self, c: ImageComposition<'_>, archive: &Path, auth: Option<&RegistryAuth>) -> Result<BuiltImage, String> {
-        if let Some(auth) = auth {
-            auth.validate(c.args.get("BASE").ok_or("authenticated composition requires a BASE reference")?, HostImageAction::ImagePull)?;
-        }
-        if archive.to_str().is_none_or(|p| p.contains(',')) {
-            return Err("archive path is not representable in Buildx output attributes".into());
-        }
-        let config = RegistryAuth::config(auth)?;
-        let metadata = archive.with_extension("metadata.json");
-        let platform = format!("linux/{}", c.architecture);
-        let output = format!("type=docker,dest={}", archive.display());
-        let mut args = vec![
-            "--config".into(),
-            config.path().to_string_lossy().into_owned(),
-            "buildx".into(),
-            "build".into(),
-            "--progress=plain".into(),
-            "--platform".into(),
-            platform,
-            "--file".into(),
-            c.fragment.into(),
-            "--output".into(),
-            output,
-            "--metadata-file".into(),
-            metadata.to_string_lossy().into_owned(),
-        ];
-        for (key, value) in c.args {
-            args.extend(["--build-arg".into(), format!("{key}={value}")]);
-        }
-        args.push(".".into());
-        self.runner
-            .run_with_timeout(
-                "docker",
-                &args.iter().map(String::as_str).collect::<Vec<_>>(),
-                c.context,
-                &ChannelLabel::Default,
-                Duration::from_secs(1800),
-            )
-            .await
-            .map_err(|text| RegistryAuth::redact(auth, text))?;
-        let result = tokio::fs::read(&metadata).await.map_err(|e| e.to_string());
-        let _ = tokio::fs::remove_file(&metadata).await;
-        let value: serde_json::Value = serde_json::from_slice(&result?).map_err(|e| e.to_string())?;
-        let digest = value["containerimage.config.digest"]
-            .as_str()
-            .filter(|d| is_image_digest(d))
-            .ok_or("Buildx has no valid config digest")?
-            .into();
-        Ok(BuiltImage { digest, archive: archive.into() })
+}
+
+impl BuildWorkspace {
+    fn create(scratch: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(scratch).map_err(|error| format!("image build scratch {}: {error}", scratch.display()))?;
+        let path = scratch.join(format!("flotilla-image-build-{}", uuid::Uuid::new_v4().simple()));
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let created = std::fs::create_dir(&path);
+        created.map_err(|error| format!("image build directory {}: {error}", path.display()))?;
+        Ok(Self(path))
     }
-    async fn load(&self, image: &BuiltImage, cache_name: &str, cache: &dyn LocalImageCache) -> Result<(), String> {
-        if cache_name.is_empty() {
-            return Err("load requires a named cache".into());
-        }
-        validate_digest(&image.digest)?;
-        cache.load(&image.archive).await?;
-        if !cache.has(&image.digest).await? {
-            return Err("loaded image does not match builder digest".into());
+
+    fn dockerfile(&self) -> PathBuf {
+        self.0.join("Dockerfile")
+    }
+    fn metadata(&self) -> PathBuf {
+        self.0.join("metadata.json")
+    }
+    /// The (empty) main build context; fragments reach files only through
+    /// their layer's named context.
+    fn root(&self) -> PathBuf {
+        self.0.join("root")
+    }
+    fn context(&self, name: &str) -> PathBuf {
+        self.0.join("contexts").join(name)
+    }
+
+    fn materialise(&self, generated: &GeneratedBuild) -> Result<(), String> {
+        let io = |error: std::io::Error| error.to_string();
+        std::fs::write(self.dockerfile(), &generated.dockerfile).map_err(io)?;
+        std::fs::create_dir_all(self.root()).map_err(io)?;
+        for context in &generated.contexts {
+            let directory = self.context(&context.name);
+            std::fs::create_dir_all(&directory).map_err(io)?;
+            for (relative, file) in &context.files {
+                // Paths are relative and normalised (layer validation).
+                let path = directory.join(relative);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(io)?;
+                }
+                std::fs::write(&path, &file.content).map_err(io)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if file.executable { 0o755 } else { 0o644 };
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(io)?;
+                }
+            }
         }
         Ok(())
     }
-    async fn push(&self, image: &BuiltImage, repository: &str, auth: Option<&RegistryAuth>) -> Result<String, String> {
-        run(self.runner.as_ref(), &["image", "load", "--input", image.archive.to_str().ok_or("archive path is not UTF-8")?], None).await?;
-        self.publish(&image.digest, repository, auth).await
+}
+
+fn path_arg(path: &Path) -> Result<String, ImageBuildFailure> {
+    path.to_str().map(str::to_owned).ok_or_else(|| infrastructure(format!("path {} is not UTF-8", path.display())))
+}
+
+impl OwnedBuildKitService {
+    async fn docker(&self, args: &[String], timeout: Duration) -> Result<Result<CommandOutput, String>, ()> {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        tokio::time::timeout(timeout, self.runner.run_output("docker", &args, Path::new("/"), &ChannelLabel::Default)).await.map_err(|_| ())
+    }
+
+    async fn execute(
+        &self,
+        request: &ImageBuildRequest<'_>,
+        probes: &mut [ImageLayerProbe],
+        log: &mut String,
+    ) -> Result<String, ImageBuildFailure> {
+        let ImageBuildRequest { identity, architecture, layers, delivery, secrets, probe_wrapper, probe_cpus } = request;
+        if !matches!(*architecture, "amd64" | "arm64") {
+            return Err(recipe(format!("image build architecture `{architecture}` must be amd64 or arm64")));
+        }
+        if image_identity(layers) != *identity {
+            return Err(recipe("image build identity does not match its layers"));
+        }
+        if *probe_cpus == 0 || probe_wrapper.trim().is_empty() {
+            return Err(recipe("image build needs a probe wrapper and at least one probe CPU"));
+        }
+        let generated = generate_build(layers, architecture).map_err(recipe)?;
+        let mut secret_args = Vec::new();
+        for name in &generated.secrets {
+            // Ungranted secrets are deterministic until the installation's
+            // grants change, so they do not retry identical inputs.
+            let file = secrets.get(name).ok_or_else(|| recipe(format!("build secret `{name}` is not granted to this build")))?;
+            let source = path_arg(file.path())?;
+            if source.contains(',') {
+                return Err(infrastructure(format!("build secret `{name}` file path is not representable in Buildx")));
+            }
+            secret_args.extend(["--secret".to_string(), format!("id={name},src={source}")]);
+        }
+        let auth = match delivery {
+            ImageDeliveryTarget::Push { repository, cache_repository, auth } => {
+                if repository.trim().is_empty() || cache_repository.trim().is_empty() || repository.contains('@') {
+                    return Err(recipe("registry delivery needs an image repository and a cache repository"));
+                }
+                auth.validate(repository, HostImageAction::ImagePush).map_err(recipe)?;
+                Some(auth)
+            }
+            ImageDeliveryTarget::Load => None,
+        };
+        let redact = |text: String| RegistryAuth::redact(auth, text);
+        // One private tool configuration for the whole operation: the push
+        // credential (or none) and a link to the owned builder's state.
+        let config = RegistryAuth::config(auth).map_err(|error| infrastructure(redact(error)))?;
+        link_builder_state(config.path(), &self.settings.state_directory).map_err(infrastructure)?;
+        let config_arg = path_arg(config.path())?;
+        let workspace = BuildWorkspace::create(&self.settings.scratch).map_err(infrastructure)?;
+        workspace.materialise(&generated).map_err(infrastructure)?;
+
+        let tag = image_tag(identity, architecture);
+        let mut args = vec![
+            "--config".to_string(),
+            config_arg.clone(),
+            "buildx".into(),
+            "build".into(),
+            "--builder".into(),
+            self.settings.builder.clone(),
+            "--platform".into(),
+            format!("linux/{architecture}"),
+            "--file".into(),
+            path_arg(&workspace.dockerfile())?,
+        ];
+        for context in &generated.contexts {
+            args.extend(["--build-context".to_string(), format!("{}={}", context.name, path_arg(&workspace.context(&context.name))?)]);
+        }
+        args.extend(secret_args);
+        args.extend([
+            "--provenance=false".to_string(),
+            "--metadata-file".into(),
+            path_arg(&workspace.metadata())?,
+            "--progress=plain".into(),
+        ]);
+        match delivery {
+            ImageDeliveryTarget::Push { repository, cache_repository, .. } => args.extend([
+                "--push".to_string(),
+                "--tag".into(),
+                format!("{repository}:{tag}"),
+                "--cache-to".into(),
+                format!("type=registry,ref={cache_repository},mode=max"),
+                "--cache-from".into(),
+                format!("type=registry,ref={cache_repository}"),
+            ]),
+            ImageDeliveryTarget::Load => args.extend(["--load".to_string(), "--tag".into(), format!("{LOCAL_IMAGE_REPOSITORY}:{tag}")]),
+        }
+        args.push(path_arg(&workspace.root())?);
+        log.push_str(&format!("### build {identity} for linux/{architecture}\n"));
+        let output = match self.docker(&args, BUILD_TIMEOUT).await {
+            Err(()) => return Err(infrastructure(format!("image build exceeded its {} second deadline", BUILD_TIMEOUT.as_secs()))),
+            Ok(Err(error)) => return Err(infrastructure(redact(error))),
+            Ok(Ok(output)) => output,
+        };
+        log.push_str(&redact(output.stdout.clone()));
+        log.push_str(&redact(output.stderr.clone()));
+        if !output.success() {
+            let reason = failure_summary(&redact(output.stderr), output.exit_code);
+            return Err(failure(classify_build_failure(output.exit_code, &reason), reason));
+        }
+
+        let image = match delivery {
+            ImageDeliveryTarget::Push { repository, .. } => {
+                let metadata = std::fs::read(workspace.metadata()).map_err(|error| infrastructure(format!("Buildx metadata: {error}")))?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&metadata).map_err(|error| infrastructure(format!("Buildx metadata: {error}")))?;
+                let digest = value["containerimage.digest"]
+                    .as_str()
+                    .filter(|digest| is_image_digest(digest))
+                    .ok_or_else(|| infrastructure("Buildx metadata has no valid pushed image digest"))?;
+                let reference = format!("{repository}@{digest}");
+                // Probe exactly the pushed manifest, as providers will pull it.
+                let pull = ["--config".to_string(), config_arg.clone(), "pull".into(), reference.clone()];
+                match self.docker(&pull, BUILD_TIMEOUT).await {
+                    Err(()) => return Err(infrastructure("pulling the pushed image exceeded its deadline")),
+                    Ok(Err(error)) => return Err(infrastructure(redact(error))),
+                    Ok(Ok(output)) if !output.success() => {
+                        return Err(infrastructure(format!(
+                            "pulling the pushed image failed: {}",
+                            failure_summary(&redact(output.stderr), output.exit_code)
+                        )))
+                    }
+                    Ok(Ok(_)) => {}
+                }
+                reference
+            }
+            ImageDeliveryTarget::Load => {
+                let inspect = [
+                    "--config".to_string(),
+                    config_arg.clone(),
+                    "image".into(),
+                    "inspect".into(),
+                    "--format".into(),
+                    "{{.Id}}".into(),
+                    format!("{LOCAL_IMAGE_REPOSITORY}:{tag}"),
+                ];
+                let output = match self.docker(&inspect, CLI_TIMEOUT).await {
+                    Err(()) => return Err(infrastructure("inspecting the loaded image exceeded its deadline")),
+                    Ok(Err(error)) => return Err(infrastructure(error)),
+                    Ok(Ok(output)) => output,
+                };
+                let id = output.stdout.trim();
+                if !output.success() || !is_image_digest(id) {
+                    return Err(infrastructure(format!(
+                        "loaded image has no valid local ID: {}",
+                        failure_summary(&output.stderr, output.exit_code)
+                    )));
+                }
+                id.to_string()
+            }
+        };
+        drop(workspace);
+
+        let cpus = probe_cpus.to_string();
+        let mut failed = Vec::new();
+        for (index, layer) in layers.iter().enumerate() {
+            let name = format!("flotilla-probe-{}", uuid::Uuid::new_v4().simple());
+            // Positional arguments carry the probe without shell interpolation;
+            // the wrapper sources preludes and runs `"$@"` in the same shell.
+            let home = format!("HOME={PROBE_HOME}");
+            let home_mount = format!("{PROBE_HOME}:exec,uid=65534,gid=65534,mode=0700");
+            let args = [
+                "--config",
+                config_arg.as_str(),
+                "run",
+                "--rm",
+                "--name",
+                name.as_str(),
+                "--network=none",
+                "--user",
+                PROBE_USER,
+                "-e",
+                home.as_str(),
+                "--tmpfs",
+                "/tmp:exec,mode=1777",
+                "--tmpfs",
+                home_mount.as_str(),
+                "--pull=never",
+                "--cpus",
+                cpus.as_str(),
+                "--memory",
+                "512m",
+                "--pids-limit",
+                "256",
+                "--entrypoint",
+                "sh",
+                image.as_str(),
+                "-c",
+                probe_wrapper,
+                "flotilla-layer-probe",
+                "sh",
+                "-c",
+                layer.probe.as_str(),
+            ]
+            .map(str::to_owned);
+            log.push_str(&format!("### probe {}\n", layer.name));
+            let output = match self.docker(&args, PROBE_TIMEOUT).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => return Err(infrastructure(redact(error))),
+                Err(()) => {
+                    // Dropping the Docker client does not stop its container.
+                    let remove = ["--config".to_string(), config_arg.clone(), "rm".into(), "--force".into(), name];
+                    let _ = self.docker(&remove, CLI_TIMEOUT).await;
+                    let reason = format!("probe exceeded its {} second deadline", PROBE_TIMEOUT.as_secs());
+                    probes[index].outcome = ImageProbeOutcome::Failed { reason: reason.clone() };
+                    return Err(infrastructure(format!("layer `{}`: {reason}", layer.name)));
+                }
+            };
+            log.push_str(&redact(output.stdout.clone()));
+            log.push_str(&redact(output.stderr.clone()));
+            if output.success() {
+                probes[index].outcome = ImageProbeOutcome::Passed;
+                continue;
+            }
+            let diagnostic = if output.stderr.trim().is_empty() { &output.stdout } else { &output.stderr };
+            let reason = failure_summary(&redact(diagnostic.clone()), output.exit_code);
+            // 125 is Docker's own failure and 137 a kill; other nonzero codes
+            // (including 126/127, an unusable probe command) are the probe's.
+            if matches!(output.exit_code, None | Some(125) | Some(137))
+                && classify_build_failure(output.exit_code, &reason) == ImageBuildFailureClass::Infrastructure
+            {
+                return Err(infrastructure(format!("layer `{}` probe could not run: {reason}", layer.name)));
+            }
+            probes[index].outcome = ImageProbeOutcome::Failed { reason };
+            failed.push(layer.name.as_str());
+        }
+        if !failed.is_empty() {
+            return Err(recipe(format!("layer probes failed: {}", failed.join(", "))));
+        }
+        Ok(image)
+    }
+}
+
+/// Make the owned builder instance visible through the private configuration
+/// (Buildx keeps instances under `<config>/buildx`).
+fn link_builder_state(config: &Path, state: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(state, config.join("buildx")).map_err(|error| format!("builder state link: {error}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (config, state);
+        Err("owned BuildKit builds require a Unix host".into())
+    }
+}
+
+#[async_trait]
+impl ImageBuildService for OwnedBuildKitService {
+    async fn build(&self, request: ImageBuildRequest<'_>, log: &mut String) -> Result<BuiltImage, FailedImageBuild> {
+        let mut probes: Vec<_> =
+            request.layers.iter().map(|layer| ImageLayerProbe { layer: layer.name.clone(), outcome: ImageProbeOutcome::NotRun }).collect();
+        match self.execute(&request, &mut probes, log).await {
+            Ok(digest) => Ok(BuiltImage { digest, probes }),
+            Err(failure) => {
+                log.push_str(&format!("\n{}\n", failure.reason));
+                Err(FailedImageBuild { failure, probes })
+            }
+        }
     }
 }
 
 pub const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REASON_CHARS: usize = 2048;
 
 // Status holds a bounded diagnostic, while the Artifact retains the full output.
