@@ -47,7 +47,9 @@ pub(super) struct ControllerRuntimeState {
     pub(super) credential_store: Option<Arc<CredentialStore>>,
     pub(super) agent_material: Option<Arc<AgentMaterialRegistry>>,
     pub(super) blob_store: Option<Arc<TieredBlobStore>>,
-    pub(super) image_distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
+    pub(super) image_inventory: Option<Arc<crate::image_inventory::ImageInventoryPublisher<crate::image_inventory::ProviderImageIo>>>,
+    /// This host's ADR 0062 image build service, when it can build images.
+    pub(super) image_build_service: Option<Arc<dyn flotilla_environment::environment::ImageBuildService>>,
     pub(super) provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
     /// A fresh provider listing is still required for each absence judgement.
@@ -114,7 +116,8 @@ impl ControllerRuntimeState {
             credential_store: None,
             agent_material: None,
             blob_store: None,
-            image_distributor: None,
+            image_inventory: None,
+            image_build_service: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
@@ -187,11 +190,19 @@ impl ControllerRuntimeState {
         self
     }
 
-    pub(super) fn with_image_distributor(
+    pub(super) fn with_image_inventory(
         mut self,
-        distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
+        publisher: Option<Arc<crate::image_inventory::ImageInventoryPublisher<crate::image_inventory::ProviderImageIo>>>,
     ) -> Self {
-        self.image_distributor = distributor;
+        self.image_inventory = publisher;
+        self
+    }
+
+    pub(super) fn with_image_build_service(
+        mut self,
+        service: Option<Arc<dyn flotilla_environment::environment::ImageBuildService>>,
+    ) -> Self {
+        self.image_build_service = service;
         self
     }
 

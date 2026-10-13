@@ -286,6 +286,153 @@ async fn registry_admission_delivers_opaque_auth_without_runtime_preflight_and_r
     }
 }
 
+// ADR 0062 A11: a composed image built for registry delivery reaches the
+// provider as `repository@digest` with the fleet image cache's pull
+// credential, admitted by an image-pull host-action grant for this host and
+// never through the crew's work credentials. Without that grant provisioning
+// refuses before the provider runs; a local build's image ID needs no
+// registry credential.
+#[tokio::test]
+async fn composed_registry_images_pull_with_the_fleet_pull_credential() {
+    use flotilla_resources::{
+        CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, FleetDesignation, FleetDesignationSpec, HostActionSelector,
+        HostImageAction, ImageCacheBinding, Project, ProjectSpec, FLEET_DESIGNATION_NAME,
+    };
+    let repository = "registry.example/flotilla/crew-images";
+    let image = format!("{repository}@sha256:{}", "d".repeat(64));
+    for case in ["granted", "ungranted", "local"] {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"composed-pull-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let skill_sources = write_test_skill_sources(temp.path());
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+        let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        let backend = daemon.resource_backend();
+        backend
+            .definitions::<Project>(NAMESPACE)
+            .create(&InputMeta::builder().name("fleet".into()).build(), &ProjectSpec::builder().display_name("Fleet".into()).build())
+            .await
+            .expect("project");
+        backend
+            .definitions::<FleetDesignation>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+                &FleetDesignationSpec {
+                    project: "fleet".into(),
+                    image_cache: Some(ImageCacheBinding {
+                        repository: repository.into(),
+                        pull_credential: "crew-image-registry-pull".into(),
+                        push_credential: "crew-image-registry-push".into(),
+                    }),
+                },
+            )
+            .await
+            .expect("fleet designation");
+        backend
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(
+                &InputMeta::builder().name("crew-image-registry-pull".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry {
+                        registry: "registry.example".to_string(),
+                        username: "puller".to_string(),
+                    },
+                    source: CredentialSource::Env { name: "TEST_PULL_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
+            .await
+            .expect("pull credential");
+        if case != "ungranted" {
+            backend
+                .definitions::<CredentialGrant>(NAMESPACE)
+                .create(
+                    &InputMeta::builder().name("image-pull".into()).build(),
+                    &CredentialGrantSpec::builder()
+                        .selector(
+                            CredentialGrantSelector::builder()
+                                .host_action(HostActionSelector::builder().action(HostImageAction::ImagePull).build())
+                                .build(),
+                        )
+                        .credentials(BTreeSet::from(["crew-image-registry-pull".to_string()]))
+                        .build(),
+                )
+                .await
+                .expect("pull grant");
+        }
+        let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None), prepared_auth: Mutex::new(None) });
+        let mut local_registry = ProviderRegistry::new();
+        local_registry.environment_providers.insert(
+            "sandbox",
+            flotilla_discovery_api::ProviderDescriptor::named(flotilla_discovery_api::ProviderCategory::EnvironmentProvider, "sandbox"),
+            Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+        );
+        let registry_runner = Arc::new(RegistryPreflightRunner {
+            outcome: RegistryPreflightOutcome::Success,
+            calls: AtomicUsize::new(0),
+            directory: Mutex::new(None),
+        });
+        let credential_store = Arc::new(CredentialStore::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_PULL_TOKEN", "pull-secret".to_string())])),
+            EnvironmentBag::new(),
+            registry_runner.clone(),
+            config.state_dir().as_path().to_path_buf(),
+        ));
+        let agent_material = Arc::new(test_agent_material_registry(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
+        ]))));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                Arc::clone(&config),
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                "host-direct-host-test".to_string(),
+            )
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
+            .with_agent_material(agent_material)
+            .with_credential_store(credential_store),
+        );
+        let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_build_ref: Some("image-build".to_string()),
+            memory_policy: Default::default(),
+            host_ref: "host-test".to_string(),
+            image: if case == "local" { format!("sha256:{}", "d".repeat(64)) } else { image.clone() },
+            declared_agent_adapters: BTreeSet::new(),
+            required_agent_adapters: BTreeSet::new(),
+            pull_policy: if case == "local" { flotilla_resources::DockerImagePullPolicy::Never } else { Default::default() },
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+        };
+        let error = DockerControllerRuntime { state }.provision("composed-environment", &spec).await.expect_err("capture stops provision");
+        let opts = provider.create_opts.lock().await.take();
+        match case {
+            "granted" => {
+                assert_eq!(error, "stop after capturing create options");
+                let auth = opts.expect("provider invoked").prepared_auth.expect("fleet pull credential admitted");
+                auth.validate(&image, flotilla_resources::HostImageAction::ImagePull).expect("pull of the composed digest");
+                assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "credential minting never invokes Docker");
+            }
+            "ungranted" => {
+                assert!(opts.is_none(), "the provider never runs without the pull credential");
+                assert!(error.contains("crew-image-registry-pull"), "{error}");
+            }
+            _ => {
+                assert_eq!(error, "stop after capturing create options");
+                assert!(opts.expect("provider invoked").prepared_auth.is_none(), "a local image ID needs no registry credential");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn docker_teardown_and_forced_cleanup_archive_persistent_agent_home() {
     let temp = TempDir::new().expect("tempdir");

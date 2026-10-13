@@ -103,6 +103,45 @@ impl DockerControllerRuntime {
     }
 }
 
+impl DockerControllerRuntime {
+    /// ADR 0062: a composed image built for registry delivery is pulled as
+    /// `repository@digest` with the fleet image cache's pull credential,
+    /// admitted by an `image-pull` host-action grant for this host. The crew's
+    /// work credentials never carry it. Local builds (an image ID) and other
+    /// images use the environment's own credential references.
+    pub(super) async fn composed_image_pull_auth(
+        &self,
+        store: &CredentialStore,
+        spec: &flotilla_resources::DockerEnvironmentSpec,
+    ) -> Result<Option<flotilla_environment::environment::RegistryAuth>, String> {
+        if spec.image_build_ref.is_none() {
+            return Ok(None);
+        }
+        let Some((repository, _)) = spec.image.split_once('@') else { return Ok(None) };
+        let fleet = match self
+            .state
+            .daemon
+            .resource_backend()
+            .definitions::<flotilla_resources::FleetDesignation>(&self.state.namespace)
+            .get(flotilla_resources::FLEET_DESIGNATION_NAME)
+            .await
+        {
+            Ok(fleet) => fleet,
+            Err(ResourceError::NotFound { .. }) => return Err(format!("composed image {} needs the fleet image cache", spec.image)),
+            Err(error) => return Err(error.to_string()),
+        };
+        let cache = fleet.spec.image_cache.ok_or_else(|| format!("composed image {} needs the fleet image cache", spec.image))?;
+        if repository != cache.repository {
+            return Err(format!("composed image {} is not in the fleet image cache {}", spec.image, cache.repository));
+        }
+        store
+            .registry_auth(&self.state.local_host_ref, flotilla_resources::HostImageAction::ImagePull, &cache.pull_credential, repository)
+            .await
+            .map(Some)
+            .map_err(|error| format!("pull credential `{}` for composed image: {error}", cache.pull_credential))
+    }
+}
+
 pub(super) struct DockerToolContext<'a> {
     pub(super) state: &'a ControllerRuntimeState,
     pub(super) host_ref: &'a str,
@@ -239,8 +278,20 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             None => Vec::new(),
         };
         let prepared_auth = match &self.state.credential_store {
-            Some(store) => match store.prepare_registry_pull(name, &credential_refs, &spec.image).await {
-                Ok(auth) => auth,
+            Some(store) => match self.composed_image_pull_auth(store, spec).await {
+                Ok(Some(auth)) => Some(auth),
+                Ok(None) => match store.prepare_registry_pull(name, &credential_refs, &spec.image).await {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        return Err(discard_uncreated_environment(
+                            self.state.credential_store.as_deref(),
+                            self.state.agent_material.as_deref(),
+                            name,
+                            error,
+                        )
+                        .await)
+                    }
+                },
                 Err(error) => {
                     return Err(discard_uncreated_environment(
                         self.state.credential_store.as_deref(),

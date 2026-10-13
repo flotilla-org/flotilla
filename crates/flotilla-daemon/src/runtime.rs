@@ -222,7 +222,7 @@ impl DaemonRuntime {
             .filter(|(_, provider)| provider.local_image_cache().is_some())
             .filter_map(|(_, provider)| local_registry.environment_providers.instance_name(provider).map(String::from))
             .collect::<BTreeSet<_>>();
-        crate::image_distribution::prune_unregistered_caches(
+        crate::image_inventory::prune_unregistered_caches(
             &daemon.resource_backend(),
             &options.namespace,
             &profile.host_id,
@@ -389,17 +389,24 @@ impl DaemonRuntime {
             ))
             .await;
         if options.start_controllers {
-            // Composed images are built by the per-identity build service
-            // (PR 2 wires its reconciler beside the projection below); this
-            // host publishes its cache inventory for placement cost.
-            let image_distributor = match local_registry
+            // ADR 0062: composed images are built by this host's build
+            // service (the Docker provider's owned BuildKit builder) when the
+            // ImageBuild reconciler finds builds for it; the reconciler
+            // enforces Host.spec.image_build_capacity, including single-host
+            // local mode's undeclared default. This host also publishes its
+            // cache inventory for placement cost.
+            let image_build_service = local_registry
+                .environment_providers
+                .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
+                .and_then(|(_, provider)| provider.image_build_service(owned_builder_settings(config.state_dir().as_path())));
+            let image_inventory = match local_registry
                 .environment_providers
                 .for_kind(flotilla_environment::environment::EnvironmentKind::Docker)
                 .filter(|(_, provider)| provider.local_image_cache().is_some())
             {
                 Some((_, provider)) => Some(Arc::new(
-                    crate::image_distribution::ImageDistributor::builder()
-                        .io(Arc::new(crate::image_distribution::ProviderImageIo::builder().provider(Arc::clone(provider)).build()))
+                    crate::image_inventory::ImageInventoryPublisher::builder()
+                        .io(Arc::new(crate::image_inventory::ProviderImageIo::builder().provider(Arc::clone(provider)).build()))
                         .backend(daemon.resource_backend())
                         .namespace(options.namespace.clone())
                         .host(profile.host_id.clone())
@@ -432,7 +439,8 @@ impl DaemonRuntime {
                 .with_credential_store(Arc::clone(&credential_store))
                 .with_agent_material(agent_material)
                 .with_blob_store(Arc::clone(&blob_store))
-                .with_image_distributor(image_distributor),
+                .with_image_inventory(image_inventory)
+                .with_image_build_service(image_build_service),
             );
             phase(
                 "set_operator_reconciler",
@@ -885,7 +893,7 @@ fn spawn_controller_loops(
             }
         }),
     ];
-    if let Some(distributor) = &state.image_distributor {
+    if let Some(distributor) = &state.image_inventory {
         let distributor = Arc::clone(distributor);
         controllers.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -897,8 +905,45 @@ fn spawn_controller_loops(
             }
         }));
     }
+    // Every host collects retired ImageBuild records; hosts with a build
+    // service also execute the builds placed on them.
+    if let Some(credentials) = state.credential_store.clone() {
+        let blobs: Arc<dyn crate::blob_store::BlobStore> = match state.blob_store.clone() {
+            Some(blobs) => blobs,
+            None => Arc::new(crate::blob_store::LocalBlobStore::new(state.config.state_dir().as_path())),
+        };
+        let materials: Arc<dyn flotilla_controllers::reconcilers::ImageBuildMaterials> =
+            Arc::new(crate::image_build::DaemonImageBuildMaterials {
+                credentials,
+                blobs,
+                backend: backend.clone(),
+                namespace: namespace_string.clone(),
+                host: state.local_host_ref.clone(),
+                secrets: image_builder_directory(state.config.state_dir().as_path()).join("secrets"),
+            });
+        let service = state.image_build_service.clone();
+        let host = state.local_host_ref.clone();
+        let probe_wrapper: Arc<str> = flotilla_agent::process::with_preludes("exec \"$@\"").into();
+        controllers.push(controller!(flotilla_resources::ImageBuild, {
+            move |backend: ResourceBackend, namespace_string: String| {
+                (
+                    vec![],
+                    flotilla_controllers::reconcilers::ImageBuildReconciler::new(
+                        service.clone(),
+                        Arc::clone(&materials),
+                        &backend,
+                        &namespace_string,
+                        &host,
+                        &probe_wrapper,
+                    ),
+                )
+            }
+        }));
+    } else {
+        warn!("no credential store; image builds placed on this host will not run");
+    }
     // Builders mirror replicated per-identity ImageBuild demand into their own
-    // store. PR 2 adds the build-service reconciler that executes it.
+    // store, and withdraw copies whose demand was deleted.
     {
         let projection_backend = backend.clone();
         let projection_namespace = namespace_string.clone();
@@ -925,6 +970,26 @@ fn spawn_controller_loops(
     }
     controllers
 }
+
+/// Daemon-owned image build state: the owned builder's Buildx state, build
+/// scratch and staged build secrets, all private to this daemon.
+fn image_builder_directory(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("image-builder")
+}
+
+/// The owned BuildKit builder of this daemon (ADR 0062). Its Buildx state is
+/// under the daemon state directory, so the instance is invisible to other
+/// Buildx users on the host and survives daemon restarts.
+fn owned_builder_settings(state_dir: &std::path::Path) -> flotilla_environment::environment::OwnedBuilderSettings {
+    let directory = image_builder_directory(state_dir);
+    flotilla_environment::environment::OwnedBuilderSettings {
+        builder: OWNED_BUILDER_NAME.into(),
+        state_directory: directory.join("buildx"),
+        scratch: directory.join("scratch"),
+    }
+}
+
+const OWNED_BUILDER_NAME: &str = "flotilla-images";
 
 #[cfg(test)]
 mod test_git_repo;
