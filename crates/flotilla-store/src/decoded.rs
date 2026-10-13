@@ -151,11 +151,12 @@ impl DecodedQueryResult {
 /// This replaces a serialize-then-deserialize round trip of the whole object:
 /// metadata is already typed and moves across unchanged.
 pub fn typed_object<T: Resource>(object: ResourceObject<SerializedResource>) -> Result<ResourceObject<T>, ResourceError> {
-    let spec = T::Spec::deserialize(object.spec).map_err(|error| ResourceError::decode(format!("decode stored object: {error}")))?;
+    let error = |error: serde_json::Error| {
+        ResourceError::decode(format!("decode stored object {}/{}: {error}", T::API_PATHS.kind, object.metadata.name))
+    };
+    let spec = T::Spec::deserialize(object.spec).map_err(error)?;
     let status = match object.status {
-        Some(status) => {
-            Option::<T::Status>::deserialize(status).map_err(|error| ResourceError::decode(format!("decode stored object: {error}")))?
-        }
+        Some(status) => Option::<T::Status>::deserialize(status).map_err(error)?,
         None => None,
     };
     Ok(ResourceObject { metadata: object.metadata, spec, status })
