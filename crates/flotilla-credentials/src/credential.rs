@@ -2849,7 +2849,7 @@ mod tests {
     // through the real CredentialStore; card observation revisions are covered by the core observer's tests. The minter and
     // RecordingRunner replace GitHub/subprocess I/O; storage and the clock are real in-memory ports.
     #[hegel::test]
-    fn generated_capability_interleavings_preserve_revisions(tc: hegel::TestCase) {
+    fn generated_capability_interleavings_preserve_observations(tc: hegel::TestCase) {
         use hegel::generators as gs;
         let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(18));
         let operations = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(8))).collect::<Vec<_>>();
