@@ -43,6 +43,7 @@ type ValidateSiblings = fn(&InputMeta, &Value, &[ResourceObject<SerializedResour
 pub struct ResourceKind {
     pub paths: ApiPaths,
     pub replication: ReplicationClass,
+    pub event_history: flotilla_resources::EventHistory,
     pub queryable_fields: &'static [&'static str],
     pub queryable_numeric_fields: &'static [&'static str],
     pub validate_namespace: bool,
@@ -95,6 +96,7 @@ impl ResourceKind {
         Self {
             paths: T::API_PATHS,
             replication: T::REPLICATION_CLASS,
+            event_history: T::EVENT_HISTORY,
             queryable_fields: T::QUERYABLE_FIELDS,
             queryable_numeric_fields: T::QUERYABLE_NUMERIC_FIELDS,
             validate_namespace: T::VALIDATE_NAMESPACE_SPEC,

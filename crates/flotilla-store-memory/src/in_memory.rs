@@ -1240,7 +1240,7 @@ impl InMemoryBackend {
             store.objects.insert(meta.name.clone(), encoded.clone());
             store.push_event(
                 StoredEvent { version, kind: StoredEventKind::Added, object: encoded },
-                resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
             );
             Ok(object)
         })
@@ -1314,13 +1314,13 @@ impl InMemoryBackend {
                 store.objects.remove(&meta.name);
                 store.push_event(
                     StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded },
-                    resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                    resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
                 );
             } else {
                 store.objects.insert(meta.name.clone(), encoded.clone());
                 store.push_event(
                     StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
-                    resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                    resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
                 );
             }
             Ok(object)
@@ -1355,7 +1355,7 @@ impl InMemoryBackend {
             store.objects.insert(name.to_string(), encoded.clone());
             store.push_event(
                 StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
-                resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
             );
             Ok(object)
         })
@@ -1377,7 +1377,7 @@ impl InMemoryBackend {
                 store.objects.insert(name.to_string(), encoded.clone());
                 store.push_event(
                     StoredEvent { version, kind: StoredEventKind::Modified, object: encoded },
-                    resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                    resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
                 );
                 return Ok(());
             }
@@ -1386,7 +1386,7 @@ impl InMemoryBackend {
             store.objects.remove(name);
             store.push_event(
                 StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded },
-                resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
             );
             Ok(())
         })
@@ -1426,7 +1426,7 @@ impl InMemoryBackend {
             };
             store.push_event(
                 StoredEvent { version, kind: StoredEventKind::Deleted, object: Self::encode_tombstone(resource_kind, &tombstone) },
-                resource_kind.replication.event_retention(self.event_retention.max_events_per_resource_stream()),
+                resource_kind.event_history.retained_events(self.event_retention.max_events_per_resource_stream()),
             );
             store.tombstones.insert(name.to_string(), tombstone.clone());
             Ok(crate::watch::TombstoneWrite { tombstone, created: true })

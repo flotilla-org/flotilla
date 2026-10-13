@@ -14,8 +14,20 @@
 ///
 /// A resource's lifetime remains represented by its metadata creation timestamp. Attempt history,
 /// if needed, belongs in events or conditions rather than additional status timestamp fields.
+///
+/// # Elided writes
+///
+/// [`StatusPatch::requires_write`] lets a patch decline to commit an application that changes
+/// nothing its readers depend on. A declined application commits nothing, allocates no resource
+/// version and emits no watch event; the caller receives the current object.
 pub trait StatusPatch<S>: Send + Sync {
     fn apply(&self, status: &mut S);
+
+    /// Whether applying this patch to `before`, producing `after`, must be committed.
+    /// The default commits every application.
+    fn requires_write(&self, _before: &S, _after: &S) -> bool {
+        true
+    }
 }
 
 pub enum NoStatusPatch {}

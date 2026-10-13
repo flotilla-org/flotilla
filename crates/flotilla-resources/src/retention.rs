@@ -32,6 +32,29 @@ impl Default for EventRetention {
     }
 }
 
+/// How much resumable watch history a kind keeps in each local event stream.
+///
+/// A watcher resuming from a version below the retained floor receives
+/// `WatchExpired` and relists, so trimming history never loses current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventHistory {
+    /// Keep the store's configured [`EventRetention`] count.
+    Configured,
+    /// Keep only the latest event. For latest-value kinds such as observations
+    /// and heartbeats, older events are superseded history nobody replays.
+    LatestOnly,
+}
+
+impl EventHistory {
+    /// Events to retain per stream, given the store's configured count.
+    pub const fn retained_events(self, configured: usize) -> usize {
+        match self {
+            Self::Configured => configured,
+            Self::LatestOnly => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceStoreWarning {

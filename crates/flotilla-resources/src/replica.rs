@@ -22,11 +22,11 @@ pub enum ReplicationClass {
 }
 
 impl ReplicationClass {
-    pub fn event_retention(self, configured: usize) -> usize {
-        if self == Self::Observations {
-            1
-        } else {
-            configured
+    /// The event history a kind of this class keeps unless it declares its own.
+    pub const fn event_history(self) -> crate::EventHistory {
+        match self {
+            Self::Observations => crate::EventHistory::LatestOnly,
+            Self::None | Self::Definitions | Self::ConvergentFacts | Self::HomeBoundRuntime => crate::EventHistory::Configured,
         }
     }
 }

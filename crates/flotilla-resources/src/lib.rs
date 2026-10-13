@@ -211,7 +211,7 @@ pub use resource::{
     K8sWatchEvent, MergeConflictSibling, MergeMetadata, ObjectMeta, OwnerReference, Resource, ResourceObject, BOOTSTRAP_PATH_ANNOTATION,
 };
 pub use retention::{
-    EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning,
+    EventHistory, EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning,
 };
 pub use review_bundle::{
     FindingResolution, ReviewBundleIndex, ReviewBundleStoreConfig, ReviewBundleWriteCredential, ReviewCheck, ReviewCheckOutcome,
