@@ -14,11 +14,12 @@ use chrono::Utc;
 use flotilla_aggregator::IssuePollingHealth;
 use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_credentials::CredentialStore;
-use flotilla_protocol::{HostSummary, NodeId, Rows};
+use flotilla_protocol::{BlobSyncStatus, HostSummary, NodeId, Rows};
 use flotilla_resources::Resource;
 use flotilla_resources::{
-    ConditionValue, Convoy, CredentialExpiry, Forge, Host, HostCondition, HostStatus, HostStatusPatch, ManifestRoot, ReplicationClass,
-    ResourceError, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
+    ConditionValue, Convoy, CredentialExpiry, FoldedHostObservations, Forge, FulfilmentFacts, Host, HostCondition, HostStatus,
+    HostStatusPatch, ManifestRoot, ReplicationClass, ResourceError, SystemClock, Vessel, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, HELD_CREDENTIALS_CAPABILITY,
 };
 use flotilla_store::{home_bound_authorship_collisions, ResourceBackend, REGISTERED_RESOURCE_KINDS};
 use serde_json::json;
@@ -29,7 +30,8 @@ use super::discovery::LocalProvisioningProfile;
 use super::seed::{ensure_host_exists, migrate_live_placement_policies};
 use super::tasks::{spawn_periodic_task, PeriodicTaskStart, CONVOY_ENSURE_CONDITION_TYPE};
 use crate::{
-    resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name, supervisor::RestartBudgetExhausted,
+    blob_store::TieredBlobStore, resource_limits::file_descriptor_pressure_condition, resource_manifest::manifest_root_name,
+    supervisor::RestartBudgetExhausted,
 };
 
 #[derive(Debug, Clone)]
@@ -44,9 +46,53 @@ pub(super) struct RuntimeHealth {
     pub(super) failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
     pub(super) restart_history_dir: Option<Arc<PathBuf>>,
     pub(super) issue_polling: IssuePollingHealth,
+    pub(super) host_observations: HostObservations,
+}
+
+/// Latest periodic observations of the local Host, folded into the heartbeat's
+/// status write so each observer does not commit the Host object on its own
+/// cadence (#3154). Host status is "latest value only" (WORKLOAD.md).
+#[derive(Clone, Default)]
+pub(super) struct HostObservations {
+    blob_store: Option<Arc<TieredBlobStore>>,
+    fulfilment_facts: Arc<tokio::sync::RwLock<Option<BTreeMap<String, FulfilmentFacts>>>>,
+}
+
+impl std::fmt::Debug for HostObservations {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("HostObservations").field("blob_store", &self.blob_store.is_some()).finish_non_exhaustive()
+    }
+}
+
+impl HostObservations {
+    pub(super) fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
+        self
+    }
+
+    async fn blob_sync(&self) -> Option<BlobSyncStatus> {
+        match &self.blob_store {
+            Some(store) => Some(store.status().await),
+            None => None,
+        }
+    }
+
+    /// The facts most recently observed by this process, if any pass has completed.
+    pub(super) async fn fulfilment_facts(&self) -> Option<BTreeMap<String, FulfilmentFacts>> {
+        self.fulfilment_facts.read().await.clone()
+    }
+
+    pub(super) async fn record_fulfilment_facts(&self, facts: BTreeMap<String, FulfilmentFacts>) {
+        *self.fulfilment_facts.write().await = Some(facts);
+    }
 }
 
 impl RuntimeHealth {
+    pub(super) fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
+        self.host_observations = self.host_observations.with_blob_store(blob_store);
+        self
+    }
+
     pub(super) fn report_capability_regression(&self, condition: HostCondition) {
         self.failures.lock().expect("runtime health lock poisoned").insert(condition.condition_type.clone(), condition);
     }
@@ -403,7 +449,7 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
             description: Some(Box::new(summary)),
             capabilities,
             agent_adapter_baseline: Some(adapter_assessment.baseline),
-            heartbeat_at: Utc::now(),
+            heartbeat_at: daemon.clock().now(),
             ready,
             resource_store: resource_store.map(Box::new),
             daemon_rss_bytes: flotilla_core::host_summary::daemon_rss_bytes(),
@@ -414,6 +460,10 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
             disk_free_bytes,
             admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
             conditions,
+            folded: Box::new(FoldedHostObservations {
+                blob_sync: runtime_health.host_observations.blob_sync().await,
+                fulfilment_refresh: runtime_health.host_observations.fulfilment_facts().await.unwrap_or_default(),
+            }),
         },
     )
     .await

@@ -159,11 +159,11 @@ pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
 pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
-    canonical_host_id, CachedModelProbe, CredentialExpiry, FulfilmentFacts, FulfilmentImage, HarnessFacts, Host, HostCondition,
-    HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState, AGENTLESS_CAPABILITY,
-    AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CREDENTIAL_EXPIRY_CAPABILITY, HEARTBEAT_READY_TTL_SECS,
-    HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SLEEP_INHIBITION_CONDITION_TYPE,
-    TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
+    canonical_host_id, CachedModelProbe, CredentialExpiry, FoldedHostObservations, FulfilmentFacts, FulfilmentImage, HarnessFacts, Host,
+    HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState,
+    AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CREDENTIAL_EXPIRY_CAPABILITY,
+    HEARTBEAT_READY_TTL_SECS, HEARTBEAT_REFRESH_SECS, HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
+    SLEEP_INHIBITION_CONDITION_TYPE, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 pub use issue::{issue_record_name, Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{

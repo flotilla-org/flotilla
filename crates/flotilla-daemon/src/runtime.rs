@@ -61,13 +61,12 @@ use self::seed::register_startup_resources;
 use self::state::ControllerRuntimeState;
 use self::tasks::{
     run_artifact_gc, run_checkout_archive_gc, spawn_adopted_checkout_reconciliation_task, spawn_aggregator_task,
-    spawn_blob_sync_status_task, spawn_convoy_ensure_reconciler_task, spawn_demand_expiry_task, spawn_dispatch_reconciler_task,
-    spawn_environment_orphan_sweep_task, spawn_event_expiry_task, spawn_heartbeat_task_with_credentials,
-    spawn_host_description_projection_task, spawn_liveness_watchdog_task, spawn_local_fulfilment_probe_task,
-    spawn_manifest_reconciler_task, spawn_periodic_task, spawn_provisioned_environment_reconciliation_task, spawn_resource_controller,
-    spawn_sleep_inhibitor_task, spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector,
-    supervise_controller, CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL,
-    MANIFEST_RECONCILE_INTERVAL,
+    spawn_convoy_ensure_reconciler_task, spawn_demand_expiry_task, spawn_dispatch_reconciler_task, spawn_environment_orphan_sweep_task,
+    spawn_event_expiry_task, spawn_heartbeat_task_with_credentials, spawn_host_description_projection_task, spawn_liveness_watchdog_task,
+    spawn_local_fulfilment_probe_task, spawn_manifest_reconciler_task, spawn_periodic_task,
+    spawn_provisioned_environment_reconciliation_task, spawn_resource_controller, spawn_sleep_inhibitor_task,
+    spawn_ssh_fulfilment_probe_task, spawn_startup_restoration, spawn_vessel_placement_projector, supervise_controller,
+    CheckoutArchiveRoot, CheckoutArchiveSweep, PeriodicTaskStart, LIVENESS_WATCHDOG_INTERVAL, MANIFEST_RECONCILE_INTERVAL,
 };
 use self::terminal::TerminalControllerRuntime;
 use crate::{blob_store::TieredBlobStore, resource_manifest::manifest_root_name, startup::phase, supervisor::ControllerSupervision};
@@ -197,7 +196,9 @@ impl DaemonRuntime {
             daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools),
         )
         .await;
-        let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
+        let runtime_health = RuntimeHealth::default()
+            .with_restart_history_dir(config.state_dir().as_path().to_path_buf())
+            .with_blob_store(Arc::clone(&blob_store));
         phase(
             "quarantine_undecodable_stored_objects",
             flotilla_store::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace),
@@ -253,6 +254,7 @@ impl DaemonRuntime {
                 profile.clone(),
                 Arc::clone(&local_registry),
                 config.state_dir().as_path().join("probe-cwd"),
+                runtime_health.host_observations.clone(),
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
             tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
@@ -266,12 +268,6 @@ impl DaemonRuntime {
                     retention_days: daemon_config.checkout_archive_retention_days,
                 },
             )),
-            spawn_blob_sync_status_task(
-                Arc::clone(&blob_store),
-                daemon.resource_backend(),
-                options.namespace.clone(),
-                profile.host_id.clone(),
-            ),
             spawn_heartbeat_task_with_credentials(
                 Arc::clone(&daemon),
                 options.namespace.clone(),

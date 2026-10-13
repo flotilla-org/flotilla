@@ -9,6 +9,8 @@ mod digest;
 mod field_ownership;
 mod forge_identity;
 mod fulfilment_kind;
+mod host_status_coalescing;
+mod host_status_wal;
 mod http_wire;
 mod in_memory;
 mod k8s_integration;
