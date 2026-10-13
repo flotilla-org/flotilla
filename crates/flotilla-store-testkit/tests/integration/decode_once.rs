@@ -20,7 +20,7 @@ use futures::StreamExt;
 use hegel::generators as gs;
 use serde::{Deserialize, Deserializer, Serialize};
 
-const PROBES: usize = 4;
+const PROBES: usize = 6;
 static FROM_TEXT: [AtomicUsize; PROBES] = [const { AtomicUsize::new(0) }; PROBES];
 static FROM_TREE: [AtomicUsize; PROBES] = [const { AtomicUsize::new(0) }; PROBES];
 
@@ -328,4 +328,66 @@ async fn raw_reads_keep_unknown_fields_and_typed_reads_ignore_them() {
         assert_eq!(typed.len(), 1, "{store:?}");
         assert_eq!(typed[0].object.spec, spec::<ID>("future"), "{store:?}");
     }
+}
+
+// Behaviour (#3154): a stored `status: null` decodes to no status on the typed
+// path, exactly as an absent status does, in both stores.
+#[tokio::test]
+async fn typed_reads_decode_null_status_as_none() {
+    const ID: usize = 4;
+    for store in [Store::Sqlite, Store::Memory] {
+        let backend = store.open();
+        let kind = ResourceKind::of::<Probe<ID>>();
+        let stored = replica_object::<ID>("null-status");
+        let object = ResourceObject::<SerializedResource> {
+            metadata: stored.metadata,
+            spec: serde_json::json!({"value": "null-status"}),
+            status: Some(serde_json::Value::Null),
+        };
+        backend
+            .store()
+            .apply_replica_raw(kind, &NodeId::new("decode-origin"), NAMESPACE, StoredReplicaEventKind::Added, &object, Utc::now())
+            .await
+            .expect("apply replica with a null status");
+
+        let typed = backend.store().list_replicas_typed::<Probe<ID>>(NAMESPACE).await.expect("typed replicas");
+        assert_eq!(typed.len(), 1, "{store:?}");
+        assert_eq!(typed[0].object.status, None, "{store:?}");
+    }
+}
+
+// Behaviour (#3154): the single typed decode still checks identity. A stored
+// body whose `kind` or `apiVersion` names another resource is refused on the
+// typed path and on the raw path alike. Only SQLite can hold such a body: the
+// memory store keeps trees it encoded itself.
+#[tokio::test]
+async fn typed_reads_refuse_a_body_of_another_kind_or_api_version() {
+    const ID: usize = 5;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let backend = ResourceBackend::new(SqliteBackend::open(&path).expect("open sqlite"));
+    let resolver = backend.using::<Probe<ID>>(NAMESPACE);
+    for name in ["other-kind", "other-version", "intact"] {
+        resolver.create(&labelled(name), &spec(name)).await.expect("create");
+    }
+    let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    SqliteBackend::register_query_functions(&raw).expect("configure raw connection");
+    for (name, path, value) in [("other-kind", "$.kind", "Convoy"), ("other-version", "$.apiVersion", "flotilla.work/v2")] {
+        let changed = raw
+            .execute(
+                "UPDATE resource_objects SET body_json = json_set(body_json, ?1, ?2) WHERE kind = 'DecodeProbe' AND name = ?3",
+                [path, value, name],
+            )
+            .expect("rewrite identity");
+        assert_eq!(changed, 1, "{name}");
+    }
+    drop(raw);
+
+    for name in ["other-kind", "other-version"] {
+        assert!(resolver.get(name).await.is_err(), "typed get refuses {name}");
+        assert!(backend.store().get_raw(ResourceKind::of::<Probe<ID>>(), NAMESPACE, name).await.is_err(), "raw get refuses {name}");
+    }
+    assert_eq!(resolver.get("intact").await.expect("intact").spec, spec::<ID>("intact"));
+    let listed = resolver.list().await.expect("list");
+    assert_eq!(listed.items.iter().map(|object| object.metadata.name.as_str()).collect::<Vec<_>>(), ["intact"]);
 }

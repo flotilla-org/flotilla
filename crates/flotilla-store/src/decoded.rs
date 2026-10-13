@@ -31,7 +31,11 @@ impl std::fmt::Debug for DecodedObject {
 }
 
 fn object_name<T: Resource>(object: &(dyn Any + Send)) -> &str {
-    object.downcast_ref::<ResourceObject<T>>().map(|object| object.metadata.name.as_str()).unwrap_or_default()
+    // `DecodedObject::typed` pairs this function with the `T` it boxes, so the
+    // downcast cannot fail.
+    let name = object.downcast_ref::<ResourceObject<T>>().map(|object| object.metadata.name.as_str());
+    debug_assert!(name.is_some(), "decoded row name function does not match its object type");
+    name.unwrap_or_default()
 }
 
 impl DecodedObject {
@@ -62,6 +66,12 @@ impl DecodedObject {
 
     /// Raw form of a row decoded for a raw caller. Typed rows cannot be turned
     /// back into stored trees without re-encoding, so they are refused.
+    ///
+    /// Which rows are typed: the `Store::*_decoded` defaults wrap `*_raw`
+    /// results and always return serialized rows; the SQLite and in-memory
+    /// overrides return typed rows, except raw watch replay, which carries
+    /// serialized rows for `SerializedWatchEvent::decode_raw`. Raw callers
+    /// therefore read through `*_raw`.
     pub fn into_serialized(self) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         self.object
             .downcast::<ResourceObject<SerializedResource>>()
@@ -141,9 +151,11 @@ impl DecodedQueryResult {
 /// This replaces a serialize-then-deserialize round trip of the whole object:
 /// metadata is already typed and moves across unchanged.
 pub fn typed_object<T: Resource>(object: ResourceObject<SerializedResource>) -> Result<ResourceObject<T>, ResourceError> {
-    let spec = T::Spec::deserialize(object.spec).map_err(|error| ResourceError::decode(error.to_string()))?;
+    let spec = T::Spec::deserialize(object.spec).map_err(|error| ResourceError::decode(format!("decode stored object: {error}")))?;
     let status = match object.status {
-        Some(status) => Option::<T::Status>::deserialize(status).map_err(|error| ResourceError::decode(error.to_string()))?,
+        Some(status) => {
+            Option::<T::Status>::deserialize(status).map_err(|error| ResourceError::decode(format!("decode stored object: {error}")))?
+        }
         None => None,
     };
     Ok(ResourceObject { metadata: object.metadata, spec, status })

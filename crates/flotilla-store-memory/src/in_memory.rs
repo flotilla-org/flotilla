@@ -202,6 +202,10 @@ impl Default for ResourceStore {
 }
 
 impl InMemoryBackend {
+    fn indexed_object<'a>(store: &'a ResourceStore, name: &str) -> Result<&'a Value, ResourceError> {
+        store.objects.get(name).ok_or_else(|| ResourceError::other("query index references missing local object"))
+    }
+
     /// Observe decoded objects without changing query results or store ownership.
     pub fn with_read_observer(mut self, observer: Arc<dyn ReadObserver>) -> Self {
         self.read_observer = Some(observer);
@@ -232,7 +236,7 @@ impl InMemoryBackend {
             if let Some(store) = stores.get(&key) {
                 for name in store.messages.names(query) {
                     items.push(ReadResourceObject {
-                        object: resource_kind.decode_typed_value(&store.objects[&name])?.into_typed()?,
+                        object: resource_kind.decode_typed_value(Self::indexed_object(store, &name)?)?.into_typed()?,
                         provenance: ResourceProvenance::Local,
                     });
                 }
@@ -901,13 +905,7 @@ impl InMemoryBackend {
                 names = names.intersection(&message_names).cloned().collect();
             }
             for name in names {
-                items.push((
-                    F::decode(
-                        kind,
-                        store.objects.get(&name).ok_or_else(|| ResourceError::other("query index references missing local object"))?,
-                    )?,
-                    ResourceProvenance::Local,
-                ));
+                items.push((F::decode(kind, Self::indexed_object(store, &name)?)?, ResourceProvenance::Local));
             }
         }
         if query.include_replicas && kind.replication != crate::ReplicationClass::None {
@@ -1128,7 +1126,7 @@ impl InMemoryBackend {
                 Some(required) => {
                     let names = store.queries.names(&crate::StoreQuery::labels(required, false, true));
                     self.count_read(resource_kind, ReadOperation::Query, names.len());
-                    names.iter().map(|name| decode(resource_kind, &store.objects[name])).collect::<Result<Vec<_>, _>>()?
+                    names.iter().map(|name| decode(resource_kind, Self::indexed_object(store, name)?)).collect::<Result<Vec<_>, _>>()?
                 }
             };
             Ok((items, store.current_version().to_string()))
