@@ -3170,6 +3170,8 @@ impl Store for SqliteBackend {
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         let result = SqliteBackend::get_raw(self, resource_kind, namespace, name).await;
         if let Some(observer) = self.read_observer() {
+            // Missing, storage and decode errors still cost a crossing, but
+            // return zero objects to the caller.
             observer.read(resource_kind.paths.kind, ReadOperation::Get, usize::from(result.is_ok()));
         }
         result
