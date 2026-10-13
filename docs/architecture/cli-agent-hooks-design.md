@@ -132,7 +132,8 @@ First-party sources are pinned to [openai/codex rust-v0.160.0](https://github.co
 `agents/fixtures/codex-hooks-list-0.160.0.json` is a hooks/list response from
 that version in an isolated Codex home, without running a model or live-host gate.
 `ci/crew-image/test-workflow.sh` requires the recorded fixture consumed by the
-Rust trust test to match the current crew-image Codex pin. On a pin upgrade,
+Rust trust test to match the version of the stdlib `harness-codex` image layer
+(`stdlib/image-layers/harness-codex/layer.yaml`). On a pin upgrade,
 repeat the isolated hooks/list probe and confirm every handler is trusted
 before refreshing the fixture; a filename change alone is insufficient.
 

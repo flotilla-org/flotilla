@@ -287,11 +287,12 @@ _Avoid_: Permission mode, sandbox flag (those are harness spellings),
 trusted/contained as workflow words.
 
 **Capability Need**:
-A namespaced capability a role's work requires, such as `platform:linux`,
-`display:headless-x11`, `harness:codex>=0.160.0` or `toolchain:rust`
-(ADRs 0046 and 0053; ADR 0062 supersedes 0053's composition rules). Needs attach to roles and compose by union across layers that
-only add: template role, project, issue, derived, dispatch. The result is
-frozen at admission. An uncovered need refuses admission by name.
+A namespaced capability a role's or leg's work requires, such as
+`platform:linux`, `display:x11`, `harness:codex>=0.160.0` or `toolchain:rust`
+(ADRs 0046 and 0062). Needs compose by union across sources that only add:
+template role and leg, project, issue, derived, dispatch. The result is frozen
+at admission. A need an **Image Layer** provides adds that layer to the
+vessel's **Image Composition**; an unresolvable need refuses admission by name.
 _Avoid_: Stance, trust level (provenance proves little; the principle is
 least privilege).
 
@@ -948,10 +949,63 @@ away from any vessel) (ADR 0059). Depth changes delivery latency and
 re-provisioning work, never what `Landing` means.
 _Avoid_: Hibernation tier, vessel state (the vessel has its own lifecycle).
 
+**Image Layer**:
+One versioned definition in a crew image: a Dockerfile fragment with pinned
+downloads, the capabilities it provides and requires, a probe and its declared
+files. Its tier fixes its place: base, shared, project or agent runtime
+(ADR 0062).
+_Avoid_: stage, spine, capability layer, utilities layer.
+
+**Image Stdlib**:
+The **Image Layer** definitions shipped as data with each flotilla release.
+Installation and project definitions of the same name shadow them.
+_Avoid_: baseline, curated image.
+
+**Image Selection**:
+The base and shared layers a **Project** names in its `image:` block, or the
+installation default (the cascaded `CrewDefaults` `image:`) when it names
+none. Placement policies never select layers: a policy omits `image` to run the
+composed image, or names a literal image.
+_Avoid_: composition selection.
+
+**Image Composition**:
+The ordered **Image Layer** list one vessel's image is built from: base, shared
+layers, project layer, agent runtime. It is derived from the **Image
+Selection**, the vessel's **Capability Needs** and its crews' harnesses, and
+never declared whole.
+_Avoid_: recipe.
+
+**Image Identity**:
+The hash of an **Image Composition**'s ordered definitions. Equal identities
+are the same image, built once per architecture (and, without a registry, per
+builder host) by one `ImageBuild` and recorded with its digest in the status of each vessel that runs it.
+_Avoid_: recipe key, execution key.
+
+**Build Service**:
+Flotilla's port that turns an **Image Composition** and an architecture into
+an image digest, such as BuildKit on an owned host or a managed builder.
+_Avoid_: CI image pipeline, image builder runner.
+
+**Environment Provider**:
+Makes one **Environment** spec kind real through preparation, provisioning,
+inspection and destruction. A **Provider Instance** identifies one host-local
+runtime endpoint or namespace. Host-direct is an adoption provider; cloud-agent
+vessels follow a separate creation route.
+
+**Local Image Cache**:
+The image inventory owned by one **Provider Instance** on one **Host**.
+A digest held in one cache does not imply it is available in another cache on
+that Host.
+
 ## Retired terms
 
 These words name models that are retired. Code may still contain them until
 removal lands; new docs and code use the replacement.
+
+**Recipe Key**:
+The identity of an image layer's resolved build inputs and parent chain.
+Retired with per-stage builds: say **Image Identity** (ADR 0062).
+_Avoid_: recipe key.
 
 **AttachableSet**:
 The per-host, checkout-keyed terminal registry (`attachables/registry.json`)
@@ -984,30 +1038,3 @@ HTTP-over-UDS (and, for cleat, a C ABI for native embedding):
   surfaces.
 - **uishell** — native UI shell (RAD-derived) that composes Panels/Views and
   embeds cleat; the intended premier interface to Flotilla.
-
-**Image Layer**:
-An independently versioned contribution to a crew image. It declares the
-capabilities it provides and what must be available beneath it (ADR 0053,
-superseded by ADR 0062: layers are ordered by tier and selected by name and provides).
-_Avoid_: composed image definition (compositions are computed).
-
-**Image Composition**:
-The base, utilities, needed capabilities, harness and project layers selected
-for a vessel's need-set, in canonical order. Convoy members share the frozen
-base and harness; newly needed capabilities extend the frozen selection.
-
-**Recipe Key**:
-The identity of resolved build inputs and their parent chain for one target
-architecture. Equal pinned inputs share a key across hosts; the key is distinct
-from the actual built image identity.
-
-**Environment Provider**:
-Makes one **Environment** spec kind real through preparation, provisioning,
-inspection and destruction. A **Provider Instance** identifies one host-local
-runtime endpoint or namespace. Host-direct is an adoption provider; cloud-agent
-vessels follow a separate creation route.
-
-**Local Image Cache**:
-The image inventory owned by one **Provider Instance** on one **Host**.
-A digest held in one cache does not imply it is available in another cache on
-that Host.
