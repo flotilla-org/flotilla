@@ -26,6 +26,7 @@ absolute-paths-allowed-crates = [
     "flotilla_aggregator",
     "flotilla_ai_utility",
     "flotilla_build_features",
+    "flotilla_capability_contract",
     "flotilla_change_request",
     "flotilla_charter",
     "flotilla_client",

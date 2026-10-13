@@ -160,6 +160,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
 | `flotilla-daemon` | Runtime supervision, socket server, replication composition and routed transport, peer networking, multi-host command routing |
+| `flotilla-capability-contract` | Session capability contract: `CredentialCapability`, `SessionCapabilitySource`, endpoint and credential-card helpers; no flotilla dependencies |
 | `flotilla-credentials` | Host-local credential minting/delivery, agent homes and skills, private vessel configuration composition |
 | `flotilla-aggregator` | Durable/observed resource query projection and demand-backed issue materialization |
 | `flotilla-resources` | Resource kinds, lifecycle authority, pure helpers, and typed list/watch shapes; no storage dependencies |

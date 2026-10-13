@@ -18,7 +18,7 @@ use crate::in_process::CREDENTIAL_REFS_ANNOTATION;
 async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, MessageReference, Vessel, VesselSpec};
 
-    use crate::crew_capabilities::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     // In-memory port stands in for credential mint/delivery I/O.
     struct Delivery(RwLock<Vec<CredentialCapability>>, RwLock<BTreeMap<String, String>>);
     #[async_trait]
@@ -310,7 +310,8 @@ async fn previous_generation_gets_full_card_once_then_delivered_deltas() {
 // a full card without referencing the deleted predecessor, and unchanged refresh is idempotent.
 #[tokio::test]
 async fn refresh_after_reaped_message_recovers_with_full_card() {
-    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker, CredentialCapability, SessionCapabilitySource};
+    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
+    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
     use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
     // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
     struct Delivery(RwLock<BTreeMap<String, String>>);
@@ -378,4 +379,74 @@ async fn refresh_after_reaped_message_recovers_with_full_card() {
     assert!(all[0].spec.body.starts_with("## Your capabilities"));
     assert!(all[0].spec.body.contains("127.0.0.1:2"));
     assert!(all[0].spec.supersedes.is_none());
+}
+
+// A source that fails after a successful delivery (daemon reconstruction gap) must leave the
+// published observation untouched: refresh errors rather than publishing an empty card.
+#[tokio::test]
+async fn failing_source_never_publishes_an_empty_card() {
+    use crate::crew_capabilities::{refresh_cards, CapabilityCardTracker};
+    use flotilla_capability_contract::{CredentialCapability, SessionCapabilitySource};
+    use flotilla_resources::{Environment, EnvironmentSpec, HostDirectEnvironmentSpec, Message, Vessel, VesselSpec};
+    // Credential/endpoint delivery is the runtime I/O boundary; resources use the real memory backend.
+    struct Delivery(RwLock<BTreeMap<String, String>>, std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl SessionCapabilitySource for Delivery {
+        async fn credentials(&self, _: &str, _: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("reconstructing".into());
+            }
+            Ok(vec![])
+        }
+        async fn endpoints(&self, _: &str, _: &str) -> Result<BTreeMap<String, String>, String> {
+            Ok(self.0.read().await.clone())
+        }
+    }
+    let (_, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    backend
+        .using::<Vessel>("flotilla")
+        .create(
+            &InputMeta::builder().name("vessel".into()).build(),
+            &VesselSpec {
+                convoy_ref: "crew".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
+        .await
+        .expect("vessel");
+    backend
+        .using::<Environment>("flotilla")
+        .create(
+            &InputMeta::builder().name("resume-env".into()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "host".into(), repo_default_dir: "/repo".into() }),
+                docker: None,
+            },
+        )
+        .await
+        .expect("environment");
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("session").await.expect("session");
+    sessions
+        .update_status(
+            "session",
+            &session.metadata.resource_version,
+            &flotilla_resources::TerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() },
+        )
+        .await
+        .expect("running");
+    let source = Delivery(RwLock::new(BTreeMap::new()), std::sync::atomic::AtomicBool::new(false));
+    let tracker = CapabilityCardTracker::default();
+    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect("initial baseline");
+    let revision = |session: &flotilla_resources::ResourceObject<ResourceTerminalSession>| {
+        session.metadata.annotations["flotilla.work/capabilities-revision"].clone()
+    };
+    let before = revision(&sessions.get("session").await.expect("session"));
+    source.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    refresh_cards(&backend, "flotilla", &source, &tracker).await.expect_err("reconstruction gap");
+    assert_eq!(revision(&sessions.get("session").await.expect("session")), before);
+    let messages = backend.using::<Message>("flotilla").list().await.expect("messages").items;
+    assert!(messages.is_empty());
 }

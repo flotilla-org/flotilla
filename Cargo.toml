@@ -6,6 +6,7 @@ members = [
     "crates/flotilla-agent",
     "crates/flotilla-aggregator",
     "crates/flotilla-build-features",
+    "crates/flotilla-capability-contract",
     "crates/flotilla-change-request",
     "crates/flotilla-charter",
     "crates/flotilla-client",

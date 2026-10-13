@@ -9,8 +9,8 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_core::crew_capabilities::CredentialCapability;
-use flotilla_core::crew_capabilities::SessionCapabilitySource;
+use flotilla_capability_contract::CredentialCapability;
+use flotilla_capability_contract::SessionCapabilitySource;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_core::in_process::WorkCredentialReconciler;
 use flotilla_credentials::{
@@ -98,7 +98,7 @@ impl SessionCapabilitySource for RuntimeSessionCapabilities {
                 .object;
             if let Some(docker) = record.spec.docker {
                 for (key, value) in &docker.env {
-                    if let Some((destination, address)) = flotilla_core::crew_capabilities::endpoint_for_env(key, value) {
+                    if let Some((destination, address)) = flotilla_capability_contract::endpoint_for_env(key, value) {
                         endpoints.insert(destination, address);
                     }
                 }
