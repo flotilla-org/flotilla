@@ -20,6 +20,9 @@ define_resource!(
 ///
 /// Strategy topology discovered by registration loops is loop-derived.
 /// Scheduling priority and runtime/container configuration are operator-authored.
+/// Docker checkout and strategy presence are loop-owned only in the reserved
+/// `docker-on-*` and `host-direct-*` seed-policy namespaces; other names are
+/// operator-authored.
 /// PlacementPolicy has no status fields.
 impl FieldOwnedResource for PlacementPolicy {
     const FIELD_OWNERSHIP: &'static [FieldOwnership] = &[
@@ -37,6 +40,27 @@ impl FieldOwnedResource for PlacementPolicy {
         FieldOwnership::new("spec.docker_per_vessel.checkout", WriterRole::ReconcileLoop),
     ];
     const OWNERSHIP_ENFORCEMENT: OwnershipEnforcement = OwnershipEnforcement::Observe;
+
+    fn field_owner(ownership: &FieldOwnership, name: &str) -> WriterRole {
+        if matches!(ownership.field, "spec.docker_per_vessel" | "spec.docker_per_vessel.checkout")
+            && !name.starts_with("docker-on-")
+            && !name.starts_with("host-direct-")
+        {
+            WriterRole::Operator
+        } else {
+            ownership.owner
+        }
+    }
+
+    fn ownership_rule(field: &str, owner: WriterRole) -> String {
+        let route = match owner {
+            WriterRole::ReconcileLoop =>
+                "author this PlacementPolicy through its managed manifest and ManifestRoot reconciliation, or create a separate crew policy outside the reserved docker-on-* and host-direct-* seed names",
+            WriterRole::Operator => "use flotilla resource apply for a local policy, or edit its source manifest for a managed policy",
+            WriterRole::Actuator => "use the owning actuator",
+        };
+        format!("{field} is owned by {owner:?}; {route}")
+    }
 
     fn spec_field_value(spec: &Self::Spec, field: &str) -> Result<Option<serde_json::Value>, ResourceError> {
         match field {

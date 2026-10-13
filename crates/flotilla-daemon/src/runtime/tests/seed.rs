@@ -583,3 +583,67 @@ async fn startup_registration_skips_repos_without_origin_and_gates_docker_policy
         "docker policy should be created when docker capability is true"
     );
 }
+
+// #3163: host-local operator and manifest checkout changes survive seed passes,
+// while the reserved docker-on-* policies retain loop-owned checkout reseeding.
+#[tokio::test]
+async fn operator_docker_checkout_survives_seed_passes() {
+    for backend in [
+        ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()),
+        ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")),
+    ] {
+        let profile = manual_profile("host-test", true);
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("seed policies");
+        let policies = backend.using::<PlacementPolicy>(NAMESPACE);
+        let seeded_name = profile.docker_policy_name();
+        let seeded = policies.get(&seeded_name).await.expect("seeded policy");
+        let original = seeded.spec.clone();
+        let crew_name = "docker-crew-image-host-test";
+        policies.create(&empty_meta(crew_name), &original).await.expect("operator policy");
+        let mut requested = original.clone();
+        requested.docker_per_vessel.as_mut().expect("docker").checkout =
+            DockerCheckoutStrategy::LocalCloneOnHostAndMount { mount_path: "/workspace".into() };
+        let document = |name: &str, spec: &PlacementPolicySpec| {
+            serde_json::json!({
+                "apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy",
+                "metadata": { "name": name }, "spec": spec
+            })
+        };
+        flotilla_store::apply_resource_document(&backend, NAMESPACE, document(crew_name, &requested))
+            .await
+            .expect("operator must be able to switch checkout");
+        for _ in 0..2 {
+            ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("later seed pass");
+            assert_eq!(policies.get(crew_name).await.expect("crew policy").spec, requested);
+            assert_eq!(policies.get(&seeded_name).await.expect("untouched seed").spec, original);
+        }
+        let error = flotilla_store::apply_resource_document(&backend, NAMESPACE, document(&seeded_name, &requested))
+            .await
+            .expect_err("seeded checkout remains loop-owned");
+        assert!(error.to_string().contains("manifest"), "refusal must name the working authoring route: {error}");
+        policies
+            .update(&InputMeta::from(&seeded.metadata), &seeded.metadata.resource_version, &requested)
+            .await
+            .expect("simulate stored seed drift");
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("reseed drift");
+        assert_eq!(policies.get(&seeded_name).await.expect("reseeded policy").spec, original);
+
+        // Host-direct seed identities also retain ownership of Docker presence
+        // so registration can repair an accidentally stored Docker strategy.
+        let direct = policies.get(&profile.host_direct_policy_name()).await.expect("direct seed");
+        policies
+            .update(&InputMeta::from(&direct.metadata), &direct.metadata.resource_version, &original)
+            .await
+            .expect("simulate host-direct strategy drift");
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("repair direct seed");
+        assert_eq!(policies.get(&profile.host_direct_policy_name()).await.expect("reseeded direct policy").spec, direct.spec);
+
+        // The manifest route may author even reserved names; managed policies
+        // are excluded from registration so manifest and seed never fight.
+        let mut manifest = document(&seeded_name, &requested);
+        manifest["metadata"]["labels"] = serde_json::json!({ "flotilla.work/managed-by": "manifest" });
+        flotilla_store::apply_manifest_resource_document(&backend, NAMESPACE, manifest).await.expect("manifest checkout switch");
+        ensure_default_policies(&backend, NAMESPACE, &profile).await.expect("seed after manifest");
+        assert_eq!(policies.get(&seeded_name).await.expect("manifest policy").spec, requested);
+    }
+}

@@ -83,6 +83,16 @@ pub trait FieldOwnedResource: Resource {
     const FIELD_OWNERSHIP: &'static [FieldOwnership];
     const OWNERSHIP_ENFORCEMENT: OwnershipEnforcement = OwnershipEnforcement::Observe;
 
+    /// Resolve a static ownership declaration for an immutable resource identity.
+    /// This permits reserved seed-name scopes without mutable ownership tracking.
+    fn field_owner(ownership: &FieldOwnership, _name: &str) -> WriterRole {
+        ownership.owner
+    }
+
+    fn ownership_rule(field: &str, owner: WriterRole) -> String {
+        format!("{field} is owned by {owner:?}")
+    }
+
     fn spec_field_value(spec: &Self::Spec, field: &str) -> Result<Option<Value>, ResourceError>
     where
         Self: Sized,
@@ -134,7 +144,8 @@ pub fn merge_owned_spec<T: FieldOwnedResource>(
         if current_field == requested_field {
             continue;
         }
-        if ownership.owner == writer.role {
+        let owner = T::field_owner(ownership, name);
+        if owner == writer.role {
             resolved_subtrees.push(ownership.field);
             continue;
         }
@@ -147,7 +158,7 @@ pub fn merge_owned_spec<T: FieldOwnedResource>(
                 .writer(writer.clone())
                 .field(ownership.field.to_string())
                 .attempted_value(attempted_value)
-                .rule(format!("{} is owned by {:?}", ownership.field, ownership.owner))
+                .rule(T::ownership_rule(ownership.field, owner))
                 .observed_at(Utc::now())
                 .build(),
         );
