@@ -1,5 +1,7 @@
 # 53. Crew images compose from declared layers and freeze in stages
 
+**Superseded by [ADR 0062](0062-crew-images-are-ordered-layer-lists-built-once-per-identity.md)** (owner re-grill, 2026-10-13).
+
 Accepted, from the owner rulings on #2271–#2274 (map #2267). This amends
 ADRs 0039, 0044 and 0046. It supersedes #1088's first two rulings
 (hand-curated images and testimony rather than lifecycle); builds remain
