@@ -6,7 +6,7 @@ This file covers agent-specific environment quirks.
 
 ## Codex Sandbox
 
-Socket bind/listen is blocked. Use the sandbox-safe test command:
+Socket bind/listen is blocked. Use the sandbox-safe test command, with the affected packages (`-p <pkg>`) in place of `--workspace` for the local gate (CI runs the full workspace):
 
 ```bash
 mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests
