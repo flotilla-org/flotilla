@@ -655,3 +655,18 @@ checkout_path = "../worktrees/{{ branch }}"
     assert_eq!(view.state_dir(), store.state_dir());
     assert_eq!(view.resolve_checkout_config(&ExecutionEnvironmentPath::new(directory.path())).path, "../worktrees/{{ branch }}");
 }
+
+// ADR 0047: previous daemon config still decodes; an explicit naming model is preserved.
+// Glue: cover absent section, old section, and the new stored field.
+#[test]
+fn naming_model_config_decodes_old_and_new_shapes() {
+    for input in ["", "[ai_utility]\nbackend = 'claude'", "[ai_utility.claude]\nimplementation = 'api'"] {
+        let config: super::FlotillaConfig = toml::from_str(input).expect("previous config");
+        assert_eq!(config.ai_utility.model, "claude-haiku-5-5");
+    }
+    let config: super::FlotillaConfig = toml::from_str("[ai_utility]\nmodel = 'custom-model'").expect("new config");
+    assert_eq!(config.ai_utility.model, "custom-model");
+    let encoded = toml::to_string(&config).expect("encode config");
+    let decoded: super::FlotillaConfig = toml::from_str(&encoded).expect("round trip");
+    assert_eq!(decoded.ai_utility.model, "custom-model");
+}

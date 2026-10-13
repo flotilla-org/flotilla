@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::info;
 
-use super::Model;
 use flotilla_provider_runtime::http_execute;
 use flotilla_provider_runtime::HttpClient;
 
@@ -16,20 +15,22 @@ const SYSTEM_PROMPT: &str = "You are a concise assistant. Output only what is as
 const ANTHROPIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct ClaudeApiAiUtility {
+    model: String,
     api_key: String,
     http: Arc<dyn HttpClient>,
 }
 
 impl ClaudeApiAiUtility {
-    pub fn new(api_key: String, http: Arc<dyn HttpClient>) -> Self {
-        Self { api_key, http }
+    pub fn new(api_key: String, http: Arc<dyn HttpClient>, model: String) -> Self {
+        Self { api_key, http, model }
     }
 
     /// Run a one-shot prompt against the Anthropic Messages API.
-    async fn prompt(&self, model: Model, prompt: &str) -> Result<String, String> {
+    async fn prompt(&self, prompt: &str) -> Result<String, String> {
         let body = serde_json::json!({
-            "model": model.api_model_id(),
+            "model": self.model,
             "max_tokens": 256,
+            "output_config": { "effort": "low" },
             "system": SYSTEM_PROMPT,
             "messages": [{ "role": "user", "content": prompt }],
         });
@@ -59,7 +60,10 @@ impl ClaudeApiAiUtility {
         parsed
             .content
             .into_iter()
-            .map(|ContentBlock::Text { text }| text)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text),
+                ContentBlock::Other => None,
+            })
             .next()
             .ok_or_else(|| "API response contained no text".to_string())
     }
@@ -75,6 +79,9 @@ struct MessagesResponse {
 enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    // Adaptive thinking can return non-text blocks before the naming result.
+    #[serde(other)]
+    Other,
 }
 
 #[async_trait]
@@ -86,7 +93,7 @@ impl super::AiUtility for ClaudeApiAiUtility {
              Output ONLY the branch name, nothing else. Use kebab-case: {context}"
         );
 
-        let output = self.prompt(Model::Haiku, &prompt).await?;
+        let output = self.prompt(&prompt).await?;
         let branch = output.trim().trim_matches(|c| c == '`' || c == '"' || c == '\'').trim().to_string();
         if branch.is_empty() {
             Err("claude returned empty output".to_string())
@@ -102,7 +109,7 @@ impl super::AiUtility for ClaudeApiAiUtility {
             "Suggest a coherent short convoy resource name and git branch name for this context. \
              Return ONLY JSON with string fields name and branch. Use lowercase kebab-case; the branch may contain one slash: {context}"
         );
-        super::parse_convoy_names(&self.prompt(Model::Haiku, &prompt).await?)
+        super::parse_convoy_names(&self.prompt(&prompt).await?)
     }
 }
 
@@ -113,7 +120,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::ClaudeApiAiUtility;
-    use crate::AiUtility;
+    use crate::{factories::claude::ClaudeApiAiUtilityFactory, testing::ModelConfig, AiUtility};
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::HttpClient;
 
@@ -128,7 +135,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn convoy_name_generation_times_out_when_anthropic_does_not_respond() {
-        let utility = ClaudeApiAiUtility::new("test-key".into(), Arc::new(HangingHttpClient));
+        let utility = ClaudeApiAiUtility::new("test-key".into(), Arc::new(HangingHttpClient), "claude-haiku-5-5".into());
 
         let result = tokio::time::timeout(Duration::from_secs(16), utility.generate_convoy_names("Issue 782"))
             .await
@@ -138,46 +145,65 @@ mod tests {
     }
     // Anthropic's documented Messages contract requires key/version headers and
     // model, max_tokens and messages: https://platform.claude.com/docs/en/api/messages/create
-    // Glue: one request exercises this endpoint's single serialization path.
+    // Glue: both naming calls must send the configured ID and low effort, and accept adaptive thinking blocks.
+    // The loop covers default and overridden IDs; the stand-in is the HTTP boundary.
     #[tokio::test]
     #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires loopback listener")]
     async fn messages_request_satisfies_http_contract() {
-        use axum::{body::Bytes, routing::post, Router};
+        use axum::{body::Bytes, extract::State, routing::post, Router};
         use http::{HeaderMap, StatusCode};
         use serde_json::{json, Value};
 
         use flotilla_replay_testkit::http_contract::StandIn;
-        async fn receive(headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
+        async fn receive(State(model): State<String>, headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
             let valid_headers = headers.get("x-api-key").is_some_and(|v| v == "test-key")
                 && headers.get("anthropic-version").is_some_and(|v| v == "2023-06-01")
                 && headers.get("content-type").is_some_and(|v| v == "application/json");
             let Ok(body) = serde_json::from_slice::<Value>(&body) else {
                 return (StatusCode::BAD_REQUEST, "malformed JSON request".into());
             };
-            let valid_body = body["model"].as_str().is_some_and(|v| !v.is_empty())
+            let valid_body = body["model"] == model
+                && body["output_config"]["effort"] == "low"
                 && body["max_tokens"].as_u64().is_some_and(|v| v > 0)
                 && body["messages"].as_array().is_some_and(|messages| {
                     !messages.is_empty() && messages.iter().all(|m| m["role"] == "user" && m["content"].is_string())
                 });
             if valid_headers && valid_body {
-                (StatusCode::OK, json!({"content":[{"type":"text","text":"contract-branch"}]}).to_string())
+                let text = if body["messages"][0]["content"].as_str().is_some_and(|p| p.contains("convoy")) {
+                    r#"{"name":"contract-convoy","branch":"contract-branch"}"#
+                } else {
+                    "contract-branch"
+                };
+                (StatusCode::OK, json!({"content":[{"type":"thinking","thinking":"internal"},{"type":"text","text":text}]}).to_string())
             } else {
                 (StatusCode::BAD_REQUEST, "invalid Messages request".into())
             }
         }
-        let server = StandIn::start("https://api.anthropic.com", Router::new().route("/v1/messages", post(receive))).await;
-        let utility = ClaudeApiAiUtility::new("test-key".into(), server.http.clone());
-        assert_eq!(utility.generate_branch_name("HTTP contract").await.expect("accepted request"), "contract-branch");
-        // Malformed JSON must receive a service refusal, not panic the handler.
-        let response = flotilla_tls::client()
-            .post(server.url.join("/v1/messages").expect("stand-in URL"))
-            .header("x-api-key", "test-key")
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .body("{")
-            .send()
-            .await
-            .expect("malformed request response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        for model in ["claude-haiku-5-5", "configured-model"] {
+            let server = StandIn::start(
+                "https://api.anthropic.com",
+                Router::new().route("/v1/messages", post(receive)).with_state(model.to_string()),
+            )
+            .await;
+            let utility = ClaudeApiAiUtilityFactory::build("test-key".into(), server.http.clone(), &ModelConfig(model.into()))
+                .await
+                .expect("configured provider");
+            assert_eq!(utility.generate_branch_name("HTTP contract").await.expect("accepted request"), "contract-branch");
+            assert_eq!(
+                utility.generate_convoy_names("HTTP contract").await.expect("accepted request"),
+                crate::ConvoyNames { name: "contract-convoy".into(), branch: "contract-branch".into() }
+            );
+            // Malformed JSON must receive a service refusal, not panic the handler.
+            let response = flotilla_tls::client()
+                .post(server.url.join("/v1/messages").expect("stand-in URL"))
+                .header("x-api-key", "test-key")
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .body("{")
+                .send()
+                .await
+                .expect("malformed request response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }
