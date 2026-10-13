@@ -30,8 +30,8 @@ The TUI is *factored, not frozen* — keep it maintained, but extract the surfac
 ```bash
 cargo build                                    # build
 cargo fmt --check          # CI format gate
-cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
-cargo test --workspace --locked                # CI test gate
+cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate (local gate: -p <affected>, see below)
+cargo test --workspace --locked                # CI test gate (local gate: -p <affected>, see below)
 python3 ci/build-graph/check.py                 # CI dependency/feature gate
 python3 -m unittest discover -s ci/build-graph -p test_check.py
 cargo fmt                  # apply pinned formatting
@@ -46,7 +46,15 @@ Use the [Git boundary check recipe](docs/development.md#git-boundary-check) for 
 
 Platform test coverage belongs in `ci/platform-tests/selectors.txt`, executed by `ci/platform-tests/run.sh`. Add a CI job only for a new runner type or OS, or for deliberate isolation; otherwise use an existing job on the same runner.
 
-Before pushing, run the Git check and its tests plus the exact CI commands: `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
+Before pushing, run the local gate:
+- `cargo fmt --check` (whole workspace).
+- Clippy and tests for the **affected packages only**: each workspace package whose files the change touches (`crates/<name>/`, plus the root `flotilla` package for `src/`), as `cargo clippy -p <pkg>... --all-targets --locked -- -D warnings` and `cargo test -p <pkg>... --locked`.
+- The build-graph check and the Git check, with their tests, when the change touches Cargo manifests, dependencies or Git-invoking code.
+- The stored-record corpus decode (`cargo test -p flotilla-store-testkit --locked --test integration stored_corpus`) when the change touches a resource kind's serialized shape.
+- A change that maps to no package (`ci/`, workspace `Cargo.toml`, `rust-toolchain.toml`) runs the check that owns that file: the build-graph or Git check and their tests, or `cargo check --workspace --locked` for a toolchain or workspace-manifest change.
+- A change to a widely used package (protocol, resources, store, core) still runs only its own tests locally; CI covers its dependents.
+
+CI runs the full workspace commands (`cargo clippy --workspace ...`, `cargo test --workspace --locked`); don't repeat that run locally, and fix a red CI result with a follow-up push. A local `-p` run can resolve features differently from the workspace run, so a local pass is not a CI guarantee.
 
 Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
@@ -55,7 +63,7 @@ Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARG
 **Formatting:** `cargo fmt` uses the same stable pin; no nightly toolchain is required.
 
 
-Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR` and run `cargo test --workspace --locked`. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
+Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR`. Either way, pass the affected packages (`-p <pkg>`) instead of `--workspace` for the local gate. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
 
 Controller-backed in-process daemon coverage lives in `flotilla-controllers`' registered integration binary:
 
