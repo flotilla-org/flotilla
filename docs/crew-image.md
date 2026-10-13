@@ -4,7 +4,11 @@
 (landing via #3147) defines crew images: a composed image is an ordered list of
 layer definitions, built once per identity by a build service and delivered by
 digest. It supersedes ADR 0053's declared layers, cover search and staged
-freeze. Arbitrary literal images remain supported by placement policies.
+freeze. A `docker_per_vessel` placement policy that omits `image` runs the
+vessel's composed image; admission freezes `Built { identity, image_build_ref }`
+into each prepared placement snapshot. Arbitrary literal images remain
+supported by setting `image`, and only for a literal image does the policy's
+`agent_adapters` list constrain which harnesses the workflow may use.
 
 ## Image shape
 
@@ -124,9 +128,11 @@ checksum, a malformed digest, an invalid capability, a fragment that breaks the
 Definitions come from three sources, resolved in this order:
 
 1. the **project**: `.flotilla/image/` (`layer.yaml`, `Dockerfile.fragment`
-   and declared files) in the project's primary repository, or a named ops
-   home. Only the project tier lives here, and other repositories of a
-   multi-repository project contribute nothing;
+   and declared files). It is read from the project's named ops home when any
+   member repository has a charter-store binding, otherwise from the first
+   repository with the code role. Only the project tier lives here, and other
+   repositories of a multi-repository project contribute nothing. A registered
+   charter's directory is applied through charter delegation;
 2. the **installation**: layer directories in its ops repository (fleet or
    project-map), for additions and overrides;
 3. the **flotilla stdlib**: [`stdlib/image-layers/`](../stdlib/image-layers),
@@ -135,8 +141,9 @@ Definitions come from three sources, resolved in this order:
 Within one logical name, the highest-precedence source wins. Shadowing across
 sources is allowed and shown by admission explanations and `flotilla image
 check`. Two definitions with the same source, name and version are a clash.
-Everything is applied through the manifest and charter reconcilers; nothing is
-applied by hand.
+Project and installation layers are applied through the manifest and charter
+reconcilers, and stdlib layers by the daemon at startup as
+`stdlib-<name>-<version>`; nothing is applied by hand.
 
 Admission uses the project layer at the default-branch head as last synced.
 Only a merged change to the layer rebuilds the project's image.
@@ -229,9 +236,11 @@ image:
 A project layer definition at `.flotilla/image/` is itself the declaration;
 deleting it is the opt-out. Installation defaults live in the fleet-root
 `CrewDefaults` `image:` block, with the same shape. Project-scoped
-`CrewDefaults` cascade like roles. Defaults apply only when the project
-declares no `image:`. A project with neither still gets the base and the agent
-runtime.
+`CrewDefaults` cascade along the project chain like roles: a later layer that
+sets `base` replaces the base, and a later non-empty `layers` list replaces the
+layers. Defaults apply only when the project declares no `image:`; a declared
+selection without `base` still takes the default base. A project with neither
+still gets the base and the agent runtime.
 
 Current selections:
 
@@ -289,11 +298,11 @@ version, tier, `from`, fragment, pins, context file contents, probe and build
 secret names. Sources, provides, requires, secret values and architecture are
 excluded. The same selection yields the same identity and reuses the same
 image. There is no nonce and no per-admission build. Vessels record the
-identity and the resolved digest in their status and keep that image until
-relaunch.
+image in `VesselStatus.image`: the identity when provisioning starts and the
+built digest once it resolves. A recorded identity is kept until relaunch.
 
 **One build per identity × architecture.** Admission gets or creates the
-`ImageBuild` named for the identity and architecture; later admissions wait for
+`ImageBuild` named for the identity and architecture (`image-<hex>-<arch>`); later admissions wait for
 it or reuse it. Each architecture is built on a same-architecture builder,
 selected from hosts with `Host.spec.image_build_capacity`, with no emulation.
 
@@ -448,8 +457,8 @@ roll between them. Then:
 3. Roll the fleet daemon cohort together.
 4. Companion changes outside this repository: a project-map change adds
    `image:` to flotilla, cleat and wheelhouse (selections above). A fleet change
-   deletes its `image-layers/` definitions and drops `image.composition` from
-   the per-host placement policies, matching `.flotilla/placement-policy.crew-image*.yaml`
+   deletes its `image-layers/` definitions and drops `image.composition` and
+   `agent_adapters` from the per-host crew-image placement policies, matching `.flotilla/placement-policy.crew-image*.yaml`
    here. Projects with native dependencies add `.flotilla/image/` in their
    primary repository.
 5. Verify that a new admission builds, probes and pulls its composition by

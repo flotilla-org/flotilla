@@ -5,6 +5,8 @@ metadata:
   namespace: flotilla
 # No `image`: the vessel runs its composed image, selected by the Project's
 # `image:` block, its leg needs and its crews' harnesses (ADR 0062).
+# `agent_adapters` is omitted too: it constrains only literal images, and a
+# composed image carries exactly the harness layers its roles resolve to.
 spec:
   pool: cleat
   docker_per_vessel:
@@ -14,9 +16,6 @@ spec:
       expected_concurrent_crews: 4
       swap_bytes: 0
     pull_policy: always
-    agent_adapters:
-      - claude-code
-      - codex
     default_cwd: /workspace
     env: {}
     checkout:

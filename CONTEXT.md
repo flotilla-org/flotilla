@@ -963,7 +963,9 @@ _Avoid_: baseline, curated image.
 
 **Image Selection**:
 The base and shared layers a **Project** names in its `image:` block, or the
-installation default when it names none. Placement policies never select images.
+installation default (the cascaded `CrewDefaults` `image:`) when it names
+none. Placement policies never select layers: a policy omits `image` to run the
+composed image, or names a literal image.
 _Avoid_: composition selection.
 
 **Image Composition**:
@@ -975,8 +977,8 @@ _Avoid_: recipe.
 
 **Image Identity**:
 The hash of an **Image Composition**'s ordered definitions. Equal identities
-are the same image, built once per architecture and recorded with its digest
-on each vessel that runs it.
+are the same image, built once per architecture by one `ImageBuild` and
+recorded with its digest in the status of each vessel that runs it.
 _Avoid_: recipe key, execution key.
 
 **Build Service**:
