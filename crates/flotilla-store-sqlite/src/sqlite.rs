@@ -190,6 +190,12 @@ impl Drop for CleanupClaim {
     }
 }
 
+#[derive(Debug)]
+enum ReplicaApplyError {
+    Rejected(ResourceError),
+    Storage(ResourceError),
+}
+
 /// Events a reader replayed for a watch, and the stored events it could not
 /// decode. Readers are read-only, so the writer persists those failures.
 #[derive(Default)]
@@ -2069,17 +2075,22 @@ impl SqliteBackend {
                         REPLICA_OBJECT_UPSERT_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name, body, synced],
                     )
-                    .map_err(|err| Self::map_sqlite(err, "insert sqlite replica object"))?;
+                    .map_err(|err| Self::map_replica_sqlite(err, "insert sqlite replica object"))?;
                     tx.execute_cached(
                         REPLICA_TOMBSTONE_CLEAR_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name],
                     )
-                    .map_err(|err| Self::map_sqlite(err, "clear authoritative snapshot tombstone"))?;
+                    .map_err(|err| Self::map_replica_sqlite(err, "clear authoritative snapshot tombstone"))?;
                     Ok(true)
                     })?;
                     if applied { accepted.insert(name.clone()); }
                 }
                 let new_names = encoded.iter().map(|(name, _)| name.clone()).collect::<std::collections::HashSet<_>>();
+                tx.execute("DELETE FROM replica_apply_quarantine WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5
+                    AND (?6 IS NULL OR digest_bucket(name)=?6) AND name NOT IN (SELECT value FROM json_each(?7))",
+                    params![origin,key.0,key.1,key.2,key.3,bucket,serde_json::json!(new_names).to_string()])
+                    .map_err(|err| Self::map_sqlite(err, "prune snapshot-absent replica quarantines"))?;
+
                 for name in old.keys().filter(|name| !new_names.contains(*name)) {
                     tx.execute_cached(
                         REPLICA_OBJECT_DELETE_SQL,
@@ -2194,17 +2205,93 @@ impl SqliteBackend {
         self.apply_replica_values(resource_kind, origin_root, namespace, vec![mutation]).await
     }
 
+    fn map_replica_sqlite(err: rusqlite::Error, action: &str) -> ReplicaApplyError {
+        let rejected = matches!(&err, rusqlite::Error::SqliteFailure(code, _) if code.code == rusqlite::ErrorCode::ConstraintViolation);
+        let error = Self::map_sqlite(err, action);
+        if rejected {
+            ReplicaApplyError::Rejected(error)
+        } else {
+            ReplicaApplyError::Storage(error)
+        }
+    }
+
+    fn write_replica_mutation(
+        tx: &rusqlite::Transaction<'_>,
+        key: &StoreKey,
+        origin: &str,
+        mutation: &ReplicaMutation,
+    ) -> Result<bool, ReplicaApplyError> {
+        let ReplicaMutation { kind, name, value, synced_at } = mutation;
+        let body = value.to_string();
+        let synced = synced_at.to_rfc3339();
+        let existing = tx
+            .query_row_cached(
+                r#"
+            SELECT body_json, last_synced_at
+            FROM replica_objects
+            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+            "#,
+                params![origin, key.0, key.1, key.2, key.3, name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|err| Self::map_replica_sqlite(err, "read existing sqlite replica event object"))?;
+        let tombstone_synced_at = tx
+            .query_row_cached(
+                r#"
+            SELECT last_synced_at
+            FROM replica_tombstones
+            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+            "#,
+                params![origin, key.0, key.1, key.2, key.3, name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| Self::map_replica_sqlite(err, "read sqlite replica tombstone"))?;
+        let unchanged = match kind {
+            StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
+                    || existing.as_ref().is_some_and(|(existing_body, existing_synced)| {
+                        existing_synced > &synced || (existing_synced == &synced && existing_body >= &body)
+                    })
+            }
+            StoredReplicaEventKind::Deleted => {
+                tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
+                    || existing.as_ref().is_some_and(|(_, existing_synced)| existing_synced > &synced)
+            }
+        };
+        if unchanged {
+            return Ok(false);
+        }
+
+        match kind {
+            StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                tx.execute_cached(REPLICA_OBJECT_UPSERT_SQL, params![origin, key.0, key.1, key.2, key.3, name, body, synced])
+                    .map_err(|err| Self::map_replica_sqlite(err, "upsert sqlite replica event object"))?;
+                tx.execute_cached(REPLICA_TOMBSTONE_CLEAR_SQL, params![origin, key.0, key.1, key.2, key.3, name])
+                    .map_err(|err| Self::map_replica_sqlite(err, "clear sqlite replica tombstone"))?;
+            }
+            StoredReplicaEventKind::Deleted => {
+                tx.execute_cached(REPLICA_OBJECT_DELETE_SQL, params![origin, key.0, key.1, key.2, key.3, name])
+                    .map_err(|err| Self::map_replica_sqlite(err, "delete sqlite replica event object"))?;
+                tx.execute_cached(REPLICA_TOMBSTONE_UPSERT_SQL, params![origin, key.0, key.1, key.2, key.3, name, synced])
+                    .map_err(|err| Self::map_replica_sqlite(err, "write sqlite replica tombstone"))?;
+            }
+        }
+        Ok(true)
+    }
+
     fn apply_replica_record(
         tx: &rusqlite::Transaction<'_>,
         resource_kind: ResourceKind,
         key: &StoreKey,
         origin: &str,
         mutation: &ReplicaMutation,
-        apply: impl FnOnce() -> Result<bool, ResourceError>,
+        apply: impl FnOnce() -> Result<bool, ReplicaApplyError>,
     ) -> Result<bool, ResourceError> {
         tx.execute_batch("SAVEPOINT replica_record").map_err(|err| Self::map_sqlite(err, "begin replica record"))?;
         let result = if matches!(mutation.kind, StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified) {
-            Self::decode_object(resource_kind, mutation.value.clone()).and_then(|_| apply())
+            resource_kind.validate_stored_object(&mutation.value).map_err(ReplicaApplyError::Rejected).and_then(|()| apply())
         } else {
             apply()
         };
@@ -2218,17 +2305,29 @@ impl SqliteBackend {
                 tx.execute_batch("RELEASE replica_record").map_err(|err| Self::map_sqlite(err, "commit replica record"))?;
                 Ok(changed)
             }
-            Err(error) => {
+            Err(ReplicaApplyError::Storage(error)) => Err(error),
+            Err(ReplicaApplyError::Rejected(error)) => {
                 tx.execute_batch("ROLLBACK TO replica_record; RELEASE replica_record")
                     .map_err(|err| Self::map_sqlite(err, "rollback rejected replica"))?;
-                tx.execute("INSERT INTO replica_apply_quarantine
+                // Preserve payload, stable event type and receipt time for operator
+                // inspection. This is forensic evidence, not a replay queue;
+                // compact diagnostics deliberately omit the payload.
+                let event_type = match mutation.kind {
+                    StoredReplicaEventKind::Added => "ADDED",
+                    StoredReplicaEventKind::Modified => "MODIFIED",
+                    StoredReplicaEventKind::Deleted => "DELETED",
+                };
+                let changed = tx.execute("INSERT INTO replica_apply_quarantine
                     (origin_root,group_name,version,kind,namespace,name,body_json,event_type,last_synced_at,error,quarantined_at)
                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
                     ON CONFLICT(origin_root,group_name,version,kind,namespace,name) DO UPDATE SET
-                    body_json=excluded.body_json,event_type=excluded.event_type,last_synced_at=excluded.last_synced_at,error=excluded.error,quarantined_at=excluded.quarantined_at",
-                    params![origin,key.0,key.1,key.2,key.3,mutation.name,mutation.value.to_string(),format!("{:?}", mutation.kind),mutation.synced_at.to_rfc3339(),error.to_string(),Utc::now().to_rfc3339()])
+                    body_json=excluded.body_json,event_type=excluded.event_type,last_synced_at=excluded.last_synced_at,error=excluded.error,quarantined_at=CASE WHEN replica_apply_quarantine.body_json=excluded.body_json THEN replica_apply_quarantine.quarantined_at ELSE excluded.quarantined_at END
+                    WHERE replica_apply_quarantine.body_json<>excluded.body_json OR replica_apply_quarantine.error<>excluded.error",
+                    params![origin,key.0,key.1,key.2,key.3,mutation.name,mutation.value.to_string(),event_type,mutation.synced_at.to_rfc3339(),error.to_string(),Utc::now().to_rfc3339()])
                     .map_err(|err| Self::map_sqlite(err, "quarantine rejected replica"))?;
-                tracing::warn!(origin, kind=key.2, namespace=key.3, name=mutation.name, %error, "quarantined rejected replica; continuing batch");
+                if changed != 0 {
+                    tracing::warn!(%origin, kind=%key.2, namespace=%key.3, name=%mutation.name, %error, "quarantined rejected replica; continuing batch");
+                }
                 Ok(false)
             }
         }
@@ -2249,103 +2348,15 @@ impl SqliteBackend {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin replica batch"))?;
             let mut changed = Vec::new();
             for mutation in mutations {
-                let ReplicaMutation { kind, name, value, synced_at } = &mutation;
                 let applied = Self::apply_replica_record(&tx, resource_kind, &key, &origin, &mutation, || {
-                    let body = serde_json::to_string(&value).map_err(|err| ResourceError::decode(err.to_string()))?;
-                    let synced = synced_at.to_rfc3339();
-                    let existing = tx
-                        .query_row(
-                            r#"
-                        SELECT body_json, last_synced_at
-                        FROM replica_objects
-                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                        "#,
-                            params![origin, key.0, key.1, key.2, key.3, name],
-                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                        )
-                        .optional()
-                        .map_err(|err| Self::map_sqlite(err, "read existing sqlite replica event object"))?;
-                    let tombstone_synced_at = tx
-                        .query_row(
-                            r#"
-                        SELECT last_synced_at
-                        FROM replica_tombstones
-                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                        "#,
-                            params![origin, key.0, key.1, key.2, key.3, name],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(|err| Self::map_sqlite(err, "read sqlite replica tombstone"))?;
-                    let unchanged = match kind {
-                        StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
-                            tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
-                                || existing.as_ref().is_some_and(|(existing_body, existing_synced)| {
-                                    existing_synced > &synced || (existing_synced == &synced && existing_body >= &body)
-                                })
-                        }
-                        StoredReplicaEventKind::Deleted => {
-                            tombstone_synced_at.as_ref().is_some_and(|existing_synced| existing_synced >= &synced)
-                                || existing.as_ref().is_some_and(|(_, existing_synced)| existing_synced > &synced)
-                        }
-                    };
-                    if unchanged {
-                        return Ok(false);
-                    }
-
-                    match kind {
-                        StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
-                            tx.execute(
-                                r#"
-                        INSERT INTO replica_objects
-                            (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                        ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                        DO UPDATE SET body_json = excluded.body_json,
-                                      last_synced_at = excluded.last_synced_at
-                        "#,
-                                params![origin, key.0, key.1, key.2, key.3, name, body, synced],
-                            )
-                            .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
-                            tx.execute(
-                                r#"
-                        DELETE FROM replica_tombstones
-                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                        "#,
-                                params![origin, key.0, key.1, key.2, key.3, name],
-                            )
-                            .map_err(|err| Self::map_sqlite(err, "clear sqlite replica tombstone"))?;
-                        }
-                        StoredReplicaEventKind::Deleted => {
-                            tx.execute(
-                                r#"
-                            DELETE FROM replica_objects
-                            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                            "#,
-                                params![origin, key.0, key.1, key.2, key.3, name],
-                            )
-                            .map_err(|err| Self::map_sqlite(err, "delete sqlite replica event object"))?;
-                            tx.execute(
-                                r#"
-                            INSERT INTO replica_tombstones
-                                (origin_root, group_name, version, kind, namespace, name, last_synced_at)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                            ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                            DO UPDATE SET last_synced_at = excluded.last_synced_at
-                            "#,
-                                params![origin, key.0, key.1, key.2, key.3, name, synced],
-                            )
-                            .map_err(|err| Self::map_sqlite(err, "write sqlite replica tombstone"))?;
-                        }
-                    }
-                    Ok(true)
+                    Self::write_replica_mutation(&tx, &key, &origin, &mutation)
                 })?;
                 if applied {
                     changed.push(StoredReplicaEvent {
                         origin_root: origin_root.clone(),
-                        synced_at: *synced_at,
-                        kind: *kind,
-                        object: value.clone(),
+                        synced_at: mutation.synced_at,
+                        kind: mutation.kind,
+                        object: mutation.value,
                     });
                 }
             }
@@ -4104,6 +4115,48 @@ mod tests {
 
     use super::*;
     use crate::{Environment, EnvironmentSpec, InputMeta};
+
+    // Transient engine failures fail the whole batch and never create a bad-data
+    // quarantine or expose preceding writes. A SQLite callback injects real
+    // busy/full/I/O codes at the engine boundary during the second object write.
+    #[rstest::rstest]
+    #[case(rusqlite::ffi::SQLITE_BUSY)]
+    #[case(rusqlite::ffi::SQLITE_FULL)]
+    #[case(rusqlite::ffi::SQLITE_IOERR)]
+    #[tokio::test]
+    async fn transient_replica_error_aborts_batch(#[case] code: i32) {
+        let backend = SqliteBackend::open_in_memory().unwrap();
+        backend.call("install transient error injection", move |connection| {
+            connection.create_scalar_function("transient_replica_failure", 0, rusqlite::functions::FunctionFlags::SQLITE_UTF8, move |_| {
+                Err::<i64, _>(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some("injected transient failure".into())))
+            }).map_err(|err| SqliteBackend::map_sqlite(err, "install transient callback"))?;
+            connection.execute_batch("CREATE TEMP TRIGGER transient_replica_failure AFTER INSERT ON replica_objects WHEN NEW.name='bad' BEGIN SELECT transient_replica_failure(); END;")
+                .map_err(|err| SqliteBackend::map_sqlite(err, "install transient trigger"))?;
+            Ok(())
+        }).await.unwrap();
+        let kind = ResourceKind::of::<Environment>();
+        let at = Utc::now();
+        let mut events = Vec::new();
+        for name in ["before", "bad", "after"] {
+            let object = backend
+                .create_raw(
+                    kind,
+                    "flotilla",
+                    &InputMeta::builder().name(name.into()).build(),
+                    &serde_json::to_value(EnvironmentSpec { host_direct: None, docker: None }).unwrap(),
+                )
+                .await
+                .unwrap();
+            events.push((WatchEvent::Added(object), at));
+        }
+        let error = backend
+            .apply_replica_batch_raw(kind, &NodeId::new("peer"), "flotilla", &events)
+            .await
+            .expect_err("engine failures must fail the batch");
+        assert!(error.to_string().contains("injected transient failure"), "preserve original engine failure: {error}");
+        assert!(backend.list_replicas_raw(kind, "flotilla").await.unwrap().is_empty(), "preceding writes must roll back");
+        assert!(backend.diagnostics().await.unwrap().replica_quarantines.is_empty());
+    }
 
     // Opening an N-generation database backfills local/replica relation indexes
     // without rewriting stored bodies; reopening the migrated schema is idempotent.

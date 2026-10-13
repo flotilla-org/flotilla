@@ -602,18 +602,24 @@ impl InMemoryBackend {
         encoded: &Value,
     ) -> bool {
         let quarantine_key = (replica_key.clone(), name.to_string());
-        match Self::decode_object(resource_kind, encoded.clone()) {
+        match resource_kind.validate_stored_object(encoded) {
             Ok(_) => true,
             Err(error) => {
+                let previous = state.quarantines.get(&quarantine_key);
+                if previous.is_some_and(|(body, diagnostic)| body == encoded && diagnostic.error == error.to_string()) {
+                    return false;
+                }
+                let quarantined_at =
+                    previous.filter(|(body, _)| body == encoded).map(|(_, diagnostic)| diagnostic.quarantined_at).unwrap_or_else(Utc::now);
                 let diagnostic = flotilla_resources::ResourceReplicaQuarantine {
                     origin_root: replica_key.0.clone(),
                     kind: replica_key.1 .2.clone(),
                     namespace: replica_key.1 .3.clone(),
                     name: name.to_string(),
                     error: error.to_string(),
-                    quarantined_at: Utc::now(),
+                    quarantined_at,
                 };
-                tracing::warn!(origin=%diagnostic.origin_root, kind=diagnostic.kind, namespace=diagnostic.namespace, name, %error, "quarantined rejected replica; continuing batch");
+                tracing::warn!(origin=%diagnostic.origin_root, kind=%diagnostic.kind, namespace=%diagnostic.namespace, %name, %error, "quarantined rejected replica; continuing batch");
                 state.quarantines.insert(quarantine_key, (encoded.clone(), diagnostic));
                 false
             }
@@ -634,17 +640,23 @@ impl InMemoryBackend {
         }
         let store_key = Self::store_key(resource_kind, namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
+        let encoded = listed.items.iter().map(|object| Self::encode_object(resource_kind, object)).collect::<Result<Vec<_>, _>>()?;
         let mut state = self.replicas.lock().await;
-        let mut listed = listed.clone();
+        let snapshot_names = listed.items.iter().map(|object| object.metadata.name.as_str()).collect::<std::collections::HashSet<_>>();
+        state.quarantines.retain(|(partition, name), _| {
+            partition != &replica_key
+                || bucket.is_some_and(|leaf| crate::digest_bucket(name) != leaf)
+                || snapshot_names.contains(name.as_str())
+        });
+        let mut accepted = Vec::new();
         let mut rejected = Vec::new();
-        listed.items.retain(|object| {
-            let encoded = Self::encode_object(resource_kind, object).expect("JSON values encode");
-            let valid = Self::validate_replica_record(&mut state, resource_kind, &replica_key, &object.metadata.name, &encoded);
-            if !valid {
+        for (object, encoded) in listed.items.iter().zip(encoded) {
+            if Self::validate_replica_record(&mut state, resource_kind, &replica_key, &object.metadata.name, &encoded) {
+                accepted.push((object, encoded));
+            } else {
                 rejected.push(object.metadata.name.clone());
             }
-            valid
-        });
+        }
         let mut old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut digest = std::mem::take(&mut old.digest);
         let mut queries = std::mem::take(&mut old.queries);
@@ -665,37 +677,29 @@ impl InMemoryBackend {
         // Absent names retain deletion fences against delayed relays. A recreated
         // key is absent from old.objects, so insertion below stamps it afresh.
         let mut synced_at_by_name = old.synced_at_by_name;
-        for object in &listed.items {
+        let mut events = Vec::new();
+        for (object, encoded) in accepted {
             let name = &object.metadata.name;
-            let encoded = Self::encode_object(resource_kind, object)?;
             state.quarantines.remove(&(replica_key.clone(), name.clone()));
             let unchanged = old.objects.get(name) == Some(&encoded);
             queries.update(name, Some(&encoded));
             messages.update(name, Some(&encoded));
-            objects.insert(name.clone(), encoded);
             digest.set(name, Some(&object.metadata.resource_version));
             if !unchanged {
                 synced_at_by_name.insert(name.clone(), synced_at);
+                events.push(StoredReplicaEvent {
+                    origin_root: origin_root.clone(),
+                    synced_at,
+                    kind: if old.objects.contains_key(name) { StoredReplicaEventKind::Modified } else { StoredReplicaEventKind::Added },
+                    object: encoded.clone(),
+                });
             }
+            objects.insert(name.clone(), encoded);
         }
         for name in rejected {
             if let Some(value) = old.objects.remove(&name) {
                 objects.insert(name, value);
             }
-        }
-        let mut events = Vec::new();
-        for object in &listed.items {
-            let name = &object.metadata.name;
-            let value = objects.get(name).expect("encoded snapshot object");
-            if old.objects.get(name) == Some(value) {
-                continue;
-            }
-            events.push(StoredReplicaEvent {
-                origin_root: origin_root.clone(),
-                synced_at,
-                kind: if old.objects.contains_key(name) { StoredReplicaEventKind::Modified } else { StoredReplicaEventKind::Added },
-                object: value.clone(),
-            });
         }
         for (name, value) in old.objects {
             if !objects.contains_key(&name) {

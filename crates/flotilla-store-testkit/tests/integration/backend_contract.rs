@@ -473,6 +473,7 @@ async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(fa
     }
     let corrected = objects[1].clone();
     objects[1].spec = json!(null);
+    let rejected = objects[1].clone();
     let origin = flotilla_protocol::NodeId::new("peer");
     let kind = ResourceKind::of::<Convoy>();
     let at = chrono::Utc::now();
@@ -508,6 +509,18 @@ async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(fa
     assert_eq!(diagnostics.replica_quarantines[0].name, "bad");
     assert_eq!(diagnostics.replica_quarantines[0].origin_root, origin);
     assert!(!diagnostics.replica_quarantines[0].error.is_empty());
+    // Re-delivering the same rejected body preserves the first rejection time.
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    backend
+        .store()
+        .apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Added(rejected.clone()), at + chrono::Duration::seconds(1))])
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines[0].quarantined_at,
+        diagnostics.replica_quarantines[0].quarantined_at
+    );
+
     backend
         .store()
         .apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Modified(corrected), at + chrono::Duration::seconds(1))])
@@ -515,6 +528,31 @@ async fn replica_batch_quarantines_one_object(#[case] adapter: &str, #[values(fa
         .unwrap();
     assert_eq!(backend.store().list_replicas_typed::<Convoy>("flotilla").await.unwrap().len(), 3);
     assert!(backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines.is_empty());
+    // An authoritative snapshot omission clears this origin's quarantine while
+    // preserving a rejection with the same name at another origin.
+    let other = flotilla_protocol::NodeId::new("other-peer");
+    for origin in [&origin, &other] {
+        backend
+            .store()
+            .apply_replica_batch_raw(kind, origin, "flotilla", &[(WatchEvent::Added(rejected.clone()), at + chrono::Duration::seconds(2))])
+            .await
+            .unwrap();
+    }
+    backend
+        .store()
+        .replace_replicas_raw(
+            kind,
+            &origin,
+            "flotilla",
+            &ResourceList { items: Vec::new(), resource_version: "4".into(), generation: None },
+            at + chrono::Duration::seconds(3),
+            None,
+        )
+        .await
+        .unwrap();
+    let quarantines = backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines;
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(quarantines[0].origin_root, other);
 }
 
 // A valid decoded object can still fail in SQLite maintenance. Its savepoint
@@ -569,4 +607,41 @@ async fn replica_sql_failure_rolls_back_only_one_record(#[values(false, true)] s
     let diagnostics = reopened.store().diagnostics().await.unwrap().unwrap();
     assert_eq!(diagnostics.replica_quarantines.len(), 1, "quarantine survives restart");
     assert!(diagnostics.replica_quarantines[0].error.contains("test unappliable replica"));
+}
+
+// A bucket snapshot proves absence only within that bucket; a full snapshot
+// subsequently clears the remaining rejected name for the same origin.
+#[rstest::rstest]
+#[case("memory")]
+#[case("sqlite")]
+#[tokio::test]
+async fn replica_snapshot_quarantine_pruning_is_bucket_scoped(#[case] adapter: &str) {
+    use flotilla_store::SerializedResource;
+    let (backend, _server) = backend(adapter).await;
+    let source = ResourceBackend::new(InMemoryBackend::default());
+    let first = "bad";
+    let second = (0..256)
+        .map(|i| format!("other-{i}"))
+        .find(|name| flotilla_resources::digest_bucket(name) != flotilla_resources::digest_bucket(first))
+        .unwrap();
+    let kind = ResourceKind::of::<Convoy>();
+    let origin = flotilla_protocol::NodeId::new("peer");
+    let at = chrono::Utc::now();
+    for name in [first, &second] {
+        let object = source.using::<Convoy>("flotilla").create(&ConvoyFixture::meta(name), &ConvoyFixture::spec()).await.unwrap();
+        let mut object = flotilla_store::transcode::<_, ResourceObject<SerializedResource>>(object).unwrap();
+        object.spec = json!(null);
+        backend.store().apply_replica_batch_raw(kind, &origin, "flotilla", &[(WatchEvent::Added(object), at)]).await.unwrap();
+    }
+    let empty = ResourceList { items: Vec::new(), resource_version: "3".into(), generation: None };
+    backend
+        .store()
+        .replace_replicas_raw(kind, &origin, "flotilla", &empty, at, Some(flotilla_resources::digest_bucket(first)))
+        .await
+        .unwrap();
+    let quarantines = backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines;
+    assert_eq!(quarantines.len(), 1);
+    assert_eq!(quarantines[0].name, second);
+    backend.store().replace_replicas_raw(kind, &origin, "flotilla", &empty, at, None).await.unwrap();
+    assert!(backend.store().diagnostics().await.unwrap().unwrap().replica_quarantines.is_empty());
 }

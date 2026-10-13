@@ -121,6 +121,10 @@ impl ResourceKind {
     /// Validate a stored tree against the registered type and expose it as
     /// serialized data. The spec and status trees are kept as stored, so
     /// defaults and unknown fields are not rewritten for raw callers.
+    /// Validate replica admission by borrowing the raw body.
+    pub fn validate_stored_object(self, value: &Value) -> Result<(), ResourceError> {
+        self.decode_typed_value(value).map(|_| ())
+    }
     pub fn decode_object(self, value: Value) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         self.from_k8s(serde_json::from_value(value).map_err(stored_decode_error)?)
     }
