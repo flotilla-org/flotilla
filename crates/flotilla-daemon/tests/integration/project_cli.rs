@@ -2330,3 +2330,140 @@ async fn project_apply_rejects_invalid_or_incomplete_definitions() {
         .expect("apply sparse project");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "inherits".into() });
 }
+
+/// Stands in for fetching a branch and reading its `.flotilla/image/`
+/// through the VCS seam: every branch carries a project layer whose fragment
+/// names the branch.
+#[derive(Clone, Default)]
+struct LayerInspector {
+    reads: Arc<Mutex<Vec<flotilla_resources::CharterSource>>>,
+}
+
+#[async_trait]
+impl RepositoryInspector for LayerInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Err(format!("unexpected inspection of {}", path.display()))
+    }
+
+    async fn image_layer_snapshot(
+        &self,
+        source: &flotilla_resources::CharterSource,
+    ) -> Result<Option<flotilla_core::charter_store::LayerDirectorySnapshot>, String> {
+        self.reads.lock().expect("reads").push(source.clone());
+        let flotilla_resources::CharterSource::Repository { branch, .. } = source else { return Err("not a repository".into()) };
+        Ok(Some(flotilla_core::charter_store::LayerDirectorySnapshot {
+            revision: format!("{branch}-head"),
+            files: BTreeMap::from([
+                ("layer.yaml".to_string(), b"name: demo-native\nversion: 1.0\ntier: project\nprobe: demo --version\n".to_vec()),
+                ("Dockerfile.fragment".to_string(), format!("FROM ${{BASE}}\nRUN echo {branch}\n").into_bytes()),
+            ]),
+        }))
+    }
+}
+
+// Glue: `image check` reaches the daemon as a command, reads the primary
+// repository's layer directory at the ref through the repository inspector,
+// creates the composition's ImageBuild on this host, and the build is then
+// readable by name for the CLI's wait loop. Without `--agent`, the harness
+// adapters come from the project's default workflow.
+#[tokio::test]
+async fn image_check_command_reads_the_ref_and_reports_its_build() {
+    use flotilla_protocol::image_check::{ImageBuildReportPhase, ImageCheckAgentSource, ImageCheckRequest};
+    use flotilla_resources::{ImageLayer, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
+
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let inspector = LayerInspector::default();
+    daemon.set_repository_inspector(Arc::new(inspector.clone())).await;
+    let host = daemon.local_host_id().expect("local host").to_string();
+    let hosts = backend.using::<flotilla_resources::Host>("flotilla");
+    let current = match hosts.get(&host).await {
+        Ok(current) => current,
+        Err(_) => hosts.create(&InputMeta::builder().name(host.clone()).build(), &Default::default()).await.expect("host"),
+    };
+    let mut status = current.status.clone().unwrap_or_default();
+    let mut description = match status.description.clone() {
+        Some(description) => description,
+        None => daemon.local_host_summary().await,
+    };
+    description.system.arch = Some("x86_64".into());
+    status.description = Some(description);
+    hosts.update_status(&host, &current.metadata.resource_version, &status).await.expect("host arch");
+
+    let repository = RepositorySpec::remote("https://github.com/example/demo").expect("repository");
+    backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().0.clone()).build(), &repository)
+        .await
+        .expect("repo");
+    let mut project = ProjectSpec::builder().display_name("Demo".into()).build();
+    project.repositories = vec![flotilla_resources::ProjectRepositorySpec::builder()
+        .repo(repository.key())
+        .roles([ProjectRepositoryRole::Code].into())
+        .build()];
+    backend.using::<Project>("flotilla").create(&InputMeta::builder().name("demo".into()).build(), &project).await.expect("project");
+    let layer = |name: &str, tier: ImageLayerTier, provides: &[&str]| {
+        ImageLayerSpec::builder()
+            .name(name.into())
+            .version("1.0".into())
+            .tier(tier)
+            .source(ImageLayerSource::Stdlib)
+            .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "1".repeat(64))))
+            .fragment("FROM ${BASE}\nRUN true\n".into())
+            .probe("true".into())
+            .provides(provides.iter().map(|provide| provide.to_string()).collect())
+            .build()
+    };
+    for spec in [
+        layer("base", ImageLayerTier::Base, &[]),
+        layer("crew-utilities", ImageLayerTier::AgentRuntime, &["crew:utilities"]),
+        layer("harness-codex", ImageLayerTier::AgentRuntime, &["harness:codex"]),
+        layer("harness-claude", ImageLayerTier::AgentRuntime, &["harness:claude"]),
+    ] {
+        backend
+            .definitions::<ImageLayer>("flotilla")
+            .apply(&InputMeta::builder().name(spec.resource_name()).build(), &spec.into())
+            .await
+            .expect("layer");
+    }
+
+    let mut rx = daemon.subscribe();
+    let request = ImageCheckRequest::builder().project("demo".into()).git_ref("feature/x".into()).agents(vec!["codex".into()]).build();
+    let CommandValue::ImageCheck(report) = execute_project_command(&daemon, &mut rx, CommandAction::ImageCheck { request }).await else {
+        panic!("expected an image check report")
+    };
+    assert_eq!(
+        inspector.reads.lock().expect("reads").last(),
+        Some(&flotilla_resources::CharterSource::Repository {
+            repo: "https://github.com/example/demo".into(),
+            branch: "feature/x".into(),
+            path: ".flotilla/image".into()
+        })
+    );
+    assert_eq!((report.project_layer.as_deref(), report.agents_from), (Some("demo-native@1.0"), ImageCheckAgentSource::Requested));
+    let build = report.build.expect("build");
+    assert_eq!((build.builder_host.as_str(), build.phase), (host.as_str(), ImageBuildReportPhase::Queued));
+    assert_eq!(
+        build.layers.iter().map(|layer| layer.layer.as_str()).collect::<Vec<_>>(),
+        ["base", "demo-native", "crew-utilities", "harness-codex"]
+    );
+
+    let queried = daemon
+        .execute_query(Command::builder().action(CommandAction::QueryImageBuild { name: build.name.clone() }).build(), uuid::Uuid::new_v4())
+        .await
+        .expect("query");
+    assert!(
+        matches!(&queried, CommandValue::ImageBuild(read) if read.name == build.name && read.identity == build.identity),
+        "{queried:?}"
+    );
+
+    let request = ImageCheckRequest::builder().project("demo".into()).git_ref("feature/x".into()).build();
+    let CommandValue::ImageCheck(defaulted) = execute_project_command(&daemon, &mut rx, CommandAction::ImageCheck { request }).await else {
+        panic!("expected an image check report")
+    };
+    assert_eq!(defaulted.agents_from, ImageCheckAgentSource::DefaultWorkflow);
+    // The built-in default workflow's agent roles resolve to codex, so the
+    // composition, and with it the build, is the one `--agent codex` made.
+    assert_eq!(defaulted.agents, ["codex"]);
+    assert!(defaulted.reused);
+    assert_eq!(defaulted.build.expect("build").name, build.name);
+}

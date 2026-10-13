@@ -61,6 +61,10 @@ pub(super) trait AdmissionActionPort: Send + Sync {
         remote: Option<&str>,
     ) -> Result<String, String>;
     async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String>;
+    async fn image_check(
+        &self,
+        request: &flotilla_protocol::image_check::ImageCheckRequest,
+    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String>;
     async fn project_register(&self, target: &str) -> Result<(String, usize), String>;
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
     async fn roll_convoy_ensure(&self, namespace: &str, name: &str) -> Result<String, String>;
@@ -573,6 +577,26 @@ impl AdmissionActions<'_> {
             return Ok(id);
         }
         Err("ProjectRefresh action selected the wrong handler".to_string())
+    }
+
+    pub(super) async fn execute_action_image_check(&self, id: u64, command: &Command) -> Result<u64, String> {
+        if let CommandAction::ImageCheck { request } = &command.action {
+            let empty_identity = empty_repo_identity();
+            self.events.sink.emit(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.events.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.port.image_check(request).await {
+                Ok(report) => CommandValue::ImageCheck(Box::new(report)),
+                Err(message) => CommandValue::Error { message },
+            };
+            self.events.finish(id, empty_identity, result);
+            return Ok(id);
+        }
+        Err("ImageCheck action selected the wrong handler".to_string())
     }
 }
 

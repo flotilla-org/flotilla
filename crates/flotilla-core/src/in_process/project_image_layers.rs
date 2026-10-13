@@ -12,20 +12,54 @@ use flotilla_charter::{
     ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION},
 };
 use flotilla_resources::{
-    parse_layer_directory, CharterSource, ImageLayer, ImageLayerSource, InputMeta, Project, ProjectRepositoryRole, Repository,
+    parse_layer_directory, CharterSource, ImageLayer, ImageLayerSource, InputMeta, Project, ProjectRepositoryRole, ProjectSpec, Repository,
     ResourceError, ResourceObject, MANAGED_BY_LABEL,
 };
+use flotilla_store::ResourceBackend;
 use tracing::warn;
 
 use super::project_ops::{repository_transport_url_with_backend, ProjectService};
 
 /// Where one project's layer directory lives, as seen from this host.
 #[derive(Debug, PartialEq, Eq)]
-enum LayerHome {
+pub(super) enum LayerHome {
     /// Read the directory here.
     Source(CharterSource),
     /// Nothing can be read yet (no default branch); leave the layer as it is.
     Elsewhere,
+}
+
+/// The project's primary (first code) repository's layer directory, at
+/// `branch` or else the repository's default branch. `None`: the project has
+/// no code repository.
+pub(super) async fn primary_layer_home(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project: &ProjectSpec,
+    branch: Option<&str>,
+) -> Result<Option<LayerHome>, String> {
+    let Some(primary) = project.repositories.iter().find(|member| member.roles.contains(&ProjectRepositoryRole::Code)) else {
+        return Ok(None);
+    };
+    let repository = backend
+        .including_replicas::<Repository>(namespace)
+        .get(&primary.repo.to_string())
+        .await
+        .map_err(|error| format!("repository {}: {error}", primary.repo))?
+        .object;
+    let Some(branch) = branch
+        .map(str::to_string)
+        .or_else(|| primary.default_branch.clone())
+        .or_else(|| repository.status.as_ref().and_then(|status| status.default_branch.clone()))
+    else {
+        return Ok(Some(LayerHome::Elsewhere));
+    };
+    let repo = repository_transport_url_with_backend(backend, namespace, &repository.spec).await?;
+    let path = primary.subpath.as_deref().map_or_else(
+        || PROJECT_IMAGE_LAYER_PATH.to_string(),
+        |subpath| format!("{}/{PROJECT_IMAGE_LAYER_PATH}", subpath.trim_end_matches('/')),
+    );
+    Ok(Some(LayerHome::Source(CharterSource::Repository { repo, branch, path })))
 }
 
 impl ProjectService<'_> {
@@ -65,30 +99,8 @@ impl ProjectService<'_> {
         Ok(())
     }
 
-    /// The primary (first code) repository, read by the project's home.
-    /// `None`: the project has no code repository.
     async fn layer_home(&self, namespace: &str, project: &ResourceObject<Project>) -> Result<Option<LayerHome>, String> {
-        let Some(primary) = project.spec.repositories.iter().find(|member| member.roles.contains(&ProjectRepositoryRole::Code)) else {
-            return Ok(None);
-        };
-        let repository = self
-            .resource_backend
-            .including_replicas::<Repository>(namespace)
-            .get(&primary.repo.to_string())
-            .await
-            .map_err(|error| format!("repository {}: {error}", primary.repo))?
-            .object;
-        let Some(branch) =
-            primary.default_branch.clone().or_else(|| repository.status.as_ref().and_then(|status| status.default_branch.clone()))
-        else {
-            return Ok(Some(LayerHome::Elsewhere));
-        };
-        let repo = repository_transport_url_with_backend(self.resource_backend, namespace, &repository.spec).await?;
-        let path = primary.subpath.as_deref().map_or_else(
-            || PROJECT_IMAGE_LAYER_PATH.to_string(),
-            |subpath| format!("{}/{PROJECT_IMAGE_LAYER_PATH}", subpath.trim_end_matches('/')),
-        );
-        Ok(Some(LayerHome::Source(CharterSource::Repository { repo, branch, path })))
+        primary_layer_home(self.resource_backend, namespace, &project.spec, None).await
     }
 
     async fn sync_project_image_layer(&self, namespace: &str, project: &str, source: &CharterSource) -> Result<(), String> {

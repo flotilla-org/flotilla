@@ -47,6 +47,12 @@ impl AdmissionActionPort for Worker {
     async fn project_register(&self, _: &str) -> Result<(String, usize), String> {
         panic!("no project edits")
     }
+    async fn image_check(
+        &self,
+        _: &flotilla_protocol::image_check::ImageCheckRequest,
+    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
+        panic!("no image checks")
+    }
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
     }

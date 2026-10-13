@@ -545,6 +545,31 @@ impl ConvoyAdmission {
         self.prepare_convoy_admission_with_preferences(namespace, intent, dispatching_principal_ref, None).await
     }
 
+    /// The harness adapters the project's default workflow's agent roles
+    /// resolve to, through the same cascade and workflow lookup admission
+    /// uses (`flotilla image check` without `--agent`).
+    pub(super) async fn default_workflow_harness_adapters(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        project: &ProjectSpec,
+    ) -> Result<BTreeSet<String>, String> {
+        let intent =
+            flotilla_protocol::ConvoyStartIntent::builder().project_ref(project_ref.to_string()).namespace(namespace.to_string()).build();
+        let (workflow_ref, workflow) = self
+            .reads(self.backend.clone())
+            .load_placement_workflow(namespace, project_ref, project, &[], &intent, PlacementPurpose::Routing)
+            .await?;
+        flotilla_agent::adapter::required_agent_adapters(
+            workflow
+                .roles
+                .iter()
+                .chain(workflow.vessels.iter().flat_map(|vessel| &vessel.crew))
+                .filter(|crew| matches!(crew.source, CrewSource::Agent { .. })),
+        )
+        .map_err(|error| format!("workflow `{workflow_ref}`: {error}"))
+    }
+
     #[cfg(test)]
     pub(super) async fn resolve_convoy_admission_workflow(
         &self,
@@ -1544,7 +1569,7 @@ async fn resolve_vessel_images(
 
 /// Installation image defaults outside a resolved workflow cascade: the
 /// project's cascade when it is declared, else the fleet-root CrewDefaults.
-async fn installation_image_defaults(
+pub(super) async fn installation_image_defaults(
     backend: &ResourceBackend,
     namespace: &str,
     project_ref: Option<&str>,

@@ -27,6 +27,7 @@ use crew_ops::{CrewService, CrewTurnDeliveryActuator};
 
 #[path = "in_process/convoy_admission.rs"]
 pub mod convoy_admission;
+mod image_check;
 mod project_image_layers;
 mod project_ops;
 use checkout_providers::{CheckoutProvider, CheckoutProviders};
@@ -104,6 +105,7 @@ use flotilla_store::{
     ResourceBackend,
 };
 use futures::{FutureExt, StreamExt};
+pub use image_check::{check_image, image_build_report, ImageCheckSources};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -5973,6 +5975,7 @@ impl InProcessDaemon {
             CommandAction::ProjectApply { .. } => return boxed_action!(admission.execute_action_project_apply(id, &command)),
             CommandAction::ProjectRegister { .. } => return boxed_action!(admission.execute_action_project_register(id, &command)),
             CommandAction::ProjectRefresh { .. } => return boxed_action!(admission.execute_action_project_refresh(id, &command)),
+            CommandAction::ImageCheck { .. } => return boxed_action!(admission.execute_action_image_check(id, &command)),
             CommandAction::TrackRepoPath { .. } => return boxed_action!(executor.execute_action_track_repo_path(id, &command)),
             CommandAction::UntrackRepo { .. } => return boxed_action!(executor.execute_action_untrack_repo(id, &command)),
             CommandAction::OpenChangeRequest { .. }
@@ -6349,6 +6352,14 @@ impl admission_actions::AdmissionActionPort for InProcessDaemon {
     async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
         InProcessDaemon::project_refresh(self, name).await
     }
+    async fn image_check(
+        &self,
+        request: &flotilla_protocol::image_check::ImageCheckRequest,
+    ) -> Result<flotilla_protocol::image_check::ImageCheckReport, String> {
+        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        let host = self.environment_manager.local_host_id().as_str().to_string();
+        image_check::check_image(&self.resource_backend, &namespace, &host, self, request).await
+    }
     async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
         InProcessDaemon::project_register(self, target).await
     }
@@ -6385,6 +6396,9 @@ impl crew_actions::CrewActionPort for InProcessDaemon {
 
 #[async_trait]
 impl projections_actions::ProjectionsActionPort for InProcessDaemon {
+    async fn provisioning_namespace(&self) -> String {
+        InProcessDaemon::provisioning_namespace(self).await
+    }
     async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
         self.attach_resolver().attach_project_context(selector).await
     }
@@ -6520,5 +6534,24 @@ impl executor_actions::ExecutorActionPort for InProcessDaemon {
     }
     async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
         InProcessDaemon::tracked_repo_identity_for_path(self, repo_path).await
+    }
+}
+
+#[async_trait]
+impl image_check::ImageCheckSources for InProcessDaemon {
+    async fn layer_snapshot(
+        &self,
+        source: &flotilla_resources::CharterSource,
+    ) -> Result<Option<crate::charter_store::LayerDirectorySnapshot>, String> {
+        project_ops::ProjectOperations::repository_inspector(self).await?.image_layer_snapshot(source).await
+    }
+
+    async fn default_harness_adapters(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        project: &flotilla_resources::ProjectSpec,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        self.convoy_admission.default_workflow_harness_adapters(namespace, project_ref, project).await
     }
 }

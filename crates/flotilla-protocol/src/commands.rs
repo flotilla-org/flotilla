@@ -1034,6 +1034,11 @@ pub enum CommandAction {
     ProjectRefresh {
         name: String,
     },
+    /// Resolve a branch's composed image and get-or-create its ImageBuild
+    /// (`flotilla image check`).
+    ImageCheck {
+        request: crate::image_check::ImageCheckRequest,
+    },
 
     TrackRepoPath {
         path: PathBuf,
@@ -1098,6 +1103,10 @@ pub enum CommandAction {
         diagnostics_dir: PathBuf,
     },
     QueryFulfilmentList {},
+    /// One ImageBuild as `flotilla image check` reports it.
+    QueryImageBuild {
+        name: String,
+    },
     QueryFleetList {
         project: Option<String>,
         crew_id: Option<String>,
@@ -1216,6 +1225,7 @@ impl CommandAction {
                 | CommandAction::QueryHostProviders { .. }
                 | CommandAction::QueryFleetHealth {}
                 | CommandAction::QueryFulfilmentList {}
+                | CommandAction::QueryImageBuild { .. }
                 | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewStalls { .. }
                 | CommandAction::QueryCrewCapabilities { .. }
@@ -1295,6 +1305,8 @@ impl Command {
             CommandAction::QueryFleetHealth {} => "query fleet health",
             CommandAction::FleetPostInstall { .. } => "fleet post-install",
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
+            CommandAction::QueryImageBuild { .. } => "query image build",
+            CommandAction::ImageCheck { .. } => "Checking composed image...",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
             CommandAction::QueryCrewCapabilities { .. } => "query crew capabilities",
@@ -1463,6 +1475,8 @@ pub enum CommandValue {
         report: serde_json::Value,
     },
     FulfilmentList(Box<FulfilmentListResponse>),
+    ImageCheck(Box<crate::image_check::ImageCheckReport>),
+    ImageBuild(Box<crate::image_check::ImageBuildReport>),
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),
     CrewCapabilities {

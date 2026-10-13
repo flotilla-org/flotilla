@@ -8,8 +8,8 @@ use flotilla_client::{
 use flotilla_protocol::{commands::CommandValue, output::OutputFormat, Command, CommandAction};
 use flotilla_provider_runtime::ProcessCommandRunner;
 use flotilla_tui::cli::args::{
-    attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, EventsArgs, FleetSubCommand, HookArgs,
-    LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
+    attach_mode, AttachArgs, Cli, CompleteArgs, CompletionsArgs, DaemonArgs, DaemonSubCommand, DomainCommand, EventsArgs, FleetSubCommand,
+    HookArgs, LogsArgs, LsArgs, ResourceListArgs, ResourceSubCommand, SubCommand, TopologyArgs, ViewArgs, WaitArgs,
 };
 
 mod cli;
@@ -18,8 +18,8 @@ mod resource_validate;
 use cli::{
     dispatch, query_installer_health, run_artifact_command, run_attach, run_complete, run_completions, run_control_command, run_daemon,
     run_daemon_bridge, run_daemon_dev_mode, run_daemon_stop, run_ensure_command, run_fleet_health, run_fleet_list, run_hook,
-    run_hooks_command, run_logs, run_manifest_command, run_pm_command, run_resource_command, run_status, run_topology_command, run_tui,
-    run_wait, run_watch,
+    run_hooks_command, run_image_command, run_logs, run_manifest_command, run_pm_command, run_resource_command, run_status,
+    run_topology_command, run_tui, run_wait, run_watch,
 };
 
 fn binary_version() -> &'static str {
@@ -150,6 +150,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
             )
             .await
         }
+        Some(SubCommand::Domain(DomainCommand::Image(noun))) => run_image_command(&cli, noun, format).await,
         Some(SubCommand::Domain(command)) => dispatch(command.resolve()?, &cli, format).await,
 
         Some(SubCommand::DaemonBridge) => run_daemon_bridge(&cli).await,
