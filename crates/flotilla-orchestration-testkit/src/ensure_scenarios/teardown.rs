@@ -392,7 +392,6 @@ pub async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_rest
             &ResourceEnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_composition: None,
                     image_build_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "local".to_string(),

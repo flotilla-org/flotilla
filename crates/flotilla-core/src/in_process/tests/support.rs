@@ -540,7 +540,7 @@ pub(super) async fn create_docker_placement(
                     legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: host_ref.to_string(),
-                    image: "crew:latest".to_string().into(),
+                    image: Some("crew:latest".into()),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::from(["codex".to_string()]),
                     default_cwd: None,

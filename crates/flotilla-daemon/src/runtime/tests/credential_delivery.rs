@@ -170,7 +170,6 @@ fn docker_environment_metadata_decodes_non_empty_credential_scopes() {
     let repository = flotilla_resources::RepositoryKey("github.com-flotilla-org-flotilla".to_string());
     let expected = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-a".to_string(),
@@ -537,7 +536,6 @@ async fn fresh_claude_provisioning_stages_generation_pinned_skills() {
     );
     let credential_refs = BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]);
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -620,7 +618,6 @@ async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home(
         .with_agent_material(agent_material),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -728,7 +725,6 @@ async fn codex_credential_and_agent_material_conflict_before_container_creation(
         .with_agent_material(agent_material),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),
@@ -814,7 +810,6 @@ async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflig
         .with_agent_material(agent_material),
     );
     let spec = flotilla_resources::DockerEnvironmentSpec {
-        image_composition: None,
         image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: "host-test".to_string(),

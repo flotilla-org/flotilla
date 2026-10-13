@@ -15,7 +15,7 @@ async fn contract(backend: ResourceBackend) {
         .host_ref("feta".to_string())
         .pool("cleat".to_string())
         .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
-        .realisation(FulfilmentRealisation::DockerPerVessel { image: "crew:v1".into() })
+        .realisation(FulfilmentRealisation::DockerPerVessel { image: Some("crew:v1".into()) })
         .build();
     let created = kinds.create(&InputMeta::builder().name("docker-crew-image-feta".to_string()).build(), &spec).await.expect("create kind");
     assert_eq!(created.spec, spec);
@@ -45,7 +45,7 @@ fn live_policy_set_migrates_to_kinds() {
             legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "feta".to_string(),
-            image: "crew:v1".into(),
+            image: Some("crew:v1".into()),
             pull_policy: DockerImagePullPolicy::Always,
             agent_adapters: BTreeSet::new(),
             default_cwd: None,
@@ -59,7 +59,7 @@ fn live_policy_set_migrates_to_kinds() {
         .build();
     for name in ["docker-crew-image-feta", "docker-on-feta"] {
         let kind = FulfilmentKindSpec::from_policy(&docker, "macos").expect(name);
-        assert_eq!(kind.realisation, FulfilmentRealisation::DockerPerVessel { image: "crew:v1".into() });
+        assert_eq!(kind.realisation, FulfilmentRealisation::DockerPerVessel { image: Some("crew:v1".into()) });
         assert!(kind.grants.contains(&FulfilmentGrant::platform("linux".to_string())));
         assert!(kind.grants.contains(&FulfilmentGrant::network("scoped".to_string())));
     }

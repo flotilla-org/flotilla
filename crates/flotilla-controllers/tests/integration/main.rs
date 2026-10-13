@@ -7,7 +7,6 @@ mod clone_reconciler;
 mod common;
 mod convoy_reconcile;
 mod environment_reconciler;
-mod image_build;
 mod in_process_daemon;
 mod liveness_contract;
 mod provisioning_in_memory;

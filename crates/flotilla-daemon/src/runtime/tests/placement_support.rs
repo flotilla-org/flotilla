@@ -163,7 +163,7 @@ pub(super) async fn remote_shared_clone_placement_reaches_running(docker: bool) 
                 legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: feta_host_ref.clone(),
-                image: "test-image".to_string().into(),
+                image: Some("test-image".into()),
                 pull_policy: Default::default(),
                 agent_adapters: BTreeSet::new(),
                 default_cwd: Some("/workspace".to_string()),

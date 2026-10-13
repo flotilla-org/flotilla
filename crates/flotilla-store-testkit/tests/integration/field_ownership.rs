@@ -26,7 +26,7 @@ fn docker(pool: &str, priority: i32, host: &str, image: &str) -> PlacementPolicy
             legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: host.to_string(),
-            image: image.to_string().into(),
+            image: Some(image.into()),
             pull_policy: DockerImagePullPolicy::IfNotPresent,
             agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: Some("/workspace".to_string()),
@@ -180,7 +180,7 @@ async fn resource_apply_reports_rejected_field_and_owner() {
     assert!(message.contains("managed manifest"), "{message}");
     let stored = policies.get("policy").await.expect("stored policy").spec.docker_per_vessel.expect("docker");
     assert_eq!(stored.host_ref, "udder");
-    assert_eq!(stored.image, "image:old".into(), "a rejected apply must not partially change operator fields");
+    assert_eq!(stored.image, Some("image:old".into()), "a rejected apply must not partially change operator fields");
     assert_eq!(backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics").field_ownership_violations.len(), 1);
 }
 
@@ -205,7 +205,7 @@ async fn operator_cannot_clear_loop_owned_docker_strategy_and_violation_remains_
 
     assert_eq!(updated.spec.priority, 9);
     assert!(updated.spec.host_direct.is_none());
-    assert_eq!(updated.spec.docker_per_vessel.expect("preserved docker strategy").image, "operator/image:latest".into());
+    assert_eq!(updated.spec.docker_per_vessel.expect("preserved docker strategy").image, Some("operator/image:latest".into()));
     let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
     assert!(
         diagnostics.field_ownership_violations.iter().any(|violation| violation.field == "spec.docker_per_vessel"),

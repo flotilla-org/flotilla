@@ -135,18 +135,6 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         Ok(EnvironmentProvisioning::HostDirect)
     }
 
-    async fn ensure_image(
-        &self,
-        build: &flotilla_resources::ResourceObject<flotilla_resources::ImageBuild>,
-        host: &str,
-    ) -> Result<Option<flotilla_resources::PlacedImageIdentity>, String> {
-        if host != self.state.local_host_ref {
-            return Err("image distribution target is not the local daemon host".into());
-        }
-        let distributor = self.state.image_distributor.as_ref().ok_or("image distributor unavailable")?;
-        distributor.request(build).await
-    }
-
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let legacy_baseline = self.legacy_baseline_for_environment(name).await?;
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };

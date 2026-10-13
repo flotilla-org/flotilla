@@ -1,90 +1,65 @@
-use flotilla_store::DockerImageSourceStoreExt;
-use flotilla_store_memory::InMemoryBackend;
-use std::collections::BTreeSet;
+//! Composed-image admission (ADR 0062): each vessel's ordered layer list comes
+//! from the project's `image:` (else the installation defaults), its leg and
+//! crew image needs, and the harness layers its roles use; admission
+//! get-or-creates one ImageBuild per identity and architecture and freezes
+//! `Built { identity, image_build_ref }` into the vessel's placement.
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use flotilla_config::ConfigStore;
-use flotilla_protocol::HostName;
-use flotilla_resources::{CrewSource, CrewSpec, InputMeta, PlacementPolicy, VesselRequirement, WorkflowTemplateSpec};
+use flotilla_protocol::{HostName, PlacementDecision};
+use flotilla_resources::{
+    image_build_name, image_identity, CrewDefaults, CrewDefaultsSpec, CrewSource, CrewSpec, DockerImageSource, FleetDesignation,
+    FleetDesignationSpec, Host, ImageBuild, ImageBuildCapacity, ImageBuildReservation, ImageCacheBinding, ImageDelivery, ImageLayer,
+    ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageSelection, PlacementPolicy, Project, ProjectSpec, VesselRequirement,
+    WorkflowTemplateSpec, FLEET_DESIGNATION_NAME,
+};
 use flotilla_store::ResourceBackend;
+use flotilla_store_memory::InMemoryBackend;
 
 use super::support::{create_docker_placement, test_meta};
+use crate::in_process::convoy_admission::PlacementResolution;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 
-// ADR 0047/#2731: legacy baseline references resolve once into no-layer
-// compositions; later baseline edits cannot change admitted literal images.
-#[tokio::test]
-async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image() {
-    use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
+const NS: &str = "flotilla";
 
-    let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
-    let backend = ResourceBackend::new(InMemoryBackend::default());
-    let daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery(false),
-        HostName::new("local"),
-        backend.clone(),
-    )
-    .await;
-    create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;
-    let policies = backend.using::<PlacementPolicy>("flotilla");
-    let mut policy = policies.get("crew-policy").await.expect("policy");
-    policy.spec.docker_per_vessel.as_mut().expect("docker").image =
-        DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() };
-    policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec).await.expect("reference baseline");
-    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
-    let error = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect_err("missing baseline must fail");
-    assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
-    let error = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, None, false)
-        .await
-        .expect_err("default selection must reject missing baseline");
-    assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
-    let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
-    baselines
-        .apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string(), layers: None })
-        .await
-        .expect("baseline");
-    let admitted = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect("admit");
-    baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v2".to_string(), layers: None }).await.expect("bump");
-    let frozen = admitted.selected.expect("placement").spec.docker_per_vessel.expect("docker").image;
-    let DockerImageSource::Composition { composition } = &frozen else { panic!("legacy source must become a no-layer composition") };
-    assert!(composition.layers.is_empty());
-    assert_eq!(composition.literal_base.as_deref(), Some("crew:v1"));
-    assert_eq!(frozen.resolve(&baselines).await.expect("frozen literal"), "crew:v1");
-    let next = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect("next admission");
-    assert_eq!(
-        next.selected.expect("placement").spec.docker_per_vessel.expect("docker").image.resolve(&baselines).await.expect("next literal"),
-        "crew:v2"
-    );
+fn layer(name: &str, tier: ImageLayerTier, provides: &[&str], requires: &[&str]) -> ImageLayerSpec {
+    ImageLayerSpec::builder()
+        .name(name.into())
+        .version("1.0.0".into())
+        .tier(tier)
+        .source(if tier == ImageLayerTier::Project { ImageLayerSource::Project } else { ImageLayerSource::Stdlib })
+        .maybe_project((tier == ImageLayerTier::Project).then(|| "flotilla".to_string()))
+        .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "a".repeat(64))))
+        .fragment(format!("FROM ${{BASE}}\nRUN echo {name}\n"))
+        .provides(provides.iter().map(|capability| capability.to_string()).collect())
+        .requires(requires.iter().map(|capability| capability.to_string()).collect())
+        .probe("true".into())
+        .build()
 }
 
-// Behaviour (#2731): new admissions freeze a need-selected composition and
-// await a built identity; the previous baseline cannot satisfy that demand.
-#[tokio::test]
-async fn image_layer_admission_freezes_inputs_without_baseline_fallback() {
-    use flotilla_resources::{
-        CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec,
-        ImageLayerStage,
-    };
+fn catalogue() -> Vec<ImageLayerSpec> {
+    vec![
+        layer("base-ubuntu", ImageLayerTier::Base, &["os:ubuntu"], &[]),
+        layer("rust", ImageLayerTier::Shared, &["toolchain:rust"], &[]),
+        layer("zig", ImageLayerTier::Shared, &["toolchain:zig"], &[]),
+        layer("display-x11", ImageLayerTier::Shared, &["display:x11"], &[]),
+        layer("crew-utilities", ImageLayerTier::AgentRuntime, &["crew:utilities"], &[]),
+        layer("harness-codex", ImageLayerTier::AgentRuntime, &["harness:codex", "harness:codex@0.160.0"], &[]),
+        layer("harness-claude", ImageLayerTier::AgentRuntime, &["harness:claude"], &[]),
+    ]
+}
+
+struct Fixture {
+    daemon: Arc<InProcessDaemon>,
+    backend: ResourceBackend,
+    _temp: tempfile::TempDir,
+}
+
+async fn fixture(layers: Vec<ImageLayerSpec>, image: Option<ImageSelection>) -> Fixture {
     let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-image-composition\"\n").expect("daemon config");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"image-admission\"\n").expect("daemon config");
     let backend = ResourceBackend::new(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
@@ -95,133 +70,219 @@ async fn image_layer_admission_freezes_inputs_without_baseline_fallback() {
     )
     .await;
     create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;
-    let policies = backend.using::<PlacementPolicy>("flotilla");
+    let policies = backend.using::<PlacementPolicy>(NS);
     let mut policy = policies.get("crew-policy").await.expect("policy");
-    policy.spec.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() };
-    policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec).await.expect("baseline policy");
-    let base = ImageLayerSpec::builder()
-        .stage(ImageLayerStage::Base)
-        .parent(ImageLayerParent::Image(format!("debian@sha256:{}", "a".repeat(64))))
-        .repository("https://example.test/images".into())
-        .revision("1".repeat(40))
-        .fragment("Dockerfile.base".into())
-        .provides(BTreeSet::from(["os:debian-family".into()]))
-        .build();
-    let display = ImageLayerSpec::builder()
-        .stage(ImageLayerStage::Capability)
-        .parent(ImageLayerParent::Rebasable)
-        .repository("https://example.test/images".into())
-        .revision("2".repeat(40))
-        .fragment("Dockerfile.display".into())
-        .provides(BTreeSet::from(["display:headless-x11".into()]))
-        .requires(BTreeSet::from(["os:debian-family".into()]))
-        .build();
-    let layers = backend.definitions::<ImageLayer>("flotilla");
-    layers.apply(&test_meta("base"), &base).await.expect("base layer");
-    layers.apply(&test_meta("display"), &display).await.expect("display layer");
-    let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
-    baselines
+    policy.spec.docker_per_vessel.as_mut().expect("docker").image = None;
+    policies.update(&test_meta("crew-policy"), &policy.metadata.resource_version, &policy.spec).await.expect("composed policy");
+    set_architecture(&backend, "host-a", "x86_64", None).await;
+    for spec in layers {
+        backend.definitions::<ImageLayer>(NS).apply(&test_meta(&spec.resource_name()), &spec.into()).await.expect("layer");
+    }
+    backend
+        .using::<Project>(NS)
+        .create(&test_meta("flotilla"), &ProjectSpec::builder().display_name("flotilla".into()).maybe_image(image).build())
+        .await
+        .expect("project");
+    Fixture { daemon, backend, _temp: temp }
+}
+
+async fn set_architecture(backend: &ResourceBackend, name: &str, arch: &str, capacity: Option<ImageBuildCapacity>) {
+    let hosts = backend.using::<Host>(NS);
+    let host = match hosts.get(name).await {
+        Ok(host) => host,
+        Err(_) => hosts.create(&test_meta(name), &flotilla_resources::HostSpec::default()).await.expect("host"),
+    };
+    if capacity.is_some() {
+        let mut spec = host.spec.clone();
+        spec.image_build_capacity = capacity;
+        hosts.update(&test_meta(name), &host.metadata.resource_version, &spec).await.expect("capacity");
+    }
+    let host = hosts.get(name).await.expect("host");
+    let mut status = host.status.clone().unwrap_or_default();
+    status.description = Some(
+        flotilla_protocol::HostSummary::builder()
+            .environment_id(flotilla_protocol::EnvironmentId::new(name))
+            .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new(name), name.to_string()))
+            .system(flotilla_protocol::SystemInfo { arch: Some(arch.into()), ..Default::default() })
+            .build(),
+    );
+    hosts.update_status(name, &host.metadata.resource_version, &status).await.expect("architecture");
+}
+
+fn agent(role: &str, adapter: &str) -> CrewSpec {
+    CrewSpec::builder()
+        .role(role.into())
+        .source(CrewSource::Agent {
+            selector: flotilla_resources::Selector { capability: "code".into(), adapter: Some(adapter.into()), model: None },
+            prompt: None,
+            brief_template: None,
+        })
+        .build()
+}
+
+fn vessel(name: &str, crew: Vec<CrewSpec>, needs: &[&str]) -> VesselRequirement {
+    VesselRequirement::builder().name(name.into()).crew(crew).needs(needs.iter().map(|need| need.parse().expect("need")).collect()).build()
+}
+
+fn decision() -> PlacementDecision {
+    PlacementDecision::builder()
+        .policy_name("crew-policy".into())
+        .target_host(flotilla_protocol::PlacementTargetHost {
+            reference: flotilla_protocol::CanonicalHostId::resolved("host-a"),
+            display_name: "host-a".into(),
+        })
+        .build()
+}
+
+/// Admit `workflow` through ConvoyCreate's placement freeze, returning the
+/// convoy-level policy image and any per-vessel pins.
+async fn admit(
+    fixture: &Fixture,
+    workflow: &WorkflowTemplateSpec,
+) -> Result<(Option<DockerImageSource>, BTreeMap<String, Option<DockerImageSource>>), String> {
+    let policy = fixture.backend.using::<PlacementPolicy>(NS).get("crew-policy").await.expect("policy");
+    let mut placement =
+        PlacementResolution { selected: Some(policy), refused_candidates: Vec::new(), viable_not_selected: Vec::new(), allocation: None };
+    let pins = fixture
+        .daemon
+        .convoy_admission
+        .join_convoy_placement_builds(NS, Some("flotilla"), workflow, &mut placement, Some(&decision()))
+        .await?;
+    let image = placement.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
+    Ok((image, pins.into_iter().map(|(vessel, (spec, _))| (vessel, spec.docker_per_vessel.expect("docker").image)).collect()))
+}
+
+fn layer_names(build: &flotilla_resources::ResourceObject<ImageBuild>) -> Vec<String> {
+    build.spec.current().expect("current build").layers.iter().map(|layer| layer.name.clone()).collect()
+}
+
+async fn build_for(fixture: &Fixture, image: &Option<DockerImageSource>) -> flotilla_resources::ResourceObject<ImageBuild> {
+    let Some(DockerImageSource::Built { identity, image_build_ref }) = image else {
+        panic!("composed image is frozen as Built: {image:?}")
+    };
+    let build = fixture.backend.using::<ImageBuild>(NS).get(image_build_ref).await.expect("image build");
+    let spec = build.spec.current().expect("current build");
+    assert_eq!(&spec.identity, identity);
+    assert_eq!(image_identity(&spec.layers), *identity, "the recorded identity is the layers' identity");
+    assert_eq!(*image_build_ref, image_build_name(identity, "amd64"));
+    build
+}
+
+// The project's selection, its project layer and the harness its roles use
+// make up the image, in tier order; without a registry the placement host
+// builds locally. A second admission of the same composition shares the build.
+#[tokio::test]
+async fn project_selection_and_harness_derivation_freeze_one_build_per_identity() {
+    let mut layers = catalogue();
+    layers.push(layer("flotilla-native", ImageLayerTier::Project, &["project:flotilla"], &["toolchain:rust"]));
+    let fixture = fixture(layers, Some(ImageSelection { base: None, layers: vec!["rust".into()] })).await;
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
+    let (image, pins) = admit(&fixture, &workflow).await.expect("admit");
+    assert!(pins.is_empty(), "one vessel needs no per-vessel pins");
+    let build = build_for(&fixture, &image).await;
+    assert_eq!(layer_names(&build), ["base-ubuntu", "rust", "flotilla-native", "crew-utilities", "harness-codex"]);
+    let spec = build.spec.current().expect("current");
+    assert_eq!(spec.delivery, ImageDelivery::Local);
+    assert_eq!(spec.host_ref, "host-a");
+    let (again, _) = admit(&fixture, &workflow).await.expect("readmit");
+    assert_eq!(again, image);
+    assert_eq!(fixture.backend.using::<ImageBuild>(NS).list().await.expect("builds").items.len(), 1);
+}
+
+// Installation defaults (fleet-root CrewDefaults) apply only when the project
+// declares no `image:`.
+#[tokio::test]
+async fn installation_defaults_apply_when_the_project_declares_nothing() {
+    let fixture = fixture(catalogue(), None).await;
+    fixture
+        .backend
+        .definitions::<CrewDefaults>(NS)
         .apply(
-            &test_meta("fleet-crew"),
-            &CrewImageBaselineSpec { image: "crew:v1".into(), layers: Some(ImageLayerSelection::builder().base("base".into()).build()) },
+            &test_meta("fleet"),
+            &CrewDefaultsSpec { image: Some(ImageSelection { base: None, layers: vec!["zig".into()] }), ..Default::default() },
         )
         .await
-        .expect("baseline alongside layers");
-    let crew = CrewSpec::builder()
-        .role("tool".into())
-        .source(CrewSource::Tool { command: "true".into() })
-        .needs(BTreeSet::from(["display:headless-x11".parse().expect("open need")]))
+        .expect("defaults");
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "claude")], &[])]).build();
+    let (image, _) = admit(&fixture, &workflow).await.expect("admit");
+    assert_eq!(layer_names(&build_for(&fixture, &image).await), ["base-ubuntu", "zig", "crew-utilities", "harness-claude"]);
+
+    let declared = fixture.backend.using::<Project>(NS).get("flotilla").await.expect("project");
+    let mut spec = declared.spec.clone();
+    spec.image = Some(ImageSelection { base: None, layers: vec!["rust".into()] });
+    fixture.backend.using::<Project>(NS).update(&test_meta("flotilla"), &declared.metadata.resource_version, &spec).await.expect("declare");
+    let (image, _) = admit(&fixture, &workflow).await.expect("admit with project image");
+    assert_eq!(layer_names(&build_for(&fixture, &image).await), ["base-ubuntu", "rust", "crew-utilities", "harness-claude"]);
+}
+
+// Leg needs add shared layers by provides lookup to that vessel only; vessels
+// with different images get their own pinned placements.
+#[tokio::test]
+async fn leg_needs_compose_per_vessel_images() {
+    let fixture = fixture(catalogue(), Some(ImageSelection::default())).await;
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            vessel("demo", vec![agent("coder", "codex")], &["display:x11"]),
+            vessel("review", vec![agent("reviewer", "codex")], &[]),
+        ])
         .build();
+    let (_, pins) = admit(&fixture, &workflow).await.expect("admit");
+    assert_eq!(pins.len(), 2, "different images pin each vessel");
+    assert_eq!(layer_names(&build_for(&fixture, &pins["demo"]).await), ["base-ubuntu", "display-x11", "crew-utilities", "harness-codex"]);
+    assert_eq!(layer_names(&build_for(&fixture, &pins["review"]).await), ["base-ubuntu", "crew-utilities", "harness-codex"]);
+}
+
+// Two providers of one need, or none, refuse admission naming the need, and
+// no ImageBuild is authored.
+#[tokio::test]
+async fn duplicate_and_unresolvable_needs_refuse_without_builds() {
+    let mut layers = catalogue();
+    layers.push(layer("display-wayland", ImageLayerTier::Shared, &["display:x11"], &[]));
+    let fixture = fixture(layers, None).await;
     let workflow =
-        WorkflowTemplateSpec::builder().vessels(vec![VesselRequirement::builder().name("work".into()).crew(vec![crew]).build()]).build();
-    let admitted = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect("admission");
-    let admitted_docker = admitted.selected.expect("selected").spec.docker_per_vessel.expect("docker");
-    assert!(admitted_docker.legacy_image_baseline_ref.is_none(), "layered output must lose the legacy tag exception");
-    let image = admitted_docker.image;
-    let DockerImageSource::Composition { composition } = &image else { panic!("admission must store composition") };
-    assert_eq!(composition.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(), ["base", "display"]);
-    assert_eq!(composition.layers[0].spec, base);
-    assert!(composition.identity.is_none());
-    assert!(composition.baseline_image.is_none());
-    assert!(image.resolve(&baselines).await.expect_err("await build").contains("placement-time build identity"));
-    let mut next_base = base;
-    next_base.revision = "3".repeat(40);
-    layers.apply(&test_meta("base"), &next_base).await.expect("update base");
-    assert_eq!(composition.layers[0].spec.revision, "1".repeat(40));
-    // A placement-bound composition keeps its concrete identity on readmission.
-    let mut bound = composition.clone();
-    bound.bind(flotilla_resources::PlacedImageIdentity { local_image_id: "sha256:placed".into(), registry_digest: None }).expect("bind");
-    let mut live = policies.get("crew-policy").await.expect("live policy");
-    live.spec.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Composition { composition: bound.clone() };
-    let live = policies.update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &live.spec).await.expect("bound policy");
-    let repeated = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect("readmission");
-    let DockerImageSource::Composition { composition: repeated } =
-        repeated.selected.expect("selected").spec.docker_per_vessel.expect("docker").image
-    else {
-        panic!("composition")
+        |need: &str| WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[need])]).build();
+    let error = admit(&fixture, &workflow("display:x11")).await.expect_err("duplicate providers");
+    assert!(error.contains("duplicate providers for `display:x11`: display-wayland, display-x11"), "{error}");
+    let error = admit(&fixture, &workflow("toolchain:go")).await.expect_err("unresolvable");
+    assert!(error.contains("unresolvable image need `toolchain:go`"), "{error}");
+    assert!(fixture.backend.using::<ImageBuild>(NS).list().await.expect("builds").items.is_empty());
+}
+
+// With a fleet image cache, the lowest-named same-architecture builder pushes
+// to the registry, whichever host the vessel is placed on.
+#[tokio::test]
+async fn registry_delivery_uses_the_deterministic_builder() {
+    let fixture = fixture(catalogue(), None).await;
+    let builder = |slots| {
+        Some(ImageBuildCapacity::Builder {
+            architecture: "amd64".into(),
+            slots,
+            reservation: ImageBuildReservation { cpu: 2, disk_bytes: 1 << 30 },
+        })
     };
-    assert_eq!(repeated.identity, bound.identity);
-    assert_eq!(repeated.layers, bound.layers);
-    // Authored mixed sources are reachable and invalid, even with a bound ID;
-    // admission must not silently drop literal_base and choose a layered image.
-    let mut mixed_policy = live.spec.clone();
-    let mut mixed = bound.clone();
-    mixed.literal_base = Some("crew:ambiguous".into());
-    mixed_policy.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Composition { composition: mixed };
-    let mixed_policy = policies
-        .update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &mixed_policy)
+    set_architecture(&fixture.backend, "udder", "x86_64", builder(1)).await;
+    set_architecture(&fixture.backend, "feta", "x86_64", builder(2)).await;
+    set_architecture(&fixture.backend, "arm", "aarch64", None).await;
+    fixture
+        .backend
+        .definitions::<FleetDesignation>(NS)
+        .apply(
+            &test_meta(FLEET_DESIGNATION_NAME),
+            &FleetDesignationSpec {
+                project: "flotilla".into(),
+                image_cache: Some(ImageCacheBinding {
+                    repository: "registry.test/flotilla/crew-images".into(),
+                    pull_credential: "pull".into(),
+                    push_credential: "push".into(),
+                }),
+            },
+        )
         .await
-        .expect("mixed authored policy");
-    let error = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect_err("ambiguous source must refuse");
-    assert!(error.contains("nonempty base and no layers"), "{error}");
-    let mut restored = live.spec;
-    // The authored generation-2 shape may contain only a selection. Previous
-    // shadow metadata still decodes, but must not survive a new admission.
-    restored.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Composition {
-        composition: Box::new(
-            flotilla_resources::ImageComposition::builder()
-                .selection(ImageLayerSelection::builder().base("base".into()).build())
-                .needs(BTreeSet::new())
-                .layers(Vec::new())
-                .baseline_image("crew:v1".into())
-                .build(),
-        ),
-    };
-    assert_eq!(restored.docker_per_vessel.as_ref().expect("docker").image.resolve(&baselines).await.expect("old snapshot"), "crew:v1");
-    policies
-        .update(&InputMeta::from(&mixed_policy.metadata), &mixed_policy.metadata.resource_version, &restored)
-        .await
-        .expect("author composition selection");
-    let next = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
-        .await
-        .expect("next admission");
-    let DockerImageSource::Composition { composition: next } =
-        next.selected.expect("selected").spec.docker_per_vessel.expect("docker").image
-    else {
-        panic!("composition")
-    };
-    assert_eq!(next.layers[0].spec.revision, "3".repeat(40));
-    assert!(next.baseline_image.is_none());
-    let mut missing = workflow;
-    missing.vessels[0].crew[0].needs = BTreeSet::from(["display:missing".parse().expect("need")]);
-    let error = daemon
-        .convoy_admission
-        .resolve_convoy_placement("flotilla", None, &[], &missing, Some("crew-policy"), false)
-        .await
-        .expect_err("missing need");
-    assert!(error.contains("display:missing"));
+        .expect("fleet");
+    let workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("work", vec![agent("coder", "codex")], &[])]).build();
+    let (image, _) = admit(&fixture, &workflow).await.expect("admit");
+    let build = build_for(&fixture, &image).await;
+    let spec = build.spec.current().expect("current");
+    assert_eq!(spec.host_ref, "feta");
+    assert_eq!(spec.delivery, ImageDelivery::Registry { repository: "registry.test/flotilla/crew-images".into() });
 }

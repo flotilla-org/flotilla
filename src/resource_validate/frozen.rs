@@ -13,9 +13,9 @@ use flotilla_environment::environment::EnvironmentProvider;
 use flotilla_provider_runtime::ChannelLabel;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_resources::{
-    compose_image, pinned_workflow_ref, Convoy, ConvoyPhase, CredentialSpec, CredentialSpecSpec, Environment, FrozenImageLayers,
-    ImageBuild, ImageComposition, InputDefinition, K8sResourceObject, Resource, ResourceObject, SkillCatalogEntry, Vessel,
-    WorkflowTemplateSpec, IMAGE_DIGESTS_CAPABILITY,
+    pinned_workflow_ref, Convoy, ConvoyPhase, CredentialSpec, CredentialSpecSpec, Environment, ImageBuild, ImageBuildPhase,
+    InputDefinition, K8sResourceObject, Resource, ResourceObject, SkillCatalogEntry, Vessel, WorkflowTemplateSpec,
+    IMAGE_DIGESTS_CAPABILITY,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -76,31 +76,10 @@ impl Probes for CandidateProbes<'_> {
                 return Ok(());
             }
         }
+        // Composed images are referenced by their build's digest directly; an
+        // exact registry manifest is checked below. Retired ADR 0053 stage
+        // builds carry no availability evidence.
         let mut registries = BTreeSet::new();
-        for document in self.inventory.iter().filter(|document| document["kind"] == "ImageBuild") {
-            let build = decode::<ImageBuild>(document).map_err(|error| error.to_string())?;
-            if let Some(status) = &build.status {
-                if let Some(identity) = status
-                    .identity
-                    .as_ref()
-                    .filter(|identity| identity.local_image_id == reference || identity.registry_digest.as_deref() == Some(reference))
-                {
-                    if !status.availability.caches.is_empty()
-                        // ADR 0047: accept old fleet-wide existence evidence for one roll after B1.
-                        || document.pointer("/status/availability/hosts").and_then(Value::as_array).is_some_and(|hosts| !hosts.is_empty())
-                    {
-                        return Ok(());
-                    }
-                    // Publication observations may add an exact registry location
-                    // for a frozen local config ID; mutable tags are not substitutes.
-                    if let Some(published) = identity.registry_digest.as_ref().or(status.availability.registry_ref.as_ref()) {
-                        if published.rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest)) {
-                            registries.insert(published.clone());
-                        }
-                    }
-                }
-            }
-        }
         if reference.contains('@') && flotilla_resources::is_image_digest(digest) {
             registries.insert(reference.to_string());
         }
@@ -315,26 +294,8 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
             });
             report.record(Category::Workflow, &identity, workflow_ref, result, waiver);
         }
-        if let Some(encoded) = convoy.metadata.annotations.get(flotilla_resources::IMAGE_LAYERS_ANNOTATION) {
-            let frozen = serde_json::from_str::<FrozenImageLayers>(encoded).map_err(|error| error.to_string());
-            let result = frozen.as_ref().map_err(Clone::clone).and_then(|frozen| {
-                for (name, layer) in &frozen.layers {
-                    layer.validate().map_err(|error| format!("layer {name}: {error}"))?;
-                }
-                if let Some(selection) = &frozen.selection {
-                    compose_image(selection, &BTreeSet::new(), &frozen.layers, &mut frozen.clone())?;
-                } else if !frozen.layers.is_empty() {
-                    return Err("frozen layers have no selection".into());
-                }
-                Ok(())
-            });
-            report.record(Category::Images, &identity, "frozen-image-layers", result, waiver);
-            if let Ok(frozen) = frozen {
-                if let Some(baseline) = frozen.baseline_image {
-                    report.record(Category::Images, &identity, &baseline, probes.image(&baseline).await, waiver);
-                }
-            }
-        }
+        // ADR 0062: the retired `flotilla.work/frozen-image-layers` annotation
+        // is ignored; vessels record their composed identity and digest.
         for vessel in inventory.iter().filter(|document| {
             document["kind"] == "Vessel" && namespace(document) == ns && document["spec"]["convoy_ref"] == convoy.metadata.name
         }) {
@@ -385,40 +346,9 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                 if let Some(environment) = environment {
                     let environment = decode::<Environment>(environment)?;
                     if let Some(docker) = &environment.spec.docker {
-                        if let Some(composition) = &docker.image_composition {
-                            report.record(
-                                Category::Images,
-                                &identity,
-                                &format!("{environment_ref}/composition"),
-                                validate_composition(composition),
-                                waiver,
-                            );
-                            for build_ref in &composition.build_refs {
-                                let build = inventory.iter().find(|document| {
-                                    document["kind"] == "ImageBuild" && namespace(document) == ns && name(document) == build_ref
-                                });
-                                let result = match build {
-                                    Some(build) => {
-                                        let build = decode::<ImageBuild>(build)?;
-                                        if let Some(identity) = build.status.as_ref().and_then(|status| status.identity.as_ref()) {
-                                            check_identity(probes, &identity.local_image_id, identity.registry_digest.as_deref()).await
-                                        } else {
-                                            Err("frozen image build has no placed identity".into())
-                                        }
-                                    }
-                                    None => Err("frozen image build is unavailable".into()),
-                                };
-                                report.record(Category::Images, &identity, build_ref, result, waiver);
-                            }
-                        }
-                        if let Some(image) = docker.image_composition.as_ref().and_then(|composition| composition.identity.as_ref()) {
-                            report.record(
-                                Category::Images,
-                                &identity,
-                                image.registry_digest.as_deref().unwrap_or(&image.local_image_id),
-                                check_identity(probes, &image.local_image_id, image.registry_digest.as_deref()).await,
-                                waiver,
-                            );
+                        let build = composed_build(inventory, ns, docker.image_build_ref.as_deref())?;
+                        if let Some((build_ref, build)) = &build {
+                            report.record(Category::Images, &identity, build_ref, check_build(probes, build).await, waiver);
                         } else if let Some(local) = &status.local_image_id {
                             report.record(
                                 Category::Images,
@@ -498,19 +428,37 @@ async fn check_identity(probes: &impl Probes, local: &str, registry: Option<&str
     }
 }
 
-fn validate_composition(composition: &ImageComposition) -> Result<(), String> {
-    let catalogue = composition.layers.iter().map(|layer| (layer.name.clone(), layer.spec.clone())).collect();
-    let recomposed = compose_image(&composition.selection, &composition.needs, &catalogue, &mut FrozenImageLayers::default())?;
-    if recomposed.layers != composition.layers {
-        return Err("candidate cannot reproduce frozen layer composition".into());
+/// The current per-identity ImageBuild a composed Environment names. Retired
+/// ADR 0053 stage builds are ignored: the Environment's placed identity is
+/// checked instead. A missing current build is a refusal.
+fn composed_build(
+    inventory: &[Value],
+    namespace_name: &str,
+    build_ref: Option<&str>,
+) -> Result<Option<(String, ResourceObject<ImageBuild>)>> {
+    let Some(build_ref) = build_ref else { return Ok(None) };
+    let Some(document) = inventory
+        .iter()
+        .find(|document| document["kind"] == "ImageBuild" && namespace(document) == namespace_name && name(document) == build_ref)
+    else {
+        return Ok(None);
+    };
+    let build = decode::<ImageBuild>(document)?;
+    Ok(build.spec.current().is_some().then(|| (build_ref.to_string(), build)))
+}
+
+/// A Built image's digest must be available; a queued or building identity is
+/// satisfiable by the candidate's build service; a failed build is not.
+async fn check_build(probes: &impl Probes, build: &ResourceObject<ImageBuild>) -> Result<(), String> {
+    let Some(status) = &build.status else { return Ok(()) };
+    match (status.phase, &status.digest, &status.failure) {
+        (ImageBuildPhase::Built, Some(digest), _) => probes.image(digest).await,
+        (ImageBuildPhase::Built, None, _) => Err("built image build has no digest".into()),
+        (ImageBuildPhase::Failed, _, failure) => {
+            Err(format!("image build failed: {}", failure.as_ref().map_or("no reason recorded", |failure| failure.reason.as_str())))
+        }
+        (ImageBuildPhase::Queued | ImageBuildPhase::Building, _, _) => Ok(()),
     }
-    // compose_image selects frozen layers; it does not build an image or derive
-    // Docker config/manifest digests. Identity is bound by placement and checked
-    // independently for availability by the caller, never inferred from layers.
-    if let Some(identity) = &composition.identity {
-        identity.validate()?;
-    }
-    Ok(())
 }
 
 pub(crate) fn load_tokens(path: Option<&Path>) -> Result<BTreeMap<String, PathBuf>> {
@@ -784,11 +732,55 @@ mod tests {
         let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert_eq!(report.grants.unsatisfied, 1);
         assert!(report.failures[0].contains("bot"));
-        inventory[environment_index]["spec"]["docker"]["image_composition"] =
-            serde_json::json!({"selection":{"base":"missing"},"layers":[]});
+        inventory[credential_index]["metadata"]["namespace"] = Value::String("fleet".into());
+        // A composed Environment is checked through its per-identity build: a
+        // failed build refuses with its reason, whatever the vessel recorded.
+        let (name, build) = failed_build(&backend).await;
+        inventory[environment_index]["spec"]["docker"]["image_build_ref"] = Value::String(name);
+        inventory.push(build);
         let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert_eq!(report.images.unsatisfied, 1);
-        assert!(report.failures.iter().any(|failure| failure.contains("composition") && failure.contains("missing")));
+        assert!(
+            report.failures.iter().any(|failure| failure.contains("image build failed: probe display-x11 failed")),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    fn current_build_spec() -> flotilla_resources::ImageBuildSpec {
+        use flotilla_resources::{ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier};
+        let layers = vec![ImageLayerSpec::builder()
+            .name("base".into())
+            .version("1".into())
+            .tier(ImageLayerTier::Base)
+            .source(ImageLayerSource::Stdlib)
+            .from(format!("ubuntu@sha256:{}", "1".repeat(64)))
+            .fragment("FROM ${BASE}\n".into())
+            .probe("true".into())
+            .build()];
+        flotilla_resources::ImageBuildSpec::builder()
+            .identity(flotilla_resources::image_identity(&layers))
+            .architecture("amd64".into())
+            .layers(layers)
+            .host_ref("host".into())
+            .delivery(ImageDelivery::Local)
+            .reservation(flotilla_resources::ImageBuildReservation { cpu: 1, disk_bytes: 1 })
+            .build()
+    }
+
+    async fn failed_build(backend: &ResourceBackend) -> (String, Value) {
+        use flotilla_resources::{ImageBuildFailure, ImageBuildFailureClass, ImageBuildStatus};
+        let spec = current_build_spec();
+        let name = flotilla_resources::image_build_name(&spec.identity, &spec.architecture);
+        let builds = backend.clone().using::<ImageBuild>("fleet");
+        let created = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("build");
+        let failed = ImageBuildStatus {
+            phase: ImageBuildPhase::Failed,
+            failure: Some(ImageBuildFailure { class: ImageBuildFailureClass::Recipe, reason: "probe display-x11 failed".into() }),
+            ..Default::default()
+        };
+        let build = builds.update_status(&name, &created.metadata.resource_version, &failed).await.expect("failed build");
+        (name, serde_json::to_value(build.to_k8s_object()).expect("document"))
     }
 
     async fn placed_image_inventory() -> (ResourceBackend, Vec<Value>) {
@@ -1078,53 +1070,24 @@ mod tests {
         });
     }
 
-    // ADR 0047: old ImageBuild host-only availability can establish fleet-wide
-    // existence at the pre-roll gate even when new per-cache inventory is empty.
+    // ADR 0062: retired stage builds decode but carry no availability evidence,
+    // and the retired frozen-image-layers annotation is ignored. A composed
+    // Environment's queued build is satisfiable; its Built digest is probed.
     #[tokio::test]
-    async fn legacy_build_availability_with_new_cache_inventory() {
-        use flotilla_resources::{
-            FrozenImageLayer, ImageBuildReason, ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageInputStability,
-            ImageLayerParent, ImageLayerSpec, ImageLayerStage, InputMeta, PlacedImageIdentity, ResolvedImageInputs,
-        };
-        let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    async fn retired_image_records_are_ignored_and_built_digests_are_probed() {
         let digest = format!("sha256:{}", "a".repeat(64));
-        let inputs = ResolvedImageInputs::builder()
-            .parent_digest(digest.clone())
-            .content_hashes(vec![digest.clone()])
-            .architecture("amd64".into())
-            .stability(ImageInputStability::Pinned)
-            .build();
-        let spec = ImageBuildSpec::builder()
-            .recipe_key(inputs.recipe_key().expect("key"))
-            .inputs(inputs)
-            .layer(FrozenImageLayer {
-                name: "base".into(),
-                spec: ImageLayerSpec::builder()
-                    .stage(ImageLayerStage::Base)
-                    .parent(ImageLayerParent::Image(digest.clone()))
-                    .repository("https://example.test/repo".into())
-                    .revision("a".repeat(40))
-                    .fragment("Dockerfile".into())
-                    .build(),
-            })
-            .host_ref("host".into())
-            .reservation(ImageBuildReservation { cpu: 1, disk_bytes: 1024 })
-            .attempt(0)
-            .reason(ImageBuildReason { description: "test".into(), old_inputs: BTreeMap::new(), new_inputs: BTreeMap::new() })
-            .build();
-        let builds = backend.using::<ImageBuild>("test");
-        let mut build = builds.create(&InputMeta::builder().name("build".into()).build(), &spec).await.expect("build");
-        build.status = Some(ImageBuildStatus {
-            phase: flotilla_resources::ImageBuildPhase::Built,
-            identity: Some(PlacedImageIdentity { local_image_id: digest.clone(), registry_digest: None }),
-            ..Default::default()
+        let retired = serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "ImageBuild",
+            "metadata": {"name": "build", "namespace": "test", "resourceVersion": "1", "labels": {}, "annotations": {},
+                         "creationTimestamp": "2026-10-01T00:00:00Z"},
+            "spec": {"recipe_key": "sha256:old", "host_ref": "host", "attempt": 0},
+            "status": {"phase": "built", "identity": {"local_image_id": digest}, "availability": {"hosts": ["host"]}}
         });
-        let mut document = serde_json::to_value(build.to_k8s_object()).expect("document");
-        document["status"]["availability"] = serde_json::json!({"hosts":["host"], "registry_ref":null, "failure":null});
-        let mut inventory =
-            vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:{"cache-a":[]}}}}), document];
+        decode::<ImageBuild>(&retired).expect("retired build decodes");
+        let inventory =
+            vec![serde_json::json!({"kind":"Host", "status":{"capabilities":{IMAGE_DIGESTS_CAPABILITY:{"cache-a":[]}}}}), retired];
         let options = ProbeOptions::default();
-        // Stands in for a registry process: this cache-only case must not invoke it.
+        // Stands in for a registry process: a local ID never reaches it.
         let runner = std::sync::Arc::new(RegistryRunner {
             reference: "unused".into(),
             available: false,
@@ -1133,16 +1096,45 @@ mod tests {
         });
         let provider =
             flotilla_environment::environment::command_provider(flotilla_environment::environment::EnvironmentKind::Docker, runner.clone());
-        CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() }
-            .image(&digest)
-            .await
-            .expect("legacy build existence");
+        let probes = CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() };
+        assert!(probes.image(&digest).await.is_err(), "retired availability is not evidence");
         assert_eq!(*runner.calls.lock().expect("calls"), 0);
-        inventory[1]["status"]["availability"]["hosts"] = serde_json::json!([]);
-        assert!(CandidateProbes { options: &options, inventory: &inventory, runner: runner.as_ref(), provider: provider.as_ref() }
-            .image(&digest)
+
+        let (backend, mut inventory) = placed_image_inventory().await;
+        inventory[0]["metadata"]["annotations"]["flotilla.work/frozen-image-layers"] = Value::String("{not json".into());
+        let spec = current_build_spec();
+        let name = flotilla_resources::image_build_name(&spec.identity, &spec.architecture);
+        let builds = backend.clone().using::<ImageBuild>("fleet");
+        let queued = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("queued build");
+        let environment = backend
+            .clone()
+            .using::<Environment>("fleet")
+            .create(
+                &InputMeta::builder().name("environment".into()).build(),
+                &flotilla_resources::EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(
+                        serde_json::from_value(serde_json::json!({"host_ref":"host-b", "image":"", "image_build_ref": name}))
+                            .expect("docker"),
+                    ),
+                },
+            )
             .await
-            .is_err());
+            .expect("environment");
+        inventory.push(serde_json::to_value(environment.to_k8s_object()).expect("environment document"));
+        let build_index = inventory.len();
+        inventory.push(serde_json::to_value(queued.to_k8s_object()).expect("build document"));
+        let unavailable = Supply { revision: "1".repeat(40), image_available: false };
+        let report = check(&inventory, &BTreeSet::new(), &unavailable).await.expect("queued");
+        assert!(report.failures.is_empty(), "a queued build is satisfiable: {:?}", report.failures);
+        assert_eq!(report.images.checked, 1);
+        let built =
+            flotilla_resources::ImageBuildStatus { phase: ImageBuildPhase::Built, digest: Some(digest.clone()), ..Default::default() };
+        let built = builds.update_status(&name, &queued.metadata.resource_version, &built).await.expect("built");
+        inventory[build_index] = serde_json::to_value(built.to_k8s_object()).expect("built document");
+        assert_eq!(check(&inventory, &BTreeSet::new(), &unavailable).await.expect("built").images.unsatisfied, 1);
+        let available = Supply { revision: "1".repeat(40), image_available: true };
+        assert!(check(&inventory, &BTreeSet::new(), &available).await.expect("available").failures.is_empty());
     }
 
     // Generated inventory property: terminal convoys are exempt; live convoys

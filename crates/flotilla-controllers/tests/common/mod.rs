@@ -130,6 +130,7 @@ pub async fn create_convoy_with_single_task(
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement {
+                        needs: Default::default(),
                         name: task.to_string(),
                         depends_on: Vec::new(),
                         repository_refs: None,
@@ -217,7 +218,7 @@ pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace:
                 legacy_image_baseline_ref: None,
                 memory_policy: Default::default(),
                 host_ref: fixture.host_ref,
-                image: fixture.image.into(),
+                image: Some(fixture.image.into()),
                 pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: fixture.default_cwd,
@@ -255,7 +256,6 @@ pub async fn create_ready_host_direct_environment(
             &name,
             &created.metadata.resource_version,
             &EnvironmentStatus {
-                image_build_refs: Vec::new(),
                 configured_limits: None,
                 runtime_observation: None,
                 phase: EnvironmentPhase::Ready,
@@ -291,7 +291,6 @@ pub async fn create_ready_docker_environment(
             name,
             &created.metadata.resource_version,
             &EnvironmentStatus {
-                image_build_refs: Vec::new(),
                 configured_limits: None,
                 runtime_observation: None,
                 phase: EnvironmentPhase::Ready,

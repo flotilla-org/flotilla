@@ -228,8 +228,10 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
     match patch {
         VesselStatusPatch::ObserveDegradation { .. }
         | VesselStatusPatch::CredentialDelivery { .. }
-        | VesselStatusPatch::CredentialRefresh { .. } => {
-            panic!("credential and degradation status patches are outside this lifecycle contract")
+        | VesselStatusPatch::CredentialRefresh { .. }
+        | VesselStatusPatch::RecordImage { .. }
+        | VesselStatusPatch::ReplaceImage { .. } => {
+            panic!("credential, degradation and image status patches are outside this lifecycle contract")
         }
         VesselStatusPatch::ObserveRuntime { .. } => PatchKind::VesselObserveRuntime,
         VesselStatusPatch::RequireEnvironmentRecreation { .. } => PatchKind::VesselRequireEnvironmentRecreation,
@@ -389,6 +391,7 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
     assert_eq!(terminal_session_patch_kind(&TerminalSessionStatusPatch::MarkStarting), PatchKind::TerminalMarkStarting);
     assert_eq!(
         vessel_patch_kind(&VesselStatusPatch::MarkProvisioning {
+            image: None,
             placement_decision: None,
             observed_policy_ref: "docker".to_string(),
             observed_policy_version: "2".to_string(),
@@ -813,6 +816,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = VesselStatus { phase: VesselPhase::Provisioning, started_at: Some(ts(10)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkProvisioning {
+                    image: None,
                     placement_decision: None,
                     observed_policy_ref: "docker".to_string(),
                     observed_policy_version: "2".to_string(),
@@ -832,6 +836,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkReady {
+                    image: None,
                     configured_limits: None,
                     placement_decision: None,
                     environment_ref: Some("env-a".to_string()),

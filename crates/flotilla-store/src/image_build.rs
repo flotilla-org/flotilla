@@ -1,7 +1,8 @@
 use flotilla_resources::*;
 
-/// Prefer execution evidence written by the declared build host over the
-/// admitting root's queued demand. Never borrow another recipe's old digest.
+/// Read one per-identity ImageBuild across the local store and replicas,
+/// preferring execution evidence written by the declared builder host over an
+/// admitting root's queued demand. Retired ADR 0053 records are ignored.
 pub async fn read_image_build(
     backend: &crate::ResourceBackend,
     namespace: &str,
@@ -13,12 +14,10 @@ pub async fn read_image_build(
         .await?
         .items
         .into_iter()
-        .filter(|source| source.object.metadata.name == name)
+        .filter(|source| source.object.metadata.name == name && !source.object.spec.is_retired())
         .collect::<Vec<_>>();
     if let Some(first) = sources.first() {
-        if sources.iter().any(|source| {
-            source.object.spec.inputs != first.object.spec.inputs || source.object.spec.recipe_key != first.object.spec.recipe_key
-        }) {
+        if sources.iter().any(|source| source.object.spec != first.object.spec) {
             return Err(ResourceError::invalid(format!("image build {name} has conflicting immutable sources")));
         }
     }
@@ -28,7 +27,7 @@ pub async fn read_image_build(
             .metadata
             .annotations
             .get(crate::ACTUATOR_HOST_REF_ANNOTATION)
-            .is_some_and(|host| host == &source.object.spec.host_ref);
+            .is_some_and(|host| source.object.spec.current().is_some_and(|spec| host == &spec.host_ref));
         let phase = match source.object.status.as_ref().map_or(ImageBuildPhase::Queued, |status| status.phase) {
             ImageBuildPhase::Built => 3,
             ImageBuildPhase::Failed => 2,

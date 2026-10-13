@@ -357,7 +357,7 @@ mod tests {
             .host_ref("feta".to_string())
             .pool("cleat".to_string())
             .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string())]))
-            .realisation(FulfilmentRealisation::DockerPerVessel { image: "crew:test".into() })
+            .realisation(FulfilmentRealisation::DockerPerVessel { image: Some("crew:test".into()) })
             .build()
     }
 

@@ -5,7 +5,7 @@ use flotilla_discovery_api::{provider_config::ProviderConfigView, EnvironmentBag
 use flotilla_environment::environment::ENVIRONMENT_PROVIDER_INSTANCE_LABEL;
 use flotilla_forge_forgejo::FORGEJO_AUTH_PROVIDER;
 use flotilla_protocol::ConvoyNaming;
-use flotilla_store::{CrewImageBaselineStoreExt, DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQuery};
+use flotilla_store::{DockerImageSourceStoreExt, ResolvedCascadeStoreExt, StoreQuery};
 #[cfg(test)]
 use flotilla_store_memory::InMemoryBackend;
 use flotilla_vcs::providers::detection::remote_assertion;
@@ -58,6 +58,9 @@ pub(super) struct ConvoyCreateAdmission<'a> {
     adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     adopted_checkout_ref_to_cleanup: Option<String>,
     dispatching_principal_ref: Option<PrincipalRef>,
+    /// Per-vessel composed-image pins when vessels resolve to different images.
+    #[builder(default)]
+    vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
 }
 
 #[derive(bon::Builder)]
@@ -82,8 +85,6 @@ pub(super) struct ConvoyAdmission {
     host_name: HostName,
     clock: Arc<dyn Clock>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
-    #[builder(default)]
-    pub(super) image_build_inputs: RwLock<Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
     guard: Mutex<()>,
@@ -112,14 +113,13 @@ struct AdmissionRuntime<'a> {
     issue_port: &'a dyn IssueQueryPort,
     clock: &'a dyn Clock,
     fulfilment_decider: &'a dyn FulfilmentDecider,
-    image_build_inputs: &'a RwLock<Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>>,
     builds: PlacementBuildJoiner<'a>,
 }
 
-/// The only store-writing action allowed during planning: joining selected builds.
+/// The only store-writing action allowed during planning: get-or-creating the
+/// ImageBuild for each selected vessel's composed image.
 struct PlacementBuildJoiner<'a> {
     backend: &'a ResourceBackend,
-    inputs: &'a RwLock<Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>>,
 }
 
 struct AdmissionLookupFailure {
@@ -152,8 +152,7 @@ impl ConvoyAdmission {
                 issue_port: self.issue_port.as_ref(),
                 clock: self.clock.as_ref(),
                 fulfilment_decider: self.fulfilment_decider.as_ref(),
-                image_build_inputs: &self.image_build_inputs,
-                builds: PlacementBuildJoiner { backend: &self.backend, inputs: &self.image_build_inputs },
+                builds: PlacementBuildJoiner { backend: &self.backend },
             },
         }
     }
@@ -713,16 +712,6 @@ impl ConvoyAdmission {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
         if let Some(placement) = placement {
-            if let Some(docker) = &placement.docker_per_vessel {
-                if let flotilla_resources::DockerImageSource::Composition { composition } = &docker.image {
-                    let mut frozen = flotilla_resources::FrozenImageLayers::default();
-                    frozen.include(composition)?;
-                    annotations.insert(
-                        flotilla_resources::IMAGE_LAYERS_ANNOTATION.to_string(),
-                        serde_json::to_string(&frozen).map_err(|error| error.to_string())?,
-                    );
-                }
-            }
             let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
             let placement_name = self.placement_snapshot_name(&placement_value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &placement_name, placement).await?;
@@ -1150,29 +1139,16 @@ impl ConvoyAdmission {
             return Ok(BTreeMap::new());
         }
         let mut pins = BTreeMap::new();
-        let mut frozen_images = flotilla_resources::FrozenImageLayers::default();
         for (vessel, (policy, decision)) in placements {
-            if let Some(docker) = &policy.docker_per_vessel {
-                if let flotilla_resources::DockerImageSource::Composition { composition } = &docker.image {
-                    frozen_images.include(composition)?;
-                }
-            }
             let value = serde_json::to_value(policy).map_err(|error| error.to_string())?;
             let name = self.placement_snapshot_name(&value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &name, policy).await?;
             pins.insert(vessel.clone(), flotilla_resources::VesselPlacementPin { policy_ref: name, decision: decision.clone() });
         }
-        let mut annotations = BTreeMap::from([(
+        Ok(BTreeMap::from([(
             flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(),
             serde_json::to_string(&pins).map_err(|error| error.to_string())?,
-        )]);
-        if !frozen_images.layers.is_empty() {
-            annotations.insert(
-                flotilla_resources::IMAGE_LAYERS_ANNOTATION.to_string(),
-                serde_json::to_string(&frozen_images).map_err(|error| error.to_string())?,
-            );
-        }
-        Ok(annotations)
+        )]))
     }
 
     pub(super) async fn create_convoy_with_annotations(
@@ -1227,8 +1203,20 @@ impl ConvoyAdmission {
         }
     }
 
-    pub(super) async fn join_convoy_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
-        PlacementBuildJoiner { backend: &self.backend, inputs: &self.image_build_inputs }.join_placement_builds(namespace, placement).await
+    /// Freeze each vessel's composed image for a ConvoyCreate placement. The
+    /// returned per-vessel pins are non-empty only when vessels resolve to
+    /// different images.
+    pub(super) async fn join_convoy_placement_builds(
+        &self,
+        namespace: &str,
+        project_ref: Option<&str>,
+        workflow: &WorkflowTemplateSpec,
+        placement: &mut PlacementResolution,
+        decision: Option<&PlacementDecision>,
+    ) -> Result<BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>, String> {
+        let joiner = PlacementBuildJoiner { backend: &self.backend };
+        let images = joiner.compose_placement_images(namespace, project_ref, workflow, placement).await?;
+        apply_vessel_images(placement, images, decision)
     }
 
     pub(super) async fn resolve_convoy_placement(
@@ -1322,16 +1310,6 @@ impl ConvoyAdmission {
             annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
         }
         if let Some(placement) = &admission.placement_policy {
-            if let Some(docker) = &placement.docker_per_vessel {
-                if let flotilla_resources::DockerImageSource::Composition { composition } = &docker.image {
-                    let mut frozen = flotilla_resources::FrozenImageLayers::default();
-                    frozen.include(composition)?;
-                    annotations.insert(
-                        flotilla_resources::IMAGE_LAYERS_ANNOTATION.to_string(),
-                        serde_json::to_string(&frozen).map_err(|error| error.to_string())?,
-                    );
-                }
-            }
             let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
             let placement_name = self.placement_snapshot_name(&placement_value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &placement_name, placement).await?;
@@ -1382,6 +1360,7 @@ impl ConvoyAdmission {
             adopted_checkout_refs,
             adopted_checkout_ref_to_cleanup,
             dispatching_principal_ref,
+            vessel_placements,
         } = request;
         let address = convoy_address(role, project_ref.as_deref());
         let mut spec = ConvoySpec {
@@ -1441,7 +1420,7 @@ impl ConvoyAdmission {
                     workflow,
                     placement: placement.selected.as_ref().map(|placement| &placement.spec),
                     placement_decision,
-                    vessel_placements: None,
+                    vessel_placements: (!vessel_placements.is_empty()).then_some(&vessel_placements),
                 },
                 ConvoyDispatchRegard::Emit,
             )
@@ -1454,19 +1433,114 @@ impl ConvoyAdmission {
 }
 
 impl PlacementBuildJoiner<'_> {
-    async fn join_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
-        if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-            if let flotilla_resources::DockerImageSource::Composition { composition } = &mut docker.image {
-                if composition.baseline_image.is_none() && composition.literal_base.is_none() && composition.identity.is_none() {
-                    let inputs = self.inputs.read().await.clone().ok_or("image build input resolver is unavailable")?;
-                    composition.build_refs = crate::image_build::ImageBuildAdmission::new(self.backend.clone(), namespace, inputs)
-                        .join(&docker.host_ref, composition)
-                        .await?;
-                }
-            }
+    /// Admission only. For a docker-per-vessel placement whose policy omits
+    /// the image, resolve every vessel's composition against the
+    /// replica-inclusive catalogue, get-or-create its ImageBuild for the
+    /// placement host's architecture, and return the policy each vessel runs
+    /// (`Built`). Literal and baseline images return no entries.
+    async fn compose_placement_images(
+        &self,
+        namespace: &str,
+        project_ref: Option<&str>,
+        workflow: &WorkflowTemplateSpec,
+        placement: &PlacementResolution,
+    ) -> Result<BTreeMap<String, PlacementPolicySpec>, String> {
+        let Some(policy) = placement.selected.as_ref() else { return Ok(BTreeMap::new()) };
+        let Some(docker) = policy.spec.docker_per_vessel.as_ref().filter(|docker| docker.image.is_none()) else {
+            return Ok(BTreeMap::new());
+        };
+        let resolved = resolve_vessel_images(self.backend, namespace, project_ref, workflow).await?;
+        let mut images = BTreeMap::new();
+        for (vessel, image) in resolved {
+            let image_build_ref = crate::image_build::ensure_image_build(self.backend, namespace, &image, &docker.host_ref).await?;
+            let mut spec = policy.spec.clone();
+            spec.docker_per_vessel.as_mut().expect("docker placement").image =
+                Some(flotilla_resources::DockerImageSource::Built { identity: image.identity, image_build_ref });
+            images.insert(vessel, spec);
         }
-        Ok(())
+        Ok(images)
     }
+}
+
+/// Write composed images into the placement: the convoy-level policy carries
+/// the first vessel's image, and when vessels differ every vessel gets its own
+/// pinned snapshot (identical values share one snapshot by content).
+fn apply_vessel_images(
+    placement: &mut PlacementResolution,
+    images: BTreeMap<String, PlacementPolicySpec>,
+    decision: Option<&PlacementDecision>,
+) -> Result<BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>, String> {
+    let Some(first) = images.values().next().cloned() else { return Ok(BTreeMap::new()) };
+    if let Some(selected) = placement.selected.as_mut() {
+        selected.spec = first.clone();
+    }
+    if images.values().all(|spec| *spec == first) {
+        return Ok(BTreeMap::new());
+    }
+    let decision = decision.ok_or("vessels with different composed images need a placement decision")?;
+    Ok(images.into_iter().map(|(vessel, spec)| (vessel, (spec, decision.clone()))).collect())
+}
+
+/// Resolve each vessel's composed image (ADR 0062): the project's `image:`
+/// (else the cascaded installation defaults), the vessel's image needs and the
+/// harness layers its crew roles use. Refusals name the vessel and the need.
+async fn resolve_vessel_images(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: Option<&str>,
+    workflow: &WorkflowTemplateSpec,
+) -> Result<BTreeMap<String, flotilla_resources::ResolvedImage>, String> {
+    let selection = match project_ref {
+        Some(project) => match backend.including_replicas::<Project>(namespace).get(project).await {
+            Ok(project) => project.object.spec.image,
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        },
+        None => None,
+    };
+    let defaults = match workflow.cascade.as_deref() {
+        Some(cascade) => cascade.image_defaults.clone(),
+        None => installation_image_defaults(backend, namespace, project_ref).await?,
+    };
+    let catalogue = crate::image_build::read_image_catalogue(backend, namespace).await?;
+    let mut resolved = BTreeMap::new();
+    for vessel in &workflow.vessels {
+        let request =
+            crate::image_build::vessel_image_request(project_ref.unwrap_or_default(), selection.as_ref(), defaults.as_ref(), vessel)?;
+        let image = flotilla_resources::resolve_image(&catalogue, &request)
+            .map_err(|error| format!("vessel `{}` composed image: {error}", vessel.name))?;
+        resolved.insert(vessel.name.clone(), image);
+    }
+    Ok(resolved)
+}
+
+/// Installation image defaults outside a resolved workflow cascade: the
+/// project's cascade when it is declared, else the fleet-root CrewDefaults.
+async fn installation_image_defaults(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: Option<&str>,
+) -> Result<Option<flotilla_resources::ImageSelection>, String> {
+    use flotilla_resources::{CrewDefaults, FleetDesignation, FLEET_DESIGNATION_NAME};
+    let defaults = project_ops::read_definition_catalog::<CrewDefaults>(backend, namespace).await?;
+    let projects = project_ops::read_definition_catalog::<Project>(backend, namespace).await?;
+    if let Some(project) = project_ref.and_then(|name| projects.iter().find(|project| project.metadata.name == name)) {
+        let fleet = backend
+            .definitions::<FleetDesignation>(namespace)
+            .list_names([FLEET_DESIGNATION_NAME.into()])
+            .await
+            .map_err(|error| error.to_string())?;
+        let hierarchy = flotilla_resources::ProjectHierarchy::from_declared(
+            projects.iter().map(|project| (project.metadata.name.clone(), project.spec.parent.clone())).collect(),
+            fleet.first().map(|designation| designation.spec.project.clone()),
+        );
+        let specs = projects.iter().map(|project| (project.metadata.name.clone(), project.spec.clone())).collect();
+        let layers = defaults.iter().map(|defaults| (defaults.metadata.name.clone(), defaults.spec.clone())).collect::<Vec<_>>();
+        return flotilla_resources::ResolvedCascade::from_specs(&hierarchy, &specs, &layers, &project.metadata.name, &project.spec)
+            .map(|cascade| cascade.image_defaults)
+            .map_err(|error| error.to_string());
+    }
+    Ok(defaults.into_iter().filter(|defaults| defaults.spec.project_ref.is_none()).find_map(|defaults| defaults.spec.image))
 }
 
 impl AdmissionRuntime<'_> {
@@ -1635,7 +1709,7 @@ impl AdmissionReadContext<'_> {
     ) -> Result<AdmissionReadContext<'a>, String> {
         use flotilla_resources::{
             CrewDefaults, CrewImageBaseline, DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageBuild, ImageLayer,
-            ReadResourceList, FLEET_DESIGNATION_NAME,
+            FLEET_DESIGNATION_NAME,
         };
         use flotilla_store::StoreQuery;
         let backend = &owner.backend;
@@ -1767,51 +1841,30 @@ impl AdmissionReadContext<'_> {
             .await
             .map_err(|error| error.to_string())?;
         let mut baseline_names = BTreeSet::new();
-        let mut frozen_layer_names = BTreeSet::new();
-        let mut composed = false;
-        let mut observe_image = |image: &DockerImageSource| match image {
-            DockerImageSource::Baseline { image_baseline_ref } => {
+        let mut observe_image = |image: Option<&DockerImageSource>| {
+            if let Some(DockerImageSource::Baseline { image_baseline_ref }) = image {
                 baseline_names.insert(image_baseline_ref.clone());
             }
-            DockerImageSource::Composition { composition } => {
-                composed = true;
-                frozen_layer_names.extend(composition.layers.iter().map(|layer| layer.name.clone()));
-            }
-            DockerImageSource::Literal(_) => {}
         };
         for kind in &kinds.items {
             if let FulfilmentRealisation::DockerPerVessel { image } = &kind.object.spec.realisation {
-                observe_image(image);
+                observe_image(image.as_ref());
             }
         }
         for policy in &policies.items {
             if let Some(docker) = &policy.object.spec.docker_per_vessel {
-                observe_image(&docker.image);
+                observe_image(docker.image.as_ref());
             }
         }
         let baselines =
             backend.definitions::<CrewImageBaseline>(namespace).list_names(baseline_names).await.map_err(|error| error.to_string())?;
-        composed |= baselines.iter().any(|baseline| baseline.spec.layers.is_some());
-        // All image layers participate in capability composition and dependency
-        // validation. Only builds for participating layer names are candidates.
-        let image_layers =
-            if composed { project_ops::read_definition_catalog::<ImageLayer>(backend, namespace).await? } else { Vec::new() };
-        frozen_layer_names.extend(image_layers.iter().map(|layer| layer.metadata.name.clone()));
-        let builds = if composed {
-            backend
-                .query_declared::<ImageBuild>(
-                    namespace,
-                    &StoreQuery {
-                        field_values: BTreeMap::from([("spec.layer.name".into(), frozen_layer_names.into_iter().collect())]),
-                        include_replicas: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?
-        } else {
-            ReadResourceList { items: Vec::new() }
-        };
+        // Composed images resolve against every layer definition, and their
+        // placement cost reads the per-identity builds.
+        let image_layers = project_ops::read_definition_catalog::<ImageLayer>(backend, namespace).await?;
+        let builds = backend
+            .query_declared::<ImageBuild>(namespace, &StoreQuery { include_replicas: true, ..Default::default() })
+            .await
+            .map_err(|error| error.to_string())?;
         let mut snapshot = project_ops::RequestSnapshot::new(backend, namespace)?;
         snapshot.insert_definitions::<Project>(projects)?;
         snapshot.insert_definitions::<FleetDesignation>(fleet)?;
@@ -2390,6 +2443,7 @@ impl AdmissionReadContext<'_> {
         }
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
+        let composed_images = tokio::sync::OnceCell::new();
         for mut kind in kinds {
             let canonical_kind_host = flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref);
             let target_ref = canonical_kind_host
@@ -2418,30 +2472,22 @@ impl AdmissionReadContext<'_> {
                 kind.spec.host_ref = canonical_kind_host.to_string();
             }
             let facts = host.and_then(|host| host.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
-            let image_needs = needs.iter().filter(|need| need.is_image_need()).map(CapabilityNeed::capability_string).collect();
+            // A kind that omits its image realises each vessel's composed
+            // image: resolution provides every image need or refuses, naming it.
             let composed = match &kind.spec.realisation {
-                flotilla_resources::FulfilmentRealisation::DockerPerVessel { image } => {
-                    match freeze_admission_image(&self.backend, namespace, image, &image_needs).await {
-                        Ok(flotilla_resources::DockerImageSource::Composition { composition }) => Some(composition),
-                        Ok(_) => None,
+                flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None } => {
+                    match composed_images.get_or_init(|| resolve_vessel_images(&self.backend, namespace, Some(project_ref), workflow)).await
+                    {
+                        Ok(images) => Some(images),
                         Err(error) => {
-                            rejected.push(refusal(error));
+                            rejected.push(refusal(error.clone()));
                             continue;
                         }
                     }
                 }
                 _ => None,
             };
-            let image_covers = |need: &CapabilityNeed| {
-                composed.as_ref().is_some_and(|composition| {
-                    need.is_image_need()
-                        && composition
-                            .layers
-                            .iter()
-                            .flat_map(|layer| &layer.spec.provides)
-                            .any(|provided| flotilla_resources::capability_satisfies(provided, &need.capability_string()))
-                })
-            };
+            let image_covers = |need: &CapabilityNeed| composed.is_some() && need.is_image_need();
             let structurally_missing = needs
                 .iter()
                 .filter(|need| {
@@ -2524,11 +2570,9 @@ impl AdmissionReadContext<'_> {
                         }
                         None => None,
                     };
-                    let image_matches = purpose == PlacementPurpose::Routing || composed.as_ref().is_none_or(|expected| {
-                        policy.spec.docker_per_vessel.as_ref().is_some_and(|docker| {
-                            matches!(&docker.image, flotilla_resources::DockerImageSource::Composition { composition } if composition == expected)
-                        })
-                    });
+                    let image_matches = purpose == PlacementPurpose::Routing
+                        || composed.is_none()
+                        || policy.spec.docker_per_vessel.as_ref().is_some_and(|docker| docker.image.is_none());
                     if !image_matches {
                         rejected.push(refusal("fulfilment kind and placement policy disagree on image composition".into()));
                         continue;
@@ -2565,8 +2609,7 @@ impl AdmissionReadContext<'_> {
                         host,
                         policy.metadata.labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                         &kind.spec.realisation,
-                        composed.as_deref(),
-                        self.runtime.image_build_inputs.read().await.clone(),
+                        composed.map(|images| images.values().map(|image| image.identity.as_str()).collect::<BTreeSet<_>>()),
                     )
                     .await?;
                     candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until, image_cost });
@@ -2694,7 +2737,7 @@ impl AdmissionReadContext<'_> {
             let mut index = 0;
             while index < workflow.vessels.len() {
                 let vessel = workflow.vessels[index].clone();
-                let needs = vessel.crew.iter().flat_map(|crew| crew.needs.iter().cloned()).collect::<BTreeSet<_>>();
+                let needs = vessel.needs.iter().chain(vessel.crew.iter().flat_map(|crew| &crew.needs)).cloned().collect::<BTreeSet<_>>();
                 let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow.clone() };
                 let (mut resolution, alternatives) = match self.decide_capability_placement(context, &one, &needs).await {
                     Ok(result) => result,
@@ -2768,7 +2811,8 @@ impl AdmissionReadContext<'_> {
                     .await?;
                 }
                 if purpose == PlacementPurpose::Admission {
-                    self.runtime.builds.join_placement_builds(namespace, &mut resolution).await?;
+                    let images = self.runtime.builds.compose_placement_images(namespace, Some(project_ref), &one, &resolution).await?;
+                    apply_vessel_images(&mut resolution, images, None)?;
                 }
                 workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
@@ -2790,7 +2834,12 @@ impl AdmissionReadContext<'_> {
             }
             first.expect("nonempty vessels")
         } else {
-            let needs = workflow.vessels.iter().flat_map(|vessel| vessel.crew.iter()).flat_map(|crew| crew.needs.iter().cloned()).collect();
+            let needs = workflow
+                .vessels
+                .iter()
+                .flat_map(|vessel| vessel.needs.iter().chain(vessel.crew.iter().flat_map(|crew| &crew.needs)))
+                .cloned()
+                .collect();
             let mut result = self.decide_capability_placement(context, workflow, &needs).await?;
             if purpose == PlacementPurpose::Admission {
                 if has_kinds {
@@ -2816,7 +2865,20 @@ impl AdmissionReadContext<'_> {
                 }
             }
             if purpose == PlacementPurpose::Admission {
-                self.runtime.builds.join_placement_builds(namespace, &mut result.0).await?;
+                let images = self.runtime.builds.compose_placement_images(namespace, Some(project_ref), workflow, &result.0).await?;
+                let decision = match result.0.selected.as_ref() {
+                    Some(selected) => Some(PlacementDecision {
+                        minimal_alternatives: result.1.clone(),
+                        escalation_reason: intent.escalation_reason.clone(),
+                        policy_name: selected.metadata.name.clone(),
+                        target_host: placement_target_host(&self.backend, namespace, selected).await?,
+                        refused_candidates: result.0.refused_candidates.clone(),
+                        viable_not_selected: result.0.viable_not_selected.clone(),
+                        allocation: result.0.allocation.clone(),
+                    }),
+                    None => None,
+                };
+                vessel_placements.extend(apply_vessel_images(&mut result.0, images, decision.as_ref())?);
             }
             result
         };
@@ -2876,25 +2938,20 @@ impl AdmissionReadContext<'_> {
         };
         if purpose == PlacementPurpose::Admission {
             if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-                let needs = workflow
-                    .vessels
-                    .iter()
-                    .flat_map(|vessel| &vessel.crew)
-                    .flat_map(|crew| &crew.needs)
-                    .filter(|need| need.is_image_need())
-                    .map(CapabilityNeed::capability_string)
-                    .collect();
-                // Preserve provenance only for the no-layer compatibility image.
-                if let flotilla_resources::DockerImageSource::Baseline { image_baseline_ref } = &docker.image {
-                    docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
-                }
-                docker.image = freeze_admission_image(&self.backend, namespace, &docker.image, &needs).await?;
-                // Layered admissions now require built identity, so they must
-                // not retain the legacy tag exception. Only no-layer literals
-                // keep that provenance for the compatibility generation.
-                if matches!(&docker.image, flotilla_resources::DockerImageSource::Composition { composition } if composition.literal_base.is_none())
-                {
-                    docker.legacy_image_baseline_ref = None;
+                match &docker.image {
+                    // Freeze the compatibility baseline into a literal and keep
+                    // its provenance; later baseline edits never reach this convoy.
+                    Some(image @ flotilla_resources::DockerImageSource::Baseline { image_baseline_ref }) => {
+                        let resolved = image.resolve(&self.backend.definitions(namespace)).await?;
+                        docker.legacy_image_baseline_ref = Some(image_baseline_ref.clone());
+                        docker.image = Some(flotilla_resources::DockerImageSource::Literal(resolved));
+                    }
+                    Some(image @ flotilla_resources::DockerImageSource::Literal(_)) => {
+                        image.resolve(&self.backend.definitions(namespace)).await?;
+                    }
+                    // Composed images freeze per vessel once the placement is
+                    // final; they never carry the legacy tag exception.
+                    Some(flotilla_resources::DockerImageSource::Built { .. }) | None => docker.legacy_image_baseline_ref = None,
                 }
             }
             validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
@@ -3159,6 +3216,9 @@ pub(super) struct AllocationRole {
     pub(super) repository_refs: Option<Vec<RepositoryKey>>,
     pub(super) depends_on: Vec<String>,
     pub(super) credential_signature: String,
+    /// The authored leg's needs (ADR 0062); roles only share a vessel with
+    /// roles from legs with equal needs.
+    pub(super) leg_needs: BTreeSet<CapabilityNeed>,
 }
 
 fn refresh_allocation_role_crews(workflow: &WorkflowTemplateSpec, roles: &mut [AllocationRole]) -> Result<(), String> {
@@ -3230,6 +3290,7 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
                         repository_refs: vessel.repository_refs.clone().or_else(|| workflow.repository_refs.clone()),
                         depends_on: vessel.depends_on.clone(),
                         credential_signature: String::new(),
+                        leg_needs: vessel.needs.clone(),
                     });
                 }
             } else {
@@ -3239,6 +3300,7 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
                     repository_refs: vessel.repository_refs.clone().or_else(|| workflow.repository_refs.clone()),
                     depends_on: vessel.depends_on.clone(),
                     credential_signature: String::new(),
+                    leg_needs: vessel.needs.clone(),
                 });
             }
         }
@@ -3251,6 +3313,7 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
                 .name(role.hint.clone())
                 .crew(vec![role.crew.clone()])
                 .maybe_repository_refs(role.repository_refs.clone())
+                .needs(role.leg_needs.clone())
                 .build()
         })
         .collect();
@@ -3267,6 +3330,7 @@ pub(super) fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[Alloc
                     && first.crew.needs.iter().any(|need| role.crew.needs.iter().any(|other| need.conflicts_with(other)))))
                 && first.credential_signature == role.credential_signature
                 && first.repository_refs == role.repository_refs
+                && first.leg_needs == role.leg_needs
                 && !group.iter().any(|other| other.crew.role == role.crew.role)
         });
         if let Some(group) = group {
@@ -3301,6 +3365,7 @@ pub(super) fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[Alloc
                 .name(name.clone())
                 .crew(group.iter().map(|role| role.crew.clone()).collect())
                 .maybe_repository_refs(group[0].repository_refs.clone())
+                .needs(group[0].leg_needs.clone())
                 .build(),
         );
         allocation.push(AllocationDecision {
@@ -4304,7 +4369,14 @@ pub(super) async fn validate_workflow_agent_adapters(
     allow_unready: bool,
 ) -> Result<(), String> {
     let required_adapters = required_workflow_agent_adapters(workflow)?;
-    // Validate each candidate's image or composition once, even for tool-only workflows.
+    // A composed image derives its harness layers from these same roles.
+    if placement
+        .and_then(|policy| policy.spec.docker_per_vessel.as_ref())
+        .is_some_and(|docker| matches!(docker.image, None | Some(flotilla_resources::DockerImageSource::Built { .. })))
+    {
+        return Ok(());
+    }
+    // Validate each candidate's literal image once, even for tool-only workflows.
     let capabilities = match placement {
         Some(policy) if !required_adapters.is_empty() || policy.spec.docker_per_vessel.is_some() => {
             Some(placement_agent_adapters(backend, namespace, policy, allow_unready).await?)
@@ -4799,75 +4871,6 @@ pub(super) fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) 
     required_agent_adapters(workflow.vessels.iter().flat_map(|vessel| &vessel.crew))
 }
 
-/// New admissions use built compositions; previous-generation frozen literals
-/// remain unchanged until their convoy completes.
-/// Selection is structural; revisions are frozen in the placement snapshot.
-async fn freeze_admission_image(
-    backend: &ResourceBackend,
-    namespace: &str,
-    image: &flotilla_resources::DockerImageSource,
-    needs: &BTreeSet<String>,
-) -> Result<flotilla_resources::DockerImageSource, String> {
-    use flotilla_resources::{compose_image, DockerImageSource, FrozenImageLayers, ImageLayer};
-    let (selection, mut frozen) = match image {
-        DockerImageSource::Baseline { image_baseline_ref } => {
-            let baseline = flotilla_resources::CrewImageBaseline::resolve(image_baseline_ref, &backend.definitions(namespace)).await?;
-            let baseline_image = baseline.image;
-            let Some(selection) = baseline.layers else {
-                return Ok(DockerImageSource::Composition {
-                    composition: Box::new(
-                        flotilla_resources::ImageComposition::builder()
-                            .selection(flotilla_resources::ImageLayerSelection::builder().base(image_baseline_ref.clone()).build())
-                            .needs(BTreeSet::new())
-                            .layers(Vec::new())
-                            .literal_base(baseline_image)
-                            .build(),
-                    ),
-                });
-            };
-            (selection, FrozenImageLayers::default())
-        }
-        DockerImageSource::Composition { composition } if composition.literal_base.is_some() => {
-            // Operator manifests can mix a literal base and layers. The common
-            // resolver refuses that invalid shape instead of silently dropping
-            // the literal base and admitting a different image source.
-            image.resolve(&backend.definitions(namespace)).await?;
-            return Ok(image.clone());
-        }
-        DockerImageSource::Composition { composition } => (composition.selection.clone(), {
-            let mut frozen = FrozenImageLayers::default();
-            frozen.include(composition)?;
-            frozen.baseline_image = None;
-            frozen
-        }),
-        DockerImageSource::Literal(_) => return image.resolve(&backend.definitions(namespace)).await.map(Into::into),
-    };
-    let catalogue = backend
-        .definitions::<ImageLayer>(namespace)
-        .list()
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|layer| {
-            layer.metadata.deletion_timestamp.is_none() && layer.metadata.merge.as_ref().is_none_or(|merge| merge.conflicts.is_empty())
-        })
-        .map(|layer| (layer.metadata.name, layer.spec))
-        .collect();
-    let mut composition = compose_image(&selection, needs, &catalogue, &mut frozen)?;
-    composition.baseline_image = None;
-    // Generation 2 never carries the shadow running image into a new admission.
-    // Existing convoy snapshots are consumed directly, without this freeze step.
-    if let DockerImageSource::Composition { composition: previous } = image {
-        if composition.layers == previous.layers {
-            composition.build_refs = previous.build_refs.clone();
-            if let Some(identity) = &previous.identity {
-                composition.bind(identity.clone())?;
-            }
-        }
-    }
-    Ok(DockerImageSource::Composition { composition: Box::new(composition) })
-}
-
 pub(super) async fn placement_agent_adapters(
     backend: &ResourceBackend,
     namespace: &str,
@@ -4875,17 +4878,16 @@ pub(super) async fn placement_agent_adapters(
     allow_unready: bool,
 ) -> Result<(BTreeSet<String>, String), String> {
     if let Some(docker) = &placement.spec.docker_per_vessel {
-        // Adapter testimony is structural. Unbound compositions acquire their
-        // image identity after admission, through ImageBuild and verification.
-        let detail = match &docker.image {
-            flotilla_resources::DockerImageSource::Composition { composition }
-                if composition.identity.is_none() && composition.baseline_image.is_none() && composition.literal_base.is_none() =>
-            {
-                format!("image composition based on `{}`", composition.selection.base)
+        // Adapter testimony is structural. A composed image carries exactly the
+        // harness layers its vessels' roles resolve to (resolution refuses
+        // otherwise), so `agent_adapters` constrains only literal images.
+        match &docker.image {
+            None | Some(flotilla_resources::DockerImageSource::Built { .. }) => Ok((BTreeSet::new(), "composed image".to_string())),
+            Some(image) => {
+                let detail = format!("image `{}`", image.resolve(&backend.definitions(namespace)).await?);
+                Ok((docker.agent_adapters.clone(), detail))
             }
-            _ => format!("image `{}`", docker.image.resolve(&backend.definitions(namespace)).await?),
-        };
-        Ok((docker.agent_adapters.clone(), detail))
+        }
     } else if placement.spec.host_direct.is_some() {
         let target_host = placement_target_host(backend, namespace, placement).await?;
         let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
@@ -4993,63 +4995,78 @@ pub(super) fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed
 
 /// Image acquisition is a placement cost, after host liveness and before other
 /// economic tie breaks. Host inventories are hints; delivery verifies identity.
+/// A composed placement costs its most expensive vessel image: Held when the
+/// host's inventory holds the Built digest, RegistryPull when the build was
+/// pushed to the registry, otherwise Build.
 async fn image_placement_cost(
     backend: &ResourceBackend,
     namespace: &str,
     host: Option<&ResourceObject<ResourceHost>>,
     provider_instance: Option<&str>,
     realisation: &flotilla_resources::FulfilmentRealisation,
-    composition: Option<&flotilla_resources::ImageComposition>,
-    resolver: Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>,
+    composed: Option<BTreeSet<&str>>,
 ) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
-    use flotilla_resources::{FleetDesignation, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY};
-    let completed = if let (Some(composition), Some(resolver), Some(architecture)) = (
-        composition,
-        resolver,
-        host.and_then(|host| host.status.as_ref())
-            .and_then(|status| status.description.as_ref())
-            .and_then(|description| description.system.arch.as_deref()),
-    ) {
-        crate::image_build::ImageBuildAdmission::new(backend.clone(), namespace, resolver).completed(architecture, composition).await?
-    } else {
-        None
+    use flotilla_resources::{
+        DockerImageSource, FleetDesignation, FulfilmentRealisation, ImageAcquisitionCost, ImageBuildPhase, FLEET_DESIGNATION_NAME,
+        IMAGE_DIGESTS_CAPABILITY,
     };
-    let completed_identity = completed.as_ref().and_then(|build| build.status.as_ref()).and_then(|status| status.identity.as_ref());
     let image = match realisation {
-        flotilla_resources::FulfilmentRealisation::HostDirect => return Ok(flotilla_resources::ImageAcquisitionCost::Held),
-        flotilla_resources::FulfilmentRealisation::DockerPerVessel { image } => match image {
-            flotilla_resources::DockerImageSource::Literal(image) => Some(image.as_str()),
-            _ => composition
-                .and_then(|composition| composition.identity.as_ref())
-                .or(completed_identity)
-                .map(|identity| identity.local_image_id.as_str()),
-        },
+        FulfilmentRealisation::HostDirect => return Ok(ImageAcquisitionCost::Held),
+        FulfilmentRealisation::DockerPerVessel { image } => image,
     };
     let held = host
         .and_then(|host| host.status.as_ref())
         .and_then(|status| status.capabilities.get(IMAGE_DIGESTS_CAPABILITY))
         .and_then(|value| serde_json::from_value::<flotilla_resources::LocalImageInventories>(value.clone()).ok())
         .unwrap_or_default();
-    if held.held(provider_instance).is_some_and(|held| {
-        image.is_some_and(|image| held.contains(image) || image.rsplit_once('@').is_some_and(|(_, digest)| held.contains(digest)))
-    }) {
-        return Ok(flotilla_resources::ImageAcquisitionCost::Held);
+    let held = held.held(provider_instance);
+    let is_held = |image: &str| {
+        held.is_some_and(|held| held.contains(image) || image.rsplit_once('@').is_some_and(|(_, digest)| held.contains(digest)))
+    };
+    if let Some(identities) = composed {
+        let architecture = host.and_then(crate::image_build::host_architecture);
+        let mut cost = ImageAcquisitionCost::Held;
+        for identity in identities {
+            let digest = match &architecture {
+                Some(architecture) => {
+                    let name = flotilla_resources::image_build_name(identity, architecture);
+                    match flotilla_store::read_image_build(backend, namespace, &name).await {
+                        Ok(build) => build.status.filter(|status| status.phase == ImageBuildPhase::Built).and_then(|status| status.digest),
+                        Err(ResourceError::NotFound { .. }) => None,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                None => None,
+            };
+            let vessel = match digest {
+                Some(digest) if is_held(&digest) => ImageAcquisitionCost::Held,
+                Some(digest) if digest.contains('@') => ImageAcquisitionCost::RegistryPull,
+                _ => ImageAcquisitionCost::Build,
+            };
+            cost = cost.max(vessel);
+        }
+        return Ok(cost);
+    }
+    let image = match image {
+        Some(DockerImageSource::Literal(image)) => Some(image.as_str()),
+        _ => None,
+    };
+    if image.is_some_and(is_held) {
+        return Ok(ImageAcquisitionCost::Held);
     }
     let cache = match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {
         Ok(fleet) => fleet.spec.image_cache,
         Err(ResourceError::NotFound { .. }) => None,
         Err(error) => return Err(error.to_string()),
     };
-    let published =
-        completed.as_ref().and_then(|build| build.status.as_ref()).and_then(|status| status.availability.registry_ref.as_deref());
     let registry = cache.as_ref().is_some_and(|cache| {
-        published.or(image).is_some_and(|reference| {
+        image.is_some_and(|reference| {
             reference
                 .rsplit_once('@')
                 .is_some_and(|(repository, digest)| repository == cache.repository && flotilla_resources::is_image_digest(digest))
         })
     });
-    Ok(if registry { flotilla_resources::ImageAcquisitionCost::RegistryPull } else { flotilla_resources::ImageAcquisitionCost::Build })
+    Ok(if registry { ImageAcquisitionCost::RegistryPull } else { ImageAcquisitionCost::Build })
 }
 
 fn require_open_continuation(status: &flotilla_protocol::ChangeRequestStatus, id: &str) -> Result<(), String> {
@@ -5729,6 +5746,7 @@ mod tests {
                 ("coder".into(), vec!["testing".into(), "implement".into()]),
                 ("governor".into(), vec!["wayfinder".into()]),
             ]),
+            image: None,
         };
         let meta = InputMeta::builder().name("fleet".to_string()).build();
         backend.definitions::<CrewDefaults>("flotilla").apply(&meta, &defaults).await.expect("defaults");
@@ -5991,7 +6009,7 @@ mod tests {
                 if other_instance { "cache-b".into() } else { "cache-a".into() },
             )]);
             let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel {
-                image: flotilla_resources::DockerImageSource::Literal(digest),
+                image: Some(flotilla_resources::DockerImageSource::Literal(digest)),
             };
             let cost = image_placement_cost(
                 &backend,
@@ -5999,7 +6017,6 @@ mod tests {
                 Some(&host),
                 labels.get(ENVIRONMENT_PROVIDER_INSTANCE_LABEL).map(String::as_str),
                 &realisation,
-                None,
                 None,
             )
             .await
@@ -6013,6 +6030,77 @@ mod tests {
                 }
             );
         });
+    }
+
+    // ADR 0062: a composed placement costs Held when the host inventory holds
+    // the identity's Built digest, RegistryPull when the build was pushed,
+    // and Build while the build is absent or unfinished.
+    #[tokio::test]
+    async fn composed_image_cost_follows_the_identity_build() {
+        use flotilla_resources::{
+            ImageAcquisitionCost, ImageBuild, ImageBuildStatus, ImageDelivery, ImageLayerSource, ImageLayerSpec, ImageLayerTier,
+        };
+        let backend = ResourceBackend::new(InMemoryBackend::default());
+        let hosts = backend.using::<ResourceHost>("test");
+        let host =
+            hosts.create(&InputMeta::builder().name("host".into()).build(), &flotilla_resources::HostSpec::default()).await.expect("host");
+        let local_id = format!("sha256:{}", "1".repeat(64));
+        let mut status = flotilla_resources::HostStatus {
+            description: Some(
+                flotilla_protocol::HostSummary::builder()
+                    .environment_id(flotilla_protocol::EnvironmentId::new("host"))
+                    .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("host"), "host".to_string()))
+                    .system(flotilla_protocol::SystemInfo { arch: Some("x86_64".into()), ..Default::default() })
+                    .build(),
+            ),
+            ..Default::default()
+        };
+        status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"cache": [local_id]}));
+        hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("inventory");
+        let host = hosts.get("host").await.expect("host");
+        let layers = vec![ImageLayerSpec::builder()
+            .name("base".into())
+            .version("1".into())
+            .tier(ImageLayerTier::Base)
+            .source(ImageLayerSource::Stdlib)
+            .from(format!("ubuntu@sha256:{}", "a".repeat(64)))
+            .fragment("FROM ${BASE}\n".into())
+            .probe("true".into())
+            .build()];
+        let identity = flotilla_resources::image_identity(&layers);
+        let name = flotilla_resources::image_build_name(&identity, "amd64");
+        let realisation = flotilla_resources::FulfilmentRealisation::DockerPerVessel { image: None };
+        let cost =
+            || image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));
+        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "no build yet");
+        let builds = backend.using::<ImageBuild>("test");
+        let spec = flotilla_resources::ImageBuildSpec::builder()
+            .identity(identity.clone())
+            .architecture("amd64".into())
+            .layers(layers)
+            .host_ref("host".into())
+            .delivery(ImageDelivery::Local)
+            .reservation(flotilla_resources::ImageBuildReservation { cpu: 1, disk_bytes: 1 })
+            .build();
+        let created = builds.create(&InputMeta::builder().name(name.clone()).build(), &spec.into()).await.expect("build");
+        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::Build, "queued build");
+        let built = |digest: &str| ImageBuildStatus {
+            phase: flotilla_resources::ImageBuildPhase::Built,
+            digest: Some(digest.to_string()),
+            ..Default::default()
+        };
+        let manifest = format!("sha256:{}", "2".repeat(64));
+        builds
+            .update_status(&name, &created.metadata.resource_version, &built(&format!("registry.test/crew@{manifest}")))
+            .await
+            .expect("pushed");
+        assert_eq!(cost().await.expect("cost"), ImageAcquisitionCost::RegistryPull);
+        status.capabilities.insert(flotilla_resources::IMAGE_DIGESTS_CAPABILITY.into(), serde_json::json!({"cache": [local_id, manifest]}));
+        hosts.update_status("host", &host.metadata.resource_version, &status).await.expect("pulled inventory");
+        let host = hosts.get("host").await.expect("host");
+        let held =
+            image_placement_cost(&backend, "test", Some(&host), Some("cache"), &realisation, Some(BTreeSet::from([identity.as_str()])));
+        assert_eq!(held.await.expect("cost"), ImageAcquisitionCost::Held);
     }
 
     #[test]
@@ -6121,6 +6209,30 @@ mod tests {
         }
     }
 
+    // ADR 0062: a workflow template leg's `needs` survive role expansion and
+    // allocation onto the allocated vessel, and roles from legs with different
+    // needs never share a vessel.
+    #[test]
+    fn leg_needs_survive_allocation() {
+        let crew = |role: &str| CrewSpec::builder().role(role.to_string()).source(CrewSource::Tool { command: "true".into() }).build();
+        let display: BTreeSet<CapabilityNeed> = BTreeSet::from(["display:x11".parse().expect("need")]);
+        let mut workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![
+                VesselRequirement::builder().name("demo".to_string()).crew(vec![crew("coder")]).needs(display.clone()).build(),
+                VesselRequirement::builder().name("review".to_string()).crew(vec![crew("reviewer")]).build(),
+            ])
+            .build();
+        let project = ProjectSpec::builder().display_name("flotilla".into()).build();
+        let roles = expand_allocation_roles(&mut workflow, &project).expect("expand");
+        assert_eq!(workflow.vessels[0].needs, display, "expanded vessels keep their leg needs");
+        allocate_roles(&mut workflow, &roles).expect("allocate");
+        assert_eq!(workflow.vessels.len(), 2, "different leg needs keep roles apart");
+        let demo = workflow.vessels.iter().find(|vessel| vessel.crew[0].role == "coder").expect("coder vessel");
+        assert_eq!(demo.needs, display);
+        let review = workflow.vessels.iter().find(|vessel| vessel.crew[0].role == "reviewer").expect("reviewer vessel");
+        assert!(review.needs.is_empty());
+    }
+
     #[test]
     fn allocation_groups_by_needs_and_credential_environment() {
         let cases = [
@@ -6142,6 +6254,7 @@ mod tests {
                     repository_refs: None,
                     depends_on: Vec::new(),
                     credential_signature: grants.to_string(),
+                    leg_needs: BTreeSet::new(),
                 })
                 .collect::<Vec<_>>();
             let mut workflow = WorkflowTemplateSpec::builder()
@@ -6204,6 +6317,7 @@ mod tests {
                 repository_refs: None,
                 depends_on: Vec::new(),
                 credential_signature: String::new(),
+                leg_needs: BTreeSet::new(),
             })
             .collect::<Vec<_>>();
         let rule = flotilla_resources::TurnDeliveryRule::builder()

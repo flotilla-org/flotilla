@@ -1,43 +1,38 @@
-use flotilla_core::image_build::{ImageBuildInputResolver, ImageBuildSourceInputs};
 use flotilla_resources::{
-    CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, FrozenImageLayer, FrozenImageLayers, ImageBuild, ImageComposition,
-    ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage, IMAGE_LAYERS_ANNOTATION,
+    image_build_name, single_agent_workflow_spec, DockerImageSource, ImageBuild, ImageDelivery, ImageLayer, ImageLayerSource,
+    ImageLayerSpec, ImageLayerTier, ResourceObject,
 };
 
 use super::*;
 
-struct BuildInputs;
-#[async_trait::async_trait]
-impl ImageBuildInputResolver for BuildInputs {
-    async fn resolve(&self, _layer: &FrozenImageLayer, architecture: &str) -> Result<ImageBuildSourceInputs, String> {
-        Ok(ImageBuildSourceInputs::builder()
-            .architecture(architecture.into())
-            .content_hashes(vec![format!("sha256:{}", "2".repeat(64))])
-            .stability(ImageInputStability::Pinned)
-            .build())
-    }
-}
-
-fn layer(stage: ImageLayerStage, provides: &[&str]) -> ImageLayerSpec {
+fn layer(name: &str, tier: ImageLayerTier, provides: &[&str]) -> ImageLayerSpec {
     ImageLayerSpec::builder()
-        .stage(stage)
-        .parent(if stage == ImageLayerStage::Base {
-            ImageLayerParent::Image(format!("debian@sha256:{}", "a".repeat(64)))
-        } else {
-            ImageLayerParent::Rebasable
-        })
-        .repository("https://example.test/images".into())
-        .revision("1".repeat(40))
-        .fragment("Dockerfile".into())
+        .name(name.into())
+        .version("1.0.0".into())
+        .tier(tier)
+        .source(ImageLayerSource::Stdlib)
+        .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "a".repeat(64))))
+        .fragment(format!("FROM ${{BASE}}\nRUN echo {name}\n"))
         .provides(provides.iter().map(|value| (*value).into()).collect())
-        .requires(if stage == ImageLayerStage::Base { BTreeSet::new() } else { BTreeSet::from(["os:debian-family".into()]) })
+        .probe("true".into())
         .build()
 }
 
-// Behaviour (#2727/#2728): routing freezes baseline or explicit composition
-// on the selected host. Two admitted convoys share a pinned execution; the
-// legacy baseline selections also demand builds after the cut-over.
-async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: bool) {
+/// The composed image a convoy's vessel placement froze.
+async fn frozen_image(backend: &ResourceBackend, convoy: &ResourceObject<Convoy>) -> DockerImageSource {
+    let snapshot = flotilla_resources::vessel_placement_pin(convoy, "work")
+        .map(|pin| pin.policy_ref)
+        .unwrap_or_else(|| convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION].clone());
+    let policy = backend.using::<PlacementPolicy>("flotilla").get(&snapshot).await.expect("placement snapshot");
+    policy.spec.docker_per_vessel.expect("docker").image.expect("admission freezes the composed image")
+}
+
+// Behaviour (ADR 0062): a composed policy resolves each vessel's image at
+// admission on the placement host. ConvoyStart's `--need display:x11`
+// resolves by provides lookup; two convoys and a ConvoyCreate whose leg
+// declares the same need share ONE ImageBuild named by identity; an
+// unresolvable need refuses routing with no convoy; the issuer authors nothing.
+async fn composed_image_routing_row(issuer: usize, satisfiable: bool) {
     let hosts = vec![empty_daemon_named("image-home").await, empty_daemon_named("image-issuer").await];
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
@@ -53,7 +48,6 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
             .system(flotilla_protocol::SystemInfo { arch: Some("x86_64".into()), ..Default::default() })
             .build(),
     );
-    home.set_image_build_input_resolver(Arc::new(BuildInputs)).await;
     status.capabilities.insert("docker".into(), serde_json::json!(true));
     status.capabilities.insert("os".into(), serde_json::json!("linux"));
     backend.using::<Host>("flotilla").update_status(&host_id, &host.metadata.resource_version, &status).await.expect("Docker capacity");
@@ -62,28 +56,10 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             legacy_image_baseline_ref: None,
             host_ref: host_id.clone(),
-            image: if build {
-                DockerImageSource::Composition {
-                    composition: Box::new(
-                        ImageComposition::builder()
-                            .selection(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build())
-                            .needs(BTreeSet::new())
-                            .layers(vec![
-                                FrozenImageLayer { name: "base".into(), spec: layer(ImageLayerStage::Base, &["os:debian-family"]) },
-                                FrozenImageLayer {
-                                    name: "harness".into(),
-                                    spec: layer(ImageLayerStage::Harness, &["harness:codex@0.160.0"]),
-                                },
-                            ])
-                            .build(),
-                    ),
-                }
-            } else {
-                DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }
-            },
+            image: None,
             pull_policy: Default::default(),
             memory_policy: Default::default(),
-            agent_adapters: BTreeSet::from(["codex".into()]),
+            agent_adapters: BTreeSet::new(),
             default_cwd: None,
             env: BTreeMap::new(),
             checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".into() },
@@ -91,70 +67,73 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         .build();
     backend
         .using::<PlacementPolicy>("flotilla")
-        .create(&InputMeta::builder().name("layered-docker".into()).build(), &policy)
+        .create(&InputMeta::builder().name("composed-docker".into()).build(), &policy)
         .await
         .expect("policy");
     backend
         .using::<FulfilmentKind>("flotilla")
         .create(
-            &InputMeta::builder().name("layered-docker".into()).build(),
+            &InputMeta::builder().name("composed-docker".into()).build(),
             &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
         )
         .await
         .expect("kind");
-    for (name, spec) in [
-        ("base", layer(ImageLayerStage::Base, &["os:debian-family"])),
-        ("display", layer(ImageLayerStage::Capability, &["display:headless-x11"])),
-        ("harness", layer(ImageLayerStage::Harness, &["harness:codex@0.160.0"])),
-    ] {
+    let catalogue = [
+        layer("base-ubuntu", ImageLayerTier::Base, &["os:ubuntu"]),
+        layer("display-x11", ImageLayerTier::Shared, &["display:x11"]),
+        layer("crew-utilities", ImageLayerTier::AgentRuntime, &["crew:utilities"]),
+        layer("harness-codex", ImageLayerTier::AgentRuntime, &["harness:codex", "harness:codex@0.160.0"]),
+        layer("harness-claude", ImageLayerTier::AgentRuntime, &["harness:claude"]),
+    ];
+    for spec in &catalogue {
         backend
             .definitions::<ImageLayer>("flotilla")
-            .apply(&InputMeta::builder().name(name.into()).build(), &spec)
+            .apply(&InputMeta::builder().name(spec.resource_name()).build(), &spec.clone().into())
             .await
             .expect("layer definition");
     }
+    let mut display_workflow = single_agent_workflow_spec();
+    display_workflow.vessels[0].needs = BTreeSet::from(["display:x11".parse().expect("leg need")]);
     backend
-        .definitions::<CrewImageBaseline>("flotilla")
-        .apply(
-            &InputMeta::builder().name("fleet-crew".into()).build(),
-            &CrewImageBaselineSpec {
-                image: "crew:authoritative".into(),
-                layers: Some(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build()),
-            },
-        )
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("display-workflow".into()).build(), &display_workflow)
         .await
-        .expect("baseline alongside layers");
+        .expect("leg-need workflow");
     for host in &hosts {
         seed_trusted_remote_convoy_project(host, "flotilla").await;
     }
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "image catalogue and placement replicate", || async {
         let issuer = mesh.hosts[issuer].resource_backend();
-        issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
-            && issuer.including_replicas::<FulfilmentKind>("flotilla").get("layered-docker").await.is_ok()
-            && issuer.including_replicas::<PlacementPolicy>("flotilla").get("layered-docker").await.is_ok()
-            && issuer.definitions::<ImageLayer>("flotilla").get("harness").await.is_ok()
-            && issuer.definitions::<ImageLayer>("flotilla").get("display").await.is_ok()
-            && issuer.definitions::<ImageLayer>("flotilla").get("base").await.is_ok()
-            && issuer.definitions::<CrewImageBaseline>("flotilla").get("fleet-crew").await.is_ok()
+        let mut replicated = issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+            && issuer.including_replicas::<FulfilmentKind>("flotilla").get("composed-docker").await.is_ok()
+            && issuer.including_replicas::<PlacementPolicy>("flotilla").get("composed-docker").await.is_ok();
+        for spec in &catalogue {
+            replicated &= issuer.definitions::<ImageLayer>("flotilla").get(&spec.resource_name()).await.is_ok();
+        }
+        replicated
     })
     .await;
-    let need = if satisfiable { "display:headless-x11" } else { "display:missing" };
-    let action = CommandAction::ConvoyStart {
+    let need = if satisfiable { "display:x11" } else { "display:missing" };
+    let start = |name: &str| CommandAction::ConvoyStart {
         intent: Box::new(
             ConvoyStartIntent::builder()
                 .project_ref("flotilla".into())
-                .name("layered-work".into())
-                .branch("test/layered-work".into())
+                .name(name.into())
+                .branch(format!("test/{name}"))
                 .needs(vec![need.into()])
                 .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                 .build(),
         ),
     };
-    let target = mesh.hosts[issuer].resolve_command_target(&action, None).await;
+    let target = mesh.hosts[issuer].resolve_command_target(&start("composed-work"), None).await;
     if !satisfiable {
-        assert!(target.expect_err("unsatisfiable need refuses routing").to_string().contains(need));
-        assert!(backend.using::<Convoy>("flotilla").list().await.expect("convoys").items.is_empty());
+        let error = target.expect_err("unresolvable need refuses routing").to_string();
+        assert!(error.contains("unresolvable image need `display:missing`"), "{error}");
+        for host in &mesh.hosts {
+            assert!(host.resource_backend().using::<Convoy>("flotilla").list().await.expect("convoys").items.is_empty());
+            assert!(host.resource_backend().using::<ImageBuild>("flotilla").list().await.expect("builds").items.is_empty());
+        }
         return;
     }
     assert_eq!(
@@ -162,46 +141,47 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         if issuer == 0 { TargetHost::Local } else { TargetHost::Placement(HostId::new(&host_id)) }
     );
     let mut events = mesh.hosts[issuer].subscribe();
-    let command_id = mesh.clients[issuer].execute(Command::builder().action(action).build()).await.expect("dispatch layered admission");
+    let command_id =
+        mesh.clients[issuer].execute(Command::builder().action(start("composed-work")).build()).await.expect("dispatch composed admission");
     let result = await_command_result(&mut events, command_id).await;
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
     let convoys = backend.using::<Convoy>("flotilla").list().await.expect("convoys").items;
     assert_eq!(convoys.len(), 1);
-    let frozen: FrozenImageLayers =
-        serde_json::from_str(convoys[0].metadata.annotations.get(IMAGE_LAYERS_ANNOTATION).expect("frozen layer record"))
-            .expect("decode layers");
-    assert_eq!(frozen.layers.keys().map(String::as_str).collect::<Vec<_>>(), ["base", "display", "harness"]);
-    assert_eq!(frozen.baseline_image, None);
-    let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("joined builds").items;
-    assert_eq!(builds.len(), 1, "admission joins the first stage before accepting the convoy");
-    assert_eq!(builds[0].spec.host_ref, host_id);
-    let second = CommandAction::ConvoyStart {
-        intent: Box::new(
-            ConvoyStartIntent::builder()
-                .project_ref("flotilla".into())
-                .name("layered-work-second".into())
-                .branch("test/layered-work-second".into())
-                .needs(vec![need.into()])
-                .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                .build(),
-        ),
+    assert!(!convoys[0].metadata.annotations.contains_key("flotilla.work/frozen-image-layers"), "the retired annotation is never written");
+    let DockerImageSource::Built { identity, image_build_ref } = frozen_image(&backend, &convoys[0]).await else {
+        panic!("composed placement freezes a Built source");
     };
-    let command_id = mesh.clients[issuer].execute(Command::builder().action(second).build()).await.expect("second admission");
-    assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted { .. }));
-    assert_eq!(backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items.len(), 2);
-    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared execution").items.len(), 1);
+    assert_eq!(image_build_ref, image_build_name(&identity, "amd64"));
+    let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("builds").items;
+    assert_eq!(builds.len(), 1, "admission get-or-creates the identity's build before accepting the convoy");
+    let build = builds[0].spec.current().expect("current build");
+    assert_eq!(builds[0].metadata.name, image_build_ref);
+    assert_eq!(
+        build.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(),
+        ["base-ubuntu", "display-x11", "crew-utilities", "harness-codex"]
+    );
+    assert_eq!((build.host_ref.as_str(), &build.delivery), (host_id.as_str(), &ImageDelivery::Local));
 
-    // ConvoyCreate uses the same demand join as ConvoyStart, including when
-    // a matching first-stage execution already exists.
+    let command_id = mesh.clients[issuer].execute(Command::builder().action(start("composed-work-second")).build()).await.expect("second");
+    assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted { .. }));
+    let convoys = backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items;
+    assert_eq!(convoys.len(), 2);
+    for convoy in &convoys {
+        assert!(matches!(frozen_image(&backend, convoy).await, DockerImageSource::Built { identity: ref other, .. } if *other == identity));
+    }
+    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared build").items.len(), 1);
+
+    // ConvoyCreate freezes the same composition: the leg's need matches the
+    // dispatched need, so it reuses the identity's build.
     let mut create_events = mesh.hosts[0].subscribe();
     let create = CommandAction::ConvoyCreate {
-        name: "created-layered-work".into(),
-        workflow_ref: "remote-workflow".into(),
+        name: "created-composed-work".into(),
+        workflow_ref: "display-workflow".into(),
         inputs: Vec::new(),
         repository_url: None,
-        r#ref: Some("test/created-layered-work".into()),
+        r#ref: Some("test/created-composed-work".into()),
         project_ref: Some("flotilla".into()),
-        placement_policy: Some("layered-docker".into()),
+        placement_policy: Some("composed-docker".into()),
         adopted_checkout: None,
     };
     let command_id = mesh.clients[0].execute(Command::builder().action(create).build()).await.expect("create admission");
@@ -214,43 +194,31 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
         .expect("created convoy")
         .items
         .into_iter()
-        .find(|convoy| convoy.spec.role == "created-layered-work")
+        .find(|convoy| convoy.spec.role == "created-composed-work")
         .expect("created role");
-    let policy = backend
-        .using::<PlacementPolicy>("flotilla")
-        .get(&created.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION])
-        .await
-        .expect("create snapshot");
-    let DockerImageSource::Composition { composition } = policy.spec.docker_per_vessel.expect("docker").image else {
-        panic!("create must freeze composition");
-    };
-    assert!(!composition.build_refs.is_empty(), "create must join a build before storing the snapshot");
-    assert!(composition.baseline_image.is_none());
-    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create execution").items.len(), 1);
+    assert_eq!(frozen_image(&backend, &created).await, DockerImageSource::Built { identity, image_build_ref });
+    assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared create build").items.len(), 1);
 
     assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
     assert!(mesh.hosts[1].resource_backend().using::<Convoy>("flotilla").list().await.expect("issuer authored convoys").items.is_empty());
 }
 
 #[tokio::test]
-async fn layered_baseline_routing_pinned_rows() {
-    for (issuer, satisfiable, build) in
-        [(1, true, false), (0, true, false), (1, false, false), (1, true, true), (0, true, true), (1, false, true)]
-    {
-        layered_baseline_routing_row(issuer, satisfiable, build).await;
+async fn composed_image_routing_pinned_rows() {
+    for (issuer, satisfiable) in [(1, true), (0, true), (1, false), (0, false)] {
+        composed_image_routing_row(issuer, satisfiable).await;
     }
 }
 
 #[hegel::test]
-fn generated_layered_baseline_routing(tc: hegel::TestCase) {
-    // Both issuer locations and satisfiable/unsatisfiable catalogue needs.
+fn generated_composed_image_routing(tc: hegel::TestCase) {
+    // Both issuer locations and resolvable/unresolvable dispatched needs.
     let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
     let satisfiable = tc.draw(gs::booleans());
-    let build = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .build()
         .expect("runtime")
-        .block_on(layered_baseline_routing_row(issuer, satisfiable, build));
+        .block_on(composed_image_routing_row(issuer, satisfiable));
 }

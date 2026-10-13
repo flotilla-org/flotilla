@@ -1425,7 +1425,7 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
                     .definitions::<flotilla_resources::CrewImageBaseline>("flotilla")
                     .apply(
                         &InputMeta::builder().name("fleet-crew".into()).build(),
-                        &flotilla_resources::CrewImageBaselineSpec { image: "crew:baseline".into(), layers: None },
+                        &flotilla_resources::CrewImageBaselineSpec { image: "crew:baseline".into() },
                     )
                     .await
                     .expect("baseline on admission host");
@@ -1442,7 +1442,7 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
                     .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
                         legacy_image_baseline_ref: None,
                         host_ref: host_id.clone(),
-                        image: flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() },
+                        image: Some(flotilla_resources::DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }),
                         pull_policy: Default::default(),
                         memory_policy: Default::default(),
                         agent_adapters: Default::default(),
@@ -1507,11 +1507,11 @@ async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested
             let snapshot = &convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
             let policy = backend.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("prepared snapshot");
             let docker = policy.spec.docker_per_vessel.expect("contained snapshot");
-            let flotilla_resources::DockerImageSource::Composition { composition } = docker.image else {
-                panic!("legacy baseline must freeze as a no-layer composition");
-            };
-            assert!(composition.layers.is_empty());
-            assert_eq!(composition.literal_base.as_deref(), Some("crew:baseline"));
+            assert_eq!(
+                docker.image,
+                Some(flotilla_resources::DockerImageSource::Literal("crew:baseline".into())),
+                "legacy baseline must freeze as a literal"
+            );
             assert_eq!(docker.legacy_image_baseline_ref.as_deref(), Some("fleet-crew"));
         }
         for host in [&topology.leader, &topology.follower] {
@@ -3668,7 +3668,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
             legacy_image_baseline_ref: None,
             memory_policy: Default::default(),
             host_ref: "remote-docker-host".to_string(),
-            image: "crew:latest".to_string().into(),
+            image: Some("crew:latest".into()),
             pull_policy: Default::default(),
             agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: None,

@@ -47,7 +47,6 @@ pub(super) struct ControllerRuntimeState {
     pub(super) credential_store: Option<Arc<CredentialStore>>,
     pub(super) agent_material: Option<Arc<AgentMaterialRegistry>>,
     pub(super) blob_store: Option<Arc<TieredBlobStore>>,
-    pub(super) image_build_runner: Option<Arc<crate::image_build::LocalImageBuildRunner>>,
     pub(super) image_distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
     pub(super) provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
@@ -115,7 +114,6 @@ impl ControllerRuntimeState {
             credential_store: None,
             agent_material: None,
             blob_store: None,
-            image_build_runner: None,
             image_distributor: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             local_backing_observed: AtomicBool::new(false),
@@ -189,9 +187,11 @@ impl ControllerRuntimeState {
         self
     }
 
-    pub(super) fn with_image_build_runner(mut self, runner: Arc<crate::image_build::LocalImageBuildRunner>) -> Self {
-        self.image_distributor = runner.distributor.clone();
-        self.image_build_runner = Some(runner);
+    pub(super) fn with_image_distributor(
+        mut self,
+        distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
+    ) -> Self {
+        self.image_distributor = distributor;
         self
     }
 

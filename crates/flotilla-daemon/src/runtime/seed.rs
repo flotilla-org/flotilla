@@ -267,7 +267,7 @@ pub(super) async fn ensure_default_policies(
                     legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: profile.host_id.clone(),
-                    image: DEFAULT_DOCKER_IMAGE.to_string().into(),
+                    image: Some(DEFAULT_DOCKER_IMAGE.into()),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::new(),
                     default_cwd: Some("/workspace".to_string()),

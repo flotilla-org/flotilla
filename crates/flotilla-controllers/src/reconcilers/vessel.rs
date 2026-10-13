@@ -23,7 +23,7 @@ use flotilla_resources::{
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository,
     RepositoryKey, RepositorySpec, Resource, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, Vessel, VesselImage, VesselPhase, VesselStatusPatch, WorkPhase,
     ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
@@ -276,7 +276,7 @@ enum PlacementStrategy {
         local_clone: bool,
         host_ref: String,
         pool: String,
-        image: DockerImageSource,
+        image: Option<DockerImageSource>,
         pull_policy: DockerImagePullPolicy,
         env: BTreeMap<String, String>,
         mount_path: String,
@@ -285,7 +285,7 @@ enum PlacementStrategy {
     DockerFreshCloneInContainer {
         host_ref: String,
         pool: String,
-        image: DockerImageSource,
+        image: Option<DockerImageSource>,
         pull_policy: DockerImagePullPolicy,
         env: BTreeMap<String, String>,
         clone_path: String,
@@ -311,18 +311,21 @@ enum PlannedPatch {
         observed_policy_version: String,
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
+        image: Option<VesselImage>,
     },
     EnvironmentRecreation {
         observed_policy_ref: String,
         observed_policy_version: String,
         placement_decision: Option<PlacementDecision>,
         message: String,
+        image: Option<VesselImage>,
     },
     CheckoutChurn {
         observed_policy_ref: String,
         observed_policy_version: String,
         placement_decision: Option<PlacementDecision>,
         message: String,
+        image: Option<VesselImage>,
     },
     Ready {
         configured_limits: Option<ConfiguredResourceLimits>,
@@ -351,6 +354,30 @@ struct ImageStamp {
     image_ref: String,
     local_image_id: String,
     registry_digest: Option<String>,
+    /// The composed identity and the digest it provisioned from.
+    composed: Option<VesselImage>,
+}
+
+/// The composed identity a placement froze at admission (ADR 0062).
+fn composed_image(placement_policy: &ResourceObject<PlacementPolicy>, digest: Option<String>) -> Option<VesselImage> {
+    match placement_policy.spec.docker_per_vessel.as_ref()?.image.as_ref()? {
+        DockerImageSource::Built { identity, .. } => Some(VesselImage { identity: identity.clone(), digest }),
+        DockerImageSource::Literal(_) | DockerImageSource::Baseline { .. } => None,
+    }
+}
+
+/// The Environment's image fields: a composed image names its per-identity
+/// ImageBuild and receives the build's digest from the Environment reconciler;
+/// literal and baseline images resolve now.
+async fn environment_image(
+    image: &Option<DockerImageSource>,
+    baselines: &flotilla_store::DefinitionResolver<flotilla_resources::CrewImageBaseline>,
+) -> Result<(String, Option<String>), String> {
+    match image {
+        None => Err("composed image was not frozen at admission; readmit the convoy".into()),
+        Some(DockerImageSource::Built { image_build_ref, .. }) => Ok((String::new(), Some(image_build_ref.clone()))),
+        Some(image) => image.resolve(baselines).await.map(|image| (image, None)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +413,7 @@ impl VesselPrepared {
                 observed_policy_version: placement_policy.metadata.resource_version.clone(),
                 placement_decision,
                 message: format!("checkout {checkout_name} is missing shortly after a create attempt; retrying after backoff"),
+                image: composed_image(placement_policy, None),
             },
             actuations,
         }
@@ -497,7 +525,7 @@ impl Reconciler for VesselReconciler {
         if let Some(decision) = placement_decision.as_ref() {
             strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
         }
-        let declared_agent_adapters =
+        let mut declared_agent_adapters =
             placement_policy.spec.docker_per_vessel.as_ref().map(|docker| docker.agent_adapters.clone()).unwrap_or_default();
 
         let (vessel_index, requirement) = match convoy
@@ -513,6 +541,11 @@ impl Reconciler for VesselReconciler {
             Ok(adapters) => adapters,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
+        // A composed image installs exactly the harnesses its roles resolve
+        // to; interior discovery verifies them instead of the policy's list.
+        if composed_image(&placement_policy, None).is_some() {
+            declared_agent_adapters.clone_from(&required_adapters);
+        }
         let effective_stance = strategy.effective_stance();
 
         let repository_refs = requirement
@@ -606,17 +639,13 @@ impl Reconciler for VesselReconciler {
                                 actuations,
                             ));
                         }
-                        match image_stamp(&existing) {
+                        match image_stamp(&existing, &placement_policy) {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
-                        let image_ref = match image {
-                            DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => Ok(String::new()),
-                            _ => image.resolve(&self.image_baselines).await,
-                        };
-                        let image_ref = match image_ref {
+                        let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -625,16 +654,7 @@ impl Reconciler for VesselReconciler {
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
-                                    image_composition: match image {
-                                        DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => {
-                                            Some(composition.clone())
-                                        }
-                                        _ => None,
-                                    },
-                                    image_build_ref: match image {
-                                        DockerImageSource::Composition { composition } => composition.build_refs.last().cloned(),
-                                        _ => None,
-                                    },
+                                    image_build_ref,
                                     memory_policy: placement_policy
                                         .spec
                                         .docker_per_vessel
@@ -1053,6 +1073,7 @@ impl Reconciler for VesselReconciler {
                                         "environment {env_name} Git checkout membership or protection mounts changed; \
                                          stop crews and recreate the environment before launching crews"
                                     ),
+                                    image: composed_image(&placement_policy, None),
                                 },
                                 actuations,
                             });
@@ -1075,7 +1096,7 @@ impl Reconciler for VesselReconciler {
                                 actuations,
                             ));
                         }
-                        match image_stamp(&existing) {
+                        match image_stamp(&existing, &placement_policy) {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
@@ -1096,11 +1117,7 @@ impl Reconciler for VesselReconciler {
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }
-                        let image_ref = match image {
-                            DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => Ok(String::new()),
-                            _ => image.resolve(&self.image_baselines).await,
-                        };
-                        let image_ref = match image_ref {
+                        let (image_ref, image_build_ref) = match environment_image(image, &self.image_baselines).await {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1109,16 +1126,7 @@ impl Reconciler for VesselReconciler {
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
-                                    image_composition: match image {
-                                        DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => {
-                                            Some(composition.clone())
-                                        }
-                                        _ => None,
-                                    },
-                                    image_build_ref: match image {
-                                        DockerImageSource::Composition { composition } => composition.build_refs.last().cloned(),
-                                        _ => None,
-                                    },
+                                    image_build_ref,
                                     memory_policy: placement_policy
                                         .spec
                                         .docker_per_vessel
@@ -1446,13 +1454,14 @@ impl Reconciler for VesselReconciler {
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = match &prepared.patch {
             PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for } => {
+            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for, image } => {
                 Some(VesselStatusPatch::MarkProvisioning {
                     observed_policy_ref: observed_policy_ref.clone(),
                     observed_policy_version: observed_policy_version.clone(),
                     placement_decision: placement_decision.clone(),
                     started_at: now,
                     message: provisioning_stuck_message(obj, waiting_for, now),
+                    image: image.clone(),
                 })
             }
             PlannedPatch::EnvironmentRecreation { message, .. }
@@ -1461,8 +1470,8 @@ impl Reconciler for VesselReconciler {
                 (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
                     .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
             }
-            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message }
-            | PlannedPatch::EnvironmentRecreation { observed_policy_ref, observed_policy_version, placement_decision, message } => {
+            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message, image }
+            | PlannedPatch::EnvironmentRecreation { observed_policy_ref, observed_policy_version, placement_decision, message, image } => {
                 if obj
                     .status
                     .as_ref()
@@ -1476,6 +1485,7 @@ impl Reconciler for VesselReconciler {
                         placement_decision: placement_decision.clone(),
                         started_at: now,
                         message: Some(message.clone()),
+                        image: image.clone(),
                     })
                 }
             }
@@ -1500,6 +1510,7 @@ impl Reconciler for VesselReconciler {
                 requested_stance: *requested_stance,
                 effective_stance: *effective_stance,
                 ready_at: now,
+                image: image.as_ref().and_then(|image| image.composed.clone()),
             }),
             PlannedPatch::Interrupted { roles, message }
                 if obj.status.as_ref().is_none_or(|status| {
@@ -1542,13 +1553,23 @@ impl Reconciler for VesselReconciler {
     }
 }
 
-fn image_stamp(environment: &ResourceObject<Environment>) -> Result<ImageStamp, String> {
+fn image_stamp(
+    environment: &ResourceObject<Environment>,
+    placement_policy: &ResourceObject<PlacementPolicy>,
+) -> Result<ImageStamp, String> {
     let status = environment.status.as_ref().expect("ready environment has status");
     let image_ref =
         status.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.metadata.name))?;
     let local_image_id =
         status.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
-    Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone() })
+    // A composed environment provisioned from its build's digest.
+    let composed = environment
+        .spec
+        .docker
+        .as_ref()
+        .and_then(|docker| docker.image_build_ref.as_ref())
+        .and_then(|_| composed_image(placement_policy, Some(image_ref.clone())));
+    Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone(), composed })
 }
 
 /// Git's ordinary upstream writes target the common config, even with
@@ -1640,6 +1661,7 @@ fn provisioning_patch(
         observed_policy_version: placement_policy.metadata.resource_version.clone(),
         placement_decision,
         waiting_for,
+        image: composed_image(placement_policy, None),
     }
 }
 

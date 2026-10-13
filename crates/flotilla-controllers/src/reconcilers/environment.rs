@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
 use flotilla_resources::{
     DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ImageBuildPhase,
-    ResourceError, ResourceObject,
+    ImageDelivery, ResourceError, ResourceObject,
 };
 use flotilla_store::{
     controller::{ReconcileOutcome, Reconciler},
@@ -23,13 +23,6 @@ pub trait DockerEnvironmentRuntime: Send + Sync {
             return self.provision(name, docker).await.map(EnvironmentProvisioning::Docker);
         }
         Err("host-direct provider unavailable".into())
-    }
-    async fn ensure_image(
-        &self,
-        _build: &ResourceObject<flotilla_resources::ImageBuild>,
-        _host: &str,
-    ) -> Result<Option<flotilla_resources::PlacedImageIdentity>, String> {
-        Ok(None)
     }
     async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String>;
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String>;
@@ -56,7 +49,6 @@ pub struct EnvironmentReconciler<R> {
     hosts: TypedResolver<Host>,
     backend: ResourceBackend,
     namespace: String,
-    image_inputs: Option<Arc<dyn flotilla_core::image_build::ImageBuildInputResolver>>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
@@ -68,15 +60,9 @@ impl<R> EnvironmentReconciler<R> {
             hosts: backend.using::<Host>(namespace),
             backend,
             namespace: namespace.into(),
-            image_inputs: None,
             local_host_ref: None,
             additional_host_refs: Default::default(),
         }
-    }
-
-    pub fn with_image_build_inputs(mut self, inputs: Option<Arc<dyn flotilla_core::image_build::ImageBuildInputResolver>>) -> Self {
-        self.image_inputs = inputs;
-        self
     }
 
     pub fn with_local_host_ref(mut self, local_host_ref: CanonicalHostId) -> Self {
@@ -123,7 +109,7 @@ pub enum EnvironmentPrepared {
     None,
     Ready(EnvironmentProvisioning),
     Failed(String),
-    Waiting(String, Vec<String>),
+    Waiting(String),
 }
 
 impl<R> Reconciler for EnvironmentReconciler<R>
@@ -141,104 +127,30 @@ where
             EnvironmentPhase::Pending | EnvironmentPhase::Provisioning => {
                 if let Some(original) = &obj.spec.docker {
                     let mut spec = original.clone();
-                    let mut resolved_identity = None;
-                    let mut progress = obj.status.as_ref().map(|status| status.image_build_refs.clone()).unwrap_or_default();
-                    if let Some(composition) = &original.image_composition {
-                        let Some(inputs) = &self.image_inputs else {
-                            return Ok(EnvironmentPrepared::Waiting("ImageBuild input resolver unavailable".into(), progress));
-                        };
-                        let mut composition = composition.as_ref().clone();
-                        if !progress.is_empty() {
-                            composition.build_refs = progress.clone();
-                        }
-                        match flotilla_core::image_build::ImageBuildAdmission::new(
-                            self.backend.clone(),
-                            &self.namespace,
-                            Arc::clone(inputs),
-                        )
-                        .join(&spec.host_ref, &composition)
-                        .await
-                        {
-                            Ok(refs) => progress = refs,
-                            Err(reason) => {
-                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild resolution waiting: {reason}"), progress))
-                            }
-                        }
-                        spec.image_build_ref = progress.last().cloned();
-                    }
-                    let waiting = |message: String| Ok(EnvironmentPrepared::Waiting(message, progress.clone()));
-
-                    if let Some(name) = &spec.image_build_ref {
-                        let mut build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
+                    if let Some(name) = &original.image_build_ref {
+                        // The composed image is the per-identity build's digest.
+                        // Never fall back to another image: wait with the reason.
+                        let build = match flotilla_store::read_image_build(&self.backend, &self.namespace, name).await {
                             Ok(build) => build,
                             Err(ResourceError::NotFound { .. }) => {
-                                return waiting(format!("ImageBuild {name} awaiting replicated build status"))
+                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} awaiting replicated build status")))
                             }
                             Err(error) => return Err(error),
                         };
-                        for _ in 0..3 {
-                            match flotilla_store::read_image_build(
-                                &self.backend,
-                                &self.namespace,
-                                &format!("{}-retry", build.metadata.name),
-                            )
-                            .await
-                            {
-                                Ok(next) => build = next,
-                                Err(ResourceError::NotFound { .. }) => break,
-                                Err(error) => return Err(error),
+                        let status = build.status.clone().unwrap_or_default();
+                        let digest = match (status.phase, &status.digest) {
+                            (ImageBuildPhase::Built, Some(digest)) => digest.clone(),
+                            (phase, _) => {
+                                let reason = status.failure.as_ref().map(|failure| format!(": {}", failure.reason)).unwrap_or_default();
+                                return Ok(EnvironmentPrepared::Waiting(format!("ImageBuild {name} {phase:?}{reason}")));
                             }
-                        }
-                        let phase = build.status.as_ref().map_or(ImageBuildPhase::Queued, |status| status.phase);
-                        let mut dependency = build.clone();
-                        let mut dependency_reason = String::new();
-                        for _ in 0..64 {
-                            if let Some(failure) = dependency.status.as_ref().and_then(|status| status.failure.as_ref()) {
-                                dependency_reason = format!("; ImageBuild {} failed: {}", dependency.metadata.name, failure.reason);
-                                break;
-                            }
-                            let parent = dependency.spec.previous_build_ref.as_ref().or(dependency.spec.parent_build_ref.as_ref());
-                            let Some(parent) = parent else {
-                                break;
-                            };
-                            match flotilla_store::read_image_build(&self.backend, &self.namespace, parent).await {
-                                Ok(parent) if parent.status.as_ref().is_some_and(|status| status.phase == ImageBuildPhase::Built) => break,
-                                Ok(parent) => dependency = parent,
-                                Err(ResourceError::NotFound { .. }) => {
-                                    dependency_reason = format!("; awaiting ImageBuild {parent}");
-                                    break;
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-
-                        let Some(status) = build.status.as_ref().filter(|status| status.phase == ImageBuildPhase::Built) else {
-                            let reason =
-                                build.status.as_ref().and_then(|status| status.failure.as_ref()).map(|failure| failure.reason.as_str());
-                            return waiting(format!(
-                                "ImageBuild {} {phase:?}{}{dependency_reason}",
-                                build.metadata.name,
-                                reason.map(|reason| format!(": {reason}")).unwrap_or_default()
-                            ));
                         };
-                        if original.image_composition.as_ref().is_some_and(|composition| progress.len() < composition.layers.len()) {
-                            return waiting(format!("ImageBuild {} built; awaiting next composition stage", build.metadata.name));
+                        spec.image = digest;
+                        // A local build is only on its builder; a registry
+                        // digest is pulled by the provider with its pull credential.
+                        if matches!(build.spec.current().map(|spec| &spec.delivery), Some(ImageDelivery::Local)) {
+                            spec.pull_policy = DockerImagePullPolicy::Never;
                         }
-                        let identity = status.identity.as_ref().ok_or_else(|| ResourceError::invalid("built image has no identity"))?;
-                        let delivered = match self.docker.ensure_image(&build, &spec.host_ref).await {
-                            Ok(Some(delivered)) => delivered,
-                            Ok(None) if build.spec.host_ref == spec.host_ref => identity.clone(),
-                            Ok(None) => {
-                                return waiting(format!(
-                                    "ImageBuild {} awaiting held digest or registry availability on {}",
-                                    build.metadata.name, spec.host_ref
-                                ))
-                            }
-                            Err(reason) => return waiting(format!("ImageBuild {} distribution waiting: {reason}", build.metadata.name)),
-                        };
-                        spec.image = delivered.local_image_id.clone();
-                        resolved_identity = Some(delivered);
-                        spec.pull_policy = DockerImagePullPolicy::Never;
                     }
                     match self
                         .docker
@@ -248,19 +160,8 @@ where
                         )
                         .await
                     {
-                        Ok(mut provisioning) => {
-                            if let Some(identity) = resolved_identity {
-                                if !matches!(&provisioning, EnvironmentProvisioning::Docker(value) if value.local_image_id == identity.local_image_id)
-                                {
-                                    return Ok(EnvironmentPrepared::Failed("provisioned image differs from delivered digest".into()));
-                                }
-                                if let EnvironmentProvisioning::Docker(value) = &mut provisioning {
-                                    value.registry_digest = identity.registry_digest;
-                                }
-                            }
-                            Ok(EnvironmentPrepared::Ready(provisioning))
-                        }
-                        Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message, progress)),
+                        Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
+                        Err(message) if message.starts_with("waiting on build:") => Ok(EnvironmentPrepared::Waiting(message)),
                         Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
@@ -300,9 +201,7 @@ where
                     registry_digest: provisioning.registry_digest.clone(),
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
-                EnvironmentPrepared::Waiting(message, build_refs) => {
-                    Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone(), build_refs: build_refs.clone() })
-                }
+                EnvironmentPrepared::Waiting(message) => Some(EnvironmentStatusPatch::WaitForImageBuild { message: message.clone() }),
                 EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,
             },
             _ => None,

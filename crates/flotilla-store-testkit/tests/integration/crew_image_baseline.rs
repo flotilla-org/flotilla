@@ -44,10 +44,10 @@ async fn crew_image_baseline_merged_resolution_contract(#[case] backend: Resourc
 
     // Concurrent incompatible edits must not silently select a merge winner.
     let meta = InputMeta::builder().name("fleet-crew".to_string()).build();
-    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-a".to_string(), layers: None }).await.expect("local bump");
+    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-a".to_string() }).await.expect("local bump");
     remote
         .definitions::<CrewImageBaseline>("flotilla")
-        .apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-b".to_string(), layers: None })
+        .apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-b".to_string() })
         .await
         .expect("remote bump");
     replicas
@@ -55,10 +55,10 @@ async fn crew_image_baseline_merged_resolution_contract(#[case] backend: Resourc
         .await
         .expect("replicate conflict");
     assert!(reference.resolve(&definitions).await.expect_err("conflict").contains("image-baseline `fleet-crew` missing/unresolved"));
-    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v3".to_string(), layers: None }).await.expect("resolve conflict");
+    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v3".to_string() }).await.expect("resolve conflict");
     assert_eq!(reference.resolve(&definitions).await.expect("resolved baseline"), "crew:v3");
 
-    definitions.apply(&meta, &CrewImageBaselineSpec { image: "  ".to_string(), layers: None }).await.expect("empty image");
+    definitions.apply(&meta, &CrewImageBaselineSpec { image: "  ".to_string() }).await.expect("empty image");
     assert!(reference.resolve(&definitions).await.expect_err("empty").contains("missing/unresolved"));
     definitions.delete("fleet-crew").await.expect("delete baseline");
     assert!(reference.resolve(&definitions).await.expect_err("deleted").contains("missing/unresolved"));
@@ -104,65 +104,35 @@ fn placement_baseline_provenance_round_trips_and_never_infers_literal_tags(tc: h
     assert_eq!(decoded.legacy_image_baseline_ref(), expected);
 }
 
-// ADR 0047/#2731: stored generation-1 snapshots keep their image; new
-// compositions await identity, and resolved legacy literals need no registry.
+// ADR 0062: a composed placement freezes `Built { identity, image_build_ref }`;
+// it has no launchable reference until its ImageBuild is Built, so resolution
+// refuses rather than substituting another image. The ADR 0053 composition
+// form decodes as an omitted image (ADR 0047), and literals stay literal.
 #[hegel::test]
-fn cutover_composition_resolution_preserves_frozen_images(tc: hegel::TestCase) {
-    use flotilla_resources::{ImageComposition, ImageLayerSelection, PlacedImageIdentity};
-    // Cross empty/boundary/ordinary literals, all stored shapes and identities,
-    // and invalid literal-plus-layer input that must not become another source.
+fn composed_sources_never_resolve_to_another_image(tc: hegel::TestCase) {
     let size = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(70));
-    let shape = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
-    let bound = tc.draw(hegel::generators::booleans());
-    let mixed_literal = tc.draw(hegel::generators::booleans());
     let literal = if size == 0 { String::new() } else { format!("crew:{}", "a".repeat(size)) };
-    let mut composition = ImageComposition::builder()
-        .selection(ImageLayerSelection::builder().base("base".into()).build())
-        .needs(Default::default())
-        .layers(Vec::new())
-        .build();
-    match shape {
-        0 => composition.baseline_image = Some(literal.clone()),
-        1 => composition.literal_base = Some(literal.clone()),
-        _ => {}
-    }
-    if shape == 1 && mixed_literal {
-        use flotilla_resources::{FrozenImageLayer, ImageLayerParent, ImageLayerSpec, ImageLayerStage};
-        composition.layers.push(FrozenImageLayer {
-            name: "base".into(),
-            spec: ImageLayerSpec::builder()
-                .stage(ImageLayerStage::Base)
-                .parent(ImageLayerParent::Image(format!("sha256:{}", "a".repeat(64))))
-                .repository("https://example.test/images".into())
-                .revision("1".repeat(40))
-                .fragment("Dockerfile".into())
-                .build(),
-        });
-    }
-    if bound {
-        composition.bind(PlacedImageIdentity { local_image_id: "sha256:built".into(), registry_digest: None }).expect("bind");
-    }
-    if shape == 1 && !mixed_literal {
-        let mut frozen = flotilla_resources::FrozenImageLayers::default();
-        frozen.include(&composition).expect("no-layer literal");
-        assert_eq!(frozen, flotilla_resources::FrozenImageLayers::default(), "literal sources do not claim frozen layer revisions");
-    }
-    let image = DockerImageSource::Composition { composition: Box::new(composition) };
-    let encoded = serde_json::to_value(&image).expect("serialize new shape");
-    assert!(encoded.get("image_baseline_ref").is_none());
-    let decoded: DockerImageSource = serde_json::from_value(encoded).expect("stored composition");
-    assert_eq!(decoded, image);
+    let built = DockerImageSource::Built { identity: format!("sha256:{}", "c".repeat(64)), image_build_ref: "image-ccc-amd64".into() };
+    let policy = |image: serde_json::Value| {
+        serde_json::from_value::<flotilla_resources::DockerPerVesselPlacementPolicySpec>(json!({
+            "host_ref": "host-a", "image": image,
+            "checkout": { "fresh_clone_in_container": { "clone_path": "/workspace" } }
+        }))
+        .expect("stored policy")
+        .image
+    };
+    assert_eq!(policy(serde_json::to_value(&built).expect("encode")), Some(built.clone()));
+    assert_eq!(policy(json!({"composition": {"selection": {"base": "base"}, "layers": [], "literal_base": literal}})), None);
+    assert_eq!(policy(json!(literal)), Some(DockerImageSource::Literal(literal.clone())));
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
         let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
-        let resolved = decoded.resolve(&backend.definitions("flotilla")).await;
-        if shape == 1 && (mixed_literal || size == 0) {
-            assert!(resolved.expect_err("invalid literal source must refuse even when bound").contains("nonempty base and no layers"));
-        } else if bound {
-            assert_eq!(resolved.expect("built identity"), "sha256:built");
-        } else if shape < 2 && size > 0 {
-            assert_eq!(resolved.expect("frozen literal"), literal);
+        let definitions = backend.definitions("flotilla");
+        assert!(built.resolve(&definitions).await.expect_err("awaits build").contains("image-ccc-amd64"));
+        let resolved = DockerImageSource::Literal(literal.clone()).resolve(&definitions).await;
+        if size == 0 {
+            assert!(resolved.is_err(), "empty literals cannot launch");
         } else {
-            assert!(resolved.is_err(), "empty/unbuilt images cannot launch");
+            assert_eq!(resolved.expect("literal"), literal);
         }
     });
 }

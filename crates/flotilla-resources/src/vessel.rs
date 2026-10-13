@@ -145,6 +145,8 @@ pub enum VesselStatusPatch {
         placement_decision: Option<PlacementDecision>,
         started_at: DateTime<Utc>,
         message: Option<String>,
+        /// The composed image provisioning started from, recorded as [`Self::RecordImage`].
+        image: Option<VesselImage>,
     },
     MarkReady {
         configured_limits: Option<ConfiguredResourceLimits>,
@@ -158,6 +160,8 @@ pub enum VesselStatusPatch {
         requested_stance: Stance,
         effective_stance: Stance,
         ready_at: DateTime<Utc>,
+        /// The composed image and its digest, recorded as [`Self::RecordImage`].
+        image: Option<VesselImage>,
     },
     MarkInterrupted {
         roles: BTreeSet<String>,
@@ -178,21 +182,16 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
             Self::ObserveDegradation { conditions } => status.degraded = conditions.clone(),
-            Self::RecordImage { image } => match &mut status.image {
-                Some(recorded) if recorded.identity == image.identity => {
-                    if recorded.digest.is_none() {
-                        recorded.digest = image.digest.clone();
-                    }
-                }
-                Some(_) => {}
-                None => status.image = Some(image.clone()),
-            },
+            Self::RecordImage { image } => record_image(status, image),
             Self::ReplaceImage { image } => status.image = Some(image.clone()),
             Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::RequireEnvironmentRecreation { message } => status.message = Some(message.clone()),
-            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {
+            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message, image } => {
+                if let Some(image) = image {
+                    record_image(status, image);
+                }
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
@@ -214,7 +213,11 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 requested_stance,
                 effective_stance,
                 ready_at,
+                image,
             } => {
+                if let Some(image) = image {
+                    record_image(status, image);
+                }
                 status.configured_limits = configured_limits.clone();
                 status.phase = VesselPhase::Ready;
                 if let Some(placement_decision) = placement_decision {
@@ -253,6 +256,20 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
 }
 
 /// Name a convoy Vessel `<convoy>-<vessel>`.
+/// A recorded identity is kept until relaunch; recording the same identity
+/// fills a missing digest and never replaces a recorded one.
+fn record_image(status: &mut VesselStatus, image: &VesselImage) {
+    match &mut status.image {
+        Some(recorded) if recorded.identity == image.identity => {
+            if recorded.digest.is_none() {
+                recorded.digest.clone_from(&image.digest);
+            }
+        }
+        Some(_) => {}
+        None => status.image = Some(image.clone()),
+    }
+}
+
 pub fn vessel_resource_name(convoy_name: &str, vessel: &str) -> String {
     format!("{convoy_name}-{vessel}")
 }

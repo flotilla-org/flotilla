@@ -22,6 +22,7 @@ fn project_removal_never_leaks_back_through_other_role_defaults(tc: hegel::TestC
         })
         .collect::<Vec<_>>();
     let defaults = CrewDefaultsSpec {
+        image: None,
         project_ref: None,
         default_workflow_ref: None,
         roles: BTreeMap::new(),

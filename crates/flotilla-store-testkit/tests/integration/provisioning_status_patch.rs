@@ -329,6 +329,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     };
 
     VesselStatusPatch::MarkProvisioning {
+        image: None,
         placement_decision: Some(placement_decision.clone()),
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "12".to_string(),
@@ -341,6 +342,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision));
 
     VesselStatusPatch::MarkProvisioning {
+        image: None,
         placement_decision: Some(PlacementDecision {
             minimal_alternatives: Vec::new(),
             escalation_reason: None,
@@ -361,6 +363,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision), "placement decision is write-once");
 
     VesselStatusPatch::MarkReady {
+        image: None,
         configured_limits: None,
         placement_decision: None,
         environment_ref: Some("env-a".to_string()),
@@ -380,6 +383,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.local_image_id.as_deref(), Some("sha256:test-image"));
 
     VesselStatusPatch::MarkReady {
+        image: None,
         configured_limits: None,
         placement_decision: None,
         environment_ref: Some("env-a".to_string()),

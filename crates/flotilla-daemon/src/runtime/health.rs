@@ -351,10 +351,11 @@ pub(super) async fn apply_host_heartbeat_with_credentials(
         );
     }
     let build_records = backend.using::<flotilla_resources::ImageBuild>(namespace).list().await.map_err(|error| error.to_string())?;
+    // Infrastructure failures retry in place; a Failed build is terminal
+    // until an operator deletes it. Retired records are ignored.
     for build in &build_records.items {
-        if build.spec.host_ref == profile.host_id
+        if build.spec.current().is_some_and(|spec| spec.host_ref == profile.host_id)
             && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)
-            && !build_records.items.iter().any(|next| next.spec.previous_build_ref.as_deref() == Some(build.metadata.name.as_str()))
         {
             let reason =
                 build.status.as_ref().and_then(|status| status.failure.as_ref()).map(|failure| failure.reason.clone()).unwrap_or_default();

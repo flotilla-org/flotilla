@@ -379,10 +379,23 @@ impl AdmissionActions<'_> {
                 self.events.finish(id, empty_identity, CommandValue::Error { message });
                 return Ok(id);
             }
-            if let Err(message) = self.convoy_admission.join_convoy_placement_builds(&namespace, &mut placement).await {
-                self.events.finish(id, empty_identity, CommandValue::Error { message });
-                return Ok(id);
-            }
+            let vessel_placements = match self
+                .convoy_admission
+                .join_convoy_placement_builds(
+                    &namespace,
+                    project_ref.as_deref(),
+                    &workflow.spec,
+                    &mut placement,
+                    placement_decision.as_ref(),
+                )
+                .await
+            {
+                Ok(vessel_placements) => vessel_placements,
+                Err(message) => {
+                    self.events.finish(id, empty_identity, CommandValue::Error { message });
+                    return Ok(id);
+                }
+            };
             let result = self
                 .convoy_admission
                 .admit_created_convoy(
@@ -401,6 +414,7 @@ impl AdmissionActions<'_> {
                         .adopted_checkout_refs(adopted_checkout_refs)
                         .maybe_adopted_checkout_ref_to_cleanup(adopted_checkout_ref_to_cleanup)
                         .maybe_dispatching_principal_ref(dispatching_principal_ref)
+                        .vessel_placements(vessel_placements)
                         .build(),
                     admission_guard,
                 )

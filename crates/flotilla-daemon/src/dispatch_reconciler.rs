@@ -948,6 +948,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name("widgets".to_string()).build(),
                 &ProjectSpec {
+                    image: None,
                     charter: None,
                     role_definitions: BTreeMap::new(),
                     charter_prose: BTreeMap::new(),

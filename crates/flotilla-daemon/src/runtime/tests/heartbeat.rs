@@ -480,8 +480,11 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
     runtime.block_on(async {
         let backend = ResourceBackend::new(InMemoryBackend::default());
         ensure_host_exists(&backend, NAMESPACE, "host", "test").await.expect("host");
-        let realisation =
-            if docker { FulfilmentRealisation::DockerPerVessel { image: "crew:test".into() } } else { FulfilmentRealisation::HostDirect };
+        let realisation = if docker {
+            FulfilmentRealisation::DockerPerVessel { image: Some("crew:test".into()) }
+        } else {
+            FulfilmentRealisation::HostDirect
+        };
         backend
             .clone()
             .using::<FulfilmentKind>(NAMESPACE)

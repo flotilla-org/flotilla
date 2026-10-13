@@ -461,7 +461,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
                     legacy_image_baseline_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "feta-host".to_string(),
-                    image: "crew:latest".to_string().into(),
+                    image: Some("crew:latest".into()),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::new(),
                     default_cwd: None,
