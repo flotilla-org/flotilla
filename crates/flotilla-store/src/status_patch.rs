@@ -19,7 +19,7 @@ where
         patch,
         || async {
             let current = resolver.get(name).await?;
-            Ok((current.metadata.resource_version, current.status))
+            Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
         },
         |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
         || async {},
@@ -29,6 +29,8 @@ where
 
 /// Apply a patch with an injected action between reading a version and writing it.
 /// This is used by callers testing a conflict and the subsequent optimistic retry.
+/// A patch whose `StatusPatch::requires_write` declines the change returns the
+/// current object without writing, so `before_update` does not run.
 #[doc(hidden)]
 pub async fn apply_status_patch_with_before_update<T, F, Fut>(
     resolver: &TypedResolver<T>,
@@ -47,7 +49,7 @@ where
         patch,
         || async {
             let current = resolver.get(name).await?;
-            Ok((current.metadata.resource_version, current.status))
+            Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
         },
         |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
         before_update,
@@ -76,7 +78,7 @@ where
         || async {
             let current = resolver.get(name).await?;
             check(&current)?;
-            Ok((current.metadata.resource_version, current.status))
+            Ok((current.metadata.resource_version.clone(), current.status.clone(), current))
         },
         |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
         || async {},
@@ -95,7 +97,7 @@ where
     S: std::clone::Clone + Default,
     P: StatusPatch<S> + ?Sized,
     G: FnMut() -> GFut,
-    GFut: Future<Output = Result<(String, Option<S>), ResourceError>>,
+    GFut: Future<Output = Result<(String, Option<S>, R), ResourceError>>,
     U: FnMut(String, S) -> UFut,
     UFut: Future<Output = Result<R, ResourceError>>,
     B: FnOnce() -> BFut,
@@ -103,9 +105,13 @@ where
 {
     let mut before_update = Some(before_update);
     for _ in 0..MAX_RETRIES {
-        let (resource_version, current_status) = get_current().await?;
-        let mut new_status = current_status.unwrap_or_default();
+        let (resource_version, current_status, current) = get_current().await?;
+        let mut new_status = current_status.clone().unwrap_or_default();
         patch.apply(&mut new_status);
+        // A first status is always committed: its presence is itself a change.
+        if current_status.as_ref().is_some_and(|before| !patch.requires_write(before, &new_status)) {
+            return Ok(current);
+        }
         if let Some(before_update) = before_update.take() {
             before_update().await;
         }
@@ -149,6 +155,87 @@ mod tests {
         }
     }
 
+    /// Sets the value and declines to commit when the value is already set.
+    struct SetPatch(u32);
+
+    impl StatusPatch<CounterStatus> for SetPatch {
+        fn apply(&self, status: &mut CounterStatus) {
+            status.value = self.0;
+        }
+
+        fn requires_write(&self, before: &CounterStatus, after: &CounterStatus) -> bool {
+            before != after
+        }
+    }
+
+    type Read = (String, Option<CounterStatus>);
+
+    async fn apply_set(value: u32, reads: Vec<Read>, conflict_on: &'static str) -> (Result<CounterStatus, ResourceError>, Vec<String>) {
+        let reads = Arc::new(Mutex::new(VecDeque::from(reads)));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _, _, _>(
+            "counter-c",
+            &SetPatch(value),
+            {
+                let reads = Arc::clone(&reads);
+                move || {
+                    let reads = Arc::clone(&reads);
+                    async move {
+                        let (resource_version, status) = reads.lock().expect("reads lock").pop_front().expect("queued read");
+                        Ok((resource_version, status.clone(), status.unwrap_or_default()))
+                    }
+                }
+            },
+            {
+                let writes = Arc::clone(&writes);
+                move |resource_version: String, status: CounterStatus| {
+                    let writes = Arc::clone(&writes);
+                    async move {
+                        writes.lock().expect("writes lock").push(resource_version.clone());
+                        if resource_version == conflict_on {
+                            Err(ResourceError::conflict("counter-c", "stale resourceVersion"))
+                        } else {
+                            Ok(status)
+                        }
+                    }
+                }
+            },
+            || async {},
+        )
+        .await;
+        let writes = writes.lock().expect("writes lock").clone();
+        (result, writes)
+    }
+
+    #[tokio::test]
+    async fn declined_patch_returns_current_object_without_writing() {
+        let current = CounterStatus { value: 7, note: Some("current".to_string()) };
+        let (result, writes) = apply_set(7, vec![("4".to_string(), Some(current.clone()))], "").await;
+
+        assert_eq!(result.expect("declined patch succeeds"), current);
+        assert!(writes.is_empty(), "a declined patch must not commit: {writes:?}");
+    }
+
+    #[tokio::test]
+    async fn first_status_is_written_even_when_the_patch_would_decline_it() {
+        let (result, writes) = apply_set(0, vec![("1".to_string(), None)], "").await;
+
+        assert_eq!(result.expect("first status"), CounterStatus::default());
+        assert_eq!(writes, ["1"]);
+    }
+
+    #[tokio::test]
+    async fn conflict_retry_declines_when_another_writer_already_applied_the_change() {
+        let reads = vec![
+            ("1".to_string(), Some(CounterStatus { value: 1, note: None })),
+            ("2".to_string(), Some(CounterStatus { value: 9, note: Some("raced".to_string()) })),
+        ];
+        let (result, writes) = apply_set(9, reads, "1").await;
+
+        assert_eq!(result.expect("retry declines"), CounterStatus { value: 9, note: Some("raced".to_string()) });
+        assert_eq!(writes, ["1"], "only the conflicting attempt writes");
+    }
+
     #[tokio::test]
     async fn retries_conflicts_and_reapplies_patch_to_latest_state() {
         let reads = Arc::new(Mutex::new(VecDeque::from([
@@ -164,7 +251,10 @@ mod tests {
                 let reads = Arc::clone(&reads);
                 move || {
                     let reads = Arc::clone(&reads);
-                    async move { Ok(reads.lock().expect("reads lock").pop_front().expect("queued read")) }
+                    async move {
+                        let (resource_version, status) = reads.lock().expect("reads lock").pop_front().expect("queued read");
+                        Ok((resource_version, status.clone(), status.unwrap_or_default()))
+                    }
                 }
             },
             {
@@ -201,7 +291,7 @@ mod tests {
         let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _, _, _>(
             "counter-b",
             &CounterPatch::Increment,
-            || async { Ok(("1".to_string(), Some(CounterStatus { value: 1, note: None }))) },
+            || async { Ok(("1".to_string(), Some(CounterStatus { value: 1, note: None }), CounterStatus { value: 1, note: None })) },
             |_resource_version: String, _status: CounterStatus| async {
                 Err(ResourceError::conflict("counter-b", "stale resourceVersion"))
             },

@@ -17,8 +17,8 @@ use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentKind;
 use flotilla_protocol::{CanonicalHostId, NodeId};
 use flotilla_resources::{
-    Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, Host, HostStatusPatch, ReadWatchEvent, Resource, ResourceError,
-    ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
+    Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, FulfilmentFacts, Host, HostStatusPatch, ReadWatchEvent, Resource,
+    ResourceError, ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
 };
 use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
@@ -36,7 +36,7 @@ use super::credentials::reconcile_work_credentials;
 use super::discovery::{observe_fulfilment_facts, AgentlessSshProfile, BagEnvVars, FulfilmentProbeContext, LocalProvisioningProfile};
 use super::docker::DockerControllerRuntime;
 use super::environments::reconcile_provisioned_environments;
-use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, RuntimeHealth};
+use super::health::{apply_host_heartbeat_with_credentials, DaemonHealthIdentity, HostObservations, RuntimeHealth};
 use super::state::ControllerRuntimeState;
 use super::StartupRestoration;
 use crate::{
@@ -159,27 +159,6 @@ pub(super) async fn run_checkout_archive_gc(backend: ResourceBackend, namespace:
             }
         }
     }
-}
-
-pub(super) fn spawn_blob_sync_status_task(
-    store: Arc<TieredBlobStore>,
-    backend: ResourceBackend,
-    namespace: String,
-    host_id: String,
-) -> JoinHandle<()> {
-    spawn_periodic_task(Duration::from_secs(5), PeriodicTaskStart::Immediate, move || {
-        let store = Arc::clone(&store);
-        let backend = backend.clone();
-        let namespace = namespace.clone();
-        let host_id = host_id.clone();
-        async move {
-            let status = store.status().await;
-            let hosts = backend.using::<Host>(&namespace);
-            if let Err(error) = flotilla_store::apply_status_patch(&hosts, &host_id, &HostStatusPatch::BlobSync { status }).await {
-                warn!(%error, "failed to publish blob sync status");
-            }
-        }
-    })
 }
 
 pub(super) fn spawn_manifest_reconciler_task(
@@ -314,12 +293,16 @@ pub(super) fn spawn_sleep_inhibitor_task(
 
 pub(super) const FULFILMENT_CHANGE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Probe local fulfilment facts. Changed facts are published at once; a probe
+/// that only refreshes `observed_at` is kept in `observations` and folded into
+/// the next heartbeat write (#3154).
 pub(super) fn spawn_local_fulfilment_probe_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
     profile: LocalProvisioningProfile,
     providers: Arc<ProviderRegistry>,
     scratch: PathBuf,
+    observations: HostObservations,
 ) -> JoinHandle<()> {
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
@@ -327,11 +310,14 @@ pub(super) fn spawn_local_fulfilment_probe_task(
         let profile = profile.clone();
         let providers = Arc::clone(&providers);
         let scratch = scratch.clone();
+        let observations = observations.clone();
         async move {
             let discovery = daemon.discovery_runtime();
             let hosts = daemon.resource_backend().using::<Host>(&namespace);
             let status = hosts.get(&profile.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();
-            let previous = status.fulfilment_facts;
+            // Probe ages come from this process's latest observation: the stored
+            // `observed_at` may lag until the heartbeat folds a refresh in.
+            let previous = observations.fulfilment_facts().await.unwrap_or_else(|| status.fulfilment_facts.clone());
             let mut model_probes = status.model_probes.clone();
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
@@ -349,18 +335,32 @@ pub(super) fn spawn_local_fulfilment_probe_task(
             )
             .await
             {
-                Ok(facts) if facts != previous || model_probes != status.model_probes => {
-                    if let Err(error) = flotilla_store::apply_status_patch(
-                        &hosts,
-                        &profile.host_id,
-                        &HostStatusPatch::FulfilmentFacts { facts, model_probes },
-                    )
-                    .await
-                    {
-                        warn!(%error, "failed to publish observed fulfilment facts");
+                Ok(facts) => {
+                    // Timestamp-only refreshes fold into the heartbeat. Remember
+                    // facts only once the store holds them, so a failed publish
+                    // of changed facts is retried rather than folded.
+                    let published =
+                        if FulfilmentFacts::same_observations(&facts, &status.fulfilment_facts) && model_probes == status.model_probes {
+                            true
+                        } else {
+                            match flotilla_store::apply_status_patch(
+                                &hosts,
+                                &profile.host_id,
+                                &HostStatusPatch::FulfilmentFacts { facts: facts.clone(), model_probes },
+                            )
+                            .await
+                            {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    warn!(%error, "failed to publish observed fulfilment facts");
+                                    false
+                                }
+                            }
+                        };
+                    if published {
+                        observations.record_fulfilment_facts(facts).await;
                     }
                 }
-                Ok(_) => {}
                 Err(error) => warn!(%error, "failed to observe local fulfilment facts"),
             }
         }
@@ -379,7 +379,10 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
         async move {
             let hosts = daemon.resource_backend().using::<Host>(&namespace);
             let status = hosts.get(&ssh.provisioning.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();
-            let previous = status.fulfilment_facts;
+            // The SSH observation folds these facts into its next write, so the
+            // stored `observed_at` may lag this process's latest probe.
+            let observed = ssh.fulfilment_facts.read().await.clone();
+            let previous = if observed.is_empty() { status.fulfilment_facts.clone() } else { observed };
             let mut model_probes = status.model_probes.clone();
             let scratch = match ssh.runner.writable_config_base(None, Path::new("/tmp")).await {
                 Ok(base) => base.join("probe-cwd"),
@@ -404,34 +407,36 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
             )
             .await
             {
-                Ok(facts) if facts != previous || model_probes != status.model_probes => {
-                    *ssh.fulfilment_facts.write().await = facts.clone();
-                    if let Err(error) = flotilla_store::apply_status_patch(
-                        &hosts,
-                        &ssh.provisioning.host_id,
-                        &HostStatusPatch::FulfilmentFacts { facts, model_probes },
-                    )
-                    .await
-                    {
-                        warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
+                Ok(facts) => {
+                    // As for the local host: timestamp-only refreshes fold into
+                    // the next SSH observation write, and facts are remembered
+                    // only once the store holds them.
+                    let published =
+                        if FulfilmentFacts::same_observations(&facts, &status.fulfilment_facts) && model_probes == status.model_probes {
+                            true
+                        } else {
+                            match flotilla_store::apply_status_patch(
+                                &hosts,
+                                &ssh.provisioning.host_id,
+                                &HostStatusPatch::FulfilmentFacts { facts: facts.clone(), model_probes },
+                            )
+                            .await
+                            {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
+                                    false
+                                }
+                            }
+                        };
+                    if published {
+                        *ssh.fulfilment_facts.write().await = facts;
                     }
                 }
-                Ok(_) => {}
                 Err(error) => warn!(host = %ssh.provisioning.host_id, %error, "failed to observe SSH fulfilment facts"),
             }
         }
     })
-}
-
-#[cfg(test)]
-pub(super) fn spawn_heartbeat_task(
-    daemon: Arc<InProcessDaemon>,
-    namespace: String,
-    profile: LocalProvisioningProfile,
-    health: DaemonHealthIdentity,
-    interval: Duration,
-) -> JoinHandle<()> {
-    spawn_heartbeat_task_with_credentials(daemon, namespace, profile, Arc::new(None), health, RuntimeHealth::default(), interval)
 }
 
 pub(super) fn spawn_heartbeat_task_with_credentials(

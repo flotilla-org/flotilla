@@ -4051,6 +4051,11 @@ impl InProcessDaemon {
     async fn reap_ensured_convoy(&self, namespace: &str, ensure_name: &str, convoy_name: &str, force: bool) -> Result<(), String> {
         self.convoy_ensure_reconciler().await?.reap_ensured_convoy(self, namespace, ensure_name, convoy_name, force).await
     }
+    /// The daemon's injected wall clock. Placement judges Host heartbeat
+    /// freshness against it, so the heartbeat stamps `heartbeat_at` from it too.
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
+    }
     pub fn clock_for_scenarios(&self) -> Arc<dyn Clock> {
         self.clock.clone()
     }

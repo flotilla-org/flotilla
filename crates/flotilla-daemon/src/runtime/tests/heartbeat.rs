@@ -1,5 +1,7 @@
 use super::*;
+use flotilla_resources::Clock;
 use flotilla_store_memory::InMemoryBackend;
+use flotilla_store_sqlite::SqliteBackend;
 
 #[tokio::test(start_paused = true)]
 async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {
@@ -100,6 +102,7 @@ async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
         profile,
         detection_registry(daemon.discovery_runtime().runner.clone()),
         temp.path().join("probe-cwd"),
+        runtime_health.host_observations.clone(),
     );
     wait_until_with_timeout(Duration::from_secs(5), || {
         let hosts = hosts.clone();
@@ -356,12 +359,18 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
     )
     .await
     .expect("seed sleep inhibition health");
-    let heartbeat =
-        spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, test_health_identity(), Duration::from_millis(20));
     let blob_store = Arc::new(TieredBlobStore::new(temp.path(), vec![("test-fleet".to_string(), Arc::new(MemoryBlobStore::default()))]));
     blob_store.put(b"pending host status blob").await.expect("local blob put");
-    let blob_status_task =
-        spawn_blob_sync_status_task(Arc::clone(&blob_store), daemon.resource_backend(), NAMESPACE.to_string(), host_id.clone());
+    // Blob sync status is folded into the heartbeat's write rather than written on its own cadence.
+    let heartbeat = spawn_heartbeat_task_with_credentials(
+        Arc::clone(&daemon),
+        NAMESPACE.to_string(),
+        profile,
+        Arc::new(None),
+        test_health_identity(),
+        RuntimeHealth::default().with_blob_store(Arc::clone(&blob_store)),
+        Duration::from_millis(20),
+    );
 
     wait_until_with_timeout(Duration::from_secs(30), || {
         let hosts = hosts.clone();
@@ -419,8 +428,6 @@ async fn heartbeat_task_updates_host_status_without_socket_server() {
 
     heartbeat.abort();
     let _ = heartbeat.await;
-    blob_status_task.abort();
-    let _ = blob_status_task.await;
 }
 
 #[tokio::test]
@@ -544,4 +551,161 @@ fn unresolved_fulfilment_provider_publishes_unknown(tc: hegel::TestCase) {
         assert_eq!(facts.free_vessel_slots, (!pool).then_some(0));
         assert_eq!(model_probes.total_requests, 0);
     });
+}
+
+/// The daemon clock on a paused tokio runtime: wall time advances only with
+/// `tokio::time::advance`, so heartbeat timestamps follow the test's intervals.
+struct PausedClock {
+    origin: chrono::DateTime<Utc>,
+    started: tokio::time::Instant,
+}
+
+impl Clock for PausedClock {
+    fn now(&self) -> chrono::DateTime<Utc> {
+        self.origin + chrono::Duration::from_std(self.started.elapsed()).expect("paused elapsed time fits")
+    }
+}
+
+/// Yield until `condition` holds. The paused clock cannot advance while the
+/// test waits (a blocking task inhibits auto-advance), so the bound is real time.
+async fn settle<F, Fut>(what: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !condition().await {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::task::yield_now().await;
+    }
+}
+
+// Behaviour (#3154, done-when): on the SQLite backend, the Host's periodic
+// writers commit its status at most once per heartbeat interval. Blob sync
+// status is folded into the heartbeat, and a 5 s fulfilment probe that only
+// refreshes `observed_at` (an unresolved provider re-stamps "unknown" every
+// pass) commits nothing. `heartbeat_at` advances every interval.
+#[tokio::test(start_paused = true)]
+async fn host_status_commits_at_most_once_per_heartbeat_interval_on_sqlite() {
+    const INTERVAL: Duration = Duration::from_secs(30);
+    // SQLite runs on its own threads; holding a blocking task stops the paused
+    // clock auto-advancing (and tripping the store's read deadline) while the
+    // test waits for them. Time then moves only through `advance`.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let hold = tokio::task::spawn_blocking(move || held.recv().ok());
+
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("daemon.toml"), "machine_id = \"heartbeat-coalescing-test\"\n").expect("daemon config");
+    let config = Arc::new(ConfigStore::with_base(temp.path()));
+    std::fs::create_dir_all(config.state_dir()).expect("state dir");
+    let backend = ResourceBackend::new(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
+    let clock = Arc::new(PausedClock { origin: Utc::now(), started: tokio::time::Instant::now() });
+    let mut discovery = git_process_discovery(false);
+    discovery.runner = Arc::new(NoPrProcessRunner);
+    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
+        Vec::new(),
+        Arc::clone(&config),
+        discovery,
+        flotilla_protocol::HostName::new("test-host"),
+        backend,
+        clock.clone(),
+    )
+    .await;
+    let host_id = daemon.local_host_id().expect("local host id").to_string();
+    let profile = manual_profile(&host_id, false);
+    ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+    daemon
+        .resource_backend()
+        .using::<FulfilmentKind>(NAMESPACE)
+        .create(
+            &empty_meta("unresolved-kind"),
+            &FulfilmentKindSpec::builder()
+                .host_ref(host_id.clone())
+                .pool("passthrough".to_string())
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("fulfilment kind");
+    let blob_store = Arc::new(TieredBlobStore::new(temp.path(), vec![("test-fleet".to_string(), Arc::new(MemoryBlobStore::default()))]));
+    blob_store.put(b"pending host status blob").await.expect("local blob put");
+    let runtime_health = RuntimeHealth::default().with_blob_store(Arc::clone(&blob_store));
+    let observations = runtime_health.host_observations.clone();
+    let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+    let tasks = [
+        spawn_heartbeat_task_with_credentials(
+            Arc::clone(&daemon),
+            NAMESPACE.to_string(),
+            profile.clone(),
+            Arc::new(None),
+            test_health_identity(),
+            runtime_health,
+            INTERVAL,
+        ),
+        // No environment provider: every pass observes a fresh "unknown".
+        spawn_local_fulfilment_probe_task(
+            Arc::clone(&daemon),
+            NAMESPACE.to_string(),
+            profile,
+            Arc::new(ProviderRegistry::new()),
+            temp.path().join("probe-cwd"),
+            observations.clone(),
+        ),
+    ];
+    let probe_time = || {
+        let observations = observations.clone();
+        async move { observations.fulfilment_facts().await.and_then(|facts| facts.get("unresolved-kind").map(|facts| facts.observed_at)) }
+    };
+    let read = |hosts: flotilla_store::TypedResolver<Host>, host_id: String| async move {
+        let host = hosts.get(&host_id).await.expect("get host");
+        (host.metadata.resource_version.parse::<u64>().expect("numeric resource version"), host.status.unwrap_or_default())
+    };
+
+    // Startup: the first heartbeat and the first fulfilment pass publish.
+    settle("first heartbeat and probe", || {
+        let (hosts, host_id) = (hosts.clone(), host_id.clone());
+        async move {
+            let (_, status) = read(hosts, host_id).await;
+            status.heartbeat_at.is_some() && status.fulfilment_facts.contains_key("unresolved-kind") && probe_time().await.is_some()
+        }
+    })
+    .await;
+    let (mut version, status) = read(hosts.clone(), host_id.clone()).await;
+    assert_eq!(status.blob_sync.as_ref().expect("blob sync folded into the heartbeat").pending_count, 1);
+    let first_probe = status.fulfilment_facts["unresolved-kind"].observed_at;
+
+    for interval in 1..=10 {
+        for _ in 0..6 {
+            let previous_probe = probe_time().await;
+            tokio::time::advance(Duration::from_secs(5)).await;
+            settle("fulfilment pass", || async { probe_time().await != previous_probe }).await;
+        }
+        let expected_heartbeat = clock.now();
+        settle("heartbeat", || {
+            let (hosts, host_id) = (hosts.clone(), host_id.clone());
+            async move { read(hosts, host_id).await.1.heartbeat_at == Some(expected_heartbeat) }
+        })
+        .await;
+        let (current, status) = read(hosts.clone(), host_id.clone()).await;
+        assert_eq!(current - version, 1, "interval {interval}: exactly the heartbeat commits the Host status");
+        version = current;
+        // The heartbeat folds the probe's refreshed observation time into its write.
+        assert!(status.fulfilment_facts["unresolved-kind"].observed_at > first_probe, "interval {interval}");
+        assert!(status.heartbeat_is_fresh(clock.now()));
+    }
+
+    // A patch that changes nothing commits nothing.
+    let unchanged = HostStatusPatch::SleepInhibition {
+        health: read(hosts.clone(), host_id.clone()).await.1.sleep_inhibition,
+        observed_at: clock.now(),
+    };
+    flotilla_store::apply_status_patch(&hosts, &host_id, &unchanged).await.expect("unchanged patch");
+    assert_eq!(read(hosts.clone(), host_id.clone()).await.0, version, "an unchanged patch commits nothing");
+
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    release.send(()).expect("release blocking hold");
+    hold.await.expect("blocking hold");
 }

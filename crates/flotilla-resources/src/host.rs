@@ -8,10 +8,22 @@ use flotilla_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    checkout::ConditionValue, resource::define_resource, retention::ResourceStoreDiagnostics, status_patch::StatusPatch, ReplicationClass,
+    checkout::ConditionValue, resource::define_resource, retention::ResourceStoreDiagnostics, status_patch::StatusPatch, EventHistory,
+    ReplicationClass,
 };
 
-define_resource!(Host, "hosts", HostSpec, HostStatus, HostStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
+// Host status is a latest-value heartbeat observation (WORKLOAD.md
+// `host_heartbeat`), not durable history: a lagging watcher relists the
+// current Host rather than replaying superseded heartbeats.
+define_resource!(
+    Host,
+    "hosts",
+    HostSpec,
+    HostStatus,
+    HostStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime,
+    event_history = EventHistory::LatestOnly
+);
 
 pub const AGENT_ADAPTERS_CAPABILITY: &str = "agent_adapters";
 pub const HELD_CREDENTIALS_CAPABILITY: &str = "held_credentials";
@@ -26,6 +38,11 @@ pub const TRANSPORT_CAPABILITY: &str = "transport";
 pub const PLACEMENT_CAPABILITY: &str = "placement";
 pub const OWNING_DAEMON_CAPABILITY: &str = "owning_daemon";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
+/// A heartbeat that observes nothing new apart from timestamps still commits
+/// once the stored `heartbeat_at` is this old. Readers then see `heartbeat_at`
+/// advance within `HEARTBEAT_REFRESH_SECS` plus one heartbeat interval, which
+/// stays inside [`HEARTBEAT_READY_TTL_SECS`] for any interval under 40 s.
+pub const HEARTBEAT_REFRESH_SECS: i64 = HEARTBEAT_READY_TTL_SECS / 3;
 pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
 
 /// Resolve a user-authored host resource name or display-name alias to the
@@ -332,6 +349,37 @@ impl HostStatus {
     pub fn readiness_blocked(&self) -> bool {
         self.conditions.iter().any(HostCondition::blocks_readiness)
     }
+
+    /// This status with every observation timestamp cleared, so two statuses
+    /// compare equal when they observed the same things at different times.
+    pub fn without_observation_times(&self) -> Self {
+        let mut status = self.clone();
+        status.heartbeat_at = None;
+        for condition in &mut status.conditions {
+            condition.observed_at = DateTime::UNIX_EPOCH;
+        }
+        for facts in status.fulfilment_facts.values_mut() {
+            facts.observed_at = DateTime::UNIX_EPOCH;
+        }
+        status
+    }
+}
+
+impl FulfilmentFacts {
+    /// Whether two observations report the same facts, whenever they were made.
+    pub fn same_observation(&self, other: &Self) -> bool {
+        Self { observed_at: other.observed_at, ..self.clone() } == *other
+    }
+
+    /// Whether two fulfilment maps report the same facts per kind, whenever
+    /// each was observed.
+    pub fn same_observations(left: &BTreeMap<String, Self>, right: &BTreeMap<String, Self>) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|((left_kind, left), (right_kind, right))| left_kind == right_kind && left.same_observation(right))
+    }
 }
 
 #[cfg(test)]
@@ -430,11 +478,20 @@ impl CredentialExpiry {
     }
 }
 
+/// Latest periodic observations a heartbeat carries into its single write,
+/// so their observers do not each commit the Host object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FoldedHostObservations {
+    /// Latest blob sync observation. `None` leaves the stored value unchanged.
+    pub blob_sync: Option<flotilla_protocol::BlobSyncStatus>,
+    /// Latest fulfilment observations. The heartbeat only advances the stored
+    /// `observed_at` of facts whose content is unchanged; changed facts are
+    /// published by the fulfilment writer itself.
+    pub fulfilment_refresh: BTreeMap<String, FulfilmentFacts>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatusPatch {
-    BlobSync {
-        status: flotilla_protocol::BlobSyncStatus,
-    },
     FulfilmentFacts {
         facts: BTreeMap<String, FulfilmentFacts>,
         model_probes: ModelProbeState,
@@ -455,6 +512,8 @@ pub enum HostStatusPatch {
         // Keep the in-process patch enum small; HostStatus stores the unboxed value.
         resource_store: Option<Box<ResourceStoreDiagnostics>>,
         conditions: Vec<HostCondition>,
+        /// Periodic observations folded into the heartbeat's write (#3154).
+        folded: Box<FoldedHostObservations>,
     },
     SleepInhibition {
         health: SleepInhibitionHealth,
@@ -463,9 +522,25 @@ pub enum HostStatusPatch {
 }
 
 impl StatusPatch<HostStatus> for HostStatusPatch {
+    /// Host status is a latest-value observation. Commit only what changes an
+    /// observation; fold timestamp-only refreshes into the heartbeat, which
+    /// still commits often enough to keep `heartbeat_at` fresh.
+    fn requires_write(&self, before: &HostStatus, after: &HostStatus) -> bool {
+        if before.without_observation_times() != after.without_observation_times() {
+            return true;
+        }
+        match self {
+            Self::Heartbeat { heartbeat_at, .. } => before.heartbeat_at.is_none_or(|previous| {
+                // A clock regression must not leave a future heartbeat looking fresh.
+                *heartbeat_at < previous
+                    || heartbeat_at.signed_duration_since(previous) >= chrono::Duration::seconds(HEARTBEAT_REFRESH_SECS)
+            }),
+            Self::FulfilmentFacts { .. } | Self::SleepInhibition { .. } => false,
+        }
+    }
+
     fn apply(&self, status: &mut HostStatus) {
         match self {
-            Self::BlobSync { status: sync } => status.blob_sync = Some(sync.clone()),
             Self::FulfilmentFacts { facts, model_probes } => {
                 status.fulfilment_facts.clone_from(facts);
                 status.model_probes.clone_from(model_probes);
@@ -485,6 +560,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 agent_adapter_baseline,
                 resource_store,
                 conditions,
+                folded,
             } => {
                 // Image inventory is observed independently of heartbeat gathering.
                 // Preserve its latest value atomically when heartbeat has no update.
@@ -522,6 +598,16 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
                 status.agent_adapter_baseline.clone_from(agent_adapter_baseline);
                 status.resource_store = resource_store.as_deref().cloned();
+                if let Some(blob_sync) = &folded.blob_sync {
+                    status.blob_sync = Some(blob_sync.clone());
+                }
+                for (kind, observed) in &folded.fulfilment_refresh {
+                    if let Some(stored) = status.fulfilment_facts.get_mut(kind) {
+                        if stored.observed_at < observed.observed_at && stored.same_observation(observed) {
+                            stored.observed_at = observed.observed_at;
+                        }
+                    }
+                }
             }
             Self::SleepInhibition { health, observed_at } => {
                 status.sleep_inhibition.clone_from(health);

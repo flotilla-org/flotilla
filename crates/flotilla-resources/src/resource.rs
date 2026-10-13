@@ -83,6 +83,22 @@ macro_rules! define_resource {
             }
         }
     };
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, event_history = $history:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+            const QUERYABLE_FIELDS: &'static [&'static str] = &["metadata.name"];
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+            const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+            const EVENT_HISTORY: $crate::EventHistory = $history;
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -164,6 +180,9 @@ pub trait Resource: Send + Sync + 'static {
     /// has the same canonical scalar representation on every backend.
     const QUERYABLE_NUMERIC_FIELDS: &'static [&'static str] = &[];
     const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
+    /// Resumable watch history kept per local event stream. Latest-value kinds
+    /// keep one event so lagging watchers relist instead of replaying history.
+    const EVENT_HISTORY: crate::EventHistory = Self::REPLICATION_CLASS.event_history();
 
     /// Opt in to sibling validation at the authoritative write boundary.
     const VALIDATE_NAMESPACE_SPEC: bool = false;

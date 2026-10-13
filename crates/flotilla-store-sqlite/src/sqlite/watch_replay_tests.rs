@@ -438,5 +438,5 @@ async fn measure_watch_replay_writer_stall() {
 fn probe_is_a_stream_with_configured_retention() {
     // glue: the scenario's compaction model assumes the probe keeps the
     // configured number of events (not the one-event observation class).
-    assert_eq!(ProbeResource::REPLICATION_CLASS.event_retention(3), 3);
+    assert_eq!(ProbeResource::EVENT_HISTORY.retained_events(3), 3);
 }

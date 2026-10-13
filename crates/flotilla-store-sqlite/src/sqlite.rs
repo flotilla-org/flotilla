@@ -1554,7 +1554,7 @@ impl SqliteBackend {
         kind: StoredEventKind,
         body_json: &str,
         event_retention: EventRetention,
-        replication_class: crate::ReplicationClass,
+        event_history: crate::EventHistory,
     ) -> Result<(), ResourceError> {
         tx.execute_cached(
             r#"
@@ -1568,7 +1568,7 @@ impl SqliteBackend {
             tx,
             key,
             event_version,
-            replication_class.event_retention(event_retention.max_events_per_resource_stream()),
+            event_history.retained_events(event_retention.max_events_per_resource_stream()),
         )?;
         Ok(())
     }
@@ -2536,7 +2536,7 @@ impl SqliteBackend {
             )
             .map_err(|err| Self::map_sqlite(err, "insert sqlite resource object"))?;
             Self::clear_decode_quarantine(&tx, &key, &meta.name)?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, event_retention, resource_kind.replication)?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, event_retention, resource_kind.event_history)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource create"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Added, object: encoded });
             Ok(object)
@@ -2623,7 +2623,7 @@ impl SqliteBackend {
                 Self::upsert_object(&tx, &key, &meta.name, version, &body_json)?;
                 StoredEventKind::Modified
             };
-            Self::insert_event(&tx, &key, version, event_kind, &body_json, event_retention, resource_kind.replication)?;
+            Self::insert_event(&tx, &key, version, event_kind, &body_json, event_retention, resource_kind.event_history)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource update"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: event_kind, object: encoded });
             Ok(object)
@@ -2664,7 +2664,7 @@ impl SqliteBackend {
             let encoded = Self::encode_object(resource_kind, &object)?;
             let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
             Self::upsert_object(&tx, &key, &name, version, &body_json)?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, event_retention, resource_kind.replication)?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, event_retention, resource_kind.event_history)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource status update"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Modified, object: encoded });
             Ok(object)
@@ -2699,7 +2699,15 @@ impl SqliteBackend {
                 let body_json =
                     serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
                 Self::upsert_object(&tx, &key, &name, version, &body_json)?;
-                Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, event_retention, resource_kind.replication)?;
+                Self::insert_event(
+                    &tx,
+                    &key,
+                    version,
+                    StoredEventKind::Modified,
+                    &body_json,
+                    event_retention,
+                    resource_kind.event_history,
+                )?;
                 (StoredEventKind::Modified, encoded)
             } else {
                 let encoded = Self::encode_object(resource_kind, &object)?;
@@ -2707,7 +2715,7 @@ impl SqliteBackend {
                     serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
                 tx.execute_cached(RESOURCE_OBJECT_DELETE_SQL, params![key.0, key.1, key.2, key.3, name])
                     .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
-                Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, resource_kind.replication)?;
+                Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, resource_kind.event_history)?;
                 (StoredEventKind::Deleted, encoded)
             };
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource delete"))?;
@@ -2799,7 +2807,7 @@ impl SqliteBackend {
             )
             .map_err(|err| Self::map_sqlite(err, "write sqlite resource tombstone"))?;
             Self::clear_decode_quarantine(&tx, &key, &name)?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, resource_kind.replication)?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, resource_kind.event_history)?;
             tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource tombstone"))?;
             Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Deleted, object: encoded });
             Ok(crate::watch::TombstoneWrite { tombstone, created: true })
