@@ -91,6 +91,7 @@ impl SqliteBackend {
     /// objects are found in `sqlite_schema`, so a database that never had some
     /// of them, or has already been swept, is left unchanged.
     pub(super) fn drop_legacy_field_indexes(tx: &rusqlite::Transaction<'_>) -> Result<(), ResourceError> {
+        let started = std::time::Instant::now();
         let legacy = Self::legacy_field_indexes();
         let wanted = legacy.iter().flat_map(LegacyFieldIndex::objects).collect::<HashSet<_>>();
         let names = legacy.iter().map(|index| index.name.as_str()).collect::<HashSet<_>>();
@@ -105,6 +106,8 @@ impl SqliteBackend {
                 .map_err(|e| Self::map_sqlite(e, "read legacy field indexes"))?;
             rows.into_iter()
                 .filter_map(|(kind, name, table)| {
+                    // DROP_ORDER doubles as the type allow-list: other schema
+                    // types are skipped here, and the same order sorts the drops.
                     let kind = DROP_ORDER.into_iter().find(|candidate| *candidate == kind)?;
                     wanted.contains(&(kind, name.clone(), table)).then_some((kind, name))
                 })
@@ -133,7 +136,12 @@ impl SqliteBackend {
         tx.execute("INSERT OR IGNORE INTO resource_store_migrations(name) VALUES (?1)", [LEGACY_FIELD_INDEX_CLEANUP])
             .map_err(|e| Self::map_sqlite(e, "record legacy field index cleanup"))?;
         if !present.is_empty() || !markers.is_empty() {
-            tracing::info!(objects = present.len(), markers = markers.len(), "dropped pre-#3057 field indexes");
+            tracing::info!(
+                objects = present.len(),
+                markers = markers.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "dropped pre-#3057 field indexes"
+            );
         }
         Ok(())
     }
