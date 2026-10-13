@@ -116,6 +116,8 @@ enum Behaviour {
     },
     /// Wait until released.
     Gate,
+    /// The build job panics.
+    Panic,
 }
 
 /// In-process stand-in for the build-service port. It enforces the request
@@ -203,6 +205,7 @@ impl ImageBuildService for BuildService {
             self.release.notified().await;
         }
         match behaviour {
+            Behaviour::Panic => panic!("the build service panicked"),
             Behaviour::Succeed | Behaviour::Gate => Ok(BuiltImage {
                 digest: match request.delivery {
                     ImageDeliveryTarget::Push { repository, .. } => format!("{repository}@{}", digest('d')),
@@ -433,6 +436,53 @@ async fn infrastructure_failures_retry_with_backoff_up_to_the_attempt_ceiling() 
     assert_eq!(materials.push_auths.load(Ordering::SeqCst), IMAGE_BUILD_MAX_ATTEMPTS as usize, "a fresh credential per attempt");
     let backoffs: Vec<_> = (1..IMAGE_BUILD_MAX_ATTEMPTS).map(|attempt| image_build_retry_backoff(attempt).num_seconds()).collect();
     assert_eq!(backoffs, [30, 60, 120, 240]);
+}
+
+// A panicked build job ends its attempt as an infrastructure failure, so
+// the retry backoff and the attempt ceiling apply: it is never re-spawned
+// as the same attempt, and after IMAGE_BUILD_MAX_ATTEMPTS it stays Failed.
+#[tokio::test]
+async fn panicked_build_jobs_are_bounded_infrastructure_failures() {
+    let backend = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default());
+    host(&backend, "amd64", builder(1)).await;
+    let spec = build_spec(layers(0, &[]), "amd64", ImageDelivery::Local, 1);
+    let name = create(&backend, &spec).await;
+    let service = BuildService::new(Behaviour::Panic);
+    service.expect(&spec);
+    let materials = Arc::new(Materials::default());
+    let clock = Arc::new(VirtualClock::new(Utc::now()));
+    let reconciler = reconciler(&backend, &service, &materials, &clock);
+    for attempt in 1..=IMAGE_BUILD_MAX_ATTEMPTS {
+        for _ in 0..200 {
+            tick(&backend, &reconciler, &clock, &name).await;
+            let current = status(&backend, &name).await;
+            let settled = current.phase == ImageBuildPhase::Queued
+                || (current.phase == ImageBuildPhase::Failed && attempt == IMAGE_BUILD_MAX_ATTEMPTS);
+            if current.attempt == attempt && settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let current = status(&backend, &name).await;
+        assert_eq!(service.calls.load(Ordering::SeqCst), attempt as usize, "one execution per attempt");
+        let failure = current.failure.clone().expect("failure");
+        assert_eq!(failure.class, ImageBuildFailureClass::Infrastructure);
+        assert!(failure.reason.contains("panic"), "{}", failure.reason);
+        assert!(current.probes.iter().all(|probe| probe.outcome == ImageProbeOutcome::NotRun));
+        if attempt < IMAGE_BUILD_MAX_ATTEMPTS {
+            assert_eq!(current.phase, ImageBuildPhase::Queued, "a panicked attempt backs off before the next");
+            assert_eq!(current.not_before.expect("backoff") - current.finished_at.expect("finished"), image_build_retry_backoff(attempt));
+            clock.set(current.not_before.expect("backoff"));
+        }
+    }
+    for _ in 0..5 {
+        tick(&backend, &reconciler, &clock, &name).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    clock.advance(chrono::Duration::hours(2));
+    tick(&backend, &reconciler, &clock, &name).await;
+    assert_eq!(status(&backend, &name).await.phase, ImageBuildPhase::Failed, "exhausted attempts stay failed");
+    assert_eq!(service.calls.load(Ordering::SeqCst), IMAGE_BUILD_MAX_ATTEMPTS as usize);
 }
 
 // ADR 0062 A12: a recipe failure is terminal for its identity (no retry of

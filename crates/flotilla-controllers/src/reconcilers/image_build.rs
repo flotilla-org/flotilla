@@ -200,6 +200,14 @@ impl ImageBuildReconciler {
     }
 }
 
+/// Every layer's probe outcome for an attempt that never reached its probes.
+fn not_run_probes(spec: &ImageBuildSpec) -> Vec<flotilla_resources::ImageLayerProbe> {
+    spec.layers
+        .iter()
+        .map(|layer| flotilla_resources::ImageLayerProbe { layer: layer.name.clone(), outcome: ImageProbeOutcome::NotRun })
+        .collect()
+}
+
 /// Resolve this attempt's materials and drive the port. Only the secrets the
 /// layers declare are resolved and passed.
 async fn execute(
@@ -209,13 +217,7 @@ async fn execute(
     probe_wrapper: &str,
     log: &mut String,
 ) -> Result<BuiltImage, FailedImageBuild> {
-    let not_run = || {
-        spec.layers
-            .iter()
-            .map(|layer| flotilla_resources::ImageLayerProbe { layer: layer.name.clone(), outcome: ImageProbeOutcome::NotRun })
-            .collect::<Vec<_>>()
-    };
-    let refuse = |failure: ImageBuildFailure| FailedImageBuild { failure, probes: not_run(), failed_step: None };
+    let refuse = |failure: ImageBuildFailure| FailedImageBuild { failure, probes: not_run_probes(spec), failed_step: None };
     let declared = spec.layers.iter().flat_map(|layer| layer.build_secrets.iter().cloned()).collect::<BTreeSet<_>>();
     let mut secrets = BTreeMap::new();
     for name in declared {
@@ -351,7 +353,7 @@ impl Reconciler for ImageBuildReconciler {
                 if !jobs.contains_key(&current.metadata.name) {
                     // Also resumes an attempt this process did not start
                     // (a restart while Building): its slot is already held.
-                    let job = self.spawn_job(Arc::clone(service), &current, spec, status.attempt);
+                    let job = self.spawn_job(Arc::clone(service), &current, spec.clone(), status.attempt);
                     jobs.insert(current.metadata.name.clone(), job);
                     drop(jobs);
                     tokio::task::yield_now().await;
@@ -361,11 +363,27 @@ impl Reconciler for ImageBuildReconciler {
                     return Ok(ImageBuildPrepared::Waiting(Some(BUSY_REQUEUE)));
                 }
                 let job = jobs.remove(&current.metadata.name).expect("finished job");
-                match job.handle.await.map_err(|error| ResourceError::other(error.to_string()))? {
-                    Some(JobResult { outcome, log_ref }) => {
+                match job.handle.await {
+                    Ok(Some(JobResult { outcome, log_ref })) => {
                         Ok(ImageBuildPrepared::Finished(Box::new(FinishedAttempt { outcome, log_ref })))
                     }
-                    None => Ok(ImageBuildPrepared::None),
+                    Ok(None) => Ok(ImageBuildPrepared::None),
+                    // This reconciler aborts only jobs it has already removed
+                    // (a stale attempt, or its own drop), so a join error here
+                    // is a panic or a foreign abort. It ends the attempt as an
+                    // infrastructure failure: backoff and the attempt ceiling
+                    // apply, instead of re-spawning the same attempt forever.
+                    Err(error) => Ok(ImageBuildPrepared::Finished(Box::new(FinishedAttempt {
+                        outcome: Err(FailedImageBuild {
+                            failure: ImageBuildFailure {
+                                class: ImageBuildFailureClass::Infrastructure,
+                                reason: format!("the image build job ended abnormally: {error}"),
+                            },
+                            probes: not_run_probes(&spec),
+                            failed_step: None,
+                        }),
+                        log_ref: Err("the image build job ended before its log was kept".into()),
+                    }))),
                 }
             }
         }
