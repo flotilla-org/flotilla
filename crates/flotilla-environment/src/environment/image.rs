@@ -116,7 +116,10 @@ impl fmt::Debug for SecretFile {
 /// A built and verified image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltImage {
-    /// Push: `<repository>@sha256:…`; Load: the local `sha256:…` image ID.
+    /// Push: the pushed manifest, `<repository>@sha256:…`.
+    /// Load: the local `sha256:…` image ID, not a registry digest despite
+    /// the field's name. It names the image only in this host's Docker store
+    /// (single-host delivery) and is not pullable from anywhere.
     pub digest: String,
     /// Every layer's probe, in layer order; all passed.
     pub probes: Vec<ImageLayerProbe>,

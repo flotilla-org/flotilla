@@ -13,7 +13,7 @@ use flotilla_resources::{
 use hegel::generators as gs;
 
 use super::{
-    docker_image::{image_tag, OwnedBuildKitService, PROBE_TIMEOUT},
+    docker_image::{image_tag, OwnedBuildKitService, CANCEL_GRACE, PROBE_TIMEOUT},
     image::{FailedImageBuild, ImageBuildRequest, ImageBuildService, ImageDeliveryTarget, OwnedBuilderSettings, SecretFile},
     image_dockerfile::generate_build,
     registry_auth::{RegistryAuthMaterial, RegistryConfig},
@@ -111,6 +111,8 @@ struct BuildKitStandIn {
     builder_present: Mutex<bool>,
     /// `buildx create` fails with this stderr.
     create_failure: Option<String>,
+    /// `image rm` of the probed image fails with this stderr.
+    remove_failure: Option<String>,
 }
 
 impl BuildKitStandIn {
@@ -135,6 +137,7 @@ impl BuildKitStandIn {
             hung_probe: Mutex::new(None),
             builder_present: Mutex::new(true),
             create_failure: None,
+            remove_failure: None,
         }
     }
 
@@ -261,7 +264,20 @@ impl CommandRunner for BuildKitStandIn {
     async fn exists(&self, _: &str, _: &[&str]) -> bool {
         panic!("the build service does not discover endpoints")
     }
-    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+    async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        panic!("the build service runs Docker through the graceful termination seam")
+    }
+    // Every Docker command is cancellable gracefully: a dropped or timed-out
+    // build sends SIGTERM so Buildx cancels its BuildKit solve.
+    async fn run_output_with_grace(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        _: &ChannelLabel,
+        grace: std::time::Duration,
+    ) -> Result<CommandOutput, String> {
+        assert_eq!(grace, CANCEL_GRACE);
         assert_eq!(cmd, "docker");
         assert_eq!(cwd, Path::new("/"));
         self.calls.lock().expect("calls").push(args.iter().map(|arg| arg.to_string()).collect());
@@ -305,6 +321,14 @@ impl CommandRunner for BuildKitStandIn {
                 assert_eq!(self.mode, Mode::Push);
                 assert_eq!(*reference, format!("{REPOSITORY}@{}", self.metadata_digest), "probes run on the pushed digest");
                 Step::Exit(Some(0), String::new())
+            }
+            ["image", "rm", reference] => {
+                assert_eq!(self.mode, Mode::Push, "a loaded image is the delivered artifact and is kept");
+                assert_eq!(*reference, format!("{REPOSITORY}@{}", self.metadata_digest), "only the probed pull is removed");
+                match &self.remove_failure {
+                    Some(stderr) => Step::Exit(Some(1), stderr.clone()),
+                    None => Step::Exit(Some(0), String::new()),
+                }
             }
             ["image", "inspect", "--format", "{{.Id}}", tag] => {
                 assert_eq!(self.mode, Mode::Load);
@@ -438,7 +462,7 @@ fn delivery_modes_build_probe_and_clean_up(tc: hegel::TestCase) {
         .map(|call| if matches!(call[2].as_str(), "buildx" | "image") { call[2..4].join(" ") } else { call[2].clone() })
         .collect();
     let expected: Vec<&str> = match mode {
-        Mode::Push => vec!["buildx inspect", "buildx build", "pull", "run", "run", "run"],
+        Mode::Push => vec!["buildx inspect", "buildx build", "pull", "run", "run", "run", "image rm"],
         Mode::Load => vec!["buildx inspect", "buildx build", "image inspect", "run", "run", "run"],
     };
     assert_eq!(verbs, expected);
@@ -648,4 +672,30 @@ async fn build_failures_report_the_failing_step_layer() {
     let failed = build(&runner, BTreeMap::new(), &mut String::new()).await.expect_err("step failure");
     assert_eq!(failed.failure.class, ImageBuildFailureClass::Recipe);
     assert_eq!(failed.failed_step.as_deref(), Some("harness-codex"));
+}
+
+// Push mode pulls the pushed manifest only to probe it; the local copy is
+// removed afterwards whether the probes passed or failed, and a failed
+// removal is logged without failing the build. (Load mode keeps its image:
+// the stand-in refuses `image rm` there, and the delivery-mode test pins
+// the absence of a removal.)
+#[tokio::test]
+async fn push_mode_removes_the_probed_pull() {
+    let directory = tempfile::tempdir().expect("directory");
+    let mut runner = BuildKitStandIn::new(Mode::Push, layers(), directory.path());
+    runner.probes.insert("probe rust".into(), Step::Exit(Some(1), "rustc: not found\n".into()));
+    let runner = Arc::new(runner);
+    build(&runner, BTreeMap::new(), &mut String::new()).await.expect_err("probe failure");
+    let last = runner.calls().last().expect("removal").clone();
+    assert_eq!(last[2..], ["image".to_string(), "rm".into(), format!("{REPOSITORY}@{}", digest('9'))], "removed after failed probes");
+
+    let mut runner = BuildKitStandIn::new(Mode::Push, layers(), &directory.path().join("unremovable"));
+    runner.remove_failure = Some(format!("Error: conflict: unable to remove {SECRET}\n"));
+    let runner = Arc::new(runner);
+    let mut log = String::new();
+    let built = build(&runner, BTreeMap::new(), &mut log).await.expect("a failed removal does not fail the build");
+    assert_eq!(built.digest, format!("{REPOSITORY}@{}", digest('9')));
+    assert!(log.contains("could not remove the probed image"), "{log}");
+    assert!(!log.contains(SECRET), "removal diagnostics are redacted");
+    assert_cleaned(&runner);
 }

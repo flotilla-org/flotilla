@@ -239,9 +239,25 @@ fn path_arg(path: &Path) -> Result<String, ImageBuildFailure> {
 }
 
 impl OwnedBuildKitService {
+    /// Run one Docker CLI command under `timeout`.
+    ///
+    /// Cancellation contract: an attempt ends early when its deadline passes
+    /// or when the caller drops the build future (the ImageBuild was deleted,
+    /// or the job was aborted). Either way the running command's future is
+    /// dropped, and the runner's graceful seam sends SIGTERM to the Docker
+    /// CLI's process group, escalating to SIGKILL after [`CANCEL_GRACE`].
+    /// The Buildx plugin shares that group (and the CLI also forwards the
+    /// signal by closing its plugin socket); Buildx cancels its BuildKit
+    /// solve on SIGTERM, so the build inside the owned docker-container
+    /// builder stops rather than running on unobserved. A SIGKILL would only
+    /// drop the client connection. `buildx stop` is deliberately not used: it
+    /// stops the whole builder, killing every other slot's build. A dropped
+    /// probe's `docker run` forwards the signal to its container (sig-proxy)
+    /// and the container is `--rm`; a probe deadline also force-removes it.
     async fn docker(&self, args: &[String], timeout: Duration) -> Result<Result<CommandOutput, String>, ()> {
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        tokio::time::timeout(timeout, self.runner.run_output("docker", &args, Path::new("/"), &ChannelLabel::Default)).await.map_err(|_| ())
+        let command = self.runner.run_output_with_grace("docker", &args, Path::new("/"), &ChannelLabel::Default, CANCEL_GRACE);
+        tokio::time::timeout(timeout, command).await.map_err(|_| ())
     }
 
     async fn execute(
@@ -381,21 +397,59 @@ impl OwnedBuildKitService {
                 ];
                 let output = match self.docker(&inspect, CLI_TIMEOUT).await {
                     Err(()) => return Err(infrastructure("inspecting the loaded image exceeded its deadline")),
-                    Ok(Err(error)) => return Err(infrastructure(error)),
+                    Ok(Err(error)) => return Err(infrastructure(redact(error))),
                     Ok(Ok(output)) => output,
                 };
                 let id = output.stdout.trim();
                 if !output.success() || !is_image_digest(id) {
                     return Err(infrastructure(format!(
                         "loaded image has no valid local ID: {}",
-                        failure_summary(&output.stderr, output.exit_code)
+                        failure_summary(&redact(output.stderr), output.exit_code)
                     )));
                 }
+                // The tagged image is the delivered artifact of a local
+                // (single-host) build: providers on this host run it by this
+                // local image ID, so it is deliberately kept.
                 id.to_string()
             }
         };
         drop(workspace);
 
+        let probed = self.probe(request, &image, &config_arg, probes, log).await;
+        if let ImageDeliveryTarget::Push { .. } = delivery {
+            // The pull above existed only to probe the pushed manifest; the
+            // registry holds the delivered image. Removing the local copy
+            // does not change the build's outcome, so a failure is logged.
+            let remove = ["--config".to_string(), config_arg.clone(), "image".into(), "rm".into(), image.clone()];
+            let removed = match self.docker(&remove, CLI_TIMEOUT).await {
+                Ok(Ok(output)) if output.success() => Ok(()),
+                Ok(Ok(output)) => Err(failure_summary(&redact(output.stderr), output.exit_code)),
+                Ok(Err(error)) => Err(redact(error)),
+                Err(()) => Err("removal exceeded its deadline".into()),
+            };
+            if let Err(error) = removed {
+                tracing::warn!(image = %image, %error, "could not remove the image pulled for probing");
+                log.push_str(&format!("### could not remove the probed image {image}: {error}\n"));
+            }
+        }
+        probed.map(|()| image)
+    }
+
+    /// Run every layer's probe, in order, on the delivered `image`.
+    async fn probe(
+        &self,
+        request: &ImageBuildRequest<'_>,
+        image: &str,
+        config_arg: &str,
+        probes: &mut [ImageLayerProbe],
+        log: &mut String,
+    ) -> Result<(), ImageBuildFailure> {
+        let ImageBuildRequest { layers, delivery, probe_wrapper, probe_cpus, .. } = request;
+        let auth = match delivery {
+            ImageDeliveryTarget::Push { auth, .. } => Some(auth),
+            ImageDeliveryTarget::Load => None,
+        };
+        let redact = |text: String| RegistryAuth::redact(auth, text);
         let cpus = probe_cpus.to_string();
         let mut failed = Vec::new();
         for (index, layer) in layers.iter().enumerate() {
@@ -406,7 +460,7 @@ impl OwnedBuildKitService {
             let home_mount = format!("{PROBE_HOME}:exec,uid=65534,gid=65534,mode=0700");
             let args = [
                 "--config",
-                config_arg.as_str(),
+                config_arg,
                 "run",
                 "--rm",
                 "--name",
@@ -429,7 +483,7 @@ impl OwnedBuildKitService {
                 "256",
                 "--entrypoint",
                 "sh",
-                image.as_str(),
+                image,
                 "-c",
                 probe_wrapper,
                 "flotilla-layer-probe",
@@ -444,7 +498,7 @@ impl OwnedBuildKitService {
                 Ok(Err(error)) => return Err(infrastructure(redact(error))),
                 Err(()) => {
                     // Dropping the Docker client does not stop its container.
-                    let remove = ["--config".to_string(), config_arg.clone(), "rm".into(), "--force".into(), name];
+                    let remove = ["--config".to_string(), config_arg.to_string(), "rm".into(), "--force".into(), name];
                     let _ = self.docker(&remove, CLI_TIMEOUT).await;
                     let reason = format!("probe exceeded its {} second deadline", PROBE_TIMEOUT.as_secs());
                     probes[index].outcome = ImageProbeOutcome::Failed { reason: reason.clone() };
@@ -472,7 +526,7 @@ impl OwnedBuildKitService {
         if !failed.is_empty() {
             return Err(recipe(format!("layer probes failed: {}", failed.join(", "))));
         }
-        Ok(image)
+        Ok(())
     }
 }
 
@@ -569,6 +623,9 @@ impl ImageBuildService for OwnedBuildKitService {
 pub const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a cancelled Docker command has to stop after SIGTERM before it is
+/// killed; Buildx needs it to cancel its BuildKit solve.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(30);
 /// Creating the builder pulls and starts the BuildKit container.
 const BUILDER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_REASON_CHARS: usize = 2048;

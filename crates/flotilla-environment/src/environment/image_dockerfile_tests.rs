@@ -182,6 +182,63 @@ fn pin_values_needing_quotes_are_escaped() {
     assert!(generate_build(&[base], "amd64").is_err());
 }
 
+/// Independent reading of a Dockerfile `ARG KEY=value` line: an unquoted
+/// value is the rest of the line verbatim (no shell runs, and `#` starts a
+/// comment only at the start of a line); a double-quoted value drops its
+/// quotes and backslash escapes.
+fn dockerfile_arg_value(dockerfile: &str, key: &str) -> Option<String> {
+    let line = dockerfile.lines().find_map(|line| line.strip_prefix(&format!("ARG {key}=")))?;
+    let Some(quoted) = line.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) else {
+        assert!(!line.contains(char::is_whitespace) && !line.contains(['"', '\\', '$', '`']), "unquoted value `{line}` is plain");
+        return Some(line.to_string());
+    };
+    let mut value = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        value.push(if c == '\\' { chars.next().expect("escaped character") } else { c });
+    }
+    Some(value)
+}
+
+// Pin values with URL and shell punctuation (`&`, `#`, `;`, `?`) reach the
+// build unchanged, whether emitted plain or quoted.
+#[test]
+fn pin_values_with_url_punctuation_round_trip() {
+    let values = [
+        "https://example.test/dl?version=1.2&arch=x86_64#sha256;x",
+        "a&b",
+        "#leading-hash",
+        "a;b",
+        "?query",
+        "a & b # c ; d ? e",
+        "$HOME&#;?",
+    ];
+    for value in values {
+        let mut base = layer("base", ImageLayerTier::Base, "FROM ${BASE}\n");
+        base.pins.insert(
+            "tool".into(),
+            ImageLayerPin { version: "1".into(), url: Some(value.into()), sha256: Some(ImagePinDigest::Single(hex('a'))) },
+        );
+        let generated = generate_build(&[base], "amd64").expect("generate");
+        assert_eq!(dockerfile_arg_value(&generated.dockerfile, "PIN_TOOL_URL").as_deref(), Some(value), "{}", generated.dockerfile);
+    }
+}
+
+// The fragment contract reads any line whose first word is FROM as a stage
+// line, including one inside a RUN heredoc. A heredoc line naming another
+// image would otherwise become a stage, so it is refused loudly rather than
+// passed through as heredoc text.
+#[test]
+fn from_lines_inside_run_heredocs_are_stage_lines_and_refused() {
+    let base = layer("base", ImageLayerTier::Base, "FROM ${BASE}\n");
+    let heredoc = layer("tool", ImageLayerTier::Shared, "FROM ${BASE}\nRUN <<EOF\necho start\nFROM ubuntu:24.04\nEOF\n");
+    let error = heredoc.validate().expect_err("a non-${BASE} FROM inside a heredoc is refused");
+    assert!(error.contains("ubuntu:24.04"), "{error}");
+    assert!(generate_build(&[base.clone(), heredoc], "amd64").is_err());
+    let indented = layer("tool", ImageLayerTier::Shared, "FROM ${BASE}\nRUN <<EOF\n  from x\nEOF\n");
+    assert!(indented.validate().is_err(), "leading whitespace and case do not hide a FROM line");
+}
+
 const BODY_LINES: &[&str] = &[
     "RUN echo ready",
     "",
