@@ -111,7 +111,11 @@ def allowed_payload(path, platform=None):
     # so a *directory* named `auth.json` lands in the crew's home as one too.
     if codex_home and CODEX_CREDENTIAL_FILE in pure.parts[len(CODEX_HOME_PREFIX):]:
         return False
+    # Optional on consumption for previous-generation health rollback; the
+    # producer requires cleat's compiled database before publishing a candidate.
+    terminfo = len(pure.parts) >= 3 and pure.parts[:2] == ("share", "terminfo")
     return (library
+            or terminfo
             or codex_home
             or (len(pure.parts) >= 4 and pure.parts[:3] == SKILLS_PREFIX))
 

@@ -41,6 +41,16 @@ read_protocol_version() {
   return 1
 }
 
+package_cleat_terminfo() {
+  local cleat_root="$1" bundle="$2"
+  # cleat #337 owns the emitter; package its pinned prepare output verbatim.
+  test -f "$cleat_root/.tools/ghostty-install/share/terminfo/x/xterm-ghostty"
+  test -f "$cleat_root/.tools/ghostty-install/share/terminfo/LICENSE"
+  mkdir -p "$bundle/share/terminfo"
+  cp -R "$cleat_root/.tools/ghostty-install/share/terminfo/." "$bundle/share/terminfo/"
+  infocmp -A "$bundle/share/terminfo" xterm-ghostty >/dev/null
+}
+
 main() {
 flotilla_sha="$(require_sha FLEET_FLOTILLA_SHA "${FLEET_FLOTILLA_SHA:-}")"
 cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
@@ -161,9 +171,14 @@ python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundl
   cargo build -p cleat --locked --features ghostty-vt --release
 )
 
+# Descriptor handover is a release gate on the host, below the provider/Docker
+# seam. Passthrough is sufficient: this proves PTY ownership, not rendering.
+"$(dirname "${BASH_SOURCE[0]}")/test-tools-handover.sh" "$cleat_root"
+
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
 install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
+package_cleat_terminfo "$cleat_root" "$bundle"
 
 if [[ "$platform" == darwin-aarch64 && -f "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" ]]; then
   install -m 0755 "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" "$bundle/lib/$ghostty_library"

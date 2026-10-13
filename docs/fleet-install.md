@@ -290,3 +290,56 @@ rejects new `literal_base` snapshots. ADR 0047 guarantees N→N+1 decoding only.
 After new stored writes, rollback needs a decoder-compatible build or explicit
 stored-data recovery. The pre-activation canary uses a private temporary store
 and does not cross that boundary in the live fleet store.
+
+## Contained tools on a roll
+
+The candidate packages cleat's prepared `.tools/ghostty-install/share/terminfo/`
+verbatim, including its license. A missing `x/xterm-ghostty` entry refuses the
+candidate. This depends on cleat #337; the fleet cleat source pin must select
+that change. No image builds Ghostty or supplies Flotilla binaries.
+
+Docker vessel provisioning requires a complete Linux tools install, including
+cleat's prepared terminfo database next to the resolved library prefix. Desk
+builds must run cleat prepare and supply that tree, or install a fleet candidate;
+missing assets refuse provisioning with the expected path and build guidance.
+There is no per-file fallback: it would silently create vessels that cannot
+upgrade in place. The delivered library uses the Linux SONAME
+`libghostty-vt.so.0`, including when its source resolves to a versioned filename.
+A native macOS dylib is not a Linux Docker vessel runtime asset.
+
+Local Docker binds the provider-owned `environment-tools/fleet` directories
+`tools`, `bin`, `lib`, and `share/terminfo` to matching `/opt/flotilla` children,
+read-only to the vessel. This preserves the image's sibling harness paths. The
+provider publishes immutable `tools/<content-generation>/` trees containing
+`bin`, `lib`, and `share/terminfo`. Relative entries in the stable real delivery
+directories follow one atomically replaced `tools/current` link. CLI invocations see the new generation immediately. Cleat's candidate RPATH
+(`$ORIGIN/../lib`) selects its own generation's library even during a link flip;
+tool delivery does not override that with a current-link library search path. A per-root filesystem
+lock serializes publication and pruning. Mounting a resolved child directory
+would pin Docker to that inode and is forbidden by the tools contract.
+
+`fleet post-install` publishes the complete incoming tools before invoking
+`cleat server handover --json` through every registered local environment runner.
+It never requests incompatible-client drops or kills sessions. Failed handovers
+leave the old daemon and its sessions running, preserve diagnostics, and report
+advisory `CleatBuildSkew` until retry or environment relaunch. Vessels created
+before this tools contract retain their old mounts and may refuse handover;
+relaunch those vessels to acquire the generation parent mount.
+
+After each post-install, local pruning checks host kernel file identities across
+process executables, mapped libraries, and open descriptors for the host UID
+that Docker uses for vessel tools. Unrelated system UIDs are outside that
+provider contract. It preserves the
+current generation and any generation still in use, including old cleat child
+reapers. Incomplete process visibility defers pruning; a later roll retries.
+Other providers must supply their own unused-generation evidence. k8s can fill a
+shared volume from an init container; sandboxes can upload the complete tree
+before replacing its link. Those adapters are outside this change.
+
+The candidate-build host gate runs
+`ci/fleet-candidates/test-tools-handover.sh <pinned-cleat-checkout>` before
+packaging. Cleat's real three-session handover scenario transfers PTY descriptors
+and redirects an attached watcher, verifies unchanged child PIDs, and sends input
+before and after the roll. It also proves the old daemon continues reaping those
+children. The passthrough engine isolates descriptor ownership from VT rendering;
+there is no Docker or live fleet in this gate.

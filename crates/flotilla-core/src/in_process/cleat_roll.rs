@@ -110,9 +110,40 @@ impl InProcessDaemon {
 
     pub async fn post_install_cleat(&self, incoming: &Path, generation: &str, diagnostics_dir: &Path) -> Result<RollReport, String> {
         let inventory = self.crew_cleat_targets(true).await?;
+        #[cfg(unix)]
+        let mut inventory = inventory;
+        // Publish under the same stable parent supplied at provisioning. A
+        // container runner receives its environment path, never the host path.
+        #[cfg(unix)]
+        if inventory.targets.iter().any(|target| target.contained) {
+            let release = incoming.parent().and_then(Path::parent).ok_or("incoming cleat has no release root")?;
+            let root = self.config.state_dir().join("environment-tools/fleet");
+            let result = flotilla_environment::tools::publish(
+                root.as_path(),
+                &flotilla_environment::tools::ToolsSource {
+                    flotilla: &release.join("bin/flotilla"),
+                    cleat: incoming,
+                    library: &release.join("lib/libghostty-vt.so.0"),
+                    terminfo: &release.join("share/terminfo"),
+                },
+            );
+            if let Err(error) = result {
+                inventory.errors.push(format!("publish vessel tools: {error}"));
+                inventory.targets.retain(|target| !target.contained);
+            }
+        }
         let mut report =
             cleat_roll::drain(self.host_name.to_string(), generation.to_string(), incoming, &inventory.targets, inventory.errors).await;
         report.information.extend(inventory.information);
+        #[cfg(target_os = "linux")]
+        {
+            let root = self.config.state_dir().join("environment-tools/fleet");
+            if root.as_path().exists() {
+                if let Err(error) = flotilla_environment::tools::prune_local(root.as_path()) {
+                    report.errors.push(format!("prune vessel tools: {error}"));
+                }
+            }
+        }
         cleat_roll::persist(&mut report, diagnostics_dir).await;
         *self.cleat_roll_report.lock().await = Some(report.clone());
         Ok(report)
@@ -139,7 +170,16 @@ impl InProcessDaemon {
             Ok(inventory) => inventory,
             Err(error) => CleatInventory { errors: vec![error], ..Default::default() },
         };
-        let report = self.cleat_roll_report.lock().await.clone();
+        let mut report = self.cleat_roll_report.lock().await.clone();
+        if let Some(report) = &mut report {
+            // A relaunched/destroyed environment no longer carries the failed
+            // handover. Keep failures only for still-registered runtime targets.
+            report.attempts.retain(|attempt| {
+                inventory.targets.iter().any(|target| {
+                    target.environment == attempt.environment && target.runtime_root == attempt.runtime_root && target.name == attempt.name
+                })
+            });
+        }
         let mut assessment = cleat_roll::build_skew(installed.as_deref(), &inventory.targets, report.as_ref()).await;
         assessment.actionable.extend(inventory.errors);
         assessment.information.extend(inventory.information);
@@ -337,6 +377,20 @@ mod tests {
         assert_eq!(targets.iter().filter(|target| target.name == "named").count(), 1);
         assert!(!targets.iter().any(|target| target.environment == "remote"));
         assert!(runner.calls().is_empty(), "enumeration is a resource/environment read");
+        // A failed first publication records the error without handing over any
+        // contained target or reporting a second spurious prune error.
+        let report = daemon
+            .post_install_cleat(
+                &directory.path().join("missing-release/bin/cleat"),
+                "test-generation",
+                &directory.path().join("diagnostics"),
+            )
+            .await
+            .unwrap();
+        assert!(report.errors.iter().any(|error| error.starts_with("publish vessel tools:")));
+        assert!(!report.errors.iter().any(|error| error.starts_with("prune vessel tools:")));
+        assert!(report.attempts.iter().all(|attempt| attempt.environment != "contained-work"));
+        assert!(runner.calls().is_empty(), "publication failure must leave contained sessions alone");
     }
 
     // The advisory host condition gives fleet-wide users exact installed and

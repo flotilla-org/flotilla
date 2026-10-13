@@ -139,9 +139,8 @@ async fn command(target: &CleatTarget, binary: &str, verb: &[&str], timeout: Dur
         .map_err(|_| format!("cleat command timed out after {} seconds", timeout.as_secs()))?
 }
 
-/// Vessels keep their launch-time toolchain until restart. A roll updates only
-/// host-direct daemons: runner availability and a copied CLI/library do not prove
-/// compatibility with an already provisioned vessel's pinned environment.
+/// Transfer live descriptors to the installed generation. Failure leaves old
+/// sessions alive and becomes actionable CleatBuildSkew; never request drops.
 pub async fn drain(host: String, generation: String, incoming: &Path, targets: &[CleatTarget], errors: Vec<String>) -> RollReport {
     let mut report = RollReport::builder().host(host).generation(generation).attempts(vec![]).errors(errors).build();
     if logical_name(&report.generation).is_err() || report.generation.contains('@') {
@@ -149,12 +148,9 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
         return report;
     }
     for target in targets {
-        if target.contained {
-            report.information.push(format!("{}: vessel cleat refreshes on restart", target.label()));
-            continue;
-        }
+        let incoming = if target.contained { Path::new("/opt/flotilla/bin/cleat") } else { incoming };
         let output = match incoming.to_str() {
-            Some(binary) => command(target, binary, &["server", "drain", "--json"], Duration::from_secs(30)).await,
+            Some(binary) => command(target, binary, &["server", "handover", "--json"], Duration::from_secs(30)).await,
             None => Err("installed cleat path is not UTF-8".into()),
         };
         let (stdout, stderr, success, mut error) = match output {
@@ -179,10 +175,41 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
             }
         };
         if error.is_none() && !success {
-            error = Some(format!("cleat drain exited unsuccessfully: {stderr}"));
+            error = Some(format!("cleat handover exited unsuccessfully: {stderr}"));
         }
         if error.is_none() {
             error = parsed_report.as_ref().and_then(|report| report.warning.clone());
+        }
+        // Handover adds per-session results to the existing drain shape. Raw
+        // output remains durable; supplement its error without changing stored
+        // decoded reports, which must still accept the previous generation.
+        if let Ok(value) = serde_json::from_str::<Value>(&stdout) {
+            let mut failures = Vec::new();
+            for session in value["stayed"].as_array().into_iter().flatten() {
+                failures.push(format!(
+                    "{} stayed: {}",
+                    session["session_id"].as_str().unwrap_or("unknown"),
+                    session["reason"].as_str().unwrap_or("handover refused")
+                ));
+            }
+            for session in value["moved"].as_array().into_iter().flatten() {
+                if let Some(warning) = session["warning"].as_str() {
+                    if parsed_report.as_ref().and_then(|report| report.warning.as_deref()) != Some(warning) {
+                        let message = format!("{}: {warning}", session["session_id"].as_str().unwrap_or("unknown"));
+                        if !failures.contains(&message) {
+                            failures.push(message);
+                        }
+                    }
+                }
+            }
+            if !failures.is_empty() {
+                let mut message = error.take().unwrap_or_default();
+                if !message.is_empty() {
+                    message.push_str("; ");
+                }
+                message.push_str(&failures.join("; "));
+                error = Some(message);
+            }
         }
         // Discovery matches registered roots literally. A missing current
         // socket does not imply failure: older generations can retain sessions
@@ -313,9 +340,7 @@ pub fn assess_current(installed: Option<&str>, target: &CleatTarget, current: &V
     let mut assessment = BuildAssessment::default();
     let serving = sha(&current["daemon"]);
     let installed = installed.filter(|sha| !sha.is_empty() && *sha != "unknown");
-    if target.contained {
-        assessment.information.push(format!("{}: vessel cleat {}, refreshes on restart", target.label(), serving.unwrap_or("unknown")));
-    } else if let (Some(installed), Some(serving)) = (installed, serving) {
+    if let (Some(installed), Some(serving)) = (installed, serving) {
         if installed != serving {
             assessment.actionable.push(format!(
                 "{} {}/{}: installed {} vs serving {}",
@@ -346,7 +371,7 @@ pub fn assess_drain(report: &RollReport) -> BuildAssessment {
     for attempt in &report.attempts {
         if let Some(error) = &attempt.error {
             assessment.actionable.push(format!(
-                "{} {}/{}: host cleat drain failed: {}",
+                "{} {}/{}: cleat handover failed: {}",
                 attempt.environment,
                 attempt.runtime_root.display(),
                 attempt.name,
@@ -411,6 +436,62 @@ async fn observe(installed: Option<&str>, target: &CleatTarget, report: Option<&
             .filter_map(|attempt| attempt.report.as_ref())
             .find(|report| report.old["name"].as_str() == Some(name))
             .and_then(|report| report.old["session_count"].as_u64());
+        // A partial handover can leave live sessions behind a healthy current
+        // alias. Observe the old daemon's read-only endpoint: `list`/`inspect`
+        // may start daemons, and a surviving child reaper alone is not skew.
+        if target.contained
+            && installed.is_some_and(|installed| sha(&daemon["build"]).is_some_and(|serving| installed != serving))
+            && name.split_once('@').is_some_and(|(_, generation)| generation.parse::<u64>().is_ok())
+        {
+            let socket = target.runtime_root.join(name).join("socket");
+            let status = match socket.to_str() {
+                Some(socket) => target
+                    .runner
+                    .run_with_timeout(
+                        "curl",
+                        &[
+                            "--disable",
+                            "--noproxy",
+                            "*",
+                            "--max-time",
+                            "4",
+                            "--fail",
+                            "--silent",
+                            "--unix-socket",
+                            socket,
+                            "http://localhost/healthz",
+                        ],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .map_err(|error| format!("old daemon health probe unavailable: {error}"))
+                    .and_then(|body| {
+                        serde_json::from_str::<Value>(&body).map_err(|error| format!("invalid old daemon health JSON: {error}"))
+                    })
+                    .and_then(|status| {
+                        status["session_count"].as_u64().ok_or_else(|| "old daemon health response lacks session_count".into())
+                    }),
+                None => Err("old daemon socket path is not UTF-8".into()),
+            };
+            match status {
+                Ok(remaining) if remaining > 0 => assessment.actionable.push(format!(
+                    "{} {}/{}: {remaining} sessions remain on old cleat {}; relaunch to clear build skew",
+                    target.label(),
+                    target.runtime_root.display(),
+                    name,
+                    sha(&daemon["build"]).unwrap_or("unknown")
+                )),
+                Ok(_) => {}
+                Err(error) => assessment.actionable.push(format!(
+                    "{} {}/{}: cannot confirm old generation has no sessions ({error})",
+                    target.label(),
+                    target.runtime_root.display(),
+                    name
+                )),
+            }
+        }
         let count_note = if count.is_some() { " (count at drain)" } else { "" };
         let count = count.map_or("unknown".to_string(), |count| count.to_string());
         assessment.information.push(format!(

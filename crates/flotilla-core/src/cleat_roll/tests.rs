@@ -71,7 +71,7 @@ async fn recorded_drain_outcomes_preserve_reports_and_continue() {
                     "--server".into(),
                     "default".into(),
                     "server".into(),
-                    "drain".into(),
+                    "handover".into(),
                     "--json".into()
                 ]
             )
@@ -161,17 +161,74 @@ fn default_runtime_roots_follow_injected_environment() {
     }
 }
 
-// #2671: contained toolchains stay pinned until restart. Even a registered
-// runner must receive no file copies, subprocesses or daemon mutations.
+// A contained roll invokes the generation-delivered binary via its runner;
+// handover failure is actionable and never causes a kill/relaunch command.
 #[tokio::test]
-async fn contained_drain_is_expected_and_never_executes() {
-    let runner = Arc::new(MockRunner::with_outputs(vec![]));
-    let report =
-        drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![]).await;
-    assert!(!report.failed());
-    assert!(report.attempts.is_empty());
-    assert!(report.information[0].contains("refreshes on restart"));
-    assert!(runner.calls().is_empty());
+async fn contained_roll_hands_over_without_killing_sessions() {
+    for name in ["success", "warning"] {
+        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(recorded(name))]));
+        let report =
+            drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![])
+                .await;
+        assert_eq!(report.failed(), name == "warning");
+        assert_eq!(report.attempts.len(), 1);
+        assert_eq!(runner.calls()[0].0, "/opt/flotilla/bin/cleat");
+        assert_eq!(&runner.calls()[0].1[4..], ["server", "handover", "--json"]);
+        assert_eq!(runner.remaining(), 0);
+    }
+}
+
+// Failed per-session handovers preserve diagnostics and become build skew,
+// even if the successor is current or the CLI exits successfully with a warning.
+#[tokio::test]
+async fn partial_handover_results_are_actionable_without_session_destruction() {
+    for (stayed, warning, successful) in [(true, false, false), (false, true, true)] {
+        let mut value: Value = serde_json::from_str(&recorded("success").stdout).unwrap();
+        value["stayed"] = if stayed {
+            serde_json::json!([{"session_id":"live-shell", "reason":"attached client refused"}])
+        } else {
+            serde_json::json!([])
+        };
+        value["moved"] =
+            if warning { serde_json::json!([{"session_id":"live-shell", "warning":"forwarder retained"}]) } else { serde_json::json!([]) };
+        let stdout = value.to_string();
+        // Subprocess boundary: cleat's documented handover result, not a daemon.
+        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+            stdout: stdout.clone(),
+            stderr: String::new(),
+            exit_code: Some(if successful { 0 } else { 1 }),
+        })]));
+        let report =
+            drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![])
+                .await;
+        assert!(report.failed());
+        assert_eq!(report.attempts[0].stdout, stdout);
+        assert!(report.attempts[0].error.as_ref().unwrap().contains("live-shell"));
+        assert_eq!(assess_drain(&report).into_condition(chrono::Utc::now()).unwrap().condition_type, "CleatBuildSkew");
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(&runner.calls()[0].1[4..], ["server", "handover", "--json"]);
+    }
+}
+
+// Summary and per-session warnings may name the same forwarder event. Keep
+// that diagnostic once, while preserving the complete raw handover evidence.
+#[tokio::test]
+async fn duplicate_handover_warnings_are_reported_once() {
+    let mut value: Value = serde_json::from_str(&recorded("success").stdout).unwrap();
+    value["warning"] = serde_json::json!("forwarder retained");
+    value["moved"] = serde_json::json!([
+        {"session_id":"shell", "warning":"forwarder retained"},
+        {"session_id":"shell", "warning":"distinct warning"},
+        {"session_id":"shell", "warning":"distinct warning"}
+    ]);
+    let stdout = value.to_string();
+    let runner =
+        Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput { stdout: stdout.clone(), stderr: String::new(), exit_code: Some(0) })]));
+    let report = drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner, "default", true)], vec![]).await;
+    let error = report.attempts[0].error.as_ref().unwrap();
+    assert_eq!(error.matches("forwarder retained").count(), 1);
+    assert_eq!(error.matches("distinct warning").count(), 1);
+    assert_eq!(report.attempts[0].stdout, stdout);
 }
 
 // Host health compares the host-installed SHA with each current serving SHA;
@@ -204,6 +261,55 @@ async fn serving_sha_skew_is_visible_per_runtime() {
             )));
         }
         assert_eq!(runner.calls()[2].1, vec!["--runtime-root", "/state/crew cleat", "--server", "named", "version", "--daemon", "--json"]);
+    }
+}
+
+// ADR 0062 A7: a failed vessel handover remains visible after a daemon restart
+// loses its in-memory roll report. An old child reaper with no sessions is healthy.
+// IPC exception: curl authors the standard GET; this process-seam test checks
+// its complete argv (Unix socket, method's default, endpoint; no headers/body).
+// Real cleat protocol behavior is covered by the candidate's host handover gate.
+#[tokio::test]
+async fn contained_old_sessions_remain_skewed_without_a_captured_roll_report() {
+    for (response, actionable, diagnostic) in [
+        (Ok(r#"{"session_count":0}"#.into()), false, ""),
+        (Ok(r#"{"session_count":1}"#.into()), true, "1 sessions remain"),
+        (Ok(r#"{"session_count":3}"#.into()), true, "3 sessions remain"),
+        (Ok("{}".into()), true, "lacks session_count"),
+        (Ok("invalid".into()), true, "invalid old daemon health JSON"),
+        (Err("curl executable not found".into()), true, "health probe unavailable"),
+        (Err("socket disappeared".into()), true, "socket disappeared"),
+    ] {
+        let runner = Arc::new(MockRunner::with_outputs(vec![
+            Ok(CommandOutput { stdout: "default@2".into(), stderr: String::new(), exit_code: Some(0) }),
+            Ok(CommandOutput { stdout: serde_json::json!({"daemon":{"git_sha":"new"},"generation":2}).to_string(), stderr: String::new(), exit_code: Some(0) }),
+            Ok(CommandOutput { stdout: serde_json::json!([{"name":"default@1","runtime_root":"/state/crew cleat","alive":true,"drain_state":"draining","build":{"git_sha":"old"}}]).to_string(), stderr: String::new(), exit_code: Some(0) }),
+            response.map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+        ]));
+        let assessment = build_skew(Some("new"), &[target(runner.clone(), "default", true)], None).await;
+        assert_eq!(!assessment.actionable.is_empty(), actionable);
+        if actionable {
+            assert!(assessment.actionable.join("; ").contains(diagnostic));
+        }
+        assert_eq!(
+            runner.calls()[3],
+            (
+                "curl".into(),
+                vec![
+                    "--disable".into(),
+                    "--noproxy".into(),
+                    "*".into(),
+                    "--max-time".into(),
+                    "4".into(),
+                    "--fail".into(),
+                    "--silent".into(),
+                    "--unix-socket".into(),
+                    "/state/crew cleat/default@1/socket".into(),
+                    "http://localhost/healthz".into()
+                ]
+            )
+        );
+        assert_eq!(runner.remaining(), 0);
     }
 }
 
@@ -309,7 +415,7 @@ async fn recorded_generations_report_draining_without_degrading() {
 // status and installed-known boundary. Old sessions and pinned vessels must
 // never change whether the host's current alias has actionable skew.
 #[hegel::test]
-fn recorded_current_observations_degrade_only_actionable_host_skew(tc: hegel::TestCase) {
+fn recorded_current_observations_degrade_only_actionable_runtime_skew(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let class = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
     let contained = tc.draw(gs::booleans());
@@ -324,14 +430,11 @@ fn recorded_current_observations_degrade_only_actionable_host_skew(tc: hegel::Te
     let target = target(Arc::new(MockRunner::with_outputs(vec![])), "default", contained);
     let installed = if installed_known { sha(&records.installed) } else { None };
     let assessment = assess_current(installed, &target, &current);
-    assert_eq!(!assessment.actionable.is_empty(), class == 1 && installed_known && !contained);
-    let informational = contained || !installed_known || class >= 2;
+    assert_eq!(!assessment.actionable.is_empty(), class == 1 && installed_known);
+    let informational = !installed_known || class >= 2;
     assert_eq!(assessment.information.len(), usize::from(informational));
-    if contained {
-        assert!(assessment.information[0].contains("refreshes on restart"));
-    }
     let condition = assessment.into_condition(chrono::Utc::now());
-    if class == 1 && installed_known && !contained {
+    if class == 1 && installed_known {
         assert_eq!(condition.expect("actionable condition").value, flotilla_resources::ConditionValue::False);
     } else if informational {
         assert_eq!(condition.expect("informational condition").value, flotilla_resources::ConditionValue::True);
@@ -513,7 +616,7 @@ async fn discovered_roll_targets_start_replacements_with_a_controlled_environmen
                 "--server".into(),
                 "default".into(),
                 "server".into(),
-                "drain".into(),
+                "handover".into(),
                 "--json".into(),
             ]
         )]
