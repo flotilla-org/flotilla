@@ -43,23 +43,27 @@ continue to use their existing worktree checkout.
 2. On each host, inspect that host's Docker crew PlacementPolicy and its owning
    host-direct Environment's `repo_default_dir`. Keep the existing image,
    credentials, pool, mount path, and other placement settings.
-3. For an operator-authored crew policy (for example `docker-crew-image-feta`),
-   change only `spec.docker_per_vessel.checkout` from
-   `worktree_on_host_and_mount` to `local_clone_on_host_and_mount`. Save the full
-   policy document and run `flotilla resource apply --file pol-new.json` against
-   that host's daemon. Checkout and Docker strategy presence are operator-owned
-   outside the reserved `docker-on-*` and `host-direct-*` seed-policy names.
-   Later seed passes leave these crew policies untouched.
-   For a manifest-authored policy, edit its source manifest and let its
-   ManifestRoot reconcile it; direct apply is not the authoring route for a
-   managed policy. The manifest route can also author the remaining loop-owned
-   topology fields (`pool`, `host_direct`, and Docker `host_ref`).
-   The reserved `docker-on-<host>` policies retain loop-owned checkout and
-   strategy presence: direct apply refuses those changes, and the seed loop
-   restores their defaults. To customize one, author it in a managed manifest
-   (registration skips managed policies), or create a separate crew policy under
-   an operator-owned name. Repeat deliberately for each host; rolling the daemon
-   does not switch seeded defaults.
+3. Switch the checkout through the policy's authoring route:
+
+   - **Operator-authored crew policy** (for example `docker-crew-image-feta`):
+     change only `spec.docker_per_vessel.checkout` from
+     `worktree_on_host_and_mount` to `local_clone_on_host_and_mount`. Save the full
+     policy document and run `flotilla resource apply --file pol-new.json` against
+     that host's daemon. Checkout and Docker strategy presence are operator-owned
+     outside the reserved `docker-on-*` and `host-direct-*` seed-policy names.
+     Later seed passes leave these crew policies untouched.
+   - **Manifest-authored policy**: edit its source manifest and let its
+     ManifestRoot reconcile it; direct apply is not the authoring route for a
+     managed policy. The manifest route can also author the remaining loop-owned
+     topology fields (`pool`, `host_direct`, and Docker `host_ref`).
+   - **Reserved seed policy**: `docker-on-<host>` policies retain loop-owned
+     checkout and strategy presence. Direct apply refuses those changes, and the
+     seed loop restores their defaults. To customize one, author it in a managed
+     manifest (registration skips managed policies), or create a separate crew
+     policy under an operator-owned name.
+
+   Repeat deliberately for each host; rolling the daemon does not switch seeded
+   defaults.
 4. Dispatch a new convoy and verify its checkout owns a `.git` directory, its
    environment has one writable workspace bind, and explain reports any copy
    fallback. Existing convoys use frozen placement snapshots: complete or retire

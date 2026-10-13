@@ -15,9 +15,13 @@ define_resource!(
     queryable = &["metadata.name", "spec.host_direct.host_ref"]
 );
 
+/// Shared namespace for host-direct Environments and seeded PlacementPolicies.
+/// Name construction and placement field ownership must use the same prefix.
+pub const HOST_DIRECT_NAME_PREFIX: &str = "host-direct-";
+
 /// Resource reference for a host's direct execution environment.
 pub fn host_direct_environment_name(host_ref: &str) -> String {
-    format!("host-direct-{host_ref}")
+    format!("{HOST_DIRECT_NAME_PREFIX}{host_ref}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

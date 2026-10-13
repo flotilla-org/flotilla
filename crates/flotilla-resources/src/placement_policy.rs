@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, FieldOwnedResource,
-    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
+    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole, HOST_DIRECT_NAME_PREFIX,
 };
+
+/// Reserved namespace shared by Docker policy seeding and field ownership.
+pub const DOCKER_POLICY_NAME_PREFIX: &str = "docker-on-";
 
 define_resource!(
     PlacementPolicy,
@@ -43,8 +46,8 @@ impl FieldOwnedResource for PlacementPolicy {
 
     fn field_owner(ownership: &FieldOwnership, name: &str) -> WriterRole {
         if matches!(ownership.field, "spec.docker_per_vessel" | "spec.docker_per_vessel.checkout")
-            && !name.starts_with("docker-on-")
-            && !name.starts_with("host-direct-")
+            && !name.starts_with(DOCKER_POLICY_NAME_PREFIX)
+            && !name.starts_with(HOST_DIRECT_NAME_PREFIX)
         {
             WriterRole::Operator
         } else {
