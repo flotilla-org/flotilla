@@ -2,8 +2,10 @@
 //! build and probe a branch's composed image before merge, with no CI.
 //!
 //! The project's primary repository's `.flotilla/image/` is read at the ref
-//! through the VCS seam and substituted for the synced project layer in the
-//! replica-inclusive catalogue. The composition then resolves exactly as
+//! through the VCS seam and substituted for the synced primary-repository
+//! layer in the replica-inclusive catalogue; a charter-authored layer is kept,
+//! and a branch defining both is refused as the sync refuses it. The
+//! composition then resolves exactly as
 //! admission resolves it (the project's `image:` or the cascaded installation
 //! defaults, `--need`, and the harness adapters), and its ImageBuild is
 //! planned and get-or-created through admission's machinery. Builds are once
@@ -13,6 +15,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
+use flotilla_charter::charter_store::{
+    source_read, LayerDirectorySnapshot, CHARTER_IMAGE_LAYER_PATH, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER,
+};
 use flotilla_protocol::image_check::{
     ImageBuildFailureReport, ImageBuildReport, ImageBuildReportPhase, ImageCheckAgentSource, ImageCheckRefusal, ImageCheckReport,
     ImageCheckRequest, ImageCheckShadow, ImageLayerReport, ImageProbeReport,
@@ -27,9 +32,6 @@ use flotilla_store::{ResourceBackend, StoreQuery};
 use super::{
     convoy_admission::installation_image_defaults,
     project_image_layers::{primary_layer_home, LayerHome},
-};
-use crate::charter_store::{
-    source_read, LayerDirectorySnapshot, CHARTER_IMAGE_LAYER_PATH, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER,
 };
 
 /// What a check reads beyond the store: the layer directory at a ref, and

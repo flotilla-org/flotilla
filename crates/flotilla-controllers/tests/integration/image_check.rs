@@ -9,10 +9,8 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_core::{
-    charter_store::{LayerDirectorySnapshot, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER},
-    in_process::{check_image, image_build_report, ImageCheckSources},
-};
+use flotilla_charter::charter_store::{LayerDirectorySnapshot, PROJECT_IMAGE_LAYER_PATH, PROJECT_IMAGE_MANAGER};
+use flotilla_core::in_process::{check_image, image_build_report, ImageCheckSources};
 use flotilla_protocol::image_check::{ImageBuildReportPhase, ImageCheckAgentSource, ImageCheckReport, ImageCheckRequest, ImageProbeReport};
 use flotilla_resources::{
     parse_layer_directory, resolve_image, CharterSource, ImageBuild, ImageBuildFailureClass, ImageLayer, ImageLayerSource, ImageLayerSpec,

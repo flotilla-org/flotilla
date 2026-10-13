@@ -6542,7 +6542,7 @@ impl image_check::ImageCheckSources for InProcessDaemon {
     async fn layer_snapshot(
         &self,
         source: &flotilla_resources::CharterSource,
-    ) -> Result<Option<crate::charter_store::LayerDirectorySnapshot>, String> {
+    ) -> Result<Option<flotilla_charter::charter_store::LayerDirectorySnapshot>, String> {
         project_ops::ProjectOperations::repository_inspector(self).await?.image_layer_snapshot(source).await
     }
 

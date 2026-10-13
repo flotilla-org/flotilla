@@ -2348,10 +2348,10 @@ impl RepositoryInspector for LayerInspector {
     async fn image_layer_snapshot(
         &self,
         source: &flotilla_resources::CharterSource,
-    ) -> Result<Option<flotilla_core::charter_store::LayerDirectorySnapshot>, String> {
+    ) -> Result<Option<flotilla_charter::charter_store::LayerDirectorySnapshot>, String> {
         self.reads.lock().expect("reads").push(source.clone());
         let flotilla_resources::CharterSource::Repository { branch, .. } = source else { return Err("not a repository".into()) };
-        Ok(Some(flotilla_core::charter_store::LayerDirectorySnapshot {
+        Ok(Some(flotilla_charter::charter_store::LayerDirectorySnapshot {
             revision: format!("{branch}-head"),
             files: BTreeMap::from([
                 ("layer.yaml".to_string(), b"name: demo-native\nversion: 1.0\ntier: project\nprobe: demo --version\n".to_vec()),
