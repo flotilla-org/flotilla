@@ -52,7 +52,7 @@ fn stock_skill_commands_match_clap_tree() {
 // Glue: these real collaborators have one declaration-to-selection path.
 #[test]
 fn project_selects_stock_skills_for_crews_and_governors() {
-    use flotilla_core::project_declaration::parse_project_declaration;
+    use flotilla_charter::project_declaration::parse_project_declaration;
     use flotilla_resources::{resolve_skills, ResolvedCascade, RoleCascadeLayer, SkillCatalogEntry};
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

@@ -18,6 +18,7 @@ toml = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sha2 = { workspace = true }
 flotilla-core = { path = "../flotilla-core" }
+flotilla-charter = { path = "../flotilla-charter" }
 flotilla-discovery = { path = "../flotilla-discovery" }
 flotilla-discovery-api = { path = "../flotilla-discovery-api" }
 flotilla-environment = { path = "../flotilla-environment" }

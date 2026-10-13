@@ -266,7 +266,7 @@ pub fn ops_root_name(project: &str, member: &flotilla_resources::ProjectReposito
 
 #[cfg(test)]
 mod tests {
-    use crate::testkits::discovery::FakeCheckoutManager;
+    use flotilla_discovery_testkit::FakeCheckoutManager;
     use flotilla_paths::path_context::ExecutionEnvironmentPath;
     use flotilla_provider_runtime::ChannelLabel;
     use flotilla_provider_runtime::CommandRunner;

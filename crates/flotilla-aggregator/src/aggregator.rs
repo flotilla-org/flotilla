@@ -8,6 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_charter::ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION};
 #[cfg(test)]
 use flotilla_core::event_sink::BroadcastEventSink;
 use flotilla_core::{
@@ -15,7 +16,6 @@ use flotilla_core::{
     convoy_branch_refresh::ConvoyBranchRefresh,
     event_sink::EventSink,
     in_process::InProcessDaemon,
-    ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION},
     salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
     terminal_health,
 };

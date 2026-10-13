@@ -1,0 +1,41 @@
+# ADR 0060 Charter component: project declarations and operational entries read
+# through a RevisionedTree. No composition-root or store dependencies.
+# See docs/adr/0060-component-crates-and-composition-root.md and ci/build-graph/check.py.
+[package]
+name = "flotilla-charter"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-provider-runtime = { path = "../flotilla-provider-runtime" }
+flotilla-resources = { path = "../flotilla-resources" }
+flotilla-vcs = { path = "../flotilla-vcs" }
+async-trait.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yml = "0.0.12"
+sha2.workspace = true
+tokio.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flotilla-build-features = { path = "../flotilla-build-features" }
+flotilla-build-features-async = { path = "../flotilla-build-features-async" }
+flotilla-build-features-base = { path = "../flotilla-build-features-base" }
+flotilla-build-features-types = { path = "../flotilla-build-features-types" }
+
+[dev-dependencies]
+flotilla-build-features-logging = { path = "../flotilla-build-features-logging" }
+flotilla-discovery-testkit = { path = "../flotilla-discovery-testkit" }
+flotilla-paths = { path = "../flotilla-paths" }
+hegeltest = "=0.48.1"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

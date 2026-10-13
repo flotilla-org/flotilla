@@ -8,15 +8,15 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use flotilla_charter::ops_entry::{
+    materialized_workflow_name, ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
+    ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+    SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+};
 use flotilla_core::{
     convoy_ensure::{ConvoyEnsureAdmission, ConvoyEnsureReconciler, StandingConvoyBackingInspector},
     host_resolution::canonical_placement_host_ref_from_sources,
     in_process::PreparedConvoyAdmission,
-    ops_entry::{
-        materialized_workflow_name, ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
-        ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
-    },
 };
 use flotilla_protocol::{PlacementTargetHost, PrincipalRef, ResourceRef};
 use flotilla_resources::{

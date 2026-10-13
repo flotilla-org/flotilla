@@ -15,10 +15,10 @@ use std::{sync::Arc, time::Duration};
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::TimeZone;
+use flotilla_charter::ops_entry::PRESENTS_AS_ANNOTATION;
+use flotilla_charter::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
+use flotilla_charter::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_core::in_process::*;
-use flotilla_core::ops_entry::PRESENTS_AS_ANNOTATION;
-use flotilla_core::ops_entry::SOURCE_ENTRY_PATH_ANNOTATION;
-use flotilla_core::ops_entry::SOURCE_REPOSITORY_ANNOTATION;
 use flotilla_discovery_testkit::fake_discovery;
 use flotilla_resources::controller_patches;
 use flotilla_resources::ConvoyEnsureHoldReason;
@@ -243,7 +243,7 @@ async fn standing_ensure_fixture_for(
         .using::<WorkflowTemplate>("flotilla")
         .create(
             &InputMeta::builder()
-                .name(flotilla_core::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
+                .name(flotilla_charter::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
                 .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.to_string(), "standing-project".to_string())]))
                 .build(),
             &WorkflowTemplateSpec::builder()
@@ -523,7 +523,7 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
 }
 
 use chrono::Duration as ChronoDuration;
-use flotilla_core::ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
+use flotilla_charter::ops_entry::{MATERIALIZED_PROJECT_ANNOTATION, SOURCE_COMMIT_ANNOTATION};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 use flotilla_resources::{CheckoutStatus as ResourceCheckoutStatus, ConvoySpec, FulfilmentKind, LifecycleAuthority};
 use flotilla_store::apply_status_patch as apply_resource_status_patch;

@@ -170,7 +170,7 @@ fn charter_record_explanation(object: &serde_json::Value) -> serde_json::Value {
             "revision": annotations["flotilla.work/manifest-revision"].as_str()
                 .or_else(|| annotations["flotilla.work/source-commit"].as_str()),
             "root": annotations["flotilla.work/manifest-reconciler-root"],
-            "verification_inputs": annotations[flotilla_core::ops_entry::VERIFICATION_PROVENANCE_ANNOTATION].as_str()
+            "verification_inputs": annotations[flotilla_charter::ops_entry::VERIFICATION_PROVENANCE_ANNOTATION].as_str()
                 .and_then(|encoded| serde_json::from_str::<serde_json::Value>(encoded).ok()),
         },
     })

@@ -133,9 +133,6 @@ use crate::host_resolution::canonical_placement_host_ref_from_sources;
 use crate::leaf_engine::LeafSubscriptionTable;
 use crate::model::repo_name;
 use crate::model::RepoModel;
-use crate::ops_entry::ENSURED_FROM_ANNOTATION;
-use crate::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
-use crate::ops_entry::SOURCE_COMMIT_ANNOTATION;
 use crate::regard_lifecycle::RegardLifecycle;
 use crate::regard_lifecycle::SurfaceGestureOutcome;
 use crate::regard_lifecycle::DEFAULT_REGARD_DECAY_SECONDS;
@@ -155,6 +152,9 @@ use flotilla_agent::adapter::required_agent_adapters;
 use flotilla_agent::adapter::CapabilityTable;
 use flotilla_ai_utility::AiUtility;
 use flotilla_ai_utility::ConvoyNames;
+use flotilla_charter::ops_entry::ENSURED_FROM_ANNOTATION;
+use flotilla_charter::ops_entry::MATERIALIZED_PROJECT_ANNOTATION;
+use flotilla_charter::ops_entry::SOURCE_COMMIT_ANNOTATION;
 use flotilla_cloud_agent::RepoCriteria;
 use flotilla_config::ConfigStore;
 use flotilla_config::StaticEnvironmentConfig;
@@ -4989,7 +4989,7 @@ impl InProcessDaemon {
 
     /// Raw bound fleet manifests at the current source head, for candidate-side
     /// validation. Returning raw text lets the candidate use its own decoder.
-    pub async fn charter_input_inventory(&self, namespace: &str) -> Result<Vec<crate::ops_entry::OperationalEntryFile>, String> {
+    pub async fn charter_input_inventory(&self, namespace: &str) -> Result<Vec<flotilla_charter::ops_entry::OperationalEntryFile>, String> {
         let roots = self.resource_backend.using::<ManifestRoot>(namespace).list().await.map_err(|error| error.to_string())?;
         let vcs = self.local_charter_vcs()?;
         let mut files = Vec::new();
@@ -5000,7 +5000,7 @@ impl InProcessDaemon {
             let Some(source) = root.spec.binding else {
                 continue;
             };
-            let snapshot = crate::charter_store::read_charter_source(&source, Path::new(&root.spec.path), Some(&*vcs)).await?;
+            let snapshot = flotilla_charter::charter_store::read_charter_source(&source, Path::new(&root.spec.path), Some(&*vcs)).await?;
             files.extend(
                 snapshot
                     .files
@@ -5008,7 +5008,7 @@ impl InProcessDaemon {
                     .filter(|(path, _)| {
                         Path::new(path).extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext, "yaml" | "yml" | "json"))
                     })
-                    .map(|(path, contents)| crate::ops_entry::OperationalEntryFile {
+                    .map(|(path, contents)| flotilla_charter::ops_entry::OperationalEntryFile {
                         path: format!("{}/{path}", root.metadata.name),
                         contents,
                     }),

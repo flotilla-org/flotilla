@@ -7,6 +7,7 @@ members = [
     "crates/flotilla-aggregator",
     "crates/flotilla-build-features",
     "crates/flotilla-change-request",
+    "crates/flotilla-charter",
     "crates/flotilla-client",
     "crates/flotilla-ai-utility",
     "crates/flotilla-cloud-agent",
@@ -97,6 +98,7 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 flotilla-config = { path = "crates/flotilla-config" }
 flotilla-environment = { path = "crates/flotilla-environment" }
 flotilla-vcs = { path = "crates/flotilla-vcs" }
+flotilla-charter = { path = "crates/flotilla-charter" }
 flotilla-provider-runtime = { path = "crates/flotilla-provider-runtime" }
 flotilla-store-memory = { path = "crates/flotilla-store-memory" }
 flotilla-tls = { path = "crates/flotilla-tls" }

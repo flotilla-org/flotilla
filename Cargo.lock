@@ -1053,6 +1053,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "flotilla-agent",
+ "flotilla-charter",
  "flotilla-client",
  "flotilla-commands",
  "flotilla-config",
@@ -1137,6 +1138,7 @@ dependencies = [
  "flotilla-build-features-sqlite",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-charter",
  "flotilla-core",
  "flotilla-daemon-api",
  "flotilla-forge-github",
@@ -1454,6 +1456,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-charter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "flotilla-build-features",
+ "flotilla-build-features-async",
+ "flotilla-build-features-base",
+ "flotilla-build-features-logging",
+ "flotilla-build-features-types",
+ "flotilla-discovery-testkit",
+ "flotilla-paths",
+ "flotilla-protocol",
+ "flotilla-provider-runtime",
+ "flotilla-resources",
+ "flotilla-vcs",
+ "hegeltest",
+ "libc",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "flotilla-client"
 version = "0.1.0"
 dependencies = [
@@ -1581,6 +1610,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-change-request",
+ "flotilla-charter",
  "flotilla-cloud-agent",
  "flotilla-config",
  "flotilla-core",
@@ -1644,6 +1674,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-change-request",
+ "flotilla-charter",
  "flotilla-cloud-agent",
  "flotilla-config",
  "flotilla-daemon-api",
@@ -1780,6 +1811,7 @@ dependencies = [
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
  "flotilla-change-request",
+ "flotilla-charter",
  "flotilla-client",
  "flotilla-config",
  "flotilla-controllers",
@@ -2119,6 +2151,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "flotilla-charter",
  "flotilla-config",
  "flotilla-core",
  "flotilla-discovery",
@@ -2640,6 +2673,7 @@ dependencies = [
  "flotilla-build-features-time",
  "flotilla-build-features-tracing",
  "flotilla-build-features-types",
+ "flotilla-charter",
  "flotilla-client",
  "flotilla-commands",
  "flotilla-config",

@@ -53,6 +53,7 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3.22", features = ["json"] }
 async-trait = { workspace = true }
 flotilla-core = { path = "../flotilla-core" }
+flotilla-charter = { path = "../flotilla-charter" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 insta = "1"
 tempfile = { workspace = true }

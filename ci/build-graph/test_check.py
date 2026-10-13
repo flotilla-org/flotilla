@@ -105,6 +105,24 @@ class BuildGraphContract(unittest.TestCase):
             package("flotilla-protocol"), package("flotilla-provider-runtime"),
         )), [])
 
+    def test_charter_is_native_and_independent(self):
+        # ADR 0060: Charter reads through VCS, so it is native, but cannot reach composition or store crates.
+        self.assertEqual(layer("flotilla-charter"), "native")
+        for target in ("flotilla-core", "flotilla-aggregator", "flotilla-credentials",
+                       "flotilla-controllers", "flotilla-daemon", "flotilla-store"):
+            for kind in ("normal", "build"):
+                for middle in (target, "adapter"):
+                    with self.subTest(target=target, kind=kind, middle=middle):
+                        self.assertEqual(violations(graph(
+                            package("flotilla-charter", **{kind: (middle,)}),
+                            package("adapter", normal=(target,)), package(target),
+                        )), [f"flotilla-charter: must not depend on {target}, directly or transitively"])
+        self.assertEqual(violations(graph(
+            package("flotilla-charter", normal=("flotilla-vcs", "flotilla-resources")),
+            package("flotilla-core", normal=("flotilla-charter",)),
+            package("flotilla-vcs"), package("flotilla-resources"),
+        )), [])
+
     def test_environment_is_native_and_independent(self):
         # ADR 0060: environment is native, but cannot reach composition or store crates.
         self.assertEqual(layer("flotilla-environment"), "native")
