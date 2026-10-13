@@ -16,7 +16,7 @@
 //! failing an `INDEXED BY` query or the `CREATE`.
 //!
 //! Remove this module one roll after every host has run it, once no rollback
-//! target predates #3057.
+//! target predates #3057 (tracked by #3173).
 
 use super::*;
 
@@ -148,7 +148,9 @@ mod tests {
 
     /// Fields declared beyond `metadata.name` at `1a5d2d2f^`, the last
     /// generation that created unsuffixed field indexes. Every registered kind
-    /// also declared `metadata.name`.
+    /// also declared `metadata.name`. To re-verify, list the
+    /// `QUERYABLE_FIELDS` declarations at that commit:
+    /// `git grep -n -A12 'QUERYABLE_FIELDS' 1a5d2d2f^ -- crates/flotilla-resources/src`.
     const PRE_3057_FIELDS: &[(&str, &[&str])] = &[
         ("Artifact", &["spec.convoy"]),
         ("ChangeRequest", &["status.state.value"]),
@@ -186,7 +188,9 @@ mod tests {
 
     /// The field loop of `initialize_query_indexes` at `1a5d2d2f^`
     /// (crates/flotilla-store-sqlite/src/sqlite.rs:549-579), restricted to its
-    /// declared fields. Returns how many field indexes it had to create.
+    /// declared fields. Returns how many field indexes it had to create. It is
+    /// a copy, so the rollback test also runs the old `INDEXED BY` and
+    /// `_members` queries against what it builds.
     fn open_as_pre_3057(connection: &mut rusqlite::Connection) -> usize {
         let tx = connection.transaction().unwrap();
         let mut created = 0;
