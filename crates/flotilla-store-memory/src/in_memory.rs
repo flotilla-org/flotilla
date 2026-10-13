@@ -739,8 +739,9 @@ impl InMemoryBackend {
         name: &str,
     ) -> Result<ResourceObject<SerializedResource>, ResourceError> {
         self.with_store(resource_kind, namespace, |store| {
-            let value = store.objects.get(name).cloned().ok_or_else(|| ResourceError::not_found(name))?;
-            self.count_read(resource_kind, ReadOperation::Get, 1);
+            let value = store.objects.get(name).cloned();
+            self.count_read(resource_kind, ReadOperation::Get, usize::from(value.is_some()));
+            let value = value.ok_or_else(|| ResourceError::not_found(name))?;
             Self::decode_object(resource_kind, value)
         })
         .await

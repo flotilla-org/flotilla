@@ -446,6 +446,54 @@ async fn sqlite_leaf_object_routing_counts_only_addressed_rows() {
 }
 
 async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
+    routing_contract(backend, changes, false).await;
+}
+
+// #3141 / #3120: a warm leaf wake must evaluate from resident subjects.
+// Today each affected row reloads its addressed objects; keep the zero budget
+// running in CI as an expected failure until the resident redesign lands.
+#[tokio::test]
+#[should_panic(expected = "zero durable-store read budget exceeded")]
+async fn leaf_wake_zero_reads_pending_3120() {
+    routing_contract(ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite")), &[0, 1, 63], true).await;
+}
+
+// #3141 / #3120: attaching a wait to an already warm leaf engine should
+// use resident subjects; today even an already watched address is re-read.
+#[tokio::test]
+#[should_panic(expected = "zero durable-store read budget exceeded")]
+async fn leaf_warm_subscription_zero_reads_pending_3120() {
+    use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
+    use futures::FutureExt;
+    let writer = ResourceBackend::new(SqliteBackend::open_in_memory().expect("sqlite"));
+    create_convoy(&writer, "watched", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+    let counted = writer.with_read_counts();
+    let table = supervision_wake(&counted).subscriptions;
+    let mut watches = Vec::new();
+    for index in 0..2 {
+        let guard = ZeroReadGuard::after_warm_up(&counted);
+        let mut row = overload_row(uuid::Uuid::new_v4());
+        row.leaves = vec![leaf(LeafAddress::Convoy { name: "watched".into() }, ".status.phase", "Failed")];
+        table.inner.rows.lock().await.insert(row.id, row.clone());
+        let mut watching = Box::pin(table.watch_row(row));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while table.inner.evaluations.load(Ordering::SeqCst) <= index {
+                assert!(watching.as_mut().now_or_never().is_none(), "Active cannot fire a Failed wait");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription evaluated");
+        watches.push(watching);
+        if index != 0 {
+            guard.assert_zero("leaf subscription after warm-up");
+        }
+    }
+}
+
+async fn routing_contract(backend: ResourceBackend, changes: &[usize], zero_reads: bool) {
+    use flotilla_store_testkit::{ReadCountsBackendExt, ZeroReadGuard};
+    let counted = backend.clone().with_read_counts();
     use futures::FutureExt;
     for index in 0..64 {
         create_convoy(&backend, &format!("object-{index}"), ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
@@ -458,7 +506,7 @@ async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
         Arc::new(UnavailableChangeRequests),
         Default::default(),
     );
-    let table = LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(events), refresher);
+    let table = LeafSubscriptionTable::new(counted.clone(), broadcast_test_sink(events), refresher);
     let mut watchers = Vec::new();
     let mut ids = Vec::new();
     for index in [0, 1, 2, 0] {
@@ -487,6 +535,7 @@ async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
     assert_eq!(table.inner.evaluations.load(Ordering::SeqCst), 4);
     assert_eq!(table.inner.store_reads.load(Ordering::SeqCst), 4, "one targeted read per unique address, no full lists");
     for (step, index) in changes.iter().enumerate() {
+        let guard = ZeroReadGuard::after_warm_up(&counted);
         let previous_events = table.inner.routing.lock().await.events_processed;
         let before_evaluations = table.inner.evaluations.load(Ordering::SeqCst);
         let before_reads = table.inner.store_reads.load(Ordering::SeqCst);
@@ -519,6 +568,9 @@ async fn routing_count_contract(backend: ResourceBackend, changes: &[usize]) {
         assert_eq!(table.inner.evaluations.load(Ordering::SeqCst) - before_evaluations, touched);
         assert_eq!(table.inner.store_reads.load(Ordering::SeqCst) - before_reads, touched);
         assert!(fires.try_recv().is_err());
+        if zero_reads {
+            guard.assert_zero("leaf wake and subscription delivery");
+        }
     }
     // A matching name in another namespace is not an addressed object.
     let other = backend.using::<Convoy>("other");

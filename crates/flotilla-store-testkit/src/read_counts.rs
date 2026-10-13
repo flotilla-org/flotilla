@@ -74,6 +74,12 @@ impl ReadSnapshot {
         self.0.is_empty()
     }
 
+    /// Zero crossings, including empty gets and queries, after warm-up.
+    #[track_caller]
+    pub fn assert_zero(&self, scenario: &str) {
+        assert!(self.is_empty(), "{scenario}: zero durable-store read budget exceeded\n{self}");
+    }
+
     /// Only whole-kind lists.
     pub fn lists(&self) -> ReadSnapshot {
         ReadSnapshot(self.0.iter().filter(|((_, operation), _)| *operation == ReadOperation::List).map(|(k, v)| (k.clone(), *v)).collect())
@@ -279,6 +285,40 @@ pub trait ReadCountsBackendExt {
     }
 }
 
+/// A warm steady-state interval on an isolated counted backend. Unlike
+/// [`measure_reads`], this includes watch workers and other spawned tasks.
+/// Keep fixture reads on an uncounted clone and await observable delivery
+/// before asserting. Startup/recovery reads belong outside the interval.
+/// See `docs/implementation-choices/steady-state-read-guards.md` for the
+/// workload, isolation assumptions, and expected-failure convention.
+///
+/// ```no_run
+/// # async fn example() {
+/// use flotilla_store_testkit::{memory_backend, ReadCountsBackendExt, ZeroReadGuard};
+/// let backend = memory_backend().with_read_counts();
+/// // Bootstrap the controller or view with backend.clone(), then:
+/// let guard = ZeroReadGuard::after_warm_up(&backend);
+/// // Drive an event and await its observable result.
+/// guard.assert_zero("controller delivery");
+/// # }
+/// ```
+pub struct ZeroReadGuard {
+    backend: ResourceBackend,
+    before: ReadSnapshot,
+}
+
+impl ZeroReadGuard {
+    pub fn after_warm_up(backend: &ResourceBackend) -> Self {
+        assert!(read_counts(backend.read_observer()).is_some(), "zero-read guard requires with_read_counts");
+        Self { backend: backend.clone(), before: backend.read_snapshot() }
+    }
+
+    #[track_caller]
+    pub fn assert_zero(&self, scenario: &str) {
+        self.backend.read_snapshot().since(&self.before).assert_zero(scenario);
+    }
+}
+
 fn snapshot(observer: Option<&dyn ReadObserver>) -> ReadSnapshot {
     read_counts(observer).map(|counts| counts.totals.lock().expect("read counts").clone()).unwrap_or_default()
 }
@@ -390,6 +430,26 @@ mod tests {
         );
         assert!(std::panic::catch_unwind(|| reads.assert_no_lists("case")).is_err());
         assert!(std::panic::catch_unwind(|| ReadSnapshot::default().assert_no_lists("case")).is_ok());
+    }
+
+    // The zero guard counts empty reads, every operation, and background tasks;
+    // uncounted fixture reads stay outside its budget.
+    #[tokio::test]
+    async fn zero_guard_includes_workers_and_rejects_every_read_operation() {
+        for operation in OPERATIONS {
+            let backend = counted();
+            let guard = ZeroReadGuard::after_warm_up(&backend);
+            guard.assert_zero("idle warm path");
+            let worker = backend.clone();
+            tokio::spawn(async move { read(&worker, "Convoy", operation, 0) }).await.expect("worker");
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.assert_zero("worker read"))).is_err());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "zero-read guard requires with_read_counts")]
+    fn zero_guard_refuses_an_uncounted_backend() {
+        ZeroReadGuard::after_warm_up(&crate::memory_backend());
     }
 
     // Flatness compares every size against the first and reports a change.

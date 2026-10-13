@@ -56,3 +56,5 @@ mod usage_tests;
 mod declared_queries;
 
 mod watch_view;
+
+mod zero_read_guards;
