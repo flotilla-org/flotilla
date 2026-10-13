@@ -253,9 +253,15 @@ pub(crate) async fn expand_registered_charters(
                             .map_err(|error| format!("{source}/{CHARTER_IMAGE_LAYER_PATH}: charter scope `{ns}/{project}`: {error}"))?;
                     // One project, one layer source: the primary repository's
                     // `.flotilla/image/` as well is a within-source clash.
-                    for other in
-                        backend.definitions::<flotilla_resources::ImageLayer>(&ns).list().await.map_err(|error| error.to_string())?
-                    {
+                    let primaries = backend
+                        .definitions::<flotilla_resources::ImageLayer>(&ns)
+                        .list_selected(flotilla_store::StoreQuery {
+                            labels: BTreeMap::from([(flotilla_resources::MANAGED_BY_LABEL.to_string(), PROJECT_IMAGE_MANAGER.to_string())]),
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for other in primaries {
                         let primary = other.metadata.deletion_timestamp.is_none()
                             && other.metadata.labels.get(flotilla_resources::MANAGED_BY_LABEL).map(String::as_str)
                                 == Some(PROJECT_IMAGE_MANAGER)
