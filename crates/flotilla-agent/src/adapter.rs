@@ -1249,6 +1249,19 @@ mod tests {
         )
     }
 
+    #[test]
+    fn harness_bound_credential_adapter_ids_name_registered_adapters() {
+        let registry = discovered_registry();
+        for consumer in [
+            flotilla_resources::CredentialConsumer::Claude,
+            flotilla_resources::CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+            flotilla_resources::CredentialConsumer::Codex,
+        ] {
+            let id = consumer.harness_adapter().expect("harness-bound consumer");
+            assert!(registry.get(id).is_some(), "`{id}` is not a registered agent adapter");
+        }
+    }
+
     #[hegel::test]
     fn codex_launch_contract_classifies_only_usage_exits(tc: hegel::TestCase) {
         let registry = discovered_registry();

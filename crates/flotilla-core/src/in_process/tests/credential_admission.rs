@@ -321,6 +321,69 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
 }
 
 #[tokio::test]
+async fn harness_bound_credential_reaches_only_vessels_running_that_harness() {
+    let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(
+            &test_meta("claude-max"),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+                source: CredentialSource::Env { name: "CLAUDE_MAX_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
+        .await
+        .expect("create Claude credential declaration");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &test_meta("claude-max-contained"),
+            &CredentialGrantSpec::builder()
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
+                .credentials(BTreeSet::from(["claude-max".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create project-selected grant");
+    let vessel = |name: &str, adapter: &str| {
+        VesselRequirement::builder()
+            .name(name.to_string())
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: Some(adapter.to_string()), model: None },
+                    prompt: None,
+                    brief_template: None,
+                })
+                .build()])
+            .build()
+    };
+    let mut workflow = WorkflowTemplateSpec::builder().vessels(vec![vessel("claude", "claude-code"), vessel("codex", "codex")]).build();
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut workflow).await.expect("resolve grants");
+    assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
+    assert!(workflow.vessels[0].credential_scopes.contains_key("claude-max"));
+    assert!(workflow.vessels[1].credential_refs.is_empty());
+    assert!(workflow.vessels[1].credential_scopes.is_empty());
+    create_docker_placement(&backend, "docker-claude", "host-a", BTreeSet::from(["claude-max".to_string()])).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-claude").await.expect("get placement");
+    validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect("codex vessel admits without the Claude credential");
+    // The regression scenario: the placement holds no Claude credential at all.
+    let mut codex_only = workflow.clone();
+    codex_only.vessels.remove(0);
+    create_docker_placement(&backend, "docker-codex", "host-b", BTreeSet::new()).await;
+    let bare = backend.using::<PlacementPolicy>("flotilla").get("docker-codex").await.expect("get placement");
+    validate_workflow_credentials(&backend, "flotilla", &codex_only, Some(&bare))
+        .await
+        .expect("codex vessel admits on a placement without the Claude credential");
+}
+
+#[tokio::test]
 async fn docker_placement_selects_credentials_for_the_effective_contained_stance() {
     let backend = ResourceBackend::new(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
