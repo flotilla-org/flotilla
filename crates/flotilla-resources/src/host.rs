@@ -370,6 +370,16 @@ impl FulfilmentFacts {
     pub fn same_observation(&self, other: &Self) -> bool {
         Self { observed_at: other.observed_at, ..self.clone() } == *other
     }
+
+    /// Whether two fulfilment maps report the same facts per kind, whenever
+    /// each was observed.
+    pub fn same_observations(left: &BTreeMap<String, Self>, right: &BTreeMap<String, Self>) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|((left_kind, left), (right_kind, right))| left_kind == right_kind && left.same_observation(right))
+    }
 }
 
 #[cfg(test)]

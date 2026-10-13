@@ -29,6 +29,8 @@ where
 
 /// Apply a patch with an injected action between reading a version and writing it.
 /// This is used by callers testing a conflict and the subsequent optimistic retry.
+/// A patch whose `StatusPatch::requires_write` declines the change returns the
+/// current object without writing, so `before_update` does not run.
 #[doc(hidden)]
 pub async fn apply_status_patch_with_before_update<T, F, Fut>(
     resolver: &TypedResolver<T>,

@@ -274,3 +274,20 @@ async fn in_memory_host_stream_keeps_one_event() {
 async fn sqlite_host_stream_keeps_one_event() {
     assert_host_stream_keeps_one_event(flotilla_store_testkit::sqlite_backend().expect("sqlite backend")).await;
 }
+
+// Behaviour: probe tasks compare fulfilment maps without observation times, so
+// a re-stamped observation is "the same" while a changed fact, an added kind
+// or a removed kind is not.
+#[test]
+fn fulfilment_maps_compare_without_observation_times() {
+    let earlier = facts(start(), 0);
+    assert!(FulfilmentFacts::same_observations(&earlier, &facts(start() + Duration::seconds(5), 0)));
+    assert!(!FulfilmentFacts::same_observations(&earlier, &facts(start(), 1)));
+    let mut wider = earlier.clone();
+    wider.insert("kind-b".to_string(), FulfilmentFacts::default());
+    assert!(!FulfilmentFacts::same_observations(&earlier, &wider));
+    assert!(!FulfilmentFacts::same_observations(&wider, &earlier));
+    let mut renamed = BTreeMap::new();
+    renamed.insert("kind-z".to_string(), earlier["kind-a"].clone());
+    assert!(!FulfilmentFacts::same_observations(&earlier, &renamed));
+}

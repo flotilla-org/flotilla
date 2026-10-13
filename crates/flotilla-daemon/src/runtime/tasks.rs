@@ -17,8 +17,8 @@ use flotilla_discovery::registry::{command_provider_registry, ProviderRegistry};
 use flotilla_environment::environment::EnvironmentKind;
 use flotilla_protocol::{CanonicalHostId, NodeId};
 use flotilla_resources::{
-    Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, Host, HostStatusPatch, ReadWatchEvent, Resource, ResourceError,
-    ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
+    Checkout, Clone, Convoy, ForgeRead, ForgeReadHeartbeat, FulfilmentFacts, Host, HostStatusPatch, ReadWatchEvent, Resource,
+    ResourceError, ResourceProvenance, RetryBackoff, SystemClock, TerminalSession, Vessel,
 };
 use flotilla_store::{watch_resource_kind, watch_resource_kind_including_replicas, ResourceBackend};
 use flotilla_vcs::vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT;
@@ -336,19 +336,30 @@ pub(super) fn spawn_local_fulfilment_probe_task(
             .await
             {
                 Ok(facts) => {
-                    // Host's patch declines timestamp-only differences.
-                    if facts != status.fulfilment_facts || model_probes != status.model_probes {
-                        if let Err(error) = flotilla_store::apply_status_patch(
-                            &hosts,
-                            &profile.host_id,
-                            &HostStatusPatch::FulfilmentFacts { facts: facts.clone(), model_probes },
-                        )
-                        .await
-                        {
-                            warn!(%error, "failed to publish observed fulfilment facts");
-                        }
+                    // Timestamp-only refreshes fold into the heartbeat. Remember
+                    // facts only once the store holds them, so a failed publish
+                    // of changed facts is retried rather than folded.
+                    let published =
+                        if FulfilmentFacts::same_observations(&facts, &status.fulfilment_facts) && model_probes == status.model_probes {
+                            true
+                        } else {
+                            match flotilla_store::apply_status_patch(
+                                &hosts,
+                                &profile.host_id,
+                                &HostStatusPatch::FulfilmentFacts { facts: facts.clone(), model_probes },
+                            )
+                            .await
+                            {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    warn!(%error, "failed to publish observed fulfilment facts");
+                                    false
+                                }
+                            }
+                        };
+                    if published {
+                        observations.record_fulfilment_facts(facts).await;
                     }
-                    observations.record_fulfilment_facts(facts).await;
                 }
                 Err(error) => warn!(%error, "failed to observe local fulfilment facts"),
             }
@@ -397,18 +408,29 @@ pub(super) fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, name
             .await
             {
                 Ok(facts) => {
-                    *ssh.fulfilment_facts.write().await = facts.clone();
-                    // Host's patch declines timestamp-only differences.
-                    if facts != status.fulfilment_facts || model_probes != status.model_probes {
-                        if let Err(error) = flotilla_store::apply_status_patch(
-                            &hosts,
-                            &ssh.provisioning.host_id,
-                            &HostStatusPatch::FulfilmentFacts { facts, model_probes },
-                        )
-                        .await
-                        {
-                            warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
-                        }
+                    // As for the local host: timestamp-only refreshes fold into
+                    // the next SSH observation write, and facts are remembered
+                    // only once the store holds them.
+                    let published =
+                        if FulfilmentFacts::same_observations(&facts, &status.fulfilment_facts) && model_probes == status.model_probes {
+                            true
+                        } else {
+                            match flotilla_store::apply_status_patch(
+                                &hosts,
+                                &ssh.provisioning.host_id,
+                                &HostStatusPatch::FulfilmentFacts { facts: facts.clone(), model_probes },
+                            )
+                            .await
+                            {
+                                Ok(_) => true,
+                                Err(error) => {
+                                    warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
+                                    false
+                                }
+                            }
+                        };
+                    if published {
+                        *ssh.fulfilment_facts.write().await = facts;
                     }
                 }
                 Err(error) => warn!(host = %ssh.provisioning.host_id, %error, "failed to observe SSH fulfilment facts"),
