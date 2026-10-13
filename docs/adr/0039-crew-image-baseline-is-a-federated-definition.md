@@ -4,7 +4,7 @@ Date: 2026-09-23
 
 ## Status
 
-Accepted
+Superseded by [ADR 0062](0062-crew-images-are-ordered-layer-lists-built-once-per-identity.md). The baseline was retired by #3116.
 
 ## Context
 
