@@ -2,7 +2,9 @@
 
 [ADR 0062](../adr/0062-crew-images-are-ordered-layer-lists-built-once-per-identity.md) defines a crew image as an ordered list of `ImageLayer` definitions. The list's
 identity is a hash of those definitions. An image is built once per identity
-and architecture, as one `ImageBuild` named `image-<first 40 hex of identity>-<arch>`.
+and architecture, as one `ImageBuild` named `image-<first 40 hex of identity>-<arch>` for
+registry delivery. A local build exists only on its builder, so its name also carries the
+sanitised builder host: `image-<hex>-<arch>-<host>`.
 
 ## Demand
 

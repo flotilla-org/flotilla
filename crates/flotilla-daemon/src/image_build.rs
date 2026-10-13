@@ -48,8 +48,12 @@ pub(crate) async fn project_builds(backend: &ResourceBackend, namespace: &str, h
         demanded.insert((origin_root.to_string(), obj.metadata.name.clone()));
         match builds.get(&obj.metadata.name).await {
             Ok(current) => {
+                // Copies of one name may disagree under replication lag (a
+                // different reservation or delivery view); like
+                // `read_image_build`, keep the existing copy rather than
+                // failing, since it serves the same identity and architecture.
                 if current.spec != obj.spec {
-                    tracing::error!(role = "infra", image_build = %obj.metadata.name, "image build name collision; skipping demand");
+                    tracing::warn!(image_build = %obj.metadata.name, source_root = %origin_root, "image build demand disagrees with the projected copy; keeping the copy");
                 }
             }
             Err(ResourceError::NotFound { .. }) => {
@@ -269,8 +273,8 @@ mod tests {
         assert!(home.using::<ImageBuild>("test").get(&name).await.expect("original demand").status.is_none());
     }
 
-    // A local build of the same name with a different builder is never
-    // overwritten by projection.
+    // A local copy whose spec disagrees with a replicated demand of the same
+    // name is kept, not overwritten, matching `read_image_build`.
     #[tokio::test]
     async fn name_collisions_are_not_projected() {
         let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
@@ -306,7 +310,7 @@ mod tests {
         let home = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("home"));
         let builder = ResourceBackend::new(flotilla_store_memory::InMemoryBackend::default()).with_local_root(NodeId::new("builder-root"));
         let demand = spec("builder");
-        let name = image_build_name(&demand.identity, &demand.architecture);
+        let name = demand.resource_name();
         let demands = home.using::<ImageBuild>("test");
         demands.create(&InputMeta::builder().name(name.clone()).build(), &demand.into()).await.expect("demand");
         let replica = builder.replica_writer::<ImageBuild>(NodeId::new("home"), "test");
@@ -319,7 +323,7 @@ mod tests {
         let lagging = spec("builder");
         let mut lagging = lagging;
         lagging.architecture = "arm64".into();
-        let lagging_name = image_build_name(&lagging.identity, "arm64");
+        let lagging_name = lagging.resource_name();
         let annotations = std::collections::BTreeMap::from([
             (flotilla_resources::ACTUATOR_HOST_REF_ANNOTATION.to_string(), "builder".to_string()),
             (flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "unsynced-root".to_string()),
@@ -331,7 +335,7 @@ mod tests {
         let mut own = spec("builder");
         own.layers[0].version = "2".into();
         own.identity = image_identity(&own.layers);
-        let own_name = image_build_name(&own.identity, "amd64");
+        let own_name = own.resource_name();
         builds.create(&InputMeta::builder().name(own_name.clone()).build(), &own.into()).await.expect("own build");
 
         demands.delete(&name).await.expect("operator retry");

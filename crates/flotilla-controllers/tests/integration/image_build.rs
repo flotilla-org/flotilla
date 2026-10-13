@@ -24,8 +24,8 @@ use flotilla_environment::environment::{
 };
 use flotilla_protocol::{EnvironmentId, HostSummary, NodeId, NodeInfo, SystemInfo};
 use flotilla_resources::{
-    image_build_name, image_identity, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentSpec,
-    FleetDesignation, FleetDesignationSpec, Host, HostImageAction, HostSpec, HostStatus, ImageBuild, ImageBuildCapacity, ImageBuildFailure,
+    image_identity, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentPhase, EnvironmentSpec, FleetDesignation,
+    FleetDesignationSpec, Host, HostImageAction, HostSpec, HostStatus, ImageBuild, ImageBuildCapacity, ImageBuildFailure,
     ImageBuildFailureClass, ImageBuildPhase, ImageBuildReservation, ImageBuildResourceSpec, ImageBuildSpec, ImageCacheBinding,
     ImageDelivery, ImageLayerProbe, ImageLayerSource, ImageLayerSpec, ImageLayerTier, ImageProbeOutcome, InputMeta, ResolvedImage,
     FLEET_DESIGNATION_NAME, IMAGE_BUILD_MAX_ATTEMPTS,
@@ -100,7 +100,7 @@ fn builder(slots: u32) -> Option<ImageBuildCapacity> {
 }
 
 async fn create(backend: &ResourceBackend, spec: &ImageBuildSpec) -> String {
-    let name = image_build_name(&spec.identity, &spec.architecture);
+    let name = spec.resource_name();
     backend.using::<ImageBuild>(NS).create(&InputMeta::builder().name(name.clone()).build(), &spec.clone().into()).await.expect("build");
     name
 }
@@ -346,9 +346,13 @@ fn concurrent_demand_executes_one_build_per_identity(tc: hegel::TestCase) {
         }
         let layers = layers(0, &[]);
         let resolved = ResolvedImage { identity: image_identity(&layers), layers, shadowed: Vec::new() };
-        let names = futures::future::join_all(
-            (0..admissions).map(|_| flotilla_core::image_build::ensure_image_build(&backend, NS, &resolved, HOST)),
-        )
+        // Each admission plans at placement and creates at its commit; a
+        // concurrent creator's copy is reused.
+        let names = futures::future::join_all((0..admissions).map(|_| async {
+            let planned = flotilla_core::image_build::plan_image_build(&backend, NS, &resolved, HOST).await?;
+            flotilla_core::image_build::create_planned_builds(&backend, NS, std::slice::from_ref(&planned)).await?;
+            Ok::<_, String>(planned.name)
+        }))
         .await;
         let name = names[0].clone().expect("admission");
         assert!(names.iter().all(|joined| joined.as_ref() == Ok(&name)), "every admission joins one build");
