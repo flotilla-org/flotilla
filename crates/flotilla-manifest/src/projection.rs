@@ -278,10 +278,17 @@ pub fn session_badge(phase: SessionPhase) -> Badge {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Catalog {
+    ttl_ms: Option<u64>,
     uncovered_services: BTreeSet<String>,
     facts: BTreeMap<MetadataTarget, BTreeMap<String, MetadataValueUpdate>>,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self { ttl_ms: Some(CATALOG_TTL_MS), uncovered_services: BTreeSet::new(), facts: BTreeMap::new() }
+    }
 }
 
 impl Catalog {
@@ -299,7 +306,7 @@ impl Catalog {
     }
 
     pub fn reassert_patches(&self) -> Vec<MetadataPatch> {
-        self.facts.iter().map(|(target, facts)| patch(target.clone(), facts.clone(), vec![])).collect()
+        self.facts.iter().map(|(target, facts)| patch(target.clone(), facts.clone(), vec![], self.ttl_ms)).collect()
     }
 
     pub fn diff_patches(&self, previous: &Catalog) -> Vec<MetadataPatch> {
@@ -314,16 +321,12 @@ impl Catalog {
             let unset: Vec<String> =
                 prior.map(|prior| prior.keys().filter(|key| !facts.contains_key(*key)).cloned().collect()).unwrap_or_default();
             if !set.is_empty() || !unset.is_empty() {
-                patches.push(patch(target.clone(), set, unset));
+                patches.push(patch(target.clone(), set, unset, self.ttl_ms));
             }
         }
         for (target, facts) in &previous.facts {
             if !self.facts.contains_key(target) {
-                patches.push(patch(
-                    target.clone(),
-                    BTreeMap::new(),
-                    facts.keys().filter(|key| key.as_str() != KEY_SOURCE).cloned().collect(),
-                ));
+                patches.push(patch(target.clone(), BTreeMap::new(), facts.keys().cloned().collect(), self.ttl_ms));
             }
         }
         patches
@@ -349,16 +352,15 @@ impl Catalog {
             .map(|(key, value)| (key.to_owned(), value))
             .chain(facts.into_iter().map(|(key, value)| (key.as_ref().to_owned(), value)))
         {
-            let mut update = MetadataValueUpdate::new(value, Some(CATALOG_TTL_MS));
+            let mut update = MetadataValueUpdate::new(value, self.ttl_ms);
             update.ordinal = ordinal;
             entry.insert(key, update);
         }
     }
 }
 
-fn patch(target: MetadataTarget, mut set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>) -> MetadataPatch {
-    set.entry(KEY_SOURCE.to_owned())
-        .or_insert_with(|| MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), Some(CATALOG_TTL_MS)));
+fn patch(target: MetadataTarget, mut set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>, ttl_ms: Option<u64>) -> MetadataPatch {
+    set.entry(KEY_SOURCE.to_owned()).or_insert_with(|| MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), ttl_ms));
     MetadataPatch { target, source_id: SOURCE_CONNECTOR.to_owned(), set, unset }
 }
 
@@ -371,7 +373,12 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
 
 /// Projection for connectors that own diagnostic suppression across rebuilds.
 pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catalog {
-    let mut catalog = Catalog::default();
+    project_catalog_with_ttl(input, mint, Some(CATALOG_TTL_MS))
+}
+
+/// Liveness is a projection input: supervised connections have no expiry.
+pub fn project_catalog_with_ttl(input: &CatalogInput<'_>, mint: &dyn RecipeMint, ttl_ms: Option<u64>) -> Catalog {
+    let mut catalog = Catalog { ttl_ms, ..Catalog::default() };
     if let Some(nodes) = input.awareness {
         for node in nodes {
             project_awareness_node(&mut catalog, node, input.convoys, mint);
@@ -463,9 +470,9 @@ fn project_standing_roles(catalog: &mut Catalog, roles: &[StandingRoleRow], conv
         let Some(role) = role_by_convoy.get(convoy).cloned() else {
             continue;
         };
-        facts.insert(KEY_CONVOY_STANDING.to_owned(), MetadataValueUpdate::new(MetadataValue::Bool(true), Some(CATALOG_TTL_MS)));
+        facts.insert(KEY_CONVOY_STANDING.to_owned(), MetadataValueUpdate::new(MetadataValue::Bool(true), catalog.ttl_ms));
         if let Some(role) = role {
-            facts.insert(KEY_ROLE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(role.id), Some(CATALOG_TTL_MS)));
+            facts.insert(KEY_ROLE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(role.id), catalog.ttl_ms));
         }
     }
     for role in roles {
@@ -598,7 +605,7 @@ fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
         };
         facts.insert(
             KEY_CONVOY_SUPERSEDED.to_owned(),
-            MetadataValueUpdate::new(MetadataValue::Bool(superseded.contains(convoy)), Some(CATALOG_TTL_MS)),
+            MetadataValueUpdate::new(MetadataValue::Bool(superseded.contains(convoy)), catalog.ttl_ms),
         );
     }
 }
@@ -933,7 +940,7 @@ fn project_readiness(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
             }
         }
         for (key, value) in readiness_facts(readiness, attach) {
-            facts.insert(key.into(), MetadataValueUpdate::new(value, Some(CATALOG_TTL_MS)));
+            facts.insert(key.into(), MetadataValueUpdate::new(value, catalog.ttl_ms));
         }
     }
     for convoy in convoys {

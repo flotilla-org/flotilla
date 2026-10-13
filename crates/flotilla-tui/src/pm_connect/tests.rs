@@ -175,11 +175,43 @@ fn rebuild_prefers_awareness_transport_when_available() {
 
 struct RecordingSink {
     patches: Mutex<Vec<MetadataPatch>>,
+    publications: Mutex<Vec<(bool, Vec<MetadataPatch>)>>,
+    mode: LivenessMode,
+    failures: AtomicUsize,
+    attempts: AtomicUsize,
+    snapshot_404: bool,
+    health_failed: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingSink {
     fn new() -> Self {
-        Self { patches: Mutex::new(Vec::new()) }
+        Self {
+            patches: Mutex::new(Vec::new()),
+            publications: Mutex::new(Vec::new()),
+            mode: LivenessMode::Ttl,
+            failures: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
+            snapshot_404: false,
+            health_failed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn connection() -> Self {
+        Self { mode: LivenessMode::Connection, ..Self::new() }
+    }
+
+    fn publications(&self) -> Vec<(bool, Vec<MetadataPatch>)> {
+        self.publications.lock().expect("publications").clone()
+    }
+
+    fn record_batch(&self, replacing: bool, patches: &[MetadataPatch]) -> Result<(), String> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt < self.failures.load(Ordering::SeqCst) {
+            return Err("forced delivery failure".to_owned());
+        }
+        self.publications.lock().expect("publications").push((replacing, patches.to_vec()));
+        self.patches.lock().expect("patches").extend_from_slice(patches);
+        Ok(())
     }
 
     fn recorded(&self) -> Vec<MetadataPatch> {
@@ -188,7 +220,29 @@ impl RecordingSink {
 }
 
 #[async_trait]
+// In-memory stand-in for the PM request/acknowledgement boundary.
 impl PatchSink for RecordingSink {
+    fn liveness(&self) -> LivenessMode {
+        self.mode
+    }
+    async fn send_batch(&self, patches: &[MetadataPatch]) -> Result<(), String> {
+        self.record_batch(false, patches)
+    }
+    async fn replace(&self, patches: &[MetadataPatch]) -> Result<SnapshotAck, String> {
+        if self.snapshot_404 {
+            return Ok(SnapshotAck::Unsupported);
+        }
+        self.record_batch(true, patches)?;
+        Ok(SnapshotAck::Applied)
+    }
+    async fn health(&self) -> Result<(), String> {
+        if self.health_failed.load(Ordering::SeqCst) {
+            Err("connection refused".into())
+        } else {
+            Ok(())
+        }
+    }
+
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
         self.patches.lock().expect("sink lock").push(patch.clone());
         Ok(())
@@ -197,8 +251,24 @@ impl PatchSink for RecordingSink {
 
 // Socket-boundary double for publication tests; real daemon tests below enforce
 // the watch contract, including rejection, bootstrap and namespace discovery.
+struct EventSender(Mutex<Option<broadcast::Sender<DaemonEvent>>>);
+
+impl EventSender {
+    fn send(&self, event: DaemonEvent) -> Result<usize, String> {
+        self.0.lock().expect("event sender").as_ref().expect("open event stream").send(event).map_err(|error| error.to_string())
+    }
+    fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.0.lock().expect("event sender").as_ref().expect("open event stream").subscribe()
+    }
+    fn close(&self) {
+        self.0.lock().expect("event sender").take();
+    }
+}
+
 struct MockDaemon {
-    tx: broadcast::Sender<DaemonEvent>,
+    tx: EventSender,
+    deferred_queries: Mutex<HashSet<QueryId>>,
+    watch_gate: Mutex<Option<(String, Arc<tokio::sync::Notify>)>>,
     bootstrap: Mutex<Vec<DaemonEvent>>,
     subscribe_calls: AtomicUsize,
     resource_lists: Mutex<HashMap<(String, String), flotilla_protocol::ResourceReadEnvelope>>,
@@ -213,7 +283,9 @@ impl MockDaemon {
     fn new(bootstrap: Vec<DaemonEvent>) -> Self {
         let (tx, _) = broadcast::channel(64);
         Self {
-            tx,
+            tx: EventSender(Mutex::new(Some(tx))),
+            deferred_queries: Mutex::new(HashSet::new()),
+            watch_gate: Mutex::new(None),
             bootstrap: Mutex::new(bootstrap),
             subscribe_calls: AtomicUsize::new(0),
             resource_lists: Mutex::new(HashMap::new()),
@@ -242,6 +314,12 @@ impl DaemonHandle for MockDaemon {
         };
         assert!(include_replicas);
         assert!(cursor.is_none(), "merged watches bootstrap from their own snapshot");
+        let gate = self.watch_gate.lock().expect("watch gate").clone();
+        if let Some((gated_kind, notify)) = gate {
+            if gated_kind == kind {
+                notify.notified().await;
+            }
+        }
         let id = self.watch_starts.fetch_add(1, Ordering::SeqCst) as u64 + 1;
         self.watch_commands.lock().expect("watch commands").insert((namespace.clone(), kind.clone()), id);
         let initial = self
@@ -330,9 +408,30 @@ impl DaemonHandle for MockDaemon {
         Ok(vec![])
     }
 
-    async fn subscribe_queries(&self, _subscriber_id: uuid::Uuid, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+    async fn subscribe_queries(&self, _subscriber_id: uuid::Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
         self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.bootstrap.lock().expect("bootstrap lock").clone())
+        let mut events = self.bootstrap.lock().expect("bootstrap lock").clone();
+        let deferred = self.deferred_queries.lock().expect("deferred queries");
+        for cursor in queries {
+            if deferred.contains(&cursor.query)
+                || events.iter().any(|event| matches!(event, DaemonEvent::ResultSet(set) if set.query() == cursor.query))
+            {
+                continue;
+            }
+            let rows = match &cursor.query {
+                QueryId::Convoys { scope } => Rows::Convoys { scope: scope.clone(), rows: vec![] },
+                QueryId::Independents { scope } => Rows::Independents { scope: scope.clone(), rows: vec![] },
+                QueryId::StandingRoles { scope } => Rows::StandingRoles { scope: scope.clone(), rows: vec![] },
+                QueryId::ProjectRepositories { scope } => Rows::ProjectRepositories { scope: scope.clone(), rows: vec![] },
+                QueryId::DispatchReady { scope } => Rows::DispatchReady { scope: scope.clone(), rows: vec![] },
+                QueryId::Awareness { scope, grouping, limit } => {
+                    Rows::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit, rows: vec![] }
+                }
+                _ => panic!("unexpected connector query"),
+            };
+            events.push(DaemonEvent::ResultSet(Box::new(ResultSet { seq: 1, rows, state: Default::default() })));
+        }
+        Ok(events)
     }
 
     async fn unsubscribe_queries(&self, _subscriber_id: uuid::Uuid) {
@@ -358,7 +457,7 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
     .expect("condition not reached within 5s");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn connector_publishes_bootstrap_deltas_gap_recovery_and_reasserts() {
     let daemon =
         Arc::new(MockDaemon::new(vec![convoys_set(1), independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
@@ -376,6 +475,8 @@ async fn connector_publishes_bootstrap_deltas_gap_recovery_and_reasserts() {
         patches.iter().any(|patch| patch.target == independent_entity("scratch"))
     })
     .await;
+
+    assert!(sink.recorded().iter().flat_map(|patch| patch.set.values()).all(|fact| fact.ttl_ms == Some(CATALOG_TTL_MS)));
 
     // A contiguous delta publishes the change.
     daemon.tx.send(independents_delta(2, vec![independent_row("yeoman", SessionPhase::Running)], vec![])).expect("send delta");
@@ -1256,4 +1357,267 @@ fn connector_admits_hold_ledger_and_message_records() {
     assert_eq!(facts.set["flotilla.convoy.held"].value, MetadataValue::Bool(false));
     assert!(facts.unset.contains(&"flotilla.convoy.latest_ledger".into()));
     assert_eq!(facts.set["flotilla.convoy.pending_messages"].value, MetadataValue::StringList(vec![]));
+}
+
+fn spawn_connection(
+    daemon: &Arc<MockDaemon>,
+    sink: &Arc<RecordingSink>,
+    connector: Arc<Connector>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+    let sink = sink.clone() as Arc<dyn PatchSink>;
+    tokio::spawn(async move { connector.run(daemon, sink, Arc::new(mint()), Duration::from_secs(10)).await })
+}
+
+// #3022: all named-query and resource snapshots precede one replacing request.
+#[tokio::test(start_paused = true)]
+async fn connection_waits_for_last_query_and_resource_snapshot() {
+    let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+    daemon.resource_lists.lock().expect("resource lists").insert(("flotilla".into(), "changerequests".into()), subject_envelope());
+    daemon.deferred_queries.lock().expect("deferred").insert(QueryId::Convoys { scope: None });
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *daemon.watch_gate.lock().expect("gate") = Some((resources::KINDS.last().expect("kinds").to_string(), gate.clone()));
+    let sink = Arc::new(RecordingSink::connection());
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    wait_until(|| daemon.subscribe_calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(sink.publications().is_empty());
+    daemon
+        .tx
+        .send(DaemonEvent::ResultSet(Box::new(ResultSet {
+            seq: 1,
+            rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
+            state: Default::default(),
+        })))
+        .expect("last query snapshot");
+    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == resources::KINDS.len() - 1).await;
+    assert!(sink.publications().is_empty());
+    *daemon.watch_gate.lock().expect("gate") = None;
+    gate.notify_one();
+    wait_until(|| !sink.publications().is_empty()).await;
+    let publications = sink.publications();
+    assert_eq!(publications.len(), 1);
+    assert!(publications[0].0);
+    assert!(publications[0].1.iter().any(|patch| patch.target == independent_entity("scratch")));
+    assert!(
+        publications[0]
+            .1
+            .iter()
+            .any(|patch| patch.target == MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"))
+                && patch.set.contains_key("flotilla.change_request.readiness")),
+        "replacing publication includes resource snapshot facts"
+    );
+    assert!(publications[0].1.iter().flat_map(|patch| patch.set.values()).all(|fact| fact.ttl_ms.is_none()));
+    handle.abort();
+}
+
+// #3022: silent time produces no requests; one daemon batch produces one diff.
+#[tokio::test(start_paused = true)]
+async fn connection_sends_atomic_diffs_removals_and_no_heartbeat() {
+    let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+    let sink = Arc::new(RecordingSink::connection());
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    wait_until(|| sink.publications().len() == 1).await;
+    for _ in 0..4 {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(sink.publications().len(), 1);
+    daemon
+        .tx
+        .send(independents_delta(
+            2,
+            vec![independent_row("scratch", SessionPhase::Stopped), independent_row("second", SessionPhase::Running)],
+            vec![],
+        ))
+        .expect("batch");
+    wait_until(|| sink.publications().len() == 2).await;
+    let batch = sink.publications()[1].clone();
+    assert!(!batch.0);
+    assert_eq!(batch.1.len(), 2);
+    daemon.tx.send(independents_delta(3, vec![independent_row("scratch", SessionPhase::Running)], vec![])).expect("single row");
+    wait_until(|| sink.publications().len() == 3).await;
+    assert_eq!(sink.publications()[2].1.len(), 1);
+    assert_eq!(sink.publications()[2].1[0].target, independent_entity("scratch"));
+    daemon.tx.send(independents_delta(4, vec![], vec![independent_row("second", SessionPhase::Running).resource])).expect("removal");
+    wait_until(|| sink.publications().len() == 4).await;
+    let removed = sink.publications()[3].1.clone();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].target, independent_entity("second"));
+    assert!(removed[0].unset.contains(&KEY_STATUS_STATE.to_owned()));
+    handle.abort();
+}
+
+// #3022: retry never commits an unacknowledged projected catalog.
+#[tokio::test(start_paused = true)]
+async fn failed_publication_retries_before_advancing_and_expires() {
+    let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+    let sink = Arc::new(RecordingSink::connection());
+    sink.failures.store(1, Ordering::SeqCst);
+    let connector = Arc::new(Connector::default());
+    let handle = spawn_connection(&daemon, &sink, connector.clone());
+    wait_until(|| sink.attempts.load(Ordering::SeqCst) == 1).await;
+    assert!(connector.catalog.lock().expect("catalog").is_empty());
+    wait_until(|| sink.publications().len() == 1).await;
+    assert!(!connector.catalog.lock().expect("catalog").is_empty());
+    sink.failures.store(usize::MAX, Ordering::SeqCst);
+    let prior = connector.catalog.lock().expect("catalog").clone();
+    daemon.tx.send(independents_delta(2, vec![independent_row("scratch", SessionPhase::Stopped)], vec![])).expect("delta");
+    wait_until(|| sink.attempts.load(Ordering::SeqCst) >= 3).await;
+    assert_eq!(*connector.catalog.lock().expect("catalog"), prior);
+    let error = handle.await.expect("connector task").expect_err("uncertain publication must exit");
+    assert!(error.contains("acknowledgement deadline"));
+    assert_eq!(*connector.catalog.lock().expect("catalog"), prior);
+}
+
+// #3022: a 404 locks the process into TTL delivery and heartbeat behavior.
+#[tokio::test(start_paused = true)]
+async fn snapshot_404_falls_back_to_ttl_for_the_process() {
+    let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+    let sink = Arc::new(RecordingSink { snapshot_404: true, ..RecordingSink::connection() });
+    let connector = Arc::new(Connector::default());
+    let handle = spawn_connection(&daemon, &sink, connector.clone());
+    wait_until(|| !sink.recorded().is_empty()).await;
+    assert_eq!(connector.mode(&*sink), LivenessMode::Ttl);
+    assert!(sink.recorded().iter().flat_map(|patch| patch.set.values()).all(|fact| fact.ttl_ms == Some(CATALOG_TTL_MS)));
+    let before = sink.recorded().len();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    wait_until(|| sink.recorded().len() > before).await;
+    handle.abort();
+}
+
+// #3022: parent death cancels all work, including connection/bootstrap/retry.
+#[tokio::test(start_paused = true)]
+async fn parent_death_cancels_run_within_two_seconds() {
+    let daemon = Arc::new(MockDaemon::new(vec![]));
+    daemon.deferred_queries.lock().expect("deferred").insert(QueryId::Convoys { scope: None });
+    let sink = Arc::new(RecordingSink::connection());
+    let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let probe = alive.clone();
+    let run_daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+    let run_sink = sink.clone() as Arc<dyn PatchSink>;
+    let handle = tokio::spawn(async move {
+        let connector = Connector::default();
+        with_parent(|| probe.load(Ordering::SeqCst), connector.run(run_daemon, run_sink, Arc::new(mint()), Duration::from_secs(10))).await
+    });
+    wait_until(|| daemon.subscribe_calls.load(Ordering::SeqCst) == 1).await;
+    alive.store(false, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(handle.await.expect("parent task").expect_err("parent exited").contains("parent exited"));
+    assert!(sink.publications().is_empty(), "parent death cancels even unfinished source bootstrap");
+}
+
+// #3022: consecutive health connection failures terminate a supervised run.
+#[tokio::test(start_paused = true)]
+async fn health_failure_ends_connection_after_fifteen_seconds() {
+    let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+    let sink = Arc::new(RecordingSink::connection());
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    wait_until(|| sink.publications().len() == 1).await;
+    sink.health_failed.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(14)).await;
+    tokio::task::yield_now().await;
+    assert!(!handle.is_finished());
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let error = handle.await.expect("connector task").expect_err("health loss");
+    assert!(error.contains("health connection failed for 15 seconds"));
+}
+
+// #3022: both gaps and broadcast lag replace source state, then send one exact diff.
+#[tokio::test(start_paused = true)]
+async fn gaps_and_lag_resync_all_sources_in_one_diff_publication() {
+    for lagged in [false, true] {
+        let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("old", SessionPhase::Running)])]));
+        let sink = Arc::new(RecordingSink::connection());
+        let connector = Arc::new(Connector::default());
+        let handle = spawn_connection(&daemon, &sink, connector.clone());
+        wait_until(|| sink.publications().len() == 1).await;
+        let prior = connector.catalog.lock().expect("catalog").clone();
+        *daemon.bootstrap.lock().expect("bootstrap") = vec![independents_set(9, vec![independent_row("new", SessionPhase::Running)])];
+        if lagged {
+            // No await: overflow every receiver before the connector can run.
+            for _ in 0..100 {
+                daemon.tx.send(convoys_set(1)).expect("overflow event");
+            }
+        } else {
+            daemon.tx.send(independents_delta(9, vec![], vec![])).expect("gap");
+        }
+        wait_until(|| sink.publications().len() == 2).await;
+        let next = connector.catalog.lock().expect("catalog").clone();
+        assert_eq!(sink.publications()[1], (false, next.diff_patches(&prior)));
+        assert_eq!(sink.publications()[1].1.len(), 2);
+        assert!(sink.publications()[1].1.iter().any(|patch| patch.target == independent_entity("old") && !patch.unset.is_empty()));
+        assert!(daemon.watch_starts.load(Ordering::SeqCst) >= resources::KINDS.len() * 2);
+        handle.abort();
+    }
+}
+
+// #3022: session loss is fatal after connection publication; TTL reconnects.
+#[tokio::test(start_paused = true)]
+async fn daemon_loss_exits_supervised_connection_and_ttl_reconnects() {
+    for mode in [LivenessMode::Connection, LivenessMode::Ttl] {
+        let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+        let sink = Arc::new(RecordingSink { mode, ..RecordingSink::new() });
+        let connector = Arc::new(Connector::default());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let dial_attempts = attempts.clone();
+        let dial_daemon = daemon.clone();
+        let handle = tokio::spawn(async move {
+            run_reconnecting(
+                move || {
+                    let attempt = dial_attempts.fetch_add(1, Ordering::SeqCst);
+                    let daemon = dial_daemon.clone() as Arc<dyn DaemonHandle>;
+                    async move {
+                        if attempt == 0 {
+                            Ok(daemon)
+                        } else {
+                            Err("daemon protocol version mismatch: test complete".to_owned())
+                        }
+                    }
+                },
+                move |daemon| {
+                    let sink = sink.clone() as Arc<dyn PatchSink>;
+                    let connector = connector.clone();
+                    async move { connector.run(daemon, sink, Arc::new(mint()), Duration::from_secs(10)).await }
+                },
+            )
+            .await
+        });
+        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) >= resources::KINDS.len()).await;
+        // Allow bootstrap acknowledgement before closing every daemon stream.
+        tokio::task::yield_now().await;
+        daemon.tx.close();
+        let error = handle.await.expect("connector task").expect_err("daemon loss");
+        if mode == LivenessMode::Connection {
+            assert!(error.starts_with("supervised daemon session ended"), "{error}");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(error.contains("test complete"), "{error}");
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
+    }
+}
+
+// #3022: the query barrier stands independently of resource-watch delay.
+#[tokio::test(start_paused = true)]
+async fn query_barrier_waits_for_each_staggered_snapshot() {
+    let daemon = Arc::new(MockDaemon::new(vec![]));
+    daemon.deferred_queries.lock().expect("deferred").extend([QueryId::Convoys { scope: None }, QueryId::Independents { scope: None }]);
+    let sink = Arc::new(RecordingSink::connection());
+    let handle = spawn_connection(&daemon, &sink, Arc::new(Connector::default()));
+    wait_until(|| daemon.subscribe_calls.load(Ordering::SeqCst) == 1).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(sink.publications().is_empty());
+    daemon.tx.send(convoys_set(1)).expect("first deferred snapshot");
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(sink.publications().is_empty());
+    daemon.tx.send(independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])).expect("last snapshot");
+    wait_until(|| sink.publications().len() == 1).await;
+    assert!(sink.publications()[0].0);
+    assert!(sink.publications()[0].1.iter().any(|patch| patch.target == independent_entity("scratch")));
+    handle.abort();
 }

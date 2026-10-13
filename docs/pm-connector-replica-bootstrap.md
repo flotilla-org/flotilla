@@ -14,19 +14,43 @@ removals use the same local logical provenance, even when the last source was a
 replica. Observation resources keep independent source provenance, so deleting
 one replica preserves a surviving local or replica observation.
 
-One `Connector` owns the last publication across connections. Each connection
-owns a fresh row/resource state, a query subscription and its watch tasks. Setup
-finishes before the first publication. Failure unsubscribes named queries and
-aborts the watch tasks; dropping each resource watch cancels its command. The
-in-process query lifetime token also removes demand on cancellation; socket
-query lifetime belongs to the connection. Reconnect diffs the fresh complete
-bootstrap against the last catalog to retract facts removed offline and refresh
-all surviving TTL facts. Resource validation refusals terminate with their
-original error instead of reconnecting; transient connection/watch failures
-still reconnect with the shared jittered exponential backoff (500ms initial base,
-30s cap). A session lasting at least 30 seconds resets the next retry. Resource
-error classification shares its prefix with the producer/formatter; the connector
-does not duplicate that string.
+One `Connector` owns the acknowledged catalog. Each daemon session owns fresh
+rows, a query subscription and resource-watch tasks. Publication waits for every
+subscribed named query's snapshot and every resource watch's bootstrap bookmark.
+A query gap or lag retires all source subscriptions, takes fresh snapshots, then
+publishes their diff against the acknowledged catalog in one request.
+
+Wheelhouse subscriptions use connection liveness: the first publication is one
+JSON array sent to `POST /v1/metadata/snapshot`, replacing the provider's old facts.
+Subsequent nonempty diffs are arrays sent to `POST /v1/metadata/patch`. Neither
+carries TTLs. The expiry tick can remove landed subjects but sends nothing when
+the projection is unchanged. Wheelhouse issue 378 supplies atomic application,
+window seeding and the companion protocol documentation. A snapshot 404 switches
+this process to the legacy single-message transport with 30-second TTLs and
+10-second full reassertions. Zellij retains that TTL behavior.
+
+The catalog advances only after acknowledged delivery. Failed atomic publications
+retry unchanged with exponential delays from 250 ms to 2 seconds, within a
+15-second deadline (including blocked transport calls). Uncertain delivery past
+that deadline exits with an error, allowing a restart's replacing snapshot to
+repair the provider. Legacy delivery retries the remaining individual patches
+within the same deadline.
+
+After the first connection-mode publication, daemon-session loss exits with an
+error so Wheelhouse can mark the provider stale and restart it. Before publication,
+daemon connection/setup failures retain the shared jittered retry (500 ms initial
+base, 30-second cap); TTL mode also reconnects after publication. Permanent resource
+validation refusals and exhausted publication retries always terminate.
+
+The connector captures its parent at startup. Unix checks `getppid()` every second;
+Windows holds and probes the parent process handle. Parent death cancels even dial
+retries or blocked setup. Connection mode also probes `GET /v1/health` every five
+seconds and exits after 15 seconds of consecutive connection failures. A received
+HTTP response establishes connection health, including an older server's 404.
+
+Failure unsubscribes named queries and aborts watch tasks; dropping each watch
+cancels its command. The in-process query lifetime token removes demand on
+cancellation; socket query lifetime belongs to the connection.
 
 ## Regression checks
 

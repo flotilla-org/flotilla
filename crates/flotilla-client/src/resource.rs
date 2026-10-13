@@ -11,6 +11,13 @@ use flotilla_protocol::{
 use flotilla_resources::{is_prepared_snapshot, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND};
 use tokio::sync::broadcast;
 
+const RESOURCE_WATCH_LAG_PREFIX: &str = "resource watch fell behind by ";
+
+/// Lost local broadcast events require a fresh snapshot within the same session.
+pub fn is_resource_watch_lag_error(error: &str) -> bool {
+    error.starts_with(RESOURCE_WATCH_LAG_PREFIX)
+}
+
 #[derive(Debug, Clone, bon::Builder)]
 pub struct ResourceListRequest {
     pub kind: String,
@@ -414,7 +421,7 @@ impl ResourceWatch {
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(format!("resource watch fell behind by {skipped} events; resume from the last emitted cursor"));
+                    return Err(format!("{RESOURCE_WATCH_LAG_PREFIX}{skipped} events; resume from the last emitted cursor"));
                 }
                 Err(broadcast::error::RecvError::Closed) => return Err("daemon disconnected during resource watch".to_string()),
             }
