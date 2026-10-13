@@ -38,6 +38,10 @@ use crate::{
 
 #[path = "sqlite/digest.rs"]
 mod digest;
+#[path = "sqlite/statements.rs"]
+pub(crate) mod statements;
+
+use statements::{CachedSql, ConnectionMeter, PrepareCounters};
 
 #[derive(Clone)]
 enum QueryColumns {
@@ -58,6 +62,22 @@ const READ_DEADLINE: Duration = Duration::from_secs(2);
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const SLOW_STORE_OPERATION: Duration = Duration::from_millis(100);
 
+// Statements shared by several write paths keep one text, so they share one
+// cached compilation per connection.
+const REPLICA_OBJECT_UPSERT_SQL: &str = "INSERT INTO replica_objects (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(origin_root, group_name, version, kind, namespace, name) DO UPDATE SET body_json = excluded.body_json, last_synced_at = excluded.last_synced_at";
+const REPLICA_OBJECT_DELETE_SQL: &str = "DELETE FROM replica_objects WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6";
+const REPLICA_TOMBSTONE_UPSERT_SQL: &str = "INSERT INTO replica_tombstones (origin_root, group_name, version, kind, namespace, name, last_synced_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(origin_root, group_name, version, kind, namespace, name) DO UPDATE SET last_synced_at = excluded.last_synced_at";
+const RESOURCE_OBJECT_BODY_SQL: &str =
+    "SELECT body_json FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5";
+const REPLICA_TOMBSTONE_CLEAR_SQL: &str = "DELETE FROM replica_tombstones WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6";
+const RESOURCE_OBJECT_DELETE_SQL: &str =
+    "DELETE FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5";
+const REPLICA_PARTITION_DELETE_SQL: [&str; 3] = [
+    "DELETE FROM replica_objects WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5",
+    "DELETE FROM replica_tombstones WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5",
+    "DELETE FROM replica_cursors WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5",
+];
+
 #[derive(bon::Builder)]
 struct ReplicaMutation {
     kind: StoredReplicaEventKind,
@@ -71,6 +91,9 @@ struct ReplicaMutation {
 pub struct SqliteBackend {
     connection: Connection,
     read_connections: Vec<Connection>,
+    // Index-aligned with `connection` and `read_connections`.
+    writer_meter: Arc<ConnectionMeter>,
+    reader_meters: Vec<Arc<ConnectionMeter>>,
     reader_slots: Arc<tokio::sync::Semaphore>,
     available_readers: Arc<Mutex<Vec<usize>>>,
     discovery_slots: Arc<tokio::sync::Semaphore>,
@@ -187,7 +210,7 @@ impl SqliteBackend {
             .collect::<BTreeMap<_, _>>();
         let kinds = crate::declared_resource_kinds();
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 "SELECT group_name, version, kind, namespace FROM resource_objects
                  UNION SELECT group_name, version, kind, namespace FROM replica_objects
                  ORDER BY namespace",
@@ -215,6 +238,16 @@ impl SqliteBackend {
         self.connection.clone()
     }
 
+    /// Statement compiles and executed operations per connection since open.
+    ///
+    /// Take a snapshot before and after an operation and compare them with
+    /// [`PrepareCounters::since`]. Zero `compile_events` means the operation
+    /// reused cached statements only; `operations` shows which connections
+    /// ran it.
+    pub fn prepare_counters(&self) -> PrepareCounters {
+        PrepareCounters { writer: self.writer_meter.counters(), readers: self.reader_meters.iter().map(|meter| meter.counters()).collect() }
+    }
+
     pub fn with_read_observer(mut self, observer: std::sync::Arc<dyn ReadObserver>) -> Self {
         self.read_observer = Some(observer);
         self
@@ -229,7 +262,7 @@ impl SqliteBackend {
         let kind = resource_kind.paths.kind.to_string();
         self.read_call("list namespaces", move |connection| {
             let mut statement = connection
-                .prepare(
+                .prepare_cached(
                     "SELECT DISTINCT namespace FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 ORDER BY namespace",
                 )
                 .map_err(|error| Self::map_sqlite(error, "prepare sqlite local namespace list"))?;
@@ -247,7 +280,7 @@ impl SqliteBackend {
         let kind = resource_kind.paths.kind.to_string();
         self.read_call("list all namespaces", move |connection| {
             let mut statement = connection
-                .prepare(
+                .prepare_cached(
                     "SELECT namespace FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3
                      UNION SELECT namespace FROM replica_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3
                      ORDER BY namespace",
@@ -272,6 +305,9 @@ impl SqliteBackend {
         for _ in 0..READER_COUNT {
             let read = RusqliteConnection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|err| ResourceError::other(format!("open sqlite resource reader: {err}")))?;
+            backend
+                .reader_meters
+                .push(statements::configure(&read).map_err(|err| Self::map_sqlite(err, "configure sqlite reader statements"))?);
             Self::register_digest_functions(&read)?;
             Self::register_query_functions(&read)?;
             read.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))?;
@@ -290,14 +326,19 @@ impl SqliteBackend {
             let read = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .await
                 .map_err(|err| ResourceError::other(format!("open sqlite resource reader: {err}")))?;
-            read.call(|connection| {
-                Self::register_digest_functions(connection)?;
-                Self::register_query_functions(connection)?;
-                connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))
-            })
-            .await
-            .map_err(Self::map_connection_error)?;
+            let meter = read
+                .call(|connection| {
+                    let meter =
+                        statements::configure(connection).map_err(|err| Self::map_sqlite(err, "configure sqlite reader statements"))?;
+                    Self::register_digest_functions(connection)?;
+                    Self::register_query_functions(connection)?;
+                    connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| Self::map_sqlite(err, "configure reader timeout"))?;
+                    Ok(meter)
+                })
+                .await
+                .map_err(Self::map_connection_error)?;
             backend.read_connections.push(read);
+            backend.reader_meters.push(meter);
         }
         backend.reader_slots = Arc::new(tokio::sync::Semaphore::new(READER_COUNT - 1));
         backend.available_readers = Arc::new(Mutex::new((0..READER_COUNT - 1).collect()));
@@ -316,10 +357,13 @@ impl SqliteBackend {
     }
 
     fn from_connection(mut connection: RusqliteConnection, event_retention: EventRetention) -> Result<Self, ResourceError> {
+        let writer_meter = statements::configure(&connection).map_err(|err| Self::map_sqlite(err, "configure sqlite writer statements"))?;
         Self::initialize_connection(&mut connection, event_retention)?;
         Ok(Self {
             connection: connection.into(),
             read_connections: Vec::new(),
+            writer_meter,
+            reader_meters: Vec::new(),
             reader_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             available_readers: Arc::new(Mutex::new(vec![0])),
             discovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -337,13 +381,19 @@ impl SqliteBackend {
     }
 
     async fn from_async_connection(connection: Connection, event_retention: EventRetention) -> Result<Self, ResourceError> {
-        connection
-            .call(move |connection| Self::initialize_connection(connection, event_retention))
+        let writer_meter = connection
+            .call(move |connection| {
+                let meter = statements::configure(connection).map_err(|err| Self::map_sqlite(err, "configure sqlite writer statements"))?;
+                Self::initialize_connection(connection, event_retention)?;
+                Ok(meter)
+            })
             .await
             .map_err(Self::map_connection_error)?;
         Ok(Self {
             connection,
             read_connections: Vec::new(),
+            writer_meter,
+            reader_meters: Vec::new(),
             reader_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             available_readers: Arc::new(Mutex::new(vec![0])),
             discovery_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -882,18 +932,15 @@ impl SqliteBackend {
             predicates.push(field_predicate(path, format!("{} IN (SELECT value FROM json_each(?{}))", field_expression(path), args.len())));
         }
         for (path, prefix) in &query.field_prefixes {
-            let pattern = prefix
-                .chars()
-                .map(|c| match c {
-                    '*' => "[*]".into(),
-                    '?' => "[?]".into(),
-                    '[' => "[[]".into(),
-                    c => c.to_string(),
-                })
-                .collect::<String>()
-                + "*";
-            args.push(SqlValue::Text(pattern));
-            predicates.push(field_predicate(path, format!("{} GLOB ?{}", field_expression(path), args.len())));
+            // A range plus an exact prefix check, like label prefixes. Under the
+            // query planner stability guarantee a bound GLOB pattern cannot
+            // become an index range, but `value>=?` always can. Value tables
+            // hold only TEXT (`j.type='text'`), so the comparison never meets a
+            // numeric value that GLOB would have coerced.
+            args.push(SqlValue::Text(prefix.clone()));
+            let n = args.len();
+            let value = field_expression(path);
+            predicates.push(field_predicate(path, format!("{value}>=?{n} AND substr({value},1,length(?{n}))=?{n}")));
         }
         for path in &query.present {
             predicates.push(field_predicate(path, format!("{} IS NOT NULL", field_expression(path))));
@@ -1024,11 +1071,13 @@ impl SqliteBackend {
     {
         let started = Instant::now();
         let depth = DepthClaim::new(self.writer_depth.clone());
+        let meter = Arc::clone(&self.writer_meter);
         self.connection
             .call(move |connection| {
                 let queue_wait = started.elapsed();
                 let queue_depth = depth.depth.load(Ordering::Relaxed).saturating_sub(1);
                 drop(depth);
+                meter.record_operation();
                 let execution = Instant::now();
                 let result = operation(connection);
                 if started.elapsed() >= SLOW_STORE_OPERATION {
@@ -1083,6 +1132,7 @@ impl SqliteBackend {
                 .ok_or_else(|| ResourceError::other("sqlite reader pool empty"))?;
             let lease = ReaderLease { index, available: available.clone(), _permit: permit };
             let connection = self.read_connections.get(index).unwrap_or(&self.connection);
+            let meter = Arc::clone(self.reader_meters.get(index).unwrap_or(&self.writer_meter));
             connection
                 .call(move |connection| {
                     let _lease = lease;
@@ -1101,6 +1151,7 @@ impl SqliteBackend {
                         }
                         return Err(ResourceError::other("resource store busy: read deadline exceeded"));
                     }
+                    meter.record_operation();
                     let execution = Instant::now();
                     if let Ok(mut timing) = worker_execution_started.lock() {
                         *timing = Some(execution);
@@ -1183,16 +1234,16 @@ impl SqliteBackend {
         event_retention: EventRetention,
     ) -> Result<ResourceStoreDiagnostics, ResourceError> {
         let object_count = connection
-            .query_row("SELECT COUNT(*) FROM resource_objects", [], |row| row.get::<_, u64>(0))
+            .query_row_cached("SELECT COUNT(*) FROM resource_objects", [], |row| row.get::<_, u64>(0))
             .map_err(|err| Self::map_sqlite(err, "count sqlite resource objects"))?;
         let event_count = connection
-            .query_row("SELECT COUNT(*) FROM resource_events", [], |row| row.get::<_, u64>(0))
+            .query_row_cached("SELECT COUNT(*) FROM resource_events", [], |row| row.get::<_, u64>(0))
             .map_err(|err| Self::map_sqlite(err, "count sqlite resource events"))?;
         let resource_stream_count = connection
-            .query_row("SELECT COUNT(*) FROM resource_sequences", [], |row| row.get::<_, u64>(0))
+            .query_row_cached("SELECT COUNT(*) FROM resource_sequences", [], |row| row.get::<_, u64>(0))
             .map_err(|err| Self::map_sqlite(err, "count sqlite resource streams"))?;
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 r#"
                 SELECT kind, namespace, name, error, quarantined_at
                 FROM resource_decode_quarantine
@@ -1224,7 +1275,7 @@ impl SqliteBackend {
         let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention);
         diagnostics.decode_quarantines = decode_quarantines;
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 r#"
                 SELECT kind, namespace, name, event_version, error, quarantined_at
                 FROM resource_event_decode_quarantine
@@ -1255,10 +1306,10 @@ impl SqliteBackend {
             .collect::<Result<Vec<_>, ResourceError>>()?;
         let cutoff = (Utc::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS)).to_rfc3339();
         connection
-            .execute("DELETE FROM field_ownership_violations WHERE unixepoch(observed_at) < unixepoch(?1)", [cutoff])
+            .execute_cached("DELETE FROM field_ownership_violations WHERE unixepoch(observed_at) < unixepoch(?1)", [cutoff])
             .map_err(|err| Self::map_sqlite(err, "expire field ownership violations"))?;
         let mut statement = connection
-            .prepare("SELECT body_json FROM field_ownership_violations ORDER BY id")
+            .prepare_cached("SELECT body_json FROM field_ownership_violations ORDER BY id")
             .map_err(|err| Self::map_sqlite(err, "prepare field ownership violation diagnostics"))?;
         diagnostics.field_ownership_violations = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -1278,13 +1329,13 @@ impl SqliteBackend {
         let observed_at = violation.observed_at.to_rfc3339();
         self.call("record field ownership violation", move |connection| {
             connection
-                .execute(
+                .execute_cached(
                     "INSERT INTO field_ownership_violations (body_json, observed_at) VALUES (?1, ?2)",
                     rusqlite::params![body, observed_at],
                 )
                 .map_err(|error| Self::map_sqlite(error, "record field ownership violation"))?;
             connection
-                .execute(
+                .execute_cached(
                     "DELETE FROM field_ownership_violations
                      WHERE id NOT IN (
                          SELECT id FROM field_ownership_violations ORDER BY id DESC LIMIT ?1
@@ -1349,7 +1400,7 @@ impl SqliteBackend {
 
     fn current_version(conn: &RusqliteConnection, key: &StoreKey) -> Result<u64, ResourceError> {
         let version = conn
-            .query_row(
+            .query_row_cached(
                 "SELECT next_version FROM resource_sequences WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4",
                 params![key.0, key.1, key.2, key.3],
                 |row| row.get::<_, u64>(0),
@@ -1369,7 +1420,7 @@ impl SqliteBackend {
         minimum_resource_version: Option<u64>,
     ) -> Result<u64, ResourceError> {
         let stored_next = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT next_version FROM resource_sequences WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4",
                 params![key.0, key.1, key.2, key.3],
                 |row| row.get::<_, u64>(0),
@@ -1378,7 +1429,7 @@ impl SqliteBackend {
             .map_err(|err| Self::map_sqlite(err, "read sqlite resource sequence"))?
             .unwrap_or(1);
         let next = minimum_resource_version.map_or(stored_next, |minimum| stored_next.max(minimum.saturating_add(1)));
-        tx.execute(
+        tx.execute_cached(
             r#"
             INSERT INTO resource_sequences (group_name, version, kind, namespace, next_version)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1400,7 +1451,7 @@ impl SqliteBackend {
         event_retention: EventRetention,
         replication_class: crate::ReplicationClass,
     ) -> Result<(), ResourceError> {
-        tx.execute(
+        tx.execute_cached(
             r#"
             INSERT INTO resource_events (group_name, version, kind, namespace, event_version, event_type, body_json)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1436,7 +1487,7 @@ impl SqliteBackend {
         if compacted_through == 0 {
             return Ok(());
         }
-        tx.execute(
+        tx.execute_cached(
             r#"
             DELETE FROM resource_events
             WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version <= ?5
@@ -1444,7 +1495,7 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, compacted_through],
         )
         .map_err(|err| Self::map_sqlite(err, "compact sqlite resource events"))?;
-        tx.execute(
+        tx.execute_cached(
             r#"
             DELETE FROM resource_event_decode_quarantine
             WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version <= ?5
@@ -1452,7 +1503,7 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, compacted_through],
         )
         .map_err(|err| Self::map_sqlite(err, "compact sqlite resource event decode quarantine"))?;
-        tx.execute(
+        tx.execute_cached(
             r#"
             INSERT INTO resource_event_compaction (group_name, version, kind, namespace, compacted_through)
             VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1510,7 +1561,7 @@ impl SqliteBackend {
         let index = query.sql_index(false);
         let mut items = self.read_call("query Message inbox", move |connection| {
             let sql = format!("SELECT body_json FROM resource_objects INDEXED BY {index} WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND kind='Message' AND ({predicate}) AND (?5 IS NULL OR ?5 IS NOT NULL) ORDER BY name");
-            let mut statement = connection.prepare(&sql).map_err(|error| Self::map_sqlite(error, "prepare Message query"))?;
+            let mut statement = connection.prepare_cached(&sql).map_err(|error| Self::map_sqlite(error, "prepare Message query"))?;
             let rows = statement.query_map(params![key.0, key.1, key.2, key.3, argument], |row| row.get::<_, String>(0)).map_err(|error| Self::map_sqlite(error, "query Message inbox"))?;
             rows.map(|row| {
                 let body = row.map_err(|error| Self::map_sqlite(error, "read Message query"))?;
@@ -1535,7 +1586,7 @@ impl SqliteBackend {
         let index = query.sql_index(true);
         self.read_call("query Message replicas", move |connection| {
             let sql = format!("SELECT body_json, origin_root, last_synced_at FROM replica_objects INDEXED BY {index} WHERE group_name=?1 AND version=?2 AND kind=?3 AND namespace=?4 AND kind='Message' AND ({predicate}) AND (?5 IS NULL OR ?5 IS NOT NULL) ORDER BY origin_root,name");
-            let mut statement = connection.prepare(&sql).map_err(|error| Self::map_sqlite(error, "prepare Message replica query"))?;
+            let mut statement = connection.prepare_cached(&sql).map_err(|error| Self::map_sqlite(error, "prepare Message replica query"))?;
             let rows = statement.query_map(params![key.0, key.1, key.2, key.3, argument], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).map_err(|error| Self::map_sqlite(error, "query Message replicas"))?;
             rows.map(|row| {
                 let (body, origin, synced_at) = row.map_err(|error| Self::map_sqlite(error, "read Message replica query"))?;
@@ -1556,7 +1607,7 @@ impl SqliteBackend {
         let (items, invalid_partitions) = self
             .read_call("list replicas", move |connection| {
                 let mut statement = connection
-                    .prepare(
+                    .prepare_cached(
                         r#"
                     SELECT o.origin_root, o.name, o.last_synced_at, o.body_json
                     FROM replica_objects o
@@ -1613,7 +1664,7 @@ impl SqliteBackend {
                     // matches the existing full-resync behavior.
                     let still_invalid = failures.iter().try_fold(false, |found, (name, body, _)| {
                         let unchanged = tx
-                            .query_row(
+                            .query_row_cached(
                                 "SELECT 1 FROM replica_objects WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6 AND body_json = ?7",
                                 params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3, name, body],
                                 |_| Ok(()),
@@ -1626,15 +1677,9 @@ impl SqliteBackend {
                     if !still_invalid {
                         continue;
                     }
-                    for table in ["replica_objects", "replica_tombstones", "replica_cursors"] {
-                        tx.execute(
-                            &format!(
-                                "DELETE FROM {table}
-                                 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5"
-                            ),
-                            params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
+                    for sql in REPLICA_PARTITION_DELETE_SQL {
+                        tx.execute_cached(sql, params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3])
+                            .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
                     }
                     for (name, _, error) in failures {
                         tracing::warn!(
@@ -1667,7 +1712,7 @@ impl SqliteBackend {
             .read_call("get replicas", move |connection| {
                 let rows = {
                     let mut statement = connection
-                        .prepare(
+                        .prepare_cached(
                             r#"
                         SELECT o.origin_root, o.last_synced_at, o.body_json
                         FROM replica_objects o
@@ -1720,7 +1765,7 @@ impl SqliteBackend {
                 for (origin_root, body, error) in invalid {
                     // Preserve full-partition resync only while the bad row is unchanged.
                     let unchanged = tx
-                        .query_row(
+                        .query_row_cached(
                             "SELECT 1 FROM replica_objects WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6 AND body_json = ?7",
                             params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3, requested_name, body],
                             |_| Ok(()),
@@ -1731,12 +1776,9 @@ impl SqliteBackend {
                     if !unchanged {
                         continue;
                     }
-                    for table in ["replica_objects", "replica_tombstones", "replica_cursors"] {
-                        tx.execute(
-                            &format!("DELETE FROM {table} WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5"),
-                            params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
+                    for sql in REPLICA_PARTITION_DELETE_SQL {
+                        tx.execute_cached(sql, params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3])
+                            .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
                     }
                     tracing::warn!(origin = %origin_root, kind = resource_kind.paths.kind, namespace = %cleanup_key.3, name = %requested_name, %error,
                         "dropping undecodable cached replica partition; origin will be fully resynced");
@@ -1812,7 +1854,7 @@ impl SqliteBackend {
                         "SELECT name,body_json,last_synced_at FROM replica_objects
                          WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5 AND ?6 IS NULL"
                     };
-                    let mut statement = tx.prepare(sql)
+                    let mut statement = tx.prepare_cached(sql)
                         .map_err(|err| Self::map_sqlite(err, "prepare old sqlite replicas"))?;
                     let rows = statement
                         .query_map(params![origin, key.0, key.1, key.2, key.3, bucket], |row| {
@@ -1825,49 +1867,32 @@ impl SqliteBackend {
                     if old.get(name).is_some_and(|(old_body, _)| old_body == body) {
                         continue;
                     }
-                    tx.execute(
-                        r#"
-                        INSERT INTO replica_objects
-                            (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                        ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                        DO UPDATE SET body_json = excluded.body_json, last_synced_at = excluded.last_synced_at
-                        "#,
+                    tx.execute_cached(
+                        REPLICA_OBJECT_UPSERT_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name, body, synced],
                     )
                     .map_err(|err| Self::map_sqlite(err, "insert sqlite replica object"))?;
-                    tx.execute(
-                        r#"
-                        DELETE FROM replica_tombstones
-                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                        "#,
+                    tx.execute_cached(
+                        REPLICA_TOMBSTONE_CLEAR_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name],
                     )
                     .map_err(|err| Self::map_sqlite(err, "clear authoritative snapshot tombstone"))?;
                 }
                 let new_names = encoded.iter().map(|(name, _)| name.clone()).collect::<std::collections::HashSet<_>>();
                 for name in old.keys().filter(|name| !new_names.contains(*name)) {
-                    tx.execute(
-                        r#"
-                        DELETE FROM replica_objects
-                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                        "#,
+                    tx.execute_cached(
+                        REPLICA_OBJECT_DELETE_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name],
                     )
                     .map_err(|err| Self::map_sqlite(err, "remove snapshot-deleted replica"))?;
-                    tx.execute(
-                        r#"
-                        INSERT INTO replica_tombstones (origin_root, group_name, version, kind, namespace, name, last_synced_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                        ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                        DO UPDATE SET last_synced_at = excluded.last_synced_at
-                        "#,
+                    tx.execute_cached(
+                        REPLICA_TOMBSTONE_UPSERT_SQL,
                         params![origin, key.0, key.1, key.2, key.3, name, synced],
                     )
                     .map_err(|err| Self::map_sqlite(err, "fence snapshot-deleted replica"))?;
                 }
                 if bucket.is_none() {
-                    tx.execute(
+                    tx.execute_cached(
                     r#"
                     INSERT INTO replica_cursors
                         (origin_root, group_name, version, kind, namespace, resource_version, generation, last_synced_at, complete_prefix)
@@ -1987,7 +2012,7 @@ impl SqliteBackend {
                 let body = serde_json::to_string(&value).map_err(|err| ResourceError::decode(err.to_string()))?;
                 let synced = synced_at.to_rfc3339();
                 let existing = tx
-                    .query_row(
+                    .query_row_cached(
                         r#"
                         SELECT body_json, last_synced_at
                         FROM replica_objects
@@ -1999,7 +2024,7 @@ impl SqliteBackend {
                     .optional()
                     .map_err(|err| Self::map_sqlite(err, "read existing sqlite replica event object"))?;
                 let tombstone_synced_at = tx
-                    .query_row(
+                    .query_row_cached(
                         r#"
                         SELECT last_synced_at
                         FROM replica_tombstones
@@ -2028,47 +2053,16 @@ impl SqliteBackend {
 
                 match kind {
                     StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
-                        tx.execute(
-                            r#"
-                        INSERT INTO replica_objects
-                            (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                        ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                        DO UPDATE SET body_json = excluded.body_json,
-                                      last_synced_at = excluded.last_synced_at
-                        "#,
-                            params![origin, key.0, key.1, key.2, key.3, name, body, synced],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
-                        tx.execute(
-                            r#"
-                        DELETE FROM replica_tombstones
-                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                        "#,
-                            params![origin, key.0, key.1, key.2, key.3, name],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "clear sqlite replica tombstone"))?;
+                        tx.execute_cached(REPLICA_OBJECT_UPSERT_SQL, params![origin, key.0, key.1, key.2, key.3, name, body, synced])
+                            .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
+                        tx.execute_cached(REPLICA_TOMBSTONE_CLEAR_SQL, params![origin, key.0, key.1, key.2, key.3, name])
+                            .map_err(|err| Self::map_sqlite(err, "clear sqlite replica tombstone"))?;
                     }
                     StoredReplicaEventKind::Deleted => {
-                        tx.execute(
-                            r#"
-                            DELETE FROM replica_objects
-                            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
-                            "#,
-                            params![origin, key.0, key.1, key.2, key.3, name],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "delete sqlite replica event object"))?;
-                        tx.execute(
-                            r#"
-                            INSERT INTO replica_tombstones
-                                (origin_root, group_name, version, kind, namespace, name, last_synced_at)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                            ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                            DO UPDATE SET last_synced_at = excluded.last_synced_at
-                            "#,
-                            params![origin, key.0, key.1, key.2, key.3, name, synced],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "write sqlite replica tombstone"))?;
+                        tx.execute_cached(REPLICA_OBJECT_DELETE_SQL, params![origin, key.0, key.1, key.2, key.3, name])
+                            .map_err(|err| Self::map_sqlite(err, "delete sqlite replica event object"))?;
+                        tx.execute_cached(REPLICA_TOMBSTONE_UPSERT_SQL, params![origin, key.0, key.1, key.2, key.3, name, synced])
+                            .map_err(|err| Self::map_sqlite(err, "write sqlite replica tombstone"))?;
                     }
                 }
                 changed.push(StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind, object: value });
@@ -2092,7 +2086,7 @@ impl SqliteBackend {
         let key = Self::store_key(resource_kind, namespace);
         let origin = origin_root.to_string();
         self.call("invalidate replica prefix", move |connection| {
-            connection.execute("UPDATE replica_cursors SET complete_prefix = 0 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5", params![origin, key.0, key.1, key.2, key.3])
+            connection.execute_cached("UPDATE replica_cursors SET complete_prefix = 0 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5", params![origin, key.0, key.1, key.2, key.3])
                 .map_err(|err| Self::map_sqlite(err, "invalidate replica prefix"))?;
             Ok(())
         }).await
@@ -2111,7 +2105,7 @@ impl SqliteBackend {
         let previous = previous.clone();
         let next = next.to_string();
         self.call("advance proven replica prefix", move |connection| {
-            let changed = connection.execute(
+            let changed = connection.execute_cached(
                 "UPDATE replica_cursors SET resource_version = ?6 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND complete_prefix = 1 AND resource_version = ?7 AND generation IS ?8",
                 params![origin, key.0, key.1, key.2, key.3, next, previous.resource_version, previous.generation],
             ).map_err(|err| Self::map_sqlite(err, "advance replica prefix"))?;
@@ -2130,7 +2124,7 @@ impl SqliteBackend {
         let origin = origin_root.to_string();
         self.read_call("read replica cursor", move |connection| {
             connection
-                .query_row(
+                .query_row_cached(
                     r#"
                     SELECT resource_version, generation FROM replica_cursors
                     WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND complete_prefix = 1
@@ -2154,14 +2148,7 @@ impl SqliteBackend {
         let name = name.to_string();
         self.read_call("get resource", move |connection| {
             let body: String = connection
-                .query_row(
-                    r#"
-                    SELECT body_json FROM resource_objects
-                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                    "#,
-                    params![key.0, key.1, key.2, key.3, name],
-                    |row| row.get(0),
-                )
+                .query_row_cached(RESOURCE_OBJECT_BODY_SQL, params![key.0, key.1, key.2, key.3, name], |row| row.get(0))
                 .optional()
                 .map_err(|err| Self::map_sqlite(err, "read sqlite resource object"))?
                 .ok_or_else(|| ResourceError::not_found(&name))?;
@@ -2202,7 +2189,7 @@ impl SqliteBackend {
             .read_call("list resources", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource list snapshot"))?;
                 let rows = {
-                    let mut statement = tx.prepare(&sql).map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
+                    let mut statement = tx.prepare_cached(&sql).map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
                     let rows = statement
                         .query_map(rusqlite::params_from_iter(args), |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
                         .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
@@ -2232,7 +2219,7 @@ impl SqliteBackend {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource decode quarantine"))?;
                 for (name, body, error) in &invalid {
                     let unchanged = tx
-                        .query_row(
+                        .query_row_cached(
                             "SELECT 1 FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5 AND body_json = ?6",
                             params![quarantine_key.0, quarantine_key.1, quarantine_key.2, quarantine_key.3, name, body],
                             |_| Ok(()),
@@ -2243,7 +2230,7 @@ impl SqliteBackend {
                     if !unchanged {
                         continue;
                     }
-                    tx.execute(
+                    tx.execute_cached(
                         "INSERT INTO resource_decode_quarantine
                          (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -2252,7 +2239,7 @@ impl SqliteBackend {
                         params![quarantine_key.0, quarantine_key.1, quarantine_key.2, quarantine_key.3, name, body, error, quarantined_at.to_rfc3339()],
                     )
                     .map_err(|err| Self::map_sqlite(err, "persist sqlite resource decode quarantine"))?;
-                    tx.execute(
+                    tx.execute_cached(
                         "DELETE FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5 AND body_json = ?6",
                         params![quarantine_key.0, quarantine_key.1, quarantine_key.2, quarantine_key.3, name, body],
                     )
@@ -2325,7 +2312,7 @@ impl SqliteBackend {
         self.call("create resource", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource create"))?;
             let exists = tx
-                .query_row(
+                .query_row_cached(
                     r#"
                     SELECT 1 FROM resource_objects
                     WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
@@ -2360,7 +2347,7 @@ impl SqliteBackend {
             };
             let encoded = Self::encode_object(resource_kind, &object)?;
             let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-            tx.execute(
+            tx.execute_cached(
                 r#"
                 DELETE FROM resource_tombstones
                 WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
@@ -2368,7 +2355,7 @@ impl SqliteBackend {
                 params![key.0, key.1, key.2, key.3, meta.name],
             )
             .map_err(|err| Self::map_sqlite(err, "clear sqlite resource tombstone"))?;
-            tx.execute(
+            tx.execute_cached(
                 r#"
                 INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2457,14 +2444,8 @@ impl SqliteBackend {
                 && object.metadata.deletion_timestamp.is_some()
                 && object.metadata.finalizers.is_empty()
             {
-                tx.execute(
-                    r#"
-                    DELETE FROM resource_objects
-                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                    "#,
-                    params![key.0, key.1, key.2, key.3, meta.name],
-                )
-                .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
+                tx.execute_cached(RESOURCE_OBJECT_DELETE_SQL, params![key.0, key.1, key.2, key.3, meta.name])
+                    .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
                 StoredEventKind::Deleted
             } else {
                 Self::upsert_object(&tx, &key, &meta.name, version, &body_json)?;
@@ -2552,14 +2533,8 @@ impl SqliteBackend {
                 let encoded = Self::encode_object(resource_kind, &object)?;
                 let body_json =
                     serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-                tx.execute(
-                    r#"
-                    DELETE FROM resource_objects
-                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                    "#,
-                    params![key.0, key.1, key.2, key.3, name],
-                )
-                .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
+                tx.execute_cached(RESOURCE_OBJECT_DELETE_SQL, params![key.0, key.1, key.2, key.3, name])
+                    .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
                 Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention, resource_kind.replication)?;
                 (StoredEventKind::Deleted, encoded)
             };
@@ -2615,7 +2590,7 @@ impl SqliteBackend {
                 return Err(ResourceError::conflict(&name, "cannot tombstone an existing resource by name"));
             }
             let existing = tx
-                .query_row(
+                .query_row_cached(
                     r#"
                     SELECT body_json FROM resource_tombstones
                     WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
@@ -2643,7 +2618,7 @@ impl SqliteBackend {
             let encoded = Self::encode_tombstone(resource_kind, &tombstone);
             let body_json =
                 serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode tombstone JSON: {err}")))?;
-            tx.execute(
+            tx.execute_cached(
                 r#"
                 INSERT INTO resource_tombstones (group_name, version, kind, namespace, name, body_json)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -2727,7 +2702,7 @@ impl SqliteBackend {
         if !resource_kind.validate_namespace {
             return Ok(());
         }
-        let mut statement = tx.prepare("SELECT body_json FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name != ?5")
+        let mut statement = tx.prepare_cached("SELECT body_json FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name != ?5")
             .map_err(|err| Self::map_sqlite(err, "prepare namespace validation"))?;
         let rows = statement
             .query_map(params![key.0, key.1, key.2, key.3, meta.name], |row| row.get::<_, String>(0))
@@ -2751,14 +2726,7 @@ impl SqliteBackend {
         name: &str,
     ) -> Result<Option<ResourceObject<SerializedResource>>, ResourceError> {
         let body = tx
-            .query_row(
-                r#"
-                SELECT body_json FROM resource_objects
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                "#,
-                params![key.0, key.1, key.2, key.3, name],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row_cached(RESOURCE_OBJECT_BODY_SQL, params![key.0, key.1, key.2, key.3, name], |row| row.get::<_, String>(0))
             .optional()
             .map_err(|err| Self::map_sqlite(err, "read sqlite resource object"))?;
         body.map(|body| {
@@ -2775,7 +2743,7 @@ impl SqliteBackend {
         resource_version: u64,
         body_json: &str,
     ) -> Result<(), ResourceError> {
-        tx.execute(
+        tx.execute_cached(
             r#"
             INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2791,7 +2759,7 @@ impl SqliteBackend {
 
     fn clear_decode_quarantine(tx: &rusqlite::Transaction<'_>, key: &StoreKey, name: &str) -> Result<bool, ResourceError> {
         let deleted = tx
-            .execute(
+            .execute_cached(
                 r#"
             DELETE FROM resource_decode_quarantine
             WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
@@ -2809,7 +2777,7 @@ impl SqliteBackend {
         replay_from: u64,
     ) -> Result<ReplayedEvents, ResourceError> {
         let compacted_through = conn
-            .query_row(
+            .query_row_cached(
                 r#"
                 SELECT compacted_through FROM resource_event_compaction
                 WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
@@ -2831,7 +2799,7 @@ impl SqliteBackend {
             return Err(ResourceError::invalid(format!("resourceVersion {replay_from} is ahead of current version {current_version}")));
         }
         let mut statement = conn
-            .prepare(
+            .prepare_cached(
                 r#"
                 SELECT event_version, event_type, body_json FROM resource_events
                 WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version > ?5
@@ -2873,7 +2841,7 @@ impl SqliteBackend {
             let quarantined_at = Utc::now().to_rfc3339();
             let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event decode quarantine"))?;
             for (event_version, name, body_json, error) in &failures {
-                tx.execute(
+                tx.execute_cached(
                     r#"
                     INSERT INTO resource_event_decode_quarantine
                         (group_name, version, kind, namespace, event_version, name, body_json, error, quarantined_at)
@@ -2943,7 +2911,7 @@ impl Store for SqliteBackend {
                         continue;
                     }
                     let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::ReadRows);
-                    let mut statement = tx.prepare(&sql).map_err(|e| Self::map_sqlite(e, "prepare declared query"))?;
+                    let mut statement = tx.prepare_cached(&sql).map_err(|e| Self::map_sqlite(e, "prepare declared query"))?;
                     let rows = statement
                         .query_map(rusqlite::params_from_iter(args), |r| {
                             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?))
@@ -3004,7 +2972,7 @@ impl Store for SqliteBackend {
                     continue;
                 }
                 let (sql, args) = Self::declared_sql(kind, &namespace, &query, replicas, &root, QueryColumns::Field(field.clone()));
-                let mut statement = connection.prepare(&sql).map_err(|e| Self::map_sqlite(e, "prepare field projection"))?;
+                let mut statement = connection.prepare_cached(&sql).map_err(|e| Self::map_sqlite(e, "prepare field projection"))?;
                 let rows = statement
                     .query_map(rusqlite::params_from_iter(args), |row| row.get::<_, Option<String>>(0))
                     .map_err(|e| Self::map_sqlite(e, "query field projection"))?;
@@ -4019,6 +3987,13 @@ mod tests {
                                 .collect::<Result<Vec<_>, _>>()
                                 .unwrap();
                             assert!(plans.iter().any(|plan| plan.contains(&index) && plan.contains("SEARCH")), "{index}: {plans:?}");
+                            if !query.field_prefixes.is_empty() {
+                                // The planner stability guarantee rules out bound GLOB ranges.
+                                assert!(
+                                    plans.iter().any(|plan| plan.contains(&index) && plan.contains("value>?")),
+                                    "prefix matches must search a value range: {plans:?}"
+                                );
+                            }
                             if index.starts_with("sqlite_autoindex_") {
                                 assert!(
                                     plans.iter().any(|plan| plan.contains(&index) && plan.contains("name=?") && plan.contains("origin=?")),
