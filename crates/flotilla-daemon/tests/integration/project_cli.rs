@@ -2400,13 +2400,17 @@ async fn image_check_command_reads_the_ref_and_reports_its_build() {
         .repo(repository.key())
         .roles([ProjectRepositoryRole::Code].into())
         .build()];
+    // The daemon applies the shipped stdlib at startup, so the test's layers
+    // are installation definitions (shadowing stdlib layers of the same name)
+    // and the project names its base beside the stdlib's.
+    project.image = Some(flotilla_resources::ImageSelection { base: Some("base".into()), layers: Vec::new() });
     backend.using::<Project>("flotilla").create(&InputMeta::builder().name("demo".into()).build(), &project).await.expect("project");
     let layer = |name: &str, tier: ImageLayerTier, provides: &[&str]| {
         ImageLayerSpec::builder()
             .name(name.into())
             .version("1.0".into())
             .tier(tier)
-            .source(ImageLayerSource::Stdlib)
+            .source(ImageLayerSource::Installation)
             .maybe_from((tier == ImageLayerTier::Base).then(|| format!("ubuntu@sha256:{}", "1".repeat(64))))
             .fragment("FROM ${BASE}\nRUN true\n".into())
             .probe("true".into())
