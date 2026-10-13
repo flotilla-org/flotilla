@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     Convoy as ResourceConvoy, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
@@ -24,7 +25,6 @@ use crate::in_process::convoy_admission::{
 };
 use crate::in_process::{placement_actuator_host_ref, placement_host_ref, placement_target_host, ConditionValue, InProcessDaemon};
 use crate::testkits::discovery::fake_discovery;
-use flotilla_config::ConfigStore;
 
 #[tokio::test]
 async fn default_remote_placement_resolves_replicated_credentials_before_admission() {

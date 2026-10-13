@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_config::ConfigStore;
 use flotilla_manifest::{
     keys::{
         KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
@@ -60,7 +61,6 @@ use crate::{
     },
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
-use flotilla_config::ConfigStore;
 
 /// Read projections can inspect subscription evidence without changing subscriptions or delivery.
 #[async_trait]

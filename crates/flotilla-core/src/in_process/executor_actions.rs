@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flotilla_config::ConfigStore;
 use flotilla_paths::path_context::DaemonHostPath;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_protocol::commands::RepositoryIdentityChange;
@@ -45,7 +46,6 @@ use crate::environment_manager::EnvironmentManager;
 use crate::executor;
 use crate::step::run_step_plan_with_remote_executor;
 use crate::step::RemoteStepExecutor;
-use flotilla_config::ConfigStore;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_provider_runtime::CommandRunner;
 use flotilla_provider_runtime::EnvVars;

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::result_set::ConvoyChangeRequest;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
@@ -28,7 +29,6 @@ use crate::in_process::{
 use crate::repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_runner, FakeChangeRequest};
 use crate::testkits::replay::testing::MockRunner;
-use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_protocol::ChangeRequest;
 use flotilla_provider_runtime::available_space::AvailableSpaceProbe;

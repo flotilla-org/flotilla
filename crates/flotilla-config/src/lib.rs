@@ -704,6 +704,8 @@ impl ConfigStore {
             }
         }))
         .await?;
+        // Concurrent cold-cache callers may each read the file; the first
+        // result wins and later reads are discarded, so the race is harmless.
         let cached = self.global_config.get_or_init(|| Mutex::new(loaded));
         Ok(cached.lock().expect("config cache mutex poisoned").clone())
     }

@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
 };
 
+use flotilla_config::ConfigStore;
 use flotilla_environment::hop_chain::{
     environment::DockerEnvironmentHopResolver,
     remote::{NoopRemoteHopResolver, SshConnection, SshRemoteHopResolver},
@@ -35,7 +36,6 @@ use crate::{
     environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
 };
-use flotilla_config::ConfigStore;
 use flotilla_discovery::{registry::ProviderRegistry, DiscoveryRuntime};
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_terminal::TerminalSessionLiveness;

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostProviderStatus, HostSummary, NodeId, NodeInfo,
     PeerConnectionState, StreamKey,
@@ -15,7 +16,6 @@ use tokio::sync::broadcast;
 use super::support::test_meta;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::{fake_discovery, fake_discovery_with_provider_set, FakeChangeRequest, FakeDiscoveryProviders};
-use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 // UTC-to-monotonic conversion must preserve a future header deadline and keep

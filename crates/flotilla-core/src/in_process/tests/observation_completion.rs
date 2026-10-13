@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_change_request::observation::ChangeRequestObservationSource;
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_config::ConfigStore;
 use flotilla_discovery_api::EnvironmentAssertion;
 use flotilla_discovery_api::EnvironmentBag;
 use flotilla_protocol::{CrewCommandContext, HostName};
@@ -26,7 +27,6 @@ use crate::in_process::forge_service_matches;
 use crate::in_process::CrewCompletionRefusalCause;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery_with_runner;
-use flotilla_config::ConfigStore;
 
 // #2585: the real convoy resolver shares proven branch absence across callers
 // while preserving ordered repository selection and refreshing after five minutes.

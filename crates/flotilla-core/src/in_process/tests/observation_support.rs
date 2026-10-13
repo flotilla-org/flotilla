@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use flotilla_config::ConfigStore;
 use flotilla_protocol::HostName;
 use flotilla_provider_runtime::CommandOutput;
 use flotilla_provider_runtime::CommandRunner;
@@ -16,7 +17,6 @@ use super::support::test_meta;
 use crate::in_process::convoy_admission::RepositoryChangeRequestProvider;
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
-use flotilla_config::ConfigStore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RestAdmissionReply {

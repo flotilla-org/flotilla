@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{CrewCommandContext, DaemonEvent, HostName, NodeId};
 use flotilla_resources::{
     Convoy as ResourceConvoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, InputMeta, TerminalAttention,
@@ -18,7 +19,6 @@ use super::support::{
 };
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
-use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 
 #[tokio::test]

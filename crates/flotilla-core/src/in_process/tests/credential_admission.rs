@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     ConvoyRepositorySpec, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec,
@@ -19,7 +20,6 @@ use crate::in_process::convoy_admission::{
 use crate::in_process::InProcessDaemon;
 use crate::testkits::discovery::fake_discovery;
 use flotilla_agent::adapter::{AgentRequirement, CapabilityTable};
-use flotilla_config::ConfigStore;
 
 #[tokio::test]
 async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {

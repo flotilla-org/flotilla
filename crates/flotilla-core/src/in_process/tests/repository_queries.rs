@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use flotilla_change_request::observation::ChangeRequestRef;
+use flotilla_config::ConfigStore;
 use flotilla_discovery_api::{ProviderCategory, ProviderDescriptor};
 use flotilla_protocol::{CliListKind, Command, CommandAction, CommandValue, HostName, RepoIdentity};
 use flotilla_resources::{
@@ -18,7 +19,6 @@ use crate::in_process::{convoy_change_request_credential_refs, InProcessDaemon};
 use crate::model::RepoModel;
 use crate::repo_state::{RepoRootState, RepoState};
 use crate::testkits::discovery::fake_discovery;
-use flotilla_config::ConfigStore;
 use flotilla_daemon_api::daemon::DaemonHandle;
 use flotilla_discovery::registry::ProviderRegistry;
 

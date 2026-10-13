@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_config::ConfigStore;
 use flotilla_protocol::commands::AttachMode;
 use flotilla_protocol::AttachBinding;
 use flotilla_protocol::CliListKind;
@@ -60,7 +61,6 @@ use crate::resource_explain::resource_read_envelope;
 use crate::resource_explain::resource_record;
 use crate::resource_explain::run_resource_watch_command;
 use crate::resource_explain::ResourceWatchCommandContext;
-use flotilla_config::ConfigStore;
 use flotilla_issue_tracker::IssueProvider;
 
 /// Host-specific read and attach orchestration. Store reads, clock, cancellation

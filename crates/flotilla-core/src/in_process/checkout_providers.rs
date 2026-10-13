@@ -9,6 +9,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use flotilla_config::ConfigStore;
 use flotilla_discovery_api::ProviderDescriptor;
 use flotilla_protocol::EnvironmentId;
 use flotilla_resources::{
@@ -22,7 +23,6 @@ use tracing::warn;
 
 use super::{checkout_path, discover_vcs_for_checkout, InProcessDaemon};
 use crate::environment_manager::ManagedEnvironmentKind;
-use flotilla_config::ConfigStore;
 use flotilla_discovery::registry::ProviderRegistry;
 use flotilla_paths::path_context::ExecutionEnvironmentPath;
 use flotilla_vcs::vcs::Vcs;
