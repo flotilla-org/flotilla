@@ -326,7 +326,12 @@ impl Catalog {
         }
         for (target, facts) in &previous.facts {
             if !self.facts.contains_key(target) {
-                patches.push(patch(target.clone(), BTreeMap::new(), facts.keys().cloned().collect(), self.ttl_ms));
+                patches.push(patch(
+                    target.clone(),
+                    BTreeMap::new(),
+                    facts.keys().filter(|key| self.ttl_ms.is_none() || key.as_str() != KEY_SOURCE).cloned().collect(),
+                    self.ttl_ms,
+                ));
             }
         }
         patches
@@ -360,7 +365,11 @@ impl Catalog {
 }
 
 fn patch(target: MetadataTarget, mut set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>, ttl_ms: Option<u64>) -> MetadataPatch {
-    set.entry(KEY_SOURCE.to_owned()).or_insert_with(|| MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), ttl_ms));
+    // TTL transports retain the legacy provenance marker on a removed row;
+    // connection liveness retracts every fact without simultaneously setting it.
+    if ttl_ms.is_some() || !set.is_empty() {
+        set.entry(KEY_SOURCE.to_owned()).or_insert_with(|| MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), ttl_ms));
+    }
     MetadataPatch { target, source_id: SOURCE_CONNECTOR.to_owned(), set, unset }
 }
 

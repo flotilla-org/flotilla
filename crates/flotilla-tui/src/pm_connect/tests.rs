@@ -154,6 +154,7 @@ fn rebuild_publishes_diffs_not_repeats() {
     assert_eq!(entity_patch.set.len(), 1, "retractions retain only producer provenance");
     assert_eq!(entity_patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
     assert!(entity_patch.unset.contains(&KEY_STATUS_STATE.to_owned()));
+    assert!(!entity_patch.unset.contains(&KEY_SOURCE.to_owned()), "TTL removals preserve their legacy provenance fact");
 }
 
 #[test]
@@ -560,7 +561,7 @@ async fn reconnect_loop_retries_restarting_daemon_with_capped_backoff() {
         },
         |_| {
             sessions += 1;
-            async { Err("daemon protocol version mismatch: stop test session".to_string()) }
+            async { Err("daemon protocol version mismatch: stop test session".to_string().into()) }
         },
     )
     .await;
@@ -1245,12 +1246,12 @@ async fn reconnect_loop_backs_off_transient_sessions_and_resets_after_health() {
                     let session = sessions;
                     async move {
                         if session == 11 {
-                            return Err(flotilla_resources::ResourceError::invalid("unsupported request").to_string());
+                            return Err(flotilla_resources::ResourceError::invalid("unsupported request").to_string().into());
                         }
                         if healthy_session && session == 4 {
                             tokio::time::sleep(Duration::from_secs(31)).await;
                         }
-                        Err("daemon disconnected during resource watch".to_string())
+                        Err("daemon disconnected during resource watch".to_string().into())
                     }
                 },
             ),
@@ -1445,6 +1446,8 @@ async fn connection_sends_atomic_diffs_removals_and_no_heartbeat() {
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].target, independent_entity("second"));
     assert!(removed[0].unset.contains(&KEY_STATUS_STATE.to_owned()));
+    assert!(removed[0].set.is_empty(), "connection removals do not reassert provenance");
+    assert!(removed[0].unset.contains(&KEY_SOURCE.to_owned()), "connection removals retract every no-TTL fact");
     handle.abort();
 }
 
@@ -1580,7 +1583,7 @@ async fn daemon_loss_exits_supervised_connection_and_ttl_reconnects() {
                 move |daemon| {
                     let sink = sink.clone() as Arc<dyn PatchSink>;
                     let connector = connector.clone();
-                    async move { connector.run(daemon, sink, Arc::new(mint()), Duration::from_secs(10)).await }
+                    async move { connector.run_session(daemon, sink, Arc::new(mint()), Duration::from_secs(10)).await }
                 },
             )
             .await
@@ -1620,4 +1623,36 @@ async fn query_barrier_waits_for_each_staggered_snapshot() {
     assert!(sink.publications()[0].0);
     assert!(sink.publications()[0].1.iter().any(|patch| patch.target == independent_entity("scratch")));
     handle.abort();
+}
+
+// #3022 item 4 applies to both liveness modes: uncertainty past the bound is
+// terminal. TTL's in-process reconnect policy applies to daemon session loss.
+#[tokio::test(start_paused = true)]
+async fn publication_deadline_is_terminal_for_ttl_and_connection_sinks() {
+    for mode in [LivenessMode::Ttl, LivenessMode::Connection] {
+        let daemon = Arc::new(MockDaemon::new(vec![independents_set(1, vec![independent_row("scratch", SessionPhase::Running)])]));
+        let sink = Arc::new(RecordingSink { mode, ..RecordingSink::new() });
+        sink.failures.store(usize::MAX, Ordering::SeqCst);
+        let connector = Connector::default();
+        let attempts = AtomicUsize::new(0);
+        let error = run_reconnecting(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+                async move {
+                    if attempt == 0 {
+                        Ok(daemon)
+                    } else {
+                        Err("daemon protocol version mismatch: unexpected reconnect".to_owned())
+                    }
+                }
+            },
+            |daemon| connector.run_session(daemon, sink.clone(), Arc::new(mint()), Duration::from_secs(10)),
+        )
+        .await
+        .expect_err("persistent uncertainty must terminate");
+        assert!(error.contains("acknowledgement deadline"), "{error}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "a deadline never becomes a daemon reconnect");
+        assert!(connector.catalog.lock().expect("catalog").is_empty());
+    }
 }

@@ -18,7 +18,11 @@ One `Connector` owns the acknowledged catalog. Each daemon session owns fresh
 rows, a query subscription and resource-watch tasks. Publication waits for every
 subscribed named query's snapshot and every resource watch's bootstrap bookmark.
 A query gap or lag retires all source subscriptions, takes fresh snapshots, then
-publishes their diff against the acknowledged catalog in one request.
+publishes their diff against the acknowledged catalog in one request. Recovery
+recreates every named query and one watch per kind in each active namespace;
+that cost deliberately buys a complete barrier and removes obsolete resource
+facts. Retiring the old receiver prevents queued pre-gap events from causing a
+resnapshot loop.
 
 Wheelhouse subscriptions use connection liveness: the first publication is one
 JSON array sent to `POST /v1/metadata/snapshot`, replacing the provider's old facts.
@@ -34,7 +38,9 @@ retry unchanged with exponential delays from 250 ms to 2 seconds, within a
 15-second deadline (including blocked transport calls). Uncertain delivery past
 that deadline exits with an error, allowing a restart's replacing snapshot to
 repair the provider. Legacy delivery retries the remaining individual patches
-within the same deadline.
+within the same deadline, logging each failed attempt. The publication deadline
+is terminal for **both** liveness modes, as required by issue #3022 item 4; TTL
+in-process reconnects apply to daemon loss, not indefinitely uncertain delivery.
 
 After the first connection-mode publication, daemon-session loss exits with an
 error so Wheelhouse can mark the provider stale and restart it. Before publication,
@@ -43,7 +49,7 @@ base, 30-second cap); TTL mode also reconnects after publication. Permanent reso
 validation refusals and exhausted publication retries always terminate.
 
 The connector captures its parent at startup. Unix checks `getppid()` every second;
-Windows holds and probes the parent process handle. Parent death cancels even dial
+Windows holds and probes an owned parent process handle (`Send + Sync`). Parent death cancels even dial
 retries or blocked setup. Connection mode also probes `GET /v1/health` every five
 seconds and exits after 15 seconds of consecutive connection failures. A received
 HTTP response establishes connection health, including an older server's 404.

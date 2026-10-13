@@ -20,6 +20,7 @@ use std::{
 };
 
 pub use flotilla_client::reconnect::is_incompatible_daemon_error;
+use flotilla_client::resource::ResourceWatchError;
 use flotilla_client::{
     reconnect::{is_permanent_daemon_error, ReconnectBackoff},
     DaemonEndpoint, SshEndpoint,
@@ -44,6 +45,38 @@ use flotilla_protocol::{
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
+#[derive(Debug)]
+enum SessionFailure {
+    Daemon(String),
+    PublicationDeadline,
+    SessionLost(String),
+}
+
+impl SessionFailure {
+    fn terminal(&self) -> bool {
+        match self {
+            Self::Daemon(error) => is_permanent_daemon_error(error),
+            Self::PublicationDeadline | Self::SessionLost(_) => true,
+        }
+    }
+}
+
+impl From<String> for SessionFailure {
+    fn from(error: String) -> Self {
+        Self::Daemon(error)
+    }
+}
+
+impl std::fmt::Display for SessionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Daemon(error) => formatter.write_str(error),
+            Self::PublicationDeadline => formatter.write_str("connector publication failed: acknowledgement deadline exceeded"),
+            Self::SessionLost(error) => write!(formatter, "supervised daemon session ended: {error}"),
+        }
+    }
+}
+
 async fn run_reconnecting<Connect, ConnectFuture, Connected, ConnectedFuture>(
     mut connect: Connect,
     mut run_connected: Connected,
@@ -52,7 +85,7 @@ where
     Connect: FnMut() -> ConnectFuture,
     ConnectFuture: Future<Output = Result<Arc<dyn DaemonHandle>, String>>,
     Connected: FnMut(Arc<dyn DaemonHandle>) -> ConnectedFuture,
-    ConnectedFuture: Future<Output = Result<(), String>>,
+    ConnectedFuture: Future<Output = Result<(), SessionFailure>>,
 {
     let mut session_backoff = ReconnectBackoff::default();
     loop {
@@ -68,11 +101,8 @@ where
         if let Err(error) = run_connected(daemon).await {
             // Resource validation refusals describe a deterministic request error;
             // reconnecting cannot make the same parameters supported.
-            if is_permanent_daemon_error(&error)
-                || error.starts_with("connector publication failed")
-                || error.starts_with("supervised daemon session ended")
-            {
-                return Err(error);
+            if error.terminal() {
+                return Err(error.to_string());
             }
             // A healthy session resets the next retry; repeated short-lived
             // failures retain the shared exponential cap and jitter.
@@ -350,7 +380,7 @@ impl ConnectorState {
 
 // Bound uncertainty, including a blocked transport. A restart replaces any
 // remotely applied publication whose acknowledgement was lost.
-async fn deliver(sink: &dyn PatchSink, patches: &[MetadataPatch], replace: bool) -> Result<SnapshotAck, String> {
+async fn deliver(sink: &dyn PatchSink, patches: &[MetadataPatch], replace: bool) -> Result<SnapshotAck, SessionFailure> {
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut delay = Duration::from_millis(250);
         loop {
@@ -364,7 +394,7 @@ async fn deliver(sink: &dyn PatchSink, patches: &[MetadataPatch], replace: bool)
         }
     })
     .await
-    .map_err(|_| "connector publication failed: acknowledgement deadline exceeded".to_owned())
+    .map_err(|_| SessionFailure::PublicationDeadline)
 }
 
 async fn publish(
@@ -373,7 +403,7 @@ async fn publish(
     mint: &dyn RecipeMint,
     connector: &Connector,
     full: bool,
-) -> Result<(), String> {
+) -> Result<(), SessionFailure> {
     let mode = connector.mode(sink);
     let ttl_ms = (mode == LivenessMode::Ttl).then_some(CATALOG_TTL_MS);
     let next = state.project_at(mint, chrono::Utc::now(), ttl_ms);
@@ -413,20 +443,21 @@ async fn publish(
     Ok(())
 }
 
-async fn deliver_legacy(sink: &dyn PatchSink, patches: &[MetadataPatch]) -> Result<(), String> {
+async fn deliver_legacy(sink: &dyn PatchSink, patches: &[MetadataPatch]) -> Result<(), SessionFailure> {
     // An older Wheelhouse accepts individual messages, not atomic arrays.
     tokio::time::timeout(Duration::from_secs(15), async {
         for patch in patches {
             loop {
-                if sink.send(patch).await.is_ok() {
-                    break;
+                match sink.send(patch).await {
+                    Ok(()) => break,
+                    Err(error) => warn!(%error, "retrying legacy catalog publication"),
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     })
     .await
-    .map_err(|_| "connector publication failed: legacy acknowledgement deadline exceeded".to_owned())
+    .map_err(|_| SessionFailure::PublicationDeadline)
 }
 
 /// (Re)subscribe to every named query; publish only after subject bootstrap.
@@ -466,7 +497,7 @@ async fn ensure_resource_watches(
     state: &mut ConnectorState,
     watched: &mut BTreeSet<String>,
     tasks: &mut tokio::task::JoinSet<()>,
-    updates: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, String>>,
+    updates: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, ResourceWatchError>>,
 ) -> Result<(), String> {
     use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
     // Scope follows the named-query graph. Namespaces with no convoy, role or
@@ -497,9 +528,9 @@ async fn ensure_resource_watches(
             let updates = updates.clone();
             tasks.spawn(async move {
                 loop {
-                    let update = match watch.next().await {
+                    let update = match watch.next_event().await {
                         Ok(Some(envelope)) => Ok(envelope),
-                        Ok(None) => Err("subject catalog resource watch ended".to_string()),
+                        Ok(None) => Err(ResourceWatchError::Failed("subject catalog resource watch ended".to_string())),
                         Err(error) => Err(error),
                     };
                     let ended = update.is_err();
@@ -571,6 +602,7 @@ impl Connector {
     fn mode(&self, sink: &dyn PatchSink) -> LivenessMode {
         self.liveness.lock().expect("liveness mode").unwrap_or_else(|| sink.liveness())
     }
+
     pub async fn run(
         &self,
         daemon: Arc<dyn DaemonHandle>,
@@ -579,7 +611,7 @@ impl Connector {
         reassert_interval: Duration,
     ) -> Result<(), String> {
         tokio::select! {
-            result = self.run_session(daemon, sink.clone(), mint, reassert_interval) => result,
+            result = self.run_session(daemon, sink.clone(), mint, reassert_interval) => result.map_err(|error| error.to_string()),
             error = monitor_health(self, &*sink) => Err(error),
         }
     }
@@ -590,14 +622,14 @@ impl Connector {
         sink: Arc<dyn PatchSink>,
         mint: Arc<dyn RecipeMint>,
         reassert_interval: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), SessionFailure> {
         let subscriber_id = uuid::Uuid::new_v4();
         let _queries = daemon.query_subscription(subscriber_id);
         let state = ConnectorState { subscriber_id, catalog: self.catalog.clone(), ..ConnectorState::default() };
         let result = run_connector_subscribed(&daemon, &*sink, &*mint, reassert_interval, state, self).await;
         daemon.unsubscribe_queries(subscriber_id).await;
         if self.mode(&*sink) == LivenessMode::Connection && self.published.load(std::sync::atomic::Ordering::SeqCst) {
-            result.map_err(|error| format!("supervised daemon session ended: {error}"))
+            result.map_err(|error| if error.terminal() { error } else { SessionFailure::SessionLost(error.to_string()) })
         } else {
             result
         }
@@ -611,7 +643,7 @@ async fn run_connector_subscribed(
     reassert_interval: Duration,
     mut state: ConnectorState,
     connector: &Connector,
-) -> Result<(), String> {
+) -> Result<(), SessionFailure> {
     // Subscribe to the broadcast before the query subscription so nothing
     // emitted in between is dropped.
     let mut events = daemon.subscribe();
@@ -639,10 +671,10 @@ async fn run_connector_subscribed(
                 // cancels their commands; no partial subscription survives a retry.
                 match update.ok_or_else(|| "subject catalog watch channel ended".to_string())? {
                     Ok(envelope) => state.apply_resource_records(&envelope)?,
-                    Err(error) if flotilla_client::resource::is_resource_watch_lag_error(&error) => {
+                    Err(ResourceWatchError::Lagged(_)) => {
                         resnapshot(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &mut resource_rx, &resource_tx, &mut events).await?;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => return Err(error.to_string().into()),
                 }
                 publish(&mut state, sink, mint, connector, false).await?;
             }
@@ -665,7 +697,7 @@ async fn run_connector_subscribed(
                     publish(&mut state, sink, mint, connector, false).await?;
                 }
                 Err(RecvError::Closed) => {
-                    return Err("daemon event stream closed".to_owned());
+                    return Err("daemon event stream closed".to_owned().into());
                 }
             }
         }
@@ -677,8 +709,8 @@ async fn resnapshot(
     state: &mut ConnectorState,
     watched: &mut BTreeSet<String>,
     tasks: &mut tokio::task::JoinSet<()>,
-    updates: &mut tokio::sync::mpsc::Receiver<Result<flotilla_protocol::ResourceReadEnvelope, String>>,
-    sender: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, String>>,
+    updates: &mut tokio::sync::mpsc::Receiver<Result<flotilla_protocol::ResourceReadEnvelope, ResourceWatchError>>,
+    sender: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, ResourceWatchError>>,
     events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
 ) -> Result<(), String> {
     tasks.abort_all();

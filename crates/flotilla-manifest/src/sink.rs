@@ -288,6 +288,8 @@ impl PatchSink for WheelhouseHttpSink {
     }
 
     async fn health(&self) -> Result<(), String> {
+        // This measures connection liveness, not service readiness. Any HTTP
+        // response proves the PM is reachable, including an older server's 404.
         self.client
             .as_ref()
             .map_err(Clone::clone)?

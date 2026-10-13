@@ -18,15 +18,16 @@ impl Parent {
 
 #[cfg(windows)]
 mod windows {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
         System::{
             Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS},
             Threading::{GetCurrentProcessId, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
         },
     };
 
-    pub struct Parent(HANDLE);
+    pub struct Parent(OwnedHandle);
 
     impl Parent {
         pub fn capture() -> Result<Self, String> {
@@ -56,23 +57,22 @@ mod windows {
                 if handle.is_null() {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
-                Ok(Self(handle))
+                Ok(Self(OwnedHandle::from_raw_handle(handle)))
             }
         }
 
         pub fn alive(&self) -> bool {
             // SAFETY: this owner retains a valid synchronization handle.
-            unsafe { WaitForSingleObject(self.0, 0) == WAIT_TIMEOUT }
+            unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_TIMEOUT }
         }
     }
 
-    impl Drop for Parent {
-        fn drop(&mut self) {
-            // SAFETY: this owner uniquely owns the process handle.
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
+    #[cfg(test)]
+    #[test]
+    fn parent_handle_can_cross_runtime_threads() {
+        // Owned kernel handles support the Send future used by a multithreaded runtime.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Parent>();
     }
 }
 
