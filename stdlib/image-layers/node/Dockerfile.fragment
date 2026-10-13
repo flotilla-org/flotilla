@@ -1,0 +1,19 @@
+# Node.js (ADR 0062, shared tier). Installed read-only under
+# /opt/flotilla/toolchains/node; global npm installs belong in a layer that
+# chooses its own prefix (see formal-modelling), never in this tree.
+FROM ${BASE}
+ARG TARGETARCH
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+        amd64) arch=x64 ;; \
+        arm64) arch=arm64 ;; \
+        *) echo "unsupported Node.js architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "$(printf '%s' "${PIN_NODE_URL}" | sed "s/{arch}/${arch}/g")" -o /tmp/node.tar.xz; \
+    printf '%s  %s\n' "${PIN_NODE_SHA256}" /tmp/node.tar.xz | sha256sum --check --strict -; \
+    mkdir -p /opt/flotilla/toolchains/node; \
+    tar -xJf /tmp/node.tar.xz -C /opt/flotilla/toolchains/node --strip-components=1 --no-same-owner; \
+    rm /tmp/node.tar.xz; \
+    chmod -R a+rX,go-w /opt/flotilla/toolchains/node; \
+    test "$(/opt/flotilla/toolchains/node/bin/node --version)" = "v${PIN_NODE_VERSION}"
+ENV PATH="/opt/flotilla/bin:/opt/flotilla/toolchains/node/bin:${PATH}"

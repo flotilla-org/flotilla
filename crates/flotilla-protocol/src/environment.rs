@@ -162,19 +162,7 @@ pub struct EnvironmentSpec {
 /// In YAML config, written as a map with one key:
 /// ```yaml
 /// image:
-///   dockerfile: .flotilla/Dockerfile.dev-env
-/// ```
-/// or:
-/// ```yaml
-/// image:
-///   registry: ubuntu:24.04
-/// ```
-/// Source from which to obtain a container image.
-///
-/// In YAML config, written as a map with one key:
-/// ```yaml
-/// image:
-///   dockerfile: .flotilla/Dockerfile.dev-env
+///   dockerfile: .flotilla/Dockerfile
 /// ```
 /// or:
 /// ```yaml
@@ -368,12 +356,12 @@ mod tests {
     fn parse_environment_yaml_dockerfile() {
         let yaml = r#"
 image:
-  dockerfile: .flotilla/Dockerfile.dev-env
+  dockerfile: .flotilla/Dockerfile
 token_env_vars:
   - GITHUB_TOKEN
 "#;
         let spec: EnvironmentSpec = serde_yml::from_str(yaml).expect("should parse dockerfile variant");
-        assert_eq!(spec.image, ImageSource::Dockerfile(PathBuf::from(".flotilla/Dockerfile.dev-env")));
+        assert_eq!(spec.image, ImageSource::Dockerfile(PathBuf::from(".flotilla/Dockerfile")));
         assert_eq!(spec.token_env_vars, vec!["GITHUB_TOKEN"]);
     }
 

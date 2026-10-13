@@ -1,0 +1,52 @@
+# OS base (ADR 0062, A2). The generator replaces ${BASE} with this layer's
+# digest-pinned `from` and emits PIN_APT_SNAPSHOT_VERSION after this line.
+FROM ${BASE}
+ARG DEBIAN_FRONTEND=noninteractive
+
+# apt reads only the dated snapshot, for this layer and every layer above it.
+# One URI serves amd64 and arm64: Launchpad's primary archive snapshot carries
+# the ports architectures too, so the image's archive/ports split is dropped.
+#
+# ca-certificates bootstrap: the stock image has no CA bundle, and
+# snapshot.ubuntu.com is HTTPS-only (plain HTTP redirects to HTTPS). The first
+# update and the ca-certificates install therefore skip TLS peer verification.
+# This does not weaken integrity: apt still verifies the snapshot's InRelease
+# signature against the image's ubuntu-archive-keyring and every package
+# against the signed hashes, exactly as it does over the archive's plain-HTTP
+# default. Every later apt call, here and in other layers, verifies TLS.
+RUN set -eu; \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*; \
+    printf '%s\n' \
+        'Types: deb' \
+        "URIs: https://snapshot.ubuntu.com/ubuntu/${PIN_APT_SNAPSHOT_VERSION}/" \
+        'Suites: noble noble-updates noble-security' \
+        'Components: main restricted universe multiverse' \
+        'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+        'Check-Valid-Until: no' \
+        > /etc/apt/sources.list.d/ubuntu.sources; \
+    apt-get -o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false update; \
+    apt-get -o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false \
+        install -y --no-install-recommends ca-certificates; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        locales \
+        pkg-config \
+        tini \
+        unzip \
+        xz-utils; \
+    locale-gen en_US.UTF-8; \
+    rm -rf /var/lib/apt/lists/*
+
+# No user is baked in: the provider runs any UID and supplies HOME, which holds
+# all writable state (ADR 0062, A2/A4). /opt/flotilla/bin is reserved for the
+# provider-delivered flotilla CLI and cleat and stays first on PATH; layers
+# above restate it ahead of their own directories. Terminfo arrives with cleat
+# under /opt/flotilla/share/terminfo (A7/A8).
+ENV LANG=en_US.UTF-8
+ENV PATH="/opt/flotilla/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV TERMINFO_DIRS=/opt/flotilla/share/terminfo:/usr/share/terminfo

@@ -1,0 +1,56 @@
+# Formal modelling: Temurin JDK, Quint (with its Rust evaluator and the
+# Apalache backend) and standalone TLC. Quint ships only on npm, so this layer
+# requires the Node toolchain layer rather than bringing its own (ADR 0062,
+# A6/A9). Quint and its dependencies are pinned by package-lock.json (npm
+# verifies each package's sha512 integrity); other downloads are pinned here.
+# `{arch}` URL placeholders are substituted by the fragment.
+name: formal-modelling
+version: 0.33.0
+tier: shared
+provides:
+  - toolchain:jdk
+  - toolchain:jdk@21.0.12.1+1
+  - tool:quint
+  - tool:quint@0.33.0
+  - tool:tlc
+  - tool:tlc@1.7.4
+  - tool:apalache
+  - tool:apalache@0.62.1
+  - tool:quint-evaluator
+  - tool:quint-evaluator@0.7.0
+requires: [toolchain:node]
+pins:
+  jdk:
+    version: 21.0.12.1+1
+    url: https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1+1/OpenJDK21U-jdk_{arch}_linux_hotspot_21.0.12.1_1.tar.gz
+    sha256:
+      amd64: ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94
+      arm64: 23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223
+  quint:
+    # Installed with `npm ci` from the declared package-lock.json.
+    version: 0.33.0
+  quint-evaluator:
+    version: 0.7.0
+    url: https://github.com/quint-co/quint/releases/download/evaluator/v0.7.0/quint_evaluator-{arch}-unknown-linux-gnu.tar.gz
+    sha256:
+      amd64: 869adb8762a518483eb39f67fde622253a58527494e15afe77d610a0b6dab7d2
+      arm64: 26c052831243cdba9cd81f8da0c1df053f3c92cfd3fd8f050c87c45642414f93
+  apalache:
+    version: 0.62.1
+    url: https://github.com/apalache-mc/apalache/releases/download/v0.62.1/apalache.tgz
+    sha256: 38202a8c4ebeb3ab73e0fe5a7e4bb948442d46ad5de8a7fb45c9e5cac2beb2a6
+  tlc:
+    version: 1.7.4
+    url: https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+    sha256: 936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
+probe: |
+  /opt/flotilla/formal-modelling/probe.sh all
+context_files:
+  - package.json
+  - package-lock.json
+  - probe.sh
+  - smoke.cfg
+  - smoke.qnt
+  - smoke.tla
+  - tlc
+build_secrets: []

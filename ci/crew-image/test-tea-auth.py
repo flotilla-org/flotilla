@@ -6,12 +6,16 @@ import json
 import os
 import pathlib
 import stat
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 
-LAUNCHER = pathlib.Path(__file__).resolve().with_name("tea-crew.py")
+# The wrapper ships as a context file of the stdlib `crew-utilities` layer.
+# Keep that layer directory free of bytecode caches.
+sys.dont_write_bytecode = True
+LAUNCHER = pathlib.Path(__file__).resolve().parents[2] / "stdlib/image-layers/crew-utilities/tea-crew.py"
 SPEC = importlib.util.spec_from_file_location("tea_crew", LAUNCHER)
 assert SPEC and SPEC.loader
 tea_crew = importlib.util.module_from_spec(SPEC)
